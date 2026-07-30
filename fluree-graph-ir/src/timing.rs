@@ -73,7 +73,7 @@
 //! observation about a cooperating corpus, never as a measurement of an
 //! untrusted one.
 
-use crate::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
+use crate::{Datatype, GraphSink, LiteralValue, SinkResult, TermId, TermScope};
 use std::time::{Duration, Instant};
 
 /// A phase of an RDF pipeline run.
@@ -854,6 +854,13 @@ impl<S: GraphSink> GraphSink for TimingSink<S> {
 
     fn supports_quads(&self) -> bool {
         self.inner.supports_quads()
+    }
+
+    /// Forwarded: a decorator that swallowed this would leave the sink on the
+    /// conservative scope and silently give up the recycling the producer
+    /// offered.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        self.inner.declare_term_scope(scope);
     }
 
     fn emit_quad(

@@ -14,7 +14,7 @@ use super::terms::WriterTerms;
 use super::{blank::BlankLabeler, Deferred, Out, WriterConfig, WriterStats};
 use crate::jsonld::{format_jsonld, JsonLdFormatConfig};
 use fluree_graph_ir::{
-    Datatype, Graph, GraphSink, LiteralValue, SinkError, SinkResult, TermId, Triple,
+    Datatype, Graph, GraphSink, LiteralValue, SinkError, SinkResult, TermId, TermScope, Triple,
 };
 use std::io::Write;
 
@@ -131,6 +131,14 @@ impl<W: Write> GraphSink for JsonLdWriter<W> {
 
     fn term_literal_value(&mut self, value: LiteralValue, datatype: Datatype) -> TermId {
         self.terms.literal_value(value, datatype)
+    }
+
+    /// Honor a producer's statement-scope declaration. This writer keeps the
+    /// whole document in a `Graph` regardless — it is the document tier — but
+    /// the term table need not be a second copy of it, and every triple is
+    /// cloned into the graph before its slot can be reused.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        self.terms.set_scope(scope);
     }
 
     fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) -> SinkResult {

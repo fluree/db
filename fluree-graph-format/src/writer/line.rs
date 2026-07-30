@@ -6,7 +6,7 @@
 
 use super::terms::{write_nt_term, WriterTerms};
 use super::{blank::BlankLabeler, Deferred, Out, WriterConfig, WriterStats};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId, TermScope};
 use std::io::Write;
 
 /// Shared machinery: the two line formats differ only in whether a graph term
@@ -113,6 +113,14 @@ macro_rules! line_sink_common {
 
         fn on_prefix(&mut self, _prefix: &str, _namespace_iri: &str) {
             // No prefixed-name syntax in the line formats.
+        }
+
+        /// Honor a producer's statement-scope declaration: everything but a
+        /// labelled blank then recycles at the statement boundary. Sound here
+        /// because every emission clones the term out of the table before the
+        /// slot can be reused.
+        fn declare_term_scope(&mut self, scope: TermScope) {
+            self.0.terms.set_scope(scope);
         }
 
         fn term_iri(&mut self, iri: &str) -> TermId {

@@ -44,7 +44,9 @@
 use crate::error::CliResult;
 use crate::rdf::diagnostic::{self, Diagnostic};
 use crate::rdf::syntax::RdfSyntax;
-use fluree_graph_ir::{Datatype, GraphCollectorSink, GraphSink, LiteralValue, SinkResult, TermId};
+use fluree_graph_ir::{
+    Datatype, GraphCollectorSink, GraphSink, LiteralValue, SinkResult, TermId, TermScope,
+};
 use fluree_graph_turtle::{splitter, ParserOptions};
 
 /// Records `@prefix` and `@base` so a resumed parse can be re-seeded.
@@ -83,6 +85,13 @@ impl<S: GraphSink> PrefixRecorder<S> {
 }
 
 impl<S: GraphSink> GraphSink for PrefixRecorder<S> {
+    /// Forwarded: a decorator that swallowed this would leave the sink on the
+    /// conservative scope and silently give up the recycling the producer
+    /// offered.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        self.inner.declare_term_scope(scope);
+    }
+
     fn on_prefix(&mut self, prefix: &str, namespace_iri: &str) {
         // A redeclaration shadows the earlier binding, matching Turtle.
         if let Some(existing) = self.prefixes.iter_mut().find(|(p, _)| p == prefix) {

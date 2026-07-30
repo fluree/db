@@ -11,7 +11,7 @@ use super::blank::BlankLabeler;
 use super::Deferred;
 use crate::escape::{write_escaped_iri, write_escaped_ntriples_string};
 use crate::prefix::{write_turtle_iri, PrefixMap};
-use fluree_graph_ir::{Datatype, LiteralValue, Term, TermId};
+use fluree_graph_ir::{Datatype, LiteralValue, Term, TermId, TermScope};
 use fluree_vocab::rdf;
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -25,38 +25,113 @@ use std::io::{self, Write};
 /// is the widest single statement. IRI and blank ids are session-scoped by
 /// contract — producers cache them across statements — so the table holds one
 /// entry per distinct IRI, one per distinct labelled blank node, and one per
-/// *anonymous* blank node. The last of those is the only unbounded term, and
-/// it is unbounded in the collecting sinks too; statement-scoping anonymous
-/// blanks would be a protocol change, not a writer change.
+/// *anonymous* blank node.
+///
+/// That contract is written for the producer that needs the most. A producer
+/// that caches nothing can say so with
+/// [`declare_term_scope`](fluree_graph_ir::GraphSink::declare_term_scope), and
+/// then everything except a labelled blank recycles with the literals: the
+/// table's high-water mark becomes the widest statement rather than the
+/// document. Measured on a 4M-statement N-Triples document, that is the
+/// difference between 814 MiB and three slots.
+///
+/// Labelled blanks are the exception under either scope, and not for storage
+/// reasons: [`BlankLabeler`] mints a *fresh* output label per call, so the
+/// mapping from input label to output label lives here or nowhere, and
+/// `_:x` in the first statement and `_:x` in the last must come out as the
+/// same node. Their slots are session-scoped even under
+/// [`TermScope::Statement`].
 #[derive(Debug)]
 pub(crate) struct WriterTerms {
-    terms: Vec<Term>,
+    /// Session-scoped slots. Everything under [`TermScope::Session`]; only
+    /// labelled blanks under [`TermScope::Statement`]. Addressed by ids
+    /// carrying [`SESSION_TAG`].
+    session: Vec<Term>,
+    /// Statement-scoped slots, reused from the start at every statement
+    /// boundary. Empty unless the producer declared [`TermScope::Statement`].
+    scoped: Vec<Term>,
+    /// How far into `scoped` the statement in flight has consumed.
+    scoped_cursor: usize,
+    /// What the producer promised. Nothing recycles beyond literals until it
+    /// promises something.
+    scope: TermScope,
     labeler: BlankLabeler,
     /// Input blank label → the id holding its (already rewritten) term.
     blank_ids: HashMap<Box<str>, TermId>,
-    /// Slots in `terms` that hold literals, in mint order.
+    /// Slots in `session` that hold literals, in mint order. Unused under
+    /// [`TermScope::Statement`], where literals recycle with everything else.
     literal_slots: Vec<u32>,
     /// How far into `literal_slots` the statement in flight has consumed.
     literal_cursor: usize,
+    /// Which statement each `scoped` slot was minted in, and which statement
+    /// is in flight. Debug builds only: this is what turns "the producer lied
+    /// about its scope" from silent corruption into a panic that names it.
+    #[cfg(debug_assertions)]
+    scoped_generation: Vec<u64>,
+    #[cfg(debug_assertions)]
+    generation: u64,
 }
+
+/// Marks an id as addressing the session region rather than the recycled one.
+///
+/// The top bit, which no real index can reach: the parser refuses documents
+/// past 4 GiB and every term needs at least one byte, so a table cannot hold
+/// 2^31 entries in the first place.
+const SESSION_TAG: u32 = 1 << 31;
 
 impl WriterTerms {
     pub(crate) fn new(labeler: BlankLabeler) -> Self {
         Self {
-            terms: Vec::new(),
+            session: Vec::new(),
+            scoped: Vec::new(),
+            scoped_cursor: 0,
+            scope: TermScope::Session,
             labeler,
             blank_ids: HashMap::new(),
             literal_slots: Vec::new(),
             literal_cursor: 0,
+            #[cfg(debug_assertions)]
+            scoped_generation: Vec::new(),
+            #[cfg(debug_assertions)]
+            generation: 0,
+        }
+    }
+
+    /// Record the producer's declaration.
+    ///
+    /// Only meaningful before the first term is minted — a producer that
+    /// changes its mind mid-document would be invalidating ids it already
+    /// handed out — so a late declaration is refused in debug builds and
+    /// ignored in release, which keeps the safe scope rather than adopting the
+    /// unsafe one.
+    pub(crate) fn set_scope(&mut self, scope: TermScope) {
+        debug_assert!(
+            self.session.is_empty() && self.scoped.is_empty(),
+            "term scope declared after {} term(s) were already minted",
+            self.session.len() + self.scoped.len(),
+        );
+        if self.session.is_empty() && self.scoped.is_empty() {
+            self.scope = scope;
         }
     }
 
     pub(crate) fn get(&self, id: TermId) -> &Term {
-        &self.terms[id.index() as usize]
+        let raw = id.index();
+        if raw & SESSION_TAG != 0 {
+            return &self.session[(raw & !SESSION_TAG) as usize];
+        }
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.scoped_generation[raw as usize], self.generation,
+            "term id {raw} was minted in an earlier statement and its slot has been \
+             recycled — the producer declared TermScope::Statement and then cached an \
+             id across end_statement()",
+        );
+        &self.scoped[raw as usize]
     }
 
     pub(crate) fn iri(&mut self, iri: &str) -> TermId {
-        self.push(Term::iri(iri))
+        self.push_scoped_or_session(Term::iri(iri))
     }
 
     /// Intern a blank node under the writer's labelling policy.
@@ -67,8 +142,11 @@ impl WriterTerms {
     /// bad label would have appeared in reaches the output.
     pub(crate) fn blank(&mut self, label: Option<&str>, deferred: &mut Deferred) -> TermId {
         let Some(label) = label else {
+            // An anonymous node is named nowhere else, so nothing can refer to
+            // it after the statement that introduced it — it recycles with the
+            // rest under a statement-scoped producer.
             let minted = self.labeler.anonymous();
-            return self.push(Term::blank(minted));
+            return self.push_scoped_or_session(Term::blank(minted));
         };
         if let Some(&id) = self.blank_ids.get(label) {
             return id;
@@ -82,7 +160,10 @@ impl WriterTerms {
                 label.into()
             }
         };
-        let id = self.push(Term::blank(output));
+        // Session-scoped under either scope; see the type docs. The labeler
+        // mints a fresh label per call, so this map is the only record that
+        // two occurrences of `_:x` are one node.
+        let id = self.push_session(Term::blank(output));
         self.blank_ids.insert(label.into(), id);
         id
     }
@@ -109,26 +190,62 @@ impl WriterTerms {
         })
     }
 
-    /// Retire the statement's literal slots. Called at both outcomes, commit
-    /// and abort, because the slots are dead either way.
+    /// Retire the statement's slots. Called at both outcomes, commit and
+    /// abort, because the slots are dead either way.
     pub(crate) fn end_statement(&mut self) {
         self.literal_cursor = 0;
+        self.scoped_cursor = 0;
+        #[cfg(debug_assertions)]
+        {
+            self.generation += 1;
+        }
     }
 
-    fn push(&mut self, term: Term) -> TermId {
-        let id = TermId::new(self.terms.len() as u32);
-        self.terms.push(term);
+    /// Put a term where this producer's scope says it belongs.
+    fn push_scoped_or_session(&mut self, term: Term) -> TermId {
+        match self.scope {
+            TermScope::Session => self.push_session(term),
+            TermScope::Statement => self.push_scoped(term),
+        }
+    }
+
+    /// Session region: grows for the document, addressed with the tag bit.
+    fn push_session(&mut self, term: Term) -> TermId {
+        let id = TermId::new(self.session.len() as u32 | SESSION_TAG);
+        self.session.push(term);
         id
     }
 
+    /// Statement region: reuse the slot this statement's Nth term used last
+    /// time, or extend by one the first time a statement is this wide.
+    fn push_scoped(&mut self, term: Term) -> TermId {
+        let slot = self.scoped_cursor;
+        self.scoped_cursor += 1;
+        if slot < self.scoped.len() {
+            self.scoped[slot] = term;
+        } else {
+            self.scoped.push(term);
+            #[cfg(debug_assertions)]
+            self.scoped_generation.push(0);
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.scoped_generation[slot] = self.generation;
+        }
+        TermId::new(slot as u32)
+    }
+
     fn push_literal(&mut self, term: Term) -> TermId {
+        if self.scope == TermScope::Statement {
+            return self.push_scoped(term);
+        }
         if let Some(&slot) = self.literal_slots.get(self.literal_cursor) {
             self.literal_cursor += 1;
-            self.terms[slot as usize] = term;
-            return TermId::new(slot);
+            self.session[slot as usize] = term;
+            return TermId::new(slot | SESSION_TAG);
         }
-        let id = self.push(term);
-        self.literal_slots.push(id.index());
+        let id = self.push_session(term);
+        self.literal_slots.push(id.index() & !SESSION_TAG);
         self.literal_cursor = self.literal_slots.len();
         id
     }
@@ -229,6 +346,116 @@ mod tests {
         let mut buf = Vec::new();
         write_nt_term(&mut buf, term).unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    fn table(scope: TermScope) -> WriterTerms {
+        let mut terms = WriterTerms::new(BlankLabeler::new(BlankNodeLabels::Relabel));
+        terms.set_scope(scope);
+        terms
+    }
+
+    /// How many slots the table is holding, both regions.
+    fn slots(terms: &WriterTerms) -> (usize, usize) {
+        (terms.session.len(), terms.scoped.len())
+    }
+
+    #[test]
+    fn a_statement_scoped_producer_costs_the_widest_statement_not_the_document() {
+        // The defect this exists for: one slot per term OCCURRENCE, held for
+        // the whole document. On a 4M-statement N-Triples corpus that was
+        // 814 MiB of table for a document whose widest statement needs three
+        // slots. Before the scope declaration, `scoped` did not exist and
+        // `session` here grew to 3000 — this assertion is the pin.
+        let mut terms = table(TermScope::Statement);
+        for i in 0..1000 {
+            terms.iri(&format!("http://ex/s{i}"));
+            terms.iri("http://ex/p");
+            terms.literal(&format!("v{i}"), Datatype::xsd_string(), None);
+            terms.end_statement();
+        }
+        assert_eq!(
+            slots(&terms),
+            (0, 3),
+            "1000 statements of three terms should leave three slots, not three thousand"
+        );
+
+        // A wider statement extends the table exactly once, and the table then
+        // holds the high-water mark rather than the last statement.
+        for i in 0..5 {
+            terms.iri(&format!("http://ex/wide{i}"));
+        }
+        terms.end_statement();
+        terms.iri("http://ex/narrow");
+        terms.end_statement();
+        assert_eq!(
+            slots(&terms),
+            (0, 5),
+            "the table holds the widest statement"
+        );
+    }
+
+    #[test]
+    fn a_labelled_blank_keeps_one_identity_across_statements_even_when_recycling() {
+        // The exception to recycling, and the reason it is an exception:
+        // `BlankLabeler` mints a FRESH output label per call, so if the id for
+        // `_:x` were recycled and re-minted, the second occurrence would come
+        // out as a different node. Same input label, same id, same rendering.
+        let mut terms = table(TermScope::Statement);
+        let mut deferred = Deferred::default();
+
+        let first = terms.blank(Some("x"), &mut deferred);
+        let first_label = rendered(terms.get(first));
+        terms.iri("http://ex/p");
+        terms.end_statement();
+
+        for _ in 0..100 {
+            terms.iri("http://ex/filler");
+            terms.end_statement();
+        }
+
+        let later = terms.blank(Some("x"), &mut deferred);
+        assert_eq!(
+            first, later,
+            "`_:x` must be one node for the whole document"
+        );
+        assert_eq!(
+            rendered(terms.get(later)),
+            first_label,
+            "the label a recycled table hands back must not drift"
+        );
+        // And a DIFFERENT label is still a different node.
+        let other = terms.blank(Some("y"), &mut deferred);
+        assert_ne!(first, other);
+        assert_ne!(rendered(terms.get(other)), first_label);
+    }
+
+    #[test]
+    fn without_a_declaration_ids_stay_valid_for_the_session() {
+        // The Turtle parser caches term ids across statements, so the default
+        // must keep every non-literal slot alive. If this ever starts
+        // recycling, a cached subject id silently starts naming another term.
+        let mut terms = table(TermScope::Session);
+        let subject = terms.iri("http://ex/s");
+        let rendering = rendered(terms.get(subject));
+        for i in 0..500 {
+            terms.iri(&format!("http://ex/p{i}"));
+            terms.literal(&format!("v{i}"), Datatype::xsd_string(), None);
+            terms.end_statement();
+        }
+        assert_eq!(
+            rendered(terms.get(subject)),
+            rendering,
+            "a session-scoped id must still name the term it was minted for"
+        );
+        // Literals still recycle under the session scope — that part of the
+        // contract is unchanged, and it is what keeps `session` at one slot
+        // per distinct IRI plus one per literal POSITION.
+        assert_eq!(slots(&terms).1, 0, "nothing should reach the scoped region");
+        assert!(
+            slots(&terms).0 <= 502,
+            "literals must reuse their slot: {:?}",
+            slots(&terms)
+        );
     }
 
     #[test]

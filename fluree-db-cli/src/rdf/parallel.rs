@@ -38,6 +38,7 @@ use crate::error::{CliError, CliResult};
 use crate::rdf::syntax::RdfSyntax;
 use fluree_graph_ir::{
     Datatype, Graph, GraphCollectorSink, GraphSink, LiteralValue, SinkResult, Term, TermId,
+    TermScope,
 };
 use fluree_graph_turtle::{splitter, ParserOptions};
 
@@ -275,6 +276,13 @@ impl<S: GraphSink> ChunkScopedBlanks<S> {
 }
 
 impl<S: GraphSink> GraphSink for ChunkScopedBlanks<S> {
+    /// Forwarded: a decorator that swallowed this would leave the sink on the
+    /// conservative scope and silently give up the recycling the producer
+    /// offered.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        self.inner.declare_term_scope(scope);
+    }
+
     fn term_blank(&mut self, label: Option<&str>) -> TermId {
         match label {
             // A document-scoped label. Two chunks naming it mean one node.
@@ -390,6 +398,13 @@ impl<S: GraphSink> DeterministicBlanks<S> {
 }
 
 impl<S: GraphSink> GraphSink for DeterministicBlanks<S> {
+    /// Forwarded: a decorator that swallowed this would leave the sink on the
+    /// conservative scope and silently give up the recycling the producer
+    /// offered.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        self.inner.declare_term_scope(scope);
+    }
+
     fn term_blank(&mut self, label: Option<&str>) -> TermId {
         match label {
             Some(label) => {

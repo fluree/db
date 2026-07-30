@@ -17,7 +17,7 @@ use fluree_graph_format::{
     ContextPolicy, JsonLdFormatConfig, JsonLdWriter, NQuadsWriter, NTriplesWriter, PrefixMap,
     TrigWriter, TurtleWriter, WriterConfig, WriterStats,
 };
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId, TermScope};
 use std::cell::Cell;
 use std::io::{self, Write};
 use std::rc::Rc;
@@ -137,6 +137,12 @@ pub fn is_writable(syntax: RdfSyntax) -> bool {
 }
 
 impl<W: Write> GraphSink for AnyWriter<W> {
+    /// Forwarded to whichever writer this is: the declaration is the
+    /// producer's, and dropping it here would cost the recycling silently.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        dispatch!(self, w => w.declare_term_scope(scope));
+    }
+
     fn on_base(&mut self, base_iri: &str) {
         dispatch!(self, w => w.on_base(base_iri));
     }
