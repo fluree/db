@@ -3276,6 +3276,97 @@ fn the_swallowed_span_stops_where_the_parse_resumed() {
     );
 }
 
+#[test]
+fn a_multi_line_statement_is_not_reported_as_swallowed() {
+    // A statement may span lines and still carry its own terminator, so the
+    // resync lands on ITS `.` and eats nothing. The first version of this
+    // warning split the error-to-resume span at the first newline and reported
+    // whatever followed, which on this document is the statement's own second
+    // line: 24 bytes announced as lost while `ex:c` converted fine.
+    //
+    // The positional shape here is identical to the honest case in
+    // `a_resync_that_swallows_the_next_statement_says_so` — error on line 3,
+    // resume at the end of line 4 — so nothing about WHERE the bytes are can
+    // separate them. Only what they say.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(
+        &tmp,
+        "multi.ttl",
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p \"ok\" .\n\
+         ex:bad ~~~ \"still the same statement\"\n\
+             ex:more \"and more\" .\n\
+         ex:c ex:p \"fine\" .\n",
+    ));
+
+    assert_eq!(
+        out.lines().count(),
+        2,
+        "nothing was lost, so nothing may be missing: {out}"
+    );
+    assert!(stderr.contains("1 statement(s) skipped"), "{stderr}");
+    assert!(
+        !stderr.contains("resync consumed"),
+        "the statement's own second line was reported as swallowed: {stderr}"
+    );
+}
+
+#[test]
+fn a_continuation_after_a_semicolon_is_not_reported_as_swallowed() {
+    // The idiomatic multi-line spelling: `;` then an indented predicate. Same
+    // requirement as above and the more common shape in real documents.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(
+        &tmp,
+        "semi-healthy.ttl",
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p \"1\" .\n\
+         ex:bad ~~~ \"x\" ;\n\
+             ex:more \"and more\" .\n\
+         ex:c ex:p \"3\" .\n",
+    ));
+
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(
+        !stderr.contains("resync consumed"),
+        "a `;` continuation was reported as a swallowed statement: {stderr}"
+    );
+}
+
+#[test]
+fn a_statement_lost_after_a_semicolon_is_still_reported() {
+    // The trap, and the reason this file does NOT check for a trailing `;`.
+    //
+    // That check is the obvious way to recognise a continuation, and it
+    // suppresses exactly the case the warning exists for: `ex:bad ~~~ ;` has no
+    // terminator of its own, so the resync runs to line 4's `.` and eats
+    // `ex:c` whole. With a punctuator check in place this document lost a
+    // statement and said nothing — measured, not theorised.
+    //
+    // The standalone-parse test gets both this and the case above right,
+    // because a `;` continuation is `predicate object` and does not parse as a
+    // statement on its own, while `ex:c ex:p "3" .` does.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(
+        &tmp,
+        "semi-lossy.ttl",
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p \"1\" .\n\
+         ex:bad ~~~ ;\n\
+         ex:c ex:p \"3\" .\n",
+    ));
+
+    assert_eq!(
+        out.lines().count(),
+        1,
+        "`ex:c` was eaten by the resync: {out}"
+    );
+    assert!(
+        stderr.contains("resync consumed"),
+        "a statement was lost and the run said nothing: {stderr}"
+    );
+}
+
 // ============================================================================
 // the three-layered parallel differential
 // ============================================================================
