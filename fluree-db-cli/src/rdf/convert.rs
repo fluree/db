@@ -449,8 +449,12 @@ fn run_recovering(
     let mut sink = crate::rdf::recover::PrefixRecorder::new(writer);
 
     timings.enter(Phase::Parse);
-    let recovery =
-        crate::rdf::recover::parse_recovering(&loaded.text, common.base.as_deref(), &mut sink);
+    let recovery = crate::rdf::recover::parse_recovering(
+        &loaded.text,
+        loaded.resolved.syntax,
+        common.base.as_deref(),
+        &mut sink,
+    );
     timings.finish();
     let recovery = recovery?;
 

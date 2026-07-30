@@ -3479,6 +3479,52 @@ fn a_mid_file_directive_falls_back_to_serial_rather_than_refusing() {
 }
 
 #[test]
+fn recovery_reads_a_line_format_strictly_too() {
+    // Recovery re-parses fragments, and it re-parsed them with the TURTLE
+    // parser whatever the input was — so `--continue-on-error` on a `.nt` file
+    // accepted every Turtle-only construct the strict reader exists to reject.
+    // Silently, too: recovery reports what it SKIPS, and a construct that
+    // parses is never skipped, so the report said nothing was wrong.
+    let tmp = TempDir::new().unwrap();
+    // Every line terminates, including the junk one. Resync scans forward to
+    // the next terminator, so a junk line WITHOUT one swallows the statement
+    // after it — which would hide the very line this test is about.
+    let nt = "<http://example.org/a> <http://example.org/p> \"ok\" .\n\
+              <http://example.org/b> <http://example.org/p> 42 .\n\
+              not a triple at all .\n\
+              <http://example.org/c> <http://example.org/p> \"fine\" .\n";
+    let input = fixture(&tmp, "recoverable.nt", nt);
+    let out = tmp.path().join("out.nt");
+
+    let assert = rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt", "--continue-on-error"])
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    // Two skips, not one: the junk line AND the bare number, which is a
+    // perfectly good Turtle integer and not an N-Triples term.
+    assert!(
+        stderr.contains("2 statement(s) skipped"),
+        "the bare number must be skipped as well as the junk line: {stderr}"
+    );
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(
+        written.lines().count(),
+        2,
+        "only the two valid N-Triples statements survive:\n{written}"
+    );
+    assert!(
+        !written.contains("42"),
+        "a bare number reached the output:\n{written}"
+    );
+}
+
+#[test]
 fn continue_on_error_still_emits_the_profile() {
     // Recovery is exactly when profiling matters — resync re-parses from each
     // error — and the two flags were mutually exclusive by accident.

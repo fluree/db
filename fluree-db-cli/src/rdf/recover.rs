@@ -43,6 +43,7 @@
 
 use crate::error::CliResult;
 use crate::rdf::diagnostic::{self, Diagnostic};
+use crate::rdf::syntax::RdfSyntax;
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 use fluree_graph_turtle::{splitter, ParserOptions};
 
@@ -158,8 +159,16 @@ impl Recovery {
 ///
 /// The sink must be configured with statement buffering; see the module docs
 /// for why that is a requirement and not a preference.
+///
+/// `source` picks the reader, for the same reason the streaming and parallel
+/// paths dispatch on it: the line formats are grammars defined by what they
+/// refuse. Recovering with the Turtle parser would not merely accept the
+/// Turtle-only constructs an N-Triples document must be refused for — it would
+/// accept them *silently*, since recovery reports what it skipped and a
+/// construct that parses is never skipped.
 pub fn parse_recovering<S: GraphSink>(
     text: &str,
+    source: RdfSyntax,
     base: Option<&str>,
     sink: &mut PrefixRecorder<S>,
 ) -> CliResult<Recovery> {
@@ -171,13 +180,27 @@ pub fn parse_recovering<S: GraphSink>(
         let effective_base = seeded_base.as_deref().or(base);
         let prefixes = sink.prefixes().to_vec();
 
-        let result = fluree_graph_turtle::parse_with_prefixes_base_options(
-            &text[offset..],
-            sink,
-            &prefixes,
-            effective_base,
-            ParserOptions::conformant(),
-        );
+        // The same four readers `rdf::parse_into` dispatches to. The line
+        // formats take neither prefixes nor a base, because they have neither.
+        let fragment = &text[offset..];
+        let result = match source {
+            RdfSyntax::NTriples => fluree_graph_turtle::parse_ntriples(fragment, sink),
+            RdfSyntax::NQuads => fluree_graph_turtle::parse_nquads(fragment, sink),
+            RdfSyntax::TriG => fluree_graph_turtle::parse_with_prefixes_base_options(
+                fragment,
+                sink,
+                &prefixes,
+                effective_base,
+                ParserOptions::conformant().with_dialect(fluree_graph_turtle::Dialect::TriG),
+            ),
+            _ => fluree_graph_turtle::parse_with_prefixes_base_options(
+                fragment,
+                sink,
+                &prefixes,
+                effective_base,
+                ParserOptions::conformant(),
+            ),
+        };
 
         let Err(error) = result else {
             return Ok(recovery);
@@ -246,7 +269,8 @@ mod tests {
         let config = WriterConfig::new().with_statement_buffering(true);
         let writer = NTriplesWriter::with_config(Vec::new(), &config);
         let mut sink = PrefixRecorder::new(writer);
-        let recovery = parse_recovering(ttl, None, &mut sink).expect("recovery must not fail");
+        let recovery = parse_recovering(ttl, RdfSyntax::Turtle, None, &mut sink)
+            .expect("recovery must not fail");
         let mut writer = sink.into_inner();
         writer.finish().ok();
         (String::from_utf8(writer.into_inner()).unwrap(), recovery)
