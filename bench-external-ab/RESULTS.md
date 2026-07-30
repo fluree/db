@@ -83,11 +83,52 @@ FINDING 2 (bloom-filter JOIN gap) → **NOT tied to the partitioned multi-file l
 
 ---
 
-## Wave C — pair-set widening (the core, substrate B SF0.1)
+## Wave C — pair-set widening (the core)
 
-STATUS: pending. The full pre-registered pair set (q038/q014/q027/q008/q036/q040/q016/q046 analogs + RT additions: 3+-table join-reorder, MIN/MAX, spill-candidate high-card GROUP BY, high-card GROUP BY at normal limits). Correctness cross-checked first; then substrate B, both fluree binaries + DuckDB, both cache modes, N=5 median+p95.
+STATUS: DONE (2026-07-30). Correctness gate PASSES all 10 pairs; then the full timed set on an UNCONTESTED cloud host (see host identity). Cold is the primary mode (fresh process/rep); warm is the reused-disk-cache secondary. N=5 (median of steady-state reps 2..5). DuckDB shown as `wall+setup`. Both Fluree binaries git-commit-stamped. Raw: `harness/out/waveC_ec2.jsonl` (250 rows = 50 DuckDB-cold + 100 fluree-main + 100 fluree-#1528; DuckDB has no separate cross-process warm mode, so 250 is the full count).
 
-_full table + PREDICTIONS-vs-OUTCOMES + NAMED-GAPS to be filled_
+### Host identity (Wave C primary)
+
+Uncontested AWS `c7g.4xlarge` (16 vCPU AWS Graviton3, aarch64, 32 GB), Amazon Linux 2023.12 (kernel 6.1.176 aarch64). DuckDB v1.5.5 (Variegata) `d8cdaa33fd`, official linux-arm64 binary, sha256 `9882c99a9804407d…` — NATIVE arm64 (no macOS/Rosetta caveat; the `arch -arm64` prefix is empty here). Fluree: shipped-main `5598ffd6a` (4.1.4) and #1528-content `c81862d2a` (4.1.3), both release builds from source on the host. Substrate B: local MinIO + `apache/iceberg-rest-fixture`, 16 tables unpartitioned, SF0.1.
+
+### Full table (median ms cold / warm; RSS MB). DuckDB = wall+setup.
+
+| pair (shape) | DuckDB w+s / RSS | fluree-main cold / warm / RSS | fluree-#1528 cold / warm | shipped gap vs DuckDB (cold) | #1528 gap |
+|---|---|---|---|---|---|
+| cq038 filtered COUNT | 50 / 57 | **74155** / 68635 / 282 | **99** / 72 | 1483x | 2.0x |
+| cq014 fused COUNT+SUM | 56 / 64 | 80 / 57 / 56 | 81 / 58 | 1.4x | 1.4x |
+| cq027 fused 1M grouped COUNT | 77 / 62 | 468 / 425 / 183 | 468 / 427 | 6.1x | 6.1x |
+| cq008 fused fact→dim→dim rollup | 128 / 95 | 628 / 572 / 147 | 614 / 567 | 4.9x | 4.8x |
+| cq040 VALUES/IN | 60 / 65 | 193 / 162 / 161 | 197 / 151 | 3.2x | 3.3x |
+| cq016 OPTIONAL left-join | 83 / 84 | **30475** / 31520 / 657 | **1020** / 1020 | 367x | 12.3x |
+| cq046 DESC top-k (tiebreak) | 66 / 66 | 412 / 386 / 253 | 403 / 376 | 6.2x | 6.1x |
+| crt_join_reorder 4-table join | 144 / 104 | **132090** / 129525 / 821 | **129395** / 122625 | 917x | 899x |
+| crt_minmax MIN/MAX | 59 / 62 | 254 / 236 / 199 | 156 / 131 | 4.3x | 2.6x |
+| crt_highcard high-card GROUP BY | 238 / 156 | 3355 / 3330 / **1206** | 3395 / 3325 | 14.1x | 14.3x |
+
+All cells correctness-matched (Wave C gate). On this uncontested host DuckDB leads every pair cold; cq014 is a near-tie (warm 58 vs 56 ms). The compute-bound gaps (cq038, cq016, crt_join_reorder) show no cold→warm speedup, confirming they are engine-compute limits, not I/O.
+
+### Predictions vs outcomes (against R1 §3.7 pre-registered map)
+
+HELD: q038 filtered COUNT — DuckDB-win predicted, shipped 1483x (held; but see the #1528 finding). q040 VALUES/IN — DuckDB-win predicted, 3.2x (held). q016 OPTIONAL — DuckDB-win predicted, shipped 367x (held). Multi-FACT aggregate join (crt_join_reorder) — DuckDB-win predicted for the uncovered class, 917x (held, the largest gap). q014 fused single-table — Fluree-competitive predicted, 1.4x near-tie (held).
+
+WRONG / OPTIMISTIC: q027 (fused 1M grouped) and q008 (fused rollup) were predicted Fluree-competitive/winning; OUTCOME DuckDB leads 6.1x / 4.9x — fused aggregation streams past the per-row ceiling but the vectorized engine still leads at these sizes. q046 DESC top-k predicted Fluree-competitive (99.9% file prune); OUTCOME DuckDB 6.2x ahead (fluree top-k ~400 ms vs 66 ms). MIN/MAX was predicted to decline to full-materialize (a large gap); OUTCOME only 4.3x (fluree ~254 ms, NOT a full-scan decline) — the prediction of a huge MIN/MAX gap was wrong.
+
+NEW (not in R1's map): the #1528 fusion is BROADER than the filter-over-join p3 case it was scoped as. It also collapses cq038 (single-table doubly-constrained COUNT: 74155→99 ms, ~750x) and cq016 (OPTIONAL: 30475→1020 ms, ~30x). It does NOT touch crt_join_reorder (the multi-FACT join). main==#1528 on all fused/relational pairs (no regression).
+
+### NAMED GAPS (DuckDB leads shipped-fluree beyond noise: shape / ratio / mechanism)
+
+1. crt_join_reorder — 4-table fact⋈fact⋈dim⋈dim + integer SUM, two selective dim constraints. **917x shipped / 899x #1528** (~130 s vs 144 ms), RSS 821 MB vs 104 MB. Mechanism: the multi-FACT aggregate join is uncovered — Fluree materializes the full join into per-row RDF bindings before aggregating; not fused, and #1528's filter-over-join fusion does not apply. The single largest, still-open gap (A3 gap #6). Cache-invariant (compute-bound).
+2. cq038 — single-table filtered COUNT (`Customer WHERE isCurrent`). **1483x shipped → 2.0x with #1528** (74 s → 99 ms). Mechanism: shipped materializes ~390k rows to count matches; the #1528 family-C fusion streams the count. Fix pending merge.
+3. cq016 — OPTIONAL (LEFT JOIN) fact→fact, unordered LIMIT. **367x shipped → 12.3x with #1528** (30 s → 1.0 s). Mechanism: OPTIONAL swallows the LIMIT budget → full fact+fact scan on shipped; #1528 largely closes it.
+4. crt_highcard — high-cardinality GROUP BY (259k groups over 1M rows). **14x both binaries; RSS 1206 MB vs 156 MB (8x)**. Mechanism: per-row RDF-binding materialization of the 1M-row scan + 259k-row grouped output at the ~56k rows/s ceiling; memory-heavy. Unaffected by #1528. (The memory_limit-pinned spill sub-variant was not separately run; the 8x RSS disparity at normal limits already shows the memory-fairness story.)
+5. cq027 / cq046 / cq008 / cq040 — fused/pruned relational shapes, **3.2–6.2x cold**. Mechanism: even fused, DuckDB's vectorized scan-agg / top-k / IN engine leads at these sizes; Fluree is competitive (low-hundreds of ms) but trails.
+
+Where Fluree LEADS: none cold on this uncontested host — DuckDB leads or ties every pair (cq014 near-tie). Note the host dependence: on the LOCAL contended host, Fluree WARM beat DuckDB on the bare-COUNT / metadata pairs (count-manifest shortcut #1478, and DuckDB re-attaches per fresh process); on this fast uncontested instance DuckDB's ATTACH is cheap enough that it leads cold. Both are honest, disclosed regimes.
+
+### Secondary: local-host (contended) legs — SUPERSEDED, not mixed
+
+An earlier partial Wave C ran on the local macOS host under heavy sibling load (load1 30–146), which inflated absolute ms; those rows are NOT merged into the table above. Directionally they agreed with the uncontested EC2 numbers: cq038 ~54 s shipped / crt_join_reorder ~90 s shipped, #1528 fixing cq038 (~0.45 s) and cq016, not fixing crt_join_reorder. The EC2 uncontested run is authoritative; the contended local rows are retained only as `harness/out/waveC_{main,1528}.jsonl` provenance.
 
 ---
 
