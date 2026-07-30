@@ -104,6 +104,27 @@ pub fn can_run_parallel(syntax: RdfSyntax) -> bool {
     )
 }
 
+/// Whether a document in this syntax can be cut at Turtle statement boundaries.
+///
+/// A different question from [`can_run_parallel`], which asks whether the
+/// OUTPUT survives being written as concatenated fragments. This asks whether
+/// the INPUT survives being cut, and the two have different answers:
+///
+/// - **TriG** writes fine in fragments but does not cut: its statements live
+///   inside `GRAPH … { … }` blocks, and the boundary scanner cuts at `.`, so a
+///   chunk boundary lands inside a brace-scoped block and neither half parses.
+/// - **JSON-LD** is a single JSON document with no statement terminators at
+///   all; cutting it at Turtle boundaries produces fragments that are not JSON.
+///
+/// Only `target` was consulted before this existed, so both were chunked as
+/// though they were Turtle.
+pub fn can_chunk_input(syntax: RdfSyntax) -> bool {
+    matches!(
+        syntax,
+        RdfSyntax::Turtle | RdfSyntax::NTriples | RdfSyntax::NQuads
+    )
+}
+
 /// Renames a collector's anonymous mints into a per-chunk namespace.
 ///
 /// Anonymous nodes arrive as `term_blank(None)` and every collector answers
@@ -436,6 +457,7 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
     text: &str,
     base: Option<&str>,
     out: &mut W,
+    source: RdfSyntax,
     syntax: RdfSyntax,
     writer_config: &fluree_graph_format::WriterConfig,
     config: ParallelConfig,
@@ -475,6 +497,7 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
                         prefix_block,
                         &text[range.clone()],
                         base,
+                        source,
                         syntax,
                         writer_config,
                     );
@@ -597,11 +620,21 @@ struct ChunkBytes {
 }
 
 /// Parse one chunk straight into its own writer.
+///
+/// `source` picks the reader and `syntax` picks the writer. They are separate
+/// parameters because using one for both was a silent correctness bug: every
+/// chunk was parsed with the Turtle parser whatever the input actually was, so
+/// an N-Triples file large enough to chunk was read by a parser that accepts
+/// directives, prefixed names and bare numbers — the very things the strict
+/// N-Triples reader exists to reject. `--parallelism 1` refused those
+/// documents and the default path accepted them.
+#[allow(clippy::too_many_arguments)]
 fn write_chunk(
     index: usize,
     prefix_block: &str,
     body: &str,
     base: Option<&str>,
+    source: RdfSyntax,
     syntax: RdfSyntax,
     writer_config: &fluree_graph_format::WriterConfig,
 ) -> ChunkBytes {
@@ -638,13 +671,22 @@ fn write_chunk(
     let mut sink = DeterministicBlanks::new(writer, index);
 
     let started = std::time::Instant::now();
-    let result = fluree_graph_turtle::parse_with_prefixes_base_options(
-        &doc,
-        &mut sink,
-        &[],
-        base,
-        ParserOptions::conformant(),
-    );
+    // The same four readers `rdf::parse_into` dispatches to, for the same
+    // reason: the line formats are grammars defined by what they refuse, so
+    // reading them with the Turtle parser accepts documents this tool is being
+    // asked to reject. `base` is not threaded into them, because N-Triples and
+    // N-Quads have no base and no relative IRIs for it to apply to.
+    let result = match source {
+        RdfSyntax::NTriples => fluree_graph_turtle::parse_ntriples(&doc, &mut sink),
+        RdfSyntax::NQuads => fluree_graph_turtle::parse_nquads(&doc, &mut sink),
+        _ => fluree_graph_turtle::parse_with_prefixes_base_options(
+            &doc,
+            &mut sink,
+            &[],
+            base,
+            ParserOptions::conformant(),
+        ),
+    };
     let parse_nanos = started.elapsed().as_nanos();
 
     let mut writer = sink.into_inner();

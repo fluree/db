@@ -2434,6 +2434,123 @@ fn parallel_corpus(statements: usize) -> String {
     ttl
 }
 
+/// An above-threshold `.nt` document that is valid TURTLE and invalid
+/// N-Triples, in the way `body` chooses.
+fn above_threshold_nt(head: &str, body: impl Fn(usize) -> String) -> String {
+    let mut nt = String::from(head);
+    for i in 0..100_000 {
+        nt.push_str(&body(i));
+    }
+    assert!(
+        nt.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate — it would \
+         convert serially and prove nothing about the parallel reader",
+        nt.len()
+    );
+    nt
+}
+
+#[test]
+fn a_line_format_is_read_strictly_at_every_parallelism() {
+    // The strict N-Triples reader exists to reject what Turtle accepts —
+    // directives, prefixed names, bare numbers — because that is what every
+    // other tool in the field does. The parallel path parsed every chunk with
+    // the TURTLE parser whatever the input was, so those documents were
+    // refused at `--parallelism 1` and accepted on the default path, which is
+    // the path any real-sized `.nt` file takes.
+    let tmp = TempDir::new().unwrap();
+
+    let cases: [(&str, String); 2] = [
+        // A directive at the top: the chunker lifts it as a header and hands
+        // it to every worker, so the prefixed names below resolve — as Turtle.
+        (
+            "prefixed names under a directive",
+            above_threshold_nt("@prefix ex: <http://example.org/> .\n", |i| {
+                format!("ex:s{i} ex:p \"a literal wide enough to reach the threshold {i}\" .\n")
+            }),
+        ),
+        // No directive anywhere, so nothing about the header is involved: a
+        // bare number is simply not an N-Triples term.
+        (
+            "bare numbers",
+            above_threshold_nt("", |i| {
+                format!(
+                    "<http://example.org/s{i}> <http://example.org/p> {i} . \
+                     <http://example.org/s{i}> <http://example.org/q> \"padding to widen the corpus\" .\n"
+                )
+            }),
+        ),
+    ];
+
+    for (name, doc) in &cases {
+        let input = fixture(&tmp, &format!("{}.nt", name.replace(' ', "_")), doc);
+        for threads in ["1", "8"] {
+            rdf_cmd()
+                .args(["--parallelism", threads, "rdf", "convert"])
+                .arg(&input)
+                .args(["--to", "nt"])
+                .assert()
+                .code(EXIT_DOCUMENT_INVALID)
+                .stderr(predicate::str::contains("--parallelism").not());
+            let _ = name;
+        }
+    }
+}
+
+#[test]
+fn an_input_that_cannot_be_cut_converts_serially() {
+    // TriG writes fine as concatenated fragments, which is what the OUTPUT
+    // check answers — but its statements live inside `GRAPH … { … }` blocks
+    // and the boundary scanner cuts at `.`, so cutting the INPUT lands inside
+    // a brace-scoped block. Only the output syntax was consulted, so this was
+    // chunked as though it were Turtle.
+    let tmp = TempDir::new().unwrap();
+    let mut trig = String::from("@prefix ex: <http://example.org/> .\n");
+    for g in 0..4_000 {
+        trig.push_str(&format!("ex:g{g} {{\n"));
+        for i in 0..20 {
+            trig.push_str(&format!(
+                "  ex:s{g}_{i} ex:p \"a literal wide enough to reach the threshold {g} {i}\" .\n"
+            ));
+        }
+        trig.push_str("}\n");
+    }
+    assert!(trig.len() > MIN_PARALLEL_BYTES, "{}", trig.len());
+    let input = fixture(&tmp, "graphs.trig", &trig);
+    let out = tmp.path().join("out.nq");
+
+    let stderr = rdf_cmd()
+        .args(["--parallelism", "8", "-q", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nq"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(
+        v["host"]["threads_used"], 1,
+        "reason: {}",
+        v["host"]["parallel_reason"]
+    );
+    assert!(
+        v["host"]["parallel_reason"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be cut"),
+        "{}",
+        v["host"]["parallel_reason"]
+    );
+    // And the conversion is whole: 4_000 graphs x 20 statements.
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(written.lines().count(), 80_000);
+}
+
 #[test]
 fn parallelism_does_not_change_the_output_bytes() {
     // The gate the whole parallel design is built around. A user must be able

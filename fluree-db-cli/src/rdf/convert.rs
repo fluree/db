@@ -120,6 +120,7 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     } else {
         ParallelPlan::decide(
             args.parallelism,
+            loaded.resolved.syntax,
             target,
             loaded.text.len(),
             config.blank_labels,
@@ -305,6 +306,7 @@ fn run_parallel(
         &loaded.text,
         common.base.as_deref(),
         &mut out,
+        loaded.resolved.syntax,
         target,
         writer_config,
         config,
@@ -577,13 +579,21 @@ impl ParallelPlan {
         }
     }
 
-    /// Decide, from the flag, the output syntax, the input size and the label
+    /// Decide, from the flag, both syntaxes, the input size and the label
     /// policy.
     ///
-    /// The policy is a parameter rather than a check at the call site so a
-    /// second call site cannot be added that forgets it.
+    /// Both syntaxes, because they answer different questions and conflating
+    /// them was a correctness bug: `target` decides whether the OUTPUT can be
+    /// produced as concatenable fragments, `source` decides whether the INPUT
+    /// can be cut at Turtle statement boundaries at all. Only `target` was
+    /// consulted, so a `.trig` or `.jsonld` input above the threshold was
+    /// chunked as though it were Turtle.
+    ///
+    /// The policy is likewise a parameter rather than a check at the call site
+    /// so a second call site cannot be added that forgets it.
     pub fn decide(
         parallelism: usize,
+        source: RdfSyntax,
         target: RdfSyntax,
         input_len: usize,
         labels: BlankNodeLabels,
@@ -616,6 +626,12 @@ impl ParallelPlan {
             return Self {
                 workers: None,
                 reason: "--bnode-policy preserve requires serial label fidelity",
+            };
+        }
+        if !crate::rdf::parallel::can_chunk_input(source) {
+            return Self {
+                workers: None,
+                reason: "input syntax cannot be cut at statement boundaries",
             };
         }
         if !crate::rdf::parallel::can_run_parallel(target) {
@@ -979,10 +995,22 @@ mod tests {
         // Everything else says parallel: eight workers, a line-based syntax, an
         // input well over the threshold.
         let big = 64 * 1024 * 1024;
-        let relabel = ParallelPlan::decide(8, RdfSyntax::NTriples, big, BlankNodeLabels::Relabel);
+        let relabel = ParallelPlan::decide(
+            8,
+            RdfSyntax::Turtle,
+            RdfSyntax::NTriples,
+            big,
+            BlankNodeLabels::Relabel,
+        );
         assert_eq!(relabel.workers, Some(8));
 
-        let preserve = ParallelPlan::decide(8, RdfSyntax::NTriples, big, BlankNodeLabels::Preserve);
+        let preserve = ParallelPlan::decide(
+            8,
+            RdfSyntax::Turtle,
+            RdfSyntax::NTriples,
+            big,
+            BlankNodeLabels::Preserve,
+        );
         assert_eq!(preserve.workers, None);
         assert!(
             preserve.reason.contains("preserve"),
