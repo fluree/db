@@ -8,9 +8,10 @@
 //! outlives its command, the index skips a page, or the published book (the
 //! `SUMMARY.md` TOC) orphans one.
 //!
-//! Runs under whatever features the test build enables; CI runs
-//! `--all-features`, so feature-gated commands (validate/cluster/iceberg) are
-//! present and their docs are required.
+//! Assumes the default/all-features surface: CI runs `--all-features`, so
+//! feature-gated commands (validate/cluster) are present and their docs are
+//! required. A `--no-default-features` build would report their pages as
+//! orphans — that direction is not supported.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -33,14 +34,20 @@ fn visible_top_level() -> Vec<clap::Command> {
         .collect()
 }
 
-/// Every non-hidden descendant subcommand name under `cmd`, any depth.
-fn descendant_names(cmd: &clap::Command, out: &mut BTreeSet<String>) {
+/// Every non-hidden descendant invocation path under `cmd`, any depth, as the
+/// full space-joined form a doc page actually writes (`"branch revert"`,
+/// `"model access enable"`). Matching the full path — not the bare action
+/// name — is what gives the mention check teeth: a stray prose occurrence of
+/// a word like "revert" cannot satisfy it.
+fn descendant_paths(cmd: &clap::Command, prefix: &[String], out: &mut BTreeSet<String>) {
     for sub in cmd.get_subcommands() {
         if sub.is_hide_set() || sub.get_name() == "help" {
             continue;
         }
-        out.insert(sub.get_name().to_string());
-        descendant_names(sub, out);
+        let mut path = prefix.to_vec();
+        path.push(sub.get_name().to_string());
+        out.insert(path.join(" "));
+        descendant_paths(sub, &path, out);
     }
 }
 
@@ -93,9 +100,11 @@ fn every_doc_page_has_a_command() {
 
 #[test]
 fn every_nested_action_is_mentioned_in_its_doc() {
-    // Presence check, not prose quality: the doc for `fluree branch` must at
-    // least mention every visible action (`revert`, ...). Catches the class
-    // of gap where an action ships and its parent page never learns.
+    // Presence check, not prose quality: the doc for `fluree branch` must
+    // mention every visible action's full invocation path ("branch revert",
+    // not merely the word "revert" — mutation-tested: bare-name matching was
+    // satisfiable by prose). Catches the class of gap where an action ships
+    // and its parent page never learns.
     let cli_docs = docs_dir().join("cli");
     let mut gaps = Vec::new();
     for top in visible_top_level() {
@@ -104,17 +113,17 @@ fn every_nested_action_is_mentioned_in_its_doc() {
             continue; // every_command_has_a_doc_page reports this
         }
         let doc = read(&doc_path);
-        let mut actions = BTreeSet::new();
-        descendant_names(&top, &mut actions);
-        for action in actions {
-            if !doc.contains(&action) {
-                gaps.push(format!("{} — `{}`", top.get_name(), action));
+        let mut paths = BTreeSet::new();
+        descendant_paths(&top, &[top.get_name().to_string()], &mut paths);
+        for path in paths {
+            if !doc.contains(&path) {
+                gaps.push(path);
             }
         }
     }
     assert!(
         gaps.is_empty(),
-        "subcommands never mentioned in their parent's docs/cli page: {gaps:?}"
+        "subcommand invocations never mentioned in their parent's docs/cli page: {gaps:?}"
     );
 }
 

@@ -2385,6 +2385,36 @@ impl<'a> LedgerInfoBuilder<'a> {
 mod tests {
     use super::*;
 
+    /// Pins redaction of every secret-bearing key the CLI writes into
+    /// `.fluree/config.toml` (`RemoteAuth` in fluree-db-nameservice-sync) —
+    /// that struct and `SECRET_CONFIG_KEYS` live in different crates with
+    /// nothing else tying them together, so this test is the tie: a new
+    /// credential field on `RemoteAuth` must be added to the list AND here,
+    /// or `fluree config list` leaks it on the next release.
+    #[test]
+    fn redacts_every_cli_config_credential_key() {
+        let mut config = serde_json::json!({
+            "remotes": [{
+                "name": "origin",
+                "auth": {
+                    "type": "oidc_device",
+                    "token": "live-access-token",
+                    "refresh_token": "live-refresh-token",
+                    "issuer": "https://stack.example",
+                    "client_id": "cli-client"
+                }
+            }]
+        });
+        assert!(redact_json_secrets(&mut config));
+        let rendered = config.to_string();
+        assert!(!rendered.contains("live-access-token"));
+        assert!(!rendered.contains("live-refresh-token"));
+        // Identifying (non-authenticating) fields survive.
+        assert!(rendered.contains("https://stack.example"));
+        assert!(rendered.contains("cli-client"));
+        assert!(rendered.contains("[redacted]"));
+    }
+
     /// T1.2 routing predicate — the empty-shell gate that decides native
     /// full-stats vs the metadata-only graph-source path. Covers the team-lead's
     /// (a)/(b)/(e) cases as a truth table (the wiring in `execute` then does the

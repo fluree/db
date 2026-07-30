@@ -30,12 +30,20 @@ allow-dirty = ["ci"]
 # (`fluree manifest`) so it cannot drift from what ships; published as a
 # release asset and consumed by CI in fluree/solo and fluree/claude-plugins
 # to validate the `fluree ...` command strings they ship.
+#
+# Deliberately a DEBUG build: extra-artifacts run in the global-artifacts job
+# on the default 4-core/16GB hosted runner with a cold cache, and this
+# workspace's release profile is fat-LTO + codegen-units=1 — the exact
+# configuration the runner note below records as OOMing at link time. The
+# manifest is pure clap-tree introspection; optimization buys nothing.
+# It describes the shipped surface because neither this config nor release.yml
+# passes --features (both get the default set); if a features key is ever
+# added to the dist config, this build must get the same one.
 [[dist.extra-artifacts]]
 artifacts = ["fluree-cli-manifest.json"]
 build = [
     "cargo",
     "run",
-    "--release",
     "-p",
     "fluree-db-cli",
     "--",
