@@ -117,6 +117,13 @@ impl<W: Write> GraphSink for JsonLdWriter<W> {
         self.graph.add_prefix(prefix, namespace_iri);
     }
 
+    /// Store the producer's own `Arc<str>` rather than a second copy. This
+    /// writer keeps a whole `Graph`, so the saving is per distinct IRI twice
+    /// over: the table entry and every triple that clones it.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.terms.iri_shared(iri)
+    }
+
     fn term_iri(&mut self, iri: &str) -> TermId {
         self.terms.iri(iri)
     }

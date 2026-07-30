@@ -821,6 +821,14 @@ impl<S: GraphSink> GraphSink for TimingSink<S> {
         self.forward(|s| s.term_iri(iri))
     }
 
+    /// The same event as `term_iri`, counted and timed identically — a sink
+    /// decorator that let this one through uncounted would silently drop every
+    /// IRI from the profile the moment a producer started sharing.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.counts.terms_iri += 1;
+        self.forward(|s| s.term_iri_shared(iri))
+    }
+
     fn term_blank(&mut self, label: Option<&str>) -> TermId {
         self.counts.terms_blank += 1;
         self.forward(|s| s.term_blank(label))
@@ -1069,6 +1077,9 @@ mod tests {
     #[derive(Default)]
     struct DiscardSink {
         next: u32,
+        /// Which IRI entry point the decorator forwarded to.
+        copying_calls: usize,
+        shared_calls: usize,
     }
 
     impl DiscardSink {
@@ -1082,6 +1093,11 @@ mod tests {
         fn on_base(&mut self, _: &str) {}
         fn on_prefix(&mut self, _: &str, _: &str) {}
         fn term_iri(&mut self, _: &str) -> TermId {
+            self.copying_calls += 1;
+            self.mint()
+        }
+        fn term_iri_shared(&mut self, _: &std::sync::Arc<str>) -> TermId {
+            self.shared_calls += 1;
             self.mint()
         }
         fn term_blank(&mut self, _: Option<&str>) -> TermId {
@@ -1112,6 +1128,33 @@ mod tests {
                 inner: DiscardSink::default(),
             }
         }
+    }
+
+    #[test]
+    fn a_shared_iri_reaches_the_inner_sink_shared_and_is_counted_the_same() {
+        // Two ways a decorator can quietly break this, neither of which shows
+        // up in output bytes. Forwarding `term_iri_shared` to the inner sink's
+        // `term_iri` puts the allocation back — the inner sink is storing, and
+        // it has to copy. Not counting it drops every IRI out of the profile
+        // the moment a producer starts sharing, so `--profile` would report
+        // zero IRI terms for a document full of them.
+        let mut sink = TimingSink::new(DiscardSink::default());
+        let shared: std::sync::Arc<str> = std::sync::Arc::from("http://example.org/a");
+        sink.term_iri_shared(&shared);
+        sink.term_iri_shared(&shared);
+        sink.term_iri("http://example.org/b");
+
+        assert_eq!(
+            sink.counts().terms_iri,
+            3,
+            "both entry points are the same event and must be counted alike"
+        );
+        let inner = sink.into_inner();
+        assert_eq!(
+            inner.shared_calls, 2,
+            "the decorator must forward the shared form as the shared form"
+        );
+        assert_eq!(inner.copying_calls, 1, "and the copying form as itself");
     }
 
     /// Busy-wait. A `sleep` this short is dominated by scheduler granularity;

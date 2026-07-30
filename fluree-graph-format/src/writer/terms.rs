@@ -15,6 +15,7 @@ use fluree_graph_ir::{Datatype, LiteralValue, Term, TermId, TermScope};
 use fluree_vocab::rdf;
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 /// Terms a writer has been handed, in the two lifetime classes the
 /// [`GraphSink`](fluree_graph_ir::GraphSink) protocol defines.
@@ -132,6 +133,16 @@ impl WriterTerms {
 
     pub(crate) fn iri(&mut self, iri: &str) -> TermId {
         self.push_scoped_or_session(Term::iri(iri))
+    }
+
+    /// Store an IRI the producer is already holding, without a second copy.
+    ///
+    /// `Term::Iri` is an `Arc<str>`, and so is a caching parser's cache key, so
+    /// this is a refcount bump where [`Self::iri`] is an allocation and a
+    /// memcpy. The stored term outlives the producer's cache entry if it has
+    /// to — that is what the `Arc` is for.
+    pub(crate) fn iri_shared(&mut self, iri: &Arc<str>) -> TermId {
+        self.push_scoped_or_session(Term::Iri(Arc::clone(iri)))
     }
 
     /// Intern a blank node under the writer's labelling policy.
@@ -391,6 +402,37 @@ mod tests {
             slots(&terms),
             (0, 5),
             "the table holds the widest statement"
+        );
+    }
+
+    #[test]
+    fn a_shared_iri_is_stored_without_copying_its_bytes() {
+        // The whole point: what the table holds is the producer's allocation,
+        // not a duplicate of it. `Arc::ptr_eq` is the only way to see the
+        // difference — a copy compares equal by value and costs a malloc plus a
+        // memcpy per distinct IRI.
+        let mut terms = table(TermScope::Session);
+        let shared: Arc<str> = Arc::from("http://example.org/some/iri");
+
+        let id = terms.iri_shared(&shared);
+        let Term::Iri(stored) = terms.get(id) else {
+            panic!("stored term is not an IRI");
+        };
+        assert!(
+            Arc::ptr_eq(stored, &shared),
+            "the table copied the string instead of sharing the allocation"
+        );
+
+        // The copying entry point still exists and still copies — it is what a
+        // producer with no `Arc` to offer must use.
+        let copied = terms.iri("http://example.org/some/iri");
+        let Term::Iri(copy) = terms.get(copied) else {
+            panic!("stored term is not an IRI");
+        };
+        assert_eq!(&**copy, &*shared, "same bytes");
+        assert!(
+            !Arc::ptr_eq(copy, &shared),
+            "iri() must not somehow alias the caller's allocation"
         );
     }
 

@@ -276,6 +276,10 @@ impl<S: GraphSink> ChunkScopedBlanks<S> {
 }
 
 impl<S: GraphSink> GraphSink for ChunkScopedBlanks<S> {
+    /// Forwarded: swallowing this would quietly put the copy back.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.inner.term_iri_shared(iri)
+    }
     /// Forwarded: a decorator that swallowed this would leave the sink on the
     /// conservative scope and silently give up the recycling the producer
     /// offered.
@@ -398,6 +402,10 @@ impl<S: GraphSink> DeterministicBlanks<S> {
 }
 
 impl<S: GraphSink> GraphSink for DeterministicBlanks<S> {
+    /// Forwarded: swallowing this would quietly put the copy back.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.inner.term_iri_shared(iri)
+    }
     /// Forwarded: a decorator that swallowed this would leave the sink on the
     /// conservative scope and silently give up the recycling the producer
     /// offered.

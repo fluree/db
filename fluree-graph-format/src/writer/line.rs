@@ -127,6 +127,13 @@ macro_rules! line_sink_common {
             self.0.terms.iri(iri)
         }
 
+        /// Store the producer's own `Arc<str>` rather than a second copy of
+        /// the same bytes. Same event as `term_iri`; only the allocation
+        /// differs.
+        fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+            self.0.terms.iri_shared(iri)
+        }
+
         fn term_blank(&mut self, label: Option<&str>) -> TermId {
             let core = &mut self.0;
             core.terms.blank(label, &mut core.deferred)

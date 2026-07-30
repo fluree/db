@@ -323,8 +323,15 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             return id;
         }
         self.iri_cache_misses += 1;
-        let id = self.sink.term_iri(iri);
-        self.iri_term_cache.insert(Arc::<str>::from(iri), id);
+        // One allocation, two owners. The cache needs an `Arc<str>` for its
+        // key either way, so building it here and handing the sink a reference
+        // lets a storing sink clone the pointer instead of allocating its own
+        // copy of the same bytes — 800K allocations and ~37 MiB on a corpus
+        // with 800K distinct terms. A sink that does not override
+        // `term_iri_shared` gets the old behavior through the default body.
+        let shared = Arc::<str>::from(iri);
+        let id = self.sink.term_iri_shared(&shared);
+        self.iri_term_cache.insert(shared, id);
         id
     }
 

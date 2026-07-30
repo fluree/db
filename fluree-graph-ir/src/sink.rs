@@ -203,6 +203,27 @@ pub trait GraphSink {
     /// The IRI should be fully expanded (not prefixed).
     fn term_iri(&mut self, iri: &str) -> TermId;
 
+    /// Create an IRI term from a string the producer is already keeping.
+    ///
+    /// Same event as [`Self::term_iri`] — every sink that counts, times or
+    /// records terms must treat the two identically — and the default body
+    /// forwards to it, so a sink that does not care never sees this.
+    ///
+    /// It exists because both sides were paying for the same string. A caching
+    /// producer holds an `Arc<str>` per distinct IRI so it can answer a repeat
+    /// occurrence without allocating; a sink handed only `&str` has no choice
+    /// but to allocate its own copy of the very bytes the producer is holding.
+    /// On a corpus with 800K distinct terms that is 800K allocations and about
+    /// 37 MiB of second copies. A sink that overrides this clones the `Arc`
+    /// instead: a refcount bump, no allocation, and the same lifetime it would
+    /// have given its own copy.
+    ///
+    /// Only worth overriding for a sink that STORES the term. One that renders
+    /// and forgets should leave the default alone.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.term_iri(iri)
+    }
+
     /// Create a blank node term and return its ID
     ///
     /// If `label` is Some, the blank node has that label (for consistent

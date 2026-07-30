@@ -137,6 +137,10 @@ pub fn is_writable(syntax: RdfSyntax) -> bool {
 }
 
 impl<W: Write> GraphSink for AnyWriter<W> {
+    /// Forwarded to whichever writer this is; all of them store terms.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        dispatch!(self, w => w.term_iri_shared(iri))
+    }
     /// Forwarded to whichever writer this is: the declaration is the
     /// producer's, and dropping it here would cost the recycling silently.
     fn declare_term_scope(&mut self, scope: TermScope) {
