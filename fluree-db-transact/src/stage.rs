@@ -2657,36 +2657,23 @@ async fn generate_upsert_deletions(
         })
         .collect();
 
-    // Novelty presence: one overlay walk per referenced graph, collecting which
-    // of this transaction's subjects have any novelty flakes. Novelty is
-    // in-memory and small (bounded by reindex backpressure), so a filtered full
-    // walk per graph is cheap — and it is authoritative in Sid space, needing
+    // Novelty presence, resolved lazily: the per-graph set is built by a
+    // filtered overlay walk only when a subject misses the base dictionary
+    // (see the skip below), so upserts whose subjects all resolve in the
+    // persisted dictionary never pay it. The walk is O(novelty flakes in the
+    // graph), and novelty is bounded by `reindex_max_bytes` — up to 20% of
+    // system RAM when indexing lags — which is why it runs at most once per
+    // graph, and only on demand. It is authoritative in Sid space, needing
     // no dictionary translation.
-    let mut novelty_present: HashMap<u16, HashSet<Sid>> = HashMap::new();
+    let mut per_g_subjects: HashMap<u16, HashSet<&Sid>> = HashMap::new();
     if binary_store.is_some() {
-        let mut per_g_subjects: HashMap<u16, HashSet<&Sid>> = HashMap::new();
         for (subject, txn_g) in subject_groups.keys() {
             if let Some(Some(ledger_g)) = ledger_g_for_txn_g.get(txn_g) {
                 per_g_subjects.entry(*ledger_g).or_default().insert(subject);
             }
         }
-        for (g, subjects) in per_g_subjects {
-            let present = novelty_present.entry(g).or_default();
-            ledger.novelty.for_each_overlay_flake(
-                g,
-                IndexType::Spot,
-                None,
-                None,
-                true,
-                ledger.t(),
-                &mut |flake| {
-                    if subjects.contains(&flake.s) && !present.contains(&flake.s) {
-                        present.insert(flake.s.clone());
-                    }
-                },
-            );
-        }
     }
+    let mut novelty_present: HashMap<u16, HashSet<Sid>> = HashMap::new();
 
     // Persisted presence: the subject reverse dictionary is authoritative under
     // canonical namespace encoding (see `fluree_db_core::ns_encoding`) — a miss
@@ -2740,15 +2727,33 @@ async fn generate_upsert_deletions(
         }
         let effective_g_id = ledger_g_id.unwrap_or(0);
 
-        // Skip subjects with no persisted or novelty presence entirely.
-        if binary_store.is_some()
-            && !novelty_present
-                .get(&effective_g_id)
-                .is_some_and(|s| s.contains(subject))
-            && !subject_in_base(subject)
-        {
-            skipped_subjects += 1;
-            continue;
+        // Skip subjects with no persisted or novelty presence entirely. The
+        // base dictionary is a point probe, so it is consulted first; the
+        // per-graph novelty set is built on the first dictionary miss only.
+        if binary_store.is_some() && !subject_in_base(subject) {
+            let present = novelty_present.entry(effective_g_id).or_insert_with(|| {
+                let mut set = HashSet::new();
+                if let Some(subjects) = per_g_subjects.get(&effective_g_id) {
+                    ledger.novelty.for_each_overlay_flake(
+                        effective_g_id,
+                        IndexType::Spot,
+                        None,
+                        None,
+                        true,
+                        ledger.t(),
+                        &mut |flake| {
+                            if subjects.contains(&flake.s) && !set.contains(&flake.s) {
+                                set.insert(flake.s.clone());
+                            }
+                        },
+                    );
+                }
+                set
+            });
+            if !present.contains(subject) {
+                skipped_subjects += 1;
+                continue;
+            }
         }
 
         // Create a materializer for this graph context if a binary store exists.
