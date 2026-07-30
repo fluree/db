@@ -1131,6 +1131,24 @@ impl ChunkSource {
     /// Returns `Ok(Some((index, text)))` for each chunk, `Ok(None)` when done.
     /// The text includes the prefix block prepended to the raw bytes.
     /// Only valid for `Streaming` variant.
+    ///
+    /// # `Ok(None)` is not proof the source was read
+    ///
+    /// The reader runs on its own thread and reports scan failures — a mid-file
+    /// `@prefix` redefinition, an I/O error part-way through — only through
+    /// [`StreamingTurtleReader::join`]. The channel closes either way, so a
+    /// caller that stops at `Ok(None)` and asks no further questions cannot
+    /// tell a complete read from one that died at 10% and imports a silently
+    /// truncated graph.
+    ///
+    /// Callers MUST join before treating `Ok(None)` as end-of-input. This
+    /// method takes `&self` and cannot join on the caller's behalf, because
+    /// [`join`](StreamingTurtleReader::join) needs `&mut`. There are no callers
+    /// in this workspace today; the streaming import paths drive the reader
+    /// directly and do join (`import.rs` does so at every completion site). If
+    /// one appears, the safer shape is to take `&mut self` here and join
+    /// internally — a breaking change to a `pub` method, hence not made
+    /// unilaterally.
     pub fn recv_next(&self) -> std::result::Result<Option<(usize, String)>, ImportError> {
         match self {
             Self::Streaming(reader) => {
