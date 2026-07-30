@@ -255,15 +255,32 @@ for tool in "${ELIGIBLE[@]}"; do
 done
 
 # --- our own column ---------------------------------------------------------
-FLUREE_BIN="$REPO_ROOT/target/release/fluree"
+#
+# Four rows, because our column is the only one with a checking dimension AND
+# the only one that parallelizes Turtle:
+#
+#   validate   the default: IRI and language-tag validation on. Comparable with
+#              riot --check=true, which is the parity pairing H-8 defines.
+#   nocheck    validation off. Comparable with riot --check=false.
+#   parallel   --parallelism 8, labelled separately and never merged into the
+#              serial rows. No other tool in this matrix parallelizes Turtle, so
+#              there is nothing to compare it against — it is our own ceiling,
+#              not a win over anyone.
+FLUREE_BIN="${FLUREE_BIN:-$REPO_ROOT/target/release/fluree}"
 if [ -x "$FLUREE_BIN" ]; then
-	if "$FLUREE_BIN" rdf convert --help >/dev/null 2>&1 &&
-		! "$FLUREE_BIN" rdf convert "$ttl" --to ntriples >/dev/null 2>&1; then
-		info "fluree rdf convert is present but not yet implemented on this branch — our cells deferred"
-		info "  (check/count exist; convert lands with the writers. The matrix carries the column already.)"
+	if ! "$FLUREE_BIN" rdf convert "$ttl" --to ntriples >/dev/null 2>&1; then
+		info "fluree rdf convert did not run — our cells deferred (see $FLUREE_BIN rdf convert --help)"
 	else
-		run_cell fluree default ttl "$ttl" "$FLUREE_BIN" rdf convert "$ttl" --to ntriples
-		run_cell fluree default nt "$nt" "$FLUREE_BIN" rdf convert "$nt" --to ntriples
+		run_cell fluree validate ttl "$ttl" "$FLUREE_BIN" rdf convert "$ttl" --to ntriples
+		run_cell fluree validate nt "$nt" "$FLUREE_BIN" rdf convert "$nt" --to ntriples
+		run_cell fluree nocheck ttl "$ttl" "$FLUREE_BIN" rdf convert "$ttl" --to ntriples --nocheck
+		run_cell fluree nocheck nt "$nt" "$FLUREE_BIN" rdf convert "$nt" --to ntriples --nocheck
+		# Parallel rows are OURS ALONE — labelled, never averaged with the
+		# serial rows, and never presented as a competitor comparison.
+		run_cell fluree par8-validate ttl "$ttl" \
+			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --parallelism 8
+		run_cell fluree par8-nocheck ttl "$ttl" \
+			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --nocheck --parallelism 8
 	fi
 else
 	info "target/release/fluree not built — our cells skipped (cargo build --release -p fluree-db-cli)"
