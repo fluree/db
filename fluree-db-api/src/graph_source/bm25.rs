@@ -972,27 +972,27 @@ impl crate::Fluree {
         // 8. Re-run indexing query and filter to affected subjects
         let results = self.execute_bm25_indexing_query(&ledger, &query).await?;
 
-        // Expand prefix map for matching
+        // Canonicalise `@id` to full IRIs before touching the index.
+        //
+        // `create_full_text_index` does this, and the sync paths did not — so the
+        // first sync to touch a document silently rewrote its key from the full
+        // IRI the build stored to the prefixed form the query returns, leaving one
+        // index holding both spellings and lookups by full IRI missing anything
+        // re-synced. Doing it here makes the document key the same value whichever
+        // path wrote it.
+        //
+        // It also removes the reason the affected set had to carry prefixed
+        // variants: both sides of the match below are now full IRIs.
         let context = query
             .get("@context")
             .cloned()
             .unwrap_or(serde_json::json!({}));
         let prefix_map = extract_prefix_map(&context);
-
-        let mut affected_iris_expanded = affected_iris.clone();
-        for full_iri in &affected_iris {
-            for (prefix, ns) in &prefix_map {
-                if full_iri.starts_with(ns.as_str()) {
-                    let local = &full_iri[ns.len()..];
-                    let prefixed = format!("{prefix}:{local}");
-                    affected_iris_expanded.insert(Arc::from(prefixed));
-                }
-            }
-        }
+        let results = expand_ids_in_results(results, &prefix_map);
 
         // 9. Apply incremental update
         let mut updater = IncrementalUpdater::new(source_ledger_alias.as_str(), &mut index);
-        let update_result = updater.apply_update(&results, &affected_iris_expanded, ledger_t);
+        let update_result = updater.apply_update(&results, &affected_iris, ledger_t);
 
         info!(
             graph_source_id = %graph_source_id,
@@ -1083,6 +1083,18 @@ impl crate::Fluree {
 
         // 4. Re-run indexing query
         let results = self.execute_bm25_indexing_query(&ledger, &query).await?;
+
+        // Canonicalise `@id` to full IRIs, exactly as `create_full_text_index`
+        // does. Without this a resync rewrites every document key from the full
+        // IRI the build stored to whatever prefixed form the query happens to
+        // return — see the note on the same call in the incremental path.
+        let prefix_map = extract_prefix_map(
+            &query
+                .get("@context")
+                .cloned()
+                .unwrap_or(serde_json::json!({})),
+        );
+        let results = expand_ids_in_results(results, &prefix_map);
 
         info!(
             graph_source_id = %graph_source_id,

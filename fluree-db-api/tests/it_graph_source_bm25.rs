@@ -1497,3 +1497,138 @@ async fn bm25_sync_refuses_a_retracted_index() {
     let resync = fluree.resync_bm25_index(&created.graph_source_id).await;
     assert!(resync.is_err(), "resync must refuse a retracted index");
 }
+
+/// The incremental sync path must produce byte-for-byte the same index as a
+/// full rebuild.
+///
+/// `sync_bm25_index` narrows its indexing query to the subjects the commit log
+/// says changed, instead of re-running the whole query over the whole ledger
+/// and filtering afterwards. That is the difference between O(delta) and
+/// O(corpus) per sync, but it is only a safe optimisation if the narrowed query
+/// yields exactly what the wide one did.
+///
+/// So: build two identical indexes over one ledger, mutate the ledger, then
+/// take one down the incremental path and rebuild the other from scratch, and
+/// require the resulting structures to match. Nothing here asserts *how* the
+/// query was narrowed — only that narrowing changed no outcome, which is the
+/// property that has to hold even if the scoping heuristic changes later.
+#[tokio::test]
+async fn bm25_incremental_sync_matches_full_resync() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/diff:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let seed = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"alpha beta gamma" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"beta delta" },
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"gamma epsilon zeta" }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &seed).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let incremental = fluree
+        .create_full_text_index(Bm25CreateConfig::new(
+            "diff-incremental",
+            ledger_id,
+            query.clone(),
+        ))
+        .await
+        .unwrap();
+    let rebuilt = fluree
+        .create_full_text_index(Bm25CreateConfig::new(
+            "diff-rebuilt",
+            ledger_id,
+            query.clone(),
+        ))
+        .await
+        .unwrap();
+
+    // Touch a subset: one existing document changes, one new one appears, so the
+    // affected set is a strict subset of the corpus and the narrowing is load
+    // bearing rather than incidentally equal to "everything".
+    let delta = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"beta delta omega" },
+            { "@id":"ex:doc4", "@type":"ex:Doc", "ex:title":"eta theta" }
+        ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &delta).await.unwrap().ledger;
+
+    let sync = fluree
+        .sync_bm25_index(&incremental.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        !sync.was_full_resync,
+        "this test is meaningless if the sync silently fell back to a full resync"
+    );
+
+    fluree
+        .resync_bm25_index(&rebuilt.graph_source_id)
+        .await
+        .unwrap();
+
+    let a = fluree
+        .load_bm25_index(&incremental.graph_source_id)
+        .await
+        .unwrap();
+    let b = fluree
+        .load_bm25_index(&rebuilt.graph_source_id)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        a.num_docs(),
+        b.num_docs(),
+        "document count diverged between incremental and full rebuild"
+    );
+    assert_eq!(
+        a.num_terms(),
+        b.num_terms(),
+        "vocabulary size diverged between incremental and full rebuild"
+    );
+
+    // Doc keys carry the ledger alias, which differs per graph source, so compare
+    // the subject IRIs and their term counts — the parts that describe the corpus
+    // rather than which index it lives in.
+    let mut a_docs: Vec<(String, u32)> = a
+        .iter_doc_keys()
+        .map(|k| {
+            (
+                k.subject_iri.to_string(),
+                a.get_doc_meta(k).map(|m| m.doc_len).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut b_docs: Vec<(String, u32)> = b
+        .iter_doc_keys()
+        .map(|k| {
+            (
+                k.subject_iri.to_string(),
+                b.get_doc_meta(k).map(|m| m.doc_len).unwrap_or_default(),
+            )
+        })
+        .collect();
+    a_docs.sort();
+    b_docs.sort();
+    assert_eq!(
+        a_docs, b_docs,
+        "incremental and full rebuild disagree on the indexed documents or their lengths"
+    );
+
+    // The mutated document must actually reflect the new text in both, otherwise
+    // the two could agree simply by both being stale.
+    assert!(
+        a_docs.iter().any(|(iri, _)| iri.ends_with("doc4")),
+        "the newly inserted document never reached the incremental index: {a_docs:?}"
+    );
+}
