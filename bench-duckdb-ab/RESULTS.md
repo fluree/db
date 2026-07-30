@@ -62,9 +62,24 @@ HEADLINE (protocol-invariant, stands): #1528 filter-over-join fusion collapses p
 
 ## Wave B — partitioned-copy probe (substrate B)
 
-STATUS: pending. Writes ONE fact table PARTITIONED BY date onto MinIO (namespace DW_SF01_PART) and runs from DuckDB: (1) the grouped-aggregate scan at default threads and threads=1; (2) a fact⋈dim join with `join_filter_pushdown` ON. Sharpens issue #1568: partitioned-LOCAL scan working ⇒ Finding 1 (fact-scan failure) is Snowflake-managed-S3-specific; the bloom-filter error appearing/absent on partitioned-local ⇒ Finding 2's trigger is partitioning vs remoteness.
+STATUS: DONE (2026-07-30). FACT_WEB_EVENT (1,000,000 rows) written to local MinIO PARTITIONED two ways — an identity int month-bucket (namespace DW_SF01_PART) and a genuine iceberg **month-transform** spec `month(6)` (DW_SF01_PART_T) — each landing 252 per-partition data files (a real many-small-files layout). Probed from DuckDB v1.5.5. `#1568` comment posted with these verdicts.
 
-_results + #1568 comment to be filled_
+### Probe results (DuckDB, local MinIO iceberg, `arch -arm64`)
+
+| probe | layout | threads | outcome | wall |
+|---|---|---|---|---|
+| grouped-agg scan (COUNT by event_type) | identity 252-file | default | OK (6 groups, sum 1,000,000) | 0.158 s |
+| grouped-agg scan | identity 252-file | 1 | OK | 0.771 s |
+| grouped-agg scan | month-transform 252-file | default | OK | 0.125 s |
+| fact⋈dim join, `join_filter_pushdown` ON | identity 252-file | default | OK (10 categories), NO bloom error | 0.095 s |
+| fact⋈dim join, pushdown ON | month-transform 252-file | default | OK, NO bloom error | 0.074 s |
+| fact⋈dim join, pushdown FORCE-ON (`disabled_optimizers=''`) | month-transform 252-file | default | OK, NO bloom error | — |
+
+### #1568 verdicts
+
+FINDING 1 (multi-file fact-scan fails/stalls) → **Snowflake-managed-S3-specific.** The exact grouped-aggregate scan shape that failed with "Could not connect to server" (default threads) and did not complete at threads=1 within ~110 s on substrate A runs fine and sub-second on a 252-file partitioned LOCAL table at BOTH default threads (0.16 s) and threads=1 (0.77 s). Many-small-files partitioning is NOT the cause; the trigger is the parallel-S3-GET connection behavior against Snowflake-managed storage. This narrows the upstream report exactly as #1568 anticipated.
+
+FINDING 2 (bloom-filter JOIN gap) → **NOT tied to the partitioned multi-file layout; also Snowflake-managed-substrate-specific.** This CORRECTS the prior hypothesis (PREP §10 / #1568 body: "tied to the partitioned multi-file scan's filter-index mapping"). The `Can't convert TableFilterType (BLOOM_FILTER) from global to local indexes` error does NOT reproduce on ANY local partitioned layout tested — neither the identity 252-file nor the genuine iceberg month-transform 252-file table — with `join_filter_pushdown` ON (default) or force-on. Combined with the earlier unpartitioned-local result (also no error), the bloom gap is specific to the Snowflake-managed iceberg path (remote/vended-cred metadata or Snowflake's exact partition/metadata encoding), not partitioning per se. Both substrate-A failures therefore point the same way: DuckDB reads partitioned LOCAL iceberg (incl. a date-transform spec) fine; the wall is specifically Snowflake-managed storage.
 
 ---
 
