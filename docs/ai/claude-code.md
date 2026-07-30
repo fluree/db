@@ -24,7 +24,7 @@ The CLI's surface varies by version and by compiled features — and an agent's 
 
 Support is per-command, not global:
 
-- `query` and `multi-query` take `--format json` (plus CSV/TSV/NDJSON variants); `query` additionally takes `--envelope` for a self-describing wrapper.
+- `query` and `multi-query` take `--format json` (plus CSV/TSV/NDJSON variants); `query --format ndjson --envelope` adds a self-describing head/rows/end wrapper (`--envelope` pairs with ndjson only).
 - `graph list`, `branch diff`, `branch revert --preview`, and the four `docs` subcommands take boolean `--json`.
 - `list`, `info`, and `show` are human-formatted only (as of 4.1.x).
 - Errors are human text; the only machine signal is the exit code (`0` ok, `1` error, `2` usage). Parse stderr only as a last resort.
