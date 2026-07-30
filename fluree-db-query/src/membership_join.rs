@@ -2,13 +2,24 @@
 //! right-side triple binds NOTHING new.
 //!
 //! When every variable of a join's right triple already appears in the left
-//! schema, the "join" is a pure existence filter: in current-state mode a
-//! fully-ground triple matches at most once, so each left row is kept or
-//! dropped. `NestedLoopJoinOperator` evaluates that shape by re-opening a
-//! scan per driving row (~ms each — the KB `o:INDEXED` membership check
-//! spent ~30 s over 21k rows this way). This operator instead drains the
-//! triple ONCE into a hash set of composite keys (same normalization as
-//! [`crate::semijoin::SemijoinOperator`]) and probes per row.
+//! schema, the "join" is a pure existence filter: over a single graph in
+//! current-state mode a fully-ground triple matches at most once, so each
+//! left row is kept or dropped. `NestedLoopJoinOperator` evaluates that
+//! shape by re-opening a scan per driving row (~ms each — the KB
+//! `o:INDEXED` membership check spent ~30 s over 21k rows this way). This
+//! operator instead drains the triple ONCE into a hash set of composite
+//! keys (same normalization as [`crate::semijoin::SemijoinOperator`]) and
+//! probes per row.
+//!
+//! **The "matches at most once" premise is graph-scoped.** Across a
+//! multi-graph active scope the same ground triple can exist in more than
+//! one graph, and the nested loop emits one row per matching graph where a
+//! hash set collapses them to one — a cardinality change, not just a
+//! reordering. Rather than assume what that duplication should be, the
+//! operator checks the active graph count at `open()` and routes EVERY row
+//! through the exact per-row fallback below when more than one graph is in
+//! scope. So the lane is join-equivalent unconditionally, and the hash fast
+//! path engages only where the premise provably holds.
 //!
 //! **Rows with an unbound key var keep exact join semantics** — a join
 //! against a partially-ground pattern EXTENDS the row (possibly multiplying
@@ -19,9 +30,12 @@
 //!
 //! Chosen by `build_scan_or_join` only when: no object bounds / inline ops,
 //! not a history query (ground triples match once per (t, op) there), at
-//! least one variable, and the triple's standalone cardinality estimate is
+//! least one variable, the triple's standalone cardinality estimate is
 //! within [`MEMBERSHIP_JOIN_MAX_BUILD`](crate::execute::where_plan) — the
-//! build side is a bounded single-predicate/class scan, never a world scan.
+//! build side is a bounded single-predicate/class scan, never a world scan —
+//! and the driving side is at least
+//! [`MEMBERSHIP_JOIN_MIN_DRIVING`](crate::execute::where_plan) rows, so the
+//! one-shot drain is cheaper than the per-row probes it replaces.
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
@@ -51,6 +65,10 @@ pub struct MembershipJoinOperator {
     /// lazily on the first fully-bound row, so a stream that never grounds
     /// the pattern (or is empty) never pays for the scan.
     key_set: Option<FxHashSet<CompositeGroupKey>>,
+    /// Set at `open()` when more than one graph is in the active scope: the
+    /// hash set is never built and every row takes the exact per-row join
+    /// (see the multi-graph note in the module docs).
+    exact_only: bool,
     planning: PlanningContext,
     norm: Option<EqualityNorm>,
     /// Probe-outcome telemetry for the exhaustion debug line.
@@ -74,6 +92,7 @@ impl MembershipJoinOperator {
             schema,
             state: OperatorState::Created,
             key_set: None,
+            exact_only: false,
             planning,
             norm: None,
             probed_rows: 0,
@@ -201,6 +220,12 @@ impl Operator for MembershipJoinOperator {
         if self.norm.is_none() {
             self.norm = equality_norm(ctx);
         }
+        // Keep/drop is only join-equivalent over a single graph; with more
+        // than one in scope a ground triple can match once per graph.
+        self.exact_only = match ctx.active_graphs() {
+            crate::dataset::ActiveGraphs::Single => false,
+            crate::dataset::ActiveGraphs::Many(graphs) => graphs.len() > 1,
+        };
         self.child.open(ctx).await?;
         self.key_set = None;
         self.state = OperatorState::Open;
@@ -231,7 +256,7 @@ impl Operator for MembershipJoinOperator {
             let mut columns: Vec<Vec<Binding>> =
                 (0..self.schema.len()).map(|_| Vec::new()).collect();
             for row_idx in 0..input_batch.len() {
-                if self.all_keys_bound(&input_batch, row_idx) {
+                if !self.exact_only && self.all_keys_bound(&input_batch, row_idx) {
                     if self.key_set.is_none() {
                         self.build_key_set(ctx).await?;
                     }
