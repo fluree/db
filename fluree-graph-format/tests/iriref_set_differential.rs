@@ -16,14 +16,17 @@
 //! Sited here because `fluree-graph-format` is the only crate that depends on
 //! all of them. Authored by the review of the H-8 term-validation branch.
 //!
-//! # The fourth copy, deliberately not covered
+//! # The fourth copy, covered elsewhere
 //!
-//! `fluree-db-sparql/src/lex/chars.rs` carries a fourth `is_iri_char`, byte-for
-//! byte identical to `fluree-graph-ir`'s today. It is NOT tested here: this is a
-//! light crate and cannot depend on the SPARQL engine, so reaching it would mean
-//! either siting this test in a heavyweight crate or lifting that copy. Recorded
-//! rather than quietly omitted — it is the copy most likely to drift, precisely
-//! because nothing binds it to the others.
+//! `fluree-db-sparql/src/lex/chars.rs` carries a fourth `is_iri_char`,
+//! byte-for-byte identical to `fluree-graph-ir`'s. It cannot be tested HERE:
+//! this is a light crate and cannot depend on the SPARQL engine.
+//!
+//! It is bound instead by `fluree-db-cli/tests/iriref_fourth_copy.rs`, over the
+//! same full-Unicode sweep. `fluree-db-cli` is the smallest crate that already
+//! depends on both sides, so the binding is a dev-dependency and adds no
+//! production edge — which is why that copy stays where it is rather than being
+//! lifted. Change either set and both files fail.
 
 use fluree_graph_format::escape_iri_into;
 use fluree_graph_ir::chars::is_iri_char;
