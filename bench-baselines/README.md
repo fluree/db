@@ -18,15 +18,28 @@ Conventions:
 - Ad-hoc local baselines (validation runs, experiments) should live
   outside the repo or be cleaned up before merge — only phase reference
   points belong here.
-- Each baseline records its `runner_class` (env `FLUREE_BENCH_RUNNER_CLASS`,
-  default `local`) and `host`. `compare` enforces **memory** across any runner
-  class but treats **wall-clock time** as advisory when the baseline's runner
-  class differs from the comparing runner's (cross-machine time can't gate).
-  Commit a CI-class baseline (`runner_class=ci-*`, via `bench.yml`'s
-  `bench-capture` job) to make the per-PR time half enforce.
+- Each baseline records a `host` block (`class`, name, os, arch, cpu model,
+  cores). `host.class` names a *comparability set*, from
+  `FLUREE_BENCH_HOST_CLASS` or the derived `{os}-{arch}` default. `compare`
+  **refuses** (exit 2) when the baseline's class differs from the comparing
+  host's, since neither wall-clock time nor a tracking allocator's peak survives
+  a machine change; `--allow-host-mismatch` downgrades those to non-gating
+  annotations. Per-phase **share** drift gates either way — it is a ratio within
+  one run, so the machine cancels.
+- A baseline that also carries a corpus block (sha256, byte length, element
+  count, input/output syntax, thread count) makes `compare` refuse outright on a
+  corpus change. There is no override: comparing different inputs is never
+  meaningful, and the result would look exactly like a real regression.
+- Baselines built with `capture --accumulate` over ≥ 5 runs carry a median + MAD
+  per scenario, and the gate widens each budget to `3 × MAD / median` when that
+  exceeds the declared budget. Prefer this for any baseline meant to gate on
+  shared CI runners.
 
 `guardrails-pre.json` is the PR-1 (guardrails net) reference — captured at the
-merge-base engine, quick profile, tiny+small, `runner_class=local`.
+merge-base engine, quick profile, tiny+small, schema 1. It predates the host
+block, so its `runner_class: "local"` is read as `host.class = "local"`: an
+honest "some developer machine, unspecified". That is why the per-PR compare
+still runs with `--allow-host-mismatch`.
 
 Capture (the `--label`/`--out` name the phase reference; capture at the
 merge-base commit):
