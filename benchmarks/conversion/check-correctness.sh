@@ -160,7 +160,27 @@ done
 
 # --- 2. independent isomorphism via rdflib ----------------------------------
 printf '\n' >&2
-if ! python3 -c 'import rdflib' >/dev/null 2>&1; then
+# Level 2 is O(statements) with a large constant AND pairwise across cells:
+# measured at 4M statements, rdflib needs ~40s merely to PARSE one 281MB cell,
+# before canonicalization, times every pair. Level 1 costs 3.5s for the same
+# file. So there is a size above which level 2 stops being affordable, and the
+# honest move is to say so by name rather than let a run appear fully verified
+# because the expensive half quietly did not happen.
+ISO_LIMIT="${FLUREE_BENCH_MAX_ISOMORPHISM_STATEMENTS:-500000}"
+biggest=0
+for cell in "$RUN_DIR"/*.json; do
+	[ "$(basename "$cell")" = "manifest.json" ] && continue
+	n="$(jq -r '.out_statements // 0' "$cell")"
+	[ "$n" -gt "$biggest" ] && biggest="$n"
+done
+
+if [ "$biggest" -gt "$ISO_LIMIT" ]; then
+	printf '  SKIPPED (named): independent isomorphism NOT run — largest cell has\n' >&2
+	printf '  %s statements, above the %s limit. Level 1 (normalized cross-tool\n' "$biggest" "$ISO_LIMIT" >&2
+	printf '  diff) DID run and covers everything except blank-node structure;\n' >&2
+	printf '  this corpus has none. Raise FLUREE_BENCH_MAX_ISOMORPHISM_STATEMENTS\n' >&2
+	printf '  to force it, and expect tens of minutes per pair.\n' >&2
+elif ! python3 -c 'import rdflib' >/dev/null 2>&1; then
 	printf '  SKIPPED (named): rdflib not installed — the independent isomorphism\n' >&2
 	printf '  check did not run. Install with: python3 -m pip install rdflib\n' >&2
 else

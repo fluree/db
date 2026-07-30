@@ -244,8 +244,8 @@ for tool in "${ELIGIBLE[@]}"; do
 		run_cell serdi default nt "$nt" serdi -i ntriples -o ntriples "$nt"
 		;;
 	oxigraph)
-		run_cell oxigraph default ttl "$ttl" oxigraph convert --from-format ttl --to-format nt --file "$ttl"
-		run_cell oxigraph default nt "$nt" oxigraph convert --from-format nt --to-format nt --file "$nt"
+		run_cell oxigraph default ttl "$ttl" oxigraph convert --from-file "$ttl" --from-format ttl --to-format nt
+		run_cell oxigraph default nt "$nt" oxigraph convert --from-file "$nt" --from-format nt --to-format nt
 		;;
 	rapper)
 		run_cell rapper default ttl "$ttl" rapper -i turtle -o ntriples "$ttl"

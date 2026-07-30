@@ -71,8 +71,8 @@
       "install_cmd": "cargo install oxigraph-cli --version 0.5.9 --locked --root .tools",
       "modes": {
         "default": {
-          "flags_disclosed": ["convert", "--to-format", "nt"],
-          "note": "The live Rust competitor — the most directly comparable column we have."
+          "flags_disclosed": ["convert", "--from-file", "<input>", "--from-format", "<syntax>", "--to-format", "nt"],
+          "note": "The live Rust competitor — the most directly comparable column we have. NOTE: 0.5.x renamed the input flag to --from-file; the 0.4.x --file spelling is rejected outright, which is how this was caught."
         }
       }
     },
