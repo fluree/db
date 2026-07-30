@@ -988,6 +988,10 @@ const SECRET_CONFIG_KEYS: &[&str] = &[
     "secret_access_key",
     "session_token",
     "default_val",
+    // OAuth refresh tokens (the CLI's `.fluree/config.toml` stores one per
+    // remote under `remotes.auth.refresh_token`; `fluree config list` redacts
+    // through this same list).
+    "refresh_token",
 ];
 
 fn is_secret_config_key(key: &str) -> bool {

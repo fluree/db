@@ -2175,7 +2175,14 @@ pub enum ConfigAction {
     },
 
     /// List all configuration values
-    List,
+    ///
+    /// Credential values (tokens, refresh tokens, client secrets) print as
+    /// `[redacted]`; pass `--reveal` to print them in the clear.
+    List {
+        /// Print credential values in the clear instead of `[redacted]`
+        #[arg(long)]
+        reveal: bool,
+    },
 
     /// Set origin configuration for a ledger (content origins for CID-based fetch)
     SetOrigins {
@@ -2477,7 +2484,7 @@ pub enum AuthAction {
     /// composes into .env files and shell substitution:
     /// `FLUREE_TOKEN=$(fluree auth token --remote prod)`. Warns on stderr
     /// if the token is expired. The refresh token is never printed; use
-    /// `fluree config list` only if you truly need the raw config.
+    /// `fluree config list --reveal` only if you truly need the raw config.
     Token {
         /// Remote name (defaults to only configured remote)
         #[arg(long)]

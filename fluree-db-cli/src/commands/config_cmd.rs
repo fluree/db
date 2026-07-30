@@ -28,9 +28,9 @@ pub fn run(action: ConfigAction, dirs: &FlureeDir) -> CliResult<()> {
             ConfigFileFormat::JsonLd => set_json(&config_path, &key, &value),
         },
 
-        ConfigAction::List => match format {
-            ConfigFileFormat::Toml => list_toml(&config_path),
-            ConfigFileFormat::JsonLd => list_json(&config_path),
+        ConfigAction::List { reveal } => match format {
+            ConfigFileFormat::Toml => list_toml(&config_path, reveal),
+            ConfigFileFormat::JsonLd => list_json(&config_path, reveal),
         },
     }
 }
@@ -69,7 +69,7 @@ fn set_toml(config_path: &Path, key: &str, value: &str) -> CliResult<()> {
     Ok(())
 }
 
-fn list_toml(config_path: &Path) -> CliResult<()> {
+fn list_toml(config_path: &Path, reveal: bool) -> CliResult<()> {
     let content = std::fs::read_to_string(config_path).unwrap_or_default();
     if content.trim().is_empty() {
         println!("(no configuration set)");
@@ -87,8 +87,23 @@ fn list_toml(config_path: &Path) -> CliResult<()> {
         return Ok(());
     }
 
+    let doc = if reveal { doc } else { redact_toml(doc)? };
     print_toml_flat("", &doc);
     Ok(())
+}
+
+/// Redact credential values in a parsed config for display, reusing the same
+/// key policy as graph-source info (`redact_json_secrets`). Round-trips
+/// through JSON: the only lossy case is a TOML datetime becoming a string,
+/// which prints identically in the flat listing.
+fn redact_toml(doc: toml::Value) -> CliResult<toml::Value> {
+    let mut json = serde_json::to_value(&doc)
+        .map_err(|e| CliError::Config(format!("failed to render config: {e}")))?;
+    if fluree_db_api::ledger_info::redact_json_secrets(&mut json) {
+        eprintln!("note: credential values shown as [redacted]; pass --reveal to print them");
+    }
+    serde_json::from_value(json)
+        .map_err(|e| CliError::Config(format!("failed to render config: {e}")))
 }
 
 /// Look up a dotted key path in a TOML value.
@@ -216,14 +231,14 @@ fn set_json(config_path: &Path, key: &str, value: &str) -> CliResult<()> {
     Ok(())
 }
 
-fn list_json(config_path: &Path) -> CliResult<()> {
+fn list_json(config_path: &Path, reveal: bool) -> CliResult<()> {
     let content = std::fs::read_to_string(config_path).unwrap_or_default();
     if content.trim().is_empty() {
         println!("(no configuration set)");
         return Ok(());
     }
 
-    let doc: serde_json::Value = serde_json::from_str(&content)
+    let mut doc: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| CliError::Config(format!("failed to parse config: {e}")))?;
 
     let obj = match doc.as_object() {
@@ -247,6 +262,9 @@ fn list_json(config_path: &Path) -> CliResult<()> {
         return Ok(());
     }
 
+    if !reveal && fluree_db_api::ledger_info::redact_json_secrets(&mut doc) {
+        eprintln!("note: credential values shown as [redacted]; pass --reveal to print them");
+    }
     print_json_flat("", &doc);
     Ok(())
 }

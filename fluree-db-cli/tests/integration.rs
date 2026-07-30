@@ -1576,6 +1576,47 @@ fn config_list_empty() {
         .stdout(predicate::str::contains("no configuration set"));
 }
 
+#[test]
+fn config_list_redacts_credentials_unless_revealed() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    // A remote with a stored bearer token — the shape `remote add --token`
+    // and `auth login` persist (access + refresh tokens).
+    fluree_cmd(&tmp)
+        .args(["config", "set", "remotes.origin.auth.token", "sekrit-access"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "config",
+            "set",
+            "remotes.origin.auth.refresh_token",
+            "sekrit-refresh",
+        ])
+        .assert()
+        .success();
+
+    // Default list masks both values but keeps the keys visible.
+    fluree_cmd(&tmp)
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remotes.origin.auth.token"))
+        .stdout(predicate::str::contains("[redacted]"))
+        .stdout(predicate::str::contains("sekrit-access").not())
+        .stdout(predicate::str::contains("sekrit-refresh").not())
+        .stderr(predicate::str::contains("--reveal"));
+
+    // --reveal prints the raw values (the documented raw-config escape hatch).
+    fluree_cmd(&tmp)
+        .args(["config", "list", "--reveal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sekrit-access"))
+        .stdout(predicate::str::contains("sekrit-refresh"));
+}
+
 // ============================================================================
 // v1.1 — Completions tests
 // ============================================================================

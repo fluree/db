@@ -14,12 +14,14 @@ fluree config <COMMAND>
 |---------|-------------|
 | `get <KEY>` | Get a configuration value |
 | `set <KEY> <VALUE>` | Set a configuration value |
-| `list` | List all configuration values |
+| `list` | List all configuration values (credentials print as `[redacted]`; `--reveal` prints them in the clear) |
 | `set-origins <LEDGER> --file <PATH>` | Set CID fetch origins for a ledger (writes a `LedgerConfig` to CAS and updates `config_id`) |
 
 ## Description
 
 Manages configuration stored in `.fluree/config.toml`. Configuration uses dotted keys for nested values (e.g., `storage.path`).
+
+`list` masks credential values — remote access and refresh tokens, client secrets, passwords — as `[redacted]`, since the config carries live tokens after `auth login`. Pass `--reveal` to print them in the clear (prefer `fluree auth token` for scripting an access token; it never prints the refresh token). `get` on an explicit key still returns the raw value.
 
 ## Examples
 
