@@ -261,6 +261,16 @@ pub trait GraphSink {
     /// recycling a slot a producer still holds an id for is silent data
     /// corruption, which is why this is a statement the producer makes rather
     /// than something a sink infers.
+    ///
+    /// The declaration is a property of the SESSION, which means a sink is
+    /// driven by exactly one producer for its lifetime. Handing a sink that
+    /// has been told `Statement` to a second, caching producer would be
+    /// undetectable from inside — the second producer says nothing, so there
+    /// is nothing to notice — and the sinks in this workspace hold that
+    /// property structurally: a writer owns one destination and writes one
+    /// document. Debug builds of the writers stamp each recycled slot with the
+    /// statement that minted it and panic on a stale read, which catches the
+    /// reachable half of this: a producer that declares and then caches anyway.
     fn declare_term_scope(&mut self, scope: TermScope) {
         let _ = scope;
     }
