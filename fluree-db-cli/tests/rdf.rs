@@ -3351,3 +3351,241 @@ fn continue_on_error_still_emits_the_profile() {
         .stderr(predicate::str::contains("skipped:"))
         .stderr(predicate::str::contains("2 statement(s) skipped"));
 }
+
+// ============================================================================
+// Flag interactions — one test per row of convert.md's table
+// ============================================================================
+//
+// Reviewers found three separate cases of one flag silently overriding
+// another (coe x profile, -o x profile-json, parallel x bnode-policy). The
+// documented table in `docs/cli/rdf/convert.md` is the contract; these are its
+// assertions. Each interaction is exercised in BOTH the serial and the
+// parallel path, because two of the three defects existed only on one side.
+//
+// A new flag adds a row there and a test here.
+
+/// Over `ParallelPlan::MIN_PARALLEL_BYTES`, so `--parallelism` is a real
+/// choice rather than a no-op the assertions cannot see.
+fn interaction_corpus() -> String {
+    let mut nt = String::new();
+    for i in 0..120_000 {
+        nt.push_str(&format!(
+            "<http://e/s{i}> <http://e/p> \"a longer literal to push this corpus over the parallel threshold {i}\" .\n"
+        ));
+    }
+    nt
+}
+
+/// A document with one unparseable statement in the middle.
+fn broken_doc() -> &'static str {
+    "@prefix ex: <http://e/> .\nex:a ex:p \"1\" .\n@@@ broken\nex:b ex:p \"2\" .\n"
+}
+
+fn profile_json(stderr: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(stderr).expect("--profile=json must emit ONE parseable JSON document")
+}
+
+/// Row: `--continue-on-error` + `--profile=json`.
+///
+/// The whole point is that the per-skip diagnostics must NOT also be written
+/// to stderr, or the JSON document stops being one.
+#[test]
+fn continue_on_error_with_json_profile_keeps_stderr_parseable() {
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "broken.ttl", broken_doc());
+
+    for threads in ["1", "8"] {
+        let out = tmp.path().join(format!("out{threads}.nt"));
+        let assert = rdf_cmd()
+            .args(["--parallelism", threads, "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt"])
+            .arg("-o")
+            .arg(&out)
+            .args(["--continue-on-error", "--profile=json", "--no-hash"])
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID);
+
+        let v = profile_json(&assert.get_output().stderr);
+        assert_eq!(
+            v["skipped_statements"], 1,
+            "the skip count must travel in the JSON at --parallelism {threads}"
+        );
+    }
+}
+
+/// Row: `--continue-on-error` + `--profile` (human). Both are prose; both
+/// appear.
+#[test]
+fn continue_on_error_with_human_profile_prints_both() {
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "broken.ttl", broken_doc());
+
+    for threads in ["1", "8"] {
+        let out = tmp.path().join(format!("h{threads}.nt"));
+        rdf_cmd()
+            .args(["--parallelism", threads, "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt"])
+            .arg("-o")
+            .arg(&out)
+            .args(["--continue-on-error", "--profile", "--no-hash"])
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID)
+            .stderr(predicate::str::contains("skipped:"))
+            .stderr(predicate::str::contains("phase"));
+    }
+}
+
+/// Row: `--continue-on-error` + `--parallelism` converts serially and says so.
+#[test]
+fn continue_on_error_forces_the_serial_path_and_reports_it() {
+    let tmp = TempDir::new().unwrap();
+    // Over the threshold, and to a LINE output, so every other reason to go
+    // serial is excluded and only `--continue-on-error` can explain the
+    // choice. Without this the test would pass on a one-line input, because
+    // recovery short-circuits the plan BEFORE the size check.
+    let mut doc = interaction_corpus();
+    assert!(
+        doc.len() > MIN_PARALLEL_BYTES,
+        "fixture must clear the parallel threshold or this asserts nothing"
+    );
+    doc.push_str("@@@ broken\n");
+    let input = fixture(&tmp, "big-broken.nt", &doc);
+    let out = tmp.path().join("out.nt");
+
+    // Control: the same corpus WITHOUT the flag does go parallel.
+    let control = rdf_cmd()
+        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .arg(fixture(&tmp, "clean.nt", &interaction_corpus()))
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(tmp.path().join("control.nt"))
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success();
+    assert!(
+        profile_json(&control.get_output().stderr)["host"]["threads_used"]
+            .as_u64()
+            .unwrap()
+            > 1,
+        "control must run parallel, or the assertion below proves nothing"
+    );
+
+    let assert = rdf_cmd()
+        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--continue-on-error", "--profile=json", "--no-hash"])
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID);
+
+    let v = profile_json(&assert.get_output().stderr);
+    assert_eq!(v["host"]["threads_used"], 1, "recovery is serial");
+    assert!(
+        v["host"]["parallel_reason"]
+            .as_str()
+            .unwrap()
+            .contains("continue-on-error"),
+        "the reason must name the flag that forced it: {}",
+        v["host"]["parallel_reason"]
+    );
+}
+
+/// Row: `-o FILE` + `--profile=json` — stdout stays empty, so the two streams
+/// never mix. And without `-o`, the bytes go to stdout while the JSON does
+/// not.
+#[test]
+fn output_file_and_json_profile_never_share_a_stream() {
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(
+        &tmp,
+        "ok.ttl",
+        "@prefix ex: <http://e/> .\nex:a ex:p \"1\" .\n",
+    );
+
+    for threads in ["1", "8"] {
+        let out = tmp.path().join(format!("o{threads}.nt"));
+        let assert = rdf_cmd()
+            .args(["--parallelism", threads, "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt"])
+            .arg("-o")
+            .arg(&out)
+            .args(["--profile=json", "--no-hash"])
+            .assert()
+            .success();
+        assert!(
+            assert.get_output().stdout.is_empty(),
+            "-o must leave stdout empty at --parallelism {threads}"
+        );
+        profile_json(&assert.get_output().stderr);
+        assert!(std::fs::read_to_string(&out)
+            .unwrap()
+            .contains("<http://e/a>"));
+
+        // Without -o the converted bytes take stdout and the JSON still does not.
+        let assert = rdf_cmd()
+            .args(["--parallelism", threads, "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt", "--profile=json", "--no-hash"])
+            .assert()
+            .success();
+        assert!(String::from_utf8_lossy(&assert.get_output().stdout).contains("<http://e/a>"));
+        profile_json(&assert.get_output().stderr);
+    }
+}
+
+/// Row: `--bnode-policy preserve` + `--parallelism` converts serially and says
+/// so. Silently relabelling here was a real defect.
+#[test]
+fn preserve_bnode_labels_forces_the_serial_path_and_reports_it() {
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.nt", &interaction_corpus());
+
+    let reason_for = |policy: &str| -> (u64, String) {
+        let out = tmp.path().join(format!("out-{policy}.nt"));
+        let assert = rdf_cmd()
+            .args(["-q", "--parallelism", "8", "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt", "--bnode-policy", policy])
+            .arg("-o")
+            .arg(&out)
+            .args(["--profile=json", "--no-hash"])
+            .assert()
+            .success();
+        let v = profile_json(&assert.get_output().stderr);
+        (
+            v["host"]["threads_used"].as_u64().unwrap(),
+            v["host"]["parallel_reason"].as_str().unwrap().to_string(),
+        )
+    };
+
+    let (threads, _) = reason_for("relabel");
+    assert!(threads > 1, "relabel must still run in parallel");
+
+    let (threads, reason) = reason_for("preserve");
+    assert_eq!(threads, 1, "preserve must convert serially");
+    assert!(
+        reason.contains("preserve"),
+        "the reason must name the flag that forced it: {reason}"
+    );
+}
+
+/// Row: `--base` is inert for the line grammars rather than mis-applied.
+#[test]
+fn base_is_inert_for_line_formats_in_both_modes() {
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "abs.nt", "<http://e/s> <http://e/p> <http://e/o> .\n");
+    for threads in ["1", "8"] {
+        rdf_cmd()
+            .args(["--parallelism", threads, "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt", "--base", "http://other.example/"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("<http://e/s>"));
+    }
+}

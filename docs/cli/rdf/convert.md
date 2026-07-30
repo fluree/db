@@ -110,6 +110,28 @@ $ fluree rdf convert dump.ttl
 See [the `rdf` overview](README.md) for input handling, compression and syntax
 resolution, which are shared by every verb.
 
+### How the flags interact
+
+Some flags change what another flag does. Every such pair is listed here, and
+each row is asserted by a test in **both** the serial and the parallel path —
+a flag that quietly overrides another is the defect this table exists to
+prevent, and three of them were found by review before it existed.
+
+**A new flag must add a row.** If it interacts with nothing, say so in the row;
+"nothing" is a claim a reader can check, and an absent row is not.
+
+| Flags together | What happens | Why |
+|---|---|---|
+| `--continue-on-error` + `--profile=json` | Per-skip diagnostics are **not** printed; the count travels as `skipped_statements` in the JSON. Exit stays `1` | Under `--profile=json` stderr is one JSON document. Printing a diagnostic per skipped statement beside it would make it unparseable, so the machine-readable channel carries the machine-readable fact |
+| `--continue-on-error` + `--profile` (human) | Both are printed: each skip, then the phase table | Both are prose on stderr; nothing to corrupt |
+| `--continue-on-error` + `--parallelism <N>` | Converts **serially**, and `parallel_reason` says so | Resync needs the document as one sequence of statements; a chunk boundary is not a place a skipped statement can be reasoned about |
+| `-o FILE` + `--profile=json` | Converted bytes go to the file, JSON to stderr, and **stdout stays empty** | The two never share a stream, so `-o` is safe to combine with either profile format |
+| no `-o` + `--profile=json` | Converted bytes to stdout, JSON to stderr | Same rule, which is why the profile goes to stderr on every verb |
+| `--bnode-policy preserve` + `--parallelism <N>` | Converts **serially**, and `parallel_reason` says so | Preserved labels are only unique document-wide; independent per-chunk relabellers cannot honour them. Silently relabelling under parallelism was a real defect, fixed rather than documented |
+| `--pretty` + `--to <non-turtle>` | Refused as a usage error naming how the syntax was chosen | `--pretty` is a Turtle fidelity tier; it has no meaning for the other syntaxes |
+| `--base` + `.nt`/`.nq` input | Inert, not applied | The line grammars have no base and no relative IRIs, so there is nothing to resolve |
+| `--parallelism <N>` + non-line output | Converts serially | Chunking changes the bytes for a syntax that folds across statements; see [Parallelism](#parallelism) |
+
 ## Fidelity
 
 Turtle and TriG output is the streaming **blocks** tier: consecutive runs of
