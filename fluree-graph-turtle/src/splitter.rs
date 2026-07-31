@@ -291,7 +291,7 @@ const SCAN_BUF_SIZE: usize = 64 * 1024; // 64 KB
 const MAX_BOUNDARY_SEARCH: u64 = 64 * 1024 * 1024; // 64 MB
 
 /// Pending lookahead state carried across buffer boundaries.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Lookahead {
     /// A `.` was the last byte processed; waiting to see if next byte is
     /// whitespace/`#`/EOF to confirm a statement boundary.
@@ -587,6 +587,7 @@ fn is_noise_only_chunk(buf: &[u8]) -> bool {
 /// ever *skip*, never decide, and [`STOP`] enumerates the bytes each state must
 /// stop on — so the two paths cannot disagree about what a boundary is. A
 /// differential test drives both over every fixture and compares.
+#[derive(Clone, PartialEq)]
 struct BoundaryScanner {
     state: ScanState,
     lookahead: Lookahead,
@@ -595,6 +596,19 @@ struct BoundaryScanner {
 }
 
 impl BoundaryScanner {
+    /// A scanner sitting in `state` with nothing pending.
+    ///
+    /// That combination is precisely when [`skip_len`](Self::skip_len)
+    /// consults the [`STOP`] table — it returns 0 while any lookahead is
+    /// outstanding — so it is the only configuration the masks describe.
+    #[cfg(test)]
+    fn in_state(state: ScanState) -> Self {
+        Self {
+            state,
+            ..Self::new()
+        }
+    }
+
     fn new() -> Self {
         Self {
             state: ScanState::Normal,
@@ -946,6 +960,7 @@ fn advance_state(
 ///
 /// We track whether we're at column 0 (or leading whitespace) and match
 /// against the keyword prefixes byte-by-byte.
+#[derive(Clone, PartialEq)]
 struct PrefixCheck {
     /// Whether any non-whitespace data byte has been seen.
     data_started: bool,
@@ -2335,6 +2350,61 @@ mod tests {
                 scan_byte_at_a_time(head),
                 "prefix of length {cut} scanned differently"
             );
+        }
+    }
+
+    /// The six masks the literal test below only restates, checked against the
+    /// scanner itself.
+    ///
+    /// `STOP_NORMAL` is absent on purpose: it already has a derived test —
+    /// `a_skipped_run_never_contains_a_byte_the_scanner_branches_on` — and it
+    /// is the one state where "a field changed" is not the right question,
+    /// because `advance_state` feeds `prefix_check` there and `absorb`
+    /// replicates that for a skipped run. In the other six states neither
+    /// touches `prefix_check`, so any change beyond `prev_byte` is a decision
+    /// the fast path would have skipped past.
+    ///
+    /// `InStringEscape` has no mask and is not listed: `skip_len` returns 0 for
+    /// it unconditionally, since its one byte is consumed whatever it is.
+    ///
+    /// This is the test that catches a `feed` which starts branching on a byte
+    /// the table does not list — an `InIri` that also ends at `\n`, an
+    /// `InComment` that reacts to `\t`. Both leave the literal test green and
+    /// fork the fast and slow paths, which on a bulk import cuts a chunk inside
+    /// a literal.
+    #[test]
+    fn every_mask_matches_what_the_scanner_actually_branches_on() {
+        let states = [
+            (ScanState::InShortDoubleString, STOP_SHORT_DOUBLE),
+            (ScanState::InLongDoubleString, STOP_LONG_DOUBLE),
+            (ScanState::InShortSingleString, STOP_SHORT_SINGLE),
+            (ScanState::InLongSingleString, STOP_LONG_SINGLE),
+            (ScanState::InIri, STOP_IRI),
+            (ScanState::InComment, STOP_COMMENT),
+        ];
+
+        for (state, mask) in states {
+            for b in 0u8..=255 {
+                let before = BoundaryScanner::in_state(state);
+                let mut after = before.clone();
+                let produced = after.feed(b, 0);
+
+                // `prev_byte` is excluded because it changes on every byte by
+                // construction; it records what was seen, not what was decided.
+                let branched = after.state != before.state
+                    || after.lookahead != before.lookahead
+                    || after.prefix_check != before.prefix_check
+                    || !matches!(produced, Ok(None));
+
+                assert_eq!(
+                    STOP[b as usize] & mask != 0,
+                    branched,
+                    "{state:?}, byte {b:?} ({:?}): table says stop={}, the scanner \
+                     branched={branched}",
+                    b as char,
+                    STOP[b as usize] & mask != 0,
+                );
+            }
         }
     }
 
