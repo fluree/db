@@ -1190,6 +1190,16 @@ pub enum Commands {
         #[arg(long)]
         allow_mor_deletes: bool,
 
+        /// Proceed even if a foreign-key parent join key maps to MORE THAN ONE
+        /// parent row. By default the build is refused: the twin would bake one
+        /// deterministically-chosen parent per key (the lexicographically smallest)
+        /// and silently drop the rest — an R2RML RefObjectMap fan-out the builder
+        /// does not yet emit. With this flag the twin builds anyway and records the
+        /// anomaly (per-parent ambiguous-key counts) in its completion stamp.
+        /// Default: fail closed.
+        #[arg(long)]
+        allow_duplicate_parent_keys: bool,
+
         /// Fluree home directory (overrides `$FLUREE_HOME` / the platform data
         /// dir). Where the twin ledger and its storage live.
         #[arg(long)]

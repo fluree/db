@@ -87,6 +87,23 @@ pub enum MaterializeError {
         cap_bytes: usize,
         table_count: usize,
     },
+    /// A parent join key resolved to more than one distinct parent subject (a
+    /// fan-out this builder does not yet emit). The twin builder REFUSES this by
+    /// default: last-wins would bake ONE arbitrary parent per key and silently drop
+    /// the others, and — before the deterministic keep-min tie-break — which one was
+    /// even kept raced the scan order, breaking the stamp's reproducibility contract.
+    /// Overridable with `--allow-duplicate-parent-keys` (the twin then records the
+    /// anomaly in its stamp). The true R2RML RefObjectMap fan-out is a tracked
+    /// follow-up; once it lands, re-materialization heals existing twins.
+    #[error(
+        "duplicate parent join keys detected — {summary}. The twin builder refuses these by \
+         default (a key mapping to multiple parents makes the foreign-key edge target ambiguous; \
+         only one parent is kept — deterministically the lexicographically smallest — and the \
+         rest are dropped, an R2RML RefObjectMap fan-out this builder does not yet emit). Re-run \
+         with --allow-duplicate-parent-keys to build anyway; the twin's stamp will record the \
+         anomaly."
+    )]
+    DuplicateParentKeys { summary: String },
 }
 
 /// Columns a scan of `tm` must project: the TriplesMap's own referenced columns
@@ -360,6 +377,13 @@ pub struct WatermarkStamp {
     /// subjects are auditable and reproducible (and so a later verify can widen
     /// coverage by rotating it). Derived deterministically from `mapping_hash`.
     pub sample_seed: u64,
+    /// Ambiguous parent join-key counts per parent TriplesMap IRI, recorded ONLY
+    /// when the twin was built with `--allow-duplicate-parent-keys` over a source
+    /// that has them (otherwise empty, and the stamp is byte-identical to a clean
+    /// twin's). An overridden twin thus self-documents the fan-out anomaly it baked:
+    /// each ambiguous key kept ONE deterministically-chosen parent and dropped the
+    /// rest (the R2RML RefObjectMap fan-out is a tracked follow-up).
+    pub dup_parent_keys: HashMap<String, u64>,
 }
 
 /// Derive the stratified-sample seed from a mapping hash (its leading 64 bits).
@@ -410,11 +434,14 @@ fn require_nonempty_watermark(
 
 /// Assemble the twin's completion stamp from the provider's captured watermark,
 /// the mapping hash, and the builder version. Fails loud on an empty watermark
-/// for a non-empty table set.
+/// for a non-empty table set. `dup_parent_keys` is non-empty only when the build
+/// ran with the duplicate-parent-key override — it self-documents the fan-out
+/// anomaly the twin baked.
 fn build_watermark_stamp(
     provider: &dyn R2rmlBuildProvider,
     graph_source_id: &str,
     mapping: &CompiledR2rmlMapping,
+    dup_parent_keys: HashMap<String, u64>,
 ) -> Result<WatermarkStamp, MaterializeError> {
     let tables = provider.build_watermark(graph_source_id);
     require_nonempty_watermark(&tables, mapping)?;
@@ -425,7 +452,42 @@ fn build_watermark_stamp(
         mapping_hash: hash,
         tables,
         sample_seed,
+        dup_parent_keys,
     })
+}
+
+/// One-clause-per-parent summary of the duplicate-parent-key anomaly for the decline
+/// error: the parent table, its join column(s), and the ambiguous-key count. Sorted
+/// so the message is deterministic.
+fn format_dup_parent_keys(
+    dups: &HashMap<String, u64>,
+    parents: &ParentIndexSet,
+    mapping: &CompiledR2rmlMapping,
+) -> String {
+    let mut clauses: Vec<String> = dups
+        .iter()
+        .map(|(tm_iri, count)| {
+            let table = mapping
+                .triples_maps
+                .get(tm_iri)
+                .and_then(|tm| tm.table_name())
+                .unwrap_or(tm_iri.as_str());
+            let cols = parents
+                .needed_columns(tm_iri)
+                .map(|sets| {
+                    let mut cs: Vec<String> = sets
+                        .iter()
+                        .map(|set| format!("[{}]", set.join(", ")))
+                        .collect();
+                    cs.sort();
+                    cs.join(" / ")
+                })
+                .unwrap_or_default();
+            format!("table '{table}' (join column(s): {cols}): {count} ambiguous key(s)")
+        })
+        .collect();
+    clauses.sort();
+    clauses.join("; ")
 }
 
 /// Namespace of the twin's completion-stamp predicates.
@@ -435,6 +497,26 @@ const STAMP_PRED_BUILDER: &str = "builderVersion";
 const STAMP_PRED_MAPPING_HASH: &str = "mappingHash";
 const STAMP_PRED_WATERMARK: &str = "watermark";
 const STAMP_PRED_SAMPLE_SEED: &str = "sampleSeed";
+/// Optional stamp predicate: present ONLY when the twin was built with the
+/// duplicate-parent-key override over a source that has them. Its absence keeps a
+/// clean twin's stamp byte-identical to before this field existed.
+const STAMP_PRED_DUP_PARENT_KEYS: &str = "dupParentKeys";
+
+/// Deterministic JSON (sorted by parent TM IRI) of the ambiguous parent-key counts,
+/// or `None` when there are none (so the stamp omits the field for a clean twin).
+fn dup_parent_keys_json(stamp: &WatermarkStamp) -> Result<Option<String>, MaterializeError> {
+    if stamp.dup_parent_keys.is_empty() {
+        return Ok(None);
+    }
+    let sorted: BTreeMap<&str, u64> = stamp
+        .dup_parent_keys
+        .iter()
+        .map(|(k, v)| (k.as_str(), *v))
+        .collect();
+    serde_json::to_string(&sorted)
+        .map(Some)
+        .map_err(|e| R2rmlError::Materialization(format!("dup_parent_keys encode: {e}")).into())
+}
 
 /// The deterministic watermark JSON string (sorted by table) stored under
 /// `materialize:watermark`. Its length is the dominant term in the stamp's
@@ -460,10 +542,13 @@ fn watermark_json(stamp: &WatermarkStamp) -> Result<String, MaterializeError> {
 fn stamp_watermark_within_cap(stamp: &WatermarkStamp) -> Result<String, MaterializeError> {
     let watermark_json = watermark_json(stamp)?;
     let entry_bytes = |name_len: usize, value_size: usize| 6 + name_len + 1 + value_size;
-    let estimated = entry_bytes(STAMP_PRED_BUILDER.len(), 4 + stamp.builder_version.len())
+    let mut estimated = entry_bytes(STAMP_PRED_BUILDER.len(), 4 + stamp.builder_version.len())
         + entry_bytes(STAMP_PRED_MAPPING_HASH.len(), 4 + stamp.mapping_hash.len())
         + entry_bytes(STAMP_PRED_WATERMARK.len(), 4 + watermark_json.len())
         + entry_bytes(STAMP_PRED_SAMPLE_SEED.len(), 8);
+    if let Some(dup_json) = dup_parent_keys_json(stamp)? {
+        estimated += entry_bytes(STAMP_PRED_DUP_PARENT_KEYS.len(), 4 + dup_json.len());
+    }
     if estimated > MAX_TXN_META_BYTES {
         return Err(MaterializeError::StampTooLarge {
             actual_bytes: estimated,
@@ -505,6 +590,13 @@ fn encode_stamp(
         name,
         TxnMetaValue::Long(stamp.sample_seed as i64),
     ));
+    // Duplicate-parent-key anomaly, ONLY when the override built over one (else the
+    // stamp is byte-identical to a clean twin's).
+    if let Some(dup_json) = dup_parent_keys_json(stamp)? {
+        let (ns, name) =
+            sink.intern_meta_predicate(&format!("{MATERIALIZE_NS}{STAMP_PRED_DUP_PARENT_KEYS}"));
+        entries.push(TxnMetaEntry::new(ns, name, TxnMetaValue::String(dup_json)));
+    }
     Ok(entries)
 }
 
@@ -558,11 +650,16 @@ pub fn read_stamp(
             _ => None,
         })
         .unwrap_or_else(|| sample_seed_from_hash(&mapping_hash));
+    // Optional: present only for an override-built twin (absent ⇒ empty ⇒ clean twin).
+    let dup_parent_keys: HashMap<String, u64> = field(STAMP_PRED_DUP_PARENT_KEYS)
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     Some(WatermarkStamp {
         builder_version,
         mapping_hash,
         tables,
         sample_seed,
+        dup_parent_keys,
     })
 }
 
@@ -648,6 +745,11 @@ fn merge_stats(acc: &mut MaterializeStats, other: MaterializeStats) {
     }
     for (k, v) in other.ref_edges {
         *acc.ref_edges.entry(k).or_default() += v;
+    }
+    // Emit workers never populate this (it comes from the parent-index build, folded
+    // in by the driver); summed for robustness so no path can silently drop it.
+    for (k, v) in other.dup_parent_keys {
+        *acc.dup_parent_keys.entry(k).or_default() += v;
     }
 }
 
@@ -830,12 +932,14 @@ fn spawn_produce_workers(
 /// lives under; no new knob. The r2rml scan futures are !Send, but each worker
 /// drives only SYNC render/encode (the async scans stay on this driver), so no Send
 /// bound is needed.
+#[allow(clippy::too_many_arguments)]
 pub async fn drive_virtual_import(
     provider: &dyn R2rmlBuildProvider,
     graph_source_id: &str,
     chunk_size_bytes: usize,
     parallelism: usize,
     memory_budget_bytes: usize,
+    allow_duplicate_parent_keys: bool,
     ctx: &VirtualChunkContext<'_>,
     result_tx: std::sync::mpsc::SyncSender<ChunkResult>,
 ) -> Result<MaterializeStats, MaterializeError> {
@@ -1014,11 +1118,29 @@ pub async fn drive_virtual_import(
         }
     }
 
+    // Duplicate-parent-key decline gate (dupkey-adjudication.md ruling C2). The
+    // deterministic keep-min tie-break in `index_batch` already made WHICH parent
+    // survives reproducible; this refuses to silently BAKE the fan-out loss (each
+    // ambiguous key keeps one parent, drops the rest) unless the operator opts in.
+    // Checked after the full index build (every parent, including those indexed
+    // during their own emit wave). Returning Err aborts the build BEFORE the
+    // completion stamp is written, so no valid (stamped) twin is ever published for a
+    // declined source — the emit chunks already sent stay unstamped and the overall
+    // import fails.
+    let dup_parent_keys = parents.dup_parent_keys();
+    if !dup_parent_keys.is_empty() && !allow_duplicate_parent_keys {
+        return Err(MaterializeError::DuplicateParentKeys {
+            summary: format_dup_parent_keys(&dup_parent_keys, &parents, &mapping),
+        });
+    }
+    total_stats.dup_parent_keys = dup_parent_keys.clone();
+
     // Assemble + ship the completion stamp on the FINAL chunk (highest idx →
     // committed last → the twin's head; a head-walk finds the stamp iff the build
     // completed, §17(a)). With parallel workers the stamp always rides its own
-    // final commit (0-triple + stamp) — the already-supported empty-stamp shape.
-    let stamp = build_watermark_stamp(provider, graph_source_id, &mapping)?;
+    // final commit (0-triple + stamp) — the already-supported empty-stamp shape. The
+    // dup-key counts are recorded in the stamp only when the override built over them.
+    let stamp = build_watermark_stamp(provider, graph_source_id, &mapping, dup_parent_keys)?;
     tracing::info!(
         builder_version = %stamp.builder_version,
         mapping_hash = %stamp.mapping_hash,
@@ -2208,6 +2330,7 @@ mod tests {
             mapping_hash: "deadbeef".into(),
             tables,
             sample_seed: 0,
+            dup_parent_keys: HashMap::new(),
         };
         match super::stamp_watermark_within_cap(&stamp) {
             Err(super::MaterializeError::StampTooLarge {
@@ -2251,6 +2374,7 @@ mod tests {
             mapping_hash: "abc123".into(),
             tables: small,
             sample_seed: 7,
+            dup_parent_keys: HashMap::new(),
         };
         assert!(
             super::stamp_watermark_within_cap(&stamp).is_ok(),
@@ -2935,7 +3059,8 @@ mod tests {
                 "mock-gs",
                 64, // tiny chunk budget → many chunks
                 parallelism,
-                0, // parent-index budget guard disabled
+                0,    // parent-index budget guard disabled
+                true, // allow duplicate parent keys — this differential test isn't the decline gate
                 &ctx,
                 tx,
             )

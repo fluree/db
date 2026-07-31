@@ -81,6 +81,13 @@ pub struct MaterializeStats {
     pub per_tm: HashMap<String, u64>,
     /// FK-edge count per `(child TriplesMap IRI, predicate IRI)` — parity key.
     pub ref_edges: HashMap<(String, String), u64>,
+    /// Ambiguous parent join keys per PARENT TriplesMap IRI: keys that resolved to
+    /// more than one distinct parent subject (a fan-out the builder cannot yet emit;
+    /// [`parent_key_insert_keep_min`] deterministically keeps one). Counted as
+    /// DISTINCT ambiguous keys, not raw collisions, so the figure is reproducible
+    /// (a raw collision tally is scan-order dependent). Drives the materialize
+    /// decline gate and is recorded in the twin's stamp when the override builds.
+    pub dup_parent_keys: HashMap<String, u64>,
 }
 
 impl MaterializeStats {
@@ -209,6 +216,53 @@ fn canonical_join(rom: &RefObjectMap) -> R2rmlResult<(Vec<String>, Vec<String>)>
 /// parent-column set.
 type KeyToSubject = HashMap<Vec<String>, RdfTerm>;
 
+/// A comparable ordering key for a parent SUBJECT term. Parent subjects are IRIs
+/// (occasionally blank nodes); the inner string gives a total lexicographic order.
+fn subject_sort_key(term: &RdfTerm) -> &str {
+    match term {
+        RdfTerm::Iri(s) | RdfTerm::BlankNode(s) => s,
+        RdfTerm::Literal { value, .. } => value,
+    }
+}
+
+/// Insert a parent join-key → subject mapping with a DETERMINISTIC keep-min
+/// tie-break, shared by the materialize index builder ([`ParentIndexSet::index_batch`])
+/// and the virtual query path (`build_parent_lookup`). On a collision — the key is
+/// already present with a DIFFERENT subject — the lexicographically smaller subject
+/// IRI wins, so which parent survives is independent of scan / IO-completion order.
+/// This makes the pick REPRODUCIBLE (the materialize stamp's mapping-hash contract
+/// rests on it) instead of a race between data files. An exact-duplicate row (same
+/// key, same subject) is not a collision. Returns `true` iff this insert observed a
+/// DISTINCT-subject collision — free duplicate-key detection (`HashMap` already
+/// tells us the key was occupied).
+pub fn parent_key_insert_keep_min(
+    map: &mut HashMap<Vec<String>, RdfTerm>,
+    key: Vec<String>,
+    subject: RdfTerm,
+) -> bool {
+    use std::collections::hash_map::Entry;
+    match map.entry(key) {
+        Entry::Vacant(e) => {
+            e.insert(subject);
+            false
+        }
+        Entry::Occupied(mut e) => {
+            let replace = {
+                let current = subject_sort_key(e.get());
+                let incoming = subject_sort_key(&subject);
+                if incoming == current {
+                    return false; // benign exact-duplicate parent row
+                }
+                incoming < current
+            };
+            if replace {
+                e.insert(subject);
+            }
+            true
+        }
+    }
+}
+
 /// All of one parent TriplesMap's indexes, keyed by canonical parent-column list
 /// (a parent may be joined on more than one column set).
 type ParentColIndex = HashMap<Vec<String>, KeyToSubject>;
@@ -225,6 +279,12 @@ pub struct ParentIndexSet {
     needed: HashMap<String, HashSet<Vec<String>>>,
     /// The built indexes.
     index: HashMap<String, ParentColIndex>,
+    /// Parent join keys that resolved to MORE THAN ONE distinct subject, per parent
+    /// TM IRI. A key is recorded iff some row minted a differing subject for it
+    /// ([`parent_key_insert_keep_min`] returned `true`) — set membership, so the
+    /// tally is independent of insertion order. The winner is picked deterministically
+    /// (keep-min); this records WHICH keys were ambiguous, for the decline gate + stamp.
+    ambiguous_keys: HashMap<String, HashSet<Vec<String>>>,
 }
 
 impl ParentIndexSet {
@@ -252,7 +312,11 @@ impl ParentIndexSet {
             }
         }
         let index = needed.keys().map(|p| (p.clone(), HashMap::new())).collect();
-        Ok(Self { needed, index })
+        Ok(Self {
+            needed,
+            index,
+            ambiguous_keys: HashMap::new(),
+        })
     }
 
     /// Whether `tm_iri` is referenced as a foreign-key parent (and therefore
@@ -269,6 +333,7 @@ impl ParentIndexSet {
         Self {
             needed: self.needed.clone(),
             index: HashMap::new(),
+            ambiguous_keys: HashMap::new(),
         }
     }
 
@@ -282,6 +347,28 @@ impl ParentIndexSet {
                 entry.entry(cols).or_default().extend(key_to_subject);
             }
         }
+        // Union the ambiguous-key sets (a parent is indexed in exactly one wave-local
+        // set, so these are normally disjoint; the union stays correct regardless and
+        // keeps the tally order-independent).
+        for (parent, keys) in other.ambiguous_keys {
+            self.ambiguous_keys.entry(parent).or_default().extend(keys);
+        }
+    }
+
+    /// Distinct ambiguous parent join keys per parent TM IRI (keys that mapped to
+    /// more than one subject). Empty when every parent key is unambiguous. Feeds the
+    /// materialize decline gate, [`MaterializeStats::dup_parent_keys`], and the stamp.
+    pub fn dup_parent_keys(&self) -> HashMap<String, u64> {
+        self.ambiguous_keys
+            .iter()
+            .map(|(tm, keys)| (tm.clone(), keys.len() as u64))
+            .collect()
+    }
+
+    /// The canonical parent-column set(s) a parent TM is indexed on — used to name
+    /// the offending join column(s) in the duplicate-parent-key decline error.
+    pub fn needed_columns(&self, tm_iri: &str) -> Option<&HashSet<Vec<String>>> {
+        self.needed.get(tm_iri)
     }
 
     /// Approximate resident byte size of the built parent index — the heap held by
@@ -316,20 +403,31 @@ impl ParentIndexSet {
             Some(sets) => sets.iter().cloned().collect(),
             None => return Ok(()),
         };
-        let entry = self.index.entry(tm.iri.clone()).or_default();
-        for row in 0..batch.num_rows {
-            let subject = match materialize_subject_from_batch(&tm.subject_map, batch, row)? {
-                Some(s) => s,
-                None => continue,
-            };
-            for cols in &col_sets {
-                if let Some(key) = get_join_key_from_batch(cols, batch, row) {
-                    entry
-                        .entry(cols.clone())
-                        .or_default()
-                        .insert(key, subject.clone());
+        // Collision resolution is deterministic keep-min (order-independent winner);
+        // ambiguous keys are recorded free (the map already reports occupancy). Buffer
+        // them locally so `self.ambiguous_keys` isn't borrowed while `entry` holds
+        // `self.index`.
+        let mut ambiguous_this_batch: Vec<Vec<String>> = Vec::new();
+        {
+            let entry = self.index.entry(tm.iri.clone()).or_default();
+            for row in 0..batch.num_rows {
+                let subject = match materialize_subject_from_batch(&tm.subject_map, batch, row)? {
+                    Some(s) => s,
+                    None => continue,
+                };
+                for cols in &col_sets {
+                    if let Some(key) = get_join_key_from_batch(cols, batch, row) {
+                        let map = entry.entry(cols.clone()).or_default();
+                        if parent_key_insert_keep_min(map, key.clone(), subject.clone()) {
+                            ambiguous_this_batch.push(key);
+                        }
+                    }
                 }
             }
+        }
+        if !ambiguous_this_batch.is_empty() {
+            let set = self.ambiguous_keys.entry(tm.iri.clone()).or_default();
+            set.extend(ambiguous_this_batch);
         }
         Ok(())
     }
@@ -768,6 +866,36 @@ mod tests {
     };
     use fluree_db_tabular::{BatchSchema, Column, FieldInfo, FieldType};
     use std::sync::Arc;
+
+    #[test]
+    fn parent_key_keep_min_is_order_independent() {
+        // The SAME colliding key fed in BOTH orders must pick the SAME winner (the
+        // lexicographically smaller subject IRI) and flag the collision — this is what
+        // makes the baked twin reproducible regardless of scan / IO-completion order.
+        let key = vec!["k1".to_string()];
+        let a = RdfTerm::iri("http://ex/parent/A");
+        let b = RdfTerm::iri("http://ex/parent/B");
+
+        let mut m1: HashMap<Vec<String>, RdfTerm> = HashMap::new();
+        assert!(!parent_key_insert_keep_min(&mut m1, key.clone(), a.clone()));
+        assert!(parent_key_insert_keep_min(&mut m1, key.clone(), b.clone()));
+        assert_eq!(m1.get(&key), Some(&a), "A < B, so A wins");
+
+        let mut m2: HashMap<Vec<String>, RdfTerm> = HashMap::new();
+        assert!(!parent_key_insert_keep_min(&mut m2, key.clone(), b.clone()));
+        assert!(parent_key_insert_keep_min(&mut m2, key.clone(), a.clone()));
+        assert_eq!(
+            m2.get(&key),
+            Some(&a),
+            "reversed feed order must pick the same winner"
+        );
+
+        // An exact-duplicate row (same key, same subject) is not a collision.
+        let mut m3: HashMap<Vec<String>, RdfTerm> = HashMap::new();
+        assert!(!parent_key_insert_keep_min(&mut m3, key.clone(), a.clone()));
+        assert!(!parent_key_insert_keep_min(&mut m3, key.clone(), a.clone()));
+        assert_eq!(m3.get(&key), Some(&a));
+    }
 
     fn field(name: &str, ty: FieldType, nullable: bool, id: i32) -> FieldInfo {
         FieldInfo {

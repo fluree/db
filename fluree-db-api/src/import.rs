@@ -192,6 +192,10 @@ pub struct ImportConfig {
 pub(crate) struct VirtualSource {
     pub provider: Arc<dyn crate::materialize::R2rmlBuildProvider>,
     pub graph_source_id: String,
+    /// Build a twin even when a parent join key maps to multiple parents (the
+    /// twin then bakes one deterministically-chosen parent per key and records the
+    /// anomaly in its stamp). Default `false` = decline such a source.
+    pub allow_duplicate_parent_keys: bool,
 }
 
 impl std::fmt::Debug for ImportConfig {
@@ -2517,6 +2521,7 @@ impl<'a> ImportBuilder<'a> {
             virtual_source: Some(VirtualSource {
                 provider,
                 graph_source_id,
+                allow_duplicate_parent_keys: false,
             }),
             ..ImportConfig::default()
         };
@@ -2575,6 +2580,19 @@ impl<'a> ImportBuilder<'a> {
     /// Set the parallelism (alias for [`threads`](Self::threads)). `0` = auto.
     pub fn parallelism(mut self, n: usize) -> Self {
         self.config.parse_threads = n;
+        self
+    }
+
+    /// Allow a virtual (materialize) import to proceed when a parent join key maps
+    /// to more than one parent. Default (`false`) DECLINES such a source: the twin
+    /// would bake one deterministically-chosen parent per key and silently drop the
+    /// rest (an R2RML RefObjectMap fan-out the builder does not yet emit). When
+    /// enabled, the twin builds and records the anomaly in its completion stamp.
+    /// No-op for non-virtual imports.
+    pub fn allow_duplicate_parent_keys(mut self, v: bool) -> Self {
+        if let Some(vs) = self.config.virtual_source.as_mut() {
+            vs.allow_duplicate_parent_keys = v;
+        }
         self
     }
 
@@ -4073,6 +4091,7 @@ where
                     chunk_size_bytes,
                     producer_parallelism,
                     memory_budget_bytes,
+                    vs.allow_duplicate_parent_keys,
                     &ctx,
                     drive_tx,
                 ));

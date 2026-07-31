@@ -51,6 +51,9 @@ pub struct MaterializeParams<'a> {
     pub verify: MaterializeVerify,
     pub max_performance: bool,
     pub allow_mor_deletes: bool,
+    /// `--allow-duplicate-parent-keys`: build over a source whose FK parent keys are
+    /// non-unique (default `false` = decline). See the import builder for the rationale.
+    pub allow_duplicate_parent_keys: bool,
     /// Global `--parallelism` (0 = unset).
     pub parallelism: usize,
     /// Global `--memory-budget-mb` (0 = unset).
@@ -132,6 +135,7 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
         .import_r2rml(Arc::clone(&provider), params.graph_source)
         .parallelism(parallelism)
         .memory_budget_mb(memory_budget_mb)
+        .allow_duplicate_parent_keys(params.allow_duplicate_parent_keys)
         .execute()
         .await
         .map_err(|e| classify_build_error(&e.to_string(), params.allow_mor_deletes))?;

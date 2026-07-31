@@ -712,6 +712,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             verify,
             max_performance,
             allow_mor_deletes,
+            allow_duplicate_parent_keys,
             home,
             tmp_dir,
         } => {
@@ -726,6 +727,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 verify,
                 max_performance,
                 allow_mor_deletes,
+                allow_duplicate_parent_keys,
                 parallelism: cli.parallelism,
                 memory_budget_mb: cli.memory_budget_mb,
                 quiet: cli.quiet,

@@ -5442,6 +5442,182 @@ async fn verify_twin_full_passes_on_multi_chunk_twin() {
     );
 }
 
+/// A parent whose SUBJECT is keyed on `c_id` but is JOINED on `region` (non-unique):
+/// two customers in the same region mint DIFFERENT subjects for the same join key, so
+/// key `["EU"]` maps to both `customer/1` and `customer/2` — the duplicate-parent-key
+/// fan-out shape. The two customers are split across two scan BATCHES (the cross-file
+/// race the deterministic keep-min tie-break repairs); `reverse` flips their order.
+#[cfg(feature = "native")]
+fn dup_parent_key_provider(reverse_customer_batches: bool) -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TriplesMap,
+    };
+
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_id}").with_class("http://ex.org/Customer");
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_id}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/placedInRegion"),
+        object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+            "<#Customer>",
+            "cust_region",
+            "region",
+        )),
+    }];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "c_id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "region".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]));
+    let cust_batch = |c_id: i64| {
+        ColumnBatch::new(
+            Arc::clone(&cust_schema),
+            vec![
+                Column::Int64(vec![Some(c_id)]),
+                Column::String(vec![Some("EU".to_string())]),
+            ],
+        )
+        .unwrap()
+    };
+    let mut cust_batches = vec![cust_batch(1), cust_batch(2)];
+    if reverse_customer_batches {
+        cust_batches.reverse();
+    }
+
+    let order_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "o_id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "cust_region".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]));
+    let order_batch = ColumnBatch::new(
+        order_schema,
+        vec![
+            Column::Int64(vec![Some(100)]),
+            Column::String(vec![Some("EU".to_string())]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), cust_batches);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// DUP-KEY DECLINE (dupkey-adjudication.md ruling C2): a source whose FK parent join
+/// key maps to more than one parent must be REFUSED by default, with an error that
+/// names the anomaly and points at the override.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_declines_duplicate_parent_keys_by_default() {
+    const LEDGER: &str = "test/dupkey-decline:main";
+    let provider = dup_parent_key_provider(false);
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    let err = fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect_err("a source with duplicate parent join keys must be declined by default");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate parent join keys"),
+        "the error must name the anomaly; got: {msg}"
+    );
+    assert!(
+        msg.contains("--allow-duplicate-parent-keys"),
+        "the error must point at the override; got: {msg}"
+    );
+}
+
+/// DUP-KEY OVERRIDE + DETERMINISM + STAMP: with `--allow-duplicate-parent-keys` the
+/// twin builds; the FK resolves to the SAME deterministic winner (keep-min =
+/// `customer/1`) regardless of scan-batch order; and the completion stamp records the
+/// ambiguous-key count so the overridden twin self-documents its anomaly.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_override_builds_deterministic_twin_and_records_stamp() {
+    for reverse in [false, true] {
+        let ledger = if reverse {
+            "test/dupkey-ovr-rev:main"
+        } else {
+            "test/dupkey-ovr:main"
+        };
+        let provider = dup_parent_key_provider(reverse);
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .build()
+            .expect("build Fluree");
+        fluree
+            .create(ledger)
+            .import_r2rml(Arc::clone(&provider), "gs:main")
+            .threads(2)
+            .memory_budget_mb(256)
+            .allow_duplicate_parent_keys(true)
+            .execute()
+            .await
+            .expect("override builds the twin");
+        let loaded = fluree.ledger(ledger).await.expect("load twin");
+
+        // Deterministic winner: order/100 -> customer/1 (the lexicographically smaller
+        // of {customer/1, customer/2}), independent of which batch was scanned first.
+        let json = support::query_sparql(
+            &fluree,
+            &loaded,
+            "SELECT ?c WHERE { <http://ex.org/order/100> <http://ex.org/placedInRegion> ?c }",
+        )
+        .await
+        .expect("query")
+        .to_sparql_json(&loaded.snapshot)
+        .expect("sparql json");
+        assert_eq!(
+            json["results"]["bindings"][0]["c"]["value"],
+            "http://ex.org/customer/1",
+            "keep-min must resolve the FK to customer/1 regardless of batch order (reverse={reverse})"
+        );
+
+        // The stamp self-documents the anomaly (exactly one ambiguous key: region=EU).
+        let stamp = read_head_stamp(&fluree, ledger).await;
+        assert!(
+            !stamp.dup_parent_keys.is_empty(),
+            "an override-built twin must record dup_parent_keys in its stamp (reverse={reverse})"
+        );
+        let total: u64 = stamp.dup_parent_keys.values().sum();
+        assert_eq!(
+            total, 1,
+            "exactly one ambiguous parent key (region=EU) regardless of order (reverse={reverse})"
+        );
+    }
+}
+
 /// PARITY GATE — pass case: a faithfully built twin matches its virtual source
 /// under both `Quick` (class counts + stratified sample) and `Full` (full-triple
 /// diff). Proves the twin-side N-Triples reader renders IRI, plain-string,
