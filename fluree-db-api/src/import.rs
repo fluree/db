@@ -184,6 +184,20 @@ pub struct ImportConfig {
     /// the provider + graph-source id; `None` for every file/remote import, so
     /// those paths are unaffected.
     pub(crate) virtual_source: Option<VirtualSource>,
+    /// Namespace that salts blank-node ids minted by this import.
+    ///
+    /// `None` (the default) salts with the normalized ledger id, so importing
+    /// one source tree into two ledgers mints two disjoint sets of ids —
+    /// blank nodes are local to the graph that holds them, and nothing should
+    /// make them look shared across ledgers by accident.
+    ///
+    /// Set it to make that sharing deliberate: two ledgers imported from the
+    /// same tree under the same namespace mint *identical* ids, so a blank
+    /// node can be matched across them (a rebuild-and-diff, a sharded load of
+    /// one logical dataset, a staging/production pair). It is a plain string
+    /// with no interpretation — any two imports that agree on it, agree on
+    /// their ids.
+    pub skolem_namespace: Option<String>,
 }
 
 /// A virtual (R2RML-over-Iceberg) graph source to materialize into a native
@@ -235,6 +249,7 @@ impl Default for ImportConfig {
             tracker: Tracker::disabled(),
             ndjson_first_line_context: FirstLineContextPolicy::Auto,
             virtual_source: None,
+            skolem_namespace: None,
         }
     }
 }
@@ -707,31 +722,154 @@ pub(crate) enum RemoteFormat {
     Ndjson,
 }
 
-/// `(chunk_index, doc_index, raw_bytes)` payload sent from a chunk producer to
-/// the parser workers.
+/// Which document a chunk came from, and where inside it.
 ///
-/// `doc_index` names the **source document** the bytes were cut from. RDF
-/// scopes blank-node labels to a document, and only the producer knows how
+/// RDF scopes blank-node labels to a document, and only the producer knows how
 /// chunks map onto input files — a large file is sub-split into many chunks,
-/// several small files can share one chunk. Workers turn it into the parser's
-/// `doc_scope` so `_:x` unifies across every chunk of one file and stays
-/// distinct between files. Producers that emit exactly one whole document per
-/// chunk set it equal to `chunk_index`.
-type RemoteChunk = (usize, usize, Vec<u8>);
-
-/// Document index used by the single-file streaming arm.
+/// several small files can share one chunk. This travels with every chunk so
+/// the parse worker can scope labels to their source document.
 ///
-/// [`ChunkSource::Streaming`] always reads exactly one local file, so every
-/// chunk it emits belongs to the same document.
-const STREAMING_DOC_IDX: usize = 0;
+/// `Copy` and two scalars wide on purpose: it rides the chunk channel, which
+/// stays allocation-free (the skolem base is rendered once per chunk in the
+/// worker, not once per document in the producer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DocChunk {
+    /// Hashed identity of the source document — see [`fluree_db_core::skolem`].
+    /// Every chunk cut from one document carries the same value, and no two
+    /// documents in an import share one (enforced by [`DocIds::new`]).
+    doc: u64,
+    /// Index of this chunk within its source document, from 0.
+    ///
+    /// Labeled blank nodes ignore it (they unify across the whole document);
+    /// *anonymous* nodes need it, because their mint counter restarts in every
+    /// sink. See `ImportSink::term_blank`.
+    sub_chunk: u32,
+}
 
-/// Render a document index as a parser `doc_scope` key.
+impl DocChunk {
+    /// A chunk that is a whole document by itself.
+    fn whole(doc: u64) -> Self {
+        Self { doc, sub_chunk: 0 }
+    }
+
+    /// The `{base}` in the parser's `fdb-{base}-{label}` skolem key.
+    fn skolem_base(self) -> String {
+        fluree_db_core::skolem::doc_scope(self.doc)
+    }
+}
+
+/// Assigns each payload its sub-chunk index within its source document.
 ///
-/// The `d` prefix keeps these keys disjoint from the commit-ordinal keys used
-/// by the serial TriG/JSON-LD paths, so no two documents in one import can
-/// collide on a skolemization base.
-fn doc_scope(doc_idx: usize) -> String {
-    format!("d{doc_idx}")
+/// Producers emit a document's chunks contiguously and in document order, so a
+/// counter that resets whenever the document changes is enough to make
+/// `(doc, sub_chunk)` unique across the import. `next_for` debug-asserts that
+/// contiguity rather than trusting it silently — a producer that interleaved
+/// documents would otherwise re-issue sub-chunk 0 and merge two documents'
+/// anonymous nodes.
+#[derive(Default)]
+struct SubChunkCounter {
+    current: Option<u64>,
+    next: u32,
+    #[cfg(debug_assertions)]
+    seen: std::collections::HashSet<u64>,
+}
+
+impl SubChunkCounter {
+    fn next_for(&mut self, doc: u64) -> DocChunk {
+        if self.current != Some(doc) {
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                self.seen.insert(doc),
+                "producer emitted document {doc:x} in two separate runs; \
+                 sub-chunk indexes would repeat"
+            );
+            self.current = Some(doc);
+            self.next = 0;
+        }
+        let sub_chunk = self.next;
+        self.next += 1;
+        DocChunk { doc, sub_chunk }
+    }
+}
+
+/// `(chunk_index, doc_chunk, raw_bytes)` payload sent from a chunk producer to
+/// the parser workers.
+type RemoteChunk = (usize, DocChunk, Vec<u8>);
+
+/// Every document in one import, in source order: its key and its hashed id.
+///
+/// Built at the two places where the document set and the import root are both
+/// in scope — [`discover_chunks`] for local sources, [`resolve_remote_objects`]
+/// for remote ones — so every arm agrees on what a document key is. Indexed the
+/// same way `per_chunk_format` and the rechunk `sizes` are.
+///
+#[derive(Debug)]
+pub(crate) struct DocIds {
+    /// `skolem::doc_id` of each document key, in source order.
+    ids: Vec<u64>,
+}
+
+impl DocIds {
+    /// Hash every key under `namespace`, refusing an import whose documents do
+    /// not have distinct ids.
+    ///
+    /// A duplicate is nearly always a duplicate *key* — the `Remote`
+    /// `OrderedObjects` arm takes a caller-supplied list, which can name one
+    /// address twice — and much more rarely an `xxh64` collision between two
+    /// genuinely different keys. Both are fatal for the same reason: two
+    /// documents sharing a scope silently merge their `_:x` nodes into one
+    /// subject. Aborting up front costs nothing; discovering it after a
+    /// multi-hour import costs the whole import.
+    fn new(namespace: &str, keys: Vec<String>) -> std::result::Result<Self, ImportError> {
+        let mut ids = Vec::with_capacity(keys.len());
+        let mut seen: HashMap<u64, usize> = HashMap::with_capacity(keys.len());
+        for (idx, key) in keys.iter().enumerate() {
+            let id = fluree_db_core::skolem::doc_id(namespace, key);
+            if let Some(&first) = seen.get(&id) {
+                return Err(ImportError::Source(format!(
+                    "two import documents share the blank-node scope \
+                     '{}': {:?} and {:?}. Blank-node labels in the two would \
+                     merge into one subject. Remove the duplicate, or import \
+                     them separately.",
+                    fluree_db_core::skolem::doc_scope(id),
+                    keys[first],
+                    key,
+                )));
+            }
+            seen.insert(id, idx);
+            ids.push(id);
+        }
+        Ok(Self { ids })
+    }
+
+    /// Hashed id of document `idx`.
+    ///
+    /// Out-of-range indexes fall back to `0`: the caller has already sized its
+    /// document list, so this is unreachable, and a wrong-but-stable scope is a
+    /// better failure than a panic mid-import.
+    fn id(&self, idx: usize) -> u64 {
+        self.ids.get(idx).copied().unwrap_or(0)
+    }
+
+    /// Hashed ids in source order, for handing to a producer thread.
+    fn ids(&self) -> Vec<u64> {
+        self.ids.clone()
+    }
+}
+
+/// Derive a document key for a local path: its location relative to the import
+/// root, or its file name when the root *is* the file.
+///
+/// Relative rather than absolute so that ids depend on the shape of the import,
+/// not on where the tree happens to be mounted — the same directory imported
+/// from `/tmp/x` and `/data/x` mints the same ids.
+fn local_doc_key(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .or_else(|| path.file_name().map(Path::new))
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 type RemoteChunkRx = Arc<std::sync::Mutex<std::sync::mpsc::Receiver<RemoteChunk>>>;
@@ -1128,12 +1266,33 @@ fn read_decoded_to_string(path: &Path) -> std::io::Result<String> {
 /// - If `path` is a single large `.ttl` file: auto-split using `StreamingTurtleReader`.
 /// - If `path` is a single small `.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld` file: treat as a single-element `Files` source.
 /// - All extensions above also accept `.gz` and `.zst` suffixes (e.g. `data.ttl.gz`).
+///
+/// Returns the source alongside its document identity table.
+/// `skolem_namespace` salts the document ids (see [`DocIds`]); it is the
+/// normalized ledger id unless the caller overrode it.
 fn resolve_chunk_source(
     path: &Path,
     config: &ImportConfig,
-) -> std::result::Result<ChunkSource, ImportError> {
+    skolem_namespace: &str,
+) -> std::result::Result<(ChunkSource, DocIds), ImportError> {
+    // Single-file sources key on the file name: a lone file is the import root
+    // *and* its only document, so a path relative to the root would be empty.
+    let single_file_docs = |p: &Path| -> std::result::Result<DocIds, ImportError> {
+        DocIds::new(
+            skolem_namespace,
+            vec![p.file_name().map_or_else(
+                || p.to_string_lossy().into_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            )],
+        )
+    };
+
     if path.is_dir() {
         let files = discover_chunks(path)?;
+        let doc_ids = DocIds::new(
+            skolem_namespace,
+            files.iter().map(|f| local_doc_key(path, f)).collect(),
+        )?;
 
         // A directory of newline-delimited JSON-LD streams via chained
         // NdjsonReaders (one file → many JSON-LD chunks). `.jsonl`/`.ndjson`
@@ -1149,11 +1308,12 @@ fn resolve_chunk_source(
             let channel_capacity = config.effective_max_inflight();
             let producer = spawn_local_ndjson_producer(
                 files,
+                doc_ids.ids(),
                 config.ndjson_first_line_context,
                 chunk_size_bytes,
                 channel_capacity,
             );
-            return Ok(ChunkSource::JsonLdStream(producer));
+            return Ok((ChunkSource::JsonLdStream(producer), doc_ids));
         }
 
         // A directory of purely Turtle/N-Triples files can be rechunked through
@@ -1171,15 +1331,16 @@ fn resolve_chunk_source(
             let rechunk_threads = config.effective_rechunk_threads();
             let producer = spawn_local_producer(
                 files,
+                doc_ids.ids(),
                 chunk_size_bytes,
                 channel_capacity,
                 coalesce_threshold,
                 rechunk_threads,
             );
-            return Ok(ChunkSource::LocalRechunk(producer));
+            return Ok((ChunkSource::LocalRechunk(producer), doc_ids));
         }
 
-        return Ok(ChunkSource::Files(files));
+        return Ok((ChunkSource::Files(files), doc_ids));
     }
 
     if !path.exists() {
@@ -1213,13 +1374,15 @@ fn resolve_chunk_source(
     if is_ndjson_ext(inner_ext.as_deref()) {
         let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
         let channel_capacity = config.effective_max_inflight();
+        let doc_ids = single_file_docs(path)?;
         let producer = spawn_local_ndjson_producer(
             vec![path.to_path_buf()],
+            doc_ids.ids(),
             config.ndjson_first_line_context,
             chunk_size_bytes,
             channel_capacity,
         );
-        return Ok(ChunkSource::JsonLdStream(producer));
+        return Ok((ChunkSource::JsonLdStream(producer), doc_ids));
     }
 
     let is_ttl = matches!(inner_ext.as_deref(), Some("ttl" | "nt"));
@@ -1279,24 +1442,37 @@ fn resolve_chunk_source(
             compression = ?compression,
             "streaming large Turtle file (no pre-scan)"
         );
-        Ok(ChunkSource::Streaming(reader))
+        Ok((ChunkSource::Streaming(reader), single_file_docs(path)?))
     } else {
         // Small file or non-TTL: treat as a single-element source. The Files
         // variant's `read_chunk` transparently decodes `.gz` / `.zst`.
-        Ok(ChunkSource::Files(vec![path.to_path_buf()]))
+        Ok((
+            ChunkSource::Files(vec![path.to_path_buf()]),
+            single_file_docs(path)?,
+        ))
     }
 }
 
 /// Resolve a remote source (`OrderedObjects` or `Prefix`) into a list of
 /// `RemoteObject`s, sorted lex by address for `Prefix` mode.
 ///
-/// Returns the accepted objects and their per-chunk formats (parallel to
-/// the objects vec). Rejects mixing Turtle (`.ttl`/`.trig`) with JSON-LD
-/// (`.jsonld`), mirroring the local `scan_directory_format` rule.
+/// Returns the accepted objects, their per-chunk formats (parallel to the
+/// objects vec), and their document identity table. Rejects mixing Turtle
+/// (`.ttl`/`.trig`) with JSON-LD (`.jsonld`), mirroring the local
+/// `scan_directory_format` rule.
+///
+/// Document keys are addresses relative to the listing prefix, so a prefix
+/// import mints the same ids wherever the bucket layout puts it — the local
+/// arms' relative-path rule, transposed. `OrderedObjects` supplies no prefix,
+/// so its keys are the full addresses. Note that `RemoteObject::address` is
+/// backend-opaque by contract (see `fluree_db_core::storage`), so hashing it
+/// pins the minted ids to whatever address encoding that backend uses: the
+/// same objects re-imported through a different backend mint different ids.
 async fn resolve_remote_objects(
     storage: &Arc<dyn StorageRead>,
     source: &RemoteSource,
-) -> std::result::Result<(Vec<RemoteObject>, Vec<RemoteFormat>), ImportError> {
+    skolem_namespace: &str,
+) -> std::result::Result<(Vec<RemoteObject>, Vec<RemoteFormat>, DocIds), ImportError> {
     let all_objects = match source {
         RemoteSource::OrderedObjects(objs) => objs.clone(),
         RemoteSource::Prefix { prefix } => {
@@ -1397,7 +1573,20 @@ async fn resolve_remote_objects(
     // and named graphs are queryable via the `#<graph-iri>` fragment. See the
     // named-graph spool wiring in `import_trig_commit` (fluree-db-transact).
 
-    Ok((accepted, extensions))
+    let doc_keys = accepted
+        .iter()
+        .map(|o| match source {
+            RemoteSource::Prefix { prefix } => o
+                .address
+                .strip_prefix(prefix.as_str())
+                .unwrap_or(&o.address)
+                .to_string(),
+            RemoteSource::OrderedObjects(_) => o.address.clone(),
+        })
+        .collect();
+    let doc_ids = DocIds::new(skolem_namespace, doc_keys)?;
+
+    Ok((accepted, extensions, doc_ids))
 }
 
 /// Spawn the async producer task + bridge thread for a remote source.
@@ -1414,10 +1603,12 @@ fn spawn_remote_producer(
     storage: Arc<dyn StorageRead>,
     objects: Vec<RemoteObject>,
     per_chunk_format: Vec<RemoteFormat>,
+    doc_ids: Vec<u64>,
     in_flight: usize,
 ) -> RemoteChunkProducer {
     let estimated_count = objects.len();
     debug_assert_eq!(estimated_count, per_chunk_format.len());
+    debug_assert_eq!(estimated_count, doc_ids.len());
     let in_flight = in_flight.max(1);
 
     // tokio mpsc — async producer side.
@@ -1449,8 +1640,9 @@ fn spawn_remote_producer(
                     "remote object size differs from listing metadata"
                 );
             }
-            // One remote object == one whole document, so doc_index == idx.
-            if tokio_tx.send((idx, idx, bytes)).await.is_err() {
+            // One remote object == one whole document.
+            let doc = DocChunk::whole(doc_ids.get(idx).copied().unwrap_or(0));
+            if tokio_tx.send((idx, doc, bytes)).await.is_err() {
                 // Bridge dropped — pipeline aborted upstream. Exit cleanly.
                 let _ = error_tx.send(None);
                 return;
@@ -1594,7 +1786,7 @@ fn estimate_ndjson_chunks(total_bytes: u64, chunk_size_bytes: u64) -> usize {
 /// `per_chunk_format` is empty because the chunks ride the
 /// [`ChunkSource::JsonLdStream`] path, which always parses them as JSON-LD.
 fn spawn_chained_ndjson_producer(
-    sources: Vec<(String, NdjsonSourceFactory)>,
+    sources: Vec<(String, u64, NdjsonSourceFactory)>,
     policy: FirstLineContextPolicy,
     chunk_size_bytes: u64,
     in_flight: usize,
@@ -1611,7 +1803,7 @@ fn spawn_chained_ndjson_producer(
         .name("ndjson-producer".into())
         .spawn(move || {
             let mut global_idx = 0usize;
-            for (label, factory) in sources {
+            for (label, doc_id, factory) in sources {
                 let byte_source = match factory() {
                     Ok(r) => r,
                     Err(e) => {
@@ -1637,10 +1829,19 @@ fn spawn_chained_ndjson_producer(
                     };
                 loop {
                     match reader.recv_chunk() {
-                        Ok(Some((_local_idx, bytes))) => {
-                            // Each ndjson chunk is rewritten into a standalone
-                            // JSON-LD document, so doc_index == global_idx.
-                            if std_tx.send((global_idx, global_idx, bytes)).is_err() {
+                        Ok(Some((local_idx, bytes))) => {
+                            // One ndjson SOURCE is one document. `NdjsonReader`
+                            // applies the source's leading `@context` to every
+                            // chunk it cuts, so the file — not the chunk, and
+                            // not the line — is the unit Fluree already treats
+                            // as one JSON-LD document. `local_idx` is the
+                            // reader's own 0-based counter, so it is the
+                            // sub-chunk index this document needs.
+                            let doc = DocChunk {
+                                doc: doc_id,
+                                sub_chunk: u32::try_from(local_idx).unwrap_or(u32::MAX),
+                            };
+                            if std_tx.send((global_idx, doc, bytes)).is_err() {
                                 // Consumer aborted upstream — exit cleanly.
                                 let _ = error_tx.send(None);
                                 return;
@@ -1689,6 +1890,7 @@ fn spawn_chained_ndjson_producer(
 fn spawn_remote_ndjson_producer(
     storage: Arc<dyn StorageRead>,
     objects: Vec<RemoteObject>,
+    doc_ids: Vec<u64>,
     policy: FirstLineContextPolicy,
     chunk_size_bytes: u64,
     in_flight: usize,
@@ -1697,9 +1899,11 @@ fn spawn_remote_ndjson_producer(
     let ranged = storage.supports_ranged_reads();
     let total_bytes: u64 = objects.iter().map(|o| o.size_bytes).sum();
     let estimated_count = estimate_ndjson_chunks(total_bytes, chunk_size_bytes);
-    let sources: Vec<(String, NdjsonSourceFactory)> = objects
+    let sources: Vec<(String, u64, NdjsonSourceFactory)> = objects
         .into_iter()
-        .map(|obj| {
+        .enumerate()
+        .map(|(idx, obj)| {
+            let doc_id = doc_ids.get(idx).copied().unwrap_or(0);
             let storage = Arc::clone(&storage);
             let handle = handle.clone();
             let label = obj.address.clone();
@@ -1730,7 +1934,7 @@ fn spawn_remote_ndjson_producer(
                     decode_buffered(comp, Box::new(std::io::Cursor::new(bytes)))
                 })
             };
-            (label, factory)
+            (label, doc_id, factory)
         })
         .collect();
     spawn_chained_ndjson_producer(
@@ -1746,6 +1950,7 @@ fn spawn_remote_ndjson_producer(
 /// `open_decoded` handles `.gz`/`.zst` transparently.
 fn spawn_local_ndjson_producer(
     files: Vec<PathBuf>,
+    doc_ids: Vec<u64>,
     policy: FirstLineContextPolicy,
     chunk_size_bytes: u64,
     in_flight: usize,
@@ -1758,12 +1963,14 @@ fn spawn_local_ndjson_producer(
         .map(|m| m.len())
         .sum();
     let estimated_count = estimate_ndjson_chunks(total_bytes, chunk_size_bytes);
-    let sources: Vec<(String, NdjsonSourceFactory)> = files
+    let sources: Vec<(String, u64, NdjsonSourceFactory)> = files
         .into_iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(idx, f)| {
+            let doc_id = doc_ids.get(idx).copied().unwrap_or(0);
             let label = f.display().to_string();
             let factory: NdjsonSourceFactory = Box::new(move || open_decoded(&f));
-            (label, factory)
+            (label, doc_id, factory)
         })
         .collect();
     spawn_chained_ndjson_producer(
@@ -1869,9 +2076,9 @@ fn should_stream_split(path: &Path, on_disk: u64, chunk_size_bytes: u64) -> bool
 /// chunks: large files are sub-split at statement boundaries; small files are
 /// read whole and (when `coalesce_enabled`) concatenated up to ~`chunk_size`.
 ///
-/// Every chunk carries the index of the file it came from, so the parse workers
-/// can scope blank-node labels to their source document (see [`RemoteChunk`]).
-/// A coalesced payload reports its *first* file — sound because
+/// Every chunk carries the identity of the file it came from, so the parse
+/// workers can scope blank-node labels to their source document (see
+/// [`DocChunk`]). A coalesced payload reports its *first* file — sound because
 /// [`coalesce_unsafe`] refuses to coalesce any file containing a `_:` label, so
 /// a coalesced payload has no labeled blank nodes to scope.
 ///
@@ -1881,6 +2088,7 @@ fn should_stream_split(path: &Path, on_disk: u64, chunk_size_bytes: u64) -> bool
 fn local_rechunk_loop(
     files: &[PathBuf],
     sizes: &[u64],
+    doc_ids: &[u64],
     chunk_size_bytes: u64,
     coalesce_enabled: bool,
     tx: &std::sync::mpsc::SyncSender<RemoteChunk>,
@@ -1890,13 +2098,15 @@ fn local_rechunk_loop(
     // index of the first file that contributed to it.
     let mut buf: Vec<u8> = Vec::new();
     let mut buf_doc = 0usize;
+    let mut sub_chunks = SubChunkCounter::default();
 
     macro_rules! emit {
         ($doc:expr, $payload:expr) => {{
             let payload = $payload;
             let payload_len = payload.len();
             let send_start = Instant::now();
-            if tx.send((next_idx, $doc, payload)).is_err() {
+            let doc = sub_chunks.next_for(doc_ids.get($doc).copied().unwrap_or(0));
+            if tx.send((next_idx, doc, payload)).is_err() {
                 // Consumer dropped the receiver — pipeline aborted upstream.
                 return Ok(());
             }
@@ -2052,7 +2262,8 @@ fn local_rechunk_loop(
         let payload = std::mem::take(&mut buf);
         let payload_len = payload.len();
         let send_start = Instant::now();
-        if tx.send((next_idx, buf_doc, payload)).is_err() {
+        let doc = sub_chunks.next_for(doc_ids.get(buf_doc).copied().unwrap_or(0));
+        if tx.send((next_idx, doc, payload)).is_err() {
             // Consumer dropped the receiver — pipeline aborted upstream.
             return Ok(());
         }
@@ -2215,13 +2426,13 @@ fn process_local_rechunk_job(
 fn emit_local_rechunk_payload(
     tx: &std::sync::mpsc::SyncSender<RemoteChunk>,
     next_idx: &mut usize,
-    doc_idx: usize,
+    doc: DocChunk,
     payload: Vec<u8>,
 ) -> bool {
     let payload_len = payload.len();
     let chunk_idx = *next_idx;
     let send_start = Instant::now();
-    if tx.send((chunk_idx, doc_idx, payload)).is_err() {
+    if tx.send((chunk_idx, doc, payload)).is_err() {
         // Consumer dropped the receiver — pipeline aborted upstream.
         return false;
     }
@@ -2247,6 +2458,7 @@ fn emit_local_rechunk_payload(
 fn local_rechunk_loop_parallel(
     files: Vec<PathBuf>,
     sizes: Vec<u64>,
+    doc_ids: Vec<u64>,
     chunk_size_bytes: u64,
     coalesce_enabled: bool,
     tx: &std::sync::mpsc::SyncSender<RemoteChunk>,
@@ -2254,7 +2466,14 @@ fn local_rechunk_loop_parallel(
 ) -> std::result::Result<(), ImportError> {
     let worker_count = rechunk_threads.min(files.len()).max(1);
     if worker_count <= 1 {
-        return local_rechunk_loop(&files, &sizes, chunk_size_bytes, coalesce_enabled, tx);
+        return local_rechunk_loop(
+            &files,
+            &sizes,
+            &doc_ids,
+            chunk_size_bytes,
+            coalesce_enabled,
+            tx,
+        );
     }
 
     let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<LocalRechunkJob>(worker_count);
@@ -2321,6 +2540,10 @@ fn local_rechunk_loop_parallel(
     // `local_rechunk_loop` for why that is sound for coalesced payloads).
     let mut buf: Vec<u8> = Vec::new();
     let mut buf_doc = 0usize;
+    let mut sub_chunks = SubChunkCounter::default();
+    let doc_chunk = |sub_chunks: &mut SubChunkCounter, file_idx: usize| {
+        sub_chunks.next_for(doc_ids.get(file_idx).copied().unwrap_or(0))
+    };
 
     while let Some((file_idx, event_rx)) = event_rxs.pop_front() {
         loop {
@@ -2342,13 +2565,23 @@ fn local_rechunk_loop_parallel(
                     if output_open && result.is_ok() {
                         if !buf.is_empty() {
                             let pending = std::mem::take(&mut buf);
-                            if !emit_local_rechunk_payload(tx, &mut next_idx, buf_doc, pending) {
+                            if !emit_local_rechunk_payload(
+                                tx,
+                                &mut next_idx,
+                                doc_chunk(&mut sub_chunks, buf_doc),
+                                pending,
+                            ) {
                                 output_open = false;
                                 buf.clear();
                             }
                         }
                         if output_open
-                            && !emit_local_rechunk_payload(tx, &mut next_idx, file_idx, payload)
+                            && !emit_local_rechunk_payload(
+                                tx,
+                                &mut next_idx,
+                                doc_chunk(&mut sub_chunks, file_idx),
+                                payload,
+                            )
                         {
                             output_open = false;
                             buf.clear();
@@ -2363,14 +2596,23 @@ fn local_rechunk_loop_parallel(
                         if !coalesce_enabled || unsafe_to_coalesce {
                             if !buf.is_empty() {
                                 let pending = std::mem::take(&mut buf);
-                                if !emit_local_rechunk_payload(tx, &mut next_idx, buf_doc, pending)
-                                {
+                                if !emit_local_rechunk_payload(
+                                    tx,
+                                    &mut next_idx,
+                                    doc_chunk(&mut sub_chunks, buf_doc),
+                                    pending,
+                                ) {
                                     output_open = false;
                                     buf.clear();
                                 }
                             }
                             if output_open
-                                && !emit_local_rechunk_payload(tx, &mut next_idx, file_idx, bytes)
+                                && !emit_local_rechunk_payload(
+                                    tx,
+                                    &mut next_idx,
+                                    doc_chunk(&mut sub_chunks, file_idx),
+                                    bytes,
+                                )
                             {
                                 output_open = false;
                                 buf.clear();
@@ -2380,8 +2622,12 @@ fn local_rechunk_loop_parallel(
                                 && (buf.len() + 1 + bytes.len()) as u64 > chunk_size_bytes
                             {
                                 let pending = std::mem::take(&mut buf);
-                                if !emit_local_rechunk_payload(tx, &mut next_idx, buf_doc, pending)
-                                {
+                                if !emit_local_rechunk_payload(
+                                    tx,
+                                    &mut next_idx,
+                                    doc_chunk(&mut sub_chunks, buf_doc),
+                                    pending,
+                                ) {
                                     output_open = false;
                                     buf.clear();
                                 }
@@ -2398,7 +2644,7 @@ fn local_rechunk_loop_parallel(
                                     if !emit_local_rechunk_payload(
                                         tx,
                                         &mut next_idx,
-                                        buf_doc,
+                                        doc_chunk(&mut sub_chunks, buf_doc),
                                         pending,
                                     ) {
                                         output_open = false;
@@ -2438,7 +2684,12 @@ fn local_rechunk_loop_parallel(
 
     if output_open && result.is_ok() && !buf.is_empty() {
         let pending = std::mem::take(&mut buf);
-        if !emit_local_rechunk_payload(tx, &mut next_idx, buf_doc, pending) {
+        if !emit_local_rechunk_payload(
+            tx,
+            &mut next_idx,
+            doc_chunk(&mut sub_chunks, buf_doc),
+            pending,
+        ) {
             return Ok(());
         }
     }
@@ -2455,6 +2706,7 @@ fn local_rechunk_loop_parallel(
 /// files (`0` disables it).
 fn spawn_local_producer(
     files: Vec<PathBuf>,
+    doc_ids: Vec<u64>,
     chunk_size_bytes: u64,
     channel_capacity: usize,
     coalesce_threshold: usize,
@@ -2500,6 +2752,7 @@ fn spawn_local_producer(
             let result = local_rechunk_loop_parallel(
                 files,
                 sizes,
+                doc_ids,
                 chunk_size_bytes,
                 coalesce_enabled,
                 &tx,
@@ -2685,6 +2938,17 @@ impl<'a> ImportBuilder<'a> {
     /// First-line interpretation for ndjson/jsonl sources: whether line 1 is a
     /// shared `@context` map or the first node. No effect on other formats.
     /// Default: [`FirstLineContextPolicy::Auto`].
+    /// Salt this import's blank-node ids with `namespace` instead of the
+    /// ledger id.
+    ///
+    /// Two imports of the same source tree mint identical blank-node ids iff
+    /// they agree on this value. See [`ImportConfig::skolem_namespace`].
+    #[must_use]
+    pub fn skolem_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.config.skolem_namespace = Some(namespace.into());
+        self
+    }
+
     pub fn ndjson_first_line_context(mut self, policy: FirstLineContextPolicy) -> Self {
         self.config.ndjson_first_line_context = policy;
         self
@@ -2984,19 +3248,33 @@ where
     async {
         // ---- Log effective settings and resolve chunk source ----
         config.log_effective_settings();
-        let chunk_source = match &import_source {
+
+        // Normalize before anything derives an identity from the alias.
+        // `create my/ledger --import` and `create my/ledger:main --import` name
+        // the SAME ledger, so they must salt blank-node ids identically —
+        // otherwise re-importing under the other spelling would mint a
+        // different id for every blank node in the source.
+        let normalized_alias = fluree_db_core::ledger_id::normalize_ledger_id(alias)
+            .unwrap_or_else(|_| alias.to_string());
+        let skolem_namespace = config
+            .skolem_namespace
+            .clone()
+            .unwrap_or_else(|| normalized_alias.clone());
+
+        let (chunk_source, doc_ids) = match &import_source {
             ImportSource::Local(path) => {
-                let cs = resolve_chunk_source(path, config)?;
+                let (cs, doc_ids) = resolve_chunk_source(path, config, &skolem_namespace)?;
                 tracing::info!(
                     estimated_chunks = cs.estimated_len(),
                     streaming = cs.is_streaming(),
                     path = %path.display(),
                     "resolved import chunks"
                 );
-                cs
+                (cs, doc_ids)
             }
             ImportSource::Remote { storage, source } => {
-                let (objects, per_chunk_format) = resolve_remote_objects(storage, source).await?;
+                let (objects, per_chunk_format, doc_ids) =
+                    resolve_remote_objects(storage, source, &skolem_namespace).await?;
                 let count = objects.len();
                 let total_bytes: u64 = objects.iter().map(|o| o.size_bytes).sum();
                 let in_flight = config.effective_max_inflight();
@@ -3014,6 +3292,7 @@ where
                     let producer = spawn_remote_ndjson_producer(
                         Arc::clone(storage),
                         objects,
+                        doc_ids.ids(),
                         config.ndjson_first_line_context,
                         chunk_size_bytes,
                         in_flight,
@@ -3024,7 +3303,7 @@ where
                         in_flight,
                         "resolved remote ndjson import (streamed)"
                     );
-                    ChunkSource::JsonLdStream(producer)
+                    (ChunkSource::JsonLdStream(producer), doc_ids)
                 } else {
                     // Each remote object is fetched whole into memory by the
                     // producer. Warn if any object exceeds the configured chunk
@@ -3048,6 +3327,7 @@ where
                         Arc::clone(storage),
                         objects,
                         per_chunk_format,
+                        doc_ids.ids(),
                         in_flight,
                     );
                     tracing::info!(
@@ -3056,20 +3336,27 @@ where
                         in_flight,
                         "resolved remote import chunks"
                     );
-                    ChunkSource::Remote(producer)
+                    (ChunkSource::Remote(producer), doc_ids)
                 }
             }
             // Virtual (R2RML) source: the provider rides on
             // `config.virtual_source`; the chunk source is an empty placeholder
             // and `run_import_chunks` routes to the virtual producer arm when
             // `config.virtual_source` is set.
-            ImportSource::Virtual => ChunkSource::Files(Vec::new()),
+            //
+            // A virtual source has no source *documents* — it scans a mapped
+            // table, not a tree of files — so its document table is empty. That
+            // is the honest value, not a placeholder: the manifest it feeds
+            // gains no `importSource` rows (there is no file to name), and any
+            // `DocIds::id` call on this path would be indexing a document list
+            // that was never populated, which the `debug_assert` there reports.
+            ImportSource::Virtual => (
+                ChunkSource::Files(Vec::new()),
+                DocIds::new(&skolem_namespace, Vec::new())?,
+            ),
         };
 
         // ---- Phase 1: Create ledger (init nameservice) ----
-        let normalized_alias = fluree_db_core::ledger_id::normalize_ledger_id(alias)
-            .unwrap_or_else(|_| alias.to_string());
-
         // Check if ledger already exists
         let ns_record = nameservice
             .lookup(&normalized_alias)
@@ -3133,6 +3420,7 @@ where
             nameservice,
             &normalized_alias,
             &chunk_source,
+            &doc_ids,
             paths,
             config,
             pipeline_start,
@@ -3241,11 +3529,13 @@ struct IndexBuildInput<'a> {
 ///
 /// Separated from `run_import_pipeline` to enable clean error-path handling:
 /// on failure, the caller keeps the session dir for debugging.
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline_phases<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
     chunk_source: &std::sync::Arc<ChunkSource>,
+    doc_ids: &DocIds,
     paths: PipelinePaths<'_>,
     config: &ImportConfig,
     pipeline_start: Instant,
@@ -3259,6 +3549,7 @@ where
         nameservice,
         alias,
         chunk_source,
+        doc_ids,
         paths.run_dir,
         config,
     )
@@ -3411,11 +3702,13 @@ struct ChunkImportResult {
 }
 
 /// Import all TTL chunks: parallel parse + serial commit + streaming runs.
+#[allow(clippy::too_many_arguments)]
 async fn run_import_chunks<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
     chunk_source: &std::sync::Arc<ChunkSource>,
+    doc_ids: &DocIds,
     run_dir: &Path,
     config: &ImportConfig,
 ) -> std::result::Result<ChunkImportResult, ImportError>
@@ -3856,32 +4149,30 @@ where
     struct ParseChunkContext<'a> {
         shared_alloc: &'a Arc<SharedNamespaceAllocator>,
         prelude: Option<&'a fluree_graph_turtle::splitter::TurtlePrelude>,
-        ledger: &'a str,
         compress: bool,
         spool_dir: &'a Path,
         spool_config: &'a Arc<SpoolConfig>,
     }
 
-    /// `doc` is the index of the source document this chunk was cut from; it
-    /// scopes blank-node labels (see [`RemoteChunk`]). It is deliberately a
-    /// separate argument from `idx`/`t`: the two coincide only when a chunk is
-    /// a whole document.
+    /// `doc` says which source document this chunk was cut from and where
+    /// inside it (see [`DocChunk`]). It is deliberately a separate argument
+    /// from `idx`/`t`: the two coincide only when a chunk is a whole document.
     fn parse_ttl_chunk(
         ttl: &str,
         ctx: &ParseChunkContext<'_>,
         t: i64,
         idx: usize,
-        doc: usize,
+        doc: DocChunk,
     ) -> std::result::Result<ParsedChunk, String> {
-        let scope = doc_scope(doc);
+        let base = doc.skolem_base();
         let parsed = if let Some(prelude) = ctx.prelude {
             parse_chunk_with_prelude(
                 ttl,
                 ctx.shared_alloc,
                 prelude,
                 t,
-                ctx.ledger,
-                &scope,
+                &base,
+                doc.sub_chunk,
                 ctx.compress,
                 Some(ctx.spool_dir),
                 Some(ctx.spool_config),
@@ -3892,8 +4183,8 @@ where
                 ttl,
                 ctx.shared_alloc,
                 t,
-                ctx.ledger,
-                &scope,
+                &base,
+                doc.sub_chunk,
                 ctx.compress,
                 Some(ctx.spool_dir),
                 Some(ctx.spool_config),
@@ -3929,8 +4220,6 @@ where
         // Streaming path: workers receive chunk data from the reader thread's
         // channel. No worker I/O — the reader is the only entity reading from disk.
         // This avoids double I/O that would kill throughput on external drives.
-        let ledger = alias.to_string();
-
         let (reader_rx, prelude, ns_preflight_cell) = match &**chunk_source {
             ChunkSource::Streaming(reader) => (
                 reader.shared_receiver(),
@@ -3960,12 +4249,14 @@ where
             std::result::Result<(usize, ParsedChunk), String>,
         >(num_threads);
 
+        // One streamed file is one document; every chunk shares its scope.
+        let streaming_doc = doc_ids.id(0);
+
         let mut parse_handles = Vec::with_capacity(num_threads);
         for thread_idx in 0..num_threads {
             let work_rx = Arc::clone(&work_rx);
             let result_tx = result_tx.clone();
             let shared_alloc = Arc::clone(&shared_alloc);
-            let ledger = ledger.clone();
             let prelude = prelude.clone();
             let spool_dir = spool_dir.clone();
             let spool_config = Arc::clone(&spool_config);
@@ -3976,7 +4267,6 @@ where
                     let ctx = ParseChunkContext {
                         shared_alloc: &shared_alloc,
                         prelude: Some(&prelude),
-                        ledger: &ledger,
                         compress,
                         spool_dir: &spool_dir,
                         spool_config: &spool_config,
@@ -4006,8 +4296,13 @@ where
                             "about to parse chunk"
                         );
                         // This arm streams a SINGLE local file, so every chunk
-                        // belongs to document 0 and shares one label scope.
-                        match parse_ttl_chunk(&ttl, &ctx, t, idx, STREAMING_DOC_IDX) {
+                        // belongs to the same document; `idx` is its sub-chunk
+                        // index inside that document.
+                        let doc = DocChunk {
+                            doc: streaming_doc,
+                            sub_chunk: u32::try_from(idx).unwrap_or(u32::MAX),
+                        };
+                        match parse_ttl_chunk(&ttl, &ctx, t, idx, doc) {
                             Ok(parsed) => {
                                 if result_tx.send(Ok((idx, parsed))).is_err() {
                                     break;
@@ -4203,7 +4498,6 @@ where
         // throttle). At least one worker is always used — zero would deadlock the
         // producer sending into an unread channel.
         let num_threads = num_threads.max(1);
-        let ledger = alias.to_string();
 
         // Both producers expose `(rx, error_rx, join_handle)` with identical EOF
         // semantics: the channel closing is not "success" on its own — we must
@@ -4241,7 +4535,6 @@ where
             let work_rx = Arc::clone(&remote_rx);
             let result_tx = result_tx.clone();
             let shared_alloc = Arc::clone(&shared_alloc);
-            let ledger = ledger.clone();
             let spool_dir = spool_dir.clone();
             let spool_config = Arc::clone(&spool_config);
 
@@ -4253,7 +4546,6 @@ where
                         // Remote objects are whole files with embedded preludes —
                         // parse_chunk extracts prelude per-chunk.
                         prelude: None,
-                        ledger: &ledger,
                         compress,
                         spool_dir: &spool_dir,
                         spool_config: &spool_config,
@@ -4435,6 +4727,7 @@ where
                     trig_content,
                     storage,
                     alias,
+                    &doc.skolem_base(),
                     compress,
                     Some(&spool_dir),
                     Some(&spool_config),
@@ -4448,12 +4741,14 @@ where
                 published_codes.extend(state.ns_registry.all_codes());
                 r
             } else {
+                let skolem_base = doc.skolem_base();
                 let parsed = if chunk_source.is_jsonld(idx) {
                     parse_jsonld_chunk(
                         &content,
                         &shared_alloc,
                         t,
-                        alias,
+                        &skolem_base,
+                        doc.sub_chunk,
                         compress,
                         Some(&spool_dir),
                         Some(&spool_config),
@@ -4464,8 +4759,8 @@ where
                         &content,
                         &shared_alloc,
                         t,
-                        alias,
-                        &doc_scope(doc),
+                        &skolem_base,
+                        doc.sub_chunk,
                         compress,
                         Some(&spool_dir),
                         Some(&spool_config),
@@ -4561,9 +4856,9 @@ where
         let has_nquads = chunk_source.has_nquads();
         let has_jsonld = chunk_source.has_jsonld();
         if estimated_total > 0 && num_threads > 0 && !has_trig && !has_nquads && !has_jsonld {
-            let ledger = alias.to_string();
-
             let next_chunk = Arc::new(AtomicUsize::new(0));
+            // One whole file per chunk, so chunk index == document index.
+            let file_doc_ids: Arc<Vec<u64>> = Arc::new(doc_ids.ids());
             let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
                 std::result::Result<(usize, ParsedChunk), String>,
             >(num_threads);
@@ -4577,7 +4872,7 @@ where
                 let next_chunk = Arc::clone(&next_chunk);
                 let result_tx = result_tx.clone();
                 let shared_alloc = Arc::clone(&shared_alloc);
-                let ledger = ledger.clone();
+                let file_doc_ids = Arc::clone(&file_doc_ids);
                 let chunk_source = Arc::clone(chunk_source);
                 let permit_rx_ref = Arc::clone(&permit_rx);
                 let permit_tx_ref = permit_tx.clone();
@@ -4591,7 +4886,6 @@ where
                         let ctx = ParseChunkContext {
                             shared_alloc: &shared_alloc,
                             prelude: None,
-                            ledger: &ledger,
                             compress,
                             spool_dir: &spool_dir,
                             spool_config: &spool_config,
@@ -4620,7 +4914,8 @@ where
 
                             // `Files` reads one whole file per chunk.
                             let t = (idx + 1) as i64;
-                            match parse_ttl_chunk(&ttl, &ctx, t, idx, idx) {
+                            let doc = DocChunk::whole(file_doc_ids[idx]);
+                            match parse_ttl_chunk(&ttl, &ctx, t, idx, doc) {
                                 Ok(parsed) => {
                                     let _ = permit_tx_ref.send(());
                                     if result_tx.send(Ok((idx, parsed))).is_err() {
@@ -4688,6 +4983,7 @@ where
                         trig_content,
                         storage,
                         alias,
+                        &DocChunk::whole(doc_ids.id(i)).skolem_base(),
                         compress,
                         Some(&spool_dir),
                         Some(&spool_config),
@@ -4703,26 +4999,28 @@ where
                     published_codes.extend(state.ns_registry.all_codes());
                     r
                 } else {
-                    // TTL and JSON-LD: parse via shared allocator, then finalize.
+                    // TTL and JSON-LD: parse via shared allocator, then
+                    // finalize. `Files` reads one whole file per chunk.
+                    let skolem_base = DocChunk::whole(doc_ids.id(i)).skolem_base();
                     let parsed = if chunk_source.is_jsonld(i) {
                         parse_jsonld_chunk(
                             &content,
                             &shared_alloc,
                             t,
-                            alias,
+                            &skolem_base,
+                            0,
                             compress,
                             Some(&spool_dir),
                             Some(&spool_config),
                             i,
                         )
                     } else {
-                        // `Files` reads one whole file per chunk.
                         parse_chunk(
                             &content,
                             &shared_alloc,
                             t,
-                            alias,
-                            &doc_scope(i),
+                            &skolem_base,
+                            0,
                             compress,
                             Some(&spool_dir),
                             Some(&spool_config),
@@ -6605,6 +6903,88 @@ mod resource_model_tests {
         }
     }
 
+    // A duplicate document key is unreachable through `discover_chunks`
+    // (`read_dir` yields each entry once), so exercise the guard directly. The
+    // one arm that CAN produce it — caller-supplied `OrderedObjects` — is
+    // covered end-to-end by `duplicate_remote_addresses_abort_the_import`.
+    #[test]
+    fn duplicate_document_keys_are_refused_by_name() {
+        let err = DocIds::new(
+            "l:main",
+            vec!["a.ttl".into(), "sub/b.ttl".into(), "a.ttl".into()],
+        )
+        .expect_err("two documents with one key must not build a DocIds");
+        let msg = err.to_string();
+        assert!(msg.contains("a.ttl"), "must name the colliding key: {msg}");
+        assert!(
+            !msg.contains("sub/b.ttl"),
+            "must not implicate the innocent document: {msg}"
+        );
+    }
+
+    #[test]
+    fn distinct_document_keys_build_distinct_ids() {
+        let docs =
+            DocIds::new("l:main", vec!["a.ttl".into(), "sub/a.ttl".into()]).expect("distinct keys");
+        assert_ne!(
+            docs.id(0),
+            docs.id(1),
+            "the same file name under a different directory is a different document"
+        );
+    }
+
+    // Anonymous-node ids are `(doc, sub_chunk, counter)`; the producer supplies
+    // the first two. A counter that reset outside its document's run would
+    // re-issue sub-chunk 0 and merge two documents' anonymous nodes.
+    #[test]
+    fn sub_chunk_indexes_restart_per_document() {
+        let mut counter = SubChunkCounter::default();
+        assert_eq!(
+            counter.next_for(7),
+            DocChunk {
+                doc: 7,
+                sub_chunk: 0
+            }
+        );
+        assert_eq!(
+            counter.next_for(7),
+            DocChunk {
+                doc: 7,
+                sub_chunk: 1
+            }
+        );
+        assert_eq!(
+            counter.next_for(9),
+            DocChunk {
+                doc: 9,
+                sub_chunk: 0
+            }
+        );
+        assert_eq!(
+            counter.next_for(9),
+            DocChunk {
+                doc: 9,
+                sub_chunk: 1
+            }
+        );
+    }
+
+    #[test]
+    fn local_doc_key_is_relative_to_the_import_root() {
+        let root = Path::new("/data/corpus");
+        assert_eq!(
+            local_doc_key(root, Path::new("/data/corpus/a.ttl")),
+            "a.ttl"
+        );
+        assert_eq!(
+            local_doc_key(root, Path::new("/data/corpus/sub/a.ttl")),
+            format!("sub{}a.ttl", std::path::MAIN_SEPARATOR)
+        );
+        // Outside the root (never produced by discovery) falls back to the
+        // file name rather than leaking an absolute path into the id.
+        assert_eq!(local_doc_key(root, Path::new("/elsewhere/a.ttl")), "a.ttl");
+    }
+
     #[test]
     fn explicit_thread_count_is_honored_uncapped() {
         let _env = EnvGuard::clear_overrides();
@@ -6749,6 +7129,7 @@ mod resource_model_tests {
             .iter()
             .map(|p| std::fs::metadata(p).expect("metadata").len())
             .collect();
+        let doc_ids: Vec<u64> = (0..files.len() as u64).map(|i| i + 1).collect();
         let chunk_size_bytes = 1024;
         let coalesce_enabled = true;
 
@@ -6756,6 +7137,7 @@ mod resource_model_tests {
         local_rechunk_loop(
             &files,
             &sizes,
+            &doc_ids,
             chunk_size_bytes,
             coalesce_enabled,
             &serial_tx,
@@ -6768,6 +7150,7 @@ mod resource_model_tests {
         local_rechunk_loop_parallel(
             files,
             sizes,
+            doc_ids,
             chunk_size_bytes,
             coalesce_enabled,
             &parallel_tx,
