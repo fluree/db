@@ -1804,6 +1804,17 @@ pub mod db {
     /// db:ledgerIndex - nameservice field: pointer to latest ledger index root
     pub const LEDGER_INDEX: &str = "ledgerIndex";
 
+    /// db:importSource - bulk-import manifest: the document a blank-node scope
+    /// was minted from, as a path relative to the import root (or a remote
+    /// address relative to its listing prefix).
+    ///
+    /// Written into the `txn-meta` graph, one triple per source document, with
+    /// the scope's blank node as subject:
+    /// `_:fdb-d<scope> db:importSource "sub/dir/data.ttl"`. Every id minted
+    /// from that document starts with that scope, so it is what turns an
+    /// opaque `_:fdb-…` back into the file it came from.
+    pub const IMPORT_SOURCE: &str = "importSource";
+
     // ========================================================================
     // Edge-annotation system predicates (durable attachment encoding)
     // ========================================================================

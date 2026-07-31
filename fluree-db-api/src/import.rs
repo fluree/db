@@ -803,9 +803,16 @@ type RemoteChunk = (usize, DocChunk, Vec<u8>);
 /// for remote ones — so every arm agrees on what a document key is. Indexed the
 /// same way `per_chunk_format` and the rechunk `sizes` are.
 ///
+/// Doubles as the import manifest: [`DocIds::manifest`] hands the
+/// `scope → key` mapping to the `txn-meta` graph builder, which is what makes a
+/// minted `_:fdb-d…` id traceable back to the document it came from.
+///
 #[derive(Debug)]
 pub(crate) struct DocIds {
-    /// `skolem::doc_id` of each document key, in source order.
+    /// Document keys in source order — paths relative to the import root, or
+    /// remote addresses relative to the listing prefix.
+    keys: Vec<String>,
+    /// `skolem::doc_id` of each key, same order.
     ids: Vec<u64>,
 }
 
@@ -839,7 +846,7 @@ impl DocIds {
             seen.insert(id, idx);
             ids.push(id);
         }
-        Ok(Self { ids })
+        Ok(Self { keys, ids })
     }
 
     /// Hashed id of document `idx`.
@@ -855,6 +862,30 @@ impl DocIds {
     fn ids(&self) -> Vec<u64> {
         self.ids.clone()
     }
+
+    /// The import manifest: `(blank-node local name of the scope, document
+    /// key)` for every document.
+    ///
+    /// The subject is the scope's own blank node — `fdb-d<scope>`, the prefix
+    /// every id minted from that document shares — so a reader holding an
+    /// opaque `_:fdb-d…-label` recovers the source with
+    /// `fluree_db_core::skolem::split_doc_scope` and one lookup.
+    fn manifest(&self) -> Vec<(String, String)> {
+        self.ids
+            .iter()
+            .zip(&self.keys)
+            .map(|(&id, key)| {
+                (
+                    format!(
+                        "{}{}",
+                        fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX,
+                        fluree_db_core::skolem::doc_scope(id)
+                    ),
+                    key.clone(),
+                )
+            })
+            .collect()
+    }
 }
 
 /// Derive a document key for a local path: its location relative to the import
@@ -863,6 +894,10 @@ impl DocIds {
 /// Relative rather than absolute so that ids depend on the shape of the import,
 /// not on where the tree happens to be mounted — the same directory imported
 /// from `/tmp/x` and `/data/x` mints the same ids.
+///
+/// [`discover_chunks`] does not recurse, so a local key is a bare file name in
+/// practice; the relative form is what remote `Prefix` listings need, and what
+/// keeps the two arms describing documents the same way.
 fn local_doc_key(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .ok()
@@ -4120,6 +4155,7 @@ where
             (fluree::DB, db::ASSERTS),
             (fluree::DB, db::RETRACTS),
             (fluree::DB, db::PREVIOUS),
+            (fluree::DB, db::IMPORT_SOURCE),
         ] {
             spool_config
                 .predicate_alloc
@@ -5127,6 +5163,10 @@ where
         let p_previous = spool_config
             .predicate_alloc
             .get_or_insert_parts(fluree::DB, db::PREVIOUS);
+        let p_import_source = spool_config
+            .predicate_alloc
+            .get_or_insert_parts(fluree::DB, db::IMPORT_SOURCE);
+        let manifest = doc_ids.manifest();
 
         // txn-meta is always pre-seeded as dict_id=0 in the graph allocator
         // (via SharedDictAllocator::new_graph), so g_id = dict_id + 1 = 1.
@@ -5154,6 +5194,24 @@ where
             let mut meta_strings = ChunkStringDict::new();
             let mut records: Vec<RunRecord> = Vec::with_capacity(commit_metas.len() * 8);
 
+            let record = |s_id: u64,
+                          p_id: u32,
+                          o_kind: ObjKind,
+                          o_key: ObjKey,
+                          dt: DatatypeDictId,
+                          t: u32| RunRecord {
+                g_id,
+                s_id: SubjectId::from_u64(s_id),
+                p_id,
+                dt: dt.as_u16(),
+                o_kind: o_kind.as_u8(),
+                op: 1, // assert
+                o_key: o_key.as_u64(),
+                t,
+                lang_id: 0,
+                i: LIST_INDEX_NONE,
+            };
+
             for cm in &commit_metas {
                 let commit_s = meta_subjects
                     .get_or_insert(namespaces::FLUREE_COMMIT, cm.commit_hash_hex.as_bytes());
@@ -5161,18 +5219,7 @@ where
 
                 let mut push =
                     |s_id: u64, p_id: u32, o_kind: ObjKind, o_key: ObjKey, dt: DatatypeDictId| {
-                        records.push(RunRecord {
-                            g_id,
-                            s_id: SubjectId::from_u64(s_id),
-                            p_id,
-                            dt: dt.as_u16(),
-                            o_kind: o_kind.as_u8(),
-                            op: 1, // assert
-                            o_key: o_key.as_u64(),
-                            t,
-                            lang_id: 0,
-                            i: LIST_INDEX_NONE,
-                        });
+                        records.push(record(s_id, p_id, o_kind, o_key, dt, t));
                     };
 
                 // db:address — commit hash hex as LEX_ID string
@@ -5246,6 +5293,29 @@ where
                 }
             }
 
+            // Import manifest: one triple per source document, mapping the
+            // blank-node scope every id from that document shares back to the
+            // document itself. Without it a minted `_:fdb-d…` is unresolvable
+            // — the scope is a hash, and nothing else in the ledger records
+            // what was hashed.
+            //
+            // Stamped at t=1: the manifest describes the import as a whole,
+            // and t=1 is the first commit any reader of the ledger can see.
+            let manifest_count = manifest.len();
+            for (scope_label, doc_key) in &manifest {
+                let scope_s =
+                    meta_subjects.get_or_insert(namespaces::BLANK_NODE, scope_label.as_bytes());
+                let key_str_id = meta_strings.get_or_insert(doc_key.as_bytes());
+                records.push(record(
+                    scope_s,
+                    p_import_source,
+                    ObjKind::LEX_ID,
+                    ObjKey::encode_u32_id(key_str_id),
+                    DatatypeDictId::STRING,
+                    1,
+                ));
+            }
+
             let meta_records_count = records.len();
             let commit_count = commit_metas.len();
 
@@ -5280,6 +5350,7 @@ where
             tracing::info!(
                 meta_chunk_idx,
                 commit_count,
+                manifest_count,
                 meta_records_count,
                 "txn-meta meta chunk built"
             );

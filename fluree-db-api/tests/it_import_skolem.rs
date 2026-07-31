@@ -472,3 +472,79 @@ async fn duplicate_remote_addresses_abort_the_import() {
         "the error must name the colliding documents, got: {msg}"
     );
 }
+
+// ============================================================================
+// Import manifest
+// ============================================================================
+
+/// A minted id is a hash, so on its own it says nothing about where it came
+/// from. The import records the mapping in the `txn-meta` graph: one
+/// `db:importSource` triple per document, subject = the blank-node scope every
+/// id from that document shares. Together with `skolem::split_doc_scope`, that
+/// turns an opaque `_:fdb-d…-label` back into a file name.
+#[tokio::test]
+async fn import_manifest_maps_blank_node_scopes_back_to_documents() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    write(data_dir.path(), "a.ttl", DOC);
+    write(
+        data_dir.path(),
+        "b.ttl",
+        "@prefix schema: <http://schema.org/> .\n\
+         _:shared schema:name \"Other document\" .\n",
+    );
+
+    let (fluree, ledger) = import_doc(
+        db_dir.path(),
+        data_dir.path(),
+        "test/skolem-manifest:main",
+        None,
+    )
+    .await;
+
+    let manifest = fluree
+        .query_connection(&json!({
+            "from": "test/skolem-manifest:main#txn-meta",
+            "select": ["?doc", "?source"],
+            "where": {"@id": "?doc", "https://ns.flur.ee/db#importSource": "?source"}
+        }))
+        .await
+        .expect("txn-meta query");
+    let rows = manifest.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let entries: Vec<(String, String)> = rows
+        .as_array()
+        .expect("array result")
+        .iter()
+        .filter_map(|row| {
+            let cols = row.as_array()?;
+            Some((
+                cols.first()?.as_str()?.into(),
+                cols.get(1)?.as_str()?.into(),
+            ))
+        })
+        .collect();
+
+    let sources: std::collections::BTreeSet<&str> =
+        entries.iter().map(|(_, src)| src.as_str()).collect();
+    assert_eq!(
+        sources,
+        ["a.ttl", "b.ttl"].into_iter().collect(),
+        "every source document must appear, keyed relative to the import root"
+    );
+
+    // The round trip a reader actually makes: minted id → scope → document.
+    let bnode = sole_blank_id(&fluree, &ledger, "Shared").await;
+    let local = bnode.strip_prefix("_:").expect("blank-node id");
+    let (scope, label) =
+        fluree_db_core::skolem::split_doc_scope(local).expect("minted id must carry a doc scope");
+    assert_eq!(label, "shared", "the source label survives the mint");
+    let source = entries
+        .iter()
+        .find(|(doc, _)| doc.strip_prefix("_:fdb-") == Some(scope))
+        .map(|(_, src)| src.as_str());
+    assert_eq!(
+        source,
+        Some("a.ttl"),
+        "the manifest must resolve {bnode} back to its document; entries: {entries:?}"
+    );
+}
