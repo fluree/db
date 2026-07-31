@@ -1,21 +1,22 @@
 //! BM25 full-text search index commands.
 //!
-//! BM25 is a Fluree *graph source* (like Iceberg/R2RML). Index **creation** and
-//! **sync** have no HTTP route or other shipped entrypoint today — they are
-//! Rust-API-only operations (`create_full_text_index` / `sync_bm25_index`).
-//! These commands expose that API so an index can be built and kept fresh
-//! reproducibly, running **in-process** against local storage via
-//! [`build_fluree`]. Native file storage coordinates writers with a per-file
+//! BM25 is a Fluree *graph source* (like Iceberg/R2RML). These commands run
+//! **in-process** against local storage via [`build_fluree`], rather than
+//! calling a server. Native file storage coordinates writers with a per-file
 //! advisory flock (not an exclusive whole-store lock), so `create`/`drop`/`sync`
 //! work under `docker exec` against a directory a server is already serving:
 //! each writes new content-addressed snapshots plus/against a graph-source
 //! nameservice record (no key the server writes). `sync` is incremental
 //! (watermark-based) and lets a maintenance job keep an index current as its
-//! source ledger is materialized — there is no HTTP `sync`, and the standalone
-//! `fluree-search-httpd` is read-only, so this CLI is the way to advance an
-//! index. Querying the resulting index is done separately — through
-//! `fluree-search-httpd` (`POST /v1/search`, reading the same storage), or
-//! embedded via an FQL `f:searchText` query.
+//! source ledger is materialized.
+//!
+//! A running server exposes the same create and sync operations over HTTP
+//! (`POST /v1/fluree/bm25/create`, `POST /v1/fluree/bm25/sync`), which is the
+//! route to take against a remote deployment; these commands are the local /
+//! `docker exec` path and do not go through it. The standalone
+//! `fluree-search-httpd` is read-only either way. Querying the resulting index
+//! is done separately — through `fluree-search-httpd` (`POST /v1/search`,
+//! reading the same storage), or embedded via an FQL `f:searchText` query.
 
 use crate::cli::Bm25Action;
 use crate::context::build_fluree;

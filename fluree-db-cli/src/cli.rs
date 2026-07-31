@@ -402,11 +402,11 @@ pub enum Commands {
 
     /// Create, list, sync, or drop BM25 full-text search indexes (graph sources).
     ///
-    /// BM25 index creation has no HTTP endpoint today — it is a Rust-API-only
-    /// operation (`Bm25CreateConfig` + `create_full_text_index`). These commands
-    /// expose it: they run in-process against local storage (no server
-    /// round-trip), so they work under `docker exec` against a running server's
-    /// data directory. Querying the resulting index is done either through the
+    /// These commands run in-process against local storage rather than calling a
+    /// server, so they work under `docker exec` against a running server's data
+    /// directory. A server also exposes create and sync over HTTP
+    /// (`POST /v1/fluree/bm25/create`, `POST /v1/fluree/bm25/sync`) for driving a
+    /// remote deployment. Querying the resulting index is done either through the
     /// standalone `fluree-search-httpd` service (`POST /v1/search`) or, embedded,
     /// via an FQL `f:searchText` query.
     ///

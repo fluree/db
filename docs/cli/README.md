@@ -68,6 +68,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`show`](show.md) | Show decoded commit contents (flakes with resolved IRIs) |
 | [`index`](index.md) | Build or update the binary index (incremental) |
 | [`reindex`](reindex.md) | Full reindex from commit history |
+| [`bm25`](bm25.md) | Manage BM25 full-text search indexes (create, list, sync, drop) |
 
 ### Remote Sync
 
