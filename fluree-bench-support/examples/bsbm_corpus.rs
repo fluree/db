@@ -20,7 +20,9 @@ fn main() {
         .next()
         .and_then(|a| a.parse().ok())
         .expect("usage: bsbm_corpus <n_products> <out.ttl>");
-    let out = args.next().expect("usage: bsbm_corpus <n_products> <out.ttl>");
+    let out = args
+        .next()
+        .expect("usage: bsbm_corpus <n_products> <out.ttl>");
 
     let data = fluree_bench_support::gen::bsbm::generate_dataset(n_products);
     let turtle = fluree_bench_support::gen::bsbm::bsbm_data_to_turtle(&data);

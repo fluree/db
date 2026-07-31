@@ -338,6 +338,13 @@ bench_lock_acquire() {
 	# PIPE is in the list because it is not hypothetical: piping a run into
 	# `head` kills the shell before an EXIT trap alone would fire, and the
 	# stale lock then blocks the other agent. Found by testing exactly that.
+	#
+	# This trap REPLACES any EXIT trap the caller installed — bash has one
+	# EXIT slot per shell. Today's callers (run-matrix, differential) have
+	# none. If a script with its own EXIT guard ever takes the lock (e.g.
+	# check-correctness's ABORTED-is-not-a-pass trap), chain the two bodies
+	# in one trap — installing this one as-is would silently delete a
+	# no-silent-pass guard.
 	trap 'bench_lock_release' EXIT INT TERM PIPE HUP
 	info "bench lock acquired by $holder"
 }

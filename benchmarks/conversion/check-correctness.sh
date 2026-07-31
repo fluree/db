@@ -178,7 +178,16 @@ if [ "$biggest" -gt "$ISO_LIMIT" ]; then
 	printf '  SKIPPED (named): independent isomorphism NOT run — largest cell has\n' >&2
 	printf '  %s statements, above the %s limit. Level 1 (normalized cross-tool\n' "$biggest" "$ISO_LIMIT" >&2
 	printf '  diff) DID run and covers everything except blank-node structure;\n' >&2
-	printf '  this corpus has none. Raise FLUREE_BENCH_MAX_ISOMORPHISM_STATEMENTS\n' >&2
+	# The blank-node sentence is derived, not asserted: printing "has none"
+	# unconditionally would state a falsehood the first time this points at a
+	# corpus that does — inside the one message whose job is honesty about
+	# what was not verified.
+	if grep -qm1 '_:' "$RUN_DIR"/*.out.nt 2>/dev/null; then
+		printf '  this corpus HAS blank nodes, whose structure is therefore\n' >&2
+		printf '  UNVERIFIED. Raise FLUREE_BENCH_MAX_ISOMORPHISM_STATEMENTS\n' >&2
+	else
+		printf '  this corpus has none. Raise FLUREE_BENCH_MAX_ISOMORPHISM_STATEMENTS\n' >&2
+	fi
 	printf '  to force it, and expect tens of minutes per pair.\n' >&2
 elif ! python3 -c 'import rdflib' >/dev/null 2>&1; then
 	printf '  SKIPPED (named): rdflib not installed — the independent isomorphism\n' >&2

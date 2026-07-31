@@ -315,9 +315,11 @@ jq -n \
 	--argjson publishable "$PUBLISHABLE" --argjson runs "$RUNS" \
 	--argjson load_per_core "$LOAD_PER_CORE" --argjson load_contaminated "$LOAD_CONTAMINATED" \
 	--arg git_sha "$(git -C "$REPO_ROOT" rev-parse HEAD)" \
+	--argjson cores "$(host_cores)" \
 	--argjson eligible "$(printf '%s\n' "${ELIGIBLE[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
 	--argjson refused "$(printf '%s\n' "${REFUSED[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
 	'{run_id:$run_id, corpus:$corpus, host_class:$host, publishable:$publishable,
+	  available_parallelism:$cores,
 	  load_per_core:$load_per_core, load_contaminated:$load_contaminated,
 	  runs_per_cell:$runs, warmup_discarded:1,
 	  clock:"wall (bash EPOCHREALTIME builtin; no subprocess inside the measured interval)",
