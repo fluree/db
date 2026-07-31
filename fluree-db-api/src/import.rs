@@ -377,6 +377,15 @@ impl ImportConfig {
             // buffers + index build and divide the rest across the working set;
             // floor at 16MB (still worth a commit), cap at 128MB (continuous with
             // the large-budget floor at the 2GB boundary).
+            //
+            // SHARED-PATH BLAST RADIUS: this branch resizes chunks for EVERY text
+            // import (Turtle/TriG/JSON-LD), not just materialize — a 512MB budget
+            // goes 128MB → ~51MB chunks (≈2.5× the commit count, a different ledger
+            // shape for the same input). The default budget is ~80% of RAM, so most
+            // hosts land ≥2048MB (the branch above) and are unaffected; what changes
+            // is containers under ~2.5GB and any explicit `--memory-budget-mb` below
+            // 2GB (which every finalizer-touching test in this repo passes, e.g.
+            // 256MB). Sizing only — never correctness.
             let working = budget_mb as f64 * 0.6 / denominator;
             (working.floor() as usize).clamp(16, 128)
         }
