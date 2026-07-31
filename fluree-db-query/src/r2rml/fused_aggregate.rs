@@ -25,6 +25,9 @@
 //! multi-valued — the operator falls back to the exact normal pipeline, so
 //! general graph-source semantics are unchanged.
 
+use rustc_hash::FxHasher;
+use std::hash::{Hash, Hasher};
+
 use crate::aggregate::NumericAcc;
 use crate::binding::{Batch, Binding, BindingRow};
 use crate::context::ExecutionContext;
@@ -649,7 +652,7 @@ struct GroupCol {
 }
 
 /// Supported GROUP BY key column kinds (slice 3).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum GKind {
     String,
     Integer,
@@ -674,6 +677,108 @@ enum GKey {
     Str(String),
     Int(i128),
     Null,
+}
+
+/// N1 kill switch (`FLUREE_FUSED_VECTOR_FOLD`, default **on**). Off (`0`/`false`/
+/// `off`/`no`) restores the byte-identical `HashMap<Vec<GKey>, Vec<Acc>>` fold that
+/// allocates + clones a fresh owned key every row. Read once per process.
+fn vector_fold_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_VECTOR_FOLD"))
+}
+
+/// N1: a BORROWED view of one composite-group-key component, read straight from
+/// the scanned batch (or the resolver's owned dim GKeys) with no per-row `String`
+/// clone. A null component drops the row before it reaches the key (matching
+/// `assemble_group_key`), so `Null` is never a key component — hence only the two
+/// value variants. Used to probe the dense group dict; the owned [`GKey`] is
+/// materialized only when a NEW group is inserted.
+#[derive(Clone, Copy)]
+enum GKeyRef<'a> {
+    Str(&'a str),
+    Int(i128),
+}
+
+impl<'a> GKeyRef<'a> {
+    /// Borrow an owned dim GKey (from the FK→GKey resolver). `None` for `GKey::Null`
+    /// so the row drops, exactly as `assemble_group_key` drops on a null slot.
+    fn from_owned(o: &'a GKey) -> Option<GKeyRef<'a>> {
+        match o {
+            GKey::Str(s) => Some(GKeyRef::Str(s.as_str())),
+            GKey::Int(i) => Some(GKeyRef::Int(*i)),
+            GKey::Null => None,
+        }
+    }
+
+    /// Feed this component into a hasher (used by [`hash_key_refs`], the borrowed
+    /// probe). Must stay in lockstep with the owned per-component hashing in
+    /// [`gkeys_hash`] — both write a `Str`/`Int` tag byte then the value, so no
+    /// dependence on `GKey`'s derived `Hash`. The tag keeps the domains disjoint.
+    fn hash_into<H: Hasher>(&self, h: &mut H) {
+        match self {
+            GKeyRef::Str(s) => {
+                0u8.hash(h);
+                s.hash(h);
+            }
+            GKeyRef::Int(i) => {
+                1u8.hash(h);
+                i.hash(h);
+            }
+        }
+    }
+
+    /// Equality against a stored owned key component (the dict's probe predicate).
+    fn eq_owned(&self, o: &GKey) -> bool {
+        match (self, o) {
+            (GKeyRef::Str(a), GKey::Str(b)) => *a == b.as_str(),
+            (GKeyRef::Int(a), GKey::Int(b)) => *a == *b,
+            _ => false,
+        }
+    }
+
+    /// Materialize the owned key component (called once per group, on insert).
+    fn to_owned_key(self) -> GKey {
+        match self {
+            GKeyRef::Str(s) => GKey::Str(s.to_string()),
+            GKeyRef::Int(i) => GKey::Int(i),
+        }
+    }
+}
+
+/// Hash an OWNED composite key — the dict's resize-rehash function. This MUST be
+/// value-identical to [`hash_key_refs`] for the equal borrowed key: a `HashTable`
+/// rehashes every entry through this closure when it grows, and the per-row probe
+/// hashes through `hash_key_refs`; if the two disagreed, a grow would re-bucket a
+/// key away from where the probe looks and split its group. Kept in lockstep by
+/// construction (same length prefix, same per-component tag + value).
+fn gkeys_hash(k: &[GKey]) -> u64 {
+    let mut h = FxHasher::default();
+    k.len().hash(&mut h);
+    for g in k {
+        match g {
+            GKey::Str(s) => {
+                0u8.hash(&mut h);
+                s.as_str().hash(&mut h);
+            }
+            GKey::Int(i) => {
+                1u8.hash(&mut h);
+                i.hash(&mut h);
+            }
+            GKey::Null => 2u8.hash(&mut h),
+        }
+    }
+    h.finish()
+}
+
+/// Hash a BORROWED composite key — the dict's per-row probe. Mirror of
+/// [`gkeys_hash`] (see its note on why they must agree).
+fn hash_key_refs(scratch: &[GKeyRef]) -> u64 {
+    let mut h = FxHasher::default();
+    scratch.len().hash(&mut h);
+    for c in scratch {
+        c.hash_into(&mut h);
+    }
+    h.finish()
 }
 
 /// W4-2: the source of one GROUP BY key position in a fused fold, in SPARQL order.
@@ -757,6 +862,34 @@ impl GroupCol {
                     _ => GKey::Null,
                 },
                 _ => GKey::Null,
+            },
+        }
+    }
+
+    /// N1: BORROWED read of this column's group-key value at a row — the zero-clone
+    /// twin of [`GroupCol::key_at`]. Returns `None` exactly where `key_at` returns
+    /// `GKey::Null` (a null/absent/wrong-typed cell), so the vector fold drops the
+    /// same rows and groups identically; the value variants match `key_at` bit for
+    /// bit (including the `NUMBER(n,0)` physical-Decimal integer coercion).
+    fn key_ref_at<'a>(&self, col: Option<&'a Column>, row: usize) -> Option<GKeyRef<'a>> {
+        let c = col?;
+        match self.kind {
+            GKind::String => match c {
+                Column::String(v) => v.get(row)?.as_deref().map(GKeyRef::Str),
+                _ => None,
+            },
+            GKind::Integer => match c {
+                Column::Int64(v) => v.get(row).and_then(|o| *o).map(|i| GKeyRef::Int(i as i128)),
+                Column::Int32(v) => v.get(row).and_then(|o| *o).map(|i| GKeyRef::Int(i as i128)),
+                Column::Decimal { values, scale, .. } => match values.get(row).and_then(|o| *o) {
+                    Some(unscaled) if *scale == 0 => Some(GKeyRef::Int(unscaled)),
+                    Some(unscaled) if *scale > 0 => match pow10(i64::from(*scale)) {
+                        Some(d) if unscaled % d == 0 => Some(GKeyRef::Int(unscaled / d)),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
             },
         }
     }
@@ -1183,6 +1316,16 @@ impl Operator for FusedR2rmlAggregateOperator {
         // GROUP BY keys one set per group. An exact i128 sum that would overflow
         // sets `overflowed` and the whole query re-runs on the exact pipeline.
         let mut implicit: Vec<Acc> = folds.iter().map(Acc::for_fold).collect();
+        // N1 vector fold (default): `dict` interns the composite group key to a dense
+        // id; `group_accs[id]` holds that group's typed accumulators. A `HashTable`
+        // (not `HashMap`) so BOTH probe and resize-rehash go through `gkeys_hash` —
+        // the borrowed probe hash and the owned rehash hash are the SAME function, so
+        // a table grow cannot re-bucket a key away from its probe (the split-group
+        // bug a plain `HashMap` + `insert_hashed_nocheck` hits on resize). `groups`
+        // is the OFF-path (`FLUREE_FUSED_VECTOR_FOLD=0`) byte-identical owned-key map.
+        let vfold = vector_fold_enabled();
+        let mut dict: hashbrown::HashTable<(Vec<GKey>, u32)> = hashbrown::HashTable::new();
+        let mut group_accs: Vec<Vec<Acc>> = Vec::new();
         let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
             std::collections::HashMap::new();
         let mut overflowed = false;
@@ -1193,7 +1336,11 @@ impl Operator for FusedR2rmlAggregateOperator {
             // typed before OOM.
             ctx.checkpoint()?;
             let batch = batch?;
-            let groups_before = groups.len();
+            let groups_before = if vfold {
+                group_accs.len()
+            } else {
+                groups.len()
+            };
             let fold_cols: Vec<Option<&Column>> = folds
                 .iter()
                 .map(|f| match f {
@@ -1223,6 +1370,10 @@ impl Operator for FusedR2rmlAggregateOperator {
                         .collect()
                 })
                 .collect();
+            // N1: reused per-batch scratch for the borrowed composite key (borrows
+            // this batch's columns + the resolver's dim GKeys); cleared each row so
+            // its allocation is paid once per batch, not once per row.
+            let mut scratch: Vec<GKeyRef> = Vec::with_capacity(gcols.len());
             for row in 0..batch.num_rows {
                 // Row-validity (R2RML star row-drop): the subject and every
                 // predicate's object column must be non-null.
@@ -1283,18 +1434,66 @@ impl Operator for FusedR2rmlAggregateOperator {
                     } else {
                         None
                     };
-                    let Some(key) = Self::assemble_group_key(
-                        &resolved.group_key_plan,
-                        gcols,
-                        &key_cols,
-                        dim_gkeys,
-                        row,
-                    ) else {
-                        continue;
-                    };
-                    groups
-                        .entry(key)
-                        .or_insert_with(|| folds.iter().map(Acc::for_fold).collect())
+                    if vfold {
+                        // N1: assemble the composite key BORROWED into the reused
+                        // scratch — no per-row `String` clone / `Vec<GKey>` alloc.
+                        // A null in ANY position drops the row (same rule as
+                        // `assemble_group_key`). Probe the dense dict by hash; clone
+                        // to an owned key only when a NEW group is inserted.
+                        scratch.clear();
+                        let mut dropped = false;
+                        for (pos, slot) in resolved.group_key_plan.iter().enumerate() {
+                            let comp = match slot {
+                                KeySource::Fact => gcols[pos].key_ref_at(key_cols[pos], row),
+                                KeySource::Dim(s) => dim_gkeys
+                                    .and_then(|g| g.get(*s))
+                                    .and_then(GKeyRef::from_owned),
+                            };
+                            match comp {
+                                Some(c) => scratch.push(c),
+                                None => {
+                                    dropped = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if dropped {
+                            continue;
+                        }
+                        let hash = hash_key_refs(&scratch);
+                        let id = match dict.entry(
+                            hash,
+                            |(k, _)| {
+                                k.len() == scratch.len()
+                                    && scratch.iter().zip(k).all(|(r, o)| r.eq_owned(o))
+                            },
+                            |(k, _)| gkeys_hash(k),
+                        ) {
+                            hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
+                            hashbrown::hash_table::Entry::Vacant(v) => {
+                                let id = group_accs.len() as u32;
+                                let owned: Vec<GKey> =
+                                    scratch.iter().map(|r| r.to_owned_key()).collect();
+                                v.insert((owned, id));
+                                group_accs.push(folds.iter().map(Acc::for_fold).collect());
+                                id
+                            }
+                        };
+                        &mut group_accs[id as usize]
+                    } else {
+                        let Some(key) = Self::assemble_group_key(
+                            &resolved.group_key_plan,
+                            gcols,
+                            &key_cols,
+                            dim_gkeys,
+                            row,
+                        ) else {
+                            continue;
+                        };
+                        groups
+                            .entry(key)
+                            .or_insert_with(|| folds.iter().map(Acc::for_fold).collect())
+                    }
                 };
                 for (i, fold) in folds.iter().enumerate() {
                     let ok = match fold {
@@ -1343,7 +1542,11 @@ impl Operator for FusedR2rmlAggregateOperator {
             }
             // Account this batch's group growth into the query-scoped counter; the next
             // batch's checkpoint enforces the budget against the running total.
-            let grown = groups.len() - groups_before;
+            let grown = (if vfold {
+                group_accs.len()
+            } else {
+                groups.len()
+            }) - groups_before;
             if grown > 0 {
                 ctx.record_alloc(grown * crate::context::GROUP_EST_BYTES);
             }
@@ -1362,15 +1565,28 @@ impl Operator for FusedR2rmlAggregateOperator {
         let columns: Vec<Vec<Binding>> = if gcols.is_empty() {
             implicit.into_iter().map(|a| vec![a.finalize()]).collect()
         } else {
-            // One output row per group: key bindings then aggregate bindings.
+            // One output row per group: key bindings then aggregate bindings. Group
+            // iteration order is unspecified either way (a wrapping Sort applies any
+            // ORDER BY), so the vector-fold dict and the owned-key map emit the same
+            // rows, only possibly in a different pre-sort order.
             let num_cols = gcols.len() + folds.len();
             let mut out: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
-            for (key, accs) in groups {
+            let emit = |out: &mut Vec<Vec<Binding>>, key: Vec<GKey>, accs: Vec<Acc>| {
                 for (i, g) in gcols.iter().enumerate() {
                     out[i].push(g.binding(&key[i]));
                 }
                 for (j, acc) in accs.into_iter().enumerate() {
                     out[gcols.len() + j].push(acc.finalize());
+                }
+            };
+            if vfold {
+                for (key, id) in dict {
+                    let accs = std::mem::take(&mut group_accs[id as usize]);
+                    emit(&mut out, key, accs);
+                }
+            } else {
+                for (key, accs) in groups {
+                    emit(&mut out, key, accs);
                 }
             }
             out
@@ -2453,6 +2669,166 @@ mod tests {
             Binding::Unbound
         ));
         assert!(matches!(gc.binding(&GKey::Null), Binding::Unbound));
+    }
+
+    fn gc_str() -> GroupCol {
+        GroupCol {
+            column: "K".to_string(),
+            kind: GKind::String,
+            dt_sid: Sid::new(1, "string"),
+        }
+    }
+    fn gc_int() -> GroupCol {
+        GroupCol {
+            column: "K".to_string(),
+            kind: GKind::Integer,
+            dt_sid: Sid::new(1, "integer"),
+        }
+    }
+
+    /// N1 value-identity guard: the BORROWED key read (`key_ref_at`) must agree
+    /// with the owned read (`key_at`) for every Column kind, null, out-of-bounds,
+    /// wrong-type, and the NUMBER(n,0) physical-Decimal integer coercion (scale 0 /
+    /// scale>0 divisible / non-divisible / null). `None` must correspond EXACTLY to
+    /// `GKey::Null` (the row-drop). If these agree, the vector fold reads identical
+    /// keys and therefore groups identically to the owned-key fold.
+    #[test]
+    fn key_ref_at_matches_key_at() {
+        let cases: Vec<(GroupCol, Column, usize)> = vec![
+            (gc_str(), Column::String(vec![Some("A".into()), None]), 0),
+            (gc_str(), Column::String(vec![Some("A".into()), None]), 1),
+            (gc_str(), Column::String(vec![Some("A".into())]), 5),
+            (gc_str(), Column::Int64(vec![Some(7)]), 0), // wrong physical type
+            (gc_int(), Column::Int64(vec![Some(42), None]), 0),
+            (gc_int(), Column::Int64(vec![Some(42), None]), 1),
+            (gc_int(), Column::Int32(vec![Some(-3)]), 0),
+            (
+                gc_int(),
+                Column::Decimal {
+                    values: vec![Some(50)],
+                    precision: 5,
+                    scale: 0,
+                },
+                0,
+            ),
+            (
+                gc_int(),
+                Column::Decimal {
+                    values: vec![Some(500)],
+                    precision: 5,
+                    scale: 2,
+                },
+                0,
+            ), // divisible -> 5
+            (
+                gc_int(),
+                Column::Decimal {
+                    values: vec![Some(543)],
+                    precision: 5,
+                    scale: 2,
+                },
+                0,
+            ), // non-divisible -> Null
+            (
+                gc_int(),
+                Column::Decimal {
+                    values: vec![None],
+                    precision: 5,
+                    scale: 2,
+                },
+                0,
+            ),
+        ];
+        for (gc, col, row) in &cases {
+            let owned = gc.key_at(Some(col), *row);
+            let borrowed = gc
+                .key_ref_at(Some(col), *row)
+                .map(GKeyRef::to_owned_key)
+                .unwrap_or(GKey::Null);
+            assert_eq!(owned, borrowed, "kind {:?} row {}", gc.kind, row);
+            if let Some(r) = gc.key_ref_at(Some(col), *row) {
+                assert!(r.eq_owned(&owned), "eq_owned disagrees for {owned:?}");
+            }
+        }
+        assert_eq!(gc_str().key_at(None, 0), GKey::Null);
+        assert!(gc_str().key_ref_at(None, 0).is_none());
+    }
+
+    /// N1 hash-consistency invariant (the resize-safety guard): the borrowed probe
+    /// hash MUST equal the owned rehash hash for the equal key. If this ever drifts,
+    /// a `HashTable` grow re-buckets keys away from the probe and splits groups (the
+    /// bug the live A/B caught before this test was hardened).
+    #[test]
+    fn key_hash_borrowed_matches_owned() {
+        let keys: Vec<Vec<GKey>> = vec![
+            vec![GKey::Str("Mobile".into())],
+            vec![GKey::Str(String::new())],
+            vec![GKey::Int(-42), GKey::Str("x".into())],
+            vec![GKey::Str("web".into()), GKey::Int(9_000_000_000)],
+        ];
+        for k in &keys {
+            let refs: Vec<GKeyRef> = k.iter().map(|g| GKeyRef::from_owned(g).unwrap()).collect();
+            assert_eq!(
+                hash_key_refs(&refs),
+                gkeys_hash(k),
+                "borrowed vs owned hash differ for {k:?}"
+            );
+        }
+    }
+
+    /// N1: the dense `HashTable` dict groups a row sequence into EXACTLY the same
+    /// partition and per-group counts as the owned-key `HashMap<Vec<GKey>, _>`, using
+    /// the SAME production probe/rehash functions. Uses ENOUGH distinct keys (2000+)
+    /// to force multiple table grows, so a probe/rehash hash mismatch (the
+    /// split-group bug) would surface here, not only in the live A/B.
+    #[test]
+    fn vector_fold_grouping_matches_owned_map() {
+        // Build a long row stream: many distinct composite keys, each repeated a
+        // varying number of times, interleaved so grows happen mid-stream.
+        let mut rows: Vec<Vec<GKey>> = Vec::new();
+        for i in 0..2500u32 {
+            let reps = 1 + (i % 4);
+            for _ in 0..reps {
+                rows.push(vec![
+                    GKey::Str(format!("chan{}", i % 37)),
+                    GKey::Int(i as i128),
+                ]);
+            }
+        }
+        // A few pure-string and pure-int keys too.
+        for i in 0..300u32 {
+            rows.push(vec![GKey::Str(format!("s{}", i % 11))]);
+        }
+
+        let mut owned: std::collections::HashMap<Vec<GKey>, u64> = Default::default();
+        for k in &rows {
+            *owned.entry(k.clone()).or_insert(0) += 1;
+        }
+
+        let mut dict: hashbrown::HashTable<(Vec<GKey>, u32)> = hashbrown::HashTable::new();
+        let mut counts: Vec<u64> = Vec::new();
+        for k in &rows {
+            let refs: Vec<GKeyRef> = k.iter().map(|g| GKeyRef::from_owned(g).unwrap()).collect();
+            let hash = hash_key_refs(&refs);
+            let id = match dict.entry(
+                hash,
+                |(kk, _)| kk.len() == refs.len() && refs.iter().zip(kk).all(|(r, o)| r.eq_owned(o)),
+                |(kk, _)| gkeys_hash(kk),
+            ) {
+                hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
+                hashbrown::hash_table::Entry::Vacant(v) => {
+                    let id = counts.len() as u32;
+                    v.insert((k.clone(), id));
+                    counts.push(0);
+                    id
+                }
+            };
+            counts[id as usize] += 1;
+        }
+        assert_eq!(dict.len(), owned.len(), "group count differs");
+        for (key, id) in &dict {
+            assert_eq!(counts[*id as usize], owned[key], "count for {key:?}");
+        }
     }
 
     /// E2: resolve_star_constraint_checks admits a SCALAR-column constraint (the
