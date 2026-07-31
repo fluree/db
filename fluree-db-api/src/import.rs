@@ -7168,6 +7168,98 @@ mod resource_model_tests {
         assert_eq!(c.effective_rechunk_threads(), 1);
     }
 
+    // The sub-chunk index a chunk carries only separates anonymous nodes if a
+    // document's chunks are emitted as one contiguous run — otherwise the
+    // counter resets mid-document and re-issues 0. The mixed shape is where
+    // that could break: a split file's sub-chunks interleaving with coalesce
+    // buffer flushes. Runs in debug, so `SubChunkCounter`'s contiguity
+    // assertion is live, and compares the two producers payload-for-payload
+    // (the comparison includes the `DocChunk`).
+    #[test]
+    fn rechunk_scopes_survive_split_and_coalesced_files_interleaved() {
+        let _env = EnvGuard::clear_overrides();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunk_size_bytes = 64 * 1024;
+
+        // 000/001 coalesce, 002 splits into several sub-chunks, 003/004
+        // coalesce again behind it.
+        let big: String = (0..5_000)
+            .map(|i| format!("<http://example/big{i}> <http://example/p> <http://example/o> .\n"))
+            .collect();
+        let small =
+            |i: usize| format!("<http://example/s{i}> <http://example/p> <http://example/o> .\n");
+        let inputs: Vec<(String, String)> = vec![
+            ("000.nt".into(), small(0)),
+            ("001.nt".into(), small(1)),
+            ("002.nt".into(), big),
+            ("003.nt".into(), small(3)),
+            ("004.nt".into(), small(4)),
+        ];
+
+        let files: Vec<PathBuf> = inputs
+            .iter()
+            .map(|(name, contents)| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, contents).expect("write fixture");
+                path
+            })
+            .collect();
+        let sizes: Vec<u64> = files
+            .iter()
+            .map(|p| std::fs::metadata(p).expect("metadata").len())
+            .collect();
+        assert!(
+            sizes[2] > chunk_size_bytes,
+            "fixture must force the split arm"
+        );
+        let doc_ids: Vec<u64> = (0..files.len() as u64).map(|i| i + 1).collect();
+
+        let (serial_tx, serial_rx) = std::sync::mpsc::sync_channel(64);
+        local_rechunk_loop(&files, &sizes, &doc_ids, chunk_size_bytes, true, &serial_tx)
+            .expect("serial rechunk");
+        drop(serial_tx);
+        let serial: Vec<RemoteChunk> = serial_rx.into_iter().collect();
+
+        let (parallel_tx, parallel_rx) = std::sync::mpsc::sync_channel(256);
+        local_rechunk_loop_parallel(
+            files,
+            sizes,
+            doc_ids,
+            chunk_size_bytes,
+            true,
+            &parallel_tx,
+            4,
+        )
+        .expect("parallel rechunk");
+        drop(parallel_tx);
+        let parallel: Vec<RemoteChunk> = parallel_rx.into_iter().collect();
+
+        assert_eq!(parallel, serial);
+
+        // Both loops buffer their whole output here (nothing drains
+        // concurrently), so the channel must outrun the chunk count.
+        //
+        // Note the 64 KB chunk size: `StreamingTurtleReader` does not
+        // terminate on a sub-KB chunk size, so the split arm cannot be
+        // exercised at the 1 KB the coalescing-only test above uses. That is
+        // pre-existing and unreachable in production — `chunk_size_mb` is
+        // megabytes — but it is why this fixture is sized the way it is.
+
+        // Every (document, sub-chunk) pair is used once — the invariant the
+        // anonymous-node mint rests on.
+        let mut seen: Vec<DocChunk> = serial.iter().map(|(_, doc, _)| *doc).collect();
+        let total = seen.len();
+        seen.sort_by_key(|d| (d.doc, d.sub_chunk));
+        seen.dedup();
+        assert_eq!(seen.len(), total, "a (doc, sub_chunk) pair was reused");
+
+        let split_chunks = serial.iter().filter(|(_, d, _)| d.doc == 3).count();
+        assert!(
+            split_chunks > 1,
+            "test is vacuous unless 002.nt was sub-split: {split_chunks} chunk(s)"
+        );
+    }
+
     #[test]
     fn parallel_local_rechunk_matches_serial_order_and_coalescing() {
         let _env = EnvGuard::clear_overrides();
