@@ -133,11 +133,9 @@ pub fn read_all_guarded(
     // caller could be told about immediately. The hint is not trusted for
     // correctness: an input that lies small still hits the `take` cap and is
     // refused there, which is why this is a short-circuit and not the check.
-    if let Some(len) = expected {
-        if len > LIMIT {
-            timings.finish();
-            return Err(oversized(what, LIMIT));
-        }
+    if hint_is_oversized(expected, LIMIT) {
+        timings.finish();
+        return Err(oversized(what, LIMIT));
     }
     // Clamped at the refusal limit for the same reason in the other direction:
     // a length that is wrong — or a file that is sparse — must not turn into an
@@ -156,6 +154,16 @@ pub fn read_all_guarded(
         return Err(oversized(what, LIMIT));
     }
     Ok(buf)
+}
+
+/// Whether a size hint already condemns the input.
+///
+/// Split out so the boundary can be tested without allocating it. The
+/// at-the-limit case is the one worth pinning, and exercising it through
+/// [`read_all_guarded`] reserves a real 4 GiB buffer to prove an inequality —
+/// survivable under overcommit, an abort inside a memory-capped CI container.
+fn hint_is_oversized(expected: Option<u64>, limit: u64) -> bool {
+    matches!(expected, Some(len) if len > limit)
 }
 
 /// The one refusal for an input past the parser's addressable limit, shared by
@@ -451,19 +459,28 @@ mod tests {
         .expect_err("a file claiming to be past the limit is refused");
         assert!(err.to_string().contains("larger than"), "{err}");
         assert!(err.to_string().contains("huge.ttl"), "{err}");
-        // And a hint exactly AT the limit is not refused — the boundary belongs
-        // to the readable side, matching the `take(LIMIT + 1)` that backs it.
-        let mut reader = std::io::Cursor::new(b"<a> <b> <c> .\n".as_slice());
+    }
+
+    #[test]
+    fn the_limit_belongs_to_the_readable_side() {
+        // Through the predicate rather than a read: a hint exactly AT the limit
+        // makes the read reserve a real 4 GiB buffer to prove an inequality —
+        // survivable under overcommit, an abort in a memory-capped container,
+        // and either way four gigabytes spent on an off-by-one. The off-by-one
+        // is the whole risk, and it lives in the predicate.
+        const LIMIT: u64 = fluree_graph_turtle::error::MAX_INPUT_BYTES as u64;
+        assert!(!hint_is_oversized(None, LIMIT), "no hint condemns nothing");
+        assert!(!hint_is_oversized(Some(0), LIMIT));
         assert!(
-            read_all_guarded(
-                &mut reader,
-                Some(LIMIT),
-                &mut PhaseTimings::start(),
-                "big.ttl"
-            )
-            .is_ok(),
-            "a file exactly at the limit must still be read"
+            !hint_is_oversized(Some(LIMIT), LIMIT),
+            "exactly at the limit must be readable — it matches the take(LIMIT + 1) \
+             that backs it up, and a file of exactly that size is addressable"
         );
+        assert!(
+            hint_is_oversized(Some(LIMIT + 1), LIMIT),
+            "one byte past the limit is the first refusal"
+        );
+        assert!(hint_is_oversized(Some(u64::MAX), LIMIT));
     }
 
     #[test]
