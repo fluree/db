@@ -16,7 +16,7 @@
 //! `ColumnBatch` format matches the rest of the crate.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
@@ -36,10 +36,11 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::ChunkReader;
 
 use crate::error::{IcebergError, Result};
-use crate::io::batch::{ColumnBatch, FieldType};
+use crate::io::batch::{Column, ColumnBatch, FieldType};
 use crate::io::parquet::{
     build_batch_schema, build_batch_schema_with_iceberg, build_columns_from_values,
-    build_field_id_to_leaf_mapping, build_root_to_leaf_map, ColumnValue, NULL_COLUMN_SENTINEL,
+    build_field_id_to_leaf_mapping, build_root_to_leaf_map, column_from_values, ColumnValue,
+    NULL_COLUMN_SENTINEL,
 };
 use crate::io::send_parquet::predicate_pushdown_enabled;
 use crate::metadata::Schema;
@@ -222,22 +223,41 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
             continue;
         }
 
-        let column_data: Vec<Vec<Option<ColumnValue>>> = batch_schema
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(batch_idx, field_info)| match field_to_pos[batch_idx] {
-                Some(pos) => arrow_column_to_values(
-                    record_batch.column(pos).as_ref(),
-                    &field_info.field_type,
-                    num_rows,
-                ),
-                // schema-evolution column absent from this file → all null.
-                None => vec![None; num_rows],
-            })
-            .collect();
-
-        let columns = build_columns_from_values(column_data, &batch_schema)?;
+        // N2 (Gap-4 P1): build `Column`s DIRECTLY from the Arrow arrays, skipping
+        // the per-cell `Vec<Option<ColumnValue>>` intermediate. Off restores the
+        // byte-identical two-hop path.
+        let columns = if direct_decode_enabled() {
+            batch_schema
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(batch_idx, field_info)| match field_to_pos[batch_idx] {
+                    Some(pos) => arrow_column_to_column(
+                        record_batch.column(pos).as_ref(),
+                        &field_info.field_type,
+                        num_rows,
+                    ),
+                    // schema-evolution column absent from this file → all null.
+                    None => column_from_values(&vec![None; num_rows], &field_info.field_type),
+                })
+                .collect()
+        } else {
+            let column_data: Vec<Vec<Option<ColumnValue>>> = batch_schema
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(batch_idx, field_info)| match field_to_pos[batch_idx] {
+                    Some(pos) => arrow_column_to_values(
+                        record_batch.column(pos).as_ref(),
+                        &field_info.field_type,
+                        num_rows,
+                    ),
+                    // schema-evolution column absent from this file → all null.
+                    None => vec![None; num_rows],
+                })
+                .collect();
+            build_columns_from_values(column_data, &batch_schema)?
+        };
         let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
         if !batch.is_empty() {
             batches.push(batch);
@@ -330,6 +350,96 @@ fn arrow_column_to_values(
         }
         _ => vec![None; num_rows],
     }
+}
+
+/// N2 kill switch (`FLUREE_ARROW_DIRECT_DECODE`, default **on**). Off
+/// (`0`/`false`/`off`/`no`, trimmed + case-insensitive per the switch family)
+/// restores the byte-identical two-hop `arrow_column_to_values` +
+/// `build_columns_from_values` path. Read once per process (`OnceLock`, the family
+/// idiom): set it at startup, not per query.
+fn direct_decode_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_ARROW_DIRECT_DECODE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// N2 (Gap-4 P1): build a [`Column`] DIRECTLY from an Arrow array, skipping the
+/// per-cell `Vec<Option<ColumnValue>>` intermediate that the two-hop
+/// `arrow_column_to_values` then `build_columns_from_values` allocate — the
+/// "two-hop decode copy" the P0 profile measured at ~33–46% of on-CPU wall on the
+/// fused GROUP BY family (`audit-2026-07/gap4-adjudication/P0-PROFILE.md`). For
+/// string keys this also drops one of the two per-cell `String` allocations.
+///
+/// The fast arms cover the case where the Arrow physical type MATCHES the target
+/// `field_type`; each is value-identical to the two-hop composition for that case
+/// (`Arrow → ColumnValue → Column`), which the `direct_decode_matches_two_hop`
+/// differential asserts cell-for-cell. ANY other (arrow-type, field_type) pair —
+/// cross-type coercions (e.g. a `Decimal`-typed field physically stored INT64, a
+/// `Date` field stored plain INT32), timestamps (unit-scaled), or unhandled types
+/// — falls back to the exact old mapping via `column_from_values`, so behavior is
+/// unchanged there.
+fn arrow_column_to_column(array: &dyn Array, field_type: &FieldType, num_rows: usize) -> Column {
+    // Downcast to the concrete typed array once, then map each row through `$conv`,
+    // preserving nulls — producing the target `Column` variant with no intermediate.
+    macro_rules! direct {
+        ($ty:ty, $variant:path, $conv:expr) => {
+            array.as_any().downcast_ref::<$ty>().map(|a| {
+                $variant(
+                    (0..num_rows)
+                        .map(|i| (!a.is_null(i)).then(|| $conv(a.value(i))))
+                        .collect(),
+                )
+            })
+        };
+    }
+
+    let built: Option<Column> = match (field_type, array.data_type()) {
+        (FieldType::Boolean, DataType::Boolean) => direct!(BooleanArray, Column::Boolean, |v| v),
+        (FieldType::Int32, DataType::Int32) => direct!(Int32Array, Column::Int32, |v| v),
+        (FieldType::Int64, DataType::Int64) => direct!(Int64Array, Column::Int64, |v| v),
+        (FieldType::Float32, DataType::Float32) => direct!(Float32Array, Column::Float32, |v| v),
+        (FieldType::Float64, DataType::Float64) => direct!(Float64Array, Column::Float64, |v| v),
+        (FieldType::String, DataType::Utf8) => {
+            direct!(StringArray, Column::String, |s: &str| s.to_string())
+        }
+        (FieldType::String, DataType::LargeUtf8) => {
+            direct!(LargeStringArray, Column::String, |s: &str| s.to_string())
+        }
+        (FieldType::Bytes, DataType::Binary) => {
+            direct!(BinaryArray, Column::Bytes, |b: &[u8]| b.to_vec())
+        }
+        (FieldType::Bytes, DataType::LargeBinary) => {
+            direct!(LargeBinaryArray, Column::Bytes, |b: &[u8]| b.to_vec())
+        }
+        (FieldType::Bytes, DataType::FixedSizeBinary(_)) => {
+            direct!(FixedSizeBinaryArray, Column::Bytes, |b: &[u8]| b.to_vec())
+        }
+        (FieldType::Date, DataType::Date32) => direct!(Date32Array, Column::Date, |v| v),
+        (FieldType::Decimal { precision, scale }, DataType::Decimal128(_, _)) => array
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .map(|a| Column::Decimal {
+                values: (0..num_rows)
+                    .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+                    .collect(),
+                precision: *precision,
+                scale: *scale,
+            }),
+        // Cross-type coercions, timestamps (unit-scaled), unhandled types: the
+        // exact old two-hop mapping, so the direct path never diverges.
+        _ => None,
+    };
+    built.unwrap_or_else(|| {
+        column_from_values(
+            &arrow_column_to_values(array, field_type, num_rows),
+            field_type,
+        )
+    })
 }
 
 /// One resolved comparison in the row filter: the column's position within the
@@ -462,5 +572,87 @@ fn literal_to_array(value: &LiteralValue) -> ArrayRef {
                 .with_precision_and_scale(*precision, *scale)
                 .expect("valid decimal precision/scale"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod direct_decode_tests {
+    use super::*;
+
+    /// N2 differential: the direct Arrow->Column decoder must produce a `Column`
+    /// value-identical to the two-hop `arrow_column_to_values` +
+    /// `column_from_values` path. `Column` has no `PartialEq`, so we compare its
+    /// `Debug` form (a faithful value rendering for these primitive-typed columns).
+    fn assert_direct_matches(array: &dyn Array, ft: FieldType) {
+        let n = array.len();
+        let direct = arrow_column_to_column(array, &ft, n);
+        let two_hop = column_from_values(&arrow_column_to_values(array, &ft, n), &ft);
+        assert_eq!(
+            format!("{direct:?}"),
+            format!("{two_hop:?}"),
+            "direct vs two-hop diverge for field_type {ft:?}"
+        );
+    }
+
+    #[test]
+    fn direct_decode_matches_two_hop() {
+        // Fast-arm cases (Arrow physical type matches the field type), each with a
+        // null and a boundary value.
+        assert_direct_matches(
+            &BooleanArray::from(vec![Some(true), None, Some(false)]),
+            FieldType::Boolean,
+        );
+        assert_direct_matches(
+            &Int32Array::from(vec![Some(1), None, Some(i32::MIN)]),
+            FieldType::Int32,
+        );
+        assert_direct_matches(
+            &Int64Array::from(vec![Some(1_000_000_000_000i64), None, Some(i64::MAX)]),
+            FieldType::Int64,
+        );
+        assert_direct_matches(
+            &Float32Array::from(vec![Some(1.5f32), None]),
+            FieldType::Float32,
+        );
+        assert_direct_matches(
+            &Float64Array::from(vec![Some(2.5f64), None, Some(f64::NAN)]),
+            FieldType::Float64,
+        );
+        assert_direct_matches(
+            &StringArray::from(vec![Some("web"), None, Some("mobile")]),
+            FieldType::String,
+        );
+        assert_direct_matches(
+            &LargeStringArray::from(vec![Some("x"), None]),
+            FieldType::String,
+        );
+        assert_direct_matches(
+            &Date32Array::from(vec![Some(19_000), None]),
+            FieldType::Date,
+        );
+        let dec = Decimal128Array::from(vec![Some(12_345i128), None])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        assert_direct_matches(
+            &dec,
+            FieldType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        );
+
+        // Cross-type coercions must hit the fallback and stay identical: an
+        // Int64-typed field physically stored INT32, and a small-precision Decimal
+        // field physically stored INT64.
+        assert_direct_matches(&Int32Array::from(vec![Some(5), None]), FieldType::Int64);
+        assert_direct_matches(
+            &Int64Array::from(vec![Some(9_999i64), None]),
+            FieldType::Decimal {
+                precision: 6,
+                scale: 2,
+            },
+        );
+        // A Date field physically stored as plain INT32 (fallback, tags as Date).
+        assert_direct_matches(&Int32Array::from(vec![Some(19_001), None]), FieldType::Date);
     }
 }
