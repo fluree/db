@@ -548,3 +548,59 @@ async fn import_manifest_maps_blank_node_scopes_back_to_documents() {
         "the manifest must resolve {bnode} back to its document; entries: {entries:?}"
     );
 }
+
+// ============================================================================
+// Entry points into the serial commit paths
+// ============================================================================
+
+/// `import_trig_commit` hands a TriG document with no named graphs and no
+/// txn-meta straight to `import_commit` — the pure-Turtle fast path. The
+/// skolem base has to travel through that delegation rather than being rebuilt
+/// on the far side, or one document would get two identities depending on
+/// which branch its *content* happened to take. Nothing about a file's blank
+/// nodes should depend on whether it also contains a `GRAPH` block.
+///
+/// Same file name and same namespace on both sides, so the document key is
+/// identical by construction and only the entry point differs.
+#[tokio::test]
+async fn trig_fast_path_delegation_keeps_the_document_key() {
+    let plain = "@prefix schema: <http://schema.org/> .\n\
+                 _:shared schema:name \"Shared\" .\n";
+    // Same triple, plus a named graph — enough to keep `import_trig_commit`
+    // from delegating.
+    let with_graph = "@prefix schema: <http://schema.org/> .\n\
+                      _:shared schema:name \"Shared\" .\n\
+                      GRAPH <http://example.org/g> {\n\
+                        <http://example.org/a> <http://example.org/p> \"x\" .\n\
+                      }\n";
+
+    let delegated_db = tempfile::tempdir().expect("db tmpdir");
+    let delegated_data = tempfile::tempdir().expect("data tmpdir");
+    write(delegated_data.path(), "doc.trig", plain);
+
+    let direct_db = tempfile::tempdir().expect("db tmpdir");
+    let direct_data = tempfile::tempdir().expect("data tmpdir");
+    write(direct_data.path(), "doc.trig", with_graph);
+
+    let (f1, l1) = import_doc(
+        delegated_db.path(),
+        delegated_data.path(),
+        "test/skolem-trig-fast:main",
+        Some("fixed"),
+    )
+    .await;
+    let (f2, l2) = import_doc(
+        direct_db.path(),
+        direct_data.path(),
+        "test/skolem-trig-graph:main",
+        Some("fixed"),
+    )
+    .await;
+
+    assert_eq!(
+        sole_blank_id(&f1, &l1, "Shared").await,
+        sole_blank_id(&f2, &l2, "Shared").await,
+        "the pure-Turtle fast path must reuse the caller's document key, \
+         not rebuild one"
+    );
+}
