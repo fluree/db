@@ -80,7 +80,7 @@ pub fn size_hint(input: &RdfInput) -> Option<u64> {
         return None;
     };
     let meta = std::fs::metadata(path).ok()?;
-    meta.is_file().then(|| meta.len())
+    meta.is_file().then_some(meta.len())
 }
 
 /// Open the input as a buffered byte stream, undecoded.
@@ -127,10 +127,21 @@ pub fn read_all_guarded(
     const LIMIT: u64 = fluree_graph_turtle::error::MAX_INPUT_BYTES as u64;
 
     timings.enter(Phase::Read);
-    // Clamped at the refusal limit: past it the read is going to be refused
-    // anyway, and reserving what an oversized file claims is how a length that
-    // is wrong — or a file that is sparse — becomes an allocation failure
-    // instead of the error message this function exists to produce.
+    // A file whose own metadata says it is too big is refused HERE, before a
+    // byte is read. The `take` below already guarantees the refusal, but it
+    // spends 4 GiB of reading and 4 GiB of buffer to reach it — on a file the
+    // caller could be told about immediately. The hint is not trusted for
+    // correctness: an input that lies small still hits the `take` cap and is
+    // refused there, which is why this is a short-circuit and not the check.
+    if let Some(len) = expected {
+        if len > LIMIT {
+            timings.finish();
+            return Err(oversized(what, LIMIT));
+        }
+    }
+    // Clamped at the refusal limit for the same reason in the other direction:
+    // a length that is wrong — or a file that is sparse — must not turn into an
+    // allocation failure in place of the error message this function produces.
     let mut buf = match expected {
         Some(len) => Vec::with_capacity(len.min(LIMIT + 1) as usize),
         None => Vec::new(),
@@ -142,14 +153,21 @@ pub fn read_all_guarded(
     timings.finish();
 
     if read as u64 > LIMIT {
-        return Err(CliError::Usage(format!(
-            "{what} is larger than {LIMIT} bytes, the most this path can parse in one \
-             pass (the parser addresses token spans with 32-bit offsets)\n  {} split the \
-             input, or wait for the chunked reader that lands with parallel conversion",
-            colored::Colorize::bold(colored::Colorize::cyan("help:")),
-        )));
+        return Err(oversized(what, LIMIT));
     }
     Ok(buf)
+}
+
+/// The one refusal for an input past the parser's addressable limit, shared by
+/// the metadata short-circuit and the read that backs it up, so the two cannot
+/// drift into telling a user two different things about one condition.
+fn oversized(what: &str, limit: u64) -> CliError {
+    CliError::Usage(format!(
+        "{what} is larger than {limit} bytes, the most this path can parse in one \
+         pass (the parser addresses token spans with 32-bit offsets)\n  {} split the \
+         input, or wait for the chunked reader that lands with parallel conversion",
+        colored::Colorize::bold(colored::Colorize::cyan("help:")),
+    ))
 }
 
 /// Strip the compression layer and validate UTF-8, producing the text the
@@ -413,6 +431,38 @@ mod tests {
         assert_eq!(
             timings.elapsed(Phase::Decompress),
             std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn an_oversized_file_is_refused_from_its_metadata_not_after_reading_it() {
+        // The `take` cap refuses it either way; what the short-circuit saves is
+        // 4 GiB of reading and 4 GiB of buffer to reach a refusal the metadata
+        // already implied. Both paths must produce the SAME message, or a user
+        // gets a different explanation depending on which one fired.
+        const LIMIT: u64 = fluree_graph_turtle::error::MAX_INPUT_BYTES as u64;
+        let mut reader = std::io::Cursor::new(b"<a> <b> <c> .\n".as_slice());
+        let err = read_all_guarded(
+            &mut reader,
+            Some(LIMIT + 1),
+            &mut PhaseTimings::start(),
+            "huge.ttl",
+        )
+        .expect_err("a file claiming to be past the limit is refused");
+        assert!(err.to_string().contains("larger than"), "{err}");
+        assert!(err.to_string().contains("huge.ttl"), "{err}");
+        // And a hint exactly AT the limit is not refused — the boundary belongs
+        // to the readable side, matching the `take(LIMIT + 1)` that backs it.
+        let mut reader = std::io::Cursor::new(b"<a> <b> <c> .\n".as_slice());
+        assert!(
+            read_all_guarded(
+                &mut reader,
+                Some(LIMIT),
+                &mut PhaseTimings::start(),
+                "big.ttl"
+            )
+            .is_ok(),
+            "a file exactly at the limit must still be read"
         );
     }
 
