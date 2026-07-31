@@ -29,6 +29,53 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
+/// Who may write prose to stderr, decided in one place.
+///
+/// There are two levels and collapsing them into one would be a regression.
+/// *Courtesy* lines — the ✓ summary, the fallback note — are exactly what `-q`
+/// exists to silence. *Diagnostics* — every skip, the swallow note, the closing
+/// warning — survive `-q` on purpose, because the one thing a script must not
+/// do is read a partial conversion as a whole one.
+///
+/// Both go quiet when stderr is carrying a `--profile=json` document. `2>
+/// run.json` is the bench lane's idiom, and one line of prose ahead of the JSON
+/// makes the file unparseable.
+///
+/// The emit goes *through* this type rather than each site spelling the
+/// predicate. It was spelled three different ways across six sites and one of
+/// them omitted the JSON term entirely, which put a `note:` line into every
+/// `2> run.json` of a document that could not be chunked. A rake that has been
+/// stepped on twice gets taken away rather than labelled: `eprintln!` should
+/// not appear anywhere else in this file.
+#[derive(Clone, Copy)]
+struct Prose {
+    quiet: bool,
+    stderr_is_a_document: bool,
+}
+
+impl Prose {
+    fn new(common: &RdfCommonArgs, quiet: bool) -> Self {
+        Self {
+            quiet,
+            stderr_is_a_document: common.profile == Some(crate::rdf::profile::ProfileFormat::Json),
+        }
+    }
+
+    /// A line the run offers as a kindness. `-q` silences it.
+    fn courtesy(self, args: std::fmt::Arguments<'_>) {
+        if !self.quiet && !self.stderr_is_a_document {
+            eprintln!("{args}");
+        }
+    }
+
+    /// A line a script must see even under `-q`.
+    fn diagnostic(self, args: std::fmt::Arguments<'_>) {
+        if !self.stderr_is_a_document {
+            eprintln!("{args}");
+        }
+    }
+}
+
 /// The output syntax when neither `--to` nor an output extension says.
 ///
 /// N-Quads, matching riot: Jena's `riot` documents N-Quads as the default
@@ -92,6 +139,7 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
         return Err(no_writer_error(target, args.to, args.output));
     }
 
+    let prose = Prose::new(common, quiet);
     let mut timings = PhaseTimings::start();
     let loaded = rdf::load(common, &mut timings)?;
     let prefixes = load_prefixes(args.prefixes)?;
@@ -158,13 +206,11 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
                     }
                     _ => "the input could not be split into chunks",
                 });
-                if !quiet {
-                    eprintln!(
-                        "{} {} — converting serially",
-                        "note:".cyan().bold(),
-                        plan.reason
-                    );
-                }
+                prose.courtesy(format_args!(
+                    "{} {} — converting serially",
+                    "note:".cyan().bold(),
+                    plan.reason
+                ));
                 None
             }
         }
@@ -259,19 +305,14 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     }
 
     // A summary on the way to a file is useful; the same line beside piped
-    // data is noise. And under `--profile=json` stderr is not a place for
-    // prose at all — `2> run.json` is the bench lane's idiom, and one ✓ line
-    // ahead of the document makes the file unparseable.
-    let stderr_is_a_document = common.profile == Some(crate::rdf::profile::ProfileFormat::Json);
-    if !quiet && !stderr_is_a_document {
-        if let Some(path) = args.output {
-            eprintln!(
-                "{} {} statements → {} ({target})",
-                "✓".green(),
-                stats.statements,
-                path.display(),
-            );
-        }
+    // data is noise.
+    if let Some(path) = args.output {
+        prose.courtesy(format_args!(
+            "{} {} statements → {} ({target})",
+            "✓".green(),
+            stats.statements,
+            path.display(),
+        ));
     }
     Ok(())
 }
@@ -392,16 +433,14 @@ fn run_parallel(
         rdf::count::print_timing(wall, outcome.statements, loaded.text.len() as u64);
     }
 
-    if !quiet && common.profile != Some(crate::rdf::profile::ProfileFormat::Json) {
-        if let Some(path) = args.output {
-            eprintln!(
-                "{} {} statements → {} ({target}, {workers} workers, {} chunks)",
-                "✓".green(),
-                outcome.statements,
-                path.display(),
-                outcome.chunks,
-            );
-        }
+    if let Some(path) = args.output {
+        Prose::new(common, quiet).courtesy(format_args!(
+            "{} {} statements → {} ({target}, {workers} workers, {} chunks)",
+            "✓".green(),
+            outcome.statements,
+            path.display(),
+            outcome.chunks,
+        ));
     }
     Ok(())
 }
@@ -483,15 +522,20 @@ fn run_recovering(
     flushed.map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
     finished.map_err(|e| CliError::Usage(format!("sink error: {e}")))?;
 
-    // Every skip, in document order, before the summary — unless stderr is
-    // carrying a JSON document, in which case the count travels inside it.
-    let human_stderr = common.profile != Some(crate::rdf::profile::ProfileFormat::Json);
-    for d in recovery.skipped.iter().filter(|_| human_stderr) {
+    // Every skip, in document order, before the summary. A diagnostic rather
+    // than a courtesy: `-q` does not silence it, because a run that dropped
+    // statements must say so however quietly it was asked to work.
+    let prose = Prose::new(common, quiet);
+    for d in &recovery.skipped {
         let where_ = match (d.line, d.column) {
             (Some(line), Some(column)) => format!("{}:{line}:{column}", loaded.input.display()),
             _ => loaded.input.display(),
         };
-        eprintln!("{} {where_}: {}", "skipped:".yellow().bold(), d.message);
+        prose.diagnostic(format_args!(
+            "{} {where_}: {}",
+            "skipped:".yellow().bold(),
+            d.message
+        ));
     }
 
     // A resync that ran past the failing line consumed the statement after it
@@ -500,14 +544,14 @@ fn run_recovering(
     // statements they held — but staying silent about it is what made a run
     // that lost three statements report two, with stderr byte-identical to the
     // honest case. Its own line, so the honest case stays byte-stable.
-    for s in recovery.swallowed.iter().filter(|_| human_stderr) {
-        eprintln!(
+    for s in &recovery.swallowed {
+        prose.diagnostic(format_args!(
             "{} resync consumed {} more byte(s) and resumed at line {} — content \
              there was never parsed, so it is not in the count above",
             "note:".cyan().bold(),
             s.bytes,
             s.resume_line,
-        );
+        ));
     }
 
     // Recovery is exactly when profiling matters — resync re-parses from each
@@ -538,35 +582,28 @@ fn run_recovering(
     }
 
     if recovery.is_clean() {
-        if !quiet {
-            if let Some(path) = args.output {
-                eprintln!(
-                    "{} {} statements → {} ({target})",
-                    "✓".green(),
-                    stats.statements,
-                    path.display(),
-                );
-            }
+        if let Some(path) = args.output {
+            prose.courtesy(format_args!(
+                "{} {} statements → {} ({target})",
+                "✓".green(),
+                stats.statements,
+                path.display(),
+            ));
         }
         return Ok(());
     }
 
-    // riot semantics: skipping is not success. The summary goes to stderr even
-    // under --quiet, because the one thing a script must not do is read a
-    // partial conversion as a whole one.
-    if common.profile == Some(crate::rdf::profile::ProfileFormat::Json) {
-        // stderr is carrying a JSON document; the skip count is in the exit
-        // code and the diagnostics already went out before it.
-        return Err(exit_document_invalid());
-    }
-    eprintln!(
+    // riot semantics: skipping is not success. A diagnostic, so it survives
+    // `--quiet` — and under `--profile=json` it is the exit code and the JSON
+    // that carry the count instead.
+    prose.diagnostic(format_args!(
         "{} {} statement(s) skipped, {} written → {}",
         "warning:".yellow().bold(),
         recovery.skipped.len(),
         stats.statements,
         args.output
             .map_or_else(|| "stdout".to_string(), |p| p.display().to_string()),
-    );
+    ));
     Err(exit_document_invalid())
 }
 
@@ -890,6 +927,23 @@ fn is_broken_pipe(
 /// serial path's [`WriterStats`](fluree_graph_format::WriterStats) precisely so
 /// the parallel path — which has no single writer to ask — can call it, instead
 /// of keeping a near-copy that drifted apart at the position.
+///
+/// # The one prose in this file that does not go through [`Prose`]
+///
+/// Deliberately, and it is a lesser-evil rather than a clean case. On the
+/// serial path a failed parse prints this and then emits the profile, so
+/// `--profile=json 2> run.json` on an invalid document produces prose ahead of
+/// the JSON — the same unparseable-stderr defect `Prose` exists to prevent.
+///
+/// Routing it through `diagnostic()` would fix the file and break the user:
+/// [`ProfileReport`] has no field for a parse failure, so the JSON says
+/// nothing about why the run stopped, and suppressing this line would leave
+/// exit 1 with no explanation anywhere. An unparseable file beats an
+/// unexplained one.
+///
+/// The real fix is a diagnostic field in the profile schema, after which this
+/// becomes a `diagnostic()` call like the rest. Until then the exception is
+/// written down rather than left to be rediscovered.
 fn report_parse_failure(
     loaded: &rdf::Loaded,
     err: &fluree_graph_turtle::TurtleError,

@@ -3035,6 +3035,106 @@ fn a_run_that_falls_back_to_serial_still_reports_what_the_attempt_cost() {
     );
 }
 
+#[test]
+fn json_profile_stderr_is_parseable_on_a_chunking_fallback() {
+    // `2> run.json` is the bench lane's idiom, so stderr under `--profile=json`
+    // is a document and not a place for prose. Five of the six prose sites
+    // knew that; the fallback note did not, and it is emitted on exactly the
+    // documents most likely to be profiled — the big ones that turn out not to
+    // chunk. Note the absence of `-q` here: passing it would hide the bug
+    // rather than test it.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "bighdr.ttl", &oversized_header_corpus());
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["--parallelism", "8", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+
+    serde_json::from_slice::<serde_json::Value>(&stderr).unwrap_or_else(|e| {
+        panic!(
+            "stderr is not a JSON document: {e}\n{}",
+            String::from_utf8_lossy(&stderr)
+        )
+    });
+}
+
+#[test]
+fn quiet_silences_courtesy_lines_and_never_the_diagnostics() {
+    // The two levels, pinned apart. `-q` is for the ✓ line and the fallback
+    // note; it must never reach a skip, the swallow note, or the closing
+    // warning, because a script that asked for quiet still may not read a
+    // partial conversion as a whole one. Folding the levels together is the
+    // obvious simplification and this is what refuses it.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
+    let out = tmp.path().join("out.nt");
+
+    for quiet in [false, true] {
+        let mut cmd = rdf_cmd();
+        if quiet {
+            cmd.arg("-q");
+        }
+        let stderr = cmd
+            .args(["rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt", "--continue-on-error"])
+            .arg("-o")
+            .arg(&out)
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID)
+            .get_output()
+            .stderr
+            .clone();
+        let stderr = String::from_utf8(stderr).unwrap();
+
+        assert!(
+            stderr.contains("skipped:"),
+            "-q {quiet}: a dropped statement went unreported: {stderr}"
+        );
+        assert!(
+            stderr.contains("2 statement(s) skipped"),
+            "-q {quiet}: the closing warning is not a courtesy: {stderr}"
+        );
+    }
+
+    // And under a JSON profile both levels go quiet, whatever -q says, because
+    // stderr is carrying a document either way.
+    for quiet in [false, true] {
+        let mut cmd = rdf_cmd();
+        if quiet {
+            cmd.arg("-q");
+        }
+        let stderr = cmd
+            .args(["rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt", "--continue-on-error"])
+            .arg("-o")
+            .arg(&out)
+            .args(["--profile=json", "--no-hash"])
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID)
+            .get_output()
+            .stderr
+            .clone();
+        serde_json::from_slice::<serde_json::Value>(&stderr).unwrap_or_else(|e| {
+            panic!(
+                "-q {quiet}: stderr is not a JSON document: {e}\n{}",
+                String::from_utf8_lossy(&stderr)
+            )
+        });
+    }
+}
+
 // ============================================================================
 // --continue-on-error
 // ============================================================================
