@@ -1,7 +1,8 @@
-//! BM25 full-text index management endpoints: POST /v1/fluree/bm25/create
+//! BM25 full-text index management endpoints: POST /v1/fluree/bm25/create and
+//! POST /v1/fluree/bm25/sync
 //!
-//! A BM25 index is a Fluree *graph source*, so only creation needs a
-//! family-specific route — listing, inspection, and drop are served by the
+//! A BM25 index is a Fluree *graph source*, so only creation and sync need
+//! family-specific routes — listing, inspection, and drop are served by the
 //! graph-source fallbacks in [`super::ledger`] (`/ledgers`, `/info`, `/drop`),
 //! the same division the Iceberg family uses.
 
@@ -146,4 +147,132 @@ fn build_bm25_config(req: Bm25CreateRequest) -> Bm25CreateConfig {
         config = config.with_b(b);
     }
     config
+}
+
+/// Request body for `POST /v1/fluree/bm25/sync`
+#[derive(Deserialize)]
+pub struct Bm25SyncRequest {
+    /// Index graph-source alias to sync (e.g. `"docsearch:main"`).
+    pub index: String,
+}
+
+/// Query parameters for `POST /v1/fluree/bm25/sync`
+#[derive(Deserialize)]
+struct Bm25SyncParams {
+    /// Source-ledger `t` to sync through. Absent syncs through the source's
+    /// current head.
+    t: Option<i64>,
+}
+
+/// Response for `POST /v1/fluree/bm25/sync`
+#[derive(Serialize)]
+pub struct Bm25SyncResponse {
+    pub graph_source_id: String,
+    pub upserted: usize,
+    pub removed: usize,
+    pub affected_subjects: usize,
+    pub old_watermark: i64,
+    pub new_watermark: i64,
+    pub was_full_resync: bool,
+}
+
+/// Sync a BM25 full-text index up to its source ledger's state
+///
+/// POST /v1/fluree/bm25/sync
+/// POST /v1/fluree/bm25/sync?t=<t>
+pub async fn bm25_sync(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    bm25_sync_local(state, request).await.into_response()
+}
+
+async fn bm25_sync_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+    let target_t = sync_target_t(&request)?;
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: Bm25SyncRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+
+    let span = create_request_span(
+        "bm25:sync",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.index),
+        None,
+        None,
+    );
+    async move {
+        tracing::info!(
+            status = "start",
+            index = %req.index,
+            target_t = ?target_t,
+            "bm25 index sync requested"
+        );
+
+        // `timeout_ms` is accepted but ignored by the API today, so the pinned
+        // path passes `None` rather than inventing a surface for it here.
+        let result = match target_t {
+            Some(t) => state.fluree.sync_bm25_index_to(&req.index, t, None).await,
+            None => state.fluree.sync_bm25_index(&req.index).await,
+        }
+        .map_err(ServerError::Api)?;
+
+        let response = Bm25SyncResponse {
+            graph_source_id: result.graph_source_id,
+            upserted: result.upserted,
+            removed: result.removed,
+            affected_subjects: result.affected_subjects,
+            old_watermark: result.old_watermark,
+            new_watermark: result.new_watermark,
+            was_full_resync: result.was_full_resync,
+        };
+
+        tracing::info!(
+            status = "success",
+            graph_source_id = %response.graph_source_id,
+            upserted = response.upserted,
+            removed = response.removed,
+            new_watermark = response.new_watermark,
+            "bm25 index synced"
+        );
+        Ok(Json(response))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Read the `t` query parameter, if present.
+///
+/// Deliberately surfaces a deserialization failure as a 400 instead of
+/// following the `.ok().unwrap_or_default()` idiom used elsewhere for optional
+/// params: silently discarding an unparseable `t` would sync through the
+/// source's head, which is the opposite of the pinned sync the caller asked
+/// for.
+///
+/// A ledger's first commit is `t = 1`, so `t < 1` names no commit. The pinned
+/// sync path does not reject it — it rebuilds at that `t` and reports success
+/// having moved the index's watermark backwards to a value no commit can
+/// restore — so it is refused here.
+fn sync_target_t(request: &Request) -> Result<Option<i64>> {
+    let Some(query) = request.uri().query() else {
+        return Ok(None);
+    };
+
+    let params: Bm25SyncParams = serde_urlencoded::from_str(query)
+        .map_err(|e| ServerError::bad_request(format!("Invalid query parameter: {e}")))?;
+
+    match params.t {
+        Some(t) if t < 1 => Err(ServerError::bad_request(format!(
+            "t must be a positive commit number, got {t}"
+        ))),
+        target_t => Ok(target_t),
+    }
 }
