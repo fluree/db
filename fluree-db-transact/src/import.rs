@@ -144,7 +144,7 @@ mod inner {
         // One serial commit == one whole document, so the commit ordinal is
         // a valid document scope here. See `skolem_base` for why the chunked
         // parallel path cannot use it.
-        let skolem_base = format!("{ledger_id}-{new_t}");
+        let skolem_base = skolem_base(ledger_id, &new_t.to_string());
 
         // 1. Create ImportSink + parse TTL
         let ns_codes_before = state.ns_registry.code_count();
@@ -306,7 +306,7 @@ mod inner {
         // One serial commit == one whole document, so the commit ordinal is
         // a valid document scope here. See `skolem_base` for why the chunked
         // parallel path cannot use it.
-        let skolem_base = format!("{ledger_id}-{new_t}");
+        let skolem_base = skolem_base(ledger_id, &new_t.to_string());
 
         let ns_codes_before = state.ns_registry.code_count();
         let _parse_span = tracing::debug_span!(
@@ -464,7 +464,7 @@ mod inner {
         // One serial commit == one whole document, so the commit ordinal is
         // a valid document scope here. See `skolem_base` for why the chunked
         // parallel path cannot use it.
-        let skolem_base = format!("{ledger_id}-{new_t}");
+        let skolem_base = skolem_base(ledger_id, &new_t.to_string());
 
         // 1. Parse TriG to extract GRAPH blocks
         let phase1 = parse_trig_phase1(trig)?;
@@ -865,6 +865,12 @@ mod inner {
     /// cross-worker coordination is needed: `blank_node_sid` is a pure function
     /// of the key, so two threads parsing chunk 1 and chunk 7 independently
     /// derive the same Sid for the same label.
+    ///
+    /// This is the **only** place an import skolem base is built. Every entry
+    /// point routes through it — the three serial commit paths and
+    /// `parse_jsonld_chunk` pass the commit ordinal (one serial call is one
+    /// whole document, so the ordinal is a valid scope); `parse_chunk` and
+    /// `parse_chunk_with_prelude` pass the caller's document scope.
     fn skolem_base(ledger_id: &str, doc_scope: &str) -> String {
         format!("{ledger_id}-{doc_scope}")
     }
@@ -1077,7 +1083,7 @@ mod inner {
         // split across chunks. That predates document scoping and is left alone
         // deliberately — deciding whether an ndjson line is its own RDF
         // document is a JSON-LD question, not a Turtle-chunking one.
-        let skolem_base = format!("{ledger_id}-{t}");
+        let skolem_base = skolem_base(ledger_id, &t.to_string());
 
         let _parse_span =
             tracing::debug_span!("parse_jsonld_chunk", t, jsonld_bytes = jsonld.len(),).entered();
