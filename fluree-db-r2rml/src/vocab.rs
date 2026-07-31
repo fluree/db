@@ -94,6 +94,11 @@ impl R2RML {
     /// rr:graph - Shortcut for constant-valued graph map
     pub const GRAPH: &'static str = "http://www.w3.org/ns/r2rml#graph";
 
+    /// `rr:defaultGraph` — the R2RML term for "the default graph". Recognised so
+    /// that `rr:graph rr:defaultGraph` can be rejected rather than silently
+    /// minting a named graph called `...r2rml#defaultGraph`.
+    pub const DEFAULT_GRAPH: &'static str = "http://www.w3.org/ns/r2rml#defaultGraph";
+
     // ==========================================================================
     // Properties - Predicate-Object Map
     // ==========================================================================

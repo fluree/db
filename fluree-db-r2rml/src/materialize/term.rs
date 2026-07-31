@@ -19,7 +19,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::error::{R2rmlError, R2rmlResult};
-use crate::mapping::{ConstantValue, ObjectMap, PredicateMap, SubjectMap, TermType};
+use crate::mapping::{ConstantValue, GraphMap, ObjectMap, PredicateMap, SubjectMap, TermType};
 
 /// Materialized RDF term
 ///
@@ -502,6 +502,78 @@ fn column_value_as_string(
     column_to_string(col, row_idx)
 }
 
+/// Read a column's value at `row_idx` as a string, using the exact same
+/// conversion the subject/object materializers use. Intended for reading
+/// auxiliary columns (e.g. a delete-marker column) so comparisons match the
+/// source encoding (booleans as `true`/`false`, timestamps/decimals formatted
+/// identically). Returns `None` when the column is absent OR the value is null
+/// — use [`batch_has_column`] to distinguish the two.
+pub fn column_string(batch: &ColumnBatch, column_name: &str, row_idx: usize) -> Option<String> {
+    column_value_as_string(batch, column_name, row_idx)
+}
+
+/// Whether `column_name` exists in `batch` (to validate a configured
+/// marker column independently of whether a given row's value is null).
+pub fn batch_has_column(batch: &ColumnBatch, column_name: &str) -> bool {
+    batch.column_by_name(column_name).is_some()
+}
+
+/// A total-order sort key for an ordering column value at `row_idx`, used for
+/// latest-by-key materialization. Numeric and temporal columns (int, date,
+/// timestamp) compare by their integer value; all other columns compare
+/// lexicographically by their string form. The returned `(i128, String)`
+/// compares as a tuple, so within one column (one type) the comparison is the
+/// natural one. `None` when the column is absent or null for that row (treated
+/// by callers as the smallest / "no ordering info").
+pub fn column_sort_key(
+    batch: &ColumnBatch,
+    column_name: &str,
+    row_idx: usize,
+) -> Option<(i128, String)> {
+    let col = batch.column_by_name(column_name)?;
+    match col {
+        Column::Int32(v) => v
+            .get(row_idx)
+            .and_then(|v| *v)
+            .map(|n| (i128::from(n), String::new())),
+        Column::Int64(v) => v
+            .get(row_idx)
+            .and_then(|v| *v)
+            .map(|n| (i128::from(n), String::new())),
+        Column::Date(v) => v
+            .get(row_idx)
+            .and_then(|v| *v)
+            .map(|n| (i128::from(n), String::new())),
+        Column::Timestamp(v) | Column::TimestampTz(v) => v
+            .get(row_idx)
+            .and_then(|v| *v)
+            .map(|n| (i128::from(n), String::new())),
+        // Floats and other types: fall back to string ordering (numeric part 0).
+        // Callers that require value-correct ordering must gate on
+        // [`column_is_orderable`] first (the materializer rejects non-orderable
+        // `order_by` columns), so this arm is only a best-effort fallback.
+        _ => column_to_string(col, row_idx).map(|s| (0i128, s)),
+    }
+}
+
+/// Whether `column_name` is a type [`column_sort_key`] orders by value (integer,
+/// date, or timestamp). Float/decimal/string/boolean are NOT value-orderable by
+/// the sort key (they fall back to a lexicographic string, which mis-orders
+/// numbers like `10 < 9`), so a latest-by-key `order_by` column must be one of
+/// these types. Returns `false` if the column is absent.
+pub fn column_is_orderable(batch: &ColumnBatch, column_name: &str) -> bool {
+    matches!(
+        batch.column_by_name(column_name),
+        Some(
+            Column::Int32(_)
+                | Column::Int64(_)
+                | Column::Date(_)
+                | Column::Timestamp(_)
+                | Column::TimestampTz(_)
+        )
+    )
+}
+
 /// Convert a Column value at a row index to a String
 fn column_to_string(col: &Column, row_idx: usize) -> Option<String> {
     match col {
@@ -746,6 +818,36 @@ pub fn materialize_subject_from_batch(
     Err(R2rmlError::MissingProperty(
         "Subject map must have rr:template, rr:column, or rr:constant".to_string(),
     ))
+}
+
+/// Materialize the named-graph IRI for a row from a [`GraphMap`].
+///
+/// Returns `Some(graph_iri)` when the graph map yields a value, or `None` when
+/// the source value is null / the template can't expand — in which case the
+/// caller falls back to the default graph. A graph term is always an IRI (no
+/// blank-node / literal graphs), so there is no term-type branch. Reuses the
+/// exact template/column expansion the subject materializer uses, so a graph
+/// template and a subject template resolve column values identically.
+pub fn materialize_graph_from_batch(
+    graph_map: &GraphMap,
+    batch: &ColumnBatch,
+    row_idx: usize,
+) -> R2rmlResult<Option<String>> {
+    if let Some(ref constant) = graph_map.constant {
+        return Ok(Some(constant.clone()));
+    }
+    if let Some(ref column) = graph_map.column {
+        // A null graph column routes the row to the default graph.
+        return Ok(column_value_as_string(batch, column, row_idx));
+    }
+    if let Some(ref template) = graph_map.template {
+        return match expand_template_from_batch(template, batch, row_idx) {
+            Ok(expanded) => Ok(Some(expanded)),
+            // A null column in the template -> no graph IRI -> default graph.
+            Err(_) => Ok(None),
+        };
+    }
+    Ok(None)
 }
 
 /// Materialize an object term from an ObjectMap and a ColumnBatch row

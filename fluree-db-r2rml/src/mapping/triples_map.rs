@@ -322,6 +322,69 @@ pub struct SubjectMap {
     ///
     /// Default is IRI. BlankNode generates blank node subjects.
     pub term_type: TermType,
+
+    /// `rr:graph` / `rr:graphMap` - the named graph this triples map's triples
+    /// are placed in (a subject-map-level graph map applies to every triple the
+    /// map generates). `None` = the default graph (the common case). A per-row
+    /// graph map (template/column) routes each row into a row-specific named
+    /// graph — e.g. one graph per tenant/user — so the same subject IRI can hold
+    /// independent per-graph statements without cross-graph clobbering.
+    pub graph_map: Option<GraphMap>,
+}
+
+/// A graph map: how the named graph for a triples map's triples is generated
+/// from a row (R2RML `rr:graphMap`, or the `rr:graph` constant shortcut).
+///
+/// A graph term is always an IRI (R2RML forbids literal/blank-node graphs), so
+/// unlike a subject map there is no term-type — just the value source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GraphMap {
+    /// `rr:template` - template for the graph IRI, e.g.
+    /// `"https://ex.org/graph/tenant/{tenant_id}/user/{user_id}"`.
+    pub template: Option<String>,
+
+    /// Column names referenced in the template (`{col}` placeholders).
+    pub template_columns: Vec<String>,
+
+    /// `rr:column` - column whose value is used directly as the graph IRI.
+    pub column: Option<String>,
+
+    /// `rr:constant` / `rr:graph` - a constant graph IRI for every row.
+    pub constant: Option<String>,
+}
+
+impl GraphMap {
+    /// Create a constant graph map (from `rr:graph` or `rr:graphMap [ rr:constant ]`).
+    pub fn constant(iri: impl Into<String>) -> Self {
+        Self {
+            constant: Some(iri.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Create a template-based graph map (per-row graph IRI).
+    pub fn template(template: impl Into<String>) -> Self {
+        let template_str = template.into();
+        let columns = extract_template_columns(&template_str);
+        Self {
+            template: Some(template_str),
+            template_columns: columns,
+            ..Default::default()
+        }
+    }
+
+    /// Create a column-based graph map.
+    pub fn column(col: impl Into<String>) -> Self {
+        Self {
+            column: Some(col.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Whether this graph map carries no value source (parsed nothing usable).
+    pub fn is_empty(&self) -> bool {
+        self.template.is_none() && self.column.is_none() && self.constant.is_none()
+    }
 }
 
 impl SubjectMap {
