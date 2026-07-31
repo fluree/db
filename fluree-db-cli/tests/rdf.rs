@@ -3771,20 +3771,31 @@ fn the_profile_records_the_load_average() {
 // input over the parallel threshold piped to `head` hung, which is the default
 // path.
 //
-// Two mechanisms keep this live, and the reviewer's four-way mutation table is
-// the reason to describe them carefully: receiver ownership (the receiver is
-// borrowed from outside the scope closure, so nothing can drop it before the
-// join) and the shutdown flag. EITHER ONE ALONE SUFFICES — remove ownership and
-// the suite still passes, remove the flag and it still passes — and only
-// removing BOTH hangs. Restoring the pre-fix receiver shape on its own makes
-// the matrix below fail at `--parallelism 4 × immediate close` in 10s while the
-// `-o FILE` control still passes.
+// What the matrix below does and does not prove, re-derived rather than
+// inherited — the previous claim here was stale and stale in the dangerous
+// direction.
 //
-// So: either mechanism alone suffices; keep both; the mutation that proves it
-// removes both. The earlier phrasing here — "the flag governs how promptly
-// workers stop, the ownership governs whether they stop at all" — reads as
-// though the flag were a mere optimization, which invites deleting a second
-// liveness guarantee that a single-mutation test can never catch.
+// It proves the run ENDS on a dead reader, at every width. It does NOT show any
+// termination mechanism to be load-bearing. With the prompt receiver drop, the
+// write-failure stop and the unconditional post-loop stop ALL removed, it still
+// passes: `rx` is a local of the scope closure and drops when that closure
+// returns, which is before `thread::scope` joins. The old four-way table
+// ("either one alone suffices … only removing BOTH hangs") described a receiver
+// shape this file no longer has, and the only way to learn that was to run the
+// cells again instead of trusting the sentence.
+//
+// So what are those mechanisms for? Promptness, which is worth having and is
+// not what this matrix measures. Without them a worker keeps taking chunks
+// until the channel fills and then parks in `send` until the closure returns —
+// on a 4 GiB input piped to `head -1`, converting most of the file for nobody.
+// Keep them; just do not believe this matrix is what guards them.
+//
+// The mechanism that IS load-bearing for liveness is the unconditional
+// `budget.stop()` after the reassembly loop, and a different test proves it:
+// `a_parse_error_wakes_workers_waiting_on_the_output_budget` hangs at the 90s
+// ceiling without it. That case needs a SATURATED budget, which a dead reader
+// never produces — which is exactly why this matrix cannot see it, and why
+// reading these two tests as covering the same thing is the mistake to avoid.
 
 /// `ParallelPlan::MIN_PARALLEL_BYTES`: below this an input converts serially
 /// whatever `--parallelism` says, so a fixture under it tests the wrong path.

@@ -150,6 +150,14 @@ pub fn can_chunk_input(syntax: RdfSyntax) -> bool {
 /// workers on a 4 million triple corpus that was ~200 MB of buffered output and
 /// a run sitting near a gigabyte.
 ///
+/// This bounds the buffered output and nothing else, which is worth stating
+/// plainly because the number people take from it is too small. A run's peak is
+/// this budget (256 MB at the ceiling) PLUS one chunk of overshoot per worker
+/// PLUS the whole input, which `convert` holds in memory. Measured: **1620 MiB
+/// peak RSS on a 745 MiB input at K=16 defaults**, on a box with no paging.
+/// Quoting the budget alone understates a real run by roughly the size of its
+/// input.
+///
 /// Workers wait here before taking work, never while holding a finished chunk.
 /// That ordering is what makes it deadlock-free: the writer never waits on this
 /// budget, so it always drains, so the bytes a waiting worker needs released
@@ -166,6 +174,15 @@ struct BudgetState {
     held: usize,
     /// Set when the run is ending, so waiters stop rather than wait for room
     /// that will never be released.
+    ///
+    /// This is the pool's ONLY shutdown signal, and living in here is the
+    /// point. It used to sit beside an external `AtomicBool` that workers read
+    /// at the top of their loop, and nothing tied the two together: the flag's
+    /// setter neither took this mutex nor notified this condvar, so a worker
+    /// parked in [`OutputBudget::wait_for_room`] was woken by `release` or
+    /// `stop` and never by the flag. Liveness therefore rested on one call site
+    /// remembering to do both, and a second setter — a cancellation path, a
+    /// deadline — would have reintroduced the hang.
     stopped: bool,
 }
 
@@ -578,11 +595,6 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
     let workers = config.workers.min(chunk_count).max(1);
 
     let next = std::sync::atomic::AtomicUsize::new(0);
-    // Set when the destination is gone. Workers check it so they stop parsing
-    // promptly instead of finishing the chunk they are on and every chunk
-    // after it — on a 4 GiB input piped to `head -1` that is the difference
-    // between exiting now and converting the whole file for nobody.
-    let shutdown = std::sync::atomic::AtomicBool::new(false);
     // Capacity >= workers so a worker can always deposit and never blocks
     // holding the chunk the writer is waiting for.
     let (tx, rx) = std::sync::mpsc::sync_channel::<ChunkBytes>(workers.max(2));
@@ -590,22 +602,24 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
 
     std::thread::scope(|scope| -> Result<ParallelOutcome, ParallelFailure> {
         let next = &next;
-        let shutdown = &shutdown;
         let budget = &budget;
 
         for _ in 0..workers {
             let tx = tx.clone();
             scope.spawn(move || {
                 loop {
-                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
                     // Wait for room BEFORE taking work, never while holding a
                     // finished chunk. A worker that blocked with output in hand
                     // could be holding the very chunk the writer is waiting
                     // for, which is the deadlock this pool has already had
                     // once; waiting here cannot, because a waiting worker holds
                     // nothing.
+                    //
+                    // This is also where a worker learns the run is over: the
+                    // call returns false the moment `stopped` is set, whether
+                    // or not it ever had to block. That is why there is no
+                    // separate flag to check first — one signal, read in one
+                    // place, so it cannot be set without waking anyone.
                     if !budget.wait_for_room() {
                         break;
                     }
@@ -665,13 +679,10 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
                 // reclaimable rather than one loop later.
                 budget.release(ready.bytes.len());
                 if let Err(e) = out.write_all(&ready.bytes) {
-                    // Terminate the pool before anything else. Setting the flag
-                    // stops workers that have not yet blocked; dropping the
-                    // receiver wakes the ones that have.
-                    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-                    // Wakes any worker waiting for room that will never be
-                    // released, since this thread is the only one that releases
-                    // it and it is leaving.
+                    // Terminate the pool before anything else. `stop` reaches
+                    // workers wherever they are in the loop — parked waiting
+                    // for room, or about to ask for it — and dropping the
+                    // receiver wakes any that are blocked in `send` instead.
                     budget.stop();
                     rx = None;
                     write_failure = Some(e);
@@ -712,8 +723,8 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
         budget.stop();
 
         // Whatever is still queued is dropped; the workers holding the rest
-        // see the flag or the closed channel and stop. Dropping here rather
-        // than at the end of the scope keeps the join prompt.
+        // see the stop above or the closed channel and stop. Dropping here
+        // rather than at the end of the scope keeps the join prompt.
         drop(rx);
         drop(pending);
 
