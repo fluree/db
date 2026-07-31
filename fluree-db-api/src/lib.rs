@@ -1156,8 +1156,7 @@ fn build_local_storage_from_config(
             "S3 storage in addressIdentifiers requires 'aws' feature",
         )),
         StorageType::Unsupported { type_iri, .. } => Err(ApiError::config(format!(
-            "Unsupported storage type in addressIdentifiers: {}",
-            type_iri
+            "Unsupported storage type in addressIdentifiers: {type_iri}"
         ))),
     }
 }
@@ -1963,6 +1962,22 @@ impl FlureeBuilder {
         self
     }
 
+    /// Inject a secret resolver used to hydrate `ConfigValue::SecretRef` auth
+    /// references in Iceberg graph sources built by this builder. It is forwarded
+    /// to the finalized `Fluree`. Most hosts inject per-request via
+    /// [`Fluree::with_secret_resolver`] instead; use this for a build-time default.
+    ///
+    /// Gated on `iceberg` ONLY (not `native`): the no-native BYO-IAM `SecretRef`
+    /// surface this exists for must be available on a per-lambda fast path.
+    #[cfg(feature = "iceberg")]
+    pub fn with_secret_resolver(
+        mut self,
+        resolver: Arc<dyn fluree_db_iceberg::SecretResolver>,
+    ) -> Self {
+        self.secret_resolver = Some(resolver);
+        self
+    }
+
     /// Build a file-backed Fluree instance
     ///
     /// Returns an error if storage_path is not set.
@@ -1973,19 +1988,6 @@ impl FlureeBuilder {
     /// spawned on the tokio runtime, so `build()` must be called within a
     /// tokio context.
     #[cfg(feature = "native")]
-    /// Inject a secret resolver used to hydrate `ConfigValue::SecretRef` auth
-    /// references in Iceberg graph sources built by this builder. It is forwarded
-    /// to the finalized `Fluree`. Most hosts inject per-request via
-    /// [`Fluree::with_secret_resolver`] instead; use this for a build-time default.
-    #[cfg(feature = "iceberg")]
-    pub fn with_secret_resolver(
-        mut self,
-        resolver: Arc<dyn fluree_db_iceberg::SecretResolver>,
-    ) -> Self {
-        self.secret_resolver = Some(resolver);
-        self
-    }
-
     pub fn build(mut self) -> Result<Fluree> {
         let path = self
             .storage_path

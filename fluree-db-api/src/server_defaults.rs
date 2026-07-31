@@ -75,7 +75,11 @@ pub fn default_reindex_max_bytes() -> usize {
 /// reach this budget. Page-cache pages are clean and reclaimable, so two-thirds
 /// is a soft target that still leaves the OS room to back the heap, the leaflet
 /// cache, and in-flight requests.
+///
+/// Only consumed by the `native` warming path.
+#[cfg(feature = "native")]
 const WARM_BUDGET_NUMERATOR: u64 = 2;
+#[cfg(feature = "native")]
 const WARM_BUDGET_DENOMINATOR: u64 = 3;
 
 /// Fallback warming budget when RAM detection is unavailable (WASM, sandbox).
