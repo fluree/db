@@ -862,7 +862,19 @@ impl DocIds {
     /// Out-of-range indexes fall back to `0`: the caller has already sized its
     /// document list, so this is unreachable, and a wrong-but-stable scope is a
     /// better failure than a panic mid-import.
+    ///
+    /// The fallback is nonetheless the one silent way this table can go wrong:
+    /// *several* out-of-range documents would all land on scope `0` and merge
+    /// their `_:x` nodes — the failure `DocIds::new` refuses up front, arriving
+    /// through the back door. The assertion turns that into a test failure and
+    /// costs nothing in release.
     fn id(&self, idx: usize) -> u64 {
+        debug_assert!(
+            idx < self.ids.len(),
+            "document index {idx} is out of range ({} documents); every \
+             out-of-range index shares scope 0",
+            self.ids.len()
+        );
         self.ids.get(idx).copied().unwrap_or(0)
     }
 

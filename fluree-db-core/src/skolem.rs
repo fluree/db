@@ -142,6 +142,21 @@ pub fn skolem_base(namespace: &str, doc_key: &str, segment: u32) -> String {
 /// splits into `("d0000000000abc", "shared")`. Returns `None` for any local
 /// name not minted by this module (a staged-transaction key, a `BNODE()` uuid,
 /// or an id minted before this format existed).
+///
+/// Rejecting a pre-C2 import id rests on one fact: those ids open with a
+/// **normalized** ledger id, `{name}:{branch}`, so a `:` always sits at index
+/// `name.len()`. Each of the three positions it can take trips a different
+/// check:
+///
+/// - `name.len() < DOC_SCOPE_LEN` — the colon is inside the scanned scope and
+///   fails the base36 charset test;
+/// - `name.len() == DOC_SCOPE_LEN` — the colon is the byte after the scope,
+///   where the label's leading `-` has to be;
+/// - `name.len() > DOC_SCOPE_LEN` — that byte is an ordinary name character,
+///   likewise not `-`.
+///
+/// So no pre-C2 id reads as a document scope however long its ledger name is,
+/// including one shaped exactly like a scope (`d` plus 13 alphanumerics).
 #[must_use]
 pub fn split_doc_scope(local: &str) -> Option<(&str, &str)> {
     let rest = local.strip_prefix(crate::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX)?;
@@ -252,6 +267,35 @@ mod tests {
         );
         // Pre-C2 import id: `fdb-{ledger}:{branch}-{t}-{label}`.
         assert_eq!(split_doc_scope("fdb-lubm:main-1-genid10"), None);
+    }
+
+    // The pre-C2 rejection rests on the normalized ledger id always carrying a
+    // `:` at `name.len()`, which trips a different check at each of the three
+    // positions it can occupy. Worst case is a ledger name shaped exactly like
+    // a document scope, so walk the boundary with one.
+    #[test]
+    fn split_doc_scope_rejects_pre_c2_ids_at_every_colon_position() {
+        let scope_shaped = format!("d{}", "0".repeat(DOC_SCOPE_DIGITS));
+        assert_eq!(scope_shaped.len(), DOC_SCOPE_LEN);
+
+        for name_len in [DOC_SCOPE_LEN - 1, DOC_SCOPE_LEN, DOC_SCOPE_LEN + 1] {
+            let name = if name_len <= scope_shaped.len() {
+                scope_shaped[..name_len].to_string()
+            } else {
+                format!(
+                    "{scope_shaped}{}",
+                    "0".repeat(name_len - scope_shaped.len())
+                )
+            };
+            assert_eq!(name.len(), name_len);
+            let local = format!("fdb-{name}:main-1-genid10");
+            assert_eq!(
+                split_doc_scope(&local),
+                None,
+                "pre-C2 id with a {name_len}-char ledger name must not read as \
+                 a document scope: {local}"
+            );
+        }
     }
 
     // Structural disjointness from the other two `fdb-` minters, expressed as
