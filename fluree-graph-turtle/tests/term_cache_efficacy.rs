@@ -24,9 +24,33 @@
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 static BYTES: AtomicUsize = AtomicUsize::new(0);
 static ARMED: AtomicUsize = AtomicUsize::new(0);
+
+/// The counters above are PROCESS-GLOBAL, so only one measurement may be in
+/// flight at a time. `cargo test` runs a binary's tests on threads of one
+/// process, so without this the two tests here arm the same counter and each
+/// measures the other's allocations: the floor came out at 104,960,128 bytes
+/// instead of ~102,520, inflated by the clamp test's two-million-entry table
+/// allocating alongside it.
+///
+/// That is worse than a flaky test. The assertion that fired blamed the
+/// PRODUCT — "the hint is being accepted and ignored" — for a defect in the
+/// measurement, which is the most expensive kind of false alarm: it sends the
+/// next reader to audit working code.
+///
+/// It stayed hidden because every green in this bucket came from nextest,
+/// which runs each test in its own process and so isolates the statics for
+/// free. CI runs nextest, so this gated nothing; a developer typing
+/// `cargo test` hit it on the first try. A test that is green only under the
+/// runner CI happens to use is a test whose isolation is accidental.
+///
+/// Poisoning is recovered rather than propagated: these tests assert, so a
+/// genuine failure would otherwise turn every sibling into a confusing
+/// poison error instead of its own verdict.
+static MEASURING: Mutex<()> = Mutex::new(());
 
 struct Measuring;
 
@@ -78,6 +102,9 @@ impl GraphSink for Hollow {
 /// Tiny on purpose: the document's own cost is a rounding error, so what the
 /// number reports is essentially the reservation.
 fn bytes_for(hint: Option<usize>) -> usize {
+    let _measuring = MEASURING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     const DOC: &str = "<http://ex/s> <http://ex/p> <http://ex/o> .\n";
     let mut options = fluree_graph_turtle::ParserOptions::default();
     if let Some(n) = hint {

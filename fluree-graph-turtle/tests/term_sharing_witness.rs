@@ -52,6 +52,17 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+// The counters above are PROCESS-GLOBAL. This file is safe today only because
+// it holds exactly ONE test that arms them: `cargo test` runs a binary's tests
+// on threads of one process, so a second measuring test added here would
+// measure this one's allocations as well as its own — silently, and in the
+// direction that accuses the product rather than the test.
+//
+// So: one measuring test per file, or serialize the arm/measure/disarm window
+// behind a mutex the way `term_cache_efficacy.rs` does. Nextest's
+// process-per-test isolation hides the difference, which means a green run
+// there is not evidence either way.
+
 /// A sink that holds nothing, so the only per-term allocation in the window is
 /// the producer's.
 #[derive(Default)]
