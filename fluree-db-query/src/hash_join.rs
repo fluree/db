@@ -325,6 +325,12 @@ pub(crate) struct HashJoinPlanner<'a> {
 }
 
 impl<'a> HashJoinPlanner<'a> {
+    /// The block's planner stats — shared with sibling join-shape decisions
+    /// (e.g. the membership-join build-size gate in `build_scan_or_join`).
+    pub(crate) fn stats(&self) -> Option<&'a StatsView> {
+        self.stats
+    }
+
     pub(crate) fn new(stats: Option<&'a StatsView>) -> Self {
         Self {
             stats,

@@ -1156,8 +1156,7 @@ fn build_local_storage_from_config(
             "S3 storage in addressIdentifiers requires 'aws' feature",
         )),
         StorageType::Unsupported { type_iri, .. } => Err(ApiError::config(format!(
-            "Unsupported storage type in addressIdentifiers: {}",
-            type_iri
+            "Unsupported storage type in addressIdentifiers: {type_iri}"
         ))),
     }
 }
@@ -1969,7 +1968,7 @@ impl FlureeBuilder {
     /// [`Fluree::with_secret_resolver`] instead; use this for a build-time default.
     ///
     /// Gated on `iceberg` ONLY (not `native`): the no-native BYO-IAM `SecretRef`
-    /// surface this exists for must be available on solo's per-lambda fast path.
+    /// surface this exists for must be available on a per-lambda fast path.
     #[cfg(feature = "iceberg")]
     pub fn with_secret_resolver(
         mut self,

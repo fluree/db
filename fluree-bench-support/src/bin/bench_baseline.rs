@@ -12,9 +12,16 @@
 //! cargo run -p fluree-bench-support --bin bench-baseline -- \
 //!     capture --label phase-1-pre --out bench-baselines/phase-1-pre.json
 //!
+//! # 2b. ...or accumulate repeat runs into one noise-aware baseline:
+//! for i in 1 2 3 4 5; do
+//!   cargo bench -p fluree-db-api --bench query_overlay_matrix
+//!   cargo run -p fluree-bench-support --bin bench-baseline -- \
+//!       capture --label phase-1-pre --out bench-baselines/phase-1-pre.json --accumulate
+//! done
+//!
 //! # 3. ...make changes, rerun the benches...
 //!
-//! # 4. Compare (exit 1 on any budget breach):
+//! # 4. Compare (exit 1 on a budget breach, 2 on a refusal to compare):
 //! cargo run -p fluree-bench-support --bin bench-baseline -- \
 //!     compare --baseline bench-baselines/phase-1-pre.json
 //!
@@ -31,11 +38,21 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use fluree_bench_support::baseline::{
-    capture, compare, default_criterion_dir, load_baseline, runner_class, save_baseline,
-    BaselineEntry, CompareStatus,
+    accumulate, capture, compare, default_criterion_dir, describe_corpus, host_class,
+    load_baseline, save_baseline, AccumulateOptions, CompareOptions, CompareStatus, Comparison,
+    HostMismatchPolicy, Metric,
 };
 use fluree_bench_support::budget;
 use fluree_bench_support::mem;
+use fluree_bench_support::meta;
+use fluree_bench_support::meta::DEFAULT_SHARE_DRIFT_PP;
+
+/// Budget breach on an enforced metric.
+const EXIT_BREACH: u8 = 1;
+/// Refusal to compare (host class, corpus identity, schema version). Distinct
+/// from a breach because the two demand different responses: a breach means
+/// "your change is slower", a refusal means "this comparison is meaningless".
+const EXIT_REFUSED: u8 = 2;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -58,15 +75,34 @@ fn print_usage() {
     eprintln!(
         "bench-baseline — capture and compare performance baselines\n\n\
          USAGE:\n  \
-         bench-baseline capture --label <name> --out <file> [--criterion-dir <dir>] [--mem-dir <dir>] [--clean-mem]\n  \
-         bench-baseline compare --baseline <file> [--criterion-dir <dir>] [--mem-dir <dir>] [--budget <file>] [--only <substr>] [--advisory]\n\n\
-         TIME and PEAK_MEM both enforce only when the baseline's runner_class\n\
-         matches this runner's (env FLUREE_BENCH_RUNNER_CLASS, default\n\
-         \"local\"); on a mismatch both are advisory and the gate passes.\n\
-         --advisory forces advisory for both.\n\n\
+         bench-baseline capture --label <name> --out <file> [--criterion-dir <dir>] [--mem-dir <dir>]\n                          \
+         [--meta-dir <dir>] [--host-class <name>] [--accumulate] [--allow-revision-drift]\n                          \
+         [--clean-sidecars]\n  \
+         bench-baseline compare --baseline <file> [--criterion-dir <dir>] [--mem-dir <dir>]\n                          \
+         [--meta-dir <dir>] [--budget <file>] [--only <substr>] [--host-class <name>]\n                          \
+         [--share-drift-pp <pp>] [--allow-host-mismatch] [--advisory]\n\n\
+         GATE\n  \
+         time and peak_mem enforce only when the baseline's host_class matches\n  \
+         this host's (env FLUREE_BENCH_HOST_CLASS, else FLUREE_BENCH_RUNNER_CLASS,\n  \
+         else {{os}}-{{arch}}). A mismatch is a REFUSAL (exit {EXIT_REFUSED}) unless\n  \
+         --allow-host-mismatch downgrades those metrics to advisory.\n  \
+         phase_share drift enforces regardless of host class — shares are ratios\n  \
+         within one run, so the machine cancels; a phase that appears or\n  \
+         disappears is gated on its share alone.\n  \
+         A corpus mismatch (sha256 / syntax / thread count) is always a refusal:\n  \
+         there is no posture in which comparing different inputs is meaningful.\n  \
+         --advisory forces every absolute metric advisory.\n\n\
+         --host-class LABELS this host; it does not make it comparable. Use it to\n  \
+         declare a class you genuinely are (CI pinning its runner class), never to\n  \
+         silence a refusal — that turns a refusal into a false ENFORCEMENT against\n  \
+         hardware the baseline never ran on. To compare anyway, use\n  \
+         --allow-host-mismatch.\n\n\
+         EXIT CODES\n  \
+         0 within budget   {EXIT_BREACH} enforced budget breach   {EXIT_REFUSED} refused to compare\n\n\
          Run the benches first (`cargo bench ...`); this tool reads criterion's\n\
-         output from target/criterion and memory sidecars from\n\
-         target/fluree-bench-mem. See BENCHMARKING.md (\"Baselines\")."
+         output from target/criterion, memory sidecars from target/fluree-bench-mem,\n\
+         and corpus/phase sidecars from target/fluree-bench-meta.\n\
+         See BENCHMARKING.md (\"Baselines\")."
     );
 }
 
@@ -111,6 +147,22 @@ fn mem_dir(flags: &BTreeMap<String, String>) -> PathBuf {
         .unwrap_or_else(mem::sidecar_dir)
 }
 
+fn meta_dir(flags: &BTreeMap<String, String>) -> PathBuf {
+    flags
+        .get("--meta-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(meta::sidecar_dir)
+}
+
+/// `--host-class` is applied by setting the env var the library reads, so there
+/// is exactly one resolution path for the class and the flag can't disagree
+/// with `HostBlock::detect()`.
+fn apply_host_class_override(flags: &BTreeMap<String, String>) {
+    if let Some(class) = flags.get("--host-class") {
+        std::env::set_var("FLUREE_BENCH_HOST_CLASS", class);
+    }
+}
+
 fn git_short_sha() -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -126,8 +178,20 @@ fn git_short_sha() -> Option<String> {
 fn run_capture(args: &[String]) -> ExitCode {
     let flags = match parse_flags(
         args,
-        &["--label", "--out", "--criterion-dir", "--mem-dir"],
-        &["--clean-mem"],
+        &[
+            "--label",
+            "--out",
+            "--criterion-dir",
+            "--mem-dir",
+            "--meta-dir",
+            "--host-class",
+        ],
+        &[
+            "--clean-mem",
+            "--clean-sidecars",
+            "--accumulate",
+            "--allow-revision-drift",
+        ],
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -144,9 +208,11 @@ fn run_capture(args: &[String]) -> ExitCode {
         eprintln!("capture requires --out <file>");
         return ExitCode::FAILURE;
     };
+    apply_host_class_override(&flags);
 
     let crit = criterion_dir(&flags);
     let mem_d = mem_dir(&flags);
+    let meta_d = meta_dir(&flags);
     if !crit.is_dir() {
         eprintln!(
             "criterion dir {} not found — run `cargo bench ...` first",
@@ -155,10 +221,11 @@ fn run_capture(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let file = capture(
+    let mut file = capture(
         label,
         &crit,
         &mem_d,
+        &meta_d,
         git_short_sha(),
         chrono::Utc::now().to_rfc3339(),
     );
@@ -166,25 +233,68 @@ fn run_capture(args: &[String]) -> ExitCode {
         eprintln!("no scenarios found under {}", crit.display());
         return ExitCode::FAILURE;
     }
+
+    if flags.contains_key("--accumulate") {
+        match load_baseline(&out_path) {
+            // `accumulate` enforces the host-class and corpus guards itself, so
+            // the CLI has no policy of its own to apply here.
+            Ok(prev) => match accumulate(
+                &prev,
+                &file,
+                &AccumulateOptions {
+                    allow_revision_drift: flags.contains_key("--allow-revision-drift"),
+                },
+            ) {
+                Ok(merged) => file = merged,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(EXIT_REFUSED);
+                }
+            },
+            // First pass of an accumulation loop: nothing to merge yet.
+            Err(_) if !out_path.exists() => {}
+            Err(e) => {
+                eprintln!("--accumulate could not read {}: {e}", out_path.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     if let Err(e) = save_baseline(&file, &out_path) {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
     let with_mem = file.entries.values().filter(|e| e.mem.is_some()).count();
+    let with_corpus = file.entries.values().filter(|e| e.corpus.is_some()).count();
+    let with_phases = file
+        .entries
+        .values()
+        .filter(|e| !e.phases.is_empty())
+        .count();
+    let sampled = file
+        .entries
+        .values()
+        .filter_map(|e| e.noise.as_ref())
+        .map(|n| n.n)
+        .min();
     println!(
-        "captured {} scenarios ({} with memory metrics) → {} [label={} sha={} profile={} scale={} runner_class={} host={}]",
+        "captured {} scenarios ({with_mem} with memory, {with_corpus} with corpus, {with_phases} with phases) → {} [label={} sha={} profile={} scale={}]",
         file.entries.len(),
-        with_mem,
         out_path.display(),
         file.label,
         file.git_sha.as_deref().unwrap_or("?"),
         file.profile,
         file.scale,
-        file.runner_class,
-        file.host,
     );
-    if flags.contains_key("--clean-mem") {
+    println!("host: {}", file.host.describe());
+    if let Some(n) = sampled {
+        println!("noise samples: {n} (min across entries)");
+    }
+    // `--clean-mem` is the pre-meta spelling; both clear every sidecar dir so a
+    // stale corpus block can't outlive the run that wrote it.
+    if flags.contains_key("--clean-sidecars") || flags.contains_key("--clean-mem") {
         mem::clear_sidecars(&mem_d);
+        meta::clear_sidecars(&meta_d);
     }
     ExitCode::SUCCESS
 }
@@ -196,10 +306,13 @@ fn run_compare(args: &[String]) -> ExitCode {
             "--baseline",
             "--criterion-dir",
             "--mem-dir",
+            "--meta-dir",
             "--budget",
             "--only",
+            "--host-class",
+            "--share-drift-pp",
         ],
-        &["--advisory"],
+        &["--advisory", "--allow-host-mismatch"],
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -212,6 +325,16 @@ fn run_compare(args: &[String]) -> ExitCode {
         eprintln!("compare requires --baseline <file>");
         return ExitCode::FAILURE;
     };
+    apply_host_class_override(&flags);
+
+    let share_drift_pp = match flags.get("--share-drift-pp").map(|s| s.parse::<f64>()) {
+        Some(Ok(pp)) if pp >= 0.0 => pp,
+        Some(_) => {
+            eprintln!("--share-drift-pp requires a non-negative number");
+            return ExitCode::FAILURE;
+        }
+        None => DEFAULT_SHARE_DRIFT_PP,
+    };
 
     let baseline = match load_baseline(&baseline_path) {
         Ok(b) => b,
@@ -221,13 +344,6 @@ fn run_compare(args: &[String]) -> ExitCode {
         }
     };
 
-    // Neither metric is comparable across machine classes, so BOTH enforce only
-    // when the baseline and this runner share a runner class; on a mismatch both
-    // are advisory. `--advisory` forces advisory regardless. Committing a
-    // baseline captured under the CI runner class is what flips them to
-    // enforcing — no code change needed.
-    let current_rc = runner_class();
-    let advisory = flags.contains_key("--advisory") || baseline.runner_class != current_rc;
     let budgets = match flags.get("--budget") {
         Some(p) => budget::load_from(PathBuf::from(p).as_path()),
         None => budget::load(),
@@ -243,40 +359,60 @@ fn run_compare(args: &[String]) -> ExitCode {
     // Collect current measurements the same way capture does.
     let crit = criterion_dir(&flags);
     let mem_d = mem_dir(&flags);
-    let current_file = capture("current", &crit, &mem_d, None, String::new());
-    let current: BTreeMap<String, BaselineEntry> = current_file.entries;
+    let meta_d = meta_dir(&flags);
+    let current = capture("current", &crit, &mem_d, &meta_d, None, String::new());
 
-    let report = compare(
-        &baseline,
-        &current,
-        &budgets,
-        flags.get("--only").map(String::as_str),
-        advisory,
-    );
+    let opts = CompareOptions {
+        only: flags.get("--only").cloned(),
+        host_mismatch: if flags.contains_key("--allow-host-mismatch") {
+            HostMismatchPolicy::Advise
+        } else {
+            HostMismatchPolicy::Fatal
+        },
+        share_drift_pp,
+        force_advisory: flags.contains_key("--advisory"),
+    };
+    let report = compare(&baseline, &current, &budgets, &opts);
 
     println!(
-        "comparing against '{}' (sha={} captured={} profile={} scale={} runner_class={})",
+        "comparing against '{}' (sha={} captured={} profile={} scale={})",
         baseline.label,
         baseline.git_sha.as_deref().unwrap_or("?"),
         baseline.captured_at,
         baseline.profile,
         baseline.scale,
-        baseline.runner_class,
     );
-    println!(
-        "runner_class: baseline={} current={} → time + peak_mem {}",
-        baseline.runner_class,
-        current_rc,
-        if advisory {
-            "ADVISORY (cross-machine or overridden; not gating)"
-        } else {
-            "ENFORCED"
-        },
-    );
+    println!("  baseline host: {}", baseline.host.describe());
+    println!("  current  host: {}", current.host.describe());
+    if let Some(corpus) = &baseline.corpus {
+        println!("  baseline corpus: {}", describe_corpus(corpus));
+    }
+
+    if report.is_fatal() {
+        eprintln!("\nREFUSED to compare:");
+        for f in &report.fatal {
+            match &f.id {
+                Some(id) => eprintln!("  [{}] {id}: {}", f.kind.as_str(), f.detail),
+                None => eprintln!("  [{}] {}", f.kind.as_str(), f.detail),
+            }
+            eprintln!("      → {}", f.remedy);
+        }
+        eprintln!(
+            "\n::error::bench-baseline refused {} comparison(s); current host_class={}",
+            report.fatal.len(),
+            host_class(),
+        );
+        return ExitCode::from(EXIT_REFUSED);
+    }
+
+    match &report.advisory_reason {
+        Some(reason) => println!("\ntime + peak_mem: ADVISORY ({reason}); phase_share: ENFORCED"),
+        None => println!("\ntime + peak_mem + phase_share: ENFORCED"),
+    }
     println!();
     println!(
-        "{:<55} {:>9} {:>14} {:>14} {:>8} {:>8}",
-        "scenario [metric]", "status", "baseline", "observed", "Δ%", "budget%"
+        "{:<62} {:>9} {:>14} {:>14} {:>9} {:>8}",
+        "scenario [metric]", "status", "baseline", "observed", "Δ", "budget"
     );
     for c in &report.comparisons {
         let status = match c.status {
@@ -285,19 +421,15 @@ fn run_compare(args: &[String]) -> ExitCode {
             CompareStatus::Exceeded if c.enforced => "EXCEEDED",
             CompareStatus::Exceeded => "advisory",
         };
-        let (baseline_s, observed_s) = if c.metric == "time" {
-            (format_ns(c.baseline), format_ns(c.observed))
-        } else {
-            (format_bytes(c.baseline), format_bytes(c.observed))
-        };
+        let (baseline_s, observed_s, delta_s, budget_s) = render(c);
         println!(
-            "{:<55} {:>9} {:>14} {:>14} {:>+8.2} {:>8.1}",
-            format!("{} [{}]", c.id, c.metric),
+            "{:<62} {:>9} {:>14} {:>14} {:>9} {:>8}",
+            c.label(),
             status,
             baseline_s,
             observed_s,
-            c.change_pct,
-            c.budget_pct,
+            delta_s,
+            budget_s,
         );
     }
     if !report.missing.is_empty() {
@@ -315,19 +447,15 @@ fn run_compare(args: &[String]) -> ExitCode {
 
     let advisories: Vec<_> = report.advisories().collect();
     if !advisories.is_empty() {
-        let reason = if baseline.runner_class != current_rc {
-            format!(
-                "baseline runner_class {} != {}; commit a {}-class baseline to make these enforce",
-                baseline.runner_class, current_rc, current_rc
-            )
-        } else {
-            "--advisory was passed".to_string()
-        };
+        let reason = report
+            .advisory_reason
+            .as_deref()
+            .unwrap_or("advisory metrics");
         println!(
             "\n::warning::advisory regressions (not gating — {reason}): {}",
             advisories
                 .iter()
-                .map(|c| format!("{} [{}] {:+.1}%", c.id, c.metric, c.change_pct))
+                .map(|c| format!("{} {}", c.label(), render(c).2))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -353,7 +481,33 @@ fn run_compare(args: &[String]) -> ExitCode {
             "FAIL: enforced budget exceeded for {} scenario metric(s)",
             breaches.len()
         );
-        ExitCode::FAILURE
+        ExitCode::from(EXIT_BREACH)
+    }
+}
+
+/// `(baseline, observed, delta, budget)` rendered in the metric's own units.
+/// Share rows are percentages moving in percentage points; everything else is a
+/// magnitude moving in percent.
+fn render(c: &Comparison) -> (String, String, String, String) {
+    match c.metric {
+        Metric::PeakMem => (
+            format_bytes(c.baseline),
+            format_bytes(c.observed),
+            format!("{:+.2}%", c.change_pct),
+            format!("{:.1}%", c.budget_pct),
+        ),
+        Metric::PhaseShare => (
+            format!("{:.1}%", c.baseline),
+            format!("{:.1}%", c.observed),
+            format!("{:+.1}pp", c.change_pct),
+            format!("{:.1}pp", c.budget_pct),
+        ),
+        Metric::Time | Metric::PhaseTime => (
+            format_ns(c.baseline),
+            format_ns(c.observed),
+            format!("{:+.2}%", c.change_pct),
+            format!("{:.1}%", c.budget_pct),
+        ),
     }
 }
 

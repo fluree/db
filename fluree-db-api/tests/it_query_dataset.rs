@@ -2687,3 +2687,87 @@ async fn sparql_within_ledger_repeated_from_is_deduped() {
         "FROM <g> FROM <g> must union the graph ONCE (set semantics), not double rows"
     );
 }
+
+/// Seed mutual `schema:knows` edges — the shape that makes a join's right
+/// triple bind nothing new (`?a knows ?b . ?b knows ?a`).
+async fn seed_mutual_knows_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "schema:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "schema:knows": {"@id": "ex:alice"}}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert mutual knows")
+        .ledger
+}
+
+/// A join whose right triple binds nothing new is evaluated as a membership
+/// probe (`MembershipJoinOperator`) when the shape and cost gates allow. That
+/// rewrite is keep/drop, which is only join-equivalent when a ground triple
+/// matches at most once — true over one graph, NOT true across a multi-graph
+/// dataset, where union does not deduplicate (see
+/// `dataset_multiple_default_graphs_no_dedup`) and the nested loop emits one
+/// row per matching graph. Pin that the multi-graph cardinality is the
+/// nested-loop answer: unioning a graph with itself must square the row
+/// count of the mutual-knows join, not collapse it. (Without the operator's
+/// multi-graph guard this returns 4 instead of 8.)
+#[tokio::test]
+async fn dataset_membership_shape_keeps_per_graph_multiplicity() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let _g1 = seed_mutual_knows_ledger(&fluree, "knows1:main").await;
+    let _g2 = seed_mutual_knows_ledger(&fluree, "knows2:main").await;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "select": ["?a", "?b"],
+        "where": [
+            {"@id": "?a", "schema:knows": "?b"},
+            {"@id": "?b", "schema:knows": "?a"}
+        ]
+    });
+
+    let one_spec = DatasetSpec::new().with_default(GraphSource::new("knows1:main"));
+    let one = fluree
+        .build_dataset_view(&one_spec)
+        .await
+        .expect("single-graph dataset");
+    let single_rows = fluree
+        .query_dataset(&one, &query)
+        .await
+        .expect("single-graph query")
+        .row_count();
+    assert_eq!(
+        single_rows, 2,
+        "one graph: the mutual pair joins both ways (alice/bob, bob/alice)"
+    );
+
+    let two_spec = DatasetSpec::new()
+        .with_default(GraphSource::new("knows1:main"))
+        .with_default(GraphSource::new("knows2:main"));
+    let two = fluree
+        .build_dataset_view(&two_spec)
+        .await
+        .expect("two-graph dataset");
+    let union_rows = fluree
+        .query_dataset(&two, &query)
+        .await
+        .expect("two-graph query")
+        .row_count();
+
+    // Each side of the join sees every triple once per graph, so duplicating
+    // the graph squares the join: 2 * 2 * 2 = 8. A keep/drop membership
+    // rewrite would report 4 (each left row kept once), collapsing the
+    // second graph's match.
+    assert_eq!(
+        union_rows,
+        single_rows * 4,
+        "two identical default graphs must keep per-graph join multiplicity"
+    );
+}

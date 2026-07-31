@@ -2598,6 +2598,31 @@ pub(crate) fn build_scan_or_join(
             // Extract object bounds if available for this pattern's object variable
             let bounds = tp.o.as_var().and_then(|v| object_bounds.get(&v).cloned());
 
+            // A right triple that binds nothing new is a pure existence
+            // filter (each ground row matches at most once in current-state
+            // mode). The nested-loop join re-opens a scan per driving row —
+            // ~ms each, ~30 s for a 21k-row `?o rdf:type :Class` membership
+            // check. Evaluate it as a build-once hash membership probe when
+            // the build side is bounded AND the driving side is large enough
+            // to amortize it; rows that do not fully ground the pattern keep
+            // exact join semantics via a per-row fallback.
+            if bounds.is_none() && inline_ops.is_empty() {
+                if let Some(key_vars) = membership_join_key_vars(
+                    &left_schema,
+                    tp,
+                    planning,
+                    hash_planner,
+                    left.estimated_rows(),
+                ) {
+                    return Box::new(crate::membership_join::MembershipJoinOperator::new(
+                        left,
+                        tp.clone(),
+                        key_vars,
+                        *planning,
+                    ));
+                }
+            }
+
             // For object→subject "path" joins, build a hash table from the small
             // (left/driving) side and probe a single contiguous scan of the large
             // predicate, instead of the per-driving-row OPST object seek that degrades
@@ -2656,6 +2681,86 @@ pub(crate) fn build_scan_or_join(
             )
         }
     }
+}
+
+/// Max estimated build-side rows for the membership-join hash lane: the
+/// one-time drain of the right triple (a single predicate slice / class
+/// extension) must stay bounded — beyond this the per-row nested loop is
+/// kept, since a huge build would cost more than the reopens it saves.
+const MEMBERSHIP_JOIN_MAX_BUILD: f64 = 250_000.0;
+
+/// Min estimated driving rows for the membership-join hash lane. Below this
+/// the nested loop's per-row probes are cheaper than one drain of the whole
+/// build side: three driving rows are three seeded probes, where the lane
+/// would drain up to [`MEMBERSHIP_JOIN_MAX_BUILD`] rows to answer them.
+/// Mirrors `HASH_ANNOTATION_MIN_DRIVING_ROWS` in
+/// [`crate::default_graph_source`], including its treatment of an unknown
+/// estimate as large — an unbounded driving stream is exactly what the
+/// build-once drain protects against.
+const MEMBERSHIP_JOIN_MIN_DRIVING: usize = 256;
+
+/// Recognize the membership-join shape for `build_scan_or_join`: every
+/// variable of `tp` (≥ 1) already appears in the left schema, the query is
+/// current-state (in history mode a ground triple matches once per
+/// `(t, op)` version, so keep/drop is not join-equivalent), the driving side
+/// is at least [`MEMBERSHIP_JOIN_MIN_DRIVING`] rows (or unknown), and stats
+/// bound the standalone build within [`MEMBERSHIP_JOIN_MAX_BUILD`].
+/// Returns the key vars in left-schema order (load-bearing for column
+/// lookup at open), or `None` to keep the nested-loop join.
+fn membership_join_key_vars(
+    left_schema: &[VarId],
+    tp: &TriplePattern,
+    planning: &PlanningContext,
+    hash_planner: &HashJoinPlanner,
+    driving_rows: Option<usize>,
+) -> Option<Vec<VarId>> {
+    if planning.is_history() {
+        return None;
+    }
+    // A small driving side is cheaper on the nested loop's per-row probes
+    // than on a one-shot drain of the whole build side. `{ ?a :knows ?b .
+    // ?b :knows ?a }` with a selective first triple is the canonical case:
+    // a handful of rows must not drain the entire `:knows` extension.
+    if driving_rows.is_some_and(|n| n < MEMBERSHIP_JOIN_MIN_DRIVING) {
+        return None;
+    }
+    // `(?s bound-from-left, const p, const o)` is the nested-loop join's own
+    // batched-EXISTS shape (`is_batched_subject_exists_eligible`): it probes
+    // PSOT for the driving subjects only — O(driving locality) — where this
+    // lane would drain the whole class/predicate extension. Leave that
+    // subset to the NLJ; membership handles the shapes it can't (a
+    // bound-VAR object or predicate).
+    if tp.s.as_var().is_some_and(|v| left_schema.contains(&v))
+        && tp.p.is_sid()
+        && !matches!(&tp.o, Term::Var(_))
+        && tp.dtc.is_none()
+    {
+        return None;
+    }
+    let mut tp_vars: Vec<VarId> = Vec::new();
+    for v in [tp.s.as_var(), tp.p.as_var(), tp.o.as_var()]
+        .into_iter()
+        .flatten()
+    {
+        if !left_schema.contains(&v) {
+            return None;
+        }
+        if !tp_vars.contains(&v) {
+            tp_vars.push(v);
+        }
+    }
+    if tp_vars.is_empty() {
+        return None;
+    }
+    let stats = hash_planner.stats()?;
+    let inner_est = crate::planner::estimate_triple_row_count(tp, &HashSet::new(), Some(stats));
+    (inner_est <= MEMBERSHIP_JOIN_MAX_BUILD).then(|| {
+        left_schema
+            .iter()
+            .copied()
+            .filter(|v| tp_vars.contains(v))
+            .collect()
+    })
 }
 
 #[inline]
@@ -4623,5 +4728,102 @@ mod tests {
         let strategy = choose_exists_strategy(&outer_schema, &inner);
 
         assert_eq!(strategy, ExistsStrategy::Semijoin { key_vars: vec![a] },);
+    }
+
+    // --- membership-join lane admission ------------------------------------
+
+    /// Stats for a `:knows`-style predicate whose extension is inside the
+    /// membership build ceiling.
+    fn knows_stats(count: u64) -> StatsView {
+        let mut v = StatsView::default();
+        v.properties.insert(
+            Sid::new(100, "knows"),
+            PropertyStatData {
+                count,
+                ndv_values: count,
+                ndv_subjects: count,
+            },
+        );
+        v
+    }
+
+    /// `?a :knows ?b . ?b :knows ?a` — the mutual-relationship shape. Both
+    /// vars of the second triple come from the left, so it is a pure
+    /// existence filter and the lane is shape-eligible.
+    fn mutual_knows_right_triple() -> (Vec<VarId>, TriplePattern) {
+        let (a, b) = (VarId(0), VarId(1));
+        (vec![a, b], make_pattern(b, "knows", a))
+    }
+
+    #[test]
+    fn membership_lane_declines_small_driving_side() {
+        let stats = knows_stats(100_000);
+        let planner = HashJoinPlanner::new(Some(&stats));
+        let (left_schema, tp) = mutual_knows_right_triple();
+        assert!(
+            membership_join_key_vars(
+                &left_schema,
+                &tp,
+                &PlanningContext::current(),
+                &planner,
+                Some(3),
+            )
+            .is_none(),
+            "3 driving rows must stay on the nested loop rather than drain the \
+             whole :knows extension"
+        );
+    }
+
+    #[test]
+    fn membership_lane_admits_large_driving_side() {
+        let stats = knows_stats(100_000);
+        let planner = HashJoinPlanner::new(Some(&stats));
+        let (left_schema, tp) = mutual_knows_right_triple();
+        let key_vars = membership_join_key_vars(
+            &left_schema,
+            &tp,
+            &PlanningContext::current(),
+            &planner,
+            Some(MEMBERSHIP_JOIN_MIN_DRIVING),
+        )
+        .expect("a large driving side amortizes the one-shot build");
+        assert_eq!(
+            key_vars, left_schema,
+            "key vars are returned in left-schema order"
+        );
+    }
+
+    /// An unknown driving estimate is treated as large — an unbounded stream
+    /// is exactly what the build-once drain protects against (matches
+    /// `HASH_ANNOTATION_MIN_DRIVING_ROWS`'s handling of `None`).
+    #[test]
+    fn membership_lane_admits_unknown_driving_side() {
+        let stats = knows_stats(100_000);
+        let planner = HashJoinPlanner::new(Some(&stats));
+        let (left_schema, tp) = mutual_knows_right_triple();
+        assert!(membership_join_key_vars(
+            &left_schema,
+            &tp,
+            &PlanningContext::current(),
+            &planner,
+            None,
+        )
+        .is_some());
+    }
+
+    /// The build ceiling still applies independently of the driving side.
+    #[test]
+    fn membership_lane_declines_unbounded_build() {
+        let stats = knows_stats(5_000_000);
+        let planner = HashJoinPlanner::new(Some(&stats));
+        let (left_schema, tp) = mutual_knows_right_triple();
+        assert!(membership_join_key_vars(
+            &left_schema,
+            &tp,
+            &PlanningContext::current(),
+            &planner,
+            None,
+        )
+        .is_none());
     }
 }

@@ -9716,3 +9716,154 @@ async fn cypher_untyped_rel_var_on_reified_edges_batched_probe() {
         "one row per edge, reified and plain alike: {cj}"
     );
 }
+
+// ============================================================================
+// Relationship-property reads over UNTYPED rels — the required
+// edge-annotation lane (`-[r]->` + `r.prop` lowers the `f:reifies*` chain
+// into the main BGP). Pins the KB pageload regressions: the chain must
+// never drive from a bound-object `f:reifiesPredicate` probe, late-
+// materialized `EncodedPid` predicates must decode, and large UNWIND
+// streams must take the batched hash-sidecar probe.
+// ============================================================================
+
+/// One reified and one plain edge from the same subject: a value-only rel
+/// var matches both; reading `r.w` flips to the required annotation lane,
+/// which matches ONLY the reified edge and reads its property.
+#[tokio::test]
+async fn cypher_untyped_rel_prop_read_matches_reified_edges_only() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:untyped-rel-prop");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@graph": [
+                    {"@id": "a", "@type": "Node", "name": "A",
+                     "knows": {"@id": "b", "@annotation": {"w": 5}},
+                     "likes": {"@id": "c"}},
+                    {"@id": "b", "@type": "Node", "name": "B"},
+                    {"@id": "c", "@type": "Node", "name": "C"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // Control: value-only var matches reified and plain edges alike.
+    let control = fluree
+        .query_cypher(&db, r#"MATCH (:Node {name: "A"})-[r]->(x) RETURN x.name"#)
+        .await
+        .expect("value-only query");
+    assert_eq!(control.row_count(), 2, "value-only rel matches both edges");
+
+    // Property read: only the reified edge carries an annotation node.
+    let result = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (:Node {name: "A"})-[r]->(x) RETURN x.name AS n, r.w AS w"#,
+        )
+        .await
+        .expect("prop-read query");
+    let (columns, rows) = result.to_cypher_table(&db.snapshot).expect("table");
+    assert_eq!(columns, ["n", "w"]);
+    assert_eq!(
+        rows,
+        vec![vec![json!("B"), json!(5)]],
+        "required lane keeps only the reified edge and reads its property"
+    );
+}
+
+/// Same shape against a rebuilt index (annotation arena sealed): the
+/// forward-arena probe must decode a late-materialized `EncodedPid`
+/// predicate — this errored with "predicate position bound to non-Sid
+/// EncodedPid" before the fix.
+#[tokio::test]
+async fn cypher_untyped_rel_prop_read_survives_indexing() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:untyped-rel-prop-indexed";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@graph": [
+                    {"@id": "a", "@type": "Node", "name": "A",
+                     "knows": {"@id": "b", "@annotation": {"w": 5}},
+                     "likes": {"@id": "c"}},
+                    {"@id": "b", "@type": "Node", "name": "B"},
+                    {"@id": "c", "@type": "Node", "name": "C"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let l = fluree.ledger(ledger_id).await.expect("reload");
+    let db = graphdb_from_ledger(&l);
+
+    let result = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (:Node {name: "A"})-[r]->(x) RETURN x.name AS n, r.w AS w"#,
+        )
+        .await
+        .expect("prop-read query on indexed ledger");
+    let (_, rows) = result.to_cypher_table(&db.snapshot).expect("table");
+    assert_eq!(
+        rows,
+        vec![vec![json!("B"), json!(5)]],
+        "indexed required lane matches the reified edge and reads its property"
+    );
+}
+
+/// The KB `getObjectsByUris` shape at a driving size that engages the
+/// batched hash-sidecar probe (≥256 rows): a large UNWIND over an untyped
+/// rel with a `p.p` property read plus a class membership check on the
+/// object. Every edge is reified with the predicate IRI stored under `p`.
+#[tokio::test]
+async fn cypher_untyped_rel_prop_read_large_unwind() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:untyped-rel-unwind");
+    let n = 300;
+    let nodes: Vec<JsonValue> = (0..n)
+        .map(|i| {
+            json!({
+                "@id": format!("n{i}"),
+                "@type": "INDEXED",
+                "value": format!("u{i}"),
+                "rel": {"@id": format!("n{}", (i + 1) % n), "@annotation": {"p": "rel"}}
+            })
+        })
+        .collect();
+    let committed = fluree
+        .insert(ledger0, &json!({"@graph": nodes}))
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let uris: Vec<String> = (0..n).map(|i| format!("\"u{i}\"")).collect();
+    let query = format!(
+        "UNWIND [{}] AS uri \
+         MATCH (s:INDEXED {{value: uri}})-[p]->(o:INDEXED) \
+         RETURN uri, p.p AS predType, o.value AS obj",
+        uris.join(",")
+    );
+    let result = fluree
+        .query_cypher(&db, &query)
+        .await
+        .expect("large unwind prop-read query");
+    let (columns, rows) = result.to_cypher_table(&db.snapshot).expect("table");
+    assert_eq!(columns, ["uri", "predType", "obj"]);
+    assert_eq!(rows.len(), n, "one row per uri (each node has one edge)");
+    assert!(
+        rows.iter().all(|r| r[1] == json!("rel")),
+        "every row reads the annotation's `p` property"
+    );
+    // Spot-check the ring structure: u0's edge points at u1.
+    let row0 = rows
+        .iter()
+        .find(|r| r[0] == json!("u0"))
+        .expect("u0 present");
+    assert_eq!(row0[2], json!("u1"));
+}

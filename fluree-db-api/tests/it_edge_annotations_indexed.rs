@@ -1203,3 +1203,77 @@ async fn seal_survives_background_index_race() {
         .expect("insert");
     assert_seals(&fluree, ledger_id, "file+large-lpg-graph").await;
 }
+
+/// Arena-backed probe over a LITERAL reified triple with a VAR object.
+/// The recognized chain accepts a var object; the arena keys literal
+/// edges by (value, dt, lang) exactly as they were written, so the probe
+/// must match them — previously a runtime literal binding dropped the
+/// row (returned nothing) instead of probing.
+#[tokio::test]
+async fn arena_probe_matches_literal_object_annotation() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:literal-object";
+
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let after_insert = fluree
+                .insert(
+                    ledger0,
+                    &json!({
+                        "@context": ctx(),
+                        "@id": "ex:alice",
+                        "ex:score": {
+                            "@value": 42,
+                            "@annotation": {"ex:confidence": "high"}
+                        }
+                    }),
+                )
+                .await
+                .expect("literal annotated insert");
+            let _ = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached load before reindex");
+
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after_insert.receipt.t).await;
+
+            let post = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after reindex");
+            assert!(
+                post.snapshot.annotation_index.is_some(),
+                "arena must be sealed for this test to exercise the probe lane"
+            );
+
+            let sparql = r"
+                PREFIX ex: <http://example.org/>
+                SELECT ?score ?conf WHERE {
+                  ex:alice ex:score ?score {| ex:confidence ?conf |} .
+                }
+            ";
+            let result = support::query_sparql(&fluree, &post, sparql)
+                .await
+                .expect("var-object literal annotation query");
+            let rows = result.to_sparql_json(&post.snapshot).expect("sparql json");
+            let bindings = rows["results"]["bindings"]
+                .as_array()
+                .expect("bindings array")
+                .clone();
+            assert_eq!(
+                bindings.len(),
+                1,
+                "the literal reified triple must match via the arena probe: {bindings:#?}"
+            );
+            assert_eq!(bindings[0]["score"]["value"].as_str(), Some("42"));
+            assert_eq!(bindings[0]["conf"]["value"].as_str(), Some("high"));
+        })
+        .await;
+}

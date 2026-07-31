@@ -728,6 +728,74 @@ async fn bm25_query_connection_with_idx_pattern() {
     );
 }
 
+/// Regression: embedded `f:searchText` must resolve through the STANDARD query
+/// path (`query_connection`), not only the dedicated `query_connection_with_bm25`.
+///
+/// This is exactly what the HTTP `POST /v1/fluree/query` route executes (via
+/// `query_from()`). Before the dataset/view execution context wired a
+/// `FlureeIndexProvider` as `bm25_provider`, this returned
+/// `InvalidQuery("BM25 IndexSearch requires ExecutionContext.bm25_search_provider
+/// or bm25_provider (not configured)")`. It must now succeed.
+#[tokio::test]
+async fn bm25_embedded_search_via_plain_query_connection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/plain-qc:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide", "ex:author":"Alice" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Rust and WebAssembly", "ex:author":"Bob" },
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Python for beginners", "ex:author":"Charlie" }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.expect("insert failed");
+
+    let index_query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let cfg = Bm25CreateConfig::new("plain-qc-search", ledger_id, index_query);
+    let created = fluree
+        .create_full_text_index(cfg)
+        .await
+        .expect("create index failed");
+
+    let idx_query = json!({
+        "@context": { "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "where": [
+            {
+                "f:graphSource": &created.graph_source_id,
+                "f:searchText": "rust",
+                "f:searchLimit": 10,
+                "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+            },
+            { "@id": "?doc", "ex:author": "?author" }
+        ],
+        "select": ["?doc", "?score", "?author"]
+    });
+
+    // The PLAIN connection path — NOT `_with_bm25`. This mirrors the HTTP query
+    // route; it must now serve the embedded BM25 search rather than error.
+    let result = fluree
+        .query_connection(&idx_query)
+        .await
+        .expect("plain query_connection must serve f:searchText (bm25 provider wired into the query context)");
+
+    let total: usize = result.batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert!(
+        total >= 2,
+        "expected >=2 rust docs via plain query_connection, got {total}"
+    );
+    assert!(
+        result.vars.get("?score").is_some(),
+        "expected ?score binding from the embedded BM25 search"
+    );
+}
+
 /// Test BM25 federated query with aggregation: search + join + groupBy/count
 ///
 /// Scenario: federated BM25 aggregation scenarios.
@@ -920,5 +988,289 @@ async fn bm25_search_enforces_view_policy_on_indexed_flake() {
     assert!(
         !rendered.contains("doc2"),
         "doc2 (hidden title) must not leak through inline BM25 search; got: {jsonld:#?}"
+    );
+}
+
+/// Regression: embedded `f:searchText` must also resolve through the **dataset**
+/// execution path (`execute_dataset_*`), not only the single-graph view path.
+///
+/// A multi-ledger `from` is what routes a query to the dataset path; the plain
+/// single-graph test above exercises the `view/mod.rs` macro site instead. The
+/// two dataset sites are the bulk of this change and are what
+/// `POST /v1/fluree/query` takes for a multi-ledger query, so they need their own
+/// guard: the fix is a struct-field initializer, the easiest thing for a future
+/// refactor of `dataset_query.rs` to drop while CI stays green. Reverting either
+/// site to `bm25_provider: None` must turn this red.
+#[tokio::test]
+async fn bm25_embedded_search_via_dataset_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Two ledgers so `from` is a dataset, forcing the dataset execution path.
+    let l1 = "bm25/dataset-a:main";
+    let l2 = "bm25/dataset-b:main";
+    let a0 = support::genesis_ledger(&fluree, l1);
+    let _ = fluree
+        .insert(
+            a0,
+            &json!({
+                "@context": { "ex":"http://example.org/" },
+                "@graph": [
+                    { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" },
+                    { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Rust and WebAssembly" },
+                    { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Python for beginners" }
+                ]
+            }),
+        )
+        .await
+        .expect("insert a");
+
+    let b0 = support::genesis_ledger(&fluree, l2);
+    let _ = fluree
+        .insert(
+            b0,
+            &json!({
+                "@context": { "ex":"http://example.org/" },
+                "@graph": [{ "@id":"ex:other1", "@type":"ex:Note", "ex:title":"Unrelated note" }]
+            }),
+        )
+        .await
+        .expect("insert b");
+
+    let index_query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("dataset-search", l1, index_query))
+        .await
+        .expect("create index");
+
+    let idx_query = json!({
+        "@context": { "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": [l1, l2],
+        "where": [{
+            "f:graphSource": &created.graph_source_id,
+            "f:searchText": "rust",
+            "f:searchLimit": 10,
+            "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+        }],
+        "select": ["?doc", "?score"]
+    });
+
+    let result = fluree.query_connection(&idx_query).await.expect(
+        "DATASET path must serve f:searchText (bm25 provider wired into the dataset context)",
+    );
+
+    let total: usize = result.batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(
+        total, 2,
+        "expected both rust docs via the dataset path, got {total}"
+    );
+    assert!(
+        result.vars.get("?score").is_some(),
+        "expected ?score binding from the embedded BM25 search"
+    );
+}
+
+/// A view policy must still hide unreadable hits on the path this PR opens.
+///
+/// The suite's other policy test drives `query_connection_with_bm25`, which was
+/// reachable before this change. This drives the plain `query_connection` — the
+/// standard, policy-enforced route the HTTP endpoint uses — because that is the
+/// surface being widened, and the failure mode of a gap here is returning
+/// documents a policy says the caller cannot read.
+#[tokio::test]
+async fn bm25_embedded_search_enforces_policy_via_plain_query_connection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/plain-policy:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let _ = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    { "@id": "ex:doc1", "@type": "ex:Doc", "ex:title": "Rust programming guide", "ex:author": "Alice" },
+                    { "@id": "ex:doc2", "@type": "ex:Doc", "ex:title": "Rust and WebAssembly", "ex:author": "Bob" }
+                ]
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let index_query = json!({
+        "@context": { "ex": "http://example.org/" },
+        "where": [{ "@id": "?x", "@type": "ex:Doc", "ex:title": "?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new(
+            "plain-policy-search",
+            ledger_id,
+            index_query,
+        ))
+        .await
+        .expect("create index");
+
+    // Bare search, no constraining BGP — the shape that leaked in the C3 regression.
+    let search_where = json!([{
+        "f:graphSource": &created.graph_source_id,
+        "f:searchText": "rust",
+        "f:searchLimit": 10,
+        "f:searchResult": { "f:resultId": "?doc" }
+    }]);
+
+    // Control: no policy, over the plain route => both rust docs match.
+    let control_res = fluree
+        .query_connection(&json!({
+            "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+            "from": ledger_id,
+            "where": search_where.clone(),
+            "select": ["?doc"]
+        }))
+        .await
+        .expect("control query");
+    let control_total: usize = control_res
+        .batches
+        .iter()
+        .map(fluree_db_api::Batch::len)
+        .sum();
+    assert_eq!(control_total, 2, "control: both rust docs should match");
+
+    // ex:title is viewable only on Alice-authored docs, so doc2's indexed text
+    // is unreadable and its hit must be dropped.
+    let policy = json!([{
+        "@id": "ex:titlePolicy",
+        "@type": "f:AccessPolicy",
+        "f:action": "f:view",
+        "f:onProperty": [{ "@id": "http://example.org/title" }],
+        "f:query": {
+            "@type": "@json",
+            "@value": {
+                "@context": { "ex": "http://example.org/" },
+                "where": [{ "@id": "?$this", "ex:author": "Alice" }]
+            }
+        }
+    }]);
+    let result = fluree
+        .query_connection(&json!({
+            "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+            "from": ledger_id,
+            "opts": { "policy": policy, "default-allow": false },
+            "where": search_where,
+            "select": ["?doc"]
+        }))
+        .await
+        .expect("policy query");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let rendered = result
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld")
+        .to_string();
+
+    assert!(
+        !rendered.contains("doc2"),
+        "doc2 (hidden title) must not leak through embedded BM25 search on the \
+         standard query route; got: {rendered}"
+    );
+    assert!(
+        rendered.contains("doc1"),
+        "doc1 (viewable title) must remain; got: {rendered}"
+    );
+}
+
+/// Regression: the **tracked** dataset site must be wired too.
+///
+/// There are two dataset wiring sites and a multi-ledger `from` alone does not
+/// reach both — which builder method you call decides it:
+///
+/// - `query_connection` / `query_from().execute_formatted()` land in
+///   `execute_dataset_internal_with_r2rml` → `execute_dataset_into_with_r2rml`;
+/// - `query_from().execute_tracked()` lands in `execute_dataset_tracked` →
+///   `execute_dataset_tracked_with_r2rml`.
+///
+/// Per-site mutation proves the split: reverting only the tracked site leaves
+/// the plain dataset test above green, and reverting only the other leaves this
+/// one green. Each site needs its own test.
+#[tokio::test]
+async fn bm25_embedded_search_via_tracked_dataset_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let l1 = "bm25/tracked-a:main";
+    let l2 = "bm25/tracked-b:main";
+    let a0 = support::genesis_ledger(&fluree, l1);
+    let _ = fluree
+        .insert(
+            a0,
+            &json!({
+                "@context": { "ex":"http://example.org/" },
+                "@graph": [
+                    { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" },
+                    { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Rust and WebAssembly" },
+                    { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Python for beginners" }
+                ]
+            }),
+        )
+        .await
+        .expect("insert a");
+
+    let b0 = support::genesis_ledger(&fluree, l2);
+    let _ = fluree
+        .insert(
+            b0,
+            &json!({
+                "@context": { "ex":"http://example.org/" },
+                "@graph": [{ "@id":"ex:other1", "@type":"ex:Note", "ex:title":"Unrelated note" }]
+            }),
+        )
+        .await
+        .expect("insert b");
+
+    let index_query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new(
+            "tracked-dataset-search",
+            l1,
+            index_query,
+        ))
+        .await
+        .expect("create index");
+
+    let idx_query = json!({
+        "@context": { "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": [l1, l2],
+        "where": [{
+            "f:graphSource": &created.graph_source_id,
+            "f:searchText": "rust",
+            "f:searchLimit": 10,
+            "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+        }],
+        "select": ["?doc", "?score"]
+    });
+
+    // `execute_tracked()` — NOT `execute_formatted()`, which routes to
+    // `execute_dataset_internal_with_r2rml` and lands on the *other* dataset
+    // site. Only the tracked builder path reaches
+    // `execute_dataset_tracked_with_r2rml`.
+    let result = fluree
+        .query_from()
+        .jsonld(&idx_query)
+        .execute_tracked()
+        .await
+        .expect("TRACKED dataset path must serve f:searchText");
+
+    let rendered = serde_json::to_value(&result.result)
+        .expect("serialize tracked result")
+        .to_string();
+    assert!(
+        rendered.contains("doc1") && rendered.contains("doc2"),
+        "expected both rust docs via the tracked dataset path; got: {rendered}"
     );
 }

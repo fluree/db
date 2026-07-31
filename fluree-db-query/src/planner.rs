@@ -263,7 +263,22 @@ pub(crate) fn estimate_triple_row_count(
             DEFAULT_PROPERTY_SCAN_SELECTIVITY
         }
 
-        PatternType::FullScan => FULL_SCAN,
+        PatternType::FullScan => {
+            // `?s ?p <o>` (or `?o` bound by an earlier pattern): an
+            // object-pinned wildcard is a reverse OPST probe bounded by the
+            // node's in-degree, not a world scan. Cypher's untyped
+            // relationship `(a)-[r]->(n {…})` lowers to exactly this shape;
+            // scoring it FULL_SCAN poisoned every downstream driving-set
+            // estimate (hash joins rejected with driving-est 1e12) and made
+            // reorder treat the whole chain as hopeless.
+            let o_bound =
+                pattern.o_bound() || pattern.o.as_var().is_some_and(|v| bound_vars.contains(&v));
+            if o_bound {
+                DEFAULT_BOUND_OBJECT_SELECTIVITY
+            } else {
+                FULL_SCAN
+            }
+        }
     }
 }
 
@@ -1241,6 +1256,24 @@ pub fn reorder_patterns(
         .flatten()
         .collect();
 
+    // Anchor vars for the seed race: subquery-producer outputs plus every
+    // VALUES/UNWIND var. A constant row set is a guaranteed producer with
+    // EXACT cardinality, so a disconnected `rdf:type <C>` class anchor must
+    // not out-seed it on the strength of a fallback class estimate — at
+    // 72k nodes the `ClassNotInStats` sqrt heuristic reads ~20k, so a
+    // 21k-row UNWIND suddenly lost the seed to the class scan and was
+    // deferred to a final 21k-row filter over the whole expanded stream
+    // (~1.3s at 18k uris → ~712s at 21k, the KB reindex cliff). Feeding the
+    // VALUES vars into the anchor set lets the existing class-anchor
+    // demotion fire at seed time; genuinely class-only queries keep their
+    // seed via the demotion's non-empty-pool fallback.
+    let mut seed_anchor_vars: HashSet<VarId> = subquery_output_vars.clone();
+    for p in patterns {
+        if let Pattern::Values { vars, .. } = p {
+            seed_anchor_vars.extend(vars.iter().copied());
+        }
+    }
+
     // Classify each pattern by its cardinality category.
     let mut sources: Vec<RankedPattern> = Vec::new();
     let mut reducers: Vec<RankedPattern> = Vec::new();
@@ -1378,7 +1411,7 @@ pub fn reorder_patterns(
                 &mut bound_vars,
                 stats,
                 &mut result,
-                &subquery_output_vars,
+                &seed_anchor_vars,
             )
             || try_place_expander(&mut expanders, &mut bound_vars, stats, &mut result);
 
@@ -1558,21 +1591,32 @@ fn demote_disconnected_class_anchors(
     anchor_vars: &HashSet<VarId>,
 ) -> Vec<usize> {
     let pipeline_active = !bound_vars.is_empty() || !anchor_vars.is_empty();
-    let has_connected_alt = pipeline_active
-        && remaining.iter().any(|rp| {
-            pattern_shares_variables(&rp.pattern, bound_vars)
-                || pattern_shares_variables(&rp.pattern, anchor_vars)
-        });
+    let connected = |rp: &RankedPattern| {
+        pattern_shares_variables(&rp.pattern, bound_vars)
+            || pattern_shares_variables(&rp.pattern, anchor_vars)
+    };
+    let has_connected_alt = pipeline_active && remaining.iter().any(connected);
     if !has_connected_alt {
         return base_pool;
     }
+    // Sidecar demotion exists to hand the seed to the concrete base edge.
+    // For an UNTYPED relationship the chain's `f:reifiesPredicate` triple
+    // joins on the base edge's predicate VAR, so once the base is placed the
+    // connected pool can be nothing but the chain itself — demoting
+    // reifiesSubject/reifiesObject would then crown reifiesPredicate, whose
+    // bound-object fan is ~(sidecar / #relationship-types) per driving row
+    // (the KB `p.p` OOM). Only demote sidecars while a connected
+    // non-annotation-chain alternative is still available to seed.
+    let has_non_chain_alt = remaining
+        .iter()
+        .any(|rp| connected(rp) && !is_annotation_chain_triple(&rp.pattern));
     let demoted: Vec<usize> = base_pool
         .iter()
         .copied()
         .filter(|&i| {
             let p = &remaining[i].pattern;
             !is_disconnected_class_anchor(p, bound_vars, anchor_vars)
-                && !is_broad_annotation_sidecar(p)
+                && !(has_non_chain_alt && is_broad_annotation_sidecar(p))
         })
         .collect();
     if demoted.is_empty() {
@@ -1652,6 +1696,29 @@ fn is_broad_annotation_sidecar(pattern: &Pattern) -> bool {
             sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB
                 && (sid.name.as_ref() == fluree_vocab::db::REIFIES_SUBJECT
                     || sid.name.as_ref() == fluree_vocab::db::REIFIES_OBJECT)
+        }
+        _ => false,
+    }
+}
+
+/// Any triple of the `f:reifies*` annotation chain (all three system
+/// predicates, unlike [`is_broad_annotation_sidecar`] which excludes the
+/// `f:reifiesPredicate` discriminator). Used by
+/// [`demote_disconnected_class_anchors`] to detect when demoting the
+/// sidecars would leave the chain to seed itself.
+fn is_annotation_chain_triple(pattern: &Pattern) -> bool {
+    let Pattern::Triple(tp) = pattern else {
+        return false;
+    };
+    match &tp.p {
+        Ref::Sid(sid) => {
+            sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+                && matches!(
+                    sid.name.as_ref(),
+                    fluree_vocab::db::REIFIES_SUBJECT
+                        | fluree_vocab::db::REIFIES_PREDICATE
+                        | fluree_vocab::db::REIFIES_OBJECT
+                )
         }
         _ => false,
     }
@@ -3820,6 +3887,113 @@ mod tests {
             matches!(&ordered[0], Pattern::Triple(tp)
                 if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_MEMBER")),
             "concrete base edge must seed before the f:reifiesObject sidecar: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn values_seed_beats_disconnected_class_anchor() {
+        // A VALUES/UNWIND row set is a guaranteed producer with EXACT
+        // cardinality; a disconnected `rdf:type <C>` class anchor whose
+        // (fallback) estimate happens to undercut the VALUES row count must
+        // not steal the seed — deferring the VALUES (the join keys!) to a
+        // final filter turned a 21k-row UNWIND into a ~712s scan cliff.
+        let (uri, s) = (VarId(0), VarId(1));
+        let values = Pattern::Values {
+            vars: vec![uri],
+            rows: (0..2000)
+                .map(|i| {
+                    vec![crate::binding::Binding::lit(
+                        FlakeValue::Long(i),
+                        Sid::new(2, "long"),
+                    )]
+                })
+                .collect(),
+        };
+        let lookup = Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(Sid::new(100, "value")),
+            Term::Var(uri),
+        ));
+        // Stats-less class estimate = DEFAULT_BOUND_OBJECT_SELECTIVITY
+        // (1000) < 2000 VALUES rows — the pre-fix seed winner.
+        let class = Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Iri(std::sync::Arc::from(fluree_vocab::rdf::TYPE)),
+            Term::Sid(Sid::new(100, "Indexed")),
+        ));
+        let ordered = reorder_patterns(&[class, lookup, values], None, &HashSet::new());
+        assert!(
+            matches!(ordered[0], Pattern::Values { .. }),
+            "the exact-cardinality VALUES must seed, not the class anchor: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn untyped_rel_chain_never_drives_reifies_predicate() {
+        // Untyped relationship with a property read (`-[p]->` + `p.p`): the
+        // base edge's predicate is a VAR, so `f:reifiesPredicate` joins the
+        // chain via that var and stays in the connected pool after the base
+        // is placed. Demoting the two sidecars there (the pre-fix behavior)
+        // crowned reifiesPredicate — whose bound-object fan is
+        // ~(sidecar / #relationship-types) per driving row: the KB `p.p`
+        // OOM. With no non-chain alternative the sidecars stay rankable and
+        // one of them must beat reifiesPredicate.
+        let (s, o, cy, ann) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let fsid = |name| Ref::Sid(Sid::new(fluree_vocab::namespaces::FLUREE_DB, name));
+        let base = Pattern::Triple(TriplePattern::new(Ref::Var(s), Ref::Var(cy), Term::Var(o)));
+        let r_subj = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            fsid(fluree_vocab::db::REIFIES_SUBJECT),
+            Term::Var(s),
+        ));
+        let r_pred = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            fsid(fluree_vocab::db::REIFIES_PREDICATE),
+            Term::Var(cy),
+        ));
+        let r_obj = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            fsid(fluree_vocab::db::REIFIES_OBJECT),
+            Term::Var(o),
+        ));
+        let patterns = vec![base, r_subj, r_pred, r_obj];
+        let mut bound = HashSet::new();
+        bound.insert(s); // the delegate's seeded child binds the subject
+        let ordered = reorder_patterns(&patterns, None, &bound);
+
+        let pos = |pred: &str| {
+            ordered
+                .iter()
+                .position(|p| {
+                    matches!(p, Pattern::Triple(tp)
+                    if matches!(&tp.p, Ref::Sid(ps) if ps.name.as_ref() == pred))
+                })
+                .unwrap_or(usize::MAX)
+        };
+        let sidecar_first =
+            pos(fluree_vocab::db::REIFIES_SUBJECT).min(pos(fluree_vocab::db::REIFIES_OBJECT));
+        assert!(
+            sidecar_first < pos(fluree_vocab::db::REIFIES_PREDICATE),
+            "a bound-object sidecar must be placed before f:reifiesPredicate: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn object_pinned_wildcard_is_not_a_full_scan() {
+        // `?s ?p <o>` / object bound by an earlier pattern: a reverse
+        // (in-degree-bounded) probe, not a world scan. The FULL_SCAN score
+        // poisoned downstream driving-set estimates (Cypher's untyped
+        // `(a)-[r]->(n {value: …})` shape).
+        let (s, p, o) = (VarId(0), VarId(1), VarId(2));
+        let tp = TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o));
+        let unbound: HashSet<VarId> = HashSet::new();
+        assert_eq!(estimate_triple_row_count(&tp, &unbound, None), FULL_SCAN);
+
+        let mut o_bound: HashSet<VarId> = HashSet::new();
+        o_bound.insert(o);
+        assert_eq!(
+            estimate_triple_row_count(&tp, &o_bound, None),
+            DEFAULT_BOUND_OBJECT_SELECTIVITY
         );
     }
 
