@@ -132,8 +132,37 @@ An earlier partial Wave C ran on the local macOS host under heavy sibling load (
 
 ---
 
-## Wave D — scale-up
+## Wave D — scale-up (SF=1, ~27.5M fact rows)
 
-STATUS: pending (heavy, last). A larger locally-generated SF (fact tables >= 10M rows total) loaded into MinIO; correctness-checked; the full pair set re-run at scale. The payoff is where verdicts CHANGE vs SF0.1.
+STATUS: DONE (2026-07-30). SF=1 generated on the same uncontested `c7g.4xlarge` (host identity as Wave C; DuckDB v1.5.5 `d8cdaa33fd`, fluree `5598ffd6a` + `c81862d2a`), loaded into MinIO namespace DW_SF1, unpartitioned. Fact magnitudes: FACT_WEB_EVENT 10,000,000; FACT_ORDER_LINE 6,000,000; FACT_INVENTORY 3,000,000; FACT_GL 2,500,000; FACT_PAYMENT 2,000,000; FACT_ORDER 1,800,000; FACT_SHIPMENT 1,800,000; FACT_SUPPORT_TICKET 400,000 (~27.5M fact rows total; 10× SF0.1). Raw: `harness/out/waveD_ec2.jsonl`.
 
-_scale table + verdict deltas to be filled_
+### Row accounting (153 rows vs Wave C's 250 — by design, to bound instance-hours)
+
+At 10× data the compute-bound pairs run minutes each, so the SF=1 timed set was scoped: DuckDB all-10 cold N=5 (50); a FAST group of 7 scan/agg pairs on fluree-main cold+warm N=5 (70) + fluree-#1528 cold N=3 parity (21); a SLOW group of 3 (cq038, cq016, crt_join_reorder) on both binaries cold N=2, DNF cap 200 s (12) — the DNF-vs-fixed verdict needs no N=5. Not run at SF=1 (deliberate): fluree-#1528 warm, and warm for the slow group. Those cells read "n/a" below, distinct from "DNF" (ran, exceeded the 200 s cap).
+
+### SF=1 table (median ms cold / warm; RSS MB). DuckDB = wall+setup.
+
+| pair | DuckDB w+s / RSS | fluree-main cold / warm / RSS | fluree-#1528 cold | gap main/DuckDB | SF0.1→SF1 ratio delta |
+|---|---|---|---|---|---|
+| cq038 filtered COUNT | 57 / 58 | **71750** / n/a / 366 | **100** | 1259x (main) / 1.75x (#1528) | 1483x→1259x shipped; fix HOLDS |
+| cq014 fused COUNT+SUM | 84 / 97 | 534 / 497 / 224 | 543 | 6.4x | 1.4x→6.4x (WIDENED) |
+| cq027 fused 1M→10M grouped | 87 / 86 | 2695 / 2660 / 1729 | 2555 | 31x | 6.1x→31x (WIDENED) |
+| cq008 fused rollup | 231 / 149 | 1570 / 1520 / 261 | 1615 | 6.8x | 4.9x→6.8x |
+| cq040 VALUES/IN | 94 / 111 | 1480 / 1520 / 496 | 1670 | 15.7x | 3.2x→15.7x (WIDENED) |
+| cq016 OPTIONAL | 140 / 227 | **DNF (>200s)** / n/a | **22340** | main DNF / #1528 160x | 367x→DNF shipped; #1528 completes |
+| cq046 DESC top-k | 113 / 107 | 3820 / 3770 / 1515 | 4075 | 34x | 6.2x→34x (WIDENED) |
+| crt_join_reorder 4-table join | 321 / 239 | **DNF (>200s)** | **DNF (>200s)** | DNF both | 917x→DNF WALL |
+| crt_minmax MIN/MAX | 96 / 94 | 2325 / 2345 / 1107 | 1375 | 24x (main) / 14x (#1528) | 4.3x→24x (WIDENED) |
+| crt_highcard high-card GROUP BY | 304 / 512 | 15820 / 15700 / **4438** | 15570 | 52x; RSS 8.7x | 14x→52x; RSS 8x→8.7x |
+
+DuckDB scaled sub-linearly (all pairs still 57–321 ms cold-comparable at 10× data; RSS ≤ 512 MB). Fluree scaled ~linearly with rows (per-row RDF materialization), so absolute walls grew ~10× and RSS grew steeply (crt_highcard 4.4 GB). "n/a" = a mode intentionally not run at SF=1; "DNF" = ran, exceeded the 200 s cap.
+
+### SCALE-DELTA reading (which Wave C verdicts changed at 27M rows — the payoff)
+
+1. The fused/scan-heavy family's 3–6x SF0.1 tail WIDENED to ~6–52x at SF1. Every scan-bound pair moved the same direction (cq014 1.4→6.4x, cq027 6.1→31x, cq040 3.2→15.7x, cq046 6.2→34x, crt_minmax 4.3→24x, crt_highcard 14→52x). Mechanism: DuckDB's vectorized engine scales sub-linearly while Fluree pays per-row RDF-binding materialization at a ~fixed rows/s ceiling, so the ratio grows ~5–6x per 10x of data. This is the headline scale finding: Fluree's relative disadvantage on relational scan/agg shapes GROWS with scale, it does not hold constant.
+2. The multi-FACT aggregate join (crt_join_reorder) went from 917x-but-completes (130 s) at SF0.1 to a HARD WALL at SF1 — DNF (>200 s) on BOTH binaries — while DuckDB stayed at 321 ms. This is the sharpest delta: the uncovered join class stops completing at 27M rows.
+3. #1528's fusion becomes MORE valuable at scale, not less. cq038 stays ~100 ms with #1528 while shipped-main is ~72 s (a ~720x separation preserved); cq016 shipped-main DNFs at SF1 while #1528 completes in ~22 s. At scale the fusion is the difference between "runs" and "does not finish" for the filtered-COUNT and OPTIONAL shapes.
+4. RSS shapes did NOT hold — they widened. Fluree's peak RSS scaled with row volume (crt_highcard 1.2 GB→4.4 GB, cq027 0.18→1.7 GB, cq046 0.25→1.5 GB) while DuckDB stayed ≤ 512 MB. The memory-fairness gap is a scale phenomenon.
+5. New DNFs introduced by scale: crt_join_reorder (both binaries) and cq016 (shipped-main). These are exactly the pairs that were "large ratio but completed" at SF0.1; at SF1 they cross into non-completion under a 200 s cap.
+
+Net: scale does not merely amplify the SF0.1 ratios uniformly — it changes KIND for two pairs (large-ratio → DNF) and confirms that Fluree's virtual-path gaps on scan/agg/join shapes are scale-sensitive, while #1528's fusion and Fluree's fused single-table aggregates remain the bright spots (cq038 fixed; fused pairs still low-single-digit-seconds at 10M–27M rows).
