@@ -391,6 +391,46 @@ async fn sync_with_t_syncs_through_that_t_only() {
     );
 }
 
+/// Both sync forms must treat a dropped index the same way. The pinned form
+/// used to skip the retraction check and write a fresh snapshot for an index
+/// whose snapshots had just been deleted.
+#[tokio::test]
+async fn sync_of_a_dropped_index_is_refused_by_both_forms() {
+    let (_tmp, state) = state_with_index().await;
+
+    let resp = build_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/drop")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"ledger": "docsearch"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "drop: {json}");
+
+    let (head_status, head_json) =
+        sync_index(&state, "/v1/fluree/bm25/sync", "docsearch:main").await;
+    let (pinned_status, pinned_json) =
+        sync_index(&state, "/v1/fluree/bm25/sync?t=1", "docsearch:main").await;
+
+    assert!(!head_status.is_success(), "head sync: {head_json}");
+    assert!(
+        !pinned_status.is_success(),
+        "pinned sync must not resurrect a dropped index: {pinned_json}"
+    );
+    // Equality rather than a literal status: the refusal currently surfaces as
+    // a 500 via the blanket `ApiError::Drop` arm, which is tracked separately.
+    // What this pins is that the two forms agree.
+    assert_eq!(
+        head_status, pinned_status,
+        "both forms should agree; head={head_json} pinned={pinned_json}"
+    );
+}
+
 #[tokio::test]
 async fn sync_of_an_unknown_index_is_404() {
     let (_tmp, state) = state_with_index().await;

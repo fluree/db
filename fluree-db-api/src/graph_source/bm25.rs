@@ -13,7 +13,7 @@ use fluree_db_core::{
     ledger_id::split_ledger_id, ContentId, ContentStore, OverlayProvider, Storage,
 };
 use fluree_db_ledger::LedgerState;
-use fluree_db_nameservice::GraphSourceType;
+use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
 use fluree_db_query::bm25::{Bm25IndexBuilder, Bm25Manifest, Bm25SnapshotEntry, PropertyDeps};
 use fluree_db_query::parse::parse_query;
 use fluree_db_query::{execute, ContextConfig, ExecutableQuery, QueryOutput, VarRegistry};
@@ -831,14 +831,12 @@ impl crate::Fluree {
     ///
     /// This operation performs incremental updates when possible,
     /// falling back to full resync if needed.
-    pub async fn sync_bm25_index(&self, graph_source_id: &str) -> Result<Bm25SyncResult> {
-        use fluree_db_core::trace_commits_by_id;
-        use fluree_db_query::bm25::{CompiledPropertyDeps, IncrementalUpdater};
-        use futures::StreamExt;
-
-        info!(graph_source_id = %graph_source_id, "Starting BM25 index sync");
-
-        // 1. Look up graph source record to get config and index address
+    /// Look up a graph source that is eligible to be synced.
+    ///
+    /// A retracted source is refused rather than resurrected: [`Self::drop_full_text_index`]
+    /// deletes its snapshots, so writing a fresh one would put a dropped index
+    /// back to serving results.
+    async fn syncable_graph_source(&self, graph_source_id: &str) -> Result<GraphSourceRecord> {
         let record = self
             .nameservice()
             .lookup_graph_source(graph_source_id)
@@ -847,12 +845,24 @@ impl crate::Fluree {
                 crate::ApiError::NotFound(format!("Graph source not found: {graph_source_id}"))
             })?;
 
-        // Check if graph source has been dropped
         if record.retracted {
             return Err(crate::ApiError::Drop(format!(
                 "Cannot sync retracted graph source: {graph_source_id}"
             )));
         }
+
+        Ok(record)
+    }
+
+    pub async fn sync_bm25_index(&self, graph_source_id: &str) -> Result<Bm25SyncResult> {
+        use fluree_db_core::trace_commits_by_id;
+        use fluree_db_query::bm25::{CompiledPropertyDeps, IncrementalUpdater};
+        use futures::StreamExt;
+
+        info!(graph_source_id = %graph_source_id, "Starting BM25 index sync");
+
+        // 1. Look up graph source record to get config and index address
+        let record = self.syncable_graph_source(graph_source_id).await?;
 
         if record.index_id.is_none() {
             // No index yet - need full resync
@@ -1035,19 +1045,7 @@ impl crate::Fluree {
         info!(graph_source_id = %graph_source_id, "Starting BM25 full resync");
 
         // 1. Look up graph source record
-        let record = self
-            .nameservice()
-            .lookup_graph_source(graph_source_id)
-            .await?
-            .ok_or_else(|| {
-                crate::ApiError::NotFound(format!("Graph source not found: {graph_source_id}"))
-            })?;
-
-        if record.retracted {
-            return Err(crate::ApiError::Drop(format!(
-                "Cannot sync retracted graph source: {graph_source_id}"
-            )));
-        }
+        let record = self.syncable_graph_source(graph_source_id).await?;
 
         if record.index_id.is_none() {
             return Err(crate::ApiError::NotFound(format!(
@@ -1221,13 +1219,7 @@ impl crate::Fluree {
         let _ = timeout_ms; // Reserved for future timeout support
 
         // 1. Look up graph source record to get config
-        let record = self
-            .nameservice()
-            .lookup_graph_source(graph_source_id)
-            .await?
-            .ok_or_else(|| {
-                crate::ApiError::NotFound(format!("Graph source not found: {graph_source_id}"))
-            })?;
+        let record = self.syncable_graph_source(graph_source_id).await?;
 
         let config: JsonValue = serde_json::from_str(&record.config)?;
         let query = config

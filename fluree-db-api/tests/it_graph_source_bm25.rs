@@ -1274,3 +1274,55 @@ async fn bm25_embedded_search_via_tracked_dataset_path() {
         "expected both rust docs via the tracked dataset path; got: {rendered}"
     );
 }
+
+/// Every sync entrypoint must refuse a dropped index. `sync_bm25_index_to`
+/// used to skip the retraction check its siblings made, so a pinned sync wrote
+/// a fresh snapshot for a graph source whose snapshots had just been deleted,
+/// putting a dropped index back to serving results.
+#[tokio::test]
+async fn bm25_sync_refuses_a_retracted_index() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/retracted:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Original document one" }]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+    let source_t = ledger1.t();
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("retracted-test", ledger_id, query))
+        .await
+        .unwrap();
+
+    let dropped = fluree
+        .drop_full_text_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(!dropped.was_already_retracted);
+
+    let head_sync = fluree.sync_bm25_index(&created.graph_source_id).await;
+    assert!(
+        head_sync.is_err(),
+        "head sync must refuse a retracted index"
+    );
+
+    let pinned_sync = fluree
+        .sync_bm25_index_to(&created.graph_source_id, source_t, None)
+        .await;
+    assert!(
+        pinned_sync.is_err(),
+        "pinned sync must refuse a retracted index too, got: {:?}",
+        pinned_sync.map(|r| r.new_watermark)
+    );
+
+    let resync = fluree.resync_bm25_index(&created.graph_source_id).await;
+    assert!(resync.is_err(), "resync must refuse a retracted index");
+}
