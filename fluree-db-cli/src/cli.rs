@@ -1167,10 +1167,13 @@ pub enum Commands {
         #[arg(long)]
         output_path: Option<PathBuf>,
 
-        /// Verification depth run against the built twin before it is announced:
-        /// `quick` (class counts + a stratified per-subject sample, the default)
-        /// or `full` (a full-triple diff). A failed gate drops the twin and
-        /// exits non-zero.
+        /// Verification depth run against the built twin before it is announced.
+        /// `quick` (default): per-class instance counts + a seeded sample of 3
+        /// subjects per class, compared against the build's OWN enumerator — a
+        /// SHARED oracle, so it catches ingest/index corruption but NOT enumerator
+        /// logic bugs (a bug appears identically on both sides). `full`: a
+        /// whole-twin triple diff against the source (strongest; ~one extra full
+        /// source read). A failed gate drops the twin and exits non-zero.
         #[arg(long, value_enum, default_value_t = MaterializeVerify::Quick)]
         verify: MaterializeVerify,
 
@@ -1191,6 +1194,15 @@ pub enum Commands {
         /// dir). Where the twin ledger and its storage live.
         #[arg(long)]
         home: Option<PathBuf>,
+
+        /// Scratch directory for `--verify full`'s on-disk spool + external-sort
+        /// runs. Defaults to a subdirectory of the twin's `.fluree` storage area.
+        /// Point it at fast local scratch if you like — but AVOID a tmpfs `/tmp`
+        /// (RAM-backed on many Linux hosts), which would undo full-verify's
+        /// bounded-memory design and can spill tens of GB back into RAM on a large
+        /// twin. Unused by `--verify quick`.
+        #[arg(long)]
+        tmp_dir: Option<PathBuf>,
     },
 }
 
@@ -1210,7 +1222,8 @@ pub enum MaterializeOutput {
 /// Verification depth for `fluree materialize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum MaterializeVerify {
-    /// Class counts + a stratified per-subject sample. The always-on default.
+    /// Per-class counts + a seeded 3-subjects-per-class sample, against the build's
+    /// own enumerator (a shared oracle). The always-on default.
     Quick,
     /// A full-triple diff of the whole twin against the source. Strongest;
     /// cost roughly a second full source read.

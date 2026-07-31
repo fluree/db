@@ -15,17 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fluree_db_api::materialize::{verify_twin, ParityReport, VerifyMode};
-use fluree_db_api::{DropMode, Fluree, FlureeR2rmlProvider};
+// The MoR-guard env var comes from ONE definition — fluree-db-iceberg's
+// `mor_guard::ALLOW_MOR_DELETES_ENV`, re-exported by fluree-db-api (which the CLI
+// already depends on) — instead of a hard-copied literal that could silently drift
+// on a rename.
+use fluree_db_api::{DropMode, Fluree, FlureeR2rmlProvider, ALLOW_MOR_DELETES_ENV};
 
 use crate::cli::{MaterializeOutput, MaterializeVerify};
 use crate::context;
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
-
-/// The env var read by fluree-db-iceberg's fail-closed merge-on-read guard. A
-/// stable public contract (`fluree_db_iceberg::mor_guard::ALLOW_MOR_DELETES_ENV`);
-/// hard-coded here so the CLI need not take a direct dependency on that crate.
-const ALLOW_MOR_DELETES_ENV: &str = "FLUREE_ICEBERG_ALLOW_MOR_DELETES";
 
 /// Co-resident-safe default parallelism when neither `--parallelism` nor
 /// `--max-performance` is given (§14 machine-safety).
@@ -57,6 +56,9 @@ pub struct MaterializeParams<'a> {
     /// Global `--memory-budget-mb` (0 = unset).
     pub memory_budget_mb: usize,
     pub quiet: bool,
+    /// `--tmp-dir` override for full-verify's on-disk spool (None = default under
+    /// the twin's `.fluree` storage area).
+    pub tmp_dir: Option<&'a Path>,
 }
 
 pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<()> {
@@ -153,12 +155,20 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
         .ledger(&twin_ledger)
         .await
         .map_err(|e| CliError::Import(format!("load twin for verification: {e}")))?;
+    // Full-verify spools to disk; default under the twin's `.fluree` storage area
+    // (discoverable + cleanable, and NOT a tmpfs `/tmp` that would undo the
+    // bounded-memory design), or the explicit `--tmp-dir` override.
+    let verify_tmp = params
+        .tmp_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dirs.data_dir().join("materialize-verify"));
     let report = verify_twin(
         fluree,
         &ledger,
         &*provider,
         params.graph_source,
         params.verify.into(),
+        Some(&verify_tmp),
     )
     .await
     .map_err(|e| CliError::Import(format!("parity gate: {e}")))?;

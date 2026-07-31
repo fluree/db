@@ -20,7 +20,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 
-use fluree_db_core::{TxnMetaEntry, TxnMetaValue};
+use fluree_db_core::{TxnMetaEntry, TxnMetaValue, MAX_TXN_META_BYTES};
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider, TableWatermark};
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, TriplesMap};
 use fluree_db_r2rml::materialize::{
@@ -67,6 +67,25 @@ pub enum MaterializeError {
     ParentIndexBudgetExceeded {
         estimated_mb: usize,
         budget_mb: usize,
+    },
+    /// The completion stamp's encoded txn-meta would exceed the commit envelope's
+    /// [`MAX_TXN_META_BYTES`] (64 KiB) cap. Driven by the table count — each table
+    /// contributes its `metadata_location` (S3 URIs + JSON framing run ~350 bytes
+    /// per table) to the one watermark JSON string. `encode_stamp` builds
+    /// `TxnMetaEntry`s directly, bypassing the TriG/JSON-LD txn-meta validators, so
+    /// the cap is enforced there instead — fail loud BEFORE finalize, consistent
+    /// with [`EmptyWatermark`]/[`ParentIndexBudgetExceeded`], rather than let an
+    /// oversize stamp fail opaquely at commit-encode time. A schema this wide needs
+    /// a compacter watermark encoding (the documented residual in `encode_stamp`).
+    #[error(
+        "materialize completion stamp is ~{actual_bytes} bytes but the commit txn-meta cap is \
+         {cap_bytes} bytes ({table_count} tables in the watermark); the twin cannot be stamped — \
+         reduce the source table count or shorten table metadata_location URIs"
+    )]
+    StampTooLarge {
+        actual_bytes: usize,
+        cap_bytes: usize,
+        table_count: usize,
     },
 }
 
@@ -163,33 +182,6 @@ where
 // Ingestion adapter: materialized triples → ImportSink (native bulk pipeline)
 // ---------------------------------------------------------------------------
 
-/// A [`TripleObserver`] that streams materialized triples into an [`ImportSink`],
-/// interning terms and encoding flakes exactly as the Turtle / JSON-LD import
-/// path does. This is the bridge from the whole-graph enumerator to the native
-/// bulk ingestion pipeline.
-///
-/// Term, datatype, and language fidelity is preserved by routing every literal
-/// through the SAME `ImportSink::term_literal` the parsers use: it parses the
-/// lexical value into the correct typed `FlakeValue` from the datatype IRI (see
-/// `convert_string_literal` in `fluree-db-transact`), so a materialized
-/// `"9.99"^^xsd:decimal` interns to a decimal flake and a `"hola"@es` to a
-/// lang-tagged string — identical to the same literal arriving from Turtle.
-///
-/// The caller owns the sink's lifecycle (construction, optional spool context,
-/// and `finish()`), so one observer drives one chunk's worth of triples into one
-/// commit. Any encoding failure is captured inside the sink and surfaced at
-/// `finish()`, matching the parser→sink contract.
-pub struct ImportSinkObserver<'a, 'ns> {
-    sink: &'a mut ImportSink<'ns>,
-}
-
-impl<'a, 'ns> ImportSinkObserver<'a, 'ns> {
-    /// Wrap a mutable [`ImportSink`].
-    pub fn new(sink: &'a mut ImportSink<'ns>) -> Self {
-        Self { sink }
-    }
-}
-
 /// Resolve a literal's datatype IRI and optional language tag for
 /// `ImportSink::term_literal`. This is the one place literal fidelity could
 /// silently narrow — lang tag vs explicit datatype vs the implicit
@@ -212,21 +204,6 @@ fn intern_term(sink: &mut ImportSink, term: &RdfTerm) -> TermId {
             let (dt_iri, lang) = literal_sink_args(dtc.as_ref());
             sink.term_literal(value, Datatype::from_iri(dt_iri), lang)
         }
-    }
-}
-
-impl TripleObserver for ImportSinkObserver<'_, '_> {
-    fn observe(
-        &mut self,
-        subject: &RdfTerm,
-        predicate: &str,
-        object: &RdfTerm,
-    ) -> Result<(), R2rmlError> {
-        let s = intern_term(self.sink, subject);
-        let p = self.sink.term_iri(predicate);
-        let o = intern_term(self.sink, object);
-        self.sink.emit_triple(s, p, o);
-        Ok(())
     }
 }
 
@@ -279,10 +256,6 @@ const _: fn() = || {
     assert_send_sync::<Arc<dyn R2rmlBuildProvider>>();
 };
 
-/// One materialized triple, owned so it can be buffered across the async scan
-/// boundary before being encoded into a chunk.
-type OwnedTriple = (RdfTerm, String, RdfTerm);
-
 /// The shared allocators and directories a virtual chunk needs to encode into a
 /// [`ParsedChunk`], mirroring the setup the Turtle parse path uses.
 pub struct VirtualChunkContext<'a> {
@@ -300,23 +273,23 @@ pub struct VirtualChunkContext<'a> {
     pub spool_config: Option<&'a SpoolConfig>,
 }
 
-/// Encode a buffer of materialized triples into a [`ParsedChunk`], mirroring
-/// `fluree_db_transact::import::parse_chunk` exactly but replaying interned
-/// triples (via [`ImportSinkObserver`]) instead of parsing Turtle text. `t` is
-/// the caller-assigned transaction number (`chunk_idx + 1`), matching the parse
-/// path's contract.
+/// Encode the twin's FINAL, stamp-only [`ParsedChunk`], mirroring
+/// `fluree_db_transact::import::parse_chunk`'s finalize but carrying NO data
+/// triples — only the completion stamp. `t` is the caller-assigned transaction
+/// number (`chunk_idx + 1`), matching the parse path's contract.
 ///
-/// `stamp` is `Some` for exactly ONE chunk — the twin's FINAL commit — and its
-/// completion stamp is ns-encoded into this chunk's `txn_meta` through the SAME
-/// sink, so the stamp predicates' namespace codes publish in this commit's
-/// namespace_delta. Every other chunk passes `None`, leaving `txn_meta` empty
-/// (byte-identical to a text-import chunk).
-pub fn build_virtual_chunk(
-    triples: &[OwnedTriple],
+/// This is the sole surviving caller of [`encode_stamp`] (O3a removed the
+/// buffer-then-re-intern data path; data chunks now intern directly through
+/// [`InterningObserver`] in the produce workers). The stamp is ns-encoded into
+/// this chunk's `txn_meta` through the SAME sink, so the stamp predicates'
+/// namespace codes publish in this commit's `namespace_delta` and resolve when
+/// the commit is read back (see [`read_stamp`]). The chunk holds zero flakes —
+/// the already-supported empty-stamp shape — so it always rides the twin's head.
+pub fn build_stamp_chunk(
     ctx: &VirtualChunkContext,
     t: i64,
     chunk_idx: usize,
-    stamp: Option<&WatermarkStamp>,
+    stamp: &WatermarkStamp,
 ) -> Result<ParsedChunk, MaterializeError> {
     let txn_id = format!("{}-{}", ctx.ledger_id, t);
     let mut worker_cache = WorkerCache::new(Arc::clone(ctx.shared_alloc));
@@ -330,19 +303,9 @@ pub fn build_virtual_chunk(
         sink.set_spool_context(spool_ctx);
     }
 
-    {
-        let mut observer = ImportSinkObserver::new(&mut sink);
-        for (s, p, o) in triples {
-            observer.observe(s, p, o)?;
-        }
-    }
-
     // Encode the completion stamp into THIS chunk's sink before finishing, so the
     // stamp predicate namespace codes land in `new_codes` (→ namespace_delta).
-    let txn_meta = match stamp {
-        Some(s) => encode_stamp(&mut sink, s)?,
-        None => Vec::new(),
-    };
+    let txn_meta = encode_stamp(&mut sink, stamp)?;
 
     let (writer, prefix_map, spool_ctx) = sink
         .finish()
@@ -473,23 +436,57 @@ const STAMP_PRED_MAPPING_HASH: &str = "mappingHash";
 const STAMP_PRED_WATERMARK: &str = "watermark";
 const STAMP_PRED_SAMPLE_SEED: &str = "sampleSeed";
 
+/// The deterministic watermark JSON string (sorted by table) stored under
+/// `materialize:watermark`. Its length is the dominant term in the stamp's
+/// txn-meta size, so [`stamp_watermark_within_cap`] computes it once and reuses
+/// the result here.
+fn watermark_json(stamp: &WatermarkStamp) -> Result<String, MaterializeError> {
+    let sorted: BTreeMap<&str, &TableWatermark> =
+        stamp.tables.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    serde_json::to_string(&sorted)
+        .map_err(|e| R2rmlError::Materialization(format!("watermark encode: {e}")).into())
+}
+
+/// Fail-loud 64 KiB txn-meta cap enforcement for the completion stamp (item #4).
+/// `encode_stamp` builds `TxnMetaEntry`s directly and hands them to
+/// `finalize_parsed_chunk`, bypassing the TriG/JSON-LD txn-meta validators
+/// (`parse/txn_meta.rs`, `parse/trig_meta.rs`) that enforce [`MAX_TXN_META_BYTES`]
+/// on user-supplied metadata — so the cap is enforced HERE or nowhere. The
+/// estimate mirrors those validators' `validate_limits` exactly (per entry:
+/// 6 + name_len for the predicate, then 1 + value_size; String value_size =
+/// 4 + len, Long = 8), so a stamp that passes here would also pass the parser
+/// path's budget. Returns the serialized watermark JSON on success so
+/// `encode_stamp` need not re-serialize. Sink-free, so it is unit-testable.
+fn stamp_watermark_within_cap(stamp: &WatermarkStamp) -> Result<String, MaterializeError> {
+    let watermark_json = watermark_json(stamp)?;
+    let entry_bytes = |name_len: usize, value_size: usize| 6 + name_len + 1 + value_size;
+    let estimated = entry_bytes(STAMP_PRED_BUILDER.len(), 4 + stamp.builder_version.len())
+        + entry_bytes(STAMP_PRED_MAPPING_HASH.len(), 4 + stamp.mapping_hash.len())
+        + entry_bytes(STAMP_PRED_WATERMARK.len(), 4 + watermark_json.len())
+        + entry_bytes(STAMP_PRED_SAMPLE_SEED.len(), 8);
+    if estimated > MAX_TXN_META_BYTES {
+        return Err(MaterializeError::StampTooLarge {
+            actual_bytes: estimated,
+            cap_bytes: MAX_TXN_META_BYTES,
+            table_count: stamp.tables.len(),
+        });
+    }
+    Ok(watermark_json)
+}
+
 /// ns-encode the completion stamp into `txn_meta` entries, interning each
 /// predicate through `sink` so its namespace code is published in this chunk's
 /// namespace_delta (and thus resolves when the commit is read back). The
 /// watermark vector is stored as one deterministic JSON string (sorted by table)
 /// under `materialize:watermark`. The whole stamp must fit the 64 KiB txn_meta
-/// cap; a schema with a very large table count would need a compacter encoding
+/// cap — enforced fail-loud by [`stamp_watermark_within_cap`] BEFORE any interning;
+/// a schema with a very large table count would need a compacter encoding
 /// (documented residual).
 fn encode_stamp(
     sink: &mut ImportSink,
     stamp: &WatermarkStamp,
 ) -> Result<Vec<TxnMetaEntry>, MaterializeError> {
-    let watermark_json = {
-        let sorted: BTreeMap<&str, &TableWatermark> =
-            stamp.tables.iter().map(|(k, v)| (k.as_str(), v)).collect();
-        serde_json::to_string(&sorted)
-            .map_err(|e| R2rmlError::Materialization(format!("watermark encode: {e}")))?
-    };
+    let watermark_json = stamp_watermark_within_cap(stamp)?;
     let fields = [
         (STAMP_PRED_BUILDER, stamp.builder_version.clone()),
         (STAMP_PRED_MAPPING_HASH, stamp.mapping_hash.clone()),
@@ -513,13 +510,36 @@ fn encode_stamp(
 
 /// Reader-side of the completion stamp: extract it from a commit's `txn_meta`, if
 /// present. A twin is valid iff a head-walk finds a commit whose txn_meta yields
-/// `Some` here (all three stamp fields present). Keys on the stable predicate
-/// LOCAL NAMES (the namespace code is per-ledger); the local names are
-/// materialize-specific, so requiring all three together identifies the stamp.
-pub fn read_stamp(txn_meta: &[TxnMetaEntry]) -> Option<WatermarkStamp> {
+/// `Some` here (all three stamp fields present). Each stamp predicate is matched
+/// on BOTH its stable local name AND its namespace: `namespace_delta` (the same
+/// commit's `CodecEnvelope::namespace_delta`) must resolve the predicate's ns code
+/// to [`MATERIALIZE_NS`]. The stamp predicates are freshly interned into the final
+/// commit's sink (see [`encode_stamp`]/`intern_meta_predicate`), so their code is
+/// published in that commit's delta and resolves here.
+///
+/// The namespace requirement is load-bearing (item #5): the local names alone are
+/// NOT a sufficient signature — a commit carrying `builderVersion`, `mappingHash`,
+/// and `watermark` string entries in ANY OTHER namespace must not be mistaken for a
+/// twin stamp. `intern_meta_predicate` exists precisely to publish these codes so
+/// the read side can insist on the namespace, not just the local name.
+pub fn read_stamp(
+    txn_meta: &[TxnMetaEntry],
+    namespace_delta: &HashMap<u16, String>,
+) -> Option<WatermarkStamp> {
+    // `canonical_split` guarantees `prefix + local == full_iri`, and each entry is
+    // matched on its local name below, so requiring the resolved prefix to equal
+    // MATERIALIZE_NS is equivalent to requiring the full predicate IRI to be the
+    // materialize stamp predicate.
+    let in_materialize_ns = |e: &TxnMetaEntry| -> bool {
+        namespace_delta
+            .get(&e.predicate_ns)
+            .is_some_and(|ns| ns == MATERIALIZE_NS)
+    };
     let field = |local: &str| -> Option<&str> {
         txn_meta.iter().find_map(|e| match &e.value {
-            TxnMetaValue::String(s) if e.predicate_name == local => Some(s.as_str()),
+            TxnMetaValue::String(s) if e.predicate_name == local && in_materialize_ns(e) => {
+                Some(s.as_str())
+            }
             _ => None,
         })
     };
@@ -530,7 +550,11 @@ pub fn read_stamp(txn_meta: &[TxnMetaEntry]) -> Option<WatermarkStamp> {
     let sample_seed = txn_meta
         .iter()
         .find_map(|e| match &e.value {
-            TxnMetaValue::Long(n) if e.predicate_name == STAMP_PRED_SAMPLE_SEED => Some(*n as u64),
+            TxnMetaValue::Long(n)
+                if e.predicate_name == STAMP_PRED_SAMPLE_SEED && in_materialize_ns(e) =>
+            {
+                Some(*n as u64)
+            }
             _ => None,
         })
         .unwrap_or_else(|| sample_seed_from_hash(&mapping_hash));
@@ -693,7 +717,7 @@ fn spawn_produce_workers(
 
                         // Fresh per-chunk sink. O3a: each batch's triples are
                         // interned DIRECTLY into this sink as they are enumerated —
-                        // no intermediate OwnedTriple buffer, no second intern pass —
+                        // no intermediate owned-triple buffer, no second intern pass —
                         // and the chunk is cut on the running byte estimate at batch
                         // boundaries (one batch of overshoot at most).
                         let mut worker_cache = WorkerCache::new(Arc::clone(&shared_alloc));
@@ -739,7 +763,7 @@ fn spawn_produce_workers(
                         }
 
                         // Finish + ship this chunk (always non-empty: it holds
-                        // `first`). Mirror build_virtual_chunk's finalize.
+                        // `first`). Mirror build_stamp_chunk's finalize.
                         let (writer, prefix_map, spool_ctx) =
                             sink.finish().map_err(|e| format!("flake encode: {e}"))?;
                         let op_count = writer.op_count();
@@ -1003,7 +1027,7 @@ pub async fn drive_virtual_import(
     );
     let idx = next_idx.fetch_add(1, Ordering::SeqCst);
     let t = (idx + 1) as i64;
-    let parsed = build_virtual_chunk(&[], ctx, t, idx, Some(&stamp))?;
+    let parsed = build_stamp_chunk(ctx, t, idx, &stamp)?;
     let _ = result_tx.send(Ok((idx, parsed)));
     drop(result_tx);
 
@@ -1099,6 +1123,15 @@ const SAMPLE_SUBJECTS_PER_CLASS: usize = 3;
 /// - [`VerifyMode::Full`] — spools BOTH sides to disk, external-sorts them under a
 ///   bounded working set, and streams a k-way diff; peak RSS is O(one sort run).
 ///
+/// `tmp_dir` (Full mode only; Quick ignores it) is the parent directory the
+/// on-disk spool + sorted runs are created under. Pass the target's `.fluree`
+/// storage area, NOT a tmpfs `/tmp` — on many Linux hosts `std::env::temp_dir()`
+/// is RAM-backed, which would put the tens of GB of Full-mode spill back in memory
+/// on exactly the large twins the bounded rewrite protects. `None` falls back to
+/// `std::env::temp_dir()` (fine for small library callers / tests); the CLI always
+/// passes a `.fluree`-based dir. See [`verify_twin_full`] for the SIGKILL-residue
+/// note.
+///
 /// Returns the report; the caller decides whether to announce or drop the twin.
 pub async fn verify_twin<P>(
     fluree: &crate::Fluree,
@@ -1106,13 +1139,16 @@ pub async fn verify_twin<P>(
     provider: &P,
     graph_source_id: &str,
     mode: VerifyMode,
+    tmp_dir: Option<&Path>,
 ) -> Result<ParityReport, MaterializeError>
 where
     P: R2rmlProvider + R2rmlTableProvider,
 {
     match mode {
         VerifyMode::Quick => verify_twin_quick(fluree, ledger, provider, graph_source_id).await,
-        VerifyMode::Full => verify_twin_full(fluree, ledger, provider, graph_source_id).await,
+        VerifyMode::Full => {
+            verify_twin_full(fluree, ledger, provider, graph_source_id, tmp_dir).await
+        }
     }
 }
 
@@ -1237,16 +1273,19 @@ where
 
 /// Full parity gate (`--verify full`). Memory-bounded via external merge-sort:
 /// both sides are spooled to on-disk N-Triples (the source streamed through the
-/// enumerator, the twin paged through bounded wildcard queries), each canonicalized
-/// as it is written; the two files are external-sorted under a bounded working set
+/// enumerator, the twin streamed in ONE linear pass over the binary index — the
+/// export path's `scan_all` shape, not O(n^2) OFFSET paging), each canonicalized as
+/// it is written; the two files are external-sorted under a bounded working set
 /// ([`SORT_RUN_LINES`] lines per run) and a streaming k-way diff counts the
-/// symmetric difference. Peak RSS is O(one sort run), never O(graph) — this
-/// replaces the old whole-graph double-buffer that OOMed at scale.
+/// symmetric difference. Peak RSS is O(one sort run), never O(graph) — this replaces
+/// both the old whole-graph double-buffer that OOMed at scale AND the query-side
+/// OFFSET paging that re-sorted the whole twin per page.
 async fn verify_twin_full<P>(
     fluree: &crate::Fluree,
     ledger: &crate::LedgerState,
     provider: &P,
     graph_source_id: &str,
+    tmp_dir: Option<&Path>,
 ) -> Result<ParityReport, MaterializeError>
 where
     P: R2rmlProvider + R2rmlTableProvider,
@@ -1254,7 +1293,17 @@ where
     let mapping = provider.compiled_mapping(graph_source_id, None).await?;
     let classes = mapping_classes(&mapping);
 
-    let dir = std::env::temp_dir().join(format!(
+    // Spool + sorted runs go under `tmp_dir` (the target's `.fluree` storage area
+    // when the CLI drives this — NOT tmpfs `/tmp`, which would put the tens of GB of
+    // Full-mode spill back in RAM; item #3). `None` falls back to the system temp
+    // dir for small library callers. `TmpDirGuard` removes the whole directory on
+    // scope exit (including on error), but NOT on SIGKILL — a crash mid-verify
+    // leaves the spill behind; rooting it under `.fluree` keeps that residue
+    // discoverable and cleanable rather than orphaned in a shared `/tmp`.
+    let base = tmp_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!(
         "fluree-verify-{}-{}",
         sanitize_tmp(graph_source_id),
         std::process::id()
@@ -1274,11 +1323,23 @@ where
         "materialize.phase verify_source_oracle"
     );
 
-    // Twin side → disk (paged wildcard, canonicalized) with per-class counts.
+    // Twin side → disk in a SINGLE linear pass over the binary index (the export
+    // path's `BinaryCursor::scan_all` shape), canonicalized as written — NOT the old
+    // `ORDER BY ?s ?p ?o LIMIT N OFFSET M` wildcard paging, which re-sorted the whole
+    // twin per page (O(n^2)) and materialized each page's bindings on the query side
+    // (item #2). Per-class counts come from bounded COUNT queries — the same shape the
+    // Quick gate uses — so they cost O(classes), never a whole-twin scan.
     let twin_start = std::time::Instant::now();
     let twin_raw = dir.join("twin.nt");
-    let twin_class_count =
-        spool_twin_ntriples(fluree, ledger, &classes, &twin_raw, &source_class_count).await?;
+    spool_twin_ntriples_indexed(ledger, &twin_raw)?;
+    let mut twin_class_count: BTreeMap<String, u64> =
+        classes.iter().map(|c| (c.clone(), 0)).collect();
+    for class in &classes {
+        twin_class_count.insert(
+            class.clone(),
+            twin_count_class(fluree, ledger, class).await?,
+        );
+    }
     tracing::info!(
         verify_twin_read_ms = twin_start.elapsed().as_millis() as u64,
         "materialize.phase verify_twin_read"
@@ -1391,6 +1452,16 @@ async fn twin_count_class(
 /// deterministic order (`ORDER BY ?s LIMIT k OFFSET off`). Blank-node subjects are
 /// skipped (they cannot be round-tripped through a bound-subject query); the class
 /// COUNT still covers their cardinality.
+///
+/// SCALE NOTE (item #2): `offset` is the [`seeded_offset`] window position, which can
+/// land near the end of a class, so this is a per-class `ORDER BY ?s ... OFFSET N`
+/// sort-and-skip. It is bounded at current scale — the sort is over ONE class's
+/// subjects (not the whole graph) and `k` is [`SAMPLE_SUBJECTS_PER_CLASS`] — but it
+/// is not a bounded scan. The seeded window is deliberate (auditable, reproducible,
+/// rotatable to widen coverage), and a bounded seek would need a scan-side offset the
+/// query layer does not expose; left as a documented residual rather than dropping
+/// the seeded spread. The Full gate's whole-twin read is already a single linear pass
+/// (see [`spool_twin_ntriples_indexed`]).
 async fn twin_sample_subject_iris(
     fluree: &crate::Fluree,
     ledger: &crate::LedgerState,
@@ -1521,59 +1592,115 @@ impl TripleObserver for FileWritingObserver {
     }
 }
 
-/// Page the whole twin to disk as canonicalized N-Triples using bounded wildcard
-/// queries (`ORDER BY ?s ?p ?o LIMIT N OFFSET M`) and tally per-class counts.
-/// Each page holds at most one window of bindings resident. `classes` seeds the
-/// count map so classes with zero twin instances still report (a dropped-table
-/// mismatch surfaces as source>0, twin=0).
-async fn spool_twin_ntriples(
-    fluree: &crate::Fluree,
+/// Spool the whole twin to `path` as canonicalized N-Triples in a SINGLE linear pass
+/// over the binary index — the export path's `BinaryCursor::scan_all` shape, which
+/// streams the graph in Spot (s, p, o) order in bounded cursor batches. This replaces
+/// the old `ORDER BY ?s ?p ?o LIMIT N OFFSET M` wildcard paging, which was O(n^2)
+/// (each page re-sorted the whole twin) and materialized every page's bindings on the
+/// query side (item #2). Each line is numeric/temporal value-canonicalized as it is
+/// written (via [`CanonicalizingLineWriter`]) so the twin diffs byte-identically
+/// against the enumerator-rendered source side. The novelty overlay is included, so
+/// committed-but-not-yet-indexed twin triples are read too (e.g. the negative gate's
+/// post-build injected corruption). Per-class counts are NOT collected here — the
+/// caller derives them from bounded COUNT queries.
+fn spool_twin_ntriples_indexed(
     ledger: &crate::LedgerState,
-    classes: &BTreeSet<String>,
     path: &Path,
-    _source_class_count: &BTreeMap<String, u64>,
-) -> Result<BTreeMap<String, u64>, MaterializeError> {
-    use std::io::Write as _;
-    const PAGE: usize = 200_000;
+) -> Result<(), MaterializeError> {
+    use fluree_db_binary_index::BinaryIndexStore;
+
+    let binary_store: Arc<BinaryIndexStore> = ledger
+        .binary_store
+        .as_ref()
+        .and_then(|te| te.0.clone().downcast::<BinaryIndexStore>().ok())
+        .ok_or_else(|| {
+            R2rmlError::Materialization(
+                "twin has no binary index for full verify (is the twin indexed?)".to_string(),
+            )
+        })?;
+    let overlay: &dyn fluree_db_core::OverlayProvider = ledger.novelty.as_ref();
+    let config = crate::export::ExportConfig {
+        g_id: 0, // default graph
+        graph_iri: None,
+        to_t: ledger.t(),
+        overlay: Some(overlay),
+        dict_novelty: Some(&ledger.dict_novelty),
+    };
+
     let file = std::fs::File::create(path)
         .map_err(|e| R2rmlError::Materialization(format!("twin spool create: {e}")))?;
-    let mut writer = std::io::BufWriter::new(file);
-    let mut class_count: BTreeMap<String, u64> = classes.iter().map(|c| (c.clone(), 0)).collect();
-    let type_p = format!("<{}>", fluree_vocab::rdf::TYPE);
-    let mut offset = 0usize;
-    loop {
-        let q = format!(
-            "SELECT ?s ?p ?o WHERE {{ ?s ?p ?o }} ORDER BY ?s ?p ?o LIMIT {PAGE} OFFSET {offset}"
-        );
-        let bindings = twin_query_bindings(fluree, ledger, &q).await?;
-        if bindings.is_empty() {
-            break;
-        }
-        let page_len = bindings.len();
-        for b in &bindings {
-            let s = term_to_ntriples(&b["s"]);
-            let p = b["p"]["value"].as_str().unwrap_or_default();
-            let o = term_to_ntriples(&b["o"]);
-            if format!("<{p}>") == type_p {
-                if let Some(class) = b["o"]["value"].as_str() {
-                    if let Some(n) = class_count.get_mut(class) {
-                        *n += 1;
-                    }
-                }
-            }
-            let line = canonicalize_value_nt(&format!("{s} <{p}> {o} ."));
-            writeln!(writer, "{line}")
-                .map_err(|e| R2rmlError::Materialization(format!("twin spool write: {e}")))?;
-        }
-        offset += page_len;
-        if page_len < PAGE {
-            break;
+    let mut writer = CanonicalizingLineWriter::new(std::io::BufWriter::new(file));
+    crate::export::export_graph_ntriples(&binary_store, &config, &mut writer)
+        .map_err(|e| R2rmlError::Materialization(format!("twin index export: {e}")))?;
+    writer.finish()
+}
+
+/// A [`std::io::Write`] adapter that numeric/temporal value-canonicalizes each
+/// complete N-Triples line (via [`canonicalize_value_nt`]) before forwarding it to
+/// the inner sink. The export writer emits one triple per line, terminated by ` .\n`,
+/// in fragments (subject / predicate / object as separate writes); N-Triples escapes
+/// any literal newline, so the only raw `\n` is the line terminator — safe to split
+/// on. Peak resident state is one line.
+struct CanonicalizingLineWriter<W: std::io::Write> {
+    inner: W,
+    buf: Vec<u8>,
+}
+
+impl<W: std::io::Write> CanonicalizingLineWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
         }
     }
-    writer
-        .flush()
-        .map_err(|e| R2rmlError::Materialization(format!("twin spool flush: {e}")))?;
-    Ok(class_count)
+
+    /// Canonicalize + flush any trailing partial line (defensive — the export always
+    /// ends every line with `\n`), then flush the inner writer.
+    fn finish(mut self) -> Result<(), MaterializeError> {
+        if !self.buf.is_empty() {
+            let out = canonical_line_bytes(&self.buf);
+            self.inner
+                .write_all(&out)
+                .and_then(|()| self.inner.write_all(b"\n"))
+                .map_err(|e| R2rmlError::Materialization(format!("twin spool write: {e}")))?;
+        }
+        self.inner
+            .flush()
+            .map_err(|e| R2rmlError::Materialization(format!("twin spool flush: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Canonicalize one N-Triples line (no trailing newline) to bytes. A non-UTF-8 line
+/// (never emitted for valid N-Triples) is passed through verbatim rather than failing
+/// the whole verify.
+fn canonical_line_bytes(line: &[u8]) -> Vec<u8> {
+    match std::str::from_utf8(line) {
+        Ok(s) => canonicalize_value_nt(s).into_bytes(),
+        Err(_) => line.to_vec(),
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CanonicalizingLineWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        let mut start = 0;
+        while let Some(rel) = self.buf[start..].iter().position(|&b| b == b'\n') {
+            let end = start + rel;
+            // Owned bytes, so the immutable borrow of `self.buf` ends before the
+            // mutable write to `self.inner`.
+            let out = canonical_line_bytes(&self.buf[start..end]);
+            self.inner.write_all(&out)?;
+            self.inner.write_all(b"\n")?;
+            start = end + 1;
+        }
+        self.buf.drain(..start);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// External merge-sort a file of lines with de-duplication (an RDF graph is a set),
@@ -2049,6 +2176,152 @@ mod tests {
         assert!(
             super::require_nonempty_watermark(&empty, &empty_mapping).is_ok(),
             "no tables → an empty watermark is fine"
+        );
+    }
+
+    #[test]
+    fn stamp_over_64kib_cap_fails_loud() {
+        use fluree_db_query::r2rml::TableWatermark;
+        use std::collections::HashMap;
+
+        // A watermark that blows the 64 KiB txn-meta cap: enough tables, each with a
+        // realistic-length S3 metadata_location, that the serialized JSON exceeds it.
+        // encode_stamp bypasses the parser-path txn-meta validators, so this must be
+        // caught fail-loud rather than fail opaquely at commit-encode time (item #4).
+        let long_loc = format!(
+            "s3://warehouse/db/schema/table/metadata/{}.metadata.json",
+            "0".repeat(300)
+        );
+        let mut tables = HashMap::new();
+        for i in 0..300 {
+            tables.insert(
+                format!("dw.table_{i}"),
+                TableWatermark {
+                    metadata_location: long_loc.clone(),
+                    snapshot_id: Some(i as i64),
+                    sequence_number: Some(i as i64),
+                },
+            );
+        }
+        let stamp = super::WatermarkStamp {
+            builder_version: "fluree-materialize/0.0.0".into(),
+            mapping_hash: "deadbeef".into(),
+            tables,
+            sample_seed: 0,
+        };
+        match super::stamp_watermark_within_cap(&stamp) {
+            Err(super::MaterializeError::StampTooLarge {
+                actual_bytes,
+                cap_bytes,
+                table_count,
+            }) => {
+                assert_eq!(cap_bytes, super::MAX_TXN_META_BYTES);
+                assert_eq!(
+                    table_count, 300,
+                    "the table count drives the failure message"
+                );
+                assert!(
+                    actual_bytes > cap_bytes,
+                    "the reported stamp size ({actual_bytes}) must exceed the cap ({cap_bytes})"
+                );
+            }
+            other => panic!("an over-cap stamp must fail loud with StampTooLarge, got {other:?}"),
+        }
+
+        // A modest two-table stamp fits comfortably (no false positive).
+        let mut small = HashMap::new();
+        small.insert(
+            "dw.a".to_string(),
+            TableWatermark {
+                metadata_location: "s3://m/a.metadata.json".into(),
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+            },
+        );
+        small.insert(
+            "dw.b".to_string(),
+            TableWatermark {
+                metadata_location: "s3://m/b.metadata.json".into(),
+                snapshot_id: Some(2),
+                sequence_number: Some(2),
+            },
+        );
+        let stamp = super::WatermarkStamp {
+            builder_version: "fluree-materialize/0.0.0".into(),
+            mapping_hash: "abc123".into(),
+            tables: small,
+            sample_seed: 7,
+        };
+        assert!(
+            super::stamp_watermark_within_cap(&stamp).is_ok(),
+            "a small stamp must fit the 64 KiB cap"
+        );
+    }
+
+    #[test]
+    fn read_stamp_requires_materialize_namespace() {
+        use fluree_db_core::{TxnMetaEntry, TxnMetaValue};
+        use fluree_db_query::r2rml::TableWatermark;
+        use std::collections::{BTreeMap, HashMap};
+
+        // A well-formed stamp payload — the same local names + value types encode_stamp writes.
+        let watermark = {
+            let mut t: BTreeMap<&str, TableWatermark> = BTreeMap::new();
+            t.insert(
+                "dw.a",
+                TableWatermark {
+                    metadata_location: "s3://m/a.metadata.json".into(),
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                },
+            );
+            serde_json::to_string(&t).unwrap()
+        };
+        let make_entries = |ns: u16| {
+            vec![
+                TxnMetaEntry::new(
+                    ns,
+                    super::STAMP_PRED_BUILDER,
+                    TxnMetaValue::String("fluree-materialize/0.0.0".into()),
+                ),
+                TxnMetaEntry::new(
+                    ns,
+                    super::STAMP_PRED_MAPPING_HASH,
+                    TxnMetaValue::String("abc123def456".into()),
+                ),
+                TxnMetaEntry::new(
+                    ns,
+                    super::STAMP_PRED_WATERMARK,
+                    TxnMetaValue::String(watermark.clone()),
+                ),
+                TxnMetaEntry::new(ns, super::STAMP_PRED_SAMPLE_SEED, TxnMetaValue::Long(42)),
+            ]
+        };
+
+        // 1) Predicates whose ns code resolves to MATERIALIZE_NS parse as a stamp.
+        let good_code = 100u16;
+        let mut good_delta = HashMap::new();
+        good_delta.insert(good_code, super::MATERIALIZE_NS.to_string());
+        let stamp = super::read_stamp(&make_entries(good_code), &good_delta)
+            .expect("a stamp in MATERIALIZE_NS must parse");
+        assert_eq!(stamp.mapping_hash, "abc123def456");
+        assert_eq!(stamp.sample_seed, 42);
+        assert_eq!(stamp.tables.len(), 1);
+
+        // 2) The SAME local names + values in a FOREIGN namespace must NOT parse —
+        //    the local names alone are not a sufficient signature (item #5).
+        let forged_code = 200u16;
+        let mut forged_delta = HashMap::new();
+        forged_delta.insert(forged_code, "https://evil.example/materialize#".to_string());
+        assert!(
+            super::read_stamp(&make_entries(forged_code), &forged_delta).is_none(),
+            "a forged stamp carrying the stamp local names in a foreign namespace must be rejected"
+        );
+
+        // 3) An unresolvable ns code (absent from the delta) is likewise not a stamp.
+        assert!(
+            super::read_stamp(&make_entries(300), &HashMap::new()).is_none(),
+            "an unresolved ns code must not parse as a stamp"
         );
     }
 
@@ -2617,7 +2890,11 @@ mod tests {
     fn run_build(
         provider: &MockBuildProvider,
         parallelism: usize,
-    ) -> (super::MaterializeStats, Vec<(usize, ParsedChunk)>) {
+    ) -> (
+        super::MaterializeStats,
+        Vec<(usize, ParsedChunk)>,
+        Arc<fluree_db_transact::SharedNamespaceAllocator>,
+    ) {
         use fluree_db_transact::namespace::{NamespaceRegistry, SharedNamespaceAllocator};
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2668,7 +2945,7 @@ mod tests {
 
         let chunks = drain.join().unwrap();
         let _ = std::fs::remove_dir_all(&spool_dir);
-        (stats, chunks)
+        (stats, chunks, shared_alloc)
     }
 
     /// Assert the p=1-vs-p=2 differential + chunk invariants for one fixture: the
@@ -2676,8 +2953,8 @@ mod tests {
     /// counts regardless of parallelism, with contiguous chunk indices and exactly
     /// one stamped final chunk.
     fn assert_parallel_differential(name: &str, provider: &MockBuildProvider) {
-        let (stats1, chunks1) = run_build(provider, 1);
-        let (stats2, chunks2) = run_build(provider, 2);
+        let (stats1, chunks1, alloc1) = run_build(provider, 1);
+        let (stats2, chunks2, alloc2) = run_build(provider, 2);
 
         // 1) Identical enumeration regardless of parallelism (the triples emitted
         //    are the same; only chunk boundaries/order differ).
@@ -2701,7 +2978,7 @@ mod tests {
 
         // 3) Chunk indices are unique and contiguous 0..N in each run (the shared
         //    atomic invariant the reordering consumer relies on — now ACROSS waves).
-        for (label, chunks) in [("p1", &chunks1), ("p2", &chunks2)] {
+        for (label, chunks, alloc) in [("p1", &chunks1, &alloc1), ("p2", &chunks2, &alloc2)] {
             let mut idxs: Vec<usize> = chunks.iter().map(|(i, _)| *i).collect();
             idxs.sort_unstable();
             let expected: Vec<usize> = (0..chunks.len()).collect();
@@ -2711,10 +2988,15 @@ mod tests {
             );
 
             // 4) Exactly ONE chunk carries the completion stamp, and it is the
-            //    highest idx (committed last → the twin's head).
+            //    highest idx (committed last → the twin's head). Resolve each chunk's
+            //    own ns codes (as the commit's namespace_delta would) so read_stamp's
+            //    MATERIALIZE_NS requirement is exercised, not bypassed.
             let stamped: Vec<usize> = chunks
                 .iter()
-                .filter(|(_, c)| super::read_stamp(&c.txn_meta).is_some())
+                .filter(|(_, c)| {
+                    let ns_delta = alloc.lookup_codes(&c.new_codes);
+                    super::read_stamp(&c.txn_meta, &ns_delta).is_some()
+                })
                 .map(|(i, _)| *i)
                 .collect();
             assert_eq!(
@@ -2745,7 +3027,7 @@ mod tests {
     /// emitted, and Region's before Country. Counted via the aggregate stats.
     #[test]
     fn chain_resolves_both_fk_levels() {
-        let (stats, _) = run_build(&chain_fixture(), 2);
+        let (stats, _, _) = run_build(&chain_fixture(), 2);
         // country/10 → region/1 (country/20 → region/9 dangling): 1 edge.
         // city/100→country/10, city/300→country/10 (200→20, 400→99 → both? 20 exists,
         // 99 dangling): city edges = 100,200,300 resolve = 3.

@@ -713,6 +713,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             max_performance,
             allow_mor_deletes,
             home,
+            tmp_dir,
         } => {
             // `--home` resolves through the same helper as `--config` (it takes
             // precedence); else the tracked `.fluree/` or the global home.
@@ -728,6 +729,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 parallelism: cli.parallelism,
                 memory_budget_mb: cli.memory_budget_mb,
                 quiet: cli.quiet,
+                tmp_dir: tmp_dir.as_deref(),
             };
             commands::materialize::run(&fluree_dir, &params).await
         }

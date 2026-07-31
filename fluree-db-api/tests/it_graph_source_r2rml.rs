@@ -4969,7 +4969,9 @@ async fn read_head_stamp(
     let start = HEADER_LEN;
     let end = start + hdr.envelope_len as usize;
     let env = decode_envelope(&raw[start..end]).expect("decode envelope");
-    fluree_db_api::materialize::read_stamp(&env.txn_meta)
+    // The stamp predicates' ns code resolves via this commit's own namespace_delta
+    // (they were freshly interned into the final commit's sink).
+    fluree_db_api::materialize::read_stamp(&env.txn_meta, &env.namespace_delta)
         .expect("head commit must carry the completion stamp")
 }
 
@@ -5221,6 +5223,225 @@ fn verify_fixture_provider() -> Arc<MultiTableMock> {
     Arc::new(MultiTableMock { mapping, tables })
 }
 
+/// The same dim+fact shape as [`verify_fixture_provider`], but generated at
+/// `n_customers`/`n_orders` rows split into `batch_rows`-sized scan batches — so a
+/// small chunk budget yields a genuinely MULTI-CHUNK build (chunk boundaries fall
+/// between scan batches). Every order's FK resolves (`cust_key = o_key % n_customers`).
+#[cfg(feature = "native")]
+fn scaled_verify_provider(
+    n_customers: usize,
+    n_orders: usize,
+    batch_rows: usize,
+) -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    };
+
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/name"),
+            object_map: ObjectMap::column("name"),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/label"),
+            object_map: ObjectMap::Column {
+                column: "label".to_string(),
+                datatype: None,
+                language: Some("en".to_string()),
+                term_type: TermType::Literal,
+            },
+        },
+    ];
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/amount"),
+            object_map: ObjectMap::column_typed(
+                "amount",
+                "http://www.w3.org/2001/XMLSchema#decimal",
+            ),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Customer>",
+                "cust_key",
+                "c_key",
+            )),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "c_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "name".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+        FieldInfo {
+            name: "label".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 3,
+        },
+    ]));
+    let mut cust_batches = Vec::new();
+    let mut i = 0;
+    while i < n_customers {
+        let end = (i + batch_rows).min(n_customers);
+        cust_batches.push(
+            ColumnBatch::new(
+                Arc::clone(&cust_schema),
+                vec![
+                    Column::Int64((i..end).map(|k| Some(k as i64)).collect()),
+                    Column::String((i..end).map(|k| Some(format!("Customer {k}"))).collect()),
+                    Column::String((i..end).map(|k| Some(format!("label-{k}"))).collect()),
+                ],
+            )
+            .unwrap(),
+        );
+        i = end;
+    }
+
+    let order_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "o_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "amount".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+        FieldInfo {
+            name: "cust_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: true,
+            field_id: 3,
+        },
+    ]));
+    let mut order_batches = Vec::new();
+    let mut i = 0;
+    while i < n_orders {
+        let end = (i + batch_rows).min(n_orders);
+        order_batches.push(
+            ColumnBatch::new(
+                Arc::clone(&order_schema),
+                vec![
+                    Column::Int64((i..end).map(|k| Some(k as i64)).collect()),
+                    Column::String((i..end).map(|k| Some(format!("{}.25", k))).collect()),
+                    Column::Int64(
+                        (i..end)
+                            .map(|k| Some((k % n_customers.max(1)) as i64))
+                            .collect(),
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        i = end;
+    }
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), cust_batches);
+    tables.insert("dw.orders".to_string(), order_batches);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// PARITY GATE — FULL mode at multi-chunk scale (item #2): a twin built across many
+/// scan batches + a tiny chunk budget must pass the full-triple diff. This exercises
+/// the rewritten twin-read path — a SINGLE linear pass over the binary index (the
+/// export `scan_all` shape) instead of O(n^2) `ORDER BY ?s ?p ?o ... OFFSET` paging —
+/// proving it streams the WHOLE twin (every chunk/segment) and diffs byte-identically
+/// against the enumerator source. Peak memory is bounded by construction (cursor
+/// batches on the read side, `SORT_RUN_LINES` on the sort side); this asserts
+/// correctness + completeness at multi-chunk size.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_full_passes_on_multi_chunk_twin() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-full-multichunk:main";
+    const N_CUSTOMERS: usize = 4000;
+    const N_ORDERS: usize = 4000;
+    let provider = scaled_verify_provider(N_CUSTOMERS, N_ORDERS, 500);
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(64)
+        .chunk_size_mb(1) // tiny chunks × many scan batches → a genuinely multi-chunk build
+        .execute()
+        .await
+        .expect("build multi-chunk twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // Spool under the tempdir (a real .fluree-style scratch area, not tmpfs /tmp).
+    let verify_tmp = dir.path().join("materialize-verify");
+    let report = verify_twin(
+        &fluree,
+        &ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Full,
+        Some(&verify_tmp),
+    )
+    .await
+    .expect("full verify");
+
+    assert!(
+        report.passed,
+        "a faithful multi-chunk twin must pass full verify; failures: {:?}",
+        report.failures()
+    );
+    let full = report
+        .checks
+        .iter()
+        .find(|c| c.name == "full-triple-diff")
+        .expect("full-diff check present");
+    assert_eq!(
+        full.outcome,
+        CheckOutcome::Match,
+        "the index-streamed twin must diff byte-identically against the enumerator source"
+    );
+    // Both class counts match at scale (proving the linear pass read every segment).
+    let count_outcome = |class: &str| {
+        report
+            .checks
+            .iter()
+            .find(|c| c.name == format!("count:{class}"))
+            .map(|c| c.outcome.clone())
+    };
+    assert_eq!(
+        count_outcome("http://ex.org/Customer"),
+        Some(CheckOutcome::Match)
+    );
+    assert_eq!(
+        count_outcome("http://ex.org/Order"),
+        Some(CheckOutcome::Match)
+    );
+}
+
 /// PARITY GATE — pass case: a faithfully built twin matches its virtual source
 /// under both `Quick` (class counts + stratified sample) and `Full` (full-triple
 /// diff). Proves the twin-side N-Triples reader renders IRI, plain-string,
@@ -5247,7 +5468,7 @@ async fn verify_twin_passes_on_faithful_twin() {
     let ledger = fluree.ledger(LEDGER).await.expect("load twin");
 
     for mode in [VerifyMode::Quick, VerifyMode::Full] {
-        let report = verify_twin(&fluree, &ledger, &*provider, "gs:main", mode)
+        let report = verify_twin(&fluree, &ledger, &*provider, "gs:main", mode, None)
             .await
             .expect("verify");
         assert!(
@@ -5314,6 +5535,7 @@ async fn verify_twin_fails_on_corrupted_twin() {
         &*provider,
         "gs:main",
         VerifyMode::Full,
+        None,
     )
     .await
     .expect("verify");
@@ -5389,6 +5611,7 @@ async fn verify_twin_quick_catches_sampled_subject_corruption() {
         &*provider,
         "gs:main",
         VerifyMode::Quick,
+        None,
     )
     .await
     .expect("verify");
