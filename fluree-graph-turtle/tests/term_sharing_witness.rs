@@ -39,7 +39,7 @@ unsafe impl GlobalAlloc for Counting {
         System.alloc(layout)
     }
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        System.dealloc(p, layout)
+        System.dealloc(p, layout);
     }
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if COUNTING.load(Ordering::Relaxed) == 1 {

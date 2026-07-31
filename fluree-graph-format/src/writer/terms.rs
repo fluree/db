@@ -157,24 +157,31 @@ impl WriterTerms {
         if raw & SESSION_TAG != 0 {
             return &self.session[(raw & !SESSION_TAG) as usize];
         }
-        #[cfg(debug_assertions)]
-        {
-            let stamped = (raw & GEN_MASK) >> GEN_SHIFT;
-            debug_assert_eq!(
-                stamped,
-                self.generation & 0x7F,
-                "term id {} was minted in statement {} and read in statement {} — the \
-                 producer declared TermScope::Statement and then cached an id across \
-                 end_statement(), so this read resolves to whatever later term took \
-                 the slot",
-                raw & INDEX_MASK,
-                stamped,
-                self.generation & 0x7F,
-            );
-            return &self.scoped[(raw & INDEX_MASK) as usize];
-        }
-        #[cfg(not(debug_assertions))]
-        &self.scoped[raw as usize]
+        &self.scoped[self.scoped_index(raw)]
+    }
+
+    /// Strip the debug-only generation stamp, checking it on the way.
+    #[cfg(debug_assertions)]
+    fn scoped_index(&self, raw: u32) -> usize {
+        let stamped = (raw & GEN_MASK) >> GEN_SHIFT;
+        debug_assert_eq!(
+            stamped,
+            self.generation & 0x7F,
+            "term id {} was minted in statement {} and read in statement {} — the \
+             producer declared TermScope::Statement and then cached an id across \
+             end_statement(), so this read resolves to whatever later term took \
+             the slot",
+            raw & INDEX_MASK,
+            stamped,
+            self.generation & 0x7F,
+        );
+        (raw & INDEX_MASK) as usize
+    }
+
+    /// Release builds carry no stamp, so the id is the index.
+    #[cfg(not(debug_assertions))]
+    fn scoped_index(&self, raw: u32) -> usize {
+        raw as usize
     }
 
     pub(crate) fn iri(&mut self, iri: &str) -> TermId {
@@ -294,16 +301,22 @@ impl WriterTerms {
         } else {
             self.scoped.push(term);
         }
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                slot as u32 <= INDEX_MASK,
-                "statement-scoped slot {slot} does not fit in {GEN_SHIFT} bits of index — \
-                 a single statement this wide needs a different id layout",
-            );
-            return TermId::new(slot as u32 | ((self.generation & 0x7F) << GEN_SHIFT));
-        }
-        #[cfg(not(debug_assertions))]
+        self.stamped_id(slot)
+    }
+
+    /// Mint a statement-scoped id carrying the statement it belongs to.
+    #[cfg(debug_assertions)]
+    fn stamped_id(&self, slot: usize) -> TermId {
+        debug_assert!(
+            slot as u32 <= INDEX_MASK,
+            "statement-scoped slot {slot} does not fit in {GEN_SHIFT} bits of index — \
+             a single statement this wide needs a different id layout",
+        );
+        TermId::new(slot as u32 | ((self.generation & 0x7F) << GEN_SHIFT))
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn stamped_id(&self, slot: usize) -> TermId {
         TermId::new(slot as u32)
     }
 
