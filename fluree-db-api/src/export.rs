@@ -489,6 +489,18 @@ pub fn write_turtle_iri<W: Write>(w: &mut W, iri: &str, prefixes: &PrefixMap) ->
 }
 
 /// Write a subject term as Turtle (prefixed name, `<iri>`, or `_:bnode`).
+///
+/// Blank-node labels are written verbatim, deliberately: an export has to
+/// round-trip, and rewriting a label to fit the Turtle grammar would merge two
+/// distinct nodes onto one id (contrast `crate::validate`, whose report output
+/// sanitizes because it does not round-trip).
+///
+/// Current blank-node ids are all writable as-is: import mints `[0-9a-z-]`
+/// (see `fluree_db_core::skolem`), staged transactions mint hex, `BNODE()`
+/// mints a UUID. Ledgers imported by Fluree 4.1.4 or earlier hold ids that
+/// embedded the ledger id, so they contain `/` and `:` and an export of such a
+/// ledger emits Turtle that strict parsers reject — the identity is preserved,
+/// the syntax is not. Re-importing the source fixes it.
 fn write_turtle_iri_or_bnode<W: Write>(
     w: &mut W,
     iri: &str,
