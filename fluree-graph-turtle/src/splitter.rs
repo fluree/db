@@ -24,7 +24,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::{parse, tokenize, TokenKind};
+use crate::{parse, StreamingLexer, TokenKind};
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 
 // ============================================================================
@@ -177,7 +177,28 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
     // we try to find a safe truncation point by scanning backwards for a newline.
     let header_str = find_safe_header(buf);
 
-    let tokens = tokenize(header_str).map_err(|e| SplitError::Tokenize(e.to_string()))?;
+    // Pull tokens one at a time and stop at the first that is not part of a
+    // directive. The walk below already stopped there; it was just handed a
+    // fully materialized `Vec` first, so a header region that failed to lex
+    // ANYWHERE — including a megabyte past the last directive — took the whole
+    // document down with it.
+    //
+    // That is not a hypothetical failure mode, it is the common one. The cap
+    // below slices at a fixed offset and `find_safe_header` backs up to a
+    // newline, which lands inside any literal long enough to span the window:
+    // `ex:doc ex:body """…"""` running past 1 MB is a perfectly valid document
+    // whose header stops lexing mid-string. Every such document lost
+    // parallelism, and the reason string blamed the document rather than the
+    // scan. Pulling lazily means those bytes are never lexed, because the walk
+    // has already stopped at `ex:doc`.
+    //
+    // A lex error that survives this loop is therefore a real defect IN THE
+    // HEADER, which is what `SplitError::Tokenize` has always claimed to mean.
+    //
+    // `StreamingLexer::new` does not call `check_input_len` the way
+    // `Lexer::tokenize` does. Harmless under the cap above — a megabyte is
+    // nowhere near `u32::MAX` — but load-bearing on that cap staying put.
+    let mut lexer = StreamingLexer::new(header_str);
 
     // Walk tokens: collect prefix/base directives. Stop at the first token that
     // is not a directive, whitespace filler, or the terminating dot of a directive.
@@ -190,7 +211,10 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
     let mut sparql_directive = false;
     let mut saw_any_directive = false;
 
-    for tok in &tokens {
+    loop {
+        let tok = lexer
+            .next_token()
+            .map_err(|e| SplitError::Tokenize(e.to_string()))?;
         match tok.kind {
             TokenKind::KwPrefix | TokenKind::KwBase => {
                 in_directive = true;

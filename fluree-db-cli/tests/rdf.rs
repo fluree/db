@@ -3035,6 +3035,149 @@ fn a_run_that_falls_back_to_serial_still_reports_what_the_attempt_cost() {
     );
 }
 
+/// A valid document whose long literal opens inside the header scan window and
+/// closes past it.
+///
+/// `find_safe_header` backs the window up to a newline, which for this document
+/// lands inside the literal — so the header region on its own is an
+/// unterminated string. Nothing is wrong with the document.
+fn literal_spanning_the_header_window() -> String {
+    const PREFIX_SCAN_SIZE: usize = 1024 * 1024;
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\nex:doc ex:body \"\"\"\n");
+    while ttl.len() < PREFIX_SCAN_SIZE + 512 * 1024 {
+        ttl.push_str("lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do.\n");
+    }
+    ttl.push_str("\"\"\" .\n");
+    for i in 0..60_000 {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:p \"a literal wide enough to push this past the gate {i}\" .\n"
+        ));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate",
+        ttl.len()
+    );
+    ttl
+}
+
+#[test]
+fn a_long_literal_spanning_the_header_window_still_chunks() {
+    // The header scan used to tokenize its whole window before looking at a
+    // single token, so a document that failed to lex ANYWHERE in the first
+    // megabyte could not be chunked — including this one, which is valid. The
+    // run fell back to serial and blamed the input: "the input could not be
+    // split into chunks".
+    //
+    // Pulling tokens lazily stops the walk at `ex:doc`, about forty bytes in,
+    // and the literal is never lexed at all.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "longlit.ttl", &literal_spanning_the_header_window());
+
+    let mut produced: Vec<Vec<u8>> = Vec::new();
+    for threads in ["1", "8"] {
+        let out = tmp.path().join(format!("out{threads}.nt"));
+        let stderr = rdf_cmd()
+            .args(["--parallelism", threads, "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt"])
+            .arg("-o")
+            .arg(&out)
+            .args(["--profile=json", "--no-hash"])
+            .assert()
+            .success()
+            .get_output()
+            .stderr
+            .clone();
+        let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+        if threads == "8" {
+            assert_eq!(
+                v["host"]["threads_used"], 8,
+                "a valid document lost parallelism to its own header scan. reason: {}",
+                v["host"]["parallel_reason"]
+            );
+        }
+        produced.push(std::fs::read(&out).unwrap());
+    }
+    assert!(
+        produced[0] == produced[1],
+        "the two widths disagree ({} vs {} bytes)",
+        produced[0].len(),
+        produced[1].len()
+    );
+}
+
+#[test]
+fn a_lexical_defect_after_the_header_does_not_force_serial() {
+    // The larger class the long literal is one instance of: ANY lex failure
+    // inside the scan window used to sink chunking, so a typo 300 KB into a
+    // 5 MB file quietly moved the whole run onto the serial path. Harmless for
+    // correctness — the document fails either way — but it means "unchunkable"
+    // reported a property of the document's SHAPE when the cause was a defect,
+    // and the two want different fixes from a user.
+    let tmp = TempDir::new().unwrap();
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..120_000 {
+        if i == 12_000 {
+            ttl.push_str("ex:bad ex:p ?? .\n");
+        }
+        ttl.push_str(&format!(
+            "ex:s{i} ex:p \"a literal wide enough to push this past the gate {i}\" .\n"
+        ));
+    }
+    assert!(ttl.len() > MIN_PARALLEL_BYTES, "{}", ttl.len());
+    let input = fixture(&tmp, "defect.ttl", &ttl);
+
+    let assert = rdf_cmd()
+        .args(["--parallelism", "8", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(tmp.path().join("out.nt"))
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(
+        !stderr.contains("converting serially"),
+        "a defect past the header still costs the whole run its parallelism: {stderr}"
+    );
+    // And it is still refused, at the right place: line 1 is the header, then
+    // 12,000 statements, then this one.
+    assert!(
+        stderr.contains("defect.ttl:12002:13:"),
+        "the defect was not reported where it is: {stderr}"
+    );
+}
+
+#[test]
+fn a_malformed_header_is_still_refused() {
+    // The negative control. Lazy tokenizing must not turn into "never look at
+    // the header": a directive that does not lex is a real defect IN the
+    // header, chunking must still refuse it, and the document must still fail.
+    // Without this the fix could silently start accepting broken headers.
+    let tmp = TempDir::new().unwrap();
+    let mut ttl = String::from("@prefix ex: <http://example.org/ .\n");
+    for i in 0..120_000 {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:p \"a literal wide enough to push this past the gate {i}\" .\n"
+        ));
+    }
+    assert!(ttl.len() > MIN_PARALLEL_BYTES, "{}", ttl.len());
+    let input = fixture(&tmp, "badhdr.ttl", &ttl);
+
+    rdf_cmd()
+        .args(["--parallelism", "8", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(tmp.path().join("out.nt"))
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .stderr(predicate::str::contains("converting serially"))
+        .stderr(predicate::str::contains("badhdr.ttl:1:13:"));
+}
+
 #[test]
 fn json_profile_stderr_is_parseable_on_a_chunking_fallback() {
     // `2> run.json` is the bench lane's idiom, so stderr under `--profile=json`
