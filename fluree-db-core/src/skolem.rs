@@ -73,12 +73,14 @@ pub const DOC_SCOPE_DIGITS: usize = 13;
 /// Byte length of a rendered document scope (`DOC_SCOPE_MARKER` + digits).
 pub const DOC_SCOPE_LEN: usize = 1 + DOC_SCOPE_DIGITS;
 
-/// Byte separating the namespace from the document key in the hash input.
+/// Byte separating the three hash-input fields: `namespace ‖ 0 ‖ doc_key ‖ 0 ‖
+/// segment` (the segment is four little-endian bytes and is always last, so it
+/// needs no terminator).
 ///
-/// A key cannot contain NUL (paths and object addresses are UTF-8 text), so no
-/// `(namespace, doc_key)` pair can be re-cut at a different boundary to produce
-/// the same hash input. Without it, namespace `"a"` + key `"b/c"` and namespace
-/// `"a/b"` + key `"c"` would hash identically.
+/// Neither a namespace nor a key can contain NUL (both are UTF-8 text: ledger
+/// ids, paths, object addresses), so no two field triples can be re-cut at a
+/// different boundary to produce the same input. Without it, namespace `"a"` +
+/// key `"b/c"` and namespace `"a/b"` + key `"c"` would hash identically.
 const NAMESPACE_SEPARATOR: u8 = 0;
 
 const BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -89,14 +91,23 @@ const BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 /// identifies the document within the import — a path relative to the import
 /// root, a remote address relative to its listing prefix, or a file's basename.
 ///
+/// `segment` distinguishes several documents carried by one source. Every arm
+/// passes `0` except ndjson, where a mid-stream `@context` line ends one
+/// document and starts the next inside a single file. It is an **ordinal** —
+/// how many context switches precede this segment — deliberately not the chunk
+/// index the segment starts at, which would vary with `chunk_size_mb` and
+/// reintroduce the dependence on import shape this module exists to remove.
+///
 /// Pure and allocation-free: parse workers on different threads derive the same
 /// id for the same document with no coordination.
 #[must_use]
-pub fn doc_id(namespace: &str, doc_key: &str) -> u64 {
+pub fn doc_id(namespace: &str, doc_key: &str, segment: u32) -> u64 {
     let mut hasher = Xxh64::new(0);
     hasher.update(namespace.as_bytes());
     hasher.update(&[NAMESPACE_SEPARATOR]);
     hasher.update(doc_key.as_bytes());
+    hasher.update(&[NAMESPACE_SEPARATOR]);
+    hasher.update(&segment.to_le_bytes());
     hasher.digest()
 }
 
@@ -120,8 +131,8 @@ pub fn doc_scope(id: u64) -> String {
 ///
 /// The result is the `{base}` in `fdb-{base}-{label}`.
 #[must_use]
-pub fn skolem_base(namespace: &str, doc_key: &str) -> String {
-    doc_scope(doc_id(namespace, doc_key))
+pub fn skolem_base(namespace: &str, doc_key: &str, segment: u32) -> String {
+    doc_scope(doc_id(namespace, doc_key, segment))
 }
 
 /// Split a stable blank-node local name minted by bulk import into its
@@ -178,7 +189,7 @@ mod tests {
     // BLANK_NODE_LABEL, which admits neither `/` nor `:`.
     #[test]
     fn skolem_base_is_free_of_characters_sparql_forbids() {
-        let base = skolem_base("my/ledger:main", "sub dir/data (1).ttl");
+        let base = skolem_base("my/ledger:main", "sub dir/data (1).ttl", 0);
         assert!(
             base.bytes()
                 .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()),
@@ -189,20 +200,40 @@ mod tests {
     #[test]
     fn namespace_separates_ledger_from_document() {
         // Without the NUL, ("a", "b/c") and ("a/b", "c") would collide.
-        assert_ne!(doc_id("a", "b/c"), doc_id("a/b", "c"));
+        assert_ne!(doc_id("a", "b/c", 0), doc_id("a/b", "c", 0));
+    }
+
+    // A mid-stream `@context` line ends one ndjson document and starts the
+    // next; the segments must not share a scope.
+    #[test]
+    fn segments_of_one_source_are_distinct_documents() {
+        let a = skolem_base("l:main", "combined.jsonl", 0);
+        let b = skolem_base("l:main", "combined.jsonl", 1);
+        assert_ne!(a, b);
+        assert_eq!(a, skolem_base("l:main", "combined.jsonl", 0), "and stable");
+    }
+
+    // The segment rides its own field, so it cannot be confused with a key
+    // that merely ends in digits.
+    #[test]
+    fn segment_is_not_absorbed_into_the_document_key() {
+        assert_ne!(
+            doc_id("l:main", "a.jsonl", 1),
+            doc_id("l:main", "a.jsonl\u{0}\u{1}", 0)
+        );
     }
 
     #[test]
     fn different_ledgers_mint_different_scopes_for_one_file() {
         assert_ne!(
-            skolem_base("one:main", "data.ttl"),
-            skolem_base("two:main", "data.ttl")
+            skolem_base("one:main", "data.ttl", 0),
+            skolem_base("two:main", "data.ttl", 0)
         );
     }
 
     #[test]
     fn split_doc_scope_recovers_labels_containing_hyphens() {
-        let base = skolem_base("l:main", "data.ttl");
+        let base = skolem_base("l:main", "data.ttl", 0);
         let local = format!("fdb-{base}-my-label-with-hyphens");
         assert_eq!(
             split_doc_scope(&local),
@@ -227,7 +258,7 @@ mod tests {
     // the offset of the first `-` after the `fdb-` prefix (see module docs).
     #[test]
     fn first_hyphen_offset_distinguishes_the_minters() {
-        let import = skolem_base("l:main", "data.ttl");
+        let import = skolem_base("l:main", "data.ttl", 0);
         assert_eq!(import.find('-'), None, "a scope contains no hyphen");
         assert_eq!(import.len(), 14, "so the first hyphen lands at offset 14");
 

@@ -809,10 +809,14 @@ type RemoteChunk = (usize, DocChunk, Vec<u8>);
 ///
 #[derive(Debug)]
 pub(crate) struct DocIds {
+    /// Salt for every id in this import — the normalized ledger id unless the
+    /// caller overrode it. Retained because the ndjson arm discovers extra
+    /// documents (context segments) mid-read, after this table is built.
+    namespace: String,
     /// Document keys in source order — paths relative to the import root, or
     /// remote addresses relative to the listing prefix.
     keys: Vec<String>,
-    /// `skolem::doc_id` of each key, same order.
+    /// `skolem::doc_id` of each key at segment 0, same order.
     ids: Vec<u64>,
 }
 
@@ -831,7 +835,7 @@ impl DocIds {
         let mut ids = Vec::with_capacity(keys.len());
         let mut seen: HashMap<u64, usize> = HashMap::with_capacity(keys.len());
         for (idx, key) in keys.iter().enumerate() {
-            let id = fluree_db_core::skolem::doc_id(namespace, key);
+            let id = fluree_db_core::skolem::doc_id(namespace, key, 0);
             if let Some(&first) = seen.get(&id) {
                 return Err(ImportError::Source(format!(
                     "two import documents share the blank-node scope \
@@ -846,7 +850,11 @@ impl DocIds {
             seen.insert(id, idx);
             ids.push(id);
         }
-        Ok(Self { keys, ids })
+        Ok(Self {
+            namespace: namespace.to_string(),
+            keys,
+            ids,
+        })
     }
 
     /// Hashed id of document `idx`.
@@ -863,6 +871,12 @@ impl DocIds {
         self.ids.clone()
     }
 
+    /// Document keys in source order, for the ndjson producers, which hash
+    /// their own per-segment ids.
+    fn keys(&self) -> Vec<String> {
+        self.keys.clone()
+    }
+
     /// The import manifest: `(blank-node local name of the scope, document
     /// key)` for every document.
     ///
@@ -870,21 +884,41 @@ impl DocIds {
     /// every id minted from that document shares — so a reader holding an
     /// opaque `_:fdb-d…-label` recovers the source with
     /// `fluree_db_core::skolem::split_doc_scope` and one lookup.
-    fn manifest(&self) -> Vec<(String, String)> {
-        self.ids
+    ///
+    /// `extra_segments` names `(document index, segment ordinal)` pairs beyond
+    /// segment 0 — the ndjson arm cuts one file into several documents at its
+    /// `@context` switches, and which ones exist is only known once the file
+    /// has been read. Each gets its own row against the same document key, so
+    /// every minted scope resolves even though the manifest does not say which
+    /// segment of the file it was.
+    fn manifest(&self, extra_segments: &[(usize, u32)]) -> Vec<(String, String)> {
+        let scope_row = |id: u64, key: &str| {
+            (
+                format!(
+                    "{}{}",
+                    fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX,
+                    fluree_db_core::skolem::doc_scope(id)
+                ),
+                key.to_string(),
+            )
+        };
+        let mut rows: Vec<(String, String)> = self
+            .ids
             .iter()
             .zip(&self.keys)
-            .map(|(&id, key)| {
-                (
-                    format!(
-                        "{}{}",
-                        fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX,
-                        fluree_db_core::skolem::doc_scope(id)
-                    ),
-                    key.clone(),
-                )
-            })
-            .collect()
+            .map(|(&id, key)| scope_row(id, key))
+            .collect();
+        for &(idx, segment) in extra_segments {
+            if segment == 0 {
+                continue; // already covered above
+            }
+            let Some(key) = self.keys.get(idx) else {
+                continue;
+            };
+            let id = fluree_db_core::skolem::doc_id(&self.namespace, key, segment);
+            rows.push(scope_row(id, key));
+        }
+        rows
     }
 }
 
@@ -918,6 +952,13 @@ type RemoteChunkRx = Arc<std::sync::Mutex<std::sync::mpsc::Receiver<RemoteChunk>
 /// exit to distinguish clean completion from producer failure.
 pub struct RemoteChunkProducer {
     pub(crate) rx: RemoteChunkRx,
+    /// `(document index, segment ordinal)` for every context segment an ndjson
+    /// source actually opened, filled by the producer as it reads. Empty for
+    /// whole-object sources, which are one document each.
+    ///
+    /// Read after the producer thread is joined; that is the only point at
+    /// which it is known to be complete.
+    pub(crate) segments: Arc<std::sync::Mutex<Vec<(usize, u32)>>>,
     /// Take-once handles, accessible through `&self` via Mutex<Option<_>>.
     /// `error_rx` carries `Some(err)` on producer failure, `None` on success.
     pub(crate) error_rx:
@@ -1343,7 +1384,8 @@ fn resolve_chunk_source(
             let channel_capacity = config.effective_max_inflight();
             let producer = spawn_local_ndjson_producer(
                 files,
-                doc_ids.ids(),
+                doc_ids.keys(),
+                skolem_namespace.to_string(),
                 config.ndjson_first_line_context,
                 chunk_size_bytes,
                 channel_capacity,
@@ -1412,7 +1454,8 @@ fn resolve_chunk_source(
         let doc_ids = single_file_docs(path)?;
         let producer = spawn_local_ndjson_producer(
             vec![path.to_path_buf()],
-            doc_ids.ids(),
+            doc_ids.keys(),
+            skolem_namespace.to_string(),
             config.ndjson_first_line_context,
             chunk_size_bytes,
             channel_capacity,
@@ -1701,6 +1744,8 @@ fn spawn_remote_producer(
 
     RemoteChunkProducer {
         rx: Arc::new(std::sync::Mutex::new(std_rx)),
+        // One whole object is one document; nothing segments it.
+        segments: Arc::default(),
         error_rx: std::sync::Mutex::new(Some(error_rx)),
         bridge_handle: std::sync::Mutex::new(Some(bridge_handle)),
         estimated_count,
@@ -1813,21 +1858,37 @@ fn estimate_ndjson_chunks(total_bytes: u64, chunk_size_bytes: u64) -> usize {
     total_bytes.div_ceil(chunk_size_bytes.max(1)).max(1) as usize
 }
 
-/// Spawn a producer that streams ndjson from a sequence of `(label, factory)`
-/// byte sources, chaining one [`NdjsonReader`] per source and forwarding their
-/// JSON-LD chunks into a shared channel with a global chunk index. The readers
-/// are independent, so each source's own leading `@context` is honored.
+/// One ndjson byte source for [`spawn_chained_ndjson_producer`].
+struct NdjsonSource {
+    /// Human-readable name — a path or remote address — for error text.
+    label: String,
+    /// Position of this source in the import's document list.
+    doc_idx: usize,
+    /// The key this source's documents hash under (see [`DocIds`]). Each of
+    /// its context segments is a document in its own right, so the id is
+    /// derived per chunk rather than precomputed.
+    doc_key: String,
+    factory: NdjsonSourceFactory,
+}
+
+/// Spawn a producer that streams ndjson from a sequence of byte sources,
+/// chaining one [`NdjsonReader`] per source and forwarding their JSON-LD chunks
+/// into a shared channel with a global chunk index. The readers are
+/// independent, so each source's own leading `@context` is honored.
 /// Reuses [`RemoteChunkProducer`]'s channel + `error_rx` machinery;
 /// `per_chunk_format` is empty because the chunks ride the
 /// [`ChunkSource::JsonLdStream`] path, which always parses them as JSON-LD.
 fn spawn_chained_ndjson_producer(
-    sources: Vec<(String, u64, NdjsonSourceFactory)>,
+    sources: Vec<NdjsonSource>,
+    skolem_namespace: String,
     policy: FirstLineContextPolicy,
     chunk_size_bytes: u64,
     in_flight: usize,
     estimated_count: usize,
 ) -> RemoteChunkProducer {
     let in_flight = in_flight.max(1);
+    let segments: Arc<std::sync::Mutex<Vec<(usize, u32)>>> = Arc::default();
+    let segment_log = Arc::clone(&segments);
     let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<RemoteChunk>(in_flight);
     let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
 
@@ -1838,7 +1899,14 @@ fn spawn_chained_ndjson_producer(
         .name("ndjson-producer".into())
         .spawn(move || {
             let mut global_idx = 0usize;
-            for (label, doc_id, factory) in sources {
+            for source in sources {
+                let NdjsonSource {
+                    label,
+                    doc_idx,
+                    doc_key,
+                    factory,
+                } = source;
+                let mut last_segment: Option<u32> = None;
                 let byte_source = match factory() {
                     Ok(r) => r,
                     Err(e) => {
@@ -1864,16 +1932,32 @@ fn spawn_chained_ndjson_producer(
                     };
                 loop {
                     match reader.recv_chunk() {
-                        Ok(Some((local_idx, bytes))) => {
-                            // One ndjson SOURCE is one document. `NdjsonReader`
-                            // applies the source's leading `@context` to every
-                            // chunk it cuts, so the file — not the chunk, and
-                            // not the line — is the unit Fluree already treats
-                            // as one JSON-LD document. `local_idx` is the
-                            // reader's own 0-based counter, so it is the
-                            // sub-chunk index this document needs.
+                        Ok(Some((local_idx, segment, bytes))) => {
+                            // One CONTEXT SEGMENT is one document. Within a
+                            // segment the nodes share an `@context` and are
+                            // emitted as members of one `@graph`, which is
+                            // what makes them co-document; a `@context` switch
+                            // seals that document and opens the next, so
+                            // `cat a.jsonl b.jsonl` keeps the two files' `_:x`
+                            // labels apart. Neither the chunk nor the line is
+                            // the unit: a chunk is a cut of a segment, and a
+                            // line is a node.
+                            //
+                            // `local_idx` is the reader's own chunk counter,
+                            // monotonic across the whole file and never reset
+                            // at a switch, so it is distinct within every
+                            // segment — which is all the sub-chunk index has
+                            // to be.
+                            if last_segment != Some(segment) {
+                                last_segment = Some(segment);
+                                segment_log.lock().unwrap().push((doc_idx, segment));
+                            }
                             let doc = DocChunk {
-                                doc: doc_id,
+                                doc: fluree_db_core::skolem::doc_id(
+                                    &skolem_namespace,
+                                    &doc_key,
+                                    segment,
+                                ),
                                 sub_chunk: u32::try_from(local_idx).unwrap_or(u32::MAX),
                             };
                             if std_tx.send((global_idx, doc, bytes)).is_err() {
@@ -1907,6 +1991,7 @@ fn spawn_chained_ndjson_producer(
 
     RemoteChunkProducer {
         rx: Arc::new(std::sync::Mutex::new(std_rx)),
+        segments,
         error_rx: std::sync::Mutex::new(Some(error_rx)),
         bridge_handle: std::sync::Mutex::new(Some(producer_handle)),
         estimated_count,
@@ -1925,7 +2010,8 @@ fn spawn_chained_ndjson_producer(
 fn spawn_remote_ndjson_producer(
     storage: Arc<dyn StorageRead>,
     objects: Vec<RemoteObject>,
-    doc_ids: Vec<u64>,
+    doc_keys: Vec<String>,
+    skolem_namespace: String,
     policy: FirstLineContextPolicy,
     chunk_size_bytes: u64,
     in_flight: usize,
@@ -1934,11 +2020,11 @@ fn spawn_remote_ndjson_producer(
     let ranged = storage.supports_ranged_reads();
     let total_bytes: u64 = objects.iter().map(|o| o.size_bytes).sum();
     let estimated_count = estimate_ndjson_chunks(total_bytes, chunk_size_bytes);
-    let sources: Vec<(String, u64, NdjsonSourceFactory)> = objects
+    let sources: Vec<NdjsonSource> = objects
         .into_iter()
         .enumerate()
         .map(|(idx, obj)| {
-            let doc_id = doc_ids.get(idx).copied().unwrap_or(0);
+            let doc_key = doc_keys.get(idx).cloned().unwrap_or_default();
             let storage = Arc::clone(&storage);
             let handle = handle.clone();
             let label = obj.address.clone();
@@ -1969,11 +2055,17 @@ fn spawn_remote_ndjson_producer(
                     decode_buffered(comp, Box::new(std::io::Cursor::new(bytes)))
                 })
             };
-            (label, doc_id, factory)
+            NdjsonSource {
+                label,
+                doc_idx: idx,
+                doc_key,
+                factory,
+            }
         })
         .collect();
     spawn_chained_ndjson_producer(
         sources,
+        skolem_namespace,
         policy,
         chunk_size_bytes,
         in_flight,
@@ -1985,7 +2077,8 @@ fn spawn_remote_ndjson_producer(
 /// `open_decoded` handles `.gz`/`.zst` transparently.
 fn spawn_local_ndjson_producer(
     files: Vec<PathBuf>,
-    doc_ids: Vec<u64>,
+    doc_keys: Vec<String>,
+    skolem_namespace: String,
     policy: FirstLineContextPolicy,
     chunk_size_bytes: u64,
     in_flight: usize,
@@ -1998,18 +2091,24 @@ fn spawn_local_ndjson_producer(
         .map(|m| m.len())
         .sum();
     let estimated_count = estimate_ndjson_chunks(total_bytes, chunk_size_bytes);
-    let sources: Vec<(String, u64, NdjsonSourceFactory)> = files
+    let sources: Vec<NdjsonSource> = files
         .into_iter()
         .enumerate()
         .map(|(idx, f)| {
-            let doc_id = doc_ids.get(idx).copied().unwrap_or(0);
+            let doc_key = doc_keys.get(idx).cloned().unwrap_or_default();
             let label = f.display().to_string();
             let factory: NdjsonSourceFactory = Box::new(move || open_decoded(&f));
-            (label, doc_id, factory)
+            NdjsonSource {
+                label,
+                doc_idx: idx,
+                doc_key,
+                factory,
+            }
         })
         .collect();
     spawn_chained_ndjson_producer(
         sources,
+        skolem_namespace,
         policy,
         chunk_size_bytes,
         in_flight,
@@ -3327,7 +3426,8 @@ where
                     let producer = spawn_remote_ndjson_producer(
                         Arc::clone(storage),
                         objects,
-                        doc_ids.ids(),
+                        doc_ids.keys(),
+                        skolem_namespace.clone(),
                         config.ndjson_first_line_context,
                         chunk_size_bytes,
                         in_flight,
@@ -5166,7 +5266,16 @@ where
         let p_import_source = spool_config
             .predicate_alloc
             .get_or_insert_parts(fluree::DB, db::IMPORT_SOURCE);
-        let manifest = doc_ids.manifest();
+        // The ndjson producer discovers documents as it reads (a `@context`
+        // switch opens a new one), and it has been joined by now, so its log
+        // is complete.
+        let observed_segments = match &**chunk_source {
+            ChunkSource::Remote(producer) | ChunkSource::JsonLdStream(producer) => {
+                producer.segments.lock().unwrap().clone()
+            }
+            _ => Vec::new(),
+        };
+        let manifest = doc_ids.manifest(&observed_segments);
 
         // txn-meta is always pre-seeded as dict_id=0 in the graph allocator
         // (via SharedDictAllocator::new_graph), so g_id = dict_id + 1 = 1.

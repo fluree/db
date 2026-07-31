@@ -638,7 +638,10 @@ Notes:
   `--skolem-namespace` on `fluree create --from` controls the other half of
   the id: by default the ledger id salts the mint, so two ledgers loaded from
   one source tree hold different blank nodes; passing the same namespace to
-  both makes them mint identical ids instead.
+  both makes them mint identical ids instead. See
+  [Blank nodes](../cli/create.md#blank-nodes) for what counts as a document —
+  in particular for `.jsonl`/`.ndjson`, where a `@context` switch ends one
+  document and starts the next.
 
 ## Error Handling
 

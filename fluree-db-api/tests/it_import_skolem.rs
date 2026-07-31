@@ -346,17 +346,18 @@ async fn labels_stay_distinct_between_documents() {
 // ndjson: one source is one document
 // ============================================================================
 
-/// `NdjsonReader` cuts one `.jsonl` source into many JSON-LD chunks, applying
-/// the source's leading `@context` to each. The document scope has to follow
-/// the source, not the cut: before this change the scope was the chunk, so
-/// `_:shared` near the top of a file and `_:shared` near the bottom became two
-/// subjects the moment the file grew past one chunk — and the boundary that
-/// decided it was `chunk_size_mb`, not anything in the data.
+/// `NdjsonReader` cuts one context segment into many JSON-LD chunks, applying
+/// the segment's `@context` to each and emitting each as one `@graph`. The
+/// document scope has to follow the segment, not the cut: before this change
+/// the scope was the chunk, so `_:shared` near the top of a file and
+/// `_:shared` near the bottom became two subjects the moment the file grew
+/// past one chunk — and the boundary that decided it was `chunk_size_mb`, not
+/// anything in the data.
 ///
 /// Fails before: the reference and the named node land in different chunks and
 /// resolve to different subjects.
 #[tokio::test]
-async fn ndjson_blank_label_is_scoped_to_its_source_not_its_chunk() {
+async fn ndjson_blank_label_is_scoped_to_its_segment_not_its_chunk() {
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
 
@@ -603,4 +604,137 @@ async fn trig_fast_path_delegation_keeps_the_document_key() {
         "the pure-Turtle fast path must reuse the caller's document key, \
          not rebuild one"
     );
+}
+
+/// `cat a.jsonl b.jsonl > combined.jsonl` is a first-class NDJSON workflow —
+/// the format is defined to be concatenable — and Fluree handles it by letting
+/// a mid-stream lone `{"@context": …}` line replace the shared context for
+/// everything after it. That seam is a document boundary: the reader seals the
+/// outgoing chunk and emits what follows as a separate `@graph` under a
+/// different context.
+///
+/// So the two halves must not share a blank-node scope. Scoping the whole file
+/// as one document would silently merge `a.jsonl`'s `_:shared` with
+/// `b.jsonl`'s — the over-merge failure class this whole change exists to
+/// avoid.
+#[tokio::test]
+async fn ndjson_context_switch_starts_a_new_blank_node_scope() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // Two independently-written sources, concatenated. Both use `_:shared`,
+    // and they mean different things by it.
+    let combined = concat!(
+        "{\"@context\":{\"schema\":\"http://schema.org/\"}}\n",
+        "{\"@id\":\"_:shared\",\"schema:name\":\"From A\"}\n",
+        "{\"@context\":{\"schema\":\"http://schema.org/\",\"b\":\"http://b.example/\"}}\n",
+        "{\"@id\":\"_:shared\",\"schema:name\":\"From B\"}\n",
+    );
+    write(data_dir.path(), "combined.jsonl", combined);
+
+    let (fluree, ledger) = {
+        let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+            .build()
+            .expect("build file-backed Fluree");
+        fluree
+            .create("test/skolem-ndjson-seam:main")
+            .import(data_dir.path())
+            .threads(1)
+            .memory_budget_mb(256)
+            .cleanup(false)
+            .execute()
+            .await
+            .expect("ndjson import should succeed");
+        let ledger = fluree
+            .ledger("test/skolem-ndjson-seam:main")
+            .await
+            .expect("load ledger");
+        (fluree, ledger)
+    };
+
+    assert_ne!(
+        sole_blank_id(&fluree, &ledger, "From A").await,
+        sole_blank_id(&fluree, &ledger, "From B").await,
+        "a `@context` switch ends one ndjson document and starts the next"
+    );
+}
+
+/// Every scope an import mints has to resolve, including the ones the ndjson
+/// arm discovers mid-read. A segment past the first is a document the manifest
+/// did not know about when it was built, so it has to be added once the
+/// producer reports it.
+#[tokio::test]
+async fn import_manifest_covers_ndjson_context_segments() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let combined = concat!(
+        "{\"@context\":{\"schema\":\"http://schema.org/\"}}\n",
+        "{\"@id\":\"_:shared\",\"schema:name\":\"From A\"}\n",
+        "{\"@context\":{\"schema\":\"http://schema.org/\",\"b\":\"http://b.example/\"}}\n",
+        "{\"@id\":\"_:shared\",\"schema:name\":\"From B\"}\n",
+    );
+    write(data_dir.path(), "combined.jsonl", combined);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create("test/skolem-ndjson-manifest:main")
+        .import(data_dir.path())
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("ndjson import should succeed");
+    let ledger = fluree
+        .ledger("test/skolem-ndjson-manifest:main")
+        .await
+        .expect("load ledger");
+
+    let manifest = fluree
+        .query_connection(&json!({
+            "from": "test/skolem-ndjson-manifest:main#txn-meta",
+            "select": ["?doc", "?source"],
+            "where": {"@id": "?doc", "https://ns.flur.ee/db#importSource": "?source"}
+        }))
+        .await
+        .expect("txn-meta query");
+    let rows = manifest.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let entries: Vec<(String, String)> = rows
+        .as_array()
+        .expect("array result")
+        .iter()
+        .filter_map(|row| {
+            let cols = row.as_array()?;
+            Some((
+                cols.first()?.as_str()?.into(),
+                cols.get(1)?.as_str()?.into(),
+            ))
+        })
+        .collect();
+
+    assert_eq!(
+        entries.len(),
+        2,
+        "one row per context segment, both naming the file: {entries:?}"
+    );
+    assert!(
+        entries.iter().all(|(_, src)| src == "combined.jsonl"),
+        "both segments came from one file: {entries:?}"
+    );
+
+    // Both minted scopes resolve.
+    for name in ["From A", "From B"] {
+        let bnode = sole_blank_id(&fluree, &ledger, name).await;
+        let local = bnode.strip_prefix("_:").expect("blank-node id");
+        let (scope, _) = fluree_db_core::skolem::split_doc_scope(local)
+            .expect("minted id must carry a doc scope");
+        assert!(
+            entries
+                .iter()
+                .any(|(doc, _)| doc.strip_prefix("_:fdb-") == Some(scope)),
+            "manifest must resolve {bnode} ({name}); entries: {entries:?}"
+        );
+    }
 }
