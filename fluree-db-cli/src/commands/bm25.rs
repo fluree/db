@@ -169,8 +169,6 @@ async fn run_create(
     if let Some(b) = b {
         config = config.with_b(b);
     }
-    config.validate().map_err(CliError::Api)?;
-
     eprintln!(
         "  {} indexing {} -> {}:{}...",
         "bm25:".cyan().bold(),

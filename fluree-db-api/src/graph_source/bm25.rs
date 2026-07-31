@@ -58,7 +58,7 @@ fn snapshot_retention() -> usize {
 impl crate::Fluree {
     /// Create a BM25 full-text search index.
     ///
-    /// This operation:
+    /// Validates the configuration, then:
     /// 1. Loads the source ledger
     /// 2. Executes the indexing query to get documents
     /// 3. Builds the BM25 index
@@ -87,6 +87,8 @@ impl crate::Fluree {
         &self,
         config: Bm25CreateConfig,
     ) -> Result<Bm25CreateResult> {
+        config.validate()?;
+
         let graph_source_id = config.graph_source_id();
         info!(
             graph_source_id = %graph_source_id,

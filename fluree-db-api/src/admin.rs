@@ -280,7 +280,7 @@ fn validate_absolute_iri(value: &str) -> std::result::Result<(), String> {
     }
     // RFC 3987 excludes whitespace, C0 controls (`U+0000..=U+001F`), DEL
     // (`U+007F`), and the bracket/quote characters below. The C0 check is
-    // important because callers can otherwise sneak a ` ` past
+    // important because callers can otherwise sneak a `U+0000` past
     // `is_whitespace` and have it surface as a SPARQL parse 500 instead
     // of the documented 400.
     if value.chars().any(|c| {
