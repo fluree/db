@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod bm25;
 pub mod branch;
 pub mod cache;
 #[cfg(feature = "server")]

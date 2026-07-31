@@ -3100,3 +3100,234 @@ fn load_requires_a_template_flag() {
         .failure()
         .stderr(predicate::str::contains("--cypher").or(predicate::str::contains("--jsonld")));
 }
+
+// ============================================================================
+// bm25 (full-text index management)
+// ============================================================================
+
+/// Indexes every `ex:Doc`'s `ex:title`. MUST select `@id`.
+const BM25_INDEX_QUERY: &str = r#"{"@context":{"ex":"http://example.org/"},"where":[{"@id":"?x","@type":"ex:Doc","ex:title":"?t"}],"select":{"?x":["@id","ex:title"]}}"#;
+
+/// `init` + a `docs` ledger holding one `ex:Doc`.
+fn bm25_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "docs"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context":{"ex":"http://example.org/"},"@id":"ex:doc1","@type":"ex:Doc","ex:title":"Rust programming guide"}"#,
+        ])
+        .assert()
+        .success();
+    tmp
+}
+
+fn bm25_create_index(tmp: &TempDir, name: &str, ledger: &str) {
+    fluree_cmd(tmp)
+        .args([
+            "bm25",
+            "create",
+            "--name",
+            name,
+            "--ledger",
+            ledger,
+            "-e",
+            BM25_INDEX_QUERY,
+        ])
+        .assert()
+        .success();
+}
+
+fn bm25_insert_second_doc(tmp: &TempDir) {
+    fluree_cmd(tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context":{"ex":"http://example.org/"},"@id":"ex:doc2","@type":"ex:Doc","ex:title":"Rust and WebAssembly"}"#,
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn bm25_list_empty_reports_no_indexes() {
+    let tmp = bm25_fixture();
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No BM25 full-text indexes found"));
+}
+
+#[test]
+fn bm25_create_then_list_shows_a_fresh_index() {
+    let tmp = bm25_fixture();
+    fluree_cmd(&tmp)
+        .args([
+            "bm25",
+            "create",
+            "--name",
+            "docsearch",
+            "--ledger",
+            "docs:main",
+            "-e",
+            BM25_INDEX_QUERY,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Created full-text index docsearch:main",
+        ));
+
+    // Built over the current head => listed, and not stale.
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docsearch"))
+        .stdout(predicate::str::contains("docs:main"))
+        .stdout(predicate::str::contains("YES").not());
+
+    // Script mode prints nothing when nothing is stale.
+    fluree_cmd(&tmp)
+        .args(["bm25", "list", "--stale"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// A commit after the index was built must make `list` report it stale, and
+/// `--stale` must emit the alias a maintenance loop feeds back to `sync`.
+#[test]
+fn bm25_list_reports_staleness_after_a_new_commit() {
+    let tmp = bm25_fixture();
+    bm25_create_index(&tmp, "docsearch", "docs:main");
+    bm25_insert_second_doc(&tmp);
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("YES"));
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "list", "--stale"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docsearch:main"));
+
+    // ...and syncing clears it.
+    fluree_cmd(&tmp)
+        .args(["bm25", "sync", "--index", "docsearch:main"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "list", "--stale"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// A dependency alias stored WITHOUT a branch must still resolve.
+///
+/// `bm25 create --ledger docs` persists the dependency verbatim as `docs`, while
+/// ledger records are keyed `docs:main`, so the staleness lookup only matches via
+/// the implicit-`:main` retry. Without that fallback the source ledger's `t` is
+/// unknown, `LEDGER_T` renders `-`, and the index silently reports itself
+/// never-stale — a maintenance loop driven off `--stale` would skip it forever.
+#[test]
+fn bm25_list_resolves_a_branchless_dependency_alias() {
+    let tmp = bm25_fixture();
+    // No `:main` — this is what lands in the record's dependencies.
+    bm25_create_index(&tmp, "baresearch", "docs");
+    bm25_insert_second_doc(&tmp);
+
+    // The load-bearing assertion: staleness is computed despite the bare alias.
+    fluree_cmd(&tmp)
+        .args(["bm25", "list", "--stale"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("baresearch:main"));
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("YES"));
+}
+
+#[test]
+fn bm25_drop_requires_force() {
+    let tmp = bm25_fixture();
+    bm25_create_index(&tmp, "docsearch", "docs:main");
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "drop", "--index", "docsearch:main"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "use --force to confirm deletion of 'docsearch:main'",
+        ));
+
+    // Still there.
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docsearch"));
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "drop", "--index", "docsearch:main", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dropped full-text index"));
+
+    fluree_cmd(&tmp)
+        .args(["bm25", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No BM25 full-text indexes found"));
+}
+
+#[test]
+fn bm25_create_rejects_a_name_with_a_colon() {
+    let tmp = bm25_fixture();
+    fluree_cmd(&tmp)
+        .args([
+            "bm25",
+            "create",
+            "--name",
+            "bad:name",
+            "--ledger",
+            "docs:main",
+            "-e",
+            BM25_INDEX_QUERY,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot contain ':'"));
+}
+
+#[test]
+fn bm25_create_rejects_invalid_json() {
+    let tmp = bm25_fixture();
+    fluree_cmd(&tmp)
+        .args([
+            "bm25",
+            "create",
+            "--name",
+            "docsearch",
+            "--ledger",
+            "docs:main",
+            "-e",
+            "{not json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "indexing query must be valid JSON",
+        ));
+}
