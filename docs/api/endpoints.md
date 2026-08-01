@@ -1617,28 +1617,28 @@ GET /ledgers
 
 **Response:**
 
+A flat array of ledgers and graph sources. Retracted entries are omitted.
+
 ```json
-{
-  "ledgers": [
-    {
-      "ledger_id": "mydb:main",
-      "branch": "main",
-      "commit_t": 5,
-      "index_t": 5,
-      "created": "2024-01-22T10:00:00.000Z",
-      "last_updated": "2024-01-22T10:30:00.000Z"
-    },
-    {
-      "ledger_id": "mydb:dev",
-      "branch": "dev",
-      "commit_t": 3,
-      "index_t": 2,
-      "created": "2024-01-22T11:00:00.000Z",
-      "last_updated": "2024-01-22T11:15:00.000Z"
-    }
-  ]
-}
+[
+  {"name": "mydb", "branch": "main", "type": "Ledger", "t": 5},
+  {"name": "mydb", "branch": "dev", "type": "Ledger", "t": 3},
+  {"name": "docsearch", "branch": "main", "type": "BM25", "t": 5,
+   "dependencies": ["mydb:main"]},
+  {"name": "warehouse", "branch": "main", "type": "Iceberg", "t": 0,
+   "dependencies": ["mydb:main"]}
+]
 ```
+
+| Field | Description |
+|-------|-------------|
+| `name` | Ledger or graph-source name, without the branch |
+| `branch` | Branch name |
+| `type` | `Ledger`, or the graph-source family: `BM25`, `Vector`, `Geo`, `R2RML`, `Iceberg` |
+| `t` | Commit `t` for a ledger; the index watermark for a graph source |
+| `dependencies` | Source ledger aliases a graph source derives from. Omitted for ledgers. |
+
+`dependencies` is what lets a client pair a graph source against its source's `t` from this one response — the staleness check behind `fluree bm25 list`. A dependency alias may omit the branch, in which case `main` is implied.
 
 **Example:**
 
