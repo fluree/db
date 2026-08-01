@@ -128,6 +128,15 @@ pub fn default_index_config() -> fluree_db_ledger::IndexConfig {
 pub const DEFAULT_AUTH_MODE: &str = "none";
 pub const DEFAULT_JWKS_CACHE_TTL: u64 = 300;
 
+// ── BM25 auto-sync ──────────────────────────────────────────────────
+
+/// Whether the server keeps BM25 indexes current automatically.
+///
+/// Off by default: it introduces background storage writes on a server that
+/// otherwise performs none for graph sources. Without it an index only advances
+/// when something calls `POST /v1/fluree/bm25/sync` or `fluree bm25 sync`.
+pub const DEFAULT_BM25_AUTO_SYNC: bool = false;
+
 // ── MCP ─────────────────────────────────────────────────────────────
 
 pub const DEFAULT_MCP_ENABLED: bool = false;

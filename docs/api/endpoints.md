@@ -2907,7 +2907,7 @@ An already-current index returns `200` with `upserted`/`removed` of `0` and an u
 
 Syncing an index that has been dropped is refused, as is requesting a `t` beyond the source ledger's head.
 
-To keep an index fresh, run `sync` from a maintenance job; the server does not sync automatically on commit. `fluree bm25 list --stale` enumerates the indexes whose source has advanced past their watermark.
+By default the server does not sync on commit, so an index only advances when something calls this endpoint — run it from a maintenance job, using `fluree bm25 list --stale` to enumerate the indexes whose source has moved past their watermark. Starting the server with `--bm25-auto-sync` (env `FLUREE_BM25_AUTO_SYNC`, or `indexing.bm25_auto_sync` in the config file) instead keeps every index current automatically, syncing each one when its source ledger commits.
 
 See also the CLI equivalent: [fluree bm25 sync](../cli/bm25.md#fluree-bm25-sync).
 

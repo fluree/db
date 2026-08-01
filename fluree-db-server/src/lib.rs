@@ -54,7 +54,49 @@ pub use state::AppState;
 pub use telemetry::{init_logging, shutdown_tracer, TelemetryConfig};
 
 use axum::Router;
+use fluree_db_api::{Bm25MaintenanceWorker, Bm25WorkerHandle, Fluree};
 use std::sync::Arc;
+
+/// Build a BM25 maintenance worker seeded with the indexes that already exist.
+///
+/// `auto_register` only picks up indexes created while the worker is running,
+/// so without this pass an index created before startup would never sync.
+/// Failing to enumerate is not fatal: those indexes stay unregistered until
+/// their next config publish, and ones created from here on still register.
+async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25WorkerHandle) {
+    let worker = Bm25MaintenanceWorker::new(Arc::clone(&fluree));
+    let handle = worker.handle();
+
+    match fluree.nameservice().all_graph_source_records().await {
+        Ok(records) => {
+            let registered = records
+                .iter()
+                .filter(|gs| gs.is_bm25() && !gs.retracted)
+                .inspect(|gs| {
+                    handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies);
+                })
+                .count();
+            info!(registered, "BM25 auto-sync starting");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to enumerate BM25 indexes for auto-sync");
+        }
+    }
+
+    (worker, handle)
+}
+
+/// Drive a BM25 maintenance worker to completion, logging an unexpected exit.
+///
+/// Used by the Raft leader watcher, whose task-spawning closure is synchronous
+/// and so cannot do the registration pass itself.
+#[cfg(feature = "raft")]
+async fn run_bm25_worker(fluree: Arc<Fluree>) {
+    let (worker, _handle) = build_bm25_worker(fluree).await;
+    if let Err(e) = worker.run().await {
+        tracing::error!(error = %e, "BM25 maintenance worker exited");
+    }
+}
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -323,6 +365,35 @@ impl FlureeServer {
         // Start ledger manager maintenance task for idle eviction
         let ledger_maintenance_task = self.state.fluree.spawn_maintenance();
 
+        // BM25 auto-sync.
+        //
+        // Skipped in peer mode: a peer forwards writes to the transaction
+        // server, so the commit events that drive a sync are published on
+        // *that* node's event bus, not this one. Under Raft the leader watcher
+        // owns the worker instead, since a sync proposes
+        // `PublishGraphSourceIndex` and must originate on the leader.
+        #[cfg(feature = "raft")]
+        let raft_owns_bm25_worker = self.state.raft.is_some();
+        #[cfg(not(feature = "raft"))]
+        let raft_owns_bm25_worker = false;
+
+        let bm25_auto_sync = if !self.state.config.bm25_auto_sync {
+            None
+        } else if self.state.config.server_role == ServerRole::Peer {
+            info!("BM25 auto-sync requested but does not run in peer mode");
+            None
+        } else if raft_owns_bm25_worker {
+            None
+        } else {
+            let (worker, handle) = build_bm25_worker(Arc::clone(&self.state.fluree)).await;
+            tokio::spawn(async move {
+                if let Err(e) = worker.run().await {
+                    tracing::error!(error = %e, "BM25 maintenance worker exited");
+                }
+            });
+            Some(handle)
+        };
+
         // Spawn the private Raft listener. Carries the inter-node
         // RPC + cluster admin routers — mount on a VPC-internal
         // interface (no auth on these endpoints by design).
@@ -418,6 +489,11 @@ impl FlureeServer {
         }
         if let Some(task) = ledger_maintenance_task {
             task.abort();
+        }
+        // Ask the BM25 worker to stop rather than aborting it, so an in-flight
+        // sync finishes its publish instead of being cut mid-write.
+        if let Some(handle) = bm25_auto_sync {
+            handle.stop();
         }
         #[cfg(feature = "raft")]
         if let Some(task) = raft_listener_task {
@@ -829,6 +905,8 @@ impl FlureeServerBuilder {
                     .expect("raft_nameservice present whenever self.raft is Some"),
             );
             let backend = state_inner.fluree.backend().clone();
+            let bm25_auto_sync = state_inner.config.bm25_auto_sync;
+            let bm25_fluree = Arc::clone(&state_inner.fluree);
             let indexer_config = fluree_db_indexer::IndexerConfig::default();
             let event_bus = Arc::clone(&integration.event_bus);
             let eviction_scheduler =
@@ -850,11 +928,21 @@ impl FlureeServerBuilder {
                     indexer_config.clone(),
                 );
                 let worker = worker.with_event_bus(Arc::clone(&event_bus));
-                vec![
+                let mut tasks = vec![
                     tokio::spawn(worker.run()),
                     tokio::spawn(eviction_scheduler.clone().run()),
                     tokio::spawn(liveness_monitor.clone().run()),
-                ]
+                ];
+                // BM25 auto-sync is leader-only for the same reason the
+                // indexer is: it publishes through the nameservice, which
+                // under Raft proposes to the state machine. Registration
+                // happens inside the task because this closure is sync and
+                // re-runs on every leadership acquisition, by which point the
+                // set of indexes may have changed.
+                if bm25_auto_sync {
+                    tasks.push(tokio::spawn(run_bm25_worker(Arc::clone(&bm25_fluree))));
+                }
+                tasks
             };
             crate::raft::spawn_leader_watcher(
                 Arc::clone(&integration.raft),
