@@ -15,32 +15,37 @@
 //! ```ignore
 //! use fluree_db_api::{FlureeBuilder, Bm25MaintenanceWorker};
 //!
-//! let fluree = FlureeBuilder::memory().build_memory();
+//! let fluree = Arc::new(FlureeBuilder::memory().build_memory());
 //!
 //! // Start the maintenance worker
-//! let worker = Bm25MaintenanceWorker::new(&fluree);
-//! let handle = worker.start().await?;
+//! let worker = Bm25MaintenanceWorker::new(Arc::clone(&fluree));
+//! let handle = worker.handle();
+//! tokio::spawn(async move { worker.run().await.ok(); });
 //!
 //! // Register a graph source for automatic sync
-//! handle.register_graph_source("my-search:main").await?;
+//! handle.register_graph_source(fluree.nameservice(), "my-search:main").await?;
 //!
 //! // Stop the worker when done
-//! handle.stop().await;
+//! handle.stop();
 //! ```
 
 use crate::{ApiError, Result};
 use fluree_db_nameservice::{GraphSourcePublisher, NameServiceEvent, NameServiceLookup};
 use futures::StreamExt;
-use std::cell::RefCell;
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Type alias for a pinned boxed future used in the BM25 sync worker.
-type SyncFuture<'a> = Pin<Box<dyn Future<Output = (String, Result<()>)> + 'a>>;
+///
+/// `Send` so [`Bm25MaintenanceWorker::run`] can be driven by a multi-threaded
+/// executor via `tokio::spawn`.
+type SyncFuture<'a> = Pin<Box<dyn Future<Output = (String, Result<()>)> + Send + 'a>>;
 
 /// Configuration for the BM25 maintenance worker.
 #[derive(Debug, Clone)]
@@ -76,9 +81,11 @@ pub struct Bm25WorkerStats {
     pub registered_graph_sources: usize,
 }
 
-/// State for the BM25 maintenance worker (single-threaded).
+/// State for the BM25 maintenance worker.
 ///
-/// Uses `RefCell` for interior mutability to work in single-threaded contexts.
+/// Shared between the worker and its [`Bm25WorkerHandle`] behind a `Mutex`;
+/// every operation on it is a short in-memory map update, never held across an
+/// await.
 pub struct Bm25WorkerState {
     /// Reverse dependency map: ledger_id -> set of graph source IDs.
     ledger_to_graph_sources: HashMap<String, HashSet<String>>,
@@ -189,9 +196,9 @@ impl Default for Bm25WorkerState {
 ///
 /// This handle allows registering/unregistering graph sources and stopping the worker.
 pub struct Bm25WorkerHandle {
-    state: Rc<RefCell<Bm25WorkerState>>,
+    state: Arc<Mutex<Bm25WorkerState>>,
     /// Signal to stop the worker (set to true to request stop).
-    stop_requested: Rc<RefCell<bool>>,
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl Bm25WorkerHandle {
@@ -212,7 +219,7 @@ impl Bm25WorkerHandle {
             })?;
 
         self.state
-            .borrow_mut()
+            .lock()
             .register_graph_source(graph_source_id, &record.dependencies);
         Ok(())
     }
@@ -220,36 +227,34 @@ impl Bm25WorkerHandle {
     /// Register a graph source with explicit dependencies (no nameservice lookup).
     pub fn register_graph_source_with_deps(&self, graph_source_id: &str, dependencies: &[String]) {
         self.state
-            .borrow_mut()
+            .lock()
             .register_graph_source(graph_source_id, dependencies);
     }
 
     /// Unregister a graph source from automatic maintenance.
     pub fn unregister_graph_source(&self, graph_source_id: &str) {
-        self.state
-            .borrow_mut()
-            .unregister_graph_source(graph_source_id);
+        self.state.lock().unregister_graph_source(graph_source_id);
     }
 
     /// Get current worker statistics.
     pub fn stats(&self) -> Bm25WorkerStats {
-        self.state.borrow().stats().clone()
+        self.state.lock().stats().clone()
     }
 
     /// Get all registered graph sources.
     pub fn registered_graph_sources(&self) -> Vec<String> {
-        self.state.borrow().registered_graph_sources()
+        self.state.lock().registered_graph_sources()
     }
 
     /// Request the worker to stop.
     pub fn stop(&self) {
-        *self.stop_requested.borrow_mut() = true;
+        self.stop_requested.store(true, Ordering::Relaxed);
         info!("BM25 maintenance worker stop requested");
     }
 
     /// Check if stop has been requested.
     pub fn is_stop_requested(&self) -> bool {
-        *self.stop_requested.borrow()
+        self.stop_requested.load(Ordering::Relaxed)
     }
 }
 
@@ -257,31 +262,34 @@ impl Bm25WorkerHandle {
 ///
 /// Monitors nameservice events and automatically syncs BM25 indexes when their
 /// source ledgers are updated.
-pub struct Bm25MaintenanceWorker<'a> {
-    fluree: &'a crate::Fluree,
+pub struct Bm25MaintenanceWorker {
+    fluree: Arc<crate::Fluree>,
     config: Bm25WorkerConfig,
-    state: Rc<RefCell<Bm25WorkerState>>,
-    stop_requested: Rc<RefCell<bool>>,
+    state: Arc<Mutex<Bm25WorkerState>>,
+    stop_requested: Arc<AtomicBool>,
 }
 
-impl<'a> Bm25MaintenanceWorker<'a> {
+impl Bm25MaintenanceWorker {
     /// Create a new maintenance worker.
-    pub fn new(fluree: &'a crate::Fluree) -> Self {
+    ///
+    /// Takes an owned handle rather than a borrow so the worker is `'static`
+    /// and can be moved into a spawned task.
+    pub fn new(fluree: Arc<crate::Fluree>) -> Self {
         Self {
             fluree,
             config: Bm25WorkerConfig::default(),
-            state: Rc::new(RefCell::new(Bm25WorkerState::new())),
-            stop_requested: Rc::new(RefCell::new(false)),
+            state: Arc::new(Mutex::new(Bm25WorkerState::new())),
+            stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Create a new maintenance worker with custom config.
-    pub fn with_config(fluree: &'a crate::Fluree, config: Bm25WorkerConfig) -> Self {
+    pub fn with_config(fluree: Arc<crate::Fluree>, config: Bm25WorkerConfig) -> Self {
         Self {
             fluree,
             config,
-            state: Rc::new(RefCell::new(Bm25WorkerState::new())),
-            stop_requested: Rc::new(RefCell::new(false)),
+            state: Arc::new(Mutex::new(Bm25WorkerState::new())),
+            stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -297,7 +305,7 @@ impl<'a> Bm25MaintenanceWorker<'a> {
     ///
     /// Returns the list of graph source IDs that need syncing.
     pub fn process_event(&self, event: &NameServiceEvent) -> Vec<String> {
-        self.state.borrow_mut().record_event();
+        self.state.lock().record_event();
 
         match event {
             NameServiceEvent::LedgerCommitPublished {
@@ -305,7 +313,7 @@ impl<'a> Bm25MaintenanceWorker<'a> {
                 commit_t,
                 ..
             } => {
-                let graph_sources = self.state.borrow().graph_sources_for_ledger(ledger_id);
+                let graph_sources = self.state.lock().graph_sources_for_ledger(ledger_id);
                 if !graph_sources.is_empty() {
                     info!(
                         ledger = %ledger_id,
@@ -331,7 +339,7 @@ impl<'a> Bm25MaintenanceWorker<'a> {
                 // Auto-register graph source if configured
                 if self.config.auto_register {
                     self.state
-                        .borrow_mut()
+                        .lock()
                         .register_graph_source(graph_source_id, dependencies);
                     info!(graph_source = %graph_source_id, "Auto-registered graph source for maintenance");
                 }
@@ -339,9 +347,7 @@ impl<'a> Bm25MaintenanceWorker<'a> {
             }
             NameServiceEvent::GraphSourceRetracted { graph_source_id } => {
                 // Unregister retracted graph source
-                self.state
-                    .borrow_mut()
-                    .unregister_graph_source(graph_source_id);
+                self.state.lock().unregister_graph_source(graph_source_id);
                 info!(graph_source = %graph_source_id, "Unregistered retracted graph source");
                 vec![]
             }
@@ -355,7 +361,7 @@ impl<'a> Bm25MaintenanceWorker<'a> {
 
         match self.fluree.sync_bm25_index(graph_source_id).await {
             Ok(result) => {
-                self.state.borrow_mut().record_sync(true);
+                self.state.lock().record_sync(true);
                 info!(
                     graph_source = %graph_source_id,
                     upserted = result.upserted,
@@ -366,7 +372,7 @@ impl<'a> Bm25MaintenanceWorker<'a> {
                 Ok(())
             }
             Err(e) => {
-                self.state.borrow_mut().record_sync(false);
+                self.state.lock().record_sync(false);
                 error!(graph_source = %graph_source_id, error = %e, "Graph source sync failed");
                 Err(e)
             }
@@ -376,25 +382,16 @@ impl<'a> Bm25MaintenanceWorker<'a> {
     /// Run the maintenance loop.
     ///
     /// This subscribes to nameservice events and processes them until stopped.
-    /// The worker uses `Rc<RefCell<...>>` internally, so it must be run on a
-    /// single-threaded runtime or via `spawn_local`.
+    /// The returned future is `Send`, so it can be driven by a multi-threaded
+    /// runtime with `tokio::spawn`.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// use tokio::task::LocalSet;
-    ///
-    /// let worker = Bm25MaintenanceWorker::new(&fluree);
+    /// let worker = Bm25MaintenanceWorker::new(Arc::clone(&fluree));
     /// let handle = worker.handle();
     ///
-    /// // Option 1: Run in a LocalSet (multi-threaded runtime)
-    /// let local = LocalSet::new();
-    /// local.spawn_local(async move {
-    ///     worker.run().await.ok();
-    /// });
-    ///
-    /// // Option 2: Run on current-thread runtime
-    /// // tokio::spawn_local(async move { worker.run().await.ok(); });
+    /// tokio::spawn(async move { worker.run().await.ok(); });
     ///
     /// // Later, stop the worker
     /// handle.stop();
@@ -418,7 +415,7 @@ impl<'a> Bm25MaintenanceWorker<'a> {
 
         loop {
             // Check for stop request
-            if *self.stop_requested.borrow() {
+            if self.stop_requested.load(Ordering::Relaxed) {
                 info!("BM25 maintenance worker stopping");
                 break;
             }
@@ -593,5 +590,39 @@ mod tests {
         state.record_sync(false);
         assert_eq!(state.stats().syncs_performed, 2);
         assert_eq!(state.stats().syncs_failed, 1);
+    }
+
+    /// The worker and its handle have to be `Send` for `tokio::spawn` to accept
+    /// `run()` on a multi-threaded runtime, which is how the server drives it.
+    /// This is a compile-time assertion — it fails to build, not at runtime, if
+    /// the shared state regresses to a non-`Send` container.
+    #[test]
+    fn worker_types_are_send() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<Bm25WorkerState>();
+        assert_send::<Bm25WorkerHandle>();
+        assert_send::<Bm25MaintenanceWorker>();
+    }
+
+    /// `tokio::spawn` needs `Send + 'static`, so the worker must be movable
+    /// into a task, not merely thread-safe. This is what the owned
+    /// `Arc<Fluree>` buys over a borrow.
+    #[test]
+    fn worker_is_spawnable() {
+        fn assert_spawnable<T: Send + 'static>() {}
+
+        assert_spawnable::<Bm25MaintenanceWorker>();
+        assert_spawnable::<Bm25WorkerHandle>();
+    }
+
+    /// `run()`'s future must also be `Send`, which the `SyncFuture` bound and
+    /// the absence of a lock guard held across an await are what buy us.
+    #[test]
+    fn worker_run_future_is_send() {
+        fn assert_send_future<F: Future + Send>(_: F) {}
+
+        // Never polled — this exists so the compiler checks the bound.
+        let _check = |worker: &Bm25MaintenanceWorker| assert_send_future(worker.run());
     }
 }
