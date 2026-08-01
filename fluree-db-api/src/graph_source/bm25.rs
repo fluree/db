@@ -827,10 +827,6 @@ impl crate::Fluree {
 // =============================================================================
 
 impl crate::Fluree {
-    /// Sync a BM25 index to catch up with ledger updates.
-    ///
-    /// This operation performs incremental updates when possible,
-    /// falling back to full resync if needed.
     /// Look up a graph source that is eligible to be synced.
     ///
     /// A retracted source is refused rather than resurrected: [`Self::drop_full_text_index`]
@@ -854,6 +850,10 @@ impl crate::Fluree {
         Ok(record)
     }
 
+    /// Sync a BM25 index to catch up with ledger updates.
+    ///
+    /// This operation performs incremental updates when possible,
+    /// falling back to full resync if needed.
     pub async fn sync_bm25_index(&self, graph_source_id: &str) -> Result<Bm25SyncResult> {
         use fluree_db_core::trace_commits_by_id;
         use fluree_db_query::bm25::{CompiledPropertyDeps, IncrementalUpdater};

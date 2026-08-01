@@ -69,14 +69,14 @@ async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25W
 
     match fluree.nameservice().all_graph_source_records().await {
         Ok(records) => {
-            let registered = records
+            let indexes: Vec<_> = records
                 .iter()
                 .filter(|gs| gs.is_bm25() && !gs.retracted)
-                .inspect(|gs| {
-                    handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies);
-                })
-                .count();
-            info!(registered, "BM25 auto-sync starting");
+                .collect();
+            for gs in &indexes {
+                handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies);
+            }
+            info!(registered = indexes.len(), "BM25 auto-sync starting");
         }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to enumerate BM25 indexes for auto-sync");
