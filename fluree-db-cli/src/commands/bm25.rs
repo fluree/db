@@ -424,6 +424,35 @@ fn create_request_body(args: &CreateArgs, query: &serde_json::Value) -> serde_js
     body
 }
 
+/// Report a `POST /drop` outcome the way the in-process path reports it.
+///
+/// The endpoint answers `200` with a `status` for every outcome, including one
+/// that dropped nothing. Left as-is that would make `bm25 drop` on an unknown
+/// index print a success line and exit `0` over a server while erroring under
+/// `--direct` — so a missing index is turned back into an error here, and an
+/// already-retracted one into the same note the local path prints.
+fn report_remote_drop(index: &str, response: &serde_json::Value) -> CliResult<()> {
+    match response.get("status").and_then(serde_json::Value::as_str) {
+        Some("not_found") => Err(CliError::Api(fluree_db_api::ApiError::NotFound(format!(
+            "Graph source not found: {index}"
+        )))),
+        Some("already_retracted") => {
+            println!("Full-text index {index} was already retracted.");
+            Ok(())
+        }
+        _ => {
+            match response
+                .get("files_deleted")
+                .and_then(serde_json::Value::as_u64)
+            {
+                Some(n) => println!("Dropped full-text index {index} (deleted {n} file(s))."),
+                None => println!("Dropped full-text index {index}."),
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Render a response field for display.
 ///
 /// Strings are unquoted: `Value`'s own `Display` would print
@@ -536,18 +565,7 @@ async fn run_drop(
             .await
             .map_err(|e| CliError::Remote(format!("failed to drop full-text index: {e}")))?;
         persist_tokens(&client, remote_flag, dirs).await;
-        let status = response
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("dropped");
-        match response
-            .get("files_deleted")
-            .and_then(serde_json::Value::as_u64)
-        {
-            Some(n) => println!("Dropped full-text index {index} ({status}, deleted {n} file(s))."),
-            None => println!("Dropped full-text index {index} ({status})."),
-        }
-        return Ok(());
+        return report_remote_drop(index, &response);
     }
 
     let fluree = build_fluree(dirs)?;
@@ -719,5 +737,29 @@ mod tests {
     fn a_resolved_listing_warns_about_nothing() {
         let rows = remote_index_rows(&ledgers_payload());
         assert!(unknown_source_aliases(&rows).is_empty());
+    }
+
+    /// `POST /drop` answers 200 even when it dropped nothing, so dropping an
+    /// unknown index must not read as success just because it went over HTTP.
+    #[test]
+    fn remote_drop_of_an_unknown_index_is_an_error() {
+        let response = json!({"ledger_id": "nosuch:main", "status": "not_found"});
+
+        assert!(report_remote_drop("nosuch:main", &response).is_err());
+    }
+
+    #[test]
+    fn remote_drop_reports_an_already_retracted_index() {
+        let response = json!({"ledger_id": "docsearch:main", "status": "already_retracted"});
+
+        assert!(report_remote_drop("docsearch:main", &response).is_ok());
+    }
+
+    #[test]
+    fn remote_drop_reports_a_successful_drop() {
+        let response =
+            json!({"ledger_id": "docsearch:main", "status": "dropped", "files_deleted": 2});
+
+        assert!(report_remote_drop("docsearch:main", &response).is_ok());
     }
 }
