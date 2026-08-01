@@ -203,7 +203,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Bm25 { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::bm25::run(action, &fluree_dir).await
+            commands::bm25::run(action, &fluree_dir, direct).await
         }
 
         Commands::Insert {
