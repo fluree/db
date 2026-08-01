@@ -336,10 +336,18 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
                 drop_status = gs_status,
                 "graph source dropped"
             );
+            // Same convention as the ledger path above: report the count only
+            // when a hard drop actually removed artifacts.
+            let files_deleted = if gs_report.files_deleted > 0 {
+                Some(gs_report.files_deleted)
+            } else {
+                None
+            };
+
             return Ok(Json(DropResponse {
                 ledger_id: format!("{}:{}", gs_report.name, gs_report.branch),
                 status: gs_status.to_string(),
-                files_deleted: None,
+                files_deleted,
                 branches_dropped: Vec::new(),
                 warnings: gs_report.warnings,
             }));

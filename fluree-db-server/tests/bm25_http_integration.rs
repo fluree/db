@@ -391,6 +391,41 @@ async fn sync_with_t_syncs_through_that_t_only() {
     );
 }
 
+/// `POST /drop` reaches the generic graph-source drop, which must sweep the
+/// index's snapshot blobs rather than only retracting the record.
+#[tokio::test]
+async fn drop_reports_deleted_snapshots() {
+    let (_tmp, state) = state_with_index().await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/drop")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"ledger": "docsearch", "hard": true}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "body: {json}");
+    assert_eq!(
+        json.get("status").and_then(JsonValue::as_str),
+        Some("dropped"),
+        "body: {json}"
+    );
+    assert!(
+        json.get("files_deleted")
+            .and_then(JsonValue::as_u64)
+            .is_some_and(|n| n >= 1),
+        "hard drop should report deleted snapshot blobs: {json}"
+    );
+}
+
 /// Both sync forms must treat a dropped index the same way. The pinned form
 /// used to skip the retraction check and write a fresh snapshot for an index
 /// whose snapshots had just been deleted.
