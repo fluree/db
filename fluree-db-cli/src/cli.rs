@@ -402,14 +402,13 @@ pub enum Commands {
 
     /// Create, list, sync, or drop BM25 full-text search indexes (graph sources).
     ///
-    /// `create`, `sync`, and `drop` run against a server when one is reachable —
-    /// `--remote <name>` picks a configured remote, and otherwise a
-    /// locally-running server is used automatically. Pass `--direct` to force
-    /// in-process execution against local storage, which also works under
-    /// `docker exec` against a running server's data directory. `list` is always
-    /// in-process. Querying the resulting index is done either through the
-    /// standalone `fluree-search-httpd` service (`POST /v1/search`) or, embedded,
-    /// via an FQL `f:searchText` query.
+    /// These commands run against a server when one is reachable — `--remote
+    /// <name>` picks a configured remote, and otherwise a locally-running server
+    /// is used automatically. Pass `--direct` to force in-process execution
+    /// against local storage, which also works under `docker exec` against a
+    /// running server's data directory. Querying the resulting index is done
+    /// either through the standalone `fluree-search-httpd` service
+    /// (`POST /v1/search`) or, embedded, via an FQL `f:searchText` query.
     ///
     /// Examples:
     ///   fluree bm25 create --name silver-search --ledger silver:main -f index-query.json
@@ -1240,6 +1239,10 @@ pub enum Bm25Action {
         /// Print only stale indexes, one alias per line (script-friendly).
         #[arg(long)]
         stale: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 

@@ -2,14 +2,17 @@
 //!
 //! BM25 is a Fluree *graph source* (like Iceberg/R2RML).
 //!
-//! `create`, `sync`, and `drop` take one of two routes, chosen by
-//! [`resolve_client`]: against a server (`--remote <name>`, or a
-//! locally-running server picked up automatically) via
-//! `POST /v1/fluree/bm25/create`, `…/bm25/sync`, and the shared `…/drop`; or
-//! in-process against local storage via [`build_fluree`] when `--direct` is
-//! passed or no server is reachable. `list` is always in-process — computing
-//! staleness needs each index's source dependencies, which the server's
-//! `/ledgers` response does not carry.
+//! Every subcommand takes one of two routes, chosen by [`resolve_client`]:
+//! against a server (`--remote <name>`, or a locally-running server picked up
+//! automatically) via `POST /v1/fluree/bm25/create`, `…/bm25/sync`, the shared
+//! `…/drop`, and `GET /v1/fluree/ledgers`; or in-process against local storage
+//! via [`build_fluree`] when `--direct` is passed or no server is reachable.
+//!
+//! `list` computes staleness by pairing each index against its source ledger's
+//! `t`. Both routes read that from a single listing — the `/ledgers` response
+//! carries ledgers and graph sources together, each with its `t` and (for graph
+//! sources) its dependencies. A server predating that field yields rows with an
+//! unknown source rather than an error.
 //!
 //! The in-process route works under `docker exec` against a directory a server
 //! is already serving: native file storage coordinates writers with a per-file
@@ -31,6 +34,7 @@ use crate::input;
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::Bm25CreateConfig;
+use std::collections::HashMap;
 
 pub async fn run(action: Bm25Action, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
     match action {
@@ -63,7 +67,9 @@ pub async fn run(action: Bm25Action, dirs: &FlureeDir, direct: bool) -> CliResul
         Bm25Action::Sync { index, t, remote } => {
             run_sync(&index, t, dirs, remote.as_deref(), direct).await
         }
-        Bm25Action::List { stale } => run_list(stale, dirs).await,
+        Bm25Action::List { stale, remote } => {
+            run_list(stale, dirs, remote.as_deref(), direct).await
+        }
     }
 }
 
@@ -113,13 +119,69 @@ struct CreateArgs {
     b: Option<f64>,
 }
 
+/// One row of `bm25 list`: an index paired with the source ledger it covers.
+struct IndexRow {
+    name: String,
+    branch: String,
+    source: String,
+    index_t: i64,
+    /// `None` when the source ledger could not be resolved — it may have been
+    /// dropped out from under the index.
+    ledger_t: Option<i64>,
+}
+
+impl IndexRow {
+    /// An index is stale once its source has committed past the watermark.
+    fn is_stale(&self) -> bool {
+        self.ledger_t
+            .is_some_and(|ledger_t| self.index_t < ledger_t)
+    }
+
+    fn alias(&self) -> String {
+        format!("{}:{}", self.name, self.branch)
+    }
+}
+
+/// Resolve a source ledger's current `t`.
+///
+/// A stored dependency alias may omit the branch (a bare `name` means
+/// `name:main` to Fluree) while ledger records are keyed `name:branch`, so try
+/// the alias as-is before assuming `:main`.
+fn resolve_source_t(commit_t: &HashMap<String, i64>, source: &str) -> Option<i64> {
+    commit_t
+        .get(source)
+        .or_else(|| commit_t.get(&format!("{source}:main")))
+        .copied()
+}
+
 /// List BM25 indexes with their source ledger and staleness — what a maintenance
 /// job enumerates to decide which to `sync`. An index is STALE when its source
 /// ledger's commit `t` has advanced past the index's watermark (`index_t`).
-async fn run_list(stale_only: bool, dirs: &FlureeDir) -> CliResult<()> {
-    use comfy_table::{ContentArrangement, Table};
-    use std::collections::HashMap;
+async fn run_list(
+    stale_only: bool,
+    dirs: &FlureeDir,
+    remote_flag: Option<&str>,
+    direct: bool,
+) -> CliResult<()> {
+    let mut rows = if let Some(client) = resolve_client(dirs, remote_flag, direct).await? {
+        let entries = client
+            .list_ledgers()
+            .await
+            .map_err(|e| CliError::Remote(format!("failed to list indexes: {e}")))?;
+        persist_tokens(&client, remote_flag, dirs).await;
+        let rows = remote_index_rows(&entries);
+        warn_unknown_sources(&rows);
+        rows
+    } else {
+        local_index_rows(dirs).await?
+    };
+    rows.sort_by(|a, b| (&a.name, &a.branch).cmp(&(&b.name, &b.branch)));
 
+    render_index_rows(&rows, stale_only);
+    Ok(())
+}
+
+async fn local_index_rows(dirs: &FlureeDir) -> CliResult<Vec<IndexRow>> {
     let fluree = build_fluree(dirs)?;
     let ledgers = fluree.nameservice().all_records().await?;
     let sources = fluree.nameservice().all_graph_source_records().await?;
@@ -131,45 +193,127 @@ async fn run_list(stale_only: bool, dirs: &FlureeDir) -> CliResult<()> {
         .map(|r| (format!("{}:{}", r.name, r.branch), r.commit_t))
         .collect();
 
-    // (name, branch, source ledger, index_t, source commit_t?, stale)
-    let mut rows: Vec<(String, String, String, i64, Option<i64>, bool)> = sources
+    let rows = sources
         .iter()
         .filter(|r| r.is_bm25() && !r.retracted)
         .map(|gs| {
             let source = gs.dependencies.first().cloned().unwrap_or_default();
-            // A stored dependency alias may omit the branch (a bare `name` means
-            // `name:main` to Fluree), while ledger records are keyed `name:branch`
-            // — so try the alias as-is, then with an implicit `:main`.
-            let ledger_t = commit_t
-                .get(&source)
-                .or_else(|| commit_t.get(&format!("{source}:main")))
-                .copied();
-            let stale = ledger_t.is_some_and(|lt| gs.index_t < lt);
-            (
-                gs.name.clone(),
-                gs.branch.clone(),
+            IndexRow {
+                name: gs.name.clone(),
+                branch: gs.branch.clone(),
+                ledger_t: resolve_source_t(&commit_t, &source),
                 source,
-                gs.index_t,
-                ledger_t,
-                stale,
-            )
+                index_t: gs.index_t,
+            }
         })
         .collect();
-    rows.sort();
+    Ok(rows)
+}
+
+/// Names of the indexes whose source ledger the server did not report.
+fn unknown_source_aliases(rows: &[IndexRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| row.source.is_empty())
+        .map(IndexRow::alias)
+        .collect()
+}
+
+/// Warn when the server did not say which ledger an index derives from.
+///
+/// An index with no known source reports as *not* stale, so a listing full of
+/// them looks like everything is current and `--stale` returns nothing. The
+/// usual cause is a server predating `dependencies` on the `/ledgers` response;
+/// `--direct` reads the records locally and is unaffected.
+fn warn_unknown_sources(rows: &[IndexRow]) {
+    let unknown = unknown_source_aliases(rows);
+    if unknown.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "  {} no source ledger reported for {}: staleness unknown. The server may \
+         predate this field — upgrade it, or use --direct to read local records.",
+        "warn:".yellow().bold(),
+        unknown.join(", ")
+    );
+}
+
+/// Build rows from a `GET /ledgers` response.
+///
+/// That response carries ledgers and graph sources together, each with its `t`
+/// and (for graph sources) its dependencies, so one request has everything
+/// staleness needs. A server too old to send `dependencies` yields rows with an
+/// empty source and no staleness rather than an error.
+fn remote_index_rows(entries: &serde_json::Value) -> Vec<IndexRow> {
+    let Some(entries) = entries.as_array() else {
+        return Vec::new();
+    };
+
+    let entry_type = |e: &serde_json::Value| {
+        e.get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let alias = |e: &serde_json::Value| {
+        format!(
+            "{}:{}",
+            field(e, "name"),
+            e.get("branch")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("main")
+        )
+    };
+    let t_of = |e: &serde_json::Value| e.get("t").and_then(serde_json::Value::as_i64);
+
+    let commit_t: HashMap<String, i64> = entries
+        .iter()
+        .filter(|e| entry_type(e) == "Ledger")
+        .filter_map(|e| t_of(e).map(|t| (alias(e), t)))
+        .collect();
+
+    entries
+        .iter()
+        .filter(|e| entry_type(e) == "BM25")
+        .map(|e| {
+            let source = e
+                .get("dependencies")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|deps| deps.first())
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            IndexRow {
+                name: field(e, "name"),
+                branch: e
+                    .get("branch")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("main")
+                    .to_string(),
+                ledger_t: resolve_source_t(&commit_t, &source),
+                source,
+                index_t: t_of(e).unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+fn render_index_rows(rows: &[IndexRow], stale_only: bool) {
+    use comfy_table::{ContentArrangement, Table};
 
     // Script-friendly mode: just the stale indexes, one alias per line, so a
     // maintenance loop can do: `for i in $(fluree bm25 list --stale); do
     // fluree bm25 sync --index "$i"; done`.
     if stale_only {
-        for (name, branch, ..) in rows.iter().filter(|r| r.5) {
-            println!("{name}:{branch}");
+        for row in rows.iter().filter(|r| r.is_stale()) {
+            println!("{}", row.alias());
         }
-        return Ok(());
+        return;
     }
 
     if rows.is_empty() {
         println!("No BM25 full-text indexes found. Run 'fluree bm25 create ...' to add one.");
-        return Ok(());
+        return;
     }
 
     // Same look and feel as `fluree list` (comfy_table, dynamic arrangement).
@@ -183,24 +327,25 @@ async fn run_list(stale_only: bool, dirs: &FlureeDir) -> CliResult<()> {
         "LEDGER_T",
         "STALE",
     ]);
-    for (name, branch, source, index_t, ledger_t, stale) in &rows {
-        let index_t_str = if *index_t > 0 {
-            index_t.to_string()
+    for row in rows {
+        let index_t = if row.index_t > 0 {
+            row.index_t.to_string()
         } else {
             "-".to_string()
         };
-        let ledger_t_str = ledger_t.map_or_else(|| "-".to_string(), |v| v.to_string());
+        let ledger_t = row
+            .ledger_t
+            .map_or_else(|| "-".to_string(), |v| v.to_string());
         table.add_row(vec![
-            name.clone(),
-            branch.clone(),
-            source.clone(),
-            index_t_str,
-            ledger_t_str,
-            if *stale { "YES" } else { "no" }.to_string(),
+            row.name.clone(),
+            row.branch.clone(),
+            row.source.clone(),
+            index_t,
+            ledger_t,
+            if row.is_stale() { "YES" } else { "no" }.to_string(),
         ]);
     }
     println!("{table}");
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -488,5 +633,91 @@ mod tests {
         assert_eq!(field(&result, "graph_source_id"), "docsearch:main");
         assert_eq!(field(&result, "doc_count"), "3");
         assert_eq!(field(&result, "missing"), "?");
+    }
+
+    /// A `GET /ledgers` payload: two ledgers, a BM25 index over one of them,
+    /// and a non-BM25 graph source that must not appear in the output.
+    fn ledgers_payload() -> serde_json::Value {
+        json!([
+            {"name": "docs", "branch": "main", "type": "Ledger", "t": 7},
+            {"name": "other", "branch": "main", "type": "Ledger", "t": 2},
+            {"name": "docsearch", "branch": "main", "type": "BM25", "t": 5,
+             "dependencies": ["docs:main"]},
+            {"name": "warehouse", "branch": "main", "type": "Iceberg", "t": 0,
+             "dependencies": ["docs:main"]},
+        ])
+    }
+
+    #[test]
+    fn remote_rows_pair_an_index_with_its_source_ledger() {
+        let rows = remote_index_rows(&ledgers_payload());
+
+        assert_eq!(rows.len(), 1, "only the BM25 entry is a row");
+        let row = &rows[0];
+        assert_eq!(row.alias(), "docsearch:main");
+        assert_eq!(row.source, "docs:main");
+        assert_eq!(row.index_t, 5);
+        assert_eq!(row.ledger_t, Some(7));
+        assert!(row.is_stale(), "index at 5 vs source at 7");
+    }
+
+    #[test]
+    fn remote_rows_report_a_current_index_as_fresh() {
+        let mut payload = ledgers_payload();
+        payload[2]["t"] = json!(7);
+
+        assert!(!remote_index_rows(&payload)[0].is_stale());
+    }
+
+    /// A dependency alias may omit the branch; a bare `docs` means `docs:main`.
+    #[test]
+    fn remote_rows_resolve_a_branchless_dependency_alias() {
+        let mut payload = ledgers_payload();
+        payload[2]["dependencies"] = json!(["docs"]);
+
+        assert_eq!(remote_index_rows(&payload)[0].ledger_t, Some(7));
+    }
+
+    /// Against a server predating the `dependencies` field, the source cannot
+    /// be resolved. That degrades to "unknown staleness" rather than claiming
+    /// the index is current, which would send a maintenance loop back to sleep.
+    #[test]
+    fn remote_rows_survive_a_server_without_dependencies() {
+        let mut payload = ledgers_payload();
+        payload[2]
+            .as_object_mut()
+            .expect("object")
+            .remove("dependencies");
+
+        let rows = remote_index_rows(&payload);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ledger_t, None);
+        assert!(!rows[0].is_stale(), "unknown staleness is not staleness");
+    }
+
+    #[test]
+    fn remote_rows_handle_an_empty_or_malformed_payload() {
+        assert!(remote_index_rows(&json!([])).is_empty());
+        assert!(remote_index_rows(&json!({"unexpected": "shape"})).is_empty());
+    }
+
+    /// The listing degrades quietly — an unknown source reads as "not stale" —
+    /// so the unresolved indexes have to be called out by name.
+    #[test]
+    fn unknown_sources_are_reported_by_alias() {
+        let mut payload = ledgers_payload();
+        payload[2]
+            .as_object_mut()
+            .expect("object")
+            .remove("dependencies");
+
+        let rows = remote_index_rows(&payload);
+        assert_eq!(unknown_source_aliases(&rows), vec!["docsearch:main"]);
+    }
+
+    #[test]
+    fn a_resolved_listing_warns_about_nothing() {
+        let rows = remote_index_rows(&ledgers_payload());
+        assert!(unknown_source_aliases(&rows).is_empty());
     }
 }

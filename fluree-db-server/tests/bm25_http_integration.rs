@@ -391,6 +391,50 @@ async fn sync_with_t_syncs_through_that_t_only() {
     );
 }
 
+/// `GET /ledgers` must report each graph source's dependencies. Without them a
+/// client has the index's `t` and the ledgers' `t`s but no way to pair the two,
+/// which is what `fluree bm25 list --remote` needs to compute staleness.
+#[tokio::test]
+async fn ledgers_reports_graph_source_dependencies() {
+    let (_tmp, state) = state_with_index().await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/ledgers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "body: {json}");
+    let entries = json.as_array().expect("array of entries");
+
+    let index = entries
+        .iter()
+        .find(|e| e.get("type").and_then(JsonValue::as_str) == Some("BM25"))
+        .unwrap_or_else(|| panic!("no BM25 entry: {json}"));
+    assert_eq!(
+        index.get("dependencies").and_then(JsonValue::as_array),
+        Some(&vec![JsonValue::from("docs:main")]),
+        "index should name its source ledger: {index}"
+    );
+
+    // Ledgers are nobody's derivative, so the field is omitted rather than
+    // serialized as an empty array.
+    let ledger = entries
+        .iter()
+        .find(|e| e.get("type").and_then(JsonValue::as_str) == Some("Ledger"))
+        .unwrap_or_else(|| panic!("no Ledger entry: {json}"));
+    assert!(
+        ledger.get("dependencies").is_none(),
+        "ledger entries should omit dependencies: {ledger}"
+    );
+}
+
 /// `POST /drop` reaches the generic graph-source drop, which must sweep the
 /// index's snapshot blobs rather than only retracting the record.
 #[tokio::test]
