@@ -18,7 +18,7 @@ use fluree_db_core::{
 use fluree_db_indexer::{
     clean_garbage, rebuild_index_from_commits_with_tracker, CleanGarbageConfig,
 };
-use fluree_db_nameservice::NsRecord;
+use fluree_db_nameservice::{GraphSourceType, NsRecord};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -1313,6 +1313,24 @@ impl crate::Fluree {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // 2b. Delete BM25 snapshot blobs (Hard mode). Runs before the retract
+        // below so the manifest is still resolvable. Without this a BM25 index
+        // dropped through this path — the `POST /drop` route, and `fluree drop`
+        // — leaves every snapshot behind; `drop_full_text_index` is the only
+        // other entrypoint that sweeps them.
+        if matches!(mode, DropMode::Hard) {
+            if let Some(ref record) = record {
+                if matches!(record.source_type, GraphSourceType::Bm25) {
+                    let manifest = self.load_or_create_bm25_manifest(&graph_source_id).await?;
+                    let (deleted, warnings) = self
+                        .delete_bm25_snapshots(&graph_source_id, &manifest)
+                        .await;
+                    report.files_deleted += deleted;
+                    report.warnings.extend(warnings);
                 }
             }
         }

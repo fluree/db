@@ -1390,6 +1390,7 @@ where {
 
         // 2. Load manifest for cleanup (get all snapshot addresses)
         let manifest = self.load_or_create_bm25_manifest(graph_source_id).await?;
+        let total = manifest.all_snapshot_ids().len();
 
         // 3. Retract graph source in nameservice
         self.publisher()?
@@ -1402,36 +1403,9 @@ where {
             "Graph source retracted, cleaning up storage"
         );
 
-        // 4. Collect all snapshot CIDs to delete
-        let snapshot_ids = manifest.all_snapshot_ids();
-        let total = snapshot_ids.len();
-
-        // 5. Delete all snapshot files (derive addresses from CIDs)
-        let mut deleted_snapshots = 0;
-        if let Some(storage) = self.admin_storage() {
-            let method = storage.storage_method().to_string();
-            for cid in &snapshot_ids {
-                let addr = fluree_db_core::content_address(
-                    &method,
-                    fluree_db_core::ContentKind::GraphSourceSnapshot,
-                    graph_source_id,
-                    &cid.digest_hex(),
-                );
-                match storage.delete(&addr).await {
-                    Ok(()) => {
-                        deleted_snapshots += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            graph_source_id = %graph_source_id,
-                            address = %addr,
-                            error = %e,
-                            "Failed to delete snapshot file"
-                        );
-                    }
-                }
-            }
-        }
+        // 4. Delete all snapshot files
+        let (deleted_snapshots, _warnings) =
+            self.delete_bm25_snapshots(graph_source_id, &manifest).await;
 
         info!(
             graph_source_id = %graph_source_id,
@@ -1445,5 +1419,51 @@ where {
             deleted_snapshots,
             was_already_retracted: false,
         })
+    }
+
+    /// Delete every snapshot blob a BM25 manifest references, returning the
+    /// number removed alongside a warning per blob that could not be.
+    ///
+    /// Best-effort per blob: a delete that fails leaves a storage leak, which
+    /// is not a reason to abandon the rest of the sweep or to leave the
+    /// nameservice record published.
+    ///
+    /// Takes the manifest rather than loading it so callers control the order
+    /// relative to retraction.
+    pub(crate) async fn delete_bm25_snapshots(
+        &self,
+        graph_source_id: &str,
+        manifest: &Bm25Manifest,
+    ) -> (usize, Vec<String>) {
+        let Some(storage) = self.admin_storage() else {
+            return (0, Vec::new());
+        };
+
+        let method = storage.storage_method().to_string();
+        let mut deleted = 0;
+        let mut warnings = Vec::new();
+
+        for cid in manifest.all_snapshot_ids() {
+            let addr = fluree_db_core::content_address(
+                &method,
+                fluree_db_core::ContentKind::GraphSourceSnapshot,
+                graph_source_id,
+                &cid.digest_hex(),
+            );
+            match storage.delete(&addr).await {
+                Ok(()) => deleted += 1,
+                Err(e) => {
+                    warn!(
+                        graph_source_id = %graph_source_id,
+                        address = %addr,
+                        error = %e,
+                        "Failed to delete snapshot file"
+                    );
+                    warnings.push(format!("Failed to delete snapshot {addr}: {e}"));
+                }
+            }
+        }
+
+        (deleted, warnings)
     }
 }

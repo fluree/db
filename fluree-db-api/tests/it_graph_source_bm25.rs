@@ -1275,6 +1275,84 @@ async fn bm25_embedded_search_via_tracked_dataset_path() {
     );
 }
 
+/// Count files under the graph-sources storage segment.
+fn graph_source_blob_count(storage_path: &str) -> usize {
+    fn walk(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| {
+                if e.path().is_dir() {
+                    walk(&e.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    walk(&std::path::Path::new(storage_path).join(STORAGE_SEGMENT_GRAPH_SOURCES))
+}
+
+/// The generic `drop_graph_source` — what `POST /drop` and `fluree drop` reach
+/// — must sweep BM25 snapshot blobs in `Hard` mode, not just retract the
+/// nameservice record. It used to delete only Iceberg mapping blobs, so a BM25
+/// index dropped this way left every snapshot on disk with no way to reach it.
+#[tokio::test]
+async fn drop_graph_source_deletes_bm25_snapshots() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let storage_path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&storage_path)
+        .build()
+        .expect("build file fluree");
+
+    let ledger_id = "bm25/hard-drop:main";
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Systems programming" }
+        ]
+    });
+    fluree.insert(ledger, &tx).await.expect("insert");
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("hard-drop-search", ledger_id, query))
+        .await
+        .expect("create index");
+    assert!(created.index_id.is_some(), "expected a persisted snapshot");
+
+    let before = graph_source_blob_count(&storage_path);
+    assert!(before > 0, "index should have written blobs");
+
+    let report = fluree
+        .drop_graph_source("hard-drop-search", None, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop graph source");
+
+    assert!(
+        report.files_deleted >= 1,
+        "hard drop should report deleted snapshots, got {}: {:?}",
+        report.files_deleted,
+        report.warnings
+    );
+    assert!(
+        graph_source_blob_count(&storage_path) < before,
+        "hard drop must remove snapshot blobs from storage (was {before})"
+    );
+}
+
 /// Every sync entrypoint must refuse a dropped index. `sync_bm25_index_to`
 /// used to skip the retraction check its siblings made, so a pinned sync wrote
 /// a fresh snapshot for a graph source whose snapshots had just been deleted,
