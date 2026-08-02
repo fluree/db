@@ -82,6 +82,7 @@
   - [`owl:imports` across named graphs](guides/cookbook-owl-imports.md)
 
 - [Design](design/README.md)
+  - [Performance architecture](design/performance.md)
   - [Query execution and overlay merge](design/query-execution.md)
   - [Auth contract (CLI ↔ Server)](design/auth-contract.md)
   - [Nameservice schema v2](design/nameservice-schema-v2.md)

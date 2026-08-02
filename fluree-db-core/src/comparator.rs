@@ -7,7 +7,14 @@
 //! | SPOT | s, p, o, t | Subject lookups |
 //! | PSOT | p, s, o, t | Predicate-subject lookups |
 //! | POST | p, o, s, t | Property value lookups |
-//! | OPST | o, p, s, t | Reference lookups (object is SID) |
+//! | OPST | o, p, s, t | Object-leading lookups (reverse traversal, bound-object scans) |
+//!
+//! OPST stores **all object types**, not only references. Because it leads with
+//! the object, its leaflets are segmented by `o_type` (see
+//! `docs/design/index-format.md`), so refs occupy one contiguous partition and
+//! each literal type occupies its own. Readers that only want reverse edges pin
+//! `o_type = IRI_REF` to scan just that partition — that is a consumer-side
+//! restriction, not a restriction on what the index contains.
 //!
 //! ## Strict Total Ordering
 //!
@@ -27,7 +34,7 @@ pub enum IndexType {
     Psot,
     /// Predicate-Object-Subject-Transaction
     Post,
-    /// Object-Predicate-Subject-Transaction (for refs only)
+    /// Object-Predicate-Subject-Transaction (all object types, segmented by `o_type`)
     Opst,
 }
 
@@ -67,6 +74,15 @@ impl IndexType {
     /// - POST: Predicate and object bound (value lookup)
     /// - OPST: Object bound and is reference (reverse traversal)
     /// - SPOT: Default fallback
+    ///
+    /// NOTE: the `o_is_ref` gate on OPST here is a **conservative default**, not
+    /// a statement that OPST only holds references — it holds every object type.
+    /// The binary scan path deliberately broadens this: `BinaryScanOperator`
+    /// prefers OPST for *any* constant object with an unbound subject, excluding
+    /// only undatatyped plain strings (ambiguous `xsd:string` vs
+    /// `rdf:langString`, so `(o_type, o_key)` may not be encodable at `open()`).
+    /// See `fluree-db-query/src/binary_scan.rs`. Callers that want the broader
+    /// behavior should pass an explicit index hint rather than relying on this.
     pub fn for_query(s_bound: bool, p_bound: bool, o_bound: bool, o_is_ref: bool) -> IndexType {
         if s_bound {
             IndexType::Spot
@@ -177,10 +193,11 @@ pub fn cmp_post(f1: &Flake, f2: &Flake) -> Ordering {
 
 /// OPST comparator: Object, Predicate, Subject, Transaction
 ///
-/// Used for reference traversal like "all subjects pointing to object O".
-/// The object is compared as a SID (for references).
+/// Object-leading order, used for "all subjects whose object is O" — reverse
+/// reference traversal, but equally bound-literal scans (e.g. prefix-bounded
+/// string ranges). `cmp_object` compares value then datatype for every object
+/// type; nothing here is ref-specific.
 pub fn cmp_opst(f1: &Flake, f2: &Flake) -> Ordering {
-    // For OPST, object is compared first (as a reference/SID)
     cmp_object(f1, f2)
         .then_with(|| f1.p.cmp(&f2.p))
         .then_with(|| f1.s.cmp(&f2.s))

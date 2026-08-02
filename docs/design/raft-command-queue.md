@@ -21,18 +21,18 @@ The Raft consensus crate (`fluree-db-consensus/src/raft/`) is structured as a se
 | `Command`, `Response`      | `state_machine.rs`                                       | The log entry types. ~20 variants spanning transaction flow, ledger lifecycle, and metadata.                |
 | `NameServiceState`         | `state_machine.rs`                                       | The replicated in-memory state: branch heads, ledger registry, per-branch queues, idempotency cache.        |
 | `StateMachineAdapter`      | `state_machine_adapter.rs`                               | openraft's `RaftStateMachine` impl. Applies entries, takes/installs snapshots, resolves waiters.            |
-| `LogStore`, `SnapshotStore`| `log_adapter.rs`, `storage/{fs,memory}.rs`               | openraft's `RaftLog`/`RaftSnapshotBuilder`. Local-disk persistence.                                          |
+| `LogStore`, `SnapshotStore`| `log_adapter.rs`, `storage/{fs,memory}.rs`               | openraft's `RaftLogStorage`/`RaftLogReader`/`RaftSnapshotBuilder`. Local-disk persistence.                                          |
 | `HttpRaftNetworkFactory`   | `network.rs`                                             | Inter-node RPC (`/raft/vote`, `/raft/append-entries`, `/raft/install-snapshot`) over HTTP.                  |
 | `RaftAdmin` / `/cluster/*` | `admin.rs`                                               | Operator-facing membership endpoints (`initialize`, `add-learner`, `change-membership`, `status`).         |
 | Follower-forward middleware| `forward.rs`                                             | Axum middleware that proxies leader-only client requests to the current leader.                            |
 | `QueuedTransactor`         | `queued_transactor.rs`                                   | Client-side proposer. Builds envelopes, writes to CAS, proposes `EnqueueCommand`, awaits the typed receipt. |
-| `CommitWorker`             | `commit_worker.rs`                                       | Leader-only. Drains per-branch queues, stages work, proposes `ApplyHead`.                                  |
+| `commit_worker::Worker`             | `commit_worker.rs`                                       | Leader-only. Drains per-branch queues, stages work, proposes `ApplyHead`.                                  |
 | `EvictionScheduler`        | `eviction_scheduler.rs`                                  | Leader-only. Periodically proposes `EvictIdempotency` to age out the cache.                                |
 | `RaftNameService`          | `nameservice.rs`                                         | The replicated `NameService` impl. Reads observe `NameServiceState`; writes propose log entries.            |
 | `WaiterMap`                | `waiter.rs`                                              | Per-process oneshot registry keyed by `queue_id`. Bridges propose and apply.                                |
 | `StagedReceiptMap`         | `staged_receipt.rs`                                      | Per-process map carrying typed apply receipts (flake counts, tally, conflict resolution) from worker to transactor on the same node. |
 
-Three of these (`CommitWorker`, `EvictionScheduler`, follower-forward middleware) are gated on leadership: the integration's leader watcher spawns / stops them in response to `current_leader()` changes.
+Three of these (`commit_worker::Worker`, `EvictionScheduler`, follower-forward middleware) are gated on leadership: the integration's leader watcher spawns / stops them in response to `current_leader()` changes.
 
 ## Submission flow in detail
 
@@ -56,7 +56,7 @@ Client → POST /api/transact
         - state.queues[branch].push_back(QueueEntry { queue_id, envelope_cid, ... })
         - leader records waiter assignment
         ↓
-[CommitWorker on leader]
+[commit_worker::Worker on leader]
    6. polls state.queues[branch].front()
    7. fetches envelope from CAS, stages via `Fluree` API
    8. writes commit blob to CAS → head_cid

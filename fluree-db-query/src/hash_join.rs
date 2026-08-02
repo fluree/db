@@ -1,8 +1,9 @@
 //! `HashJoinOperator` — build/probe inner join for object→subject "path" joins.
 //!
 //! This is the cure for the BSBM-BI "small + large" two-pattern join slowdown
-//! (see `docs/troubleshooting/performance-tracing.md` and the benchmark report
-//! `bsbm-bi-fluree-100m-join-scaling.md`). The minimal repro:
+//! (see `docs/design/performance.md` for where this sits in the engine, and
+//! `docs/troubleshooting/performance-tracing.md` for diagnosing the shape).
+//! The minimal repro:
 //!
 //! ```sparql
 //! SELECT (COUNT(*) AS ?c) WHERE {
