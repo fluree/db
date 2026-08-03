@@ -1257,15 +1257,26 @@ fn check_is_a_hidden_alias_for_parse() {
 
     // …but it stays out of `--help`, because listing both spellings would put
     // the ambiguity with `validate` back on the page the rename cleared.
+    //
+    // Asserted against clap's rendering rather than the line's first word: a
+    // visible alias is not a row of its own, it is an `[aliases: check]` tail
+    // on `parse`'s row, so a test that only checked how rows *start* would
+    // pass with the alias fully advertised.
     let mut cmd = rdf_cmd();
     cmd.arg("--help");
     let help = stdout_of(&mut cmd);
-    for line in help.lines() {
-        assert!(
-            !line.trim_start().starts_with("check"),
-            "the `check` alias must not be advertised: {line}"
-        );
-    }
+    let parse_row = help
+        .lines()
+        .find(|l| l.trim_start().starts_with("parse "))
+        .unwrap_or_else(|| panic!("top-level help lists no `parse` row:\n{help}"));
+    assert!(
+        !parse_row.contains("aliases:"),
+        "the `check` alias must stay hidden; clap advertises visible ones: {parse_row}"
+    );
+    assert!(
+        !help.contains("check"),
+        "the `check` spelling must not appear in top-level help:\n{help}"
+    );
 }
 
 #[test]
