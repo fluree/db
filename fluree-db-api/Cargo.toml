@@ -198,6 +198,14 @@ path = "tests/it_cyclic_bgp_novelty_pred.rs"
 name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
 
+# Standalone (not in grp_misc): its process-scoped tracing capture + the
+# process-global callsite-interest cache require being the only test in its
+# process to avoid parallel-interleaving flake. Same convention as the span-
+# capture tests above.
+[[test]]
+name = "it_minmax_fast_path_fired"
+path = "tests/it_minmax_fast_path_fired.rs"
+
 [[test]]
 name = "it_multi_graph_property_path"
 path = "tests/it_multi_graph_property_path.rs"
