@@ -48,10 +48,13 @@ use bigdecimal::num_bigint::BigInt;
 use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_r2rml::mapping::{
-    extract_template_columns, CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, TermType,
-    TriplesMap,
+    extract_template_columns, CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, RefObjectMap,
+    TermType, TriplesMap,
 };
-use fluree_db_r2rml::materialize::{get_join_key_from_batch, materialize_object_from_batch};
+use fluree_db_r2rml::materialize::{
+    canonical_join, get_join_key_from_batch, materialize_object_from_batch,
+    materialize_subject_from_batch, RdfTerm,
+};
 use fluree_db_tabular::{Column, ColumnBatch};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -759,6 +762,12 @@ struct GroupCol {
 enum GKind {
     String,
     Integer,
+    /// P2a: a RefObjectMap group key — the group value is the referenced parent
+    /// SUBJECT IRI, not a table cell. It is always Dim-sourced (resolved through the
+    /// FK→IRI map, never read inline from the fact batch), so `key_at`/`key_ref_at`
+    /// never produce it; only `binding` acts on it, emitting an IRI term (not a
+    /// literal) so the output matches the generic path's `RdfTerm::Iri`.
+    Iri,
 }
 
 /// Classify a declared datatype into a group-key kind, or `None` (fall back).
@@ -939,6 +948,9 @@ impl GroupCol {
     fn key_at(&self, col: Option<&Column>, row: usize) -> GKey {
         let Some(c) = col else { return GKey::Null };
         match self.kind {
+            // P2a: a ref-IRI key is Dim-sourced (from the FK→IRI map), never read
+            // inline from the fact batch, so this is unreachable for it.
+            GKind::Iri => GKey::Null,
             GKind::String => match c {
                 Column::String(v) => v.get(row).cloned().flatten().map_or(GKey::Null, GKey::Str),
                 _ => GKey::Null,
@@ -977,6 +989,8 @@ impl GroupCol {
     fn key_ref_at<'a>(&self, col: Option<&'a Column>, row: usize) -> Option<GKeyRef<'a>> {
         let c = col?;
         match self.kind {
+            // P2a: a ref-IRI key is Dim-sourced; never read inline from the fact.
+            GKind::Iri => None,
             GKind::String => match c {
                 Column::String(v) => v.get(row)?.as_deref().map(GKeyRef::Str),
                 _ => None,
@@ -999,10 +1013,14 @@ impl GroupCol {
 
     /// Materialize the output binding for a group key component.
     fn binding(&self, key: &GKey) -> Binding {
-        match key {
-            GKey::Str(s) => Binding::lit(FlakeValue::String(s.clone()), self.dt_sid.clone()),
-            GKey::Int(i) => Binding::lit(FlakeValue::Long(*i as i64), self.dt_sid.clone()),
-            GKey::Null => Binding::Unbound,
+        match (self.kind, key) {
+            // P2a: a ref-IRI group key emits an IRI TERM (byte-identical to the
+            // generic path's `RdfTerm::Iri => Binding::iri`), not an xsd:string
+            // literal. The GKey holds the parent subject IRI minted at resolver-build.
+            (GKind::Iri, GKey::Str(s)) => Binding::iri(s.as_str()),
+            (_, GKey::Str(s)) => Binding::lit(FlakeValue::String(s.clone()), self.dt_sid.clone()),
+            (_, GKey::Int(i)) => Binding::lit(FlakeValue::Long(*i as i64), self.dt_sid.clone()),
+            (_, GKey::Null) => Binding::Unbound,
         }
     }
 }
@@ -1257,6 +1275,35 @@ impl FusedR2rmlAggregateOperator {
             } => Some((column.clone(), datatype.clone())),
             _ => None, // RefObjectMap / Template / Constant
         }
+    }
+
+    /// P2a: resolve a variable's predicate to a single RefObjectMap object and its
+    /// parent TriplesMap, or `None` (not a ref, missing/multi-valued predicate, or
+    /// an unresolvable parent). This is the RefObjectMap twin of
+    /// `scalar_column_for_var` — a GROUP BY key like `?c` bound as `edw:customer`
+    /// (the referenced customer IRI) resolves here, not there. The group-key admission
+    /// folds on the parent SUBJECT IRI (minted once per parent row at resolve, exactly
+    /// as `build_parent_lookup` does on the generic path), so the fused key is
+    /// byte-identical to the materialized `?c` binding.
+    fn ref_object_map_for_var<'m>(
+        pattern: &R2rmlPattern,
+        tm: &'m TriplesMap,
+        var: VarId,
+        mapping: &'m CompiledR2rmlMapping,
+    ) -> Option<(&'m RefObjectMap, &'m TriplesMap)> {
+        let pred = Self::predicate_for_var(pattern, var)?;
+        let mut poms = tm
+            .predicate_object_maps
+            .iter()
+            .filter(|pom| pom.predicate_map.as_constant() == Some(pred));
+        let (Some(pom), None) = (poms.next(), poms.next()) else {
+            return None; // missing or multi-valued predicate
+        };
+        let ObjectMap::RefObjectMap(rom) = &pom.object_map else {
+            return None; // a Column / Template / Constant object, not a ref
+        };
+        let parent = mapping.triples_maps.get(&rom.parent_triples_map)?;
+        Some((rom, parent))
     }
 
     /// Q2 admission gate: a group-key column may be fused only when its object map
@@ -2004,9 +2051,62 @@ impl FusedR2rmlAggregateOperator {
         // key binding's datatype Sid is encoded from the snapshot so it matches
         // what the normal materialization path produces.
         let mut group_cols = Vec::with_capacity(self.group_by.len());
+        // P2a: per GROUP BY position, whether the key reads inline from the fact
+        // (`Fact`) or from the FK→IRI resolver (`Dim(0)`, for the one admitted
+        // RefObjectMap key). All-`Fact` keeps the fold byte-identical to before.
+        let mut group_key_plan: Vec<KeySource> = Vec::with_capacity(self.group_by.len());
+        // P2a: the one RefObjectMap group key's (fact FK child cols, parent join
+        // cols, parent TM IRI), captured in SPARQL order; the FK→IRI resolver is
+        // built after the scan projection below. At most one (≥2 declines).
+        let mut ref_group_key: Option<(Vec<String>, Vec<String>, String)> = None;
         for gv in &self.group_by {
             let Some((col, datatype)) = Self::scalar_column_for_var(&pattern, tm, *gv) else {
-                return Ok(None);
+                // P2a (#1583 fan-out caveat): admit a RefObjectMap group key — the
+                // `GROUP BY ?c` where `?c` is a referenced parent IRI (crt_highcard).
+                // The generic path resolves `?c` through `build_parent_lookup`
+                // (parent scan → parent-subject IRI, deterministic keep-min on a
+                // duplicate parent key, drop on a dangling/NULL FK — NOT a fan-out,
+                // since a non-crawl aggregate has `trust_fk_refs=false`). We fold on
+                // that same IRI, minted once per parent row at resolver-build (O(dim),
+                // the cost `build_parent_lookup` already pays) instead of once per
+                // fact row, and emit it as an IRI term at output. WHEN true R2RML
+                // RefObjectMap fan-out lands (issue #1583), this admission changes
+                // group multiplicity and MUST be revisited in the same change — the
+                // fused path and generic path must flip together.
+                let Some((rom, parent_tm)) =
+                    Self::ref_object_map_for_var(&pattern, tm, *gv, &mapping)
+                else {
+                    return Ok(None); // neither a scalar column nor a ref object
+                };
+                if ref_group_key.is_some() {
+                    return Ok(None); // ≥2 ref group keys: follow-on scope
+                }
+                // The parent subject must be a pure IRI (the fold emits an IRI term);
+                // a blank-node / literal parent subject declines to the generic path.
+                if !parent_tm.subject_map.generates_iri() {
+                    return Ok(None);
+                }
+                // MAJOR-1: canonical_join aligns child/parent columns deterministically,
+                // so the resolver's parent-side index and the fact-side probe agree.
+                let Some((parent_cols, child_cols)) = canonical_join(rom).ok() else {
+                    return Ok(None);
+                };
+                // dt_sid is unused for an IRI key (the output is `Binding::iri`); a
+                // valid placeholder Sid keeps the struct uniform.
+                let Some(dt_sid) = ctx.active_snapshot.encode_iri(fluree_vocab::xsd::STRING) else {
+                    return Ok(None);
+                };
+                for c in &child_cols {
+                    projection.push(c.clone());
+                }
+                group_key_plan.push(KeySource::Dim(0));
+                group_cols.push(GroupCol {
+                    column: child_cols.first().cloned().unwrap_or_default(),
+                    kind: GKind::Iri,
+                    dt_sid,
+                });
+                ref_group_key = Some((child_cols, parent_cols, parent_tm.iri.clone()));
+                continue;
             };
             // C5 slice-1: default an un-annotated column group key to `xsd:string`
             // — the R2RML natural mapping for an UN-ANNOTATED PLAIN-LITERAL column
@@ -2054,6 +2154,7 @@ impl FusedR2rmlAggregateOperator {
                 return Ok(None);
             };
             projection.push(col.clone());
+            group_key_plan.push(KeySource::Fact);
             group_cols.push(GroupCol {
                 column: col,
                 kind,
@@ -2102,11 +2203,29 @@ impl FusedR2rmlAggregateOperator {
         let mut obj_vars: Vec<VarId> = pattern.object_var.into_iter().collect();
         obj_vars.extend(pattern.star_bindings.iter().map(|(_, v)| *v));
         for v in obj_vars {
-            let Some((col, _)) = Self::scalar_column_for_var(&pattern, tm, v) else {
-                return Ok(None);
-            };
-            validity_cols.push(col.clone());
-            count_non_null_cols.push(col);
+            match Self::scalar_column_for_var(&pattern, tm, v) {
+                Some((col, _)) => {
+                    validity_cols.push(col.clone());
+                    count_non_null_cols.push(col);
+                }
+                None => {
+                    // P2a: a RefObjectMap object var (e.g. the `?c` group key) has no
+                    // scalar column. Its row-validity is "the FK child columns are
+                    // non-null" — a NULL FK yields no ref triple, exactly as
+                    // `materialize_pom_object` returns None on a null join key, so the
+                    // fact row drops. (A present-but-dangling FK is dropped later by
+                    // the resolver probe.) Any other unresolvable object declines.
+                    let Some((rom, _parent)) =
+                        Self::ref_object_map_for_var(&pattern, tm, v, &mapping)
+                    else {
+                        return Ok(None);
+                    };
+                    for c in rom.child_columns() {
+                        validity_cols.push(c.to_string());
+                        count_non_null_cols.push(c.to_string());
+                    }
+                }
+            }
         }
         count_non_null_cols.sort();
         count_non_null_cols.dedup();
@@ -2130,6 +2249,81 @@ impl FusedR2rmlAggregateOperator {
 
         projection.sort();
         projection.dedup();
+
+        // P2a: build the FK→IRI resolver for the one admitted RefObjectMap group key
+        // by scanning the parent dimension ONCE — minting the parent-subject IRI per
+        // row exactly as `build_parent_lookup` does, with deterministic keep-min on a
+        // duplicate parent join key (matching the generic query path post-#1529), so
+        // the fused group key is byte-identical to the materialized `?c`. Null parent
+        // subject / null join key rows are skipped (they can never satisfy the join);
+        // a fact-row probe miss then folds "dangling FK" and "null parent" into one
+        // drop, exactly as the generic path does.
+        let group_resolver = if let Some((fk_child_cols, parent_cols, parent_tm_iri)) =
+            ref_group_key
+        {
+            let Some(parent_tm) = mapping.triples_maps.get(&parent_tm_iri) else {
+                return Ok(None);
+            };
+            let Some(parent_table) = parent_tm.table_name().map(str::to_string) else {
+                return Ok(None);
+            };
+            let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
+                QueryError::InvalidQuery("R2RML table provider not configured".to_string())
+            })?;
+            let mut parent_proj = parent_cols.clone();
+            if let Some(t) = parent_tm.subject_map.template.as_deref() {
+                parent_proj.extend(extract_template_columns(t));
+            }
+            if let Some(c) = &parent_tm.subject_map.column {
+                parent_proj.push(c.clone());
+            }
+            parent_proj.sort();
+            parent_proj.dedup();
+            let gs = &pattern.graph_source_id;
+            let mut map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
+                std::collections::HashMap::new();
+            let mut s = table_provider
+                .scan_table(gs, &parent_table, &parent_proj, &[], None, as_of_t)
+                .await?;
+            while let Some(batch) = s.next().await {
+                ctx.checkpoint()?;
+                let batch = batch?;
+                let map_before = map.len();
+                for row in 0..batch.num_rows {
+                    let Some(key) = get_join_key_from_batch(&parent_cols, &batch, row) else {
+                        continue; // null join key → never matches
+                    };
+                    let iri =
+                        match materialize_subject_from_batch(&parent_tm.subject_map, &batch, row) {
+                            Ok(Some(RdfTerm::Iri(iri))) => iri,
+                            _ => continue, // null / non-IRI subject → skip (blank node declined above)
+                        };
+                    // Deterministic keep-min on a duplicate parent join key: keep the
+                    // lexicographically smaller IRI, byte-identical to
+                    // `parent_key_insert_keep_min` on the generic path.
+                    match map.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(vec![GKey::Str(iri)]);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if let Some(GKey::Str(cur)) = e.get().first() {
+                                if iri < *cur {
+                                    e.insert(vec![GKey::Str(iri)]);
+                                }
+                            }
+                        }
+                    }
+                }
+                ctx.record_alloc((map.len() - map_before) * crate::context::GROUP_EST_BYTES);
+            }
+            Some(GroupKeyResolver {
+                fact_fk_cols: fk_child_cols,
+                map,
+            })
+        } else {
+            None
+        };
+
         Ok(Some(Resolved {
             pattern,
             table_name,
@@ -2140,9 +2334,8 @@ impl FusedR2rmlAggregateOperator {
             expr_folds,
             validity_cols,
             count_non_null_cols,
-            group_resolver: None,
-            // Single-table fold: every key reads inline from the fact batch.
-            group_key_plan: (0..self.group_by.len()).map(|_| KeySource::Fact).collect(),
+            group_resolver,
+            group_key_plan,
             fact_constraints,
             minmax_folds,
             minmax_encoder,
@@ -4644,6 +4837,261 @@ mod tests {
             "a non-PK (duplicate) dim join key must DECLINE the fused join fold \
              (fall back to the materialize path), not silently under-count"
         );
+    }
+
+    // --- P2a: RefObjectMap (IRI) group-key admission (crt_highcard shape) ---
+
+    /// Run the fused single-table operator over `GROUP BY ?c { ?o <http://ex/custRef>
+    /// ?c } COUNT(*)` against `mapping` + per-table `batches` (a mock provider serving
+    /// BOTH the parent scan that builds the FK→IRI resolver AND the fact scan). Returns
+    /// `(?c IRI, COUNT)` rows sorted by IRI; PANICS if the group key is not emitted as
+    /// an IRI term or the count is not a Long — pinning P2a's byte-identity to the
+    /// generic path (`RdfTerm::Iri => Binding::iri`, `Acc::Count => xsd:integer Long`).
+    async fn run_ref_iri_group_by(
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: std::collections::HashMap<String, fluree_db_tabular::ColumnBatch>,
+    ) -> Vec<(String, i64)> {
+        use crate::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use async_trait::async_trait;
+        use fluree_db_core::LedgerSnapshot;
+
+        #[derive(Debug)]
+        struct P {
+            m: Arc<CompiledR2rmlMapping>,
+            b: std::collections::HashMap<String, fluree_db_tabular::ColumnBatch>,
+        }
+        #[async_trait]
+        impl R2rmlProvider for P {
+            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
+                true
+            }
+            async fn compiled_mapping(
+                &self,
+                _gs: &str,
+                _t: Option<i64>,
+            ) -> Result<Arc<CompiledR2rmlMapping>> {
+                Ok(Arc::clone(&self.m))
+            }
+        }
+        #[async_trait]
+        impl R2rmlTableProvider for P {
+            async fn scan_table(
+                &self,
+                _gs: &str,
+                table: &str,
+                _p: &[String],
+                _f: &[ScanFilter],
+                _tk: Option<&crate::r2rml::ScanTopK>,
+                _t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                let b = self
+                    .b
+                    .get(table)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("no batch for table {table}"));
+                Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
+            }
+        }
+
+        let (o, c, cnt) = (VarId(0), VarId(1), VarId(20));
+        // `?o <custRef> ?c` — the object var `?c` is bound by a RefObjectMap predicate,
+        // so the rewrite keeps it as ONE R2rml pattern (single-table path).
+        let mut fact = R2rmlPattern::new("gs", o, Some(c));
+        fact.triples_map_iri = Some("#Order".to_string());
+        fact.predicate_filter = Some("http://ex/custRef".to_string());
+        let plan = FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![Pattern::R2rml(fact)], // passes through the rewrite as-is
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![c],
+            aggregates: vec![(cnt, AggregateFn::CountAll)],
+        };
+        let mut op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let provider = P {
+            m: mapping,
+            b: batches,
+        };
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        op.open(&ctx).await.expect("open");
+        let batch = op
+            .next_batch(&ctx)
+            .await
+            .expect("next_batch")
+            .expect("the fused ref-IRI GROUP BY must produce an output batch, not decline");
+        let n = batch.column(c).map(<[Binding]>::len).unwrap_or(0);
+        let mut out = Vec::with_capacity(n);
+        for row in 0..n {
+            let iri = match batch.get(row, c).expect("group-key binding") {
+                Binding::Iri(s) => s.to_string(),
+                other => panic!("a RefObjectMap group key MUST be an IRI term, got {other:?}"),
+            };
+            let count = match batch.get(row, cnt).expect("count binding") {
+                Binding::Lit {
+                    val: FlakeValue::Long(n),
+                    ..
+                } => *n,
+                other => panic!("COUNT must be an xsd:integer Long, got {other:?}"),
+            };
+            out.push((iri, count));
+        }
+        out.sort();
+        out
+    }
+
+    /// A `#Order --custRef(RefObjectMap CFK->CID)--> #Customer` mapping. The customer
+    /// subject template is caller-chosen so a test can key it on a column OTHER than
+    /// the join column (the keep-min case).
+    fn order_customer_mapping(customer_subject_template: &str) -> Arc<CompiledR2rmlMapping> {
+        use fluree_db_r2rml::mapping::PredicateMap;
+        Arc::new(CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("#Order", "order")
+                .with_subject_template("http://ex/order/{OID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/custRef"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Customer",
+                        "CFK",
+                        "CID",
+                    )),
+                }),
+            TriplesMap::new("#Customer", "customer")
+                .with_subject_template(customer_subject_template),
+        ]))
+    }
+
+    fn i64_col(
+        name: &str,
+        id: i32,
+        vals: Vec<Option<i64>>,
+    ) -> (fluree_db_tabular::FieldInfo, Column) {
+        (
+            fluree_db_tabular::FieldInfo {
+                name: name.to_string(),
+                field_type: fluree_db_tabular::FieldType::Int64,
+                nullable: true,
+                field_id: id,
+            },
+            Column::Int64(vals),
+        )
+    }
+
+    fn str_col(
+        name: &str,
+        id: i32,
+        vals: Vec<Option<String>>,
+    ) -> (fluree_db_tabular::FieldInfo, Column) {
+        (
+            fluree_db_tabular::FieldInfo {
+                name: name.to_string(),
+                field_type: fluree_db_tabular::FieldType::String,
+                nullable: true,
+                field_id: id,
+            },
+            Column::String(vals),
+        )
+    }
+
+    fn batch_of(
+        cols: Vec<(fluree_db_tabular::FieldInfo, Column)>,
+    ) -> fluree_db_tabular::ColumnBatch {
+        let (fields, columns): (Vec<_>, Vec<_>) = cols.into_iter().unzip();
+        let schema = Arc::new(fluree_db_tabular::BatchSchema::new(fields));
+        fluree_db_tabular::ColumnBatch::new(schema, columns).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ref_iri_group_key_folds_to_parent_iris_and_drops_dangling() {
+        // GROUP BY the customer IRI. Orders 1,2 → cust/10; order 3 → cust/20; order 4
+        // has a DANGLING FK (99, no customer) and must drop — exactly what
+        // build_parent_lookup + materialize_pom_object do on the generic path.
+        let mapping = order_customer_mapping("http://ex/cust/{CID}");
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "order".to_string(),
+            batch_of(vec![
+                i64_col("OID", 1, vec![Some(1), Some(2), Some(3), Some(4)]),
+                i64_col("CFK", 2, vec![Some(10), Some(10), Some(20), Some(99)]),
+            ]),
+        );
+        batches.insert(
+            "customer".to_string(),
+            batch_of(vec![i64_col("CID", 1, vec![Some(10), Some(20)])]),
+        );
+        let out = run_ref_iri_group_by(mapping, batches).await;
+        assert_eq!(
+            out,
+            vec![
+                ("http://ex/cust/10".to_string(), 2),
+                ("http://ex/cust/20".to_string(), 1),
+            ],
+            "fused ref-IRI GROUP BY must equal the generic answer (dangling FK dropped)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ref_iri_group_key_keep_min_on_duplicate_parent_key() {
+        // Rider (b): a DUPLICATE parent join key with DISTINCT subjects. The customer
+        // subject is keyed on SID (not the join column CID), so join key 10 mints two
+        // subjects cust/b (row 0) and cust/a (row 1). The generic path
+        // (parent_key_insert_keep_min) keeps the lexicographically SMALLER — cust/a —
+        // so the fused fold must too (last-wins would pick cust/b). One order joins key
+        // 10 → exactly one group cust/a, count 1.
+        let mapping = order_customer_mapping("http://ex/cust/{SID}");
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "order".to_string(),
+            batch_of(vec![
+                i64_col("OID", 1, vec![Some(1)]),
+                i64_col("CFK", 2, vec![Some(10)]),
+            ]),
+        );
+        batches.insert(
+            "customer".to_string(),
+            batch_of(vec![
+                i64_col("CID", 1, vec![Some(10), Some(10)]),
+                str_col("SID", 2, vec![Some("b".to_string()), Some("a".to_string())]),
+            ]),
+        );
+        let out = run_ref_iri_group_by(mapping, batches).await;
+        assert_eq!(
+            out,
+            vec![("http://ex/cust/a".to_string(), 1)],
+            "keep-min must bind the lexicographically smaller parent subject (cust/a), \
+             byte-identical to build_parent_lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn ref_iri_group_key_high_cardinality() {
+        // ~100k distinct customer IRIs exercise the dense-id dict at scale (the
+        // crt_highcard shape): one order per customer → 100k groups, each count 1.
+        const N: i64 = 100_000;
+        let mapping = order_customer_mapping("http://ex/cust/{CID}");
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "order".to_string(),
+            batch_of(vec![
+                i64_col("OID", 1, (0..N).map(Some).collect()),
+                i64_col("CFK", 2, (0..N).map(Some).collect()),
+            ]),
+        );
+        batches.insert(
+            "customer".to_string(),
+            batch_of(vec![i64_col("CID", 1, (0..N).map(Some).collect())]),
+        );
+        let out = run_ref_iri_group_by(mapping, batches).await;
+        assert_eq!(out.len(), N as usize, "one group per distinct customer IRI");
+        assert!(
+            out.iter().all(|(_, count)| *count == 1),
+            "each single-order customer counts exactly 1"
+        );
+        assert_eq!(out[0].0, "http://ex/cust/0");
     }
 
     #[test]
