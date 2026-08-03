@@ -5344,7 +5344,7 @@ fn scaled_verify_provider(
                 Arc::clone(&order_schema),
                 vec![
                     Column::Int64((i..end).map(|k| Some(k as i64)).collect()),
-                    Column::String((i..end).map(|k| Some(format!("{}.25", k))).collect()),
+                    Column::String((i..end).map(|k| Some(format!("{k}.25"))).collect()),
                     Column::Int64(
                         (i..end)
                             .map(|k| Some((k % n_customers.max(1)) as i64))
