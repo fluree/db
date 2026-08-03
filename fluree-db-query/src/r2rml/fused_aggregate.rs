@@ -109,6 +109,7 @@ fn minmax_admissible_datatype(datatype: Option<&str>) -> bool {
 ///   so it replaces only on a strictly-less candidate;
 /// - MAX keeps the LAST maximum (`max_by` returns the last of equal-maximums),
 ///   so it replaces on greater-OR-EQUAL — the later of two equal elements wins.
+///
 /// The `Equal` case is load-bearing: two values that compare equal can still
 /// RENDER differently (double `+0.0` vs `-0.0` → "0" vs "-0"; or a decimal at two
 /// scales — `1.50` vs `1.5`), so picking the wrong one breaks byte-parity with the

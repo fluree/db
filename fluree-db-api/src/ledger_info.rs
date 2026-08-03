@@ -1601,6 +1601,11 @@ fn info_count_budget_ms() -> u64 {
 /// best-effort — a parse / auth / load / metadata failure drops only that table's
 /// count (logged at debug), never the whole response. A Direct-catalog source (no
 /// REST client) returns no counts.
+/// One table's `loadTable` outcome for the virtual-info fan-out:
+/// `(table name, summary row count if present, snapshot id, MoR-approximate?)`.
+#[cfg(feature = "iceberg")]
+type VirtualTableCount = (String, Option<i64>, i64, bool);
+
 #[cfg(feature = "iceberg")]
 async fn fetch_virtual_table_row_counts(
     fluree: &crate::Fluree,
@@ -1679,7 +1684,7 @@ async fn fetch_virtual_table_row_counts(
     // client. `.buffered` (not `buffer_unordered`) preserves request order, so the
     // snapshot pin (first successful table) is deterministic for the sorted
     // `tables`.
-    let per_table: Vec<Option<(String, Option<i64>, i64, bool)>> =
+    let per_table: Vec<Option<VirtualTableCount>> =
         futures::stream::iter(tables.iter().cloned())
             .map(|table| {
                 let catalog = Arc::clone(&catalog);

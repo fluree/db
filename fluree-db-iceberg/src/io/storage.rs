@@ -501,7 +501,7 @@ impl S3IcebergStorage {
         if !parallel_range_gets_enabled() {
             let mut out = Vec::with_capacity(ranges.len());
             for range in ranges {
-                out.push(self.get_object_range(&bucket, &key, range).await?);
+                out.push(self.get_object_range(bucket, key, range).await?);
             }
             return Ok(out);
         }
