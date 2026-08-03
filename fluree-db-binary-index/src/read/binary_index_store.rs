@@ -258,6 +258,11 @@ pub struct BinaryIndexStore {
     ns_split_mode: NsSplitMode,
     /// Whether `set_ns_split_mode` was called. Debug-asserted on first encode.
     ns_split_mode_set: bool,
+    /// Lazily-built persisted `p_id → Sid` table, shared by scan operators.
+    /// Initialized on first query use — always after load-time `&mut`
+    /// configuration (`set_ns_split_mode`, namespace augmentation), which
+    /// cannot occur once the store is behind `Arc`.
+    p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
 }
 
 impl BinaryIndexStore {
@@ -382,6 +387,7 @@ impl BinaryIndexStore {
             lex_sorted_string_ids: root.lex_sorted_string_ids,
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
+            p_sid_table: std::sync::OnceLock::new(),
         })
     }
 
@@ -988,8 +994,21 @@ impl BinaryIndexStore {
                 fluree_db_core::temporal::DayTimeDuration::from_micros(key.decode_day_time_dur()),
             ))),
             DecodeKind::Duration => {
-                // Compound duration — not yet fully supported in V5 either.
-                Ok(FlakeValue::Null)
+                // Generic duration: o_key is the string-dictionary id of the
+                // canonical lexical form (see the resolver's DurationStr arm).
+                let s = self.resolve_string_value(o_key as u32).map_err(|e| {
+                    tracing::debug!(
+                        g_id,
+                        str_id = o_key as u32,
+                        error = %e,
+                        "binary index failed to resolve duration lexical value"
+                    );
+                    e
+                })?;
+                match fluree_db_core::temporal::Duration::parse(&s) {
+                    Ok(d) => Ok(FlakeValue::Duration(Box::new(d))),
+                    Err(_) => Ok(FlakeValue::String(s)),
+                }
             }
             DecodeKind::GeoPoint => Ok(FlakeValue::GeoPoint(fluree_db_core::GeoPointBits(o_key))),
             DecodeKind::BlankNode => {
@@ -1434,6 +1453,25 @@ impl BinaryIndexStore {
     /// Resolve a predicate ID to its IRI.
     pub fn resolve_predicate_iri(&self, p_id: u32) -> Option<&str> {
         self.dicts.predicates.resolve(p_id)
+    }
+
+    /// Shared persisted `p_id → Sid` table, built once per store on first use.
+    ///
+    /// Scan opens previously rebuilt this table (one dictionary resolve +
+    /// namespace encode per predicate) on every call — a fixed cost
+    /// proportional to the ledger's predicate count that dominated
+    /// bound-subject point lookups.
+    pub fn p_sid_table(&self) -> &Arc<[Sid]> {
+        self.p_sid_table.get_or_init(|| {
+            let mut table = Vec::new();
+            for p_id in 0u32.. {
+                match self.resolve_predicate_iri(p_id) {
+                    Some(iri) => table.push(self.encode_iri(iri)),
+                    None => break,
+                }
+            }
+            table.into()
+        })
     }
 
     /// Lookup a predicate IRI → p_id.
@@ -2270,6 +2308,18 @@ impl BinaryGraphView {
                             return Ok(FlakeValue::Json(s));
                         }
                     }
+                    DecodeKind::Duration => {
+                        // Generic durations are string-dict-backed; an overlay
+                        // row can carry a novelty string id (the canonical
+                        // lexical interned by an unrelated novelty string),
+                        // which the store's base-only resolve cannot see.
+                        if let Some(s) = self.resolve_novel_string(dn, o_key as u32) {
+                            return Ok(match fluree_db_core::temporal::Duration::parse(&s) {
+                                Ok(d) => FlakeValue::Duration(Box::new(d)),
+                                Err(_) => FlakeValue::String(s),
+                            });
+                        }
+                    }
                     _ => {} // Non-dict types: straight to store
                 }
             }
@@ -2278,7 +2328,10 @@ impl BinaryGraphView {
         // encoded) and we didn't already satisfy it from novelty above.
         if matches!(
             kind,
-            DecodeKind::IriRef | DecodeKind::StringDict | DecodeKind::JsonArena
+            DecodeKind::IriRef
+                | DecodeKind::StringDict
+                | DecodeKind::JsonArena
+                | DecodeKind::Duration
         ) {
             self.charge_dict_touch()?;
         }
@@ -3011,6 +3064,7 @@ mod tests {
             lex_sorted_string_ids: false,
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
+            p_sid_table: std::sync::OnceLock::new(),
         }
     }
 

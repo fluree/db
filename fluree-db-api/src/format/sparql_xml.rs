@@ -460,6 +460,7 @@ mod tests {
             output: fluree_db_query::ir::QueryOutput::select_all(vec![]),
             batches: vec![],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 
@@ -520,6 +521,7 @@ mod tests {
             output: fluree_db_query::ir::QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 

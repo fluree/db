@@ -4,6 +4,10 @@ Architecture and design documents for Fluree's internal systems. These documents
 
 ## Documents
 
+### [Performance architecture](performance.md)
+
+Why Fluree is fast, layer by layer: integer-ID execution, columnar leaflets with region-selective decompression, directory-only aggregates, the cost model and its tested invariants, the specialized join operators, the 16 fast-path operators and their fallback contract, batched frontier traversal, and where parallelism is and isn't applied. Includes measured head-to-head results and a frank account of current limits.
+
 ### [Query execution and overlay merge](query-execution.md)
 
 How queries run through a single preparation/execution pipeline, how scan operators select the binary-cursor path vs the range fallback, and where overlay novelty merges with indexed data (including graph scoping boundaries).
@@ -30,7 +34,7 @@ The content-addressed identity layer: `ContentId` type, `ContentStore` trait, mu
 
 ### [Index Format](index-format.md)
 
-Binary columnar index format: branch/leaf/leaflet hierarchy, dictionary artifacts, SPOT/PSOT/POST/OPST/TSPO layout, and encoding details.
+Binary columnar index format: branch/leaf/leaflet hierarchy, dictionary artifacts, SPOT/PSOT/POST/OPST layout, and encoding details.
 
 ### [Edge annotations (storage internals)](edge-annotations.md)
 

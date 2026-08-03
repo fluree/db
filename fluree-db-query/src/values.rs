@@ -12,10 +12,18 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
+
+/// Below this many value rows the plain per-row scan over `value_rows` is
+/// cheap enough; the hash lane only pays off when the input × values
+/// product is large (a 21k-row UNWIND joined against a broad child scan
+/// burned ~30 s in pairwise compatibility checks).
+const VALUES_HASH_MIN_ROWS: usize = 16;
 
 /// VALUES operator - injects constant solutions into the stream
 ///
@@ -35,6 +43,25 @@ pub struct ValuesOperator {
     /// Reverse mapping: child column index → index into `overlap_positions` / `value_rows`.
     /// Pre-computed at construction for O(1) lookup in `merge_rows`.
     child_col_to_val_idx: std::collections::HashMap<usize, usize>,
+    /// Hash lane over `value_rows`, keyed on the overlapping columns'
+    /// representation-normalized keys. Built lazily on the first batch
+    /// (normalization needs the execution context) when there is at least
+    /// one overlap and [`VALUES_HASH_MIN_ROWS`]+ value rows. A hash hit is
+    /// only a PREFILTER — every candidate still passes `is_compatible`, so
+    /// the lane can never admit a wrong row; rows that could produce hash
+    /// false-negatives are excluded up front (see `hash_fragile`).
+    value_index: Option<FxHashMap<CompositeGroupKey, Vec<usize>>>,
+    /// Value rows the hash cannot key exactly (an unbound/poisoned overlap
+    /// binding is a wildcard; Iri/IriMatch compare through SID decoding) —
+    /// always scanned per input row alongside any hash bucket.
+    fallback_value_rows: Vec<usize>,
+}
+
+/// Binding classes whose VALUES compatibility goes through decode-based
+/// comparison (`Sid` vs `Iri`/`IriMatch`), which a normalized hash key
+/// cannot reproduce — such rows keep the scan path.
+fn hash_fragile(b: &Binding) -> bool {
+    matches!(b, Binding::Iri(_) | Binding::IriMatch { .. })
 }
 
 impl ValuesOperator {
@@ -85,6 +112,8 @@ impl ValuesOperator {
             state: OperatorState::Created,
             overlap_positions,
             child_col_to_val_idx,
+            value_index: None,
+            fallback_value_rows: Vec::new(),
         }
     }
 
@@ -121,6 +150,37 @@ impl ValuesOperator {
             }
         }
         true
+    }
+
+    /// Build the value-row hash lane (see the field docs). Called once per
+    /// open, on the first batch.
+    fn build_value_index(&mut self, ctx: &ExecutionContext<'_>) {
+        let has_overlap = self.overlap_positions.iter().any(Option::is_some);
+        if !has_overlap || self.value_rows.len() < VALUES_HASH_MIN_ROWS {
+            return;
+        }
+        let gv = ctx.graph_view();
+        let store_arc = crate::object_binding::equality_norm_store(ctx);
+        let store = store_arc.as_deref();
+        let mut index: FxHashMap<CompositeGroupKey, Vec<usize>> = FxHashMap::default();
+        let mut fallback: Vec<usize> = Vec::new();
+        'rows: for (i, row) in self.value_rows.iter().enumerate() {
+            let mut keys = Vec::new();
+            for (val_idx, overlap_pos) in self.overlap_positions.iter().enumerate() {
+                if overlap_pos.is_none() {
+                    continue;
+                }
+                let b = &row[val_idx];
+                if b.is_unbound_or_poisoned() || hash_fragile(b) {
+                    fallback.push(i);
+                    continue 'rows;
+                }
+                keys.push(binding_to_group_key_normalized(b, store, gv.as_ref()));
+            }
+            index.entry(CompositeGroupKey(keys)).or_default().push(i);
+        }
+        self.fallback_value_rows = fallback;
+        self.value_index = Some(index);
     }
 
     /// Merge an input row with a compatible value row
@@ -170,6 +230,9 @@ impl Operator for ValuesOperator {
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
+        self.value_index = None;
+        self.fallback_value_rows.clear();
+        self.build_value_index(ctx);
         Ok(())
     }
 
@@ -197,7 +260,14 @@ impl Operator for ValuesOperator {
             return Ok(Some(Batch::empty(self.schema.clone())?));
         }
 
-        // Build output: for each input row × each value row, check compatibility
+        // Build output: for each input row × each value row, check compatibility.
+        // The nested match is O(input_rows × value_rows); when a VALUES set is joined
+        // against a large (e.g. un-lowered graph-source) child, that product can burn
+        // a long uncancelled stretch. Poll cancellation per batch so a deadline /
+        // RSS-watchdog signal stops it (W4-3: the round-3b #9 VALUES-over-GlJournal
+        // shape). Plain `check_cancelled` — this operator streams and retains no
+        // buffer beyond the current batch, so it needs no memory-budget checkpoint.
+        ctx.check_cancelled()?;
         let num_cols = self.schema.len();
         let child_num_cols = self.child.schema().len();
         let max_rows = input_batch.len() * self.value_rows.len();
@@ -205,19 +275,62 @@ impl Operator for ValuesOperator {
             .map(|_| Vec::with_capacity(max_rows))
             .collect();
 
+        let gv = ctx.graph_view();
+        let norm_store_arc = crate::object_binding::equality_norm_store(ctx);
+        let norm_store = norm_store_arc.as_deref();
         for row_idx in 0..input_batch.len() {
             // Get input row as slice of references
             let input_row: Vec<&Binding> = (0..child_num_cols)
                 .map(|col| input_batch.get_by_col(row_idx, col))
                 .collect();
 
-            for value_row in &self.value_rows {
+            // Hash lane: probe only the value rows sharing this row's
+            // normalized overlap key (plus the wildcard/fragile fallback
+            // set). A hash hit still passes through `is_compatible`, so
+            // this only ever removes provably-mismatching candidates. A
+            // row whose own overlap bindings are unbound or fragile keys
+            // nothing exactly — it scans the full set like before.
+            let bucket: Option<&Vec<usize>> = self.value_index.as_ref().and_then(|index| {
+                let mut keys = Vec::new();
+                for overlap_pos in self.overlap_positions.iter().flatten() {
+                    let b = input_row[*overlap_pos];
+                    if b.is_unbound_or_poisoned() || hash_fragile(b) {
+                        return None;
+                    }
+                    keys.push(binding_to_group_key_normalized(b, norm_store, gv.as_ref()));
+                }
+                Some(
+                    index
+                        .get(&CompositeGroupKey(keys))
+                        .unwrap_or(const { &Vec::new() }),
+                )
+            });
+
+            let check_and_merge = |value_row: &[Binding], columns: &mut Vec<Vec<Binding>>| {
                 if self.is_compatible(ctx, &input_row, value_row) {
-                    // Merge and add to output
                     let merged = self.merge_rows(&input_row, value_row);
                     for (col_idx, binding) in merged.into_iter().enumerate() {
                         columns[col_idx].push(binding);
                     }
+                }
+            };
+
+            if let Some(bucket) = bucket {
+                // Emit candidates in original value-row order (bucket and
+                // fallback are each ascending; merging them keeps the scan
+                // path's output order byte-identical).
+                let mut idxs: Vec<usize> = bucket
+                    .iter()
+                    .chain(self.fallback_value_rows.iter())
+                    .copied()
+                    .collect();
+                idxs.sort_unstable();
+                for i in idxs {
+                    check_and_merge(&self.value_rows[i], &mut columns);
+                }
+            } else {
+                for value_row in &self.value_rows {
+                    check_and_merge(value_row, &mut columns);
                 }
             }
         }

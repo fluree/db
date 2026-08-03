@@ -1,0 +1,37 @@
+[package]
+name = "fluree-bench-virtual"
+description = "vbench: corpus benchmark runner comparing SPARQL execution across a native materialized ledger and R2RML/Iceberg virtual graph sources (per-query wall time, pathway span counters, result-correctness hashing)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A single binary. The crate is a runner, not a library — its schema types live
+# in `src/schema.rs` and are exercised by the in-crate unit tests.
+[[bin]]
+name = "vbench"
+path = "src/main.rs"
+
+[dependencies]
+# The engine under test. `iceberg` pulls in the R2RML/Iceberg read path (and the
+# `with_r2rml()` builder method) plus the AWS SDK the Snowflake REST catalog needs.
+fluree-db-api = { path = "../fluree-db-api", features = ["iceberg"] }
+# `QueryCancellation` for cooperative per-query deadlines.
+fluree-db-core = { path = "../fluree-db-core" }
+# BenchSpanCapture / BenchSpanLayer for pathway span counters.
+fluree-bench-support = { path = "../fluree-bench-support" }
+
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+ulid = { workspace = true }
+anyhow = "1"
+
+[lints]
+workspace = true

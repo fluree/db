@@ -1,0 +1,9 @@
+# q021 gl_account_code_range
+# Intent: Integer-range FILTER on GL (H4 int-positive control; prunes on virtual).
+# BI lineage (BI-12): "Which GL entries fall in account-code band 40000-49999?"
+# Predicates verified against enterprise.ttl — FactGlJournal: glAccountCode, debitAmount.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?code ?deb
+WHERE { ?j a edw:GlJournalEntry ; edw:glAccountCode ?code ; edw:debitAmount ?deb .
+        FILTER(?code >= 40000 && ?code < 50000) }
+LIMIT 5000

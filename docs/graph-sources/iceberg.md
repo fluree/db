@@ -50,6 +50,10 @@ fluree iceberg map orders \
 
 Once mapped, graph sources appear in `fluree list`, can be inspected with `fluree info`, and removed with `fluree drop`. See [CLI iceberg reference](../cli/iceberg.md) for all options.
 
+#### Warehouse-root `--table-location` (multi-table, catalog-less)
+
+`--table-location` normally points at a single table's root directory. It may instead point at a **database / namespace root** — e.g. `s3://bucket/warehouse/dw` — for a catalog-less copy whose table directories carry random suffixes (a Snowflake-managed Iceberg database writes `fact_order.UIHGsQex/`, not `fact_order/`). With an `--r2rml` mapping, each `rr:tableName` (e.g. `DW.FACT_ORDER`) is resolved to its own directory under the root via a single S3 `LIST`, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively on the name (the namespace prefix stripped). Warehouse-root mode is **auto-detected** when the location's leaf directory does not name the requested table; a bare single-table location resolves exactly as before. (A table named identically to its own parent directory reads as single-table.) No catalog or OAuth flags are needed — direct mode reads with ambient IAM credentials.
+
 ### HTTP API
 
 When running the Fluree server (or Docker image) with the `iceberg` feature enabled, map a table by POSTing to `{api_base_url}/iceberg/map` (default: `/v1/fluree/iceberg/map`). The endpoint is admin-protected — include the admin Bearer token if admin auth is configured.
@@ -520,11 +524,52 @@ GROUP BY ?region ?category
 ORDER BY DESC(?total)
 ```
 
+## Materializing a Native Twin
+
+Querying a virtual Iceberg source pays catalog + S3 latency on every query. For a stable, low-latency copy, **materialize** it into a native ledger — a *twin* — with [`fluree materialize`](../cli/materialize.md):
+
+```bash
+fluree materialize warehouse-orders:main --output ledger --verify full
+```
+
+A twin is an ordinary, fully-indexed Fluree ledger holding a point-in-time snapshot of the virtual source, so it supports the full query surface (SPARQL / JSON-LD / Cypher), time travel, branching, policy, and `.flpack` export — with none of the per-query catalog/S3 round-trips.
+
+### The completion stamp and watermark
+
+The build writes a **completion stamp** into the twin's *final* commit (in the `https://ns.flur.ee/materialize#` namespace): `builderVersion`, `mappingHash` (a SHA-256 of the R2RML mapping — a mapping change invalidates the twin), the `watermark` (the per-table pinned Iceberg snapshot vector captured at build time, what a delta-sync reads), and a `sampleSeed`. The contract is: **a twin is valid iff a head-walk finds this stamp** — a build that dies mid-way leaves the head commit unstamped, so a partial twin is detectable. A **pin-all pre-pass** pins every table's current snapshot up front so the watermark reflects one narrow window rather than the whole build duration.
+
+### Verification modes
+
+Before a twin is announced, a memory-bounded parity gate re-checks it against the source:
+
+- **`quick`** (default) — per-class counts + a seeded 3-subjects-per-class sample against the build's *own* enumerator. A **shared oracle**: catches ingest/index corruption, but not enumerator-logic bugs (they appear identically on both sides).
+- **`full`** — a whole-twin triple diff (the twin streamed in a single linear pass over the binary index), external-sorted and diffed under a bounded working set.
+
+A failed gate drops the twin so nothing unverified stays announced. See the [`fluree materialize`](../cli/materialize.md) reference for the full flow, the machine-safety posture, and `--tmp-dir`.
+
 ## Limitations
 
 1. **Read-Only:** Iceberg graph sources are read-only (no writes via Fluree)
 2. **Complex Joins:** Large joins between Fluree and Iceberg may be slow
 3. **No Full-Text Search:** Use Fluree's BM25 for text search
+4. **Merge-on-read deletes are not yet applied (fail-closed):** Fluree reads the
+   live data files of a snapshot but does **not** apply Iceberg *merge-on-read*
+   position/equality delete files. To avoid silently returning deleted rows (or
+   over-counting `COUNT(*)`/row totals), a query over a snapshot that carries
+   delete files is **refused** with a `Merge-on-read deletes not applied` error.
+   Copy-on-write deletes (the Snowflake-managed v2 default today) rewrite data
+   files and are handled correctly — this only affects tables written with
+   merge-on-read semantics (e.g. Athena `DELETE`, Flink/CDC upserts, Snowflake v3
+   deletion vectors, or Snowflake v2 once `ENABLE_ICEBERG_MERGE_ON_READ` is on).
+   See the switch below to override.
+
+### Environment switches
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `FLUREE_ICEBERG_ALLOW_MOR_DELETES` | off | When truthy (`1`/`true`/`yes`/`on`), **disables** the fail-closed merge-on-read guard: delete files are ignored and the read proceeds. **Results may include deleted rows and row counts may be over-counted.** A one-time warning is logged per table. |
+| `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | When falsy (`0`/`false`/`off`), disables row-group / row-level predicate pushdown during Parquet reads. |
+| `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch; `0` returns structure only. |
 
 ## Troubleshooting
 

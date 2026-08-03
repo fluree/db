@@ -26,14 +26,18 @@ use fluree_db_cypher::ast::{
 use fluree_db_ledger::LedgerState;
 use fluree_db_transact::ir::Txn;
 
-/// A lowered Cypher write: either a ready-to-stage `Txn`, or a conditional
-/// write that must probe the writer snapshot before it can be resolved.
+/// A lowered Cypher write: a ready-to-stage `Txn`, a conditional write that
+/// must probe the writer snapshot before it can be resolved, or a
+/// multi-clause statement the sequential driver executes.
 pub enum WritePlan {
     /// A ready-to-stage transaction.
     Single(Box<Txn>),
     /// A write needing a pre-write probe. Boxed (both variants embed a large
     /// AST clause).
     Conditional(Box<ConditionalCypherWrite>),
+    /// A multi-clause write statement staged clause-by-clause into one commit
+    /// (see [`crate::cypher_seq`]).
+    Sequential(Box<crate::cypher_seq::SequentialCypherWrite>),
 }
 
 /// The outcome of resolving a [`ConditionalCypherWrite`] against the writer
@@ -760,7 +764,7 @@ fn collect_part_vars<'a>(part: &'a PatternPart, out: &mut std::collections::Hash
 /// The skolemized Sid a created entity resolves to (mirrors
 /// `FlakeGenerator::skolemize_blank_node`: key `{txn_id}-{solution}-{label}`,
 /// blank-node local `fdb-{key}`).
-fn skolem_sid(skolem_txn_id: &str, solution: u64, label: &str) -> fluree_db_core::Sid {
+pub(crate) fn skolem_sid(skolem_txn_id: &str, solution: u64, label: &str) -> fluree_db_core::Sid {
     let local = format!(
         "{}-{skolem_txn_id}-{solution}-{label}",
         fluree_db_transact::BLANK_NODE_ID_PREFIX

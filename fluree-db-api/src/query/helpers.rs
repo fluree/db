@@ -271,13 +271,16 @@ pub(crate) fn lower_cypher_ast_to_ir(
 
     let mut vars = VarRegistry::new();
     let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars)
-        .with_vocab_opt(vocab)
+        .with_vocab_opt(vocab.clone())
         .with_allow_full_scan(cypher_full_scan_enabled())
         .with_reified_edges_possible(reified_edges_possible(snapshot, overlay));
     if !overrides.is_empty() {
         ctx = ctx.with_overrides(overrides);
     }
-    let parsed = fluree_db_cypher::lower_cypher_with_context(ast, &mut ctx)?;
+    let mut parsed = fluree_db_cypher::lower_cypher_with_context(ast, &mut ctx)?;
+    // Carried to `labels()`/`type()`/`keys()` evaluation so name compaction
+    // matches `db.labels()` (vocab-strip or full IRI).
+    parsed.cypher_vocab = vocab.map(std::sync::Arc::from);
     Ok((vars, parsed))
 }
 
@@ -437,6 +440,10 @@ pub(crate) fn build_query_result(
         output: parsed.output,
         batches,
         binary_graph,
+        // Default: not a graph-source result. The R2RML execution path
+        // (`query_view_with_r2rml_options`) overrides this to true so the
+        // sparql_json formatter CURIE-compacts graph-source IRIs (F9).
+        from_graph_source: false,
     }
 }
 
@@ -618,6 +625,10 @@ pub(crate) fn status_for_query_error(err: &fluree_db_query::QueryError) -> u16 {
     match err {
         fluree_db_query::QueryError::FuelLimitExceeded(_) => 400,
         fluree_db_query::QueryError::Cancelled { .. } => 408,
+        // R3-B: the in-memory join/aggregate budget guard — 507 (Insufficient
+        // Storage), distinct from the 408 timeout so the caller degrades on it
+        // specifically (a query too memory-heavy, not a slow one).
+        fluree_db_query::QueryError::MemoryBudgetExceeded { .. } => 507,
         fluree_db_query::QueryError::InvalidQuery(_) => 400,
         fluree_db_query::QueryError::InvalidFilter(_) => 400,
         fluree_db_query::QueryError::InvalidExpression(_) => 400,

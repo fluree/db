@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_duration_index_roundtrip.rs"]
+mod it_duration_index_roundtrip;
 #[path = "it_indexing_fuel.rs"]
 mod it_indexing_fuel;
 #[path = "it_indexing_stats.rs"]

@@ -22,6 +22,7 @@ use crate::fast_group_count_firsts::{
 };
 use crate::fast_label_regex_type::label_regex_type_operator;
 use crate::fast_min_max_string::{predicate_min_max_string_operator, MinMaxMode};
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::fast_path_plus_count_all::{
     property_path_plus_count_all_operator, transitive_path_plus_count_all_operator,
 };
@@ -55,7 +56,7 @@ use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
 use crate::sort::SortSpec;
-use crate::stats_query::StatsCountByPredicateOperator;
+use crate::stats_query::stats_count_by_predicate_operator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_core::StatsView;
@@ -1680,6 +1681,15 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
     if !query.order_binds.is_empty() {
         return None;
     }
+    // OFFSET is applied twice when this operator declines at open() time and
+    // its fallback runs: the fallback tree already applies the full modifier
+    // stack, and the dispatch below wraps modifiers (including OFFSET) around
+    // this operator again. Sort/project/distinct/limit are idempotent under
+    // that re-wrapping; OFFSET is not. Decline and let the generic pipeline
+    // handle it.
+    if query.offset.is_some() {
+        return None;
+    }
     // Must have stats available (checked by caller)
     // Must have exactly one triple pattern with all variables
     if query.patterns.len() != 1 {
@@ -2175,6 +2185,43 @@ fn detect_union_star_count_all(
     Some((union_preds, extra_preds, mode, out_var))
 }
 
+/// Global fast-path kill switch.
+///
+/// When set (programmatically via [`set_fast_paths_disabled`] or via the
+/// `FLUREE_DISABLE_QUERY_FAST_PATHS` env var), the planner skips every
+/// `detect_*` shape recognizer — the fused chain *and* the history-gated
+/// non-fused paths — and always builds the generic operator pipeline.
+///
+/// This exists for the differential correctness harness
+/// (`fluree-db-api/tests/it_differential_fastpath.rs`), which runs the same
+/// query with fast paths on and off and asserts identical results, and as
+/// an operational escape hatch when triaging a suspected fast-path bug.
+/// It is NOT a tuning knob: runtime operator-internal optimizations
+/// (cursor selection, batched joins) are unaffected.
+static FAST_PATHS_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Disable (or re-enable) planner fast paths process-wide. Test/triage use.
+///
+/// Env-override footgun: [`fast_paths_disabled`] OR's this flag with the
+/// `FLUREE_DISABLE_QUERY_FAST_PATHS` env var (read once per process), so when
+/// that env var is set `set_fast_paths_disabled(false)` CANNOT re-enable fast
+/// paths. A harness that toggles fast paths on and off to compare their results
+/// (the differential harness) must run with the env var UNSET — otherwise its
+/// fast-paths-on phase silently runs generically and every fast-vs-generic
+/// assertion passes vacuously. That harness guards against this at startup.
+pub fn set_fast_paths_disabled(disabled: bool) {
+    FAST_PATHS_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when planner fast paths are disabled, either programmatically or
+/// via `FLUREE_DISABLE_QUERY_FAST_PATHS` (read once per process).
+pub fn fast_paths_disabled() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    FAST_PATHS_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+        || *ENV.get_or_init(|| std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_some())
+}
+
 /// Build the complete operator tree for a query
 ///
 /// Constructs operators in the order:
@@ -2230,6 +2277,23 @@ fn build_operator_tree_inner(
     enable_fused_fast_paths: bool,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // Global kill switch (differential harness / triage): force the generic
+    // pipeline for the fused chain and the non-fused history-gated paths
+    // below alike.
+    let fast_paths_globally_disabled = fast_paths_disabled();
+    let enable_fused_fast_paths = enable_fused_fast_paths && !fast_paths_globally_disabled;
+    // EXPLAIN seed (PR-1): record whether the kill switch suppressed the fused
+    // fast-path chain at this gate. TODO(PR-3): per-detector verdicts, not one
+    // aggregate chain stamp.
+    stamp_fast_path(
+        "fused_chain",
+        if fast_paths_globally_disabled {
+            FastPathOutcome::Fallback(FastPathFallback::KillSwitch)
+        } else {
+            FastPathOutcome::Proceed
+        },
+    );
+
     // Phase 5 of the planner-mode refactor: fast paths emit current-state
     // bindings (no `op` channel, no retract events) and don't consult the
     // history sidecar. In `History` mode they're semantically wrong, so the
@@ -2493,6 +2557,15 @@ fn build_operator_tree_inner(
             let mut op: BoxedOperator = Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
                 plan, fallback,
             ));
+            // PR-6: HAVING filters the grouped rows before ORDER BY (SPARQL order:
+            // WHERE → GROUP → HAVING → ORDER → LIMIT). The fused op emits exactly
+            // the projected group + aggregate vars (detect's projection check
+            // rejects any HAVING referencing an unprojected aggregate), so the
+            // HAVING expression sees only variables in the fused output — no
+            // output trim is needed.
+            if let Some(having) = query.grouping.as_ref().and_then(|g| g.having()) {
+                op = Box::new(crate::having::HavingOperator::new(op, having.clone()));
+            }
             // The fused operator emits the final grouped result; apply ORDER BY /
             // OFFSET / LIMIT on top with the engine's own operators (exact
             // semantics on the small grouped output).
@@ -2774,10 +2847,11 @@ fn build_operator_tree_inner(
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
     // Skipped in `History` mode for the same reason as the fused fast paths above:
     // the path emits current-state counts and ignores retracts.
-    if !planning.is_history() {
+    if !planning.is_history() && !fast_paths_globally_disabled {
         if let Some((pred, s_var, o_var, count_var, limit)) =
             detect_predicate_group_by_object_count_topk(query)
         {
+            stamp_fast_path("group_by_object_count_topk", FastPathOutcome::Proceed);
             return Ok(Box::new(PredicateGroupCountFirstsOperator::new(
                 s_var,
                 o_var,
@@ -2804,8 +2878,9 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
     // Skipped in `History` mode (current-state count semantics).
-    if !planning.is_history() {
+    if !planning.is_history() && !fast_paths_globally_disabled {
         if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
+            stamp_fast_path("predicate_object_count", FastPathOutcome::Proceed);
             let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
                 pred,
                 s_var,
@@ -2847,71 +2922,81 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: stats-based count-by-predicate query
-    // This avoids scanning all triples when we can answer directly from IndexStats.
-    // Skipped in `History` mode — IndexStats reflects current-state cardinality,
-    // not the asserts + retracts a history-range query needs.
-    if !planning.is_history() {
-        if let Some(ref stats_view) = stats {
-            if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
-                // Build the policy-enforced fallback: the same query as a generic
-                // GROUP BY, producing the operator's internal `[pred, count]`
-                // schema (output forced to those two vars; ORDER BY / LIMIT /
-                // OFFSET stripped, since those wrap the stats operator below).
-                // Recurse with stats disabled so this fast path isn't re-entered.
-                // The operator streams from this fallback when a view policy is
-                // active (the whole-index stats counts can't be trusted then).
-                let mut fallback_query = query.clone();
-                fallback_query.output = QueryOutput::select_all(vec![pred_var, count_var]);
-                fallback_query.ordering = Vec::new();
-                fallback_query.order_binds = Vec::new();
-                fallback_query.limit = None;
-                fallback_query.offset = None;
-                let fallback = build_operator_tree_inner(
-                    &fallback_query,
-                    None,
-                    enable_fused_fast_paths,
-                    planning,
-                )?;
+    // Fast-path: per-predicate count answered from POST leaf-directory metadata
+    // (exact — see stats_query.rs for why the old IndexStats numbers were wrong
+    // answers, differential harness FD-3). Skipped in `History` mode (directory
+    // rows are current-state only) and under the kill switch. `stats.is_some()`
+    // both keeps the probe to plausibly-indexed ledgers AND is the re-entry
+    // guard — the fallback below recurses with `stats = None`, so a false here on
+    // that recursion stops this fast path re-wrapping itself. The operator's
+    // open()-time gate (`fast_path_store`) is the real guard, declining to the
+    // generic fallback under overlay novelty, time-travel, a non-root policy, or
+    // multi-ledger.
+    if !planning.is_history() && !fast_paths_globally_disabled && stats.is_some() {
+        if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
+            // EXPLAIN seed (PR-1): planned here; the FastPathOperator below
+            // stamps the runtime Proceed/Fallback(GateDeclined) at open().
+            stamp_fast_path("stats_count_by_predicate", FastPathOutcome::Proceed);
+            // Build the fallback: the same query as a generic GROUP BY,
+            // producing the operator's internal `[pred, count]` schema (output
+            // forced to those two vars; ORDER BY / LIMIT / OFFSET stripped,
+            // since those wrap the operator below). Recurse with stats=None so
+            // this fast path isn't re-entered. The operator streams from this
+            // fallback whenever the directory-count gate declines (overlay,
+            // time-travel, policy, multi-ledger) — which also keeps a non-root
+            // policy's restricted predicates from leaking through stale counts.
+            let mut fallback_query = query.clone();
+            fallback_query.output = QueryOutput::select_all(vec![pred_var, count_var]);
+            fallback_query.ordering = Vec::new();
+            fallback_query.order_binds = Vec::new();
+            fallback_query.limit = None;
+            fallback_query.offset = None;
+            let fallback = build_operator_tree_inner(
+                &fallback_query,
+                None,
+                enable_fused_fast_paths,
+                planning,
+            )?;
 
-                let mut operator: BoxedOperator = Box::new(StatsCountByPredicateOperator::new(
-                    Arc::clone(stats_view),
-                    pred_var,
-                    count_var,
-                    Some(fallback),
-                ));
+            let mut operator: BoxedOperator = Box::new(stats_count_by_predicate_operator(
+                pred_var,
+                count_var,
+                Some(fallback),
+            ));
 
-                // ORDER BY (on predicate or count)
-                if !query.ordering.is_empty() {
-                    operator = Box::new(SortOperator::new(operator, query.ordering.clone()));
-                }
-
-                // PROJECT (select specific columns)
-                if let Some(vars) = query.output.projected_vars() {
-                    if !vars.is_empty() {
-                        operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
-                    }
-                }
-
-                // DISTINCT
-                if query.output.is_distinct() {
-                    operator = Box::new(crate::distinct::DistinctOperator::new(operator));
-                }
-
-                // OFFSET
-                if let Some(offset) = query.offset {
-                    if offset > 0 {
-                        operator = Box::new(OffsetOperator::new(operator, offset));
-                    }
-                }
-
-                // LIMIT
-                if let Some(limit) = query.limit {
-                    operator = Box::new(LimitOperator::new(operator, limit));
-                }
-
-                return Ok(operator);
+            // ORDER BY (on predicate or count)
+            if !query.ordering.is_empty() {
+                operator = Box::new(SortOperator::new(operator, query.ordering.clone()));
             }
+
+            // PROJECT (select specific columns)
+            if let Some(vars) = query.output.projected_vars() {
+                if !vars.is_empty() {
+                    operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
+                }
+            }
+
+            // DISTINCT
+            if query.output.is_distinct() {
+                operator = Box::new(crate::distinct::DistinctOperator::new(operator));
+            }
+
+            // OFFSET: unreachable. detect_stats_count_by_predicate declines any
+            // query with `offset.is_some()` (~:1690) — OFFSET is not idempotent
+            // when the fallback re-applies the full modifier stack — so it is
+            // always None here. Asserted rather than wrapped so the next reader
+            // need not re-derive the double-OFFSET analysis.
+            debug_assert!(
+                query.offset.is_none(),
+                "stats-count dispatch reached with OFFSET set; the detector must decline it"
+            );
+
+            // LIMIT
+            if let Some(limit) = query.limit {
+                operator = Box::new(LimitOperator::new(operator, limit));
+            }
+
+            return Ok(operator);
         }
     }
 
@@ -2945,12 +3030,45 @@ fn build_operator_tree_inner(
         .flat_map(Grouping::group_by_vars)
         .collect();
 
+    // WHERE-level early dedup (project away dead vars, collapse duplicate rows
+    // between joins) is sound only when downstream cannot observe row
+    // multiplicity. With a grouping phase there are two consumers to clear:
+    // every aggregate must be duplicate-insensitive (COUNT/SUM/AVG/… DISTINCT,
+    // or MIN/MAX/SAMPLE), AND nothing may read a non-key variable raw. A
+    // non-key variable surviving the grouping stage comes out as a per-group
+    // LIST (the JSON-LD grouped projection), which observes multiplicity —
+    // note `aggregates()` is empty for a dedup-only `GROUP BY ?g`, where the
+    // aggregate check alone is vacuously true. An outer SELECT DISTINCT does
+    // NOT license dedup — it dedups result rows *after* aggregation, so a
+    // plain COUNT under it still observes pre-aggregation multiplicity.
+    // Without grouping, SELECT DISTINCT is exactly the license.
+    let where_dedup_safe = match query.grouping.as_ref() {
+        Some(g) => {
+            let aggregates_ok = g
+                .aggregates()
+                .all(|spec| spec.function.duplicate_insensitive());
+            // `required_aggregate_vars` is what the grouping stage's OUTPUT must
+            // carry, so it already folds in projection, HAVING, post-binds and
+            // ORDER BY. Anything in it that is not a GROUP BY key or an
+            // aggregate output passes through raw as a grouped list.
+            let keys: HashSet<VarId> = g.group_by_vars().collect();
+            let agg_outputs: HashSet<VarId> = g.aggregates().map(|s| s.output_var).collect();
+            let no_raw_passthrough = variable_deps.as_ref().is_some_and(|d| {
+                d.required_aggregate_vars
+                    .iter()
+                    .all(|v| keys.contains(v) || agg_outputs.contains(v))
+            });
+            aggregates_ok && no_raw_passthrough
+        }
+        None => query.output.is_distinct(),
+    };
+
     let mut operator = build_where_operators_with_needed(
         &query.patterns,
         stats,
         &needed_where_vars,
         &group_by_vec,
-        query.output.is_distinct(),
+        where_dedup_safe,
         required_where_vars,
         planning,
     )?;
@@ -3355,6 +3473,14 @@ pub(crate) fn apply_solution_modifiers(
             _ => 0,
         };
         let can_topk = limit.is_some();
+        // Deliberately NO scan-side `set_topk` here, unlike the sibling branch
+        // below: the DISTINCT sits BELOW the sort on this path, so k scan rows can
+        // dedup to FEWER than k. Pruning the scan to its top-k by sort key would
+        // drop rows that dedup would have made room for, under-producing DISTINCT
+        // results — so the push-down is unsound here even though `k`/`can_topk` are
+        // computed identically to the sibling. This `SortOperator`'s own
+        // post-DISTINCT top-k stays sound; only the scan-side prune is declined
+        // (mirror of the ASC-declines note in the `else` branch below).
         let mut sort_op = if can_topk {
             SortOperator::new_topk(operator, ordering.to_vec(), k)
         } else {
@@ -3378,6 +3504,30 @@ pub(crate) fn apply_solution_modifiers(
                 (Some(limit), None) => limit,
                 _ => 0,
             };
+            // PR-5 / item 8 (F-AUD-6): offer the primary sort key + k to the
+            // row-preserving scan below, so a single-column `ORDER BY <scan col>
+            // LIMIT k` over an R2RML scan can read only the files that can hold the
+            // top-k. DESC is offered for any scalar column; ASC is offered too but
+            // the scan honors it ONLY when the column is REQUIRED (non-nullable) —
+            // SPARQL orders unbound values FIRST under ASC, so a nullable column
+            // could hide an unread top-k row (the provider re-checks). The scan
+            // honors either direction ONLY if the key resolves to a single scalar
+            // scan column, else no-op. Pure optimization — this `SortOperator`
+            // remains the authority for the exact (compound) order + LIMIT.
+            if can_topk {
+                if let Some(primary) = ordering.first() {
+                    use crate::sort::SortDirection;
+                    match primary.direction {
+                        SortDirection::Descending => operator.set_topk(primary.var, k, false),
+                        // Gated by FLUREE_R2RML_TOPK_ASC: OFF is byte-identical to
+                        // the pre-item-8 DESC-only behavior.
+                        SortDirection::Ascending if crate::r2rml::topk_asc_enabled() => {
+                            operator.set_topk(primary.var, k, true);
+                        }
+                        SortDirection::Ascending => {}
+                    }
+                }
+            }
             let mut sort_op = if can_topk {
                 SortOperator::new_topk(operator, ordering.to_vec(), k)
             } else {
@@ -3430,6 +3580,130 @@ mod tests {
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 
+    /// PR-5: the scan-side top-k directive offered to the child must carry
+    /// `k = LIMIT + OFFSET`, not `LIMIT` — the scan has to retain enough rows for
+    /// the OFFSET the sort above then skips, or `ORDER BY DESC … LIMIT k OFFSET m`
+    /// would silently drop the rows at positions `k+1..=k+m`. This locks the
+    /// single-owner `+offset` arithmetic against a future edit that moves or
+    /// duplicates it. (A pure `ORDER BY DESC LIMIT` with no residual filter still
+    /// pushes topk, so this arithmetic is live even though q046 has offset 0.)
+    #[test]
+    fn topk_directive_carries_limit_plus_offset() {
+        use crate::binding::Batch;
+        use crate::context::ExecutionContext;
+        use crate::error::Result as QResult;
+        use crate::operator::{BoxedOperator, Operator};
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingTopkOp {
+            schema: Vec<VarId>,
+            recorded: Arc<Mutex<Option<(VarId, usize, bool)>>>,
+        }
+        #[async_trait::async_trait]
+        impl Operator for RecordingTopkOp {
+            fn schema(&self) -> &[VarId] {
+                &self.schema
+            }
+            async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> QResult<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> QResult<Option<Batch>> {
+                Ok(None)
+            }
+            fn close(&mut self) {}
+            fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+                *self.recorded.lock().unwrap() = Some((sort_var, k, ascending));
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(None));
+        let op: BoxedOperator = Box::new(RecordingTopkOp {
+            schema: vec![VarId(0), VarId(1)],
+            recorded: Arc::clone(&recorded),
+        });
+        let planning = crate::temporal_mode::PlanningContext::current();
+        // ORDER BY DESC(?1) LIMIT 10 OFFSET 5.
+        let _tree = apply_solution_modifiers(
+            op,
+            None,
+            &[],
+            &[SortSpec::desc(VarId(1))],
+            None,
+            false,
+            Some(5),
+            Some(10),
+            false,
+            None,
+            &planning,
+        )
+        .expect("apply_solution_modifiers");
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some((VarId(1), 15, false)),
+            "k must be LIMIT(10) + OFFSET(5) = 15, so the scan retains the offset rows the sort then skips; DESC ⇒ ascending=false"
+        );
+    }
+
+    /// Item 8 (F-AUD-6): an ASC `ORDER BY … LIMIT` offers a top-k directive too,
+    /// carrying `ascending = true` (the scan/provider then gates on the column
+    /// being required). Mirrors the DESC test above.
+    #[test]
+    fn topk_directive_ascending_carries_direction() {
+        use crate::binding::Batch;
+        use crate::context::ExecutionContext;
+        use crate::error::Result as QResult;
+        use crate::operator::{BoxedOperator, Operator};
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingTopkOp {
+            schema: Vec<VarId>,
+            recorded: Arc<Mutex<Option<(VarId, usize, bool)>>>,
+        }
+        #[async_trait::async_trait]
+        impl Operator for RecordingTopkOp {
+            fn schema(&self) -> &[VarId] {
+                &self.schema
+            }
+            async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> QResult<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> QResult<Option<Batch>> {
+                Ok(None)
+            }
+            fn close(&mut self) {}
+            fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+                *self.recorded.lock().unwrap() = Some((sort_var, k, ascending));
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(None));
+        let op: BoxedOperator = Box::new(RecordingTopkOp {
+            schema: vec![VarId(0), VarId(1)],
+            recorded: Arc::clone(&recorded),
+        });
+        let planning = crate::temporal_mode::PlanningContext::current();
+        // ORDER BY ASC(?1) LIMIT 10.
+        let _tree = apply_solution_modifiers(
+            op,
+            None,
+            &[],
+            &[SortSpec::asc(VarId(1))],
+            None,
+            false,
+            None,
+            Some(10),
+            false,
+            None,
+            &planning,
+        )
+        .expect("apply_solution_modifiers");
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some((VarId(1), 10, true)),
+            "ASC ⇒ ascending=true (switch default-on); provider re-gates on required column"
+        );
+    }
+
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
         TriplePattern::new(
             Ref::Var(s_var),
@@ -3457,6 +3731,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         }
     }
 
@@ -3482,6 +3757,7 @@ mod tests {
             ))],
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            cypher_vocab: None,
             grouping: Grouping::assemble(
                 vec![p],
                 vec![AggregateSpec {
@@ -3557,6 +3833,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
 
         let spec =
@@ -3587,6 +3864,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
 
         let result = build_operator_tree(
@@ -3615,6 +3893,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
 
         let result = build_operator_tree(
@@ -3691,6 +3970,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
         let reversed = Query {
             context: ParsedContext::default(),
@@ -3716,6 +3996,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
         assert_eq!(
             detect_exists_join_count_distinct_object(&counted_first),
@@ -3752,6 +4033,7 @@ mod tests {
             ],
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            cypher_vocab: None,
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -3815,6 +4097,7 @@ mod tests {
             patterns,
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            cypher_vocab: None,
             grouping: None,
             ordering,
             order_binds: Vec::new(),

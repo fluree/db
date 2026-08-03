@@ -37,8 +37,6 @@ pub enum GraphSourceMode {
     /// No graph source integration (default).
     #[default]
     None,
-    /// Enable BM25/Vector index providers.
-    IndexProviders,
     /// Enable R2RML/Iceberg support (feature-gated).
     #[cfg(feature = "iceberg")]
     R2rml,
@@ -124,10 +122,6 @@ impl<'a> QueryCore<'a> {
         self.execution = options;
     }
 
-    pub(crate) fn set_index_providers(&mut self) {
-        self.graph_sources = GraphSourceMode::IndexProviders;
-    }
-
     #[cfg(feature = "iceberg")]
     pub(crate) fn set_r2rml(&mut self) {
         self.graph_sources = GraphSourceMode::R2rml;
@@ -145,12 +139,6 @@ impl<'a> QueryCore<'a> {
 
         match self.graph_sources {
             GraphSourceMode::None => {}
-            GraphSourceMode::IndexProviders => {
-                errs.push(BuilderError::Invalid {
-                    field: "graph_sources",
-                    message: "Index provider mode (.with_index_providers()) is not yet supported by query builders; use fluree.query_connection_with_bm25() or fluree.query_dataset_with_bm25() instead".into(),
-                });
-            }
             #[cfg(feature = "iceberg")]
             GraphSourceMode::R2rml => {
                 if self.r2rml.is_none() {
@@ -247,12 +235,6 @@ impl<'a> ViewQueryBuilder<'a> {
     /// Set query execution controls.
     pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
         self.core.set_execution_options(options);
-        self
-    }
-
-    /// Enable BM25/Vector index providers for graph source queries.
-    pub fn with_index_providers(mut self) -> Self {
-        self.core.set_index_providers();
         self
     }
 
@@ -533,12 +515,6 @@ impl<'a> DatasetQueryBuilder<'a> {
     /// Set query execution controls.
     pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
         self.core.set_execution_options(options);
-        self
-    }
-
-    /// Enable BM25/Vector index providers.
-    pub fn with_index_providers(mut self) -> Self {
-        self.core.set_index_providers();
         self
     }
 
@@ -881,12 +857,6 @@ impl<'a> FromQueryBuilder<'a> {
     /// Set query execution controls.
     pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
         self.core.set_execution_options(options);
-        self
-    }
-
-    /// Enable BM25/Vector index providers.
-    pub fn with_index_providers(mut self) -> Self {
-        self.core.set_index_providers();
         self
     }
 

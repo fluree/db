@@ -43,14 +43,17 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::ir::{Pattern, Ref, Term};
+use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
+use crate::ir::{Pattern, Ref, Term, TriplePattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::annotation_arena::AnnotationArenaReader;
 use fluree_db_core::edge::{id_datatype_sid, EdgeKey};
 use fluree_db_core::storage::ContentStore;
-use fluree_db_core::{AnnotationIndexRoot, FlakeValue, Sid};
+use fluree_db_core::{AnnotationIndexRoot, FlakeValue, Sid, StatsView};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The recognized `[base edge + 3 f:reifies* + body]` shape, decomposed
@@ -103,13 +106,11 @@ pub(crate) fn recognize_annotation_edge(patterns: &[Pattern]) -> Option<Annotati
         return None;
     };
 
-    // Predicate must be a constant relationship type (a typed Cypher
-    // relationship lowers to `Ref::Iri`; a `Ref::Sid` is also accepted).
-    // A variable predicate is not a fixed edge type → fall back.
-    let p_pred = match &base.p {
-        Ref::Iri(_) | Ref::Sid(_) => base.p.clone(),
-        Ref::Var(_) => return None,
-    };
+    // Constant relationship type (a typed Cypher relationship lowers to
+    // `Ref::Iri`; a `Ref::Sid` is also accepted) or a variable predicate
+    // (untyped `-[p]->`): the probe resolves a variable per row from the
+    // base-edge binding, so both are probeable.
+    let p_pred = base.p.clone();
     // Subject and object must be node refs (no IRI/literal objects in v1).
     let s_pos = EdgePos::from_ref(&base.s)?;
     let o_pos = EdgePos::from_term(&base.o)?;
@@ -185,8 +186,9 @@ pub struct AnnotationEdgeProbeOperator {
     ann_var: VarId,
     /// Base-edge subject source.
     s_pos: EdgePos,
-    /// Base-edge predicate (constant for a typed relationship).
-    p_sid: Sid,
+    /// Base-edge predicate source: constant for a typed relationship,
+    /// per-row for an untyped `-[p]->` (the base scan binds it as a Sid).
+    p_pos: EdgePos,
     /// Base-edge object source.
     o_pos: EdgePos,
     schema: Arc<[VarId]>,
@@ -213,7 +215,7 @@ impl AnnotationEdgeProbeOperator {
         child: BoxedOperator,
         ann_var: VarId,
         s_pos: EdgePos,
-        p_sid: Sid,
+        p_pos: EdgePos,
         o_pos: EdgePos,
     ) -> Self {
         let mut schema_vec: Vec<VarId> = child.schema().to_vec();
@@ -226,7 +228,7 @@ impl AnnotationEdgeProbeOperator {
             child,
             ann_var,
             s_pos,
-            p_sid,
+            p_pos,
             o_pos,
             schema,
             state: OperatorState::Created,
@@ -249,69 +251,402 @@ impl AnnotationEdgeProbeOperator {
         row: usize,
         view: Option<&fluree_db_binary_index::BinaryGraphView>,
     ) -> Result<Option<EdgeKey>> {
-        let Some(s) = self.resolve_ref(batch, row, &self.s_pos, view)? else {
+        let Some(s) = resolve_pos_ref(batch, row, &self.s_pos, view)? else {
             return Ok(None);
         };
-        // Object: ref-valued for a relationship edge. Resolve to a Sid
-        // and wrap as a ref FlakeValue with the `@id` datatype, matching
-        // how the arena stored the edge.
-        let Some(o) = self.resolve_ref(batch, row, &self.o_pos, view)? else {
+        let Some(p) = resolve_pos_pred(batch, row, &self.p_pos, view)? else {
+            return Ok(None);
+        };
+        // Object: any FlakeValue. Ref objects key with the `@id`
+        // datatype; literal objects (a wildcard `?s ?p ?o` base scan
+        // also delivers literal-valued triples, and SPARQL quoted
+        // triples reify them) key by value + effective datatype +
+        // language tag — exactly as `EdgeKey::from_flake` stored them,
+        // so reified literal triples are probeable rather than dropped.
+        let Some((o, dt, lang)) = resolve_obj_key_parts(batch, row, &self.o_pos, view)? else {
             return Ok(None);
         };
         Ok(Some(EdgeKey {
             g: None,
             s,
-            p: self.p_sid.clone(),
-            o: FlakeValue::Ref(o),
-            dt: id_datatype_sid(),
-            lang: None,
+            p,
+            o,
+            dt,
+            lang,
             list_i: None,
         }))
     }
+}
 
-    /// Resolve an edge position to a concrete `Sid`. Handles the two
-    /// ref-valued binding representations a base-edge scan can emit:
-    /// eagerly-resolved `Sid` and late-materialized `EncodedSid`. The
-    /// latter is decoded **directly** through the subject dictionary
-    /// (`BinaryGraphView::resolve_subject_sid`) — an IRI round-trip
-    /// (`resolve_subject_iri` + `encode_iri`) silently returns `None` for
-    /// subjects whose IRI doesn't re-encode, which would drop rows
-    /// non-deterministically (a subject may arrive eager or late depending
-    /// on scan timing). A failure here is a loud error, never a dropped row.
-    fn resolve_ref(
-        &self,
-        batch: &Batch,
-        row: usize,
-        pos: &EdgePos,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
-    ) -> Result<Option<Sid>> {
-        match pos {
-            EdgePos::Const(sid) => Ok(Some(sid.clone())),
-            EdgePos::Var(v) => match batch.get(row, *v) {
-                Some(Binding::Sid { sid, .. }) => Ok(Some(sid.clone())),
-                Some(Binding::EncodedSid { s_id, .. }) => {
-                    let view = view.ok_or_else(|| {
-                        QueryError::execution(
-                            "annotation edge probe: encoded subject with no binary graph view",
-                        )
-                    })?;
-                    let sid = view.resolve_subject_sid(*s_id).map_err(|e| {
-                        QueryError::execution(format!(
-                            "annotation edge probe: resolve encoded subject {s_id}: {e}"
-                        ))
-                    })?;
-                    Ok(Some(sid))
+/// Resolve the base edge's OBJECT position into arena `EdgeKey` parts
+/// (`o`, `dt`, `lang`) exactly as [`EdgeKey::from_flake`] recorded them
+/// at write time. `None` drops the row: an unbound position matches no
+/// `f:reifies*` row, and Poisoned follows join semantics (a failed
+/// OPTIONAL row joins nothing). Value/dt/lang decode through the same
+/// dictionaries the writer used — sound here because the arena gates
+/// require an empty overlay, so every binding comes from the indexed
+/// scan.
+fn resolve_obj_key_parts(
+    batch: &Batch,
+    row: usize,
+    pos: &EdgePos,
+    view: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Result<Option<(FlakeValue, Sid, Option<String>)>> {
+    let ref_parts = |sid: Sid| (FlakeValue::Ref(sid), id_datatype_sid(), None);
+    match pos {
+        EdgePos::Const(sid) => Ok(Some(ref_parts(sid.clone()))),
+        EdgePos::Var(v) => {
+            let Some(b) = batch.get(row, *v) else {
+                return Ok(None);
+            };
+            match b {
+                Binding::Sid { sid, .. } => Ok(Some(ref_parts(sid.clone()))),
+                Binding::EncodedSid { .. } => {
+                    Ok(resolve_pos_ref(batch, row, pos, view)?.map(ref_parts))
                 }
-                Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
-                // A non-ref binding in an edge ref position means the
-                // recognized shape's invariant was violated. Surface it
-                // loudly rather than silently dropping the row.
-                Some(other) => Err(QueryError::execution(format!(
-                    "annotation edge probe: edge ref position bound to non-ref {other:?}"
-                ))),
-            },
+                Binding::Unbound | Binding::Poisoned => Ok(None),
+                other => {
+                    // Literal object: decode to (value, effective dt, lang).
+                    match crate::group_aggregate::materialize_encoded(other, view) {
+                        Binding::Lit { val, dtc, .. } => Ok(Some((
+                            val,
+                            dtc.datatype().clone(),
+                            dtc.lang_tag().map(str::to_string),
+                        ))),
+                        // Anything else (cross-ledger Iri, list/path/rel
+                        // values) has no arena key — the row matches no
+                        // reified edge.
+                        _ => Ok(None),
+                    }
+                }
+            }
         }
     }
+}
+
+/// Resolve the predicate position of a base edge. A variable predicate
+/// (untyped `-[p]->`) arrives from the base-edge scan either as an eager
+/// `Binding::Sid` or late-materialized as `Binding::EncodedPid` — decode
+/// the latter through the store's predicate table. An id absent from the
+/// persisted table is a shape violation (both probe paths run on planned
+/// scans whose predicate ids come from that table) — surface it loudly
+/// rather than silently dropping the row.
+pub(crate) fn resolve_pos_pred(
+    batch: &Batch,
+    row: usize,
+    pos: &EdgePos,
+    view: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Result<Option<Sid>> {
+    match pos {
+        EdgePos::Const(sid) => Ok(Some(sid.clone())),
+        EdgePos::Var(v) => match batch.get(row, *v) {
+            Some(Binding::Sid { sid, .. }) => Ok(Some(sid.clone())),
+            Some(Binding::EncodedPid { p_id }) => {
+                let view = view.ok_or_else(|| {
+                    QueryError::execution(
+                        "annotation edge probe: encoded predicate with no binary graph view",
+                    )
+                })?;
+                view.store()
+                    .p_sid_table()
+                    .get(*p_id as usize)
+                    .cloned()
+                    .map(Some)
+                    .ok_or_else(|| {
+                        QueryError::execution(format!(
+                            "annotation edge probe: resolve encoded predicate {p_id}"
+                        ))
+                    })
+            }
+            Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
+            Some(other) => Err(QueryError::execution(format!(
+                "annotation edge probe: predicate position bound to non-Sid {other:?}"
+            ))),
+        },
+    }
+}
+
+/// Resolve an edge ref position to a concrete `Sid`. Handles the two
+/// ref-valued binding representations a base-edge scan can emit:
+/// eagerly-resolved `Sid` and late-materialized `EncodedSid`. The
+/// latter is decoded **directly** through the subject dictionary
+/// (`BinaryGraphView::resolve_subject_sid`) — an IRI round-trip
+/// (`resolve_subject_iri` + `encode_iri`) silently returns `None` for
+/// subjects whose IRI doesn't re-encode, which would drop rows
+/// non-deterministically (a subject may arrive eager or late depending
+/// on scan timing). A failure here is a loud error, never a dropped row.
+pub(crate) fn resolve_pos_ref(
+    batch: &Batch,
+    row: usize,
+    pos: &EdgePos,
+    view: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Result<Option<Sid>> {
+    match pos {
+        EdgePos::Const(sid) => Ok(Some(sid.clone())),
+        EdgePos::Var(v) => match batch.get(row, *v) {
+            Some(Binding::Sid { sid, .. }) => Ok(Some(sid.clone())),
+            Some(Binding::EncodedSid { s_id, .. }) => {
+                let view = view.ok_or_else(|| {
+                    QueryError::execution(
+                        "annotation edge probe: encoded subject with no binary graph view",
+                    )
+                })?;
+                let sid = view.resolve_subject_sid(*s_id).map_err(|e| {
+                    QueryError::execution(format!(
+                        "annotation edge probe: resolve encoded subject {s_id}: {e}"
+                    ))
+                })?;
+                Ok(Some(sid))
+            }
+            Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
+            // A non-ref binding in an edge ref position means the
+            // recognized shape's invariant was violated. Surface it
+            // loudly rather than silently dropping the row.
+            Some(other) => Err(QueryError::execution(format!(
+                "annotation edge probe: edge ref position bound to non-ref {other:?}"
+            ))),
+        },
+    }
+}
+
+/// Normalize a binding to a raw `Sid` — decoding late-materialized
+/// subjects through the graph view and late-materialized predicates (an
+/// untyped `-[p]->` base scan can emit `EncodedPid`) through the store's
+/// predicate table. `None` for unbound/poisoned or non-ref bindings —
+/// such a position matches no `f:reifies*` row.
+pub(crate) fn binding_sid(
+    b: &Binding,
+    view: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Result<Option<Sid>> {
+    match b {
+        Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
+        Binding::EncodedSid { s_id, .. } => {
+            let view = view.ok_or_else(|| {
+                QueryError::execution("annotation probe: encoded subject with no binary graph view")
+            })?;
+            view.resolve_subject_sid(*s_id).map(Some).map_err(|e| {
+                QueryError::execution(format!(
+                    "annotation probe: resolve encoded subject {s_id}: {e}"
+                ))
+            })
+        }
+        Binding::EncodedPid { p_id } => {
+            let view = view.ok_or_else(|| {
+                QueryError::execution(
+                    "annotation probe: encoded predicate with no binary graph view",
+                )
+            })?;
+            Ok(view.store().p_sid_table().get(*p_id as usize).cloned())
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The three `f:reifies*` lookups, drained once through ordinary planned
+/// scans (overlay-merged and policy-filtered like any scan) and
+/// hash-indexed. Shared by the value-only OPTIONAL lane
+/// ([`crate::optional::AnnotationValueOptionalBuilder`]) and the required
+/// lane ([`HashAnnotationEdgeProbeOperator`]).
+pub(crate) struct AnnotationSidecarMaps {
+    pub(crate) s_to_anns: HashMap<Sid, Vec<Sid>>,
+    ann_preds: HashMap<Sid, Vec<Sid>>,
+    /// Object keyed by [`GroupKeyOwned`] (representation-normalized), so
+    /// ref objects AND literal objects (a literal-valued reified edge)
+    /// both match across encoded/materialized binding representations.
+    ann_objs: HashMap<Sid, Vec<GroupKeyOwned>>,
+}
+
+impl AnnotationSidecarMaps {
+    pub(crate) fn matches(&self, ann: &Sid, p: &Sid, o: &GroupKeyOwned) -> bool {
+        self.ann_preds
+            .get(ann)
+            .is_some_and(|preds| preds.contains(p))
+            && self.ann_objs.get(ann).is_some_and(|objs| objs.contains(o))
+    }
+
+    /// Drain the three reifies triples and build the lookup maps.
+    pub(crate) async fn build(
+        r_subj: &TriplePattern,
+        r_pred: &TriplePattern,
+        r_obj: &TriplePattern,
+        stats: Option<Arc<StatsView>>,
+        planning: &PlanningContext,
+        ctx: &ExecutionContext<'_>,
+        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+    ) -> Result<Self> {
+        let mut s_to_anns: HashMap<Sid, Vec<Sid>> = HashMap::new();
+        for (ann, s) in drain_pairs(r_subj, stats.clone(), planning, ctx, view).await? {
+            s_to_anns.entry(s).or_default().push(ann);
+        }
+        let mut ann_preds: HashMap<Sid, Vec<Sid>> = HashMap::new();
+        for (ann, pred) in drain_pairs(r_pred, stats.clone(), planning, ctx, view).await? {
+            ann_preds.entry(ann).or_default().push(pred);
+        }
+        let mut ann_objs: HashMap<Sid, Vec<GroupKeyOwned>> = HashMap::new();
+        for (ann, obj) in drain_object_keys(r_obj, stats, planning, ctx, view).await? {
+            ann_objs.entry(ann).or_default().push(obj);
+        }
+        Ok(Self {
+            s_to_anns,
+            ann_preds,
+            ann_objs,
+        })
+    }
+}
+
+/// The probe-side counterpart to [`drain_object_keys`]'s normalization:
+/// one base-edge row's object position as a [`GroupKeyOwned`].
+/// `GroupKeyOwned::Absent` (never matched by the maps — absent pairs are
+/// skipped at build) for unbound/poisoned positions.
+pub(crate) fn row_obj_key(
+    batch: &Batch,
+    row: usize,
+    pos: &EdgePos,
+    view: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> GroupKeyOwned {
+    let store = view.map(fluree_db_binary_index::BinaryGraphView::store);
+    match pos {
+        EdgePos::Const(sid) => {
+            binding_to_group_key_normalized(&Binding::sid(sid.clone()), store, view)
+        }
+        EdgePos::Var(v) => match batch.get(row, *v) {
+            Some(b) => binding_to_group_key_normalized(b, store, view),
+            None => GroupKeyOwned::Absent,
+        },
+    }
+}
+
+/// Drain one reifies triple's whole predicate through a planned scan,
+/// yielding `(reifier Sid, object Sid)` pairs. Non-ref objects (a
+/// literal-valued reified edge) are skipped — the probe only matches
+/// ref positions, mirroring `EdgePos::from_term`.
+async fn drain_pairs(
+    triple: &TriplePattern,
+    stats: Option<Arc<StatsView>>,
+    planning: &PlanningContext,
+    ctx: &ExecutionContext<'_>,
+    view: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Result<Vec<(Sid, Sid)>> {
+    let ann_v = match &triple.s {
+        Ref::Var(v) => *v,
+        _ => {
+            return Err(QueryError::execution(
+                "annotation probe: reifies subject must be the reifier var",
+            ))
+        }
+    };
+    let o_v = match &triple.o {
+        Term::Var(v) => Some(*v),
+        _ => None,
+    };
+    let mut op = crate::execute::build_where_operators_seeded(
+        None,
+        std::slice::from_ref(&Pattern::Triple(triple.clone())),
+        stats,
+        None,
+        planning,
+    )?;
+    op.open(ctx).await?;
+    let mut out = Vec::new();
+    while let Some(batch) = op.next_batch(ctx).await? {
+        ctx.check_cancelled()?;
+        for r in 0..batch.len() {
+            let Some(ann) = batch
+                .get(r, ann_v)
+                .map(|b| binding_sid(b, view))
+                .transpose()?
+                .flatten()
+            else {
+                continue;
+            };
+            let obj = match o_v {
+                Some(v) => batch
+                    .get(r, v)
+                    .map(|b| binding_sid(b, view))
+                    .transpose()?
+                    .flatten(),
+                // Constant object (typed relationship / fixed endpoint):
+                // the scan already filtered to it; record the constant.
+                None => match &triple.o {
+                    Term::Sid(sid) => Some(sid.clone()),
+                    _ => None,
+                },
+            };
+            if let Some(obj) = obj {
+                out.push((ann, obj));
+            }
+        }
+    }
+    op.close();
+    Ok(out)
+}
+
+/// Drain the `f:reifiesObject` triple, yielding `(reifier Sid, object
+/// key)` pairs with the object normalized via
+/// [`binding_to_group_key_normalized`] — ref objects and literal objects
+/// (literal-valued reified edges) both key canonically. Absent objects
+/// are skipped, so `GroupKeyOwned::Absent` never enters the maps.
+async fn drain_object_keys(
+    triple: &TriplePattern,
+    stats: Option<Arc<StatsView>>,
+    planning: &PlanningContext,
+    ctx: &ExecutionContext<'_>,
+    view: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Result<Vec<(Sid, GroupKeyOwned)>> {
+    let ann_v = match &triple.s {
+        Ref::Var(v) => *v,
+        _ => {
+            return Err(QueryError::execution(
+                "annotation probe: reifies subject must be the reifier var",
+            ))
+        }
+    };
+    let o_v = match &triple.o {
+        Term::Var(v) => Some(*v),
+        _ => None,
+    };
+    let store = view.map(fluree_db_binary_index::BinaryGraphView::store);
+    let mut op = crate::execute::build_where_operators_seeded(
+        None,
+        std::slice::from_ref(&Pattern::Triple(triple.clone())),
+        stats,
+        None,
+        planning,
+    )?;
+    op.open(ctx).await?;
+    let mut out = Vec::new();
+    while let Some(batch) = op.next_batch(ctx).await? {
+        ctx.check_cancelled()?;
+        for r in 0..batch.len() {
+            let Some(ann) = batch
+                .get(r, ann_v)
+                .map(|b| binding_sid(b, view))
+                .transpose()?
+                .flatten()
+            else {
+                continue;
+            };
+            let obj = match o_v {
+                Some(v) => batch
+                    .get(r, v)
+                    .map(|b| binding_to_group_key_normalized(b, store, view))
+                    .unwrap_or(GroupKeyOwned::Absent),
+                // Constant object (typed relationship / fixed endpoint):
+                // the scan already filtered to it; record the constant.
+                None => match &triple.o {
+                    Term::Sid(sid) => {
+                        binding_to_group_key_normalized(&Binding::sid(sid.clone()), store, view)
+                    }
+                    _ => GroupKeyOwned::Absent,
+                },
+            };
+            if !matches!(obj, GroupKeyOwned::Absent) {
+                out.push((ann, obj));
+            }
+        }
+    }
+    op.close();
+    Ok(out)
 }
 
 #[async_trait]
@@ -367,8 +702,12 @@ impl AnnotationEdgeProbeOperator {
     /// materializing it is cheap relative to the per-batch reader rebuild
     /// it replaces.
     async fn probe_all(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        // The reifier binding is appended as the final schema column.
-        debug_assert_eq!(self.schema.last(), Some(&self.ann_var));
+        // The reifier binding is appended as the final schema column —
+        // unless the child already binds it (nested reifier patterns like
+        // `?t :p :z . << ?s ?p ?o ~ ?t >>`), in which case candidates
+        // UNIFY with the existing column instead of appending.
+        let ann_col = self.child.schema().iter().position(|v| *v == self.ann_var);
+        debug_assert!(ann_col.is_some() || self.schema.last() == Some(&self.ann_var));
         let parent_schema_len = self.child.schema().len();
 
         // Collect every child row's parent-schema bindings plus its
@@ -413,22 +752,40 @@ impl AnnotationEdgeProbeOperator {
                 })?
         };
 
-        for (i, mut rb) in saved_rows.into_iter().enumerate() {
+        for (i, rb) in saved_rows.into_iter().enumerate() {
             let Some(edge_idx) = edge_of_row[i] else {
                 continue;
             };
             let anns = &anns_per_edge[edge_idx];
-            match anns.as_slice() {
-                [] => {}
-                [single] => {
-                    rb.push(Binding::sid(single.clone()));
-                    self.result_buffer.push(rb);
-                }
-                many => {
-                    // Fan out: one output row per live reifier.
-                    for ann in many {
+            match ann_col {
+                // Fan out: one output row per live reifier.
+                None => {
+                    for ann in anns {
                         let mut row = rb.clone();
                         row.push(Binding::sid(ann.clone()));
+                        self.result_buffer.push(row);
+                    }
+                }
+                // Pre-bound reifier column: a bound value is a join key
+                // (keep only the matching candidate); an unbound one is
+                // filled per candidate.
+                Some(c) => {
+                    let bound = match &rb[c] {
+                        // Poisoned rows join nothing (nested-loop parity);
+                        // a bound non-ref reifier matches no annotation.
+                        Binding::Poisoned => continue,
+                        Binding::Unbound => None,
+                        b => match binding_sid(b, view.as_ref())? {
+                            Some(sid) => Some(sid),
+                            None => continue,
+                        },
+                    };
+                    for ann in anns {
+                        if bound.as_ref().is_some_and(|t| t != ann) {
+                            continue;
+                        }
+                        let mut row = rb.clone();
+                        row[c] = Binding::sid(ann.clone());
                         self.result_buffer.push(row);
                     }
                 }
@@ -459,6 +816,432 @@ impl AnnotationEdgeProbeOperator {
             return None;
         }
         Batch::new(self.schema.clone(), columns).ok()
+    }
+}
+
+/// One base-edge row collected by the sweep: the normalized subject key it
+/// hash-joins the driving stream on, the concrete Sids the sidecar maps
+/// are probed with, and the original bindings for the pattern's VAR
+/// positions (`None` for constants — those columns aren't in the schema).
+struct SweptEdge {
+    s_sid: Sid,
+    p_sid: Sid,
+    o_key: GroupKeyOwned,
+    s_b: Option<Binding>,
+    p_b: Option<Binding>,
+    o_b: Option<Binding>,
+}
+
+/// Required-lane counterpart to [`AnnotationEdgeProbeOperator`] for ledgers
+/// WITHOUT a sealed annotation arena (bulk-imported roots): instead of
+/// per-row `f:reifies*` joins — whose planned chain drives from a
+/// bound-object probe per driving row — drain the three reifies predicates
+/// ONCE into [`AnnotationSidecarMaps`] and answer every base-edge row by
+/// hash lookup. Rows with no matching reifier are dropped (the required
+/// chain's semantics: an unreified edge matches no `f:reifies*` row).
+///
+/// The base edge is NOT joined per driving row either: re-opening a scan
+/// per row costs ~ms each (the KB `UNWIND` shape spent ~30 s over 1k rows
+/// this way). Instead ONE unseeded planned scan of the base pattern runs
+/// after the child drains, keeping only rows whose subject occurs in the
+/// driving stream, and the surviving edges hash-join the driving rows.
+/// The planner gates this operator on total ledger size (see
+/// `build_single_graph_delegate`), so the sweep is bounded.
+///
+/// All scans here (sidecar + base) are ordinary planned scans, so overlay
+/// novelty and policy filtering apply — unlike the arena path, no
+/// empty-overlay or root-policy gate is needed.
+pub struct HashAnnotationEdgeProbeOperator {
+    child: BoxedOperator,
+    /// The base-edge triple, executed as ONE unseeded planned scan.
+    base: TriplePattern,
+    ann_var: VarId,
+    s_pos: EdgePos,
+    p_pos: EdgePos,
+    o_pos: EdgePos,
+    r_subj: TriplePattern,
+    r_pred: TriplePattern,
+    r_obj: TriplePattern,
+    stats: Option<Arc<StatsView>>,
+    planning: PlanningContext,
+    schema: Arc<[VarId]>,
+    state: OperatorState,
+    probed: bool,
+    result_buffer: Vec<Vec<Binding>>,
+    buffer_pos: usize,
+}
+
+impl HashAnnotationEdgeProbeOperator {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        child: BoxedOperator,
+        base: TriplePattern,
+        ann_var: VarId,
+        s_pos: EdgePos,
+        p_pos: EdgePos,
+        o_pos: EdgePos,
+        r_subj: TriplePattern,
+        r_pred: TriplePattern,
+        r_obj: TriplePattern,
+        stats: Option<Arc<StatsView>>,
+        planning: PlanningContext,
+    ) -> Self {
+        // Child columns, then the base pattern's var positions the sweep
+        // produces, then the reifier.
+        let mut schema_vec: Vec<VarId> = child.schema().to_vec();
+        for pos in [&s_pos, &p_pos, &o_pos] {
+            if let EdgePos::Var(v) = pos {
+                if !schema_vec.contains(v) {
+                    schema_vec.push(*v);
+                }
+            }
+        }
+        if !schema_vec.contains(&ann_var) {
+            schema_vec.push(ann_var);
+        }
+        let schema = Arc::from(schema_vec.into_boxed_slice());
+        Self {
+            child,
+            base,
+            ann_var,
+            s_pos,
+            p_pos,
+            o_pos,
+            r_subj,
+            r_pred,
+            r_obj,
+            stats,
+            planning,
+            schema,
+            state: OperatorState::Created,
+            probed: false,
+            result_buffer: Vec::new(),
+            buffer_pos: 0,
+        }
+    }
+
+    /// One pass over the base pattern via an unseeded planned scan,
+    /// keeping rows whose subject key occurs in `driving` (or every row
+    /// when `keep_all` — some driving row leaves the subject unbound).
+    async fn sweep_base_edges(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+        driving: &std::collections::HashSet<GroupKeyOwned>,
+        keep_all: bool,
+    ) -> Result<HashMap<GroupKeyOwned, Vec<SweptEdge>>> {
+        let store = view.map(fluree_db_binary_index::BinaryGraphView::store);
+        let mut op = crate::execute::build_where_operators_seeded(
+            None,
+            std::slice::from_ref(&Pattern::Triple(self.base.clone())),
+            self.stats.clone(),
+            None,
+            &self.planning,
+        )?;
+        let mut edges: HashMap<GroupKeyOwned, Vec<SweptEdge>> = HashMap::new();
+        op.open(ctx).await?;
+        while let Some(batch) = op.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
+            for row in 0..batch.len() {
+                let (s_key, s_b) = match &self.s_pos {
+                    EdgePos::Const(sid) => (
+                        binding_to_group_key_normalized(&Binding::sid(sid.clone()), store, view),
+                        None,
+                    ),
+                    EdgePos::Var(v) => {
+                        let b = batch.get(row, *v).cloned().unwrap_or(Binding::Unbound);
+                        (binding_to_group_key_normalized(&b, store, view), Some(b))
+                    }
+                };
+                if matches!(s_key, GroupKeyOwned::Absent)
+                    || (!keep_all && !driving.contains(&s_key))
+                {
+                    continue;
+                }
+                let Some(s_sid) = resolve_pos_ref(&batch, row, &self.s_pos, view)? else {
+                    continue;
+                };
+                let Some(p_sid) = resolve_pos_pred(&batch, row, &self.p_pos, view)? else {
+                    continue;
+                };
+                let o_key = row_obj_key(&batch, row, &self.o_pos, view);
+                if matches!(o_key, GroupKeyOwned::Absent) {
+                    continue;
+                }
+                let var_binding = |pos: &EdgePos| match pos {
+                    EdgePos::Const(_) => None,
+                    EdgePos::Var(v) => {
+                        Some(batch.get(row, *v).cloned().unwrap_or(Binding::Unbound))
+                    }
+                };
+                let edge = SweptEdge {
+                    s_sid,
+                    p_sid,
+                    o_key,
+                    s_b,
+                    p_b: var_binding(&self.p_pos),
+                    o_b: var_binding(&self.o_pos),
+                };
+                edges.entry(s_key).or_default().push(edge);
+            }
+        }
+        op.close();
+        Ok(edges)
+    }
+
+    /// Emit one output row: child bindings, then the base edge's var
+    /// positions, then the reifier.
+    fn emit_row(&mut self, child_batch: &Batch, child_row: usize, edge: &SweptEdge, ann: &Sid) {
+        let mut rb = Vec::with_capacity(self.schema.len());
+        for var in self.schema.iter() {
+            let binding = if child_batch.schema().contains(var) {
+                let b = child_batch
+                    .get(child_row, *var)
+                    .cloned()
+                    .unwrap_or(Binding::Unbound);
+                // An unbound driving position takes the join's value —
+                // the matched reifier for the ann var, the edge's value
+                // for a base position — like any join would.
+                if matches!(b, Binding::Unbound) {
+                    if *var == self.ann_var {
+                        Binding::sid(ann.clone())
+                    } else {
+                        self.pos_binding_for_var(*var, edge)
+                            .unwrap_or(Binding::Unbound)
+                    }
+                } else {
+                    b
+                }
+            } else if *var == self.ann_var {
+                Binding::sid(ann.clone())
+            } else {
+                self.pos_binding_for_var(*var, edge)
+                    .unwrap_or(Binding::Unbound)
+            };
+            rb.push(binding);
+        }
+        self.result_buffer.push(rb);
+    }
+
+    /// The swept edge's binding for a base-pattern var, if `var` is one of
+    /// its positions.
+    fn pos_binding_for_var(&self, var: VarId, edge: &SweptEdge) -> Option<Binding> {
+        for (pos, b) in [
+            (&self.s_pos, &edge.s_b),
+            (&self.p_pos, &edge.p_b),
+            (&self.o_pos, &edge.o_b),
+        ] {
+            if matches!(pos, EdgePos::Var(v) if *v == var) {
+                return b.clone();
+            }
+        }
+        None
+    }
+
+    /// Drain the whole child stream, build the sidecar maps and the
+    /// base-edge sweep once, and fill `result_buffer` with each driving
+    /// row hash-joined to its reified edges (rows with none are dropped).
+    /// The child drains first so an empty driving stream never pays for
+    /// either sweep.
+    async fn probe_all(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        let view = ctx.graph_view();
+        let view = view.as_ref();
+        let store = view.map(fluree_db_binary_index::BinaryGraphView::store);
+
+        let mut child_batches: Vec<Batch> = Vec::new();
+        let mut driving: std::collections::HashSet<GroupKeyOwned> =
+            std::collections::HashSet::new();
+        let mut keep_all = false;
+        while let Some(batch) = self.child.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
+            if batch.is_empty() {
+                continue;
+            }
+            for row in 0..batch.len() {
+                match &self.s_pos {
+                    EdgePos::Const(sid) => {
+                        driving.insert(binding_to_group_key_normalized(
+                            &Binding::sid(sid.clone()),
+                            store,
+                            view,
+                        ));
+                    }
+                    EdgePos::Var(v) => match batch.get(row, *v) {
+                        None | Some(Binding::Unbound) => keep_all = true,
+                        Some(b) => {
+                            driving.insert(binding_to_group_key_normalized(b, store, view));
+                        }
+                    },
+                }
+            }
+            child_batches.push(batch);
+        }
+        if child_batches.is_empty() {
+            return Ok(());
+        }
+
+        let maps = AnnotationSidecarMaps::build(
+            &self.r_subj,
+            &self.r_pred,
+            &self.r_obj,
+            self.stats.clone(),
+            &self.planning,
+            ctx,
+            view,
+        )
+        .await?;
+        let edges = self.sweep_base_edges(ctx, view, &driving, keep_all).await?;
+
+        for batch in std::mem::take(&mut child_batches) {
+            ctx.check_cancelled()?;
+            for row in 0..batch.len() {
+                // A child-bound var position constrains the join like the
+                // per-row substitution it replaces: the edge must carry the
+                // SAME value there. Unbound positions are free — the edge
+                // binds them.
+                let row_key = |pos: &EdgePos| -> Option<GroupKeyOwned> {
+                    match pos {
+                        EdgePos::Const(_) => None, // constrained by the scan pattern itself
+                        EdgePos::Var(v) => match batch.get(row, *v) {
+                            None | Some(Binding::Unbound) => None,
+                            Some(b) => Some(binding_to_group_key_normalized(b, store, view)),
+                        },
+                    }
+                };
+                let s_key = row_key(&self.s_pos);
+                // Predicate compares in Sid space (a normalized key would
+                // straddle the predicate/subject id spaces).
+                let p_bound_sid = match &self.p_pos {
+                    EdgePos::Const(_) => None,
+                    EdgePos::Var(v) => match batch.get(row, *v) {
+                        Some(Binding::Poisoned) => continue,
+                        None | Some(Binding::Unbound) => None,
+                        Some(b) => match binding_sid(b, view)? {
+                            Some(sid) => Some(sid),
+                            None => continue,
+                        },
+                    },
+                };
+                let o_key = row_key(&self.o_pos);
+                let row_edges: Vec<&SweptEdge> = match &s_key {
+                    // Unbound driving subject: every swept edge is a candidate.
+                    None => edges.values().flatten().collect(),
+                    Some(k) => edges.get(k).map(|v| v.iter().collect()).unwrap_or_default(),
+                };
+                // A pre-bound reifier var (nested reifier patterns bind
+                // `?t` upstream: `?t :p :z . << ?s ?p ?o ~ ?t >>`) is a
+                // JOIN key like any other position — candidates must
+                // unify with it, not be overwritten by it. Without this,
+                // every candidate emitted a row stamped with the child's
+                // binding (W3C sparql12 eval-triple-terms pattern-8).
+                // Poisoned = a failed upstream OPTIONAL: join semantics
+                // drop the row (the nested-loop join skips poisoned rows)
+                // — never treat it as a wildcard. A bound non-ref reifier
+                // can match no annotation, so it too joins nothing.
+                let bound_ann: Option<Sid> = match batch.get(row, self.ann_var) {
+                    Some(Binding::Poisoned) => continue,
+                    None | Some(Binding::Unbound) => None,
+                    Some(b) => match binding_sid(b, view)? {
+                        Some(sid) => Some(sid),
+                        None => continue,
+                    },
+                };
+                for edge in row_edges {
+                    if p_bound_sid.as_ref().is_some_and(|ps| *ps != edge.p_sid) {
+                        continue;
+                    }
+                    if o_key.as_ref().is_some_and(|k| *k != edge.o_key) {
+                        continue;
+                    }
+                    let Some(cands) = maps.s_to_anns.get(&edge.s_sid) else {
+                        continue;
+                    };
+                    let matching: Vec<Sid> = cands
+                        .iter()
+                        .filter(|ann| {
+                            bound_ann.as_ref().is_none_or(|t| *t == **ann)
+                                && maps.matches(ann, &edge.p_sid, &edge.o_key)
+                        })
+                        .cloned()
+                        .collect();
+                    for ann in matching {
+                        self.emit_row(&batch, row, edge, &ann);
+                    }
+                }
+            }
+        }
+        tracing::debug!(
+            driving = driving.len(),
+            rows = self.result_buffer.len(),
+            "annotation required-lane hash probe complete"
+        );
+        Ok(())
+    }
+
+    /// Emit up to [`PROBE_OUTPUT_CHUNK`] buffered output rows as one batch.
+    fn drain_chunk(&mut self) -> Option<Batch> {
+        if self.buffer_pos >= self.result_buffer.len() {
+            return None;
+        }
+        let end = (self.buffer_pos + PROBE_OUTPUT_CHUNK).min(self.result_buffer.len());
+        let num_cols = self.schema.len();
+        let mut columns: Vec<Vec<Binding>> = (0..num_cols)
+            .map(|_| Vec::with_capacity(end - self.buffer_pos))
+            .collect();
+        for row in &self.result_buffer[self.buffer_pos..end] {
+            for (col, b) in row.iter().enumerate() {
+                if col < columns.len() {
+                    columns[col].push(b.clone());
+                }
+            }
+        }
+        self.buffer_pos = end;
+        if columns.is_empty() || columns[0].is_empty() {
+            return None;
+        }
+        Batch::new(self.schema.clone(), columns).ok()
+    }
+}
+
+#[async_trait]
+impl Operator for HashAnnotationEdgeProbeOperator {
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.child.open(ctx).await?;
+        self.state = OperatorState::Open;
+        self.probed = false;
+        self.result_buffer.clear();
+        self.buffer_pos = 0;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+        if !self.probed {
+            self.probe_all(ctx).await?;
+            self.probed = true;
+        }
+        let out = self.drain_chunk();
+        if out.is_none() {
+            self.state = OperatorState::Exhausted;
+        }
+        Ok(out)
+    }
+
+    fn close(&mut self) {
+        self.child.close();
+        self.result_buffer.clear();
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        // ~1 reifier per base edge.
+        self.child.estimated_rows()
     }
 }
 
@@ -586,5 +1369,23 @@ mod tests {
     fn rejects_too_short_chain() {
         let chain = canonical_chain();
         assert!(recognize_annotation_edge(&chain[..3]).is_none());
+    }
+
+    #[test]
+    fn annotation_sidecar_maps_preserve_multi_target_values() {
+        let ann = Sid::new(1, "ann");
+        let p1 = Sid::new(2, "p1");
+        let p2 = Sid::new(2, "p2");
+        let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None);
+        let o1 = ok(&Sid::new(3, "o1"));
+        let o2 = ok(&Sid::new(3, "o2"));
+        let maps = AnnotationSidecarMaps {
+            s_to_anns: HashMap::new(),
+            ann_preds: HashMap::from([(ann.clone(), vec![p1.clone(), p2.clone()])]),
+            ann_objs: HashMap::from([(ann.clone(), vec![o1.clone(), o2.clone()])]),
+        };
+
+        assert!(maps.matches(&ann, &p1, &o1));
+        assert!(maps.matches(&ann, &p2, &o2));
     }
 }

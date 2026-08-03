@@ -17,6 +17,7 @@
   - [update](cli/update.md)
   - [query](cli/query.md)
   - [validate](cli/validate.md)
+  - [model](cli/model.md)
   - [multi-query](cli/multi-query.md)
   - [history](cli/history.md)
   - [export](cli/export.md)
@@ -43,6 +44,7 @@
   - [mcp](cli/mcp.md)
   - [docs](cli/docs.md)
   - [iceberg](cli/iceberg.md)
+  - [materialize](cli/materialize.md)
   - [completions](cli/completions.md)
 
 - [Getting started](getting-started/README.md)
@@ -81,6 +83,7 @@
   - [`owl:imports` across named graphs](guides/cookbook-owl-imports.md)
 
 - [Design](design/README.md)
+  - [Performance architecture](design/performance.md)
   - [Query execution and overlay merge](design/query-execution.md)
   - [Auth contract (CLI ↔ Server)](design/auth-contract.md)
   - [Nameservice schema v2](design/nameservice-schema-v2.md)
@@ -89,6 +92,7 @@
   - [ContentId and ContentStore](design/content-id-and-contentstore.md)
   - [Index format](design/index-format.md)
   - [Edge annotations (storage internals)](design/edge-annotations.md)
+  - [Cypher sequential writes (multi-clause MERGE composition)](design/cypher-sequential-writes.md)
   - [Spatial index (GeoPoint + S2)](design/spatial-index.md)
   - [Namespace allocation and fallback modes](design/namespace-allocation.md)
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
@@ -199,6 +203,7 @@
     - [TTL file format](memory/reference/ttl-format.md)
 
 - [Operations](operations/README.md)
+  - [Scaling and resilience architecture](operations/scaling-and-resilience.md)
   - [Configuration](operations/configuration.md)
   - [Running with Docker](operations/docker.md)
   - [Storage modes (memory/file/AWS/IPFS)](operations/storage.md)

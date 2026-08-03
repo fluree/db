@@ -496,6 +496,26 @@ impl IcebergConnectionConfig {
         self
     }
 
+    /// Set bearer token authentication from a secret REFERENCE (REST mode only).
+    ///
+    /// `token_ref` is an opaque reference resolved at use time by the injected
+    /// [`SecretResolver`](fluree_db_iceberg::SecretResolver) (see
+    /// [`Fluree::with_secret_resolver`](crate::Fluree::with_secret_resolver)); the
+    /// token value never appears in the stored config. Mirrors
+    /// [`Self::with_auth_bearer`].
+    pub fn with_auth_bearer_token_ref(mut self, token_ref: impl Into<String>) -> Self {
+        if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
+            rest.auth = fluree_db_iceberg::auth::AuthConfig::Bearer {
+                token: fluree_db_iceberg::ConfigValue::SecretRef {
+                    secret_ref: token_ref.into(),
+                },
+            };
+        } else {
+            tracing::warn!("with_auth_bearer_token_ref has no effect in Direct catalog mode");
+        }
+        self
+    }
+
     /// Set OAuth2 client credentials authentication (REST mode only).
     pub fn with_auth_oauth2(
         mut self,
@@ -513,6 +533,39 @@ impl IcebergConnectionConfig {
             };
         } else {
             tracing::warn!("with_auth_oauth2 has no effect in Direct catalog mode");
+        }
+        self
+    }
+
+    /// Set OAuth2 client-credentials auth with the client secret supplied as a
+    /// secret REFERENCE (REST mode only).
+    ///
+    /// `client_secret_ref` is an opaque reference resolved at use time by the
+    /// injected [`SecretResolver`](fluree_db_iceberg::SecretResolver); the secret
+    /// value never appears in the stored config. `token_url` and `client_id` are
+    /// non-secret and stored literally. Scope/audience are set separately via
+    /// [`Self::with_oauth2_scope`] / [`Self::with_oauth2_audience`] (call them
+    /// AFTER this). Mirrors [`Self::with_auth_oauth2`].
+    pub fn with_auth_oauth2_client_secret_ref(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret_ref: impl Into<String>,
+    ) -> Self {
+        if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
+            rest.auth = fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                token_url: token_url.into(),
+                client_id: fluree_db_iceberg::ConfigValue::literal(client_id.into()),
+                client_secret: fluree_db_iceberg::ConfigValue::SecretRef {
+                    secret_ref: client_secret_ref.into(),
+                },
+                scope: None,
+                audience: None,
+            };
+        } else {
+            tracing::warn!(
+                "with_auth_oauth2_client_secret_ref has no effect in Direct catalog mode"
+            );
         }
         self
     }
@@ -679,6 +732,30 @@ impl IcebergCreateConfig {
         self.connection = self
             .connection
             .with_auth_oauth2(token_url, client_id, client_secret);
+        self
+    }
+
+    /// Set bearer authentication from a secret *reference* (REST mode only).
+    /// See [`IcebergConnectionConfig::with_auth_bearer_token_ref`].
+    pub fn with_auth_bearer_token_ref(mut self, token_ref: impl Into<String>) -> Self {
+        self.connection = self.connection.with_auth_bearer_token_ref(token_ref);
+        self
+    }
+
+    /// Set OAuth2 client-credentials authentication with the client secret as a
+    /// secret *reference* (REST mode only). See
+    /// [`IcebergConnectionConfig::with_auth_oauth2_client_secret_ref`].
+    pub fn with_auth_oauth2_client_secret_ref(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret_ref: impl Into<String>,
+    ) -> Self {
+        self.connection = self.connection.with_auth_oauth2_client_secret_ref(
+            token_url,
+            client_id,
+            client_secret_ref,
+        );
         self
     }
 
@@ -954,6 +1031,30 @@ impl R2rmlCreateConfig {
         self
     }
 
+    /// Set bearer authentication from a secret *reference*.
+    /// See [`IcebergConnectionConfig::with_auth_bearer_token_ref`].
+    pub fn with_auth_bearer_token_ref(mut self, token_ref: impl Into<String>) -> Self {
+        self.iceberg = self.iceberg.with_auth_bearer_token_ref(token_ref);
+        self
+    }
+
+    /// Set OAuth2 client-credentials authentication with the client secret as a
+    /// secret *reference*. See
+    /// [`IcebergConnectionConfig::with_auth_oauth2_client_secret_ref`].
+    pub fn with_auth_oauth2_client_secret_ref(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret_ref: impl Into<String>,
+    ) -> Self {
+        self.iceberg = self.iceberg.with_auth_oauth2_client_secret_ref(
+            token_url,
+            client_id,
+            client_secret_ref,
+        );
+        self
+    }
+
     /// Set the OAuth2 `scope` (delegates to the underlying Iceberg config).
     ///
     /// Call after [`Self::with_auth_oauth2`]. See
@@ -1201,6 +1302,59 @@ mod tests {
             } => {
                 assert_eq!(scope.as_deref(), Some("session:role:ICEBERG_READER"));
                 assert_eq!(audience.as_deref(), Some("polaris"));
+            }
+            other => panic!("expected OAuth2 auth, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn conn_auth(conn: &IcebergConnectionConfig) -> &fluree_db_iceberg::auth::AuthConfig {
+        match &conn.catalog_mode {
+            CatalogMode::Rest(rest) => &rest.auth,
+            CatalogMode::Direct { .. } => panic!("expected REST catalog mode"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn bearer_token_ref_builder_stores_secret_ref() {
+        let conn = IcebergConnectionConfig::rest("https://catalog.example.com")
+            .with_auth_bearer_token_ref("vault://team/bearer");
+        match conn_auth(&conn) {
+            fluree_db_iceberg::auth::AuthConfig::Bearer { token } => assert_eq!(
+                *token,
+                fluree_db_iceberg::ConfigValue::SecretRef {
+                    secret_ref: "vault://team/bearer".to_string()
+                }
+            ),
+            other => panic!("expected Bearer auth, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn oauth2_client_secret_ref_builder_stores_secret_ref_and_literal_id() {
+        let conn = IcebergConnectionConfig::rest("https://catalog.example.com")
+            .with_auth_oauth2_client_secret_ref(
+                "https://catalog.example.com/v1/oauth/tokens",
+                "svc-client",
+                "vault://team/client-secret",
+            );
+        match conn_auth(&conn) {
+            fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                client_id,
+                client_secret,
+                ..
+            } => {
+                // client_id is non-secret and stored as a plain literal.
+                assert_eq!(client_id.resolve().unwrap(), "svc-client");
+                // client_secret is stored as an opaque SecretRef, never a literal.
+                assert_eq!(
+                    *client_secret,
+                    fluree_db_iceberg::ConfigValue::SecretRef {
+                        secret_ref: "vault://team/client-secret".to_string()
+                    }
+                );
             }
             other => panic!("expected OAuth2 auth, got {other:?}"),
         }

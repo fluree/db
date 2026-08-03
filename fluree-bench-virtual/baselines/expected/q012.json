@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "query_id": "q012",
+  "result_hash": "c7f4832edc409efc697bc1622d821000af98d6ec3f83946ad8315dadff5a3035",
+  "rows": 10,
+  "head_rows": [
+    "Product 11435\u001f224",
+    "Product 11995\u001f218",
+    "Product 14100\u001f219",
+    "Product 18044\u001f217",
+    "Product 19749\u001f229",
+    "Product 23811\u001f217",
+    "Product 25632\u001f218",
+    "Product 26396\u001f218",
+    "Product 6419\u001f220",
+    "Product 9327\u001f214"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

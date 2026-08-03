@@ -1,0 +1,11 @@
+# q029 purchase_or_cart_events
+# Intent: UNION of two branch scans + LIMIT (H2 UNION absorbs the budget).
+# BI lineage (BI-15): "Show purchase-or-add-to-cart events."
+# Predicates verified against enterprise.ttl — FactWebEvent: eventType.
+# Determinism: unordered LIMIT truncates a larger set (any k rows are valid) -> hash_gate=rows_only; gated on row count + invariants, not an exact hash.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?e ?et
+WHERE { { ?e a edw:WebEvent ; edw:eventType "purchase" . BIND("purchase" AS ?et) }
+        UNION
+        { ?e a edw:WebEvent ; edw:eventType "add_to_cart" . BIND("add_to_cart" AS ?et) } }
+LIMIT 100

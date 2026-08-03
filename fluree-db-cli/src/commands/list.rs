@@ -3,6 +3,7 @@ use crate::context;
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use comfy_table::{ContentArrangement, Table};
+use fluree_db_api::ledger_info::graph_source_type_label;
 use fluree_db_api::server_defaults::FlureeDir;
 
 pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> CliResult<()> {
@@ -81,7 +82,7 @@ pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> C
                     " ".to_string(),
                     gs.name.clone(),
                     gs.branch.clone(),
-                    format_source_type(&gs.source_type),
+                    graph_source_type_label(&gs.source_type),
                     t_str,
                 ]);
             }
@@ -220,15 +221,4 @@ fn print_ledger_list(result: &serde_json::Value, remote_label: Option<&str>) -> 
 
     println!("{table}");
     Ok(())
-}
-
-fn format_source_type(st: &fluree_db_nameservice::GraphSourceType) -> String {
-    match st {
-        fluree_db_nameservice::GraphSourceType::Bm25 => "BM25".to_string(),
-        fluree_db_nameservice::GraphSourceType::Vector => "Vector".to_string(),
-        fluree_db_nameservice::GraphSourceType::Geo => "Geo".to_string(),
-        fluree_db_nameservice::GraphSourceType::R2rml => "R2RML".to_string(),
-        fluree_db_nameservice::GraphSourceType::Iceberg => "Iceberg".to_string(),
-        fluree_db_nameservice::GraphSourceType::Unknown(s) => format!("Unknown({s})"),
-    }
 }

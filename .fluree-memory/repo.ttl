@@ -1108,6 +1108,23 @@ mem:fact-01kp4g1wa8yyty4sd2p03k6bg9 a mem:Fact ;
     mem:artifactRef "fluree-graph-json-ld/src/expand.rs" ;
     mem:createdAt "2026-04-13T22:40:33.608461+00:00"^^xsd:dateTime .
 
+mem:fact-01ky55dwckmwazppht36vrn5hk a mem:Fact ;
+    mem:content "SPARQL history queries use the legacy RDF-star form: `FROM <l@t:1> TO <l@t:latest>` + `<< s p ?o >> f:t ?t ; f:op ?op`. The carve-out fires ONLY when the quoted-triple subject is reifier-less AND the predicate is f:t/f:op; anything else takes the RDF 1.2 reification path. Inner object must be a variable (BIND target). `f:op`/`@op` is xsd:boolean — \"assert\"/\"retract\" strings match nothing. Selecting ?t/?op WITHOUT the bindings does NOT error: it returns history rows with null metadata (issue #1532; pinned by history_metadata_vars_without_bindings_are_null). `FROM..TO` is rejected on the ledger-scoped and streaming endpoints — connection-scoped `/v1/fluree/query` only." ;
+    mem:tag "docs" ;
+    mem:tag "history" ;
+    mem:tag "rdf-star" ;
+    mem:tag "sparql" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/guides/cookbook-time-travel.md" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_history_sparql.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/fluree.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/query.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/rdf_star.rs" ;
+    mem:branch "docs/time-travel-history-audit" ;
+    mem:createdAt "2026-07-22T14:59:41.587318+00:00"^^xsd:dateTime ;
+    mem:rationale "The cookbook drifted into fully non-runnable syntax because this path had parser tests but no e2e coverage, and the unbound-metadata case fails silently rather than erroring." .
+
 mem:decision-01kwwmmezehttr76cjq1kdtfqf a mem:Decision ;
     mem:content "Bolt/Cypher node-emit strings are Arc<str> end-to-end: CypherNode/Relationship/Path fields, the hydrator memos, AND the bolt codec's Value::String + MapValue keys — names alloc once per distinct name per result, never per use (87→73ms on the 20k-node probe). IriCompactor::decode_sid_shared returns the Sid's own name (refcount bump, no alloc) for EMPTY/OVERFLOW/empty-prefix namespaces — the ready-made hot path for the planned move of default Cypher identifiers to namespace 0 (no IRI prefix instead of http://example.org/). Note: the dict already stores split (ns_code, suffix), so NS-0's win is decode-side only." ;
     mem:tag "bolt" ;
@@ -1280,6 +1297,33 @@ mem:fact-01kwx8z7tx43vecccdww6w19j9 a mem:Fact ;
     mem:createdAt "2026-07-07T03:11:58.813517+00:00"^^xsd:dateTime ;
     mem:rationale "Supersedes the earlier reverted-batched-frontier memory: the revert's conclusion (per-node reads fit early-exit searches) held only on the old substrate; with shared mmaps + cascaded seeks + galloping lookups, batched level expansion wins at every scale. Novelty semantics pinned by cypher_shortest_path_batched_lane_respects_novelty." .
 
+mem:constraint-01ky5xtjzq1mvmzatgmmpvh8pq a mem:Constraint ;
+    mem:content "RemoteAuth (nameservice-sync) round-trips asymmetrically in the CLI config store: reads go through serde (toml::from_str), but writes are HAND-ROLLED via toml_edit in write_sync_config_toml. Adding a field to RemoteAuth silently drops it on every config save unless you also add a branch to the auth_table builder AND the has_any guard in fluree-db-cli/src/config.rs. login_flow (added for honest `auth status` flow reporting) followed this pattern." ;
+    mem:tag "cli" ;
+    mem:tag "config" ;
+    mem:tag "gotcha" ;
+    mem:tag "remote-auth" ;
+    mem:tag "serialization" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-cli/src/config.rs" ;
+    mem:artifactRef "fluree-db-nameservice-sync/src/config.rs" ;
+    mem:branch "feature/cli-auth-token-and-access-disable" ;
+    mem:createdAt "2026-07-22T22:06:03.767306+00:00"^^xsd:dateTime .
+
+mem:constraint-01ky5xtw9tzntfmqwqa62zzyd1 a mem:Constraint ;
+    mem:content "Hosted-stack grants API: an EMPTY policyClasses list on a grant reads as instance-wide access (classes are optional narrowing), so `model access disable --space` must never POST an empty class list when detaching the last policy class — that would WIDEN the grant instead of revoking it. It leaves the grant untouched and tells the user to delete the grant itself; a grant naming a deleted policy class is fail-closed (selects no policies). Related parked decision (#4 of the internal CLI report): whether a class-less write grant should dominate over a class-carrying read grant in merged access reporting — router-side, undecided." ;
+    mem:tag "cli" ;
+    mem:tag "grants" ;
+    mem:tag "hosted-stack" ;
+    mem:tag "model-access" ;
+    mem:tag "policy" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-cli/src/commands/model/access.rs" ;
+    mem:branch "feature/cli-auth-token-and-access-disable" ;
+    mem:createdAt "2026-07-22T22:06:13.306994+00:00"^^xsd:dateTime .
+
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
     mem:tag "api-alignment" ;
@@ -1376,6 +1420,37 @@ mem:fact-01kwx6n2brwbcgryf5txj1hchn a mem:Fact ;
     mem:artifactRef "fluree-db-server/src/bolt.rs" ;
     mem:branch "feature/cypher-import" ;
     mem:createdAt "2026-07-07T02:31:28.376492+00:00"^^xsd:dateTime .
+
+mem:fact-01kxv8nbpawq7fg6hxf34mcjzn a mem:Fact ;
+    mem:content "Multi-clause Cypher writes LANDED (feature/cypher-merge-composition): cypher_seq.rs sequential driver over SequentialStager (factored from SPARQL D-10 loop in tx.rs). Per MERGE clause: seeded-VALUES match probe → identity-key dedup (first absent row per key creates) → re-bind all rows → ON MATCH SET for non-creators. Row threading: UnresolvedValue::PreBound(Binding) write-side; read-side probes swap rows into the lowered Pattern::Values (patterns[0]; seed cols MUST include #__cy_seq_row when placeholder_with_index used). CREATE vars thread as skolem Sids ({base}-s{clause}, row i = solution i, pinned by test). Computed merge-key/SET values hoist into engine-evaluated columns. detect_sequential fires only on previously-rejected shapes." ;
+    mem:tag "cypher" ;
+    mem:tag "driver" ;
+    mem:tag "merge" ;
+    mem:tag "sequential-writes" ;
+    mem:tag "staging" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/design/cypher-sequential-writes.md" ;
+    mem:artifactRef "fluree-db-api/src/cypher_seq.rs" ;
+    mem:artifactRef "fluree-db-api/src/tx.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_cypher_seq_writes.rs" ;
+    mem:branch "feature/cypher-merge-composition" ;
+    mem:createdAt "2026-07-18T18:43:48.042882+00:00"^^xsd:dateTime .
+
+mem:fact-01kxv8np3dtyza9xzbtfedvqxa a mem:Fact ;
+    mem:content "Sequential Cypher write wiring gotchas: (1) WritePlan::Sequential must dispatch BEFORE plan_write_return / plan_write_return_source at every call site (they reject MERGE+RETURN); autocommit/Bolt/HTTP route all early-detect via detect_sequential/classify_sequential_source. (2) TransactionReceipt+TransactResultRef carry cypher_return (local committer only); Raft supports sequential writes but the route rejects sequential+RETURN pre-submission (source_import_supported doubles as the is-raft check). (3) Boxing: CypherWriteUnderLock variants and ClaimOutcome::AlreadyDone are Boxed for clippy large-enum-variant. (4) UNWIND desugar's last-wins dedup gated to write_clauses.len()==1 — would drop rows in chains." ;
+    mem:tag "consensus" ;
+    mem:tag "cypher" ;
+    mem:tag "raft" ;
+    mem:tag "return" ;
+    mem:tag "sequential-writes" ;
+    mem:tag "wiring" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/tx_builder.rs" ;
+    mem:artifactRef "fluree-db-consensus/src/local.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/params.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/transact.rs" ;
+    mem:branch "feature/cypher-merge-composition" ;
+    mem:createdAt "2026-07-18T18:43:58.701455+00:00"^^xsd:dateTime .
 
 mem:fact-01km06dhjzpgyvbs1yc5h0h28e a mem:Fact ;
     mem:content "Default context: per-ledger JSON prefix map auto-applied to queries/transactions that omit @context. Stored in CAS keyed by ContentId; pointer in ConfigPayload.default_context via nameservice.\n\nPopulation: bulk import captures @prefix + builtins; API set_default_context(); HTTP PUT /v1/fluree/context/*ledger; CLI fluree context set.\n\nPrecedence: Query @context/PREFIX > ledger default > built-in (rdf, rdfs, xsd, owl, sh, geo).\n\nUpdates use CAS via ConfigPublisher::push_config() with retry; disconnect_ledger() evicts cache after update. ProxyNameService does NOT implement ConfigPublisher — context writes only on tx server." ;
@@ -1932,6 +2007,54 @@ mem:fact-01kvzn4mmmcvc7zz6bcswtw47c a mem:Fact ;
     mem:createdAt "2026-06-25T15:07:25.716857+00:00"^^xsd:dateTime ;
     mem:rationale "Predicate-var + IRI() filter is the proven approach for negated sets — the cypher 'var-predicate IN fails' warning was string-literal-specific, not IRI." .
 
+mem:fact-01kxtrxpq07vr4vbgybyk3e0p8 a mem:Fact ;
+    mem:content "Customer KB UNWIND OOM FIXED (57d9a0d6a + cache 4bc0c6c31): value-only Cypher rel binding lowers to OPTIONAL{EdgeAnnotation}; on reified ledgers without annotation_index (bulk import AND full reindex both write annotation_index: None) the chain ran per row driving from f:reifiesPredicate ≈25ms/row, matching field 35s-LIMIT-20/OOM. Fix: AnnotationValueOptionalBuilder — 3 set-wise f:reifies* planned scans hash-indexed ONCE per query run (Mutex-cached across required batches) + per-row lookups. Verified full customer scale (72k nodes/187k reified edges/21k uris): full 54.6k rows 35s→1.1s, LIMIT 20 0.89s, no OOM. Also: hash-join lane admits single-source DefaultGraphSource; arena probe takes per-row var predicate; reifies* structural selectivities in estimator. Non-annotated scale was already ~0.4s." ;
+    mem:tag "batched-probe" ;
+    mem:tag "cypher" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "oom" ;
+    mem:tag "optional" ;
+    mem:tag "performance" ;
+    mem:tag "reifies" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/examples/cypher_unwind_probe.rs" ;
+    mem:artifactRef "fluree-db-query/src/annotation_edge_probe.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/optional.rs" ;
+    mem:branch "fix/cypher-kb-feedback" ;
+    mem:createdAt "2026-07-18T14:08:44.257589+00:00"^^xsd:dateTime .
+
+mem:fact-01kxtyfvt9dh1007s6f5fdt271 a mem:Fact ;
+    mem:content "HTTP source-upload import LANDED (61dcbca82 + 0db7a6e58): /import-upload mint accepts source_kind:\"source\"+filename (extension drives pipeline sniffing, whitelisted); complete branches .flpack restore vs create().import().execute(); CSV/Cypher converted server-side via shared fluree-db-api::import_source (csv_to_shards/cypher_to_shards — the CLI local import uses them too). Discovery advertises \"source-upload\"+source_formats; refused on Raft (pipeline publishes NS heads outside the log). CLI: `create --remote --from data.ttl|dump.cypher` (single files) rides mint→PUT→complete→poll. When has_annotations, the server reindexes once post-import so the bootstrap scan seals the annotation arena (tested)." ;
+    mem:tag "annotation-arena" ;
+    mem:tag "bulk-import" ;
+    mem:tag "cli" ;
+    mem:tag "http-import" ;
+    mem:tag "server" ;
+    mem:tag "source-upload" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/import_source.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/create.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/import.rs" ;
+    mem:artifactRef "fluree-db-server/tests/flpack_import_integration.rs" ;
+    mem:branch "fix/cypher-kb-feedback" ;
+    mem:createdAt "2026-07-18T15:46:02.185560+00:00"^^xsd:dateTime .
+
+mem:fact-01kxtyga1y6fek1zwt2w6kz9vs a mem:Fact ;
+    mem:content "Annotation arena seal trap FIXED (8270133cd): three cooperating defects on the write-only ingest flow. (1) provider returned None when ledger not resident in LedgerManager → 'delta unknown' → defensive drop + sticky bit; fixed via transient_attachment_events (LedgerState::load, NEVER cached — cache insertion from background disturbs novelty bookkeeping, pinned by it_select_star_novelty_retract). (2) full rebuild under Augment discarded a sealed arena; Fir6Inputs.prev_index_root_id + Augment arm merges prev-arena events with delta (incremental 3d contract). (3) Fluree::reindex read NsRecord before quiescing background indexer → stale index_head_id; re-fetched after cancel. Pinned by seal_* matrix in it_edge_annotations_indexed incl. seal_survives_background_index_race. Deliberate post-defensive-drop scan-fallback contract unchanged." ;
+    mem:tag "annotation-arena" ;
+    mem:tag "bootstrap" ;
+    mem:tag "known-issue" ;
+    mem:tag "reindex" ;
+    mem:tag "sticky-bit" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/examples/cypher_unwind_probe.rs" ;
+    mem:artifactRef "fluree-db-api/src/indexer_attachment_provider.rs" ;
+    mem:artifactRef "fluree-db-api/src/ledger_manager.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/build/root_assembly.rs" ;
+    mem:branch "fix/cypher-kb-feedback" ;
+    mem:createdAt "2026-07-18T15:46:16.766954+00:00"^^xsd:dateTime .
+
 mem:decision-01kv5jegwe2h3fmsrbygh9j644 a mem:Decision ;
     mem:content "DATATYPE(?v) now returns the datatype IRI as ComparableValue::Sid (SPARQL 1.1 §17.4.2.3), not the old compact string (\"xsd:decimal\"). eval_datatype maps Lit→dtc.datatype() Sid, EncodedLit→reserved_datatype_sid() fast path or store.dt_sids(), IRI bindings→id_type Sid. Removed format_datatype_sid/format_reserved_datatype. Comparison works because filter-side xsd:decimal lowers via IRI()→encode_iri_strict→same Sid. Serialization: SPARQL results = full IRI; JSON-LD compacts via @context (so xsd prefix → \"xsd:decimal\"). JSON-LD s-expr filters can't express IRIs as bare prefixed names — must use (iri \"<full-iri>\"); STR(DATATYPE()) now yields the FULL IRI, breaking old \"xsd:decimal\" string workarounds." ;
     mem:tag "datatype" ;
@@ -2186,6 +2309,57 @@ mem:constraint-01kv3h37ky6wpm8c8jdvpnamjk a mem:Constraint ;
     mem:createdAt "2026-06-14T16:58:01.214124+00:00"^^xsd:dateTime ;
     mem:rationale "Non-obvious behavior change: distinguishing \"WHERE matched nothing\" (no-op) from \"no WHERE clause\" (fire once) and the OPTIONAL=1-row subtlety prevents future regressions or confusion when touching stage.rs." .
 
+mem:fact-01kynp3kwy5kxn5yff47hv9507 a mem:Fact ;
+    mem:content "Upsert staging was ~8ms/flake (35-70s per bulk txn): generate_upsert_deletions ran one execute_pattern per (subject,predicate); for subjects not in the persisted dict, BinaryScanOperator's unresolved_bound_subject_iri fallback degrades to a full PSOT predicate-partition walk with per-row resolve_subject_iri. Fixed (branch fix/upsert-staging-new-subject-scan, 0282073e2): group by subject, pre-check existence via subject reverse dict (authoritative under canonical ns encoding; subject_reverse_tree always Some in prod loader) + one Sid-space novelty walk per graph; absent subjects skip all lookups. 600 new subjects: 13.3s → 0.9ms. Resolved-subject point queries were already fast (~12µs/tuple)." ;
+    mem:tag "binary-scan" ;
+    mem:tag "dictionary" ;
+    mem:tag "novelty" ;
+    mem:tag "performance" ;
+    mem:tag "staging" ;
+    mem:tag "transact" ;
+    mem:tag "upsert" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_transact_upsert_indexed.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "fix/upsert-staging-new-subject-scan" ;
+    mem:createdAt "2026-07-29T00:59:01.918421+00:00"^^xsd:dateTime ;
+    mem:rationale "Any per-flake bound-subject lookup loop over unresolvable subjects reintroduces this partition-scan livelock class; the PSOT paranoid fallback at binary_scan.rs (unresolved subject + resolved predicate → Psot) is the mechanism to watch for." .
+
+mem:fact-01kynrrhdfqt0n6rx1wpcv5843 a mem:Fact ;
+    mem:content "Existing-subject upserts are NOT slow: 600 base-resident subjects / 6,600 flakes → generate_upsert_deletions ~40ms (~13µs per (s,p) point probe) on the STAGING-PERF-BUG repro; only unresolvable (new) subjects hit the PSOT partition-walk catastrophe. Per-probe cost is cursor/leaf machinery, not the p_id→Sid table rebuild at 62 predicates — but that rebuild was O(predicate count) per BinaryScanOperator::open (plus per-row re-resolve in binary_range materialization), a latent cliff for wide schemas; now cached once per store via OnceLock<Arc<[Sid]>> (0b2d607d9), novelty-only predicates in a per-operator ephemeral map. Further headroom if needed: sorted-subject SPOT merge-sweep to batch probes." ;
+    mem:tag "binary-scan" ;
+    mem:tag "performance" ;
+    mem:tag "point-lookup" ;
+    mem:tag "predicate-dictionary" ;
+    mem:tag "staging" ;
+    mem:tag "upsert" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_range.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:branch "fix/upsert-staging-new-subject-scan" ;
+    mem:createdAt "2026-07-29T01:45:24.655252+00:00"^^xsd:dateTime ;
+    mem:rationale "Answers \"would batching help existing-subject upserts?\" with measurements — avoids speculative batching work; documents the store-cached p_sid_table invariant (store immutable behind Arc → OnceLock safe)." .
+
+mem:constraint-01kyke812e1np5c9ag45ac7580 a mem:Constraint ;
+    mem:content "The WHERE early-dedup gate (`where_dedup_safe`) must check BOTH that every aggregate is `duplicate_insensitive()` AND that every var in `VariableDeps::required_aggregate_vars` is a GROUP BY key or an aggregate output. A non-key var surviving the grouping stage is emitted as `Binding::Grouped` — a per-group LIST (JSON-LD-only feature; SPARQL rejects the shape) that observes row multiplicity. Note `aggregates()` is EMPTY for a dedup-only `GROUP BY ?g`, so the aggregate check alone is vacuously true there." ;
+    mem:tag "aggregates" ;
+    mem:tag "correctness" ;
+    mem:tag "dedup" ;
+    mem:tag "grouping" ;
+    mem:tag "jsonld" ;
+    mem:tag "planner" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_grouping.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/dependency.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/groupby.rs" ;
+    mem:branch "fix/where-early-dedup-aggregate-gate" ;
+    mem:createdAt "2026-07-28T04:03:09.006298+00:00"^^xsd:dateTime ;
+    mem:rationale "Using required_aggregate_vars (rather than checking the projection directly) folds in projection, HAVING, post-binds and ORDER BY in one check — a post-bind whose EXPRESSION reads a non-key var still reads a grouped list, which a bind-output whitelist would miss. Regression tests need a fan-in fixture; the pinned grouped-list test has none and cannot catch dedup." .
+
 mem:constraint-01kjte29y3cp8mae56xy6yfv2n a mem:Constraint ;
     mem:content "SPARQL↔JSON-LD Parity: both compile to the same IR (fluree-db-query/src/ir.rs) and share the entire execution engine. When adding SPARQL features: (1) shared IR changes already affect JSON-LD — verify JSON-LD tests pass, (2) if expressible in JSON-LD, add parallel tests, (3) execution path missing in JSON-LD lower → track follow-up.\n\nSPARQL tests: it_query_sparql.rs | JSON-LD tests: it_query.rs, it_query_analytical.rs, it_query_grouping.rs\nValidate: `cd testsuite-sparql && make test-eval-cat CAT=<cat>` then `cargo test -p fluree-db-api --test it_query`" ;
     mem:tag "compliance" ;
@@ -2376,6 +2550,109 @@ mem:fact-01kwsthhc6fkb931xyd6anfjye a mem:Fact ;
     mem:artifactRef "fluree-db-server/src/routes/transact.rs" ;
     mem:branch "main" ;
     mem:createdAt "2026-07-05T19:02:06.470017+00:00"^^xsd:dateTime .
+
+mem:fact-01kxtfwax7ghq50a4rdar3f845 a mem:Fact ;
+    mem:content "Cypher untyped-string bound-object gap (REAL but NOT the KB OOM cause — that was the annotation OPTIONAL, see the batched-probe memory): UNWIND $uris elements are tagged xsd:string (stmt.rs:1644); inline prop {value: uri} is a Var-object triple, so the constant-object fast path never fires. When the predicate mixes string datatypes (e.g. langString labels), inference declines and the untyped-string branch sets o_key but leaves o_type wild (binary_scan.rs untyped_string branch; OPST withheld) → broad predicate leaf scan. Measured: point lookup 0.1ms → 7ms (70×) with 5% langString mix; the UNWIND hash-join lane is unaffected. Fix direction: multi-slice (o_type,o_key) seeks per present string-compatible datatype — needs cursor support for an o_type set." ;
+    mem:tag "bound-object" ;
+    mem:tag "cypher" ;
+    mem:tag "oom" ;
+    mem:tag "performance" ;
+    mem:tag "scan-narrowing" ;
+    mem:tag "unwind" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cypher/src/lower/pattern.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/stmt.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-18T11:30:42.215082+00:00"^^xsd:dateTime .
+
+mem:fact-01kxtfwfgkbab1krve3kcedr18 a mem:Fact ;
+    mem:content "Cypher UNWIND+MATCH join shape: labels lower to rdf:type triples and untyped rels to var-predicate + edge-set filter, so the block is not a property-join star → values_after_triples deferral disabled (where_plan.rs:1926-1929); both hash-join and nested-loop branches full-scan the probed predicate (where_plan.rs:2552-2609). LIMIT is only the outermost LimitOperator (operator_tree.rs:2835/2902/3409) — no pushdown through joins, so LIMIT 20 still paid the full first-stage scan (~35s). OOM mechanism = chained hash-join build sides holding unshrunk intermediates × full edge expansion. No query memory budget exists to fail gracefully instead of OOM-kill." ;
+    mem:tag "cypher" ;
+    mem:tag "hash-join" ;
+    mem:tag "limit-pushdown" ;
+    mem:tag "oom" ;
+    mem:tag "performance" ;
+    mem:tag "values-deferral" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-18T11:30:46.931435+00:00"^^xsd:dateTime .
+
+mem:fact-01kxtfwkkjdqkpj0507s7yme46 a mem:Fact ;
+    mem:content "Silent no-op 200 on wrong Content-Type — FIXED on fix/cypher-kb-feedback (2faa895e1): parse_update now rejects bodies with neither \"insert\" nor \"delete\" key (explicit \"delete\": [] keeps documented no-op semantics); execute_transaction (single choke point for all 6 transact handlers) detects a cypher-shaped envelope ({\"cypher\": string} with no JSON-LD txn keys) under a JSON Content-Type and 400s pointing at application/cypher. Root cause was: header-driven dispatch fell through to JSON-LD update; parse_update had no empty-update guard (insert path did, jsonld.rs:203); consensus path 200s any receipt regardless of flake count." ;
+    mem:tag "content-type" ;
+    mem:tag "cypher" ;
+    mem:tag "no-op-commit" ;
+    mem:tag "silent-failure" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-server/src/extract/headers.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/transact.rs" ;
+    mem:artifactRef "fluree-db-transact/src/parse/jsonld.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-18T11:30:51.122291+00:00"^^xsd:dateTime .
+
+mem:fact-01kxtfws2y2788at9d6kv5jjww a mem:Fact ;
+    mem:content "Cypher surface gaps — ALL LANDED on fix/cypher-kb-feedback: (1) EXPLAIN wired end-to-end: explain_cypher takes params (substituted pre-lowering), Fluree::explain_cypher method, server /explain cypher branch (application/cypher, ledger-scoped only), CLI --cypher --explain local+remote. (2) =~ regex operator: lexed/parsed at string-predicate precedence, lowers to Regex with CONCAT(\"^(?:\",pat,\")$\") anchoring (whole-string Neo4j semantics); write-path filter lowering too. (3) labels()/type()/keys() now follow db.labels() rule (vocab-strip or full IRI, no last-#// stripping): vocab rides Query::cypher_vocab → ExecutionContext.cypher_vocab (set in runner.rs from ContextConfig); NodeHydrator derives vocab from view.default_context." ;
+    mem:tag "cypher" ;
+    mem:tag "explain" ;
+    mem:tag "gaps" ;
+    mem:tag "iri-compaction" ;
+    mem:tag "labels" ;
+    mem:tag "regex" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_procedures.rs" ;
+    mem:artifactRef "fluree-db-api/src/explain.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/expr.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/metadata.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/query.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-18T11:30:56.734909+00:00"^^xsd:dateTime .
+
+mem:fact-01kxtfwy7tzh5vebpny7sayycv a mem:Fact ;
+    mem:content "HTTP bulk-import feasibility: all upload/job plumbing already exists for .flpack restore — streaming + negotiated multipart routes (routes/import.rs), reusable async job registry (import_jobs.rs), import_staging_dir config. Raw TTL pipeline (CreateBuilder::import, import.rs:2596/2636; import_from_storage :2661) is server-callable (spawn_blocking internally, no feature gate) but unused server-side. Crux risk: pipeline publishes to nameservice repeatedly (init + CAS checkpoint every 50 chunks + final publish_index, import.rs:3140) — unproven under RaftNameService; restore_ledger sets head once, which is why it shipped. Smallest path: swap restore_ledger for the pipeline in complete_upload, validate on single-transactor first." ;
+    mem:tag "bulk-import" ;
+    mem:tag "feasibility" ;
+    mem:tag "flpack" ;
+    mem:tag "http-api" ;
+    mem:tag "nameservice" ;
+    mem:tag "raft" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/import.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/create.rs" ;
+    mem:artifactRef "fluree-db-server/src/import_jobs.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/import.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-18T11:31:02.010277+00:00"^^xsd:dateTime .
+
+mem:fact-01kye0dqrnn5ffnwnwwnk9f0bp a mem:Fact ;
+    mem:content "WHERE-level early dedup (project dead vars + DistinctOperator between joins) is gated by `where_dedup_safe`, computed in build_operator_tree_inner: grouping present → ALL aggregates duplicate_insensitive() (DISTINCT-marked or MIN/MAX/SAMPLE) AND no raw non-key var passes through grouping; no grouping → SELECT DISTINCT. The old gate was `query.output.is_distinct()` alone, which (1) never fired for COUNT(DISTINCT) chains — the PrimeKG q66 2,490×-redundancy/404×-slowdown bug — and (2) was UNSOUND for `SELECT DISTINCT (COUNT(?x))`: it collapsed pre-aggregation rows and halved counts. Outer DISTINCT never licenses pre-aggregation dedup." ;
+    mem:tag "aggregates" ;
+    mem:tag "correctness" ;
+    mem:tag "dedup" ;
+    mem:tag "distinct" ;
+    mem:tag "planner" ;
+    mem:tag "query-perf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/ir/grouping.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-26T01:25:23.861334+00:00"^^xsd:dateTime ;
+    mem:rationale "Any future change to the dedup gate or aggregate variants must preserve both directions: fire for duplicate-insensitive aggregate chains (perf) and never fire under a duplicate-sensitive aggregate (correctness). Plan-shape guards live in it_query_explain.rs (explain_chain_* tests)." .
+
+mem:fact-01kye0e6kqs8q712xrcvdednee a mem:Fact ;
+    mem:content "hash-join-reason \"subject-driven-forward-join\" is an intentional structural short-circuit, not a costing bug: HashJoinOperator only implements object→subject joins (build keyed on the probe's OBJECT var, one PSOT partition scan). object_hash_shape() classifies subject-bound/object-new patterns as SubjectDriven and explain_object_hash_join returns chosen=false before any cost gate. Forward joins use the batched-SUBJECT SPOT galloping path, cheap per probe — a forward join with driving-est ≫ probe-count usually signals duplicate multiplicity feeding it (see early-dedup gate), not a wrong join choice. No subject-keyed/build-on-right hash join variant exists." ;
+    mem:tag "explain" ;
+    mem:tag "hash-join" ;
+    mem:tag "planner" ;
+    mem:tag "query-perf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/hash_join.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-26T01:25:39.063758+00:00"^^xsd:dateTime .
 
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;
@@ -2705,6 +2982,46 @@ mem:fact-01kpm3sz8pxzakzcj4r8xx687v a mem:Fact ;
     mem:branch "misc/fixes" ;
     mem:createdAt "2026-04-20T00:14:22.486023+00:00"^^xsd:dateTime ;
     mem:rationale "This is a subtle semi-naive reasoning invariant; future restriction or chain work could easily reintroduce the bug by splitting lookups across delta and derived." .
+
+mem:constraint-01kyp8dthh765py61gfmcqjje3 a mem:Constraint ;
+    mem:content "DefaultGraphSourceOperator's single-graph delegate emits batches in the REORDERED inner chain's column order, which need not match the operator's declared schema — next_batch now re-projects delegate batches to the declared schema. Any operator reading columns POSITIONALLY (get_by_col with indices precomputed from a child's declared schema) is unsound against non-conforming children; prefer Batch::get(row, var). MembershipJoinOperator was bitten by exactly this (probed the wrong column, silently dropped all rows)." ;
+    mem:tag "batch-schema" ;
+    mem:tag "correctness" ;
+    mem:tag "default-graph-source" ;
+    mem:tag "operator-contract" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-query/src/default_graph_source.rs" ;
+    mem:artifactRef "fluree-db-query/src/membership_join.rs" ;
+    mem:branch "perf/cypher-untyped-rel-scan" ;
+    mem:createdAt "2026-07-29T06:19:10.769709+00:00"^^xsd:dateTime .
+
+mem:constraint-01kypsdq2jdgvba3ndpce6bb49 a mem:Constraint ;
+    mem:content "Annotation probe lanes must UNIFY a pre-bound reifier var, not overwrite it: nested reifier patterns (`?t :p :z . << ?s ?p ?o ~ ?t >>`) arrive with ann_var already in the child schema, and both HashAnnotationEdgeProbeOperator and the arena AnnotationEdgeProbeOperator previously stamped every candidate row with the child's binding (or appended a misaligned column) — W3C sparql12 eval-triple-terms pattern-8 returned 11 rows instead of 1. Candidates now filter against the bound value; unbound pre-existing columns are filled per candidate. The W3C suite (testsuite-sparql, workspace-excluded — run `make test` there for any annotation-lane change) is the guard; the fix also unlocked basic-4/pattern-5/pattern-7/pattern-9." ;
+    mem:tag "correctness" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "reifier" ;
+    mem:tag "sparql12" ;
+    mem:tag "unification" ;
+    mem:tag "w3c" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-query/src/annotation_edge_probe.rs" ;
+    mem:artifactRef "testsuite-sparql/tests/registers/mod.rs" ;
+    mem:branch "perf/cypher-untyped-rel-scan" ;
+    mem:createdAt "2026-07-29T11:16:13.010949+00:00"^^xsd:dateTime .
+
+mem:fact-01kyp8dy5fbhd1f7svcj282d2y a mem:Fact ;
+    mem:content "Batch fragmentation is a systemic per-row-cost amplifier: per-row NLJs emit 1-row batches, and every downstream \"batched\" lane (PatternOptionalBuilder / GroupedPatternOptionalBuilder probes, ValuesOperator matching) then pays its per-batch setup per driving row. Both optional builders opt into PR-4d seed-coalescing (supports_seed_coalescing=true — safe because their batched probes are pure per-row restrictions), and ValuesOperator hash-indexes value rows on normalized overlap keys (≥16 rows; prefilter only — is_compatible still verifies; Iri/wildcard rows keep the scan). Diagnosing slow UNWIND/VALUES shapes: check the VALUES join shape and input batch sizes FIRST (debug-log timestamp gaps + Operator::describe() child dumps beat per-row-scan theories), before blaming scans." ;
+    mem:tag "batching" ;
+    mem:tag "coalescing" ;
+    mem:tag "diagnosis" ;
+    mem:tag "optional" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/optional.rs" ;
+    mem:branch "perf/cypher-untyped-rel-scan" ;
+    mem:createdAt "2026-07-29T06:19:14.479669+00:00"^^xsd:dateTime .
 
 mem:fact-01kx4zr6ed32yj966mpngvqhcg a mem:Fact ;
     mem:content "HTTP Cypher READ endpoint already existed server-side: POST /v1/fluree/query/*ledger + Content-Type: application/cypher → execute_cypher_ledger (can_read/policy/Min-T, returns application/vnd.fluree.cypher+json). Gap was CLI-only; wired `fluree query --cypher --remote` via remote_client::query_cypher (body sent verbatim as RequestBody::Text; server calls extract_cypher_envelope itself) + run_remote_cypher_query. Remote emits cypher-json ONLY — --format json/typed-json/csv/tsv and --at rejected before network call, pointing to --direct." ;

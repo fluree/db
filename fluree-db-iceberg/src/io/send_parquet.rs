@@ -16,12 +16,16 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_core::disk_cache::DiskArtifactCache;
 use tokio::runtime::Handle;
+// PR-2 phase-1 (measurement-only): `.instrument()` for the per-file cost
+// decomposition sub-spans in `read_task_small_file`. Additive/debug-level;
+// no behavior change.
+use tracing::Instrument as _;
 
 use crate::error::{IcebergError, Result};
 use crate::io::batch::ColumnBatch;
@@ -161,6 +165,96 @@ async fn read_whole_local(path: &Path, expected_size: u64) -> Option<Bytes> {
     }
 }
 
+/// Lever A kill switch (`FLUREE_ICEBERG_FOOTER_FROM_CACHE`, default **on**). When
+/// on, a file that is read whole anyway — a disk-cache hit, or a cheap/small file
+/// the policy fetches whole — parses its Parquet footer from those in-memory
+/// bytes instead of issuing a separate footer round-trip (measured ~190ms of two
+/// serial S3 range GETs per file, see `docs/audit/2026-07-virtual-dataset-perf/06-per-file-cost.md`).
+/// Off (`0`/`false`/`off`/`no`, trimmed + case-insensitive per the R2RML switch
+/// family) restores the byte-identical footer-first path. Read once per process
+/// (`OnceLock`, the family idiom — e.g. `catalog_session::cache_enabled` in
+/// `fluree-db-api`): set it at startup, not per query.
+fn footer_from_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_ICEBERG_FOOTER_FROM_CACHE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// T2.3 kill switch (`FLUREE_ICEBERG_ROWGROUP_PARALLELISM`, default **on**). When
+/// on, a large file whose scan granted it a row-group concurrency > 1 decodes its
+/// surviving row groups across that many blocking tasks instead of one, so a
+/// single-file table (which the file-level fan-out pins at concurrency 1) uses the
+/// idle cores. Off (`0`/`false`/`off`/`no`) restores the byte-identical sequential
+/// single-thread decode. Read once per process (`OnceLock`, the family idiom).
+fn rowgroup_parallelism_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("FLUREE_ICEBERG_ROWGROUP_PARALLELISM") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// Split `n` row-group indices `0..n` into `parts` contiguous chunks as evenly as
+/// possible (earlier chunks get the remainder). Each chunk is decoded by one
+/// blocking task; row groups are independently decodable, so the union of the
+/// chunks' rows equals a sequential decode's rows (order-independent for a scan).
+fn split_row_groups(n: usize, parts: usize) -> Vec<Vec<usize>> {
+    let parts = parts.clamp(1, n.max(1));
+    let base = n / parts;
+    let rem = n % parts;
+    let mut chunks = Vec::with_capacity(parts);
+    let mut start = 0usize;
+    for p in 0..parts {
+        let len = base + usize::from(p < rem);
+        if len == 0 {
+            break;
+        }
+        chunks.push((start..start + len).collect());
+        start += len;
+    }
+    chunks
+}
+
+/// Parse Parquet metadata from a whole-file byte buffer already resident in
+/// memory — the footer is sliced out of `bytes`, so this does **no I/O**. Mirrors
+/// the validation and parse in [`SendParquetReader::read_metadata`] exactly (same
+/// footer slice `file_size - 8 - footer_len .. file_size`, same parser), differing
+/// only in that the bytes are already local.
+fn metadata_from_whole_bytes(bytes: &Bytes) -> Result<Arc<ParquetMetaData>> {
+    let file_size = bytes.len() as u64;
+    if file_size < 12 {
+        return Err(IcebergError::Storage(format!(
+            "File too small to be Parquet: {file_size} bytes"
+        )));
+    }
+    let len = bytes.len();
+    if bytes[len - 4..len] != PARQUET_MAGIC {
+        return Err(IcebergError::Storage(
+            "Invalid Parquet file: missing magic bytes".to_string(),
+        ));
+    }
+    let footer_len = u32::from_le_bytes([
+        bytes[len - 8],
+        bytes[len - 7],
+        bytes[len - 6],
+        bytes[len - 5],
+    ]) as u64;
+    let footer_start = file_size.saturating_sub(8 + footer_len) as usize;
+    let footer_bytes = bytes.slice(footer_start..len);
+    let metadata = parse_parquet_metadata_from_bytes(&footer_bytes, file_size)?;
+    Ok(Arc::new(metadata))
+}
+
 /// A [`SendIcebergStorage`] backed by a single local cache file, serving a large
 /// file's byte ranges from local disk instead of the remote store. Reads run
 /// synchronously; the chunk reader only drives this from a blocking context.
@@ -246,6 +340,13 @@ pub struct SendParquetReader<'a, S: SendIcebergStorage> {
     storage: &'a S,
     footer_cache: Option<&'a ParquetFooterCache>,
     disk_cache: Option<DiskCacheRef<'a>>,
+    /// T2.3: how many of this file's row groups to decode CONCURRENTLY. `1`
+    /// (the default) is the sequential single-thread decode. The scan sets this
+    /// to `max(1, available_parallelism / file_concurrency)` so a single-file
+    /// table (file concurrency 1) reclaims the idle cores while a many-file scan
+    /// (already saturating cores via the file fan-out) stays at 1 — no
+    /// oversubscription.
+    rowgroup_concurrency: usize,
 }
 
 impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
@@ -255,6 +356,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             storage,
             footer_cache: None,
             disk_cache: None,
+            rowgroup_concurrency: 1,
         }
     }
 
@@ -264,6 +366,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             storage,
             footer_cache: Some(cache),
             disk_cache: None,
+            rowgroup_concurrency: 1,
         }
     }
 
@@ -286,7 +389,17 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 cache: disk_cache,
                 dir: cache_dir,
             }),
+            rowgroup_concurrency: 1,
         }
+    }
+
+    /// T2.3: set how many of a large file's row groups to decode concurrently.
+    /// The scan passes `max(1, available_parallelism / file_concurrency)`; `1`
+    /// (or the `FLUREE_ICEBERG_ROWGROUP_PARALLELISM` switch off) keeps the
+    /// sequential single-thread decode.
+    pub fn with_rowgroup_concurrency(mut self, n: usize) -> Self {
+        self.rowgroup_concurrency = n.max(1);
+        self
     }
 
     /// Read the Parquet file metadata (footer) using range reads.
@@ -368,17 +481,129 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         self.read_task_small_file(task).await
     }
 
-    /// Read a small file using sparse buffer approach.
+    /// Lever A: obtain the whole-file bytes for the cases where the disk-cache /
+    /// small-file policy reads the file whole regardless of projection, WITHOUT a
+    /// separate footer read. Returns `None` for files that take the sparse-range
+    /// path (they keep the footer-first policy in [`Self::read_task_small_file`]).
+    ///
+    /// - **A2** (disk-cache hit, any size in the small-file range): the whole file
+    ///   — and thus its footer — is served from the cached local bytes.
+    /// - **A1** (a miss on the cheap tier `<= WHOLE_FILE_MAX_BYTES`, admitted whole
+    ///   unconditionally by `admit_whole_file`'s `cheap` branch; or a
+    ///   sub-[`MIN_SPARSE_FILE_BYTES`] file with no disk cache): the file is
+    ///   fetched whole in one GET (single-flight, cached when a disk cache is
+    ///   present), then its footer is parsed from those bytes.
+    ///
+    /// A larger file with a narrow projection returns `None` — that is the
+    /// range-read tier, whose footer path is intentionally unchanged.
+    async fn try_whole_bytes_no_footer(&self, path: &str, file_size: u64) -> Result<Option<Bytes>> {
+        if let Some(dc) = self.disk_cache.filter(|dc| dc.cache.budget_bytes() > 0) {
+            let local = dc.local_path(path, file_size);
+            // A2: whole file already local — serve footer + data from disk.
+            if let Some(bytes) = read_whole_local(&local, file_size).await {
+                tracing::debug!(
+                    path,
+                    file_size,
+                    "Lever A: footer+data from disk cache (whole file)"
+                );
+                return Ok(Some(bytes));
+            }
+            // A1 (cheap tier): admitted whole unconditionally, so fetch whole
+            // without the footer. Single-flight fill mirrors `read_file_for_task`.
+            if file_size <= WHOLE_FILE_MAX_BYTES {
+                let data = dc
+                    .cache
+                    .coalesced_fetch(local, || async {
+                        self.storage
+                            .read(path)
+                            .await
+                            .map(|b| b.to_vec())
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    })
+                    .await
+                    .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
+                tracing::debug!(
+                    path,
+                    file_size,
+                    "Lever A: footer+data from whole-file fetch (cheap, cached)"
+                );
+                return Ok(Some(Bytes::from(data)));
+            }
+            // Larger file, narrow projection: range-read tier (unchanged).
+            return Ok(None);
+        }
+        // No disk cache: only the sub-`MIN_SPARSE_FILE_BYTES` correctness-floor
+        // files are read whole (matches `read_file_for_task`).
+        if file_size < MIN_SPARSE_FILE_BYTES {
+            tracing::debug!(
+                path,
+                file_size,
+                "Lever A: footer+data from whole small file (no disk cache)"
+            );
+            return Ok(Some(self.storage.read(path).await?));
+        }
+        Ok(None)
+    }
+
+    /// Read a small file (`<= MAX_SPARSE_BUFFER_SIZE`).
+    //
+    // PR-2: Lever A (footer-from-cache) fast path first — when the file is read
+    // whole anyway, parse the footer from the fetched/cached bytes instead of a
+    // separate 2-round-trip footer read. Sparse-range files (larger, narrow
+    // projection) and the kill-switch-off case fall through to the unchanged
+    // footer-first path. The four `iceberg.*` sub-spans (PR-2 phase-1 counters)
+    // decompose the per-file wall; in the fast path `iceberg.read_footer` times
+    // the in-memory footer parse — the ~190ms round-trip collapsed to a parse.
     async fn read_task_small_file(&self, task: &FileScanTask) -> Result<Vec<ColumnBatch>> {
         let path = &task.data_file.file_path;
-        let metadata = self.read_metadata(path).await?;
+        let file_size = task.data_file.file_size_in_bytes as u64;
+
+        // Lever A fast path (default on; FLUREE_ICEBERG_FOOTER_FROM_CACHE=0 skips).
+        if footer_from_cache_enabled() {
+            let maybe_whole = self
+                .try_whole_bytes_no_footer(path, file_size)
+                .instrument(tracing::debug_span!("iceberg.fetch_bytes"))
+                .await?;
+            if let Some(file_bytes) = maybe_whole {
+                // Parse+validate the footer from the in-memory bytes (no I/O).
+                // `decode_batches_arrow` re-derives it from the same bytes; this
+                // parse is the early validation and the footer-cost counter.
+                {
+                    let _footer_guard = tracing::debug_span!("iceberg.read_footer").entered();
+                    metadata_from_whole_bytes(&file_bytes)?;
+                }
+                let _decode_guard = tracing::debug_span!("iceberg.decode").entered();
+                return crate::io::arrow_reader::decode_batches_arrow(
+                    file_bytes,
+                    &task.projected_field_ids,
+                    task.residual_filter.as_ref(),
+                    task.iceberg_schema.as_deref(),
+                    None,
+                    None,
+                );
+            }
+        }
+
+        // Unchanged path: footer first (range reads), then the policy-driven fetch
+        // of the projected column chunks (sparse) or the whole file.
+        let metadata = self
+            .read_metadata(path)
+            .instrument(tracing::debug_span!("iceberg.read_footer"))
+            .await?;
 
         // Resolve the projected Parquet column indices so the sparse-range read
         // fetches exactly the column chunks the Arrow reader will decode.
-        let (_, column_indices) = if let Some(ref iceberg_schema) = task.iceberg_schema {
-            build_batch_schema_with_iceberg(&metadata, iceberg_schema, &task.projected_field_ids)?
-        } else {
-            build_batch_schema(&metadata, &task.projected_field_ids)?
+        let (_, column_indices) = {
+            let _plan_guard = tracing::debug_span!("iceberg.plan_columns").entered();
+            if let Some(ref iceberg_schema) = task.iceberg_schema {
+                build_batch_schema_with_iceberg(
+                    &metadata,
+                    iceberg_schema,
+                    &task.projected_field_ids,
+                )?
+            } else {
+                build_batch_schema(&metadata, &task.projected_field_ids)?
+            }
         };
 
         let real_column_indices: Vec<usize> = column_indices
@@ -390,16 +615,19 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         // Read the file bytes via range reads for the needed column chunks.
         let file_bytes = self
             .read_file_for_task(path, task, &real_column_indices, &metadata)
+            .instrument(tracing::debug_span!("iceberg.fetch_bytes"))
             .await?;
 
         // Decode the range-read bytes with native projection + row-group pruning
         // + exact row filtering. `Bytes` is a `ChunkReader`, so the Arrow reader
         // reuses the exact bytes fetched above.
+        let _decode_guard = tracing::debug_span!("iceberg.decode").entered();
         crate::io::arrow_reader::decode_batches_arrow(
             file_bytes,
             &task.projected_field_ids,
             task.residual_filter.as_ref(),
             task.iceberg_schema.as_deref(),
+            None,
             None,
         )
     }
@@ -439,6 +667,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     iceberg_schema,
                     runtime,
                     None,
+                    self.rowgroup_concurrency,
                 )
                 .await;
             }
@@ -475,6 +704,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                         iceberg_schema,
                         runtime,
                         None,
+                        self.rowgroup_concurrency,
                     )
                     .await;
                 }
@@ -492,6 +722,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             iceberg_schema,
             runtime,
             None,
+            self.rowgroup_concurrency,
         )
         .await
     }
@@ -517,11 +748,66 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         iceberg_schema: Option<Arc<Schema>>,
         runtime: Handle,
         max_rows: Option<usize>,
+        rowgroup_concurrency: usize,
     ) -> Result<Vec<ColumnBatch>> {
-        // Run the sync Arrow decode in a blocking context: native projection +
-        // row-group pruning + row filtering over the range-backed reader
-        // (skipped row groups' column chunks are never fetched).
-        let result = tokio::task::spawn_blocking(move || {
+        // T2.3: decode this file's row groups across up to `rowgroup_concurrency`
+        // blocking tasks (each a contiguous slice of the row groups) when the scan
+        // granted concurrency > 1 — a single-file table otherwise decodes on ONE
+        // core while the other vCPUs sit idle. Row groups are independently
+        // decodable, so the union of the tasks' rows equals a sequential decode's
+        // (order-independent for a scan). Declines to the sequential single-thread
+        // decode for: the switch off; a bounded `max_rows` peek (decline (v) — a
+        // small budget wants only the first row group, so parallelizing would
+        // decode groups a sequential read would skip); and a single row group.
+        if rowgroup_concurrency > 1 && max_rows.is_none() && rowgroup_parallelism_enabled() {
+            // One footer read to size the fan and honor the single-group decline.
+            let num_row_groups = {
+                let storage = Arc::clone(&storage);
+                let path = path.clone();
+                let runtime = runtime.clone();
+                tokio::task::spawn_blocking(move || {
+                    let cr = RangeBackedChunkReader::new(storage, path, file_size, runtime);
+                    crate::io::arrow_reader::read_num_row_groups(cr)
+                })
+                .await
+                .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))??
+            };
+            let n_tasks = rowgroup_concurrency.min(num_row_groups);
+            if n_tasks > 1 {
+                let mut handles = Vec::with_capacity(n_tasks);
+                for chunk in split_row_groups(num_row_groups, n_tasks) {
+                    let storage = Arc::clone(&storage);
+                    let path = path.clone();
+                    let projected = projected_field_ids.clone();
+                    let residual = residual_filter.clone();
+                    let schema = iceberg_schema.clone();
+                    let runtime = runtime.clone();
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        let cr = RangeBackedChunkReader::new(storage, path, file_size, runtime);
+                        crate::io::arrow_reader::decode_batches_arrow(
+                            cr,
+                            &projected,
+                            residual.as_ref(),
+                            schema.as_deref(),
+                            None,
+                            Some(&chunk),
+                        )
+                    }));
+                }
+                let mut out = Vec::new();
+                for h in handles {
+                    out.extend(h.await.map_err(|e| {
+                        IcebergError::Storage(format!("Blocking task failed: {e}"))
+                    })??);
+                }
+                return Ok(out);
+            }
+        }
+
+        // Sequential decode (default / declined): native projection + row-group
+        // pruning + row filtering over the range-backed reader (skipped row
+        // groups' column chunks are never fetched).
+        tokio::task::spawn_blocking(move || {
             let chunk_reader = RangeBackedChunkReader::new(storage, path, file_size, runtime);
             crate::io::arrow_reader::decode_batches_arrow(
                 chunk_reader,
@@ -529,12 +815,11 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 residual_filter.as_ref(),
                 iceberg_schema.as_deref(),
                 max_rows,
+                None,
             )
         })
         .await
-        .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))?;
-
-        result
+        .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))?
     }
 
     /// Read at most `max_rows` rows from the **first row group** of the task's
@@ -571,6 +856,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             task.iceberg_schema.clone(),
             Handle::current(),
             Some(max_rows),
+            1,
         )
         .await
     }
@@ -664,12 +950,14 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             "Range-reading Parquet file"
         );
 
-        // Fetch all ranges
-        let mut range_data: Vec<(u64, Bytes)> = Vec::with_capacity(coalesced.len());
-        for (start, end) in &coalesced {
-            let data = self.storage.read_range(path, *start..*end).await?;
-            range_data.push((*start, data));
-        }
+        // Item 12 (B1-AppD): fetch the coalesced ranges via `read_ranges` — bounded
+        // concurrent GETs on S3 (order-preserving), sequential on other backends
+        // (incl. the local-file wrapper, where the default sequential impl already
+        // does the right thing). Bytes return in input order → zip to their starts.
+        let range_reqs: Vec<std::ops::Range<u64>> = coalesced.iter().map(|(s, e)| *s..*e).collect();
+        let range_bytes = self.storage.read_ranges(path, range_reqs).await?;
+        let range_data: Vec<(u64, Bytes)> =
+            coalesced.iter().map(|(s, _)| *s).zip(range_bytes).collect();
 
         // Assemble into sparse buffer
         let sparse_buffer = assemble_sparse_buffer(file_size as usize, range_data);
@@ -982,6 +1270,56 @@ mod tests {
             out.extend(extract(col).iter().cloned());
         }
         out
+    }
+
+    /// T2.3 parity: the parallel decode partitions a file's row groups across
+    /// tasks by index, so decoding subset `[0]` then subset `[1]` and concatenating
+    /// yields EXACTLY the full sequential decode's rows (row groups are
+    /// independently decodable). An empty subset decodes nothing (a task whose
+    /// slice contains no surviving groups).
+    #[test]
+    fn rowgroup_subset_decode_partitions_the_file() {
+        use crate::io::arrow_reader::decode_batches_arrow;
+        use crate::io::batch::Column;
+        let id_of = |batches: &[ColumnBatch]| {
+            flatten(batches, 0, |c| match c {
+                Column::Int64(v) => v.as_slice(),
+                _ => panic!("id not Int64"),
+            })
+        };
+        let bytes = multitype_parquet(); // row group 0 = ids [1, 2], row group 1 = id [3]
+
+        let full = decode_batches_arrow(bytes.clone(), &[], None, None, None, None).unwrap();
+        assert_eq!(id_of(&full), vec![Some(1), Some(2), Some(3)]);
+
+        let rg0 = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[0])).unwrap();
+        let rg1 = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[1])).unwrap();
+        let mut combined = id_of(&rg0);
+        combined.extend(id_of(&rg1));
+        assert_eq!(
+            combined,
+            id_of(&full),
+            "subset [0] ++ subset [1] must equal the full sequential decode"
+        );
+
+        let empty = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[])).unwrap();
+        assert_eq!(empty.iter().map(|b| b.num_rows).sum::<usize>(), 0);
+    }
+
+    #[test]
+    fn split_row_groups_partitions_indices_evenly() {
+        assert_eq!(split_row_groups(5, 2), vec![vec![0, 1, 2], vec![3, 4]]);
+        assert_eq!(
+            split_row_groups(6, 3),
+            vec![vec![0, 1], vec![2, 3], vec![4, 5]]
+        );
+        // Parts are capped to the group count; a single group never fans.
+        assert_eq!(split_row_groups(2, 4), vec![vec![0], vec![1]]);
+        assert_eq!(split_row_groups(1, 3), vec![vec![0]]);
+        // Union == 0..n with no overlap.
+        let mut all: Vec<usize> = split_row_groups(7, 3).into_iter().flatten().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..7).collect::<Vec<_>>());
     }
 
     /// End-to-end decode round-trip: asserts the exact decoded values across all

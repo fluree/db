@@ -110,7 +110,10 @@ pub(crate) fn ref_values_match(a: &RefValue, b: &RefValue) -> bool {
 ///
 /// Used when constructing storage addresses for BM25, vector, and other graph
 /// source index artifacts, e.g. `fluree:file://graph-sources/{name}/{branch}/bm25/...`.
-pub const STORAGE_SEGMENT_GRAPH_SOURCES: &str = "graph-sources";
+///
+/// Aliased to the canonical constant next to `content_path` in fluree-db-core
+/// so the forward layout and every reverse parser share one definition.
+pub const STORAGE_SEGMENT_GRAPH_SOURCES: &str = fluree_db_core::storage::GRAPH_SOURCES_PATH_SEGMENT;
 pub use storage_ns::StorageNameService;
 pub use tracking::{MemoryTrackingStore, RemoteName, RemoteTrackingStore, TrackingRecord};
 #[cfg(feature = "native")]

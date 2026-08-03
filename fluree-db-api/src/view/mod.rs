@@ -92,11 +92,25 @@ macro_rules! view_context_config {
         } else {
             None
         };
+        // Wire the BM25 index provider so embedded `f:searchText` graph-source
+        // queries execute in-process on the single-graph view path too.
+        // Zero-cost `&Fluree` wrapper, only consulted by the `IndexSearch`
+        // operator, so non-search queries are unaffected. Declared before `$cfg`
+        // so it outlives the borrow the context holds.
+        //
+        // `bm25_provider` (the "legacy" index-provider slot), NOT the
+        // "preferred" `bm25_search_provider` that `ContextConfig` steers you
+        // toward: view-policy enforcement on a hit only works in index-provider
+        // mode. Search-provider mode has no local flakes and fails closed
+        // (`operator.rs`), so it would return zero rows for every
+        // policy-enforced query. Do not "upgrade" this.
+        let __index_provider = $crate::FlureeIndexProvider::new($self);
         let $cfg = ContextConfig {
             tracker: Some($tracker),
             cancellation: $options.cancellation.clone(),
             policy_enforcer: __db.policy_enforcer().cloned(),
             r2rml: $r2rml,
+            bm25_provider: Some(&__index_provider),
             binary_store: __db.binary_store.clone(),
             binary_g_id: __db.graph_id,
             dict_novelty: __db.dict_novelty.clone(),
@@ -110,6 +124,7 @@ macro_rules! view_context_config {
             // transaction opt-in).
             strict_bind_errors: false,
             include_system_facts: $executable.query.include_system_facts,
+            cypher_vocab: $executable.query.cypher_vocab.clone(),
             trust_fk_refs: $options.trust_fk_refs,
             ..Default::default()
         };

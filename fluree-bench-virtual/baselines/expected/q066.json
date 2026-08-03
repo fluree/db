@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q066",
+  "result_hash": "6bec0ef72b2c76bd830e5b1c6aa630ec8f1d845c934d52cd955c6bf08e24597a",
+  "rows": 105,
+  "head_rows": [
+    "1605\u001fGround\u001f2017",
+    "1642\u001fGround\u001f2018",
+    "1647\u001fExpress\u001f2011",
+    "1652\u001fOvernight\u001f2009",
+    "1656\u001fExpress\u001f2022",
+    "1661\u001fTwoDay\u001f2019",
+    "1666\u001fExpress\u001f2010",
+    "1668\u001fOvernight\u001f2022",
+    "1671\u001fTwoDay\u001f2023",
+    "1676\u001fTwoDay\u001f2010",
+    "1677\u001fTwoDay\u001f2015",
+    "1678\u001fOvernight\u001f2012",
+    "1679\u001fExpress\u001f2013",
+    "1681\u001fExpress\u001f2008",
+    "1681\u001fExpress\u001f2014",
+    "1684\u001fEconomy\u001f2006",
+    "1685\u001fEconomy\u001f2007",
+    "1687\u001fExpress\u001f2025",
+    "1688\u001fOvernight\u001f2008",
+    "1689\u001fEconomy\u001f2010"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KXSDYKA901PGKPSVV3T42Z0H",
+    "commit": "ece51d618"
+  }
+}

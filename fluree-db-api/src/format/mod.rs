@@ -84,15 +84,117 @@ mod xml_escape;
 pub use config::{AgentJsonContext, FormatterConfig, OutputFormat, QueryOutput};
 pub use iri::IriCompactor;
 
-/// Format a single result binding to JSON-LD (used by the graph-source crawl
-/// expansion to render object values identically to the normal formatter).
-pub(crate) use jsonld::format_binding_with_result;
-
 use crate::QueryResult;
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_core::{FuelExceededError, GraphDbRef, Tracker};
+#[cfg(feature = "iceberg")]
+use fluree_db_query::binding::Binding;
 use fluree_graph_json_ld::ParsedContext;
 use serde_json::{json, Value as JsonValue};
+
+/// Serialize a graph-source subgraph-crawl's OBJECT-position binding as a
+/// JSON-LD node-document value, at parity with native hydration
+/// ([`hydration`]), for the crawl expander ([`crate::graph_source::crawl`]).
+///
+/// This is the node-document-aware facade that replaces the two flat-select
+/// `jsonld::format_binding_with_result` call sites in the crawl. Unlike that
+/// flat formatter, it treats the value as a node-document object slot:
+///
+/// - an object-position IRI / reference (`Binding::Iri`, and defensively `Sid` /
+///   `IriMatch`) becomes a JSON-LD node reference `{"@id": <compacted>}` — NOT a
+///   bare string — compacted with the SAME id-compactor the crawl uses for the
+///   subject `@id` (`compact_id_iri` / `compact_id_sid`, never the `@vocab`
+///   predicate compactor), so a foreign-key ref's `@id` is byte-identical to the
+///   target subject's own `@id` and forward navigation resolves (defect D1);
+/// - a literal is shaped per `config.format`, so a `typed-json` crawl reaches the
+///   typed value-object formatter (`{"@value","@type"}`) instead of silently
+///   getting default JSON-LD shaping (defect D2), and a boolean the R2RML
+///   operator left as a string is coerced back to a real JSON boolean in BOTH
+///   formats, matching native (`true`, not `"true"` — defect D3).
+///
+/// The crawl shapes the root `@id` and `@type` itself; those never reach here.
+#[cfg(feature = "iceberg")]
+pub(crate) fn format_node_object_binding(
+    result: &QueryResult,
+    binding: &Binding,
+    compactor: &IriCompactor,
+    config: &FormatterConfig,
+) -> Result<JsonValue> {
+    // Encoded bindings can't be branched on structurally; materialize first
+    // (the underlying formatters would do this too).
+    if binding.is_encoded() {
+        let materialized = materialize::materialize_binding(result, binding)?;
+        return format_node_object_binding(result, &materialized, compactor, config);
+    }
+    match binding {
+        // Object-position node reference → `{"@id": <compacted>}`. Uses the
+        // id-compactor (not the `@vocab` predicate compactor) so the string
+        // matches the subject `@id`; native hydration does the same at the
+        // object position (`hydration.rs` ref arm).
+        Binding::Iri(iri) => Ok(json!({ "@id": compactor.compact_id_iri(iri.as_ref()) })),
+        Binding::IriMatch { iri, .. } => Ok(json!({ "@id": compactor.compact_id_iri(iri) })),
+        Binding::Sid { sid, .. } => Ok(json!({ "@id": compactor.compact_id_sid(sid)? })),
+        // Literal: coerce a stringly boolean to a real bool (D3), then shape per
+        // the requested format (D2).
+        Binding::Lit { .. } => {
+            let coerced = coerce_bool_literal(binding, compactor);
+            format_scalar_binding(
+                result,
+                coerced.as_ref().unwrap_or(binding),
+                compactor,
+                config,
+            )
+        }
+        // Grouped / List / Map / Path / Rel / Unbound are not node-document object
+        // shapes on the crawl path, but route them through the same
+        // format-appropriate path for completeness rather than a silent default.
+        _ => format_scalar_binding(result, binding, compactor, config),
+    }
+}
+
+/// Shape a non-reference binding per `config.format`: `typed-json` reaches the
+/// typed value-object formatter; every other format keeps the default JSON-LD
+/// shaping (byte-identical to the crawl's prior behavior for the default path).
+#[cfg(feature = "iceberg")]
+fn format_scalar_binding(
+    result: &QueryResult,
+    binding: &Binding,
+    compactor: &IriCompactor,
+    config: &FormatterConfig,
+) -> Result<JsonValue> {
+    match config.format {
+        OutputFormat::TypedJson => typed::format_binding_with_result(result, binding, compactor),
+        _ => jsonld::format_binding_with_result(result, binding, compactor),
+    }
+}
+
+/// The R2RML operator's `encode` coerces numeric literals to typed `FlakeValue`s
+/// but leaves an `xsd:boolean` object as a `FlakeValue::String` (`"true"` /
+/// `"false"`); native hydration stores and emits a real boolean. Coerce the
+/// string back so BOTH the default and typed formatters emit a JSON boolean, not
+/// a string. Returns `None` — keep the original binding — for every non-boolean
+/// literal: numerics are already typed by `encode`, and strings / temporals keep
+/// their operator-produced lexical form.
+#[cfg(feature = "iceberg")]
+fn coerce_bool_literal(binding: &Binding, compactor: &IriCompactor) -> Option<Binding> {
+    use fluree_db_core::{coerce_value, FlakeValue};
+    let Binding::Lit {
+        val: FlakeValue::String(s),
+        dtc,
+        ..
+    } = binding
+    else {
+        return None;
+    };
+    let dt_sid = dtc.datatype();
+    if compactor.decode_sid(dt_sid).ok()? != fluree_vocab::xsd::BOOLEAN {
+        return None;
+    }
+    match coerce_value(FlakeValue::String(s.clone()), fluree_vocab::xsd::BOOLEAN) {
+        Ok(coerced @ FlakeValue::Boolean(_)) => Some(Binding::lit(coerced, dt_sid.clone())),
+        _ => None,
+    }
+}
 
 /// Error type for formatting operations
 #[derive(Debug, thiserror::Error)]
@@ -143,6 +245,42 @@ pub async fn format_cypher_typed_table(
     cypher_typed::typed_table(result, &compactor, view).await
 }
 
+/// Kill switch (default ON) for the F9 graph-source CURIE alignment. Set
+/// `FLUREE_R2RML_CURIE_ALIGN=0` to force raw graph-source IRIs (the pre-F9
+/// behavior) — used for the revert differential in the perf harness and as a
+/// production safety. Read once per process (mirrors the other engine switches).
+fn curie_align_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FLUREE_R2RML_CURIE_ALIGN")
+            // Match the R2RML switch family's falsy set (not just "0"), so
+            // `=false`/`off`/`no` disable too (#1499 review).
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// Whether the `sparql_json` formatter should CURIE-compact raw graph-source
+/// `Binding::Iri` node references for this render (F9).
+///
+/// True ONLY for a `SparqlJson` render of a result from the R2RML / graph-source
+/// execution path (`QueryResult::from_graph_source`). The format gate keeps the
+/// change scoped to `sparql_json`: every other output formatter (JSON-LD, SPARQL
+/// XML, typed, delimited) shares this compactor but receives `false` here and so
+/// keeps raw graph-source IRIs — that cross-format consistency work is register
+/// entry F16, deliberately out of scope for the corpus-gated F9 fix.
+fn graph_source_iri_compaction(result: &QueryResult, config: &FormatterConfig) -> bool {
+    result.from_graph_source
+        && curie_align_enabled()
+        && matches!(config.format, OutputFormat::SparqlJson)
+}
+
 /// Format query results to JSON using the specified configuration
 ///
 /// This is the main entry point for formatting. It dispatches to the appropriate
@@ -176,7 +314,8 @@ pub fn format_results(
         )));
     }
 
-    let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
+    let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
+        .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config));
 
     // CONSTRUCT / DESCRIBE produce a graph, not a binding table, so the only
     // sensible JSON rendering is JSON-LD. Any JSON-producing format request
@@ -297,7 +436,8 @@ pub fn format_results_string(
     // Stream JSON straight to a String for the common SELECT case, skipping the
     // serde_json::Value DOM and its second serialization pass.
     if json_stream_eligible(result, config) {
-        let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
+        let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
+            .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config));
         return stream_json(result, &compactor, config);
     }
 
@@ -371,7 +511,8 @@ pub async fn format_results_async(
         )));
     }
 
-    let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
+    let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context)
+        .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config));
 
     // CONSTRUCT / DESCRIBE produce a graph (sync, no DB access needed); coerce
     // any JSON-producing format to JSON-LD rather than rejecting it. RDF/XML and
@@ -616,6 +757,7 @@ mod tests {
             output: QueryOutput::select_all(vec![]),
             batches: vec![],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 
@@ -781,6 +923,7 @@ mod tests {
             output: QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 

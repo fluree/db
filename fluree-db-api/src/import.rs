@@ -179,6 +179,23 @@ pub struct ImportConfig {
     /// shared `@context` map or already the first node. No effect on other
     /// formats. Default: [`FirstLineContextPolicy::Auto`].
     pub ndjson_first_line_context: FirstLineContextPolicy,
+    /// When set, the import materializes a virtual R2RML graph source into a
+    /// native ledger instead of parsing files (DEC-003 Deliverable 1). Carries
+    /// the provider + graph-source id; `None` for every file/remote import, so
+    /// those paths are unaffected.
+    pub(crate) virtual_source: Option<VirtualSource>,
+}
+
+/// A virtual (R2RML-over-Iceberg) graph source to materialize into a native
+/// twin: the combined provider handle plus the graph-source id to scan.
+#[derive(Clone)]
+pub(crate) struct VirtualSource {
+    pub provider: Arc<dyn crate::materialize::R2rmlBuildProvider>,
+    pub graph_source_id: String,
+    /// Build a twin even when a parent join key maps to multiple parents (the
+    /// twin then bakes one deterministically-chosen parent per key and records the
+    /// anomaly in its stamp). Default `false` = decline such a source.
+    pub allow_duplicate_parent_keys: bool,
 }
 
 impl std::fmt::Debug for ImportConfig {
@@ -217,6 +234,7 @@ impl Default for ImportConfig {
             progress: None,
             tracker: Tracker::disabled(),
             ndjson_first_line_context: FirstLineContextPolicy::Auto,
+            virtual_source: None,
         }
     }
 }
@@ -347,12 +365,34 @@ impl ImportConfig {
         }
         let budget_mb = self.effective_memory_budget_mb();
         let max_inflight = self.effective_max_inflight();
-        // Budget ≈ max_inflight * chunk_size * 2.5 + run_budget + 2GB (fixed overhead)
-        // Solve for chunk_size: (budget - 2048) / (max_inflight * 2.5 + 1)
-        let numerator = budget_mb.saturating_sub(2048) as f64;
         let denominator = max_inflight as f64 * 2.5 + 1.0;
-        let raw = (numerator / denominator).floor() as usize;
-        raw.clamp(128, 768)
+        if budget_mb >= 2048 {
+            // Large budget: subtract the ~2GB fixed overhead (index build, dict
+            // merge, OS cache) and divide the rest across the in-flight working
+            // set, clamped to [128, 768] MB. Unchanged behavior.
+            let numerator = (budget_mb - 2048) as f64;
+            (numerator / denominator).floor().clamp(128.0, 768.0) as usize
+        } else {
+            // Sub-2GB budgets (O6): the flat 2GB overhead term underflowed to 0 and
+            // the 128MB clamp floor then applied REGARDLESS of budget — so a
+            // 512MB-budget import used the same 128MB chunk as a 2GB one, and a
+            // 128MB chunk under a 512MB budget blows the budget once the ~2.5x
+            // parse/inflight expansion is counted. Instead reserve ~40% for run
+            // buffers + index build and divide the rest across the working set;
+            // floor at 16MB (still worth a commit), cap at 128MB (continuous with
+            // the large-budget floor at the 2GB boundary).
+            //
+            // SHARED-PATH BLAST RADIUS: this branch resizes chunks for EVERY text
+            // import (Turtle/TriG/JSON-LD), not just materialize — a 512MB budget
+            // goes 128MB → ~51MB chunks (≈2.5× the commit count, a different ledger
+            // shape for the same input). The default budget is ~80% of RAM, so most
+            // hosts land ≥2048MB (the branch above) and are unaffected; what changes
+            // is containers under ~2.5GB and any explicit `--memory-budget-mb` below
+            // 2GB (which every finalizer-touching test in this repo passes, e.g.
+            // 256MB). Sizing only — never correctness.
+            let working = budget_mb as f64 * 0.6 / denominator;
+            (working.floor() as usize).clamp(16, 128)
+        }
     }
 
     /// Effective parse/worker thread count.
@@ -568,6 +608,10 @@ pub enum ImportError {
     MixedFormats(String),
     /// Tracker max-fuel limit exceeded mid-import.
     FuelExceeded(FuelExceededError),
+    /// A virtual (R2RML materialize) import was attempted on a single-threaded
+    /// tokio runtime. Its producer drives an async scan via `Handle::block_on`
+    /// off a dedicated thread, which deadlocks on a current-thread runtime.
+    UnsupportedRuntime(String),
 }
 
 impl std::fmt::Display for ImportError {
@@ -589,6 +633,7 @@ impl std::fmt::Display for ImportError {
                 e.used_fuel(),
                 e.limit_fuel()
             ),
+            Self::UnsupportedRuntime(msg) => write!(f, "unsupported runtime: {msg}"),
         }
     }
 }
@@ -643,6 +688,11 @@ pub(crate) enum ImportSource {
         storage: Arc<dyn StorageRead>,
         source: RemoteSource,
     },
+    /// Materialize a virtual R2RML graph source into a native ledger. The
+    /// provider + graph-source id ride on [`ImportConfig::virtual_source`]; this
+    /// marker only routes `run_import_pipeline` past file resolution to the
+    /// virtual producer arm.
+    Virtual,
 }
 
 /// Format of an individual remote object, derived from its extension.
@@ -895,12 +945,12 @@ impl ChunkSource {
         }
     }
 
-    /// Whether chunk at `index` is a JSON-LD file (`.jsonld`, also compressed).
+    /// Whether chunk at `index` is a JSON-LD file (`.json`/`.jsonld`, also compressed).
     pub fn is_jsonld(&self, index: usize) -> bool {
         match self {
             Self::Files(files) => files
                 .get(index)
-                .is_some_and(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
+                .is_some_and(|p| is_jsonld_ext(effective_extension(p).0.as_deref())),
             Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => {
                 matches!(producer.format_at(index), Some(RemoteFormat::JsonLd))
@@ -916,7 +966,7 @@ impl ChunkSource {
         match self {
             Self::Files(files) => files
                 .iter()
-                .any(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
+                .any(|p| is_jsonld_ext(effective_extension(p).0.as_deref())),
             Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => producer.has_jsonld(),
             Self::JsonLdStream(_) => true,
@@ -973,8 +1023,14 @@ pub(crate) fn is_ndjson_ext(ext: Option<&str>) -> bool {
     matches!(ext, Some("jsonl" | "ndjson"))
 }
 
+/// Whether an effective extension names a whole-document JSON-LD file.
+/// `.json` is accepted because it is a common JSON-LD filename convention.
+pub(crate) fn is_jsonld_ext(ext: Option<&str>) -> bool {
+    matches!(ext, Some("json" | "jsonld"))
+}
+
 /// Whether `path` names a file the bulk-import pipeline accepts: any supported
-/// RDF/JSON-LD extension (`.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld`/`.jsonl`/
+/// RDF/JSON-LD extension (`.ttl`/`.nt`/`.nq`/`.trig`/`.json`/`.jsonld`/`.jsonl`/
 /// `.ndjson`, case-insensitive), optionally compressed with `.gz`/`.zst`.
 ///
 /// Single source of truth shared with the CLI's import-vs-transact routing —
@@ -982,10 +1038,8 @@ pub(crate) fn is_ndjson_ext(ext: Option<&str>) -> bool {
 pub fn is_bulk_import_file(path: &Path) -> bool {
     let inner = effective_extension(path).0;
     is_ndjson_ext(inner.as_deref())
-        || matches!(
-            inner.as_deref(),
-            Some("ttl" | "nt" | "trig" | "nq" | "jsonld")
-        )
+        || is_jsonld_ext(inner.as_deref())
+        || matches!(inner.as_deref(), Some("ttl" | "nt" | "trig" | "nq"))
 }
 
 /// Buffer size for decoded input streams, sized to match the splitter's scan
@@ -1283,7 +1337,7 @@ async fn resolve_remote_objects(
                     accepted.push(obj);
                     extensions.push(RemoteFormat::Nquads);
                 }
-                Some("jsonld") => {
+                Some("json" | "jsonld") => {
                     has_jsonld = true;
                     accepted.push(obj);
                     extensions.push(RemoteFormat::JsonLd);
@@ -1308,7 +1362,8 @@ async fn resolve_remote_objects(
 
     if accepted.is_empty() {
         return Err(ImportError::NoChunks(
-            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld/.jsonl/.ndjson objects".into(),
+            "remote source contains no .ttl/.nt/.nq/.trig/.json/.jsonld/.jsonl/.ndjson objects"
+                .into(),
         ));
     }
 
@@ -2456,6 +2511,28 @@ impl<'a> ImportBuilder<'a> {
         }
     }
 
+    pub(crate) fn new_virtual(
+        fluree: &'a super::Fluree,
+        ledger_id: String,
+        provider: Arc<dyn crate::materialize::R2rmlBuildProvider>,
+        graph_source_id: String,
+    ) -> Self {
+        let config = ImportConfig {
+            virtual_source: Some(VirtualSource {
+                provider,
+                graph_source_id,
+                allow_duplicate_parent_keys: false,
+            }),
+            ..ImportConfig::default()
+        };
+        Self {
+            fluree,
+            ledger_id,
+            source: ImportSource::Virtual,
+            config,
+        }
+    }
+
     /// Set the number of parallel TTL parse threads. `0` = auto (use the
     /// machine's logical cores, memory-capped). Explicit values are honored
     /// as-is (not capped to core count) with a hard floor of 1.
@@ -2503,6 +2580,19 @@ impl<'a> ImportBuilder<'a> {
     /// Set the parallelism (alias for [`threads`](Self::threads)). `0` = auto.
     pub fn parallelism(mut self, n: usize) -> Self {
         self.config.parse_threads = n;
+        self
+    }
+
+    /// Allow a virtual (materialize) import to proceed when a parent join key maps
+    /// to more than one parent. Default (`false`) DECLINES such a source: the twin
+    /// would bake one deterministically-chosen parent per key and silently drop the
+    /// rest (an R2RML RefObjectMap fan-out the builder does not yet emit). When
+    /// enabled, the twin builds and records the anomaly in its completion stamp.
+    /// No-op for non-virtual imports.
+    pub fn allow_duplicate_parent_keys(mut self, v: bool) -> Self {
+        if let Some(vs) = self.config.virtual_source.as_mut() {
+            vs.allow_duplicate_parent_keys = v;
+        }
         self
     }
 
@@ -2637,6 +2727,27 @@ impl<'a> CreateBuilder<'a> {
         ImportBuilder::new(self.fluree, self.ledger_id, path.as_ref().to_path_buf())
     }
 
+    /// Materialize a virtual R2RML graph source into this native ledger
+    /// (DEC-003 Deliverable 1). `provider` scans the source and compiles its
+    /// mapping; `graph_source_id` selects which registered source to read. The
+    /// returned [`ImportBuilder`] accepts the usual tuning.
+    ///
+    /// MACHINE-SAFETY: set explicit `.parallelism(...)` and
+    /// `.memory_budget_mb(...)` — the auto (own-the-box) defaults can OOM a
+    /// co-resident machine, and the memory budget also drives the chunk size.
+    pub fn import_r2rml<P: crate::materialize::R2rmlBuildProvider + 'static>(
+        self,
+        provider: Arc<P>,
+        graph_source_id: impl Into<String>,
+    ) -> ImportBuilder<'a> {
+        ImportBuilder::new_virtual(
+            self.fluree,
+            self.ledger_id,
+            provider,
+            graph_source_id.into(),
+        )
+    }
+
     /// Attach a bulk import that streams source bytes from a remote
     /// `StorageRead` backend (e.g. S3) instead of local disk.
     ///
@@ -2734,7 +2845,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         } else {
             match inner.as_deref() {
                 Some("ttl" | "trig" | "nt" | "nq") => has_turtle = true,
-                Some("jsonld") => has_jsonld = true,
+                Some("json" | "jsonld") => has_jsonld = true,
                 _ => {}
             }
         }
@@ -2754,7 +2865,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         (true, _) => Ok(DirectoryFormat::Turtle),
         (false, true) => Ok(DirectoryFormat::JsonLd),
         (false, false) => Err(ImportError::NoChunks(format!(
-            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld, .jsonl, .ndjson) found in {}",
+            "no supported data files (.ttl, .nt, .nq, .trig, .json, .jsonld, .jsonl, .ndjson) found in {}",
             dir.display()
         ))),
     }
@@ -2892,6 +3003,11 @@ where
                     ChunkSource::Remote(producer)
                 }
             }
+            // Virtual (R2RML) source: the provider rides on
+            // `config.virtual_source`; the chunk source is an empty placeholder
+            // and `run_import_chunks` routes to the virtual producer arm when
+            // `config.virtual_source` is set.
+            ImportSource::Virtual => ChunkSource::Files(Vec::new()),
         };
 
         // ---- Phase 1: Create ledger (init nameservice) ----
@@ -3514,7 +3630,11 @@ where
     let is_remote_serial = is_remote && !remote_all_ttl;
     let is_local_rechunk = chunk_source.is_local_rechunk();
     let is_jsonld_stream = chunk_source.is_jsonld_stream();
-    let is_channel_fed = is_streaming || is_remote_parallel || is_local_rechunk;
+    // Virtual (R2RML) materialization is signaled on the config, not the chunk
+    // source (an empty placeholder). Its own bounded chunk channel provides
+    // backpressure, so it counts as channel-fed (skips the permit channel).
+    let is_virtual = config.virtual_source.is_some();
+    let is_channel_fed = is_streaming || is_remote_parallel || is_local_rechunk || is_virtual;
     let estimated_total = chunk_source.estimated_len();
     let compress = config.compress_commits;
     let num_threads = config.effective_parse_threads();
@@ -3905,6 +4025,101 @@ where
         tracing::info!(
             committed_chunks = next_expected,
             "streaming import phase complete"
+        );
+    } else if is_virtual {
+        // Virtual (R2RML) source: one materializer thread scans the graph source,
+        // enumerates triples, and encodes byte-budgeted ParsedChunks that feed the
+        // SAME commit_parsed_chunks_in_order consumer + index/publish downstream as
+        // the text paths. Chunk byte-size derives from the memory budget
+        // (machine-safety); the sync-channel capacity bounds in-flight chunks. The
+        // scan is async, so the producer thread drives it via the ambient runtime
+        // handle — Handle::block_on off a DEDICATED thread (never a runtime worker),
+        // so the blocking channel sends inside it are safe.
+        let vs = config
+            .virtual_source
+            .clone()
+            .expect("is_virtual implies virtual_source is set");
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
+            std::result::Result<(usize, ParsedChunk), String>,
+        >(num_threads);
+        let chunk_size_bytes = config.effective_chunk_size_mb() * 1024 * 1024;
+        // The parallelism knob bounds the produce side's concurrent scans (O5:
+        // pin-all + Pass-1 pre-index) inside the materializer.
+        let producer_parallelism = num_threads.max(1);
+        // Import memory budget in bytes, so the materializer can charge the resident
+        // FK parent index against it and fail loud on overflow (O6).
+        let memory_budget_bytes = config.effective_memory_budget_mb() * 1024 * 1024;
+        let shared_alloc = Arc::clone(&shared_alloc);
+        let spool_config = Arc::clone(&spool_config);
+        let spool_dir = spool_dir.clone();
+        let ledger = alias.to_string();
+        let runtime = tokio::runtime::Handle::current();
+        // Fail loud, not deadlock: the producer drives its async scan via
+        // `runtime.block_on` off a dedicated thread, which hangs on a
+        // single-threaded runtime. Production servers and the CLI both run
+        // multi-thread. FUTURE: a remote-style two-stage producer (async tokio
+        // task → bridge thread → sync ParsedChunk channel) would be
+        // runtime-flavor-agnostic; deferred until a customer needs it.
+        if matches!(
+            runtime.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread
+        ) {
+            return Err(ImportError::UnsupportedRuntime(
+                "materialize (virtual R2RML import) requires a multi-thread tokio runtime; \
+                 the current runtime is single-threaded"
+                    .to_string(),
+            ));
+        }
+
+        let producer = std::thread::Builder::new()
+            .name("virtual-materializer".into())
+            .spawn(move || {
+                let ctx = crate::materialize::VirtualChunkContext {
+                    shared_alloc: &shared_alloc,
+                    ledger_id: &ledger,
+                    compress,
+                    spool_dir: &spool_dir,
+                    spool_config: Some(&spool_config),
+                };
+                // The driver + its worker pool send chunks on this cloned sender;
+                // keep the outer `result_tx` in this closure so a build error can
+                // still be surfaced to the consumer AFTER the driver drops its copy.
+                let drive_tx = result_tx.clone();
+                let outcome = runtime.block_on(crate::materialize::drive_virtual_import(
+                    &*vs.provider,
+                    &vs.graph_source_id,
+                    chunk_size_bytes,
+                    producer_parallelism,
+                    memory_budget_bytes,
+                    vs.allow_duplicate_parent_keys,
+                    &ctx,
+                    drive_tx,
+                ));
+                if let Err(e) = outcome {
+                    let _ = result_tx.send(Err(e.to_string()));
+                }
+                // result_tx dropped here → the consumer sees EOF.
+            })
+            .map_err(|e| ImportError::Transact(format!("spawn virtual materializer: {e}")))?;
+
+        let next_expected = commit_parsed_chunks_in_order(
+            result_rx,
+            &commit_env,
+            &mut state,
+            &mut published_codes,
+            compute_ns_delta,
+            &mut sort_write_handles,
+            &mut total_commit_size,
+            &mut commit_metas,
+        )
+        .await?;
+
+        producer
+            .join()
+            .map_err(|_| ImportError::Transact("virtual materializer thread panicked".into()))?;
+        tracing::info!(
+            committed_chunks = next_expected,
+            "virtual import phase complete"
         );
     } else if is_remote_parallel || is_local_rechunk {
         // Channel-fed parallel path. Two sources share this arm:
@@ -6329,6 +6544,41 @@ mod resource_model_tests {
         assert_eq!(c.effective_parse_threads(), 64);
         // ...and heavy workers follow it.
         assert_eq!(c.effective_heavy_workers(), 64);
+    }
+
+    #[test]
+    fn chunk_size_scales_below_2gb_budget_not_floored_at_128() {
+        // O6: any sub-2GB budget used to underflow the fixed 2GB overhead term to 0
+        // and floor at 128MB REGARDLESS of budget. A 512MB budget must now yield a
+        // chunk WELL below 128MB so peak RAM tracks the budget.
+        let _env = EnvGuard::clear_overrides();
+        let small = cfg(512, 0, 0).effective_chunk_size_mb();
+        assert!(
+            (16..128).contains(&small),
+            "512MB budget must scale the chunk into [16,128), got {small}"
+        );
+        // Monotone-ish: a smaller budget must not produce a LARGER chunk.
+        let tiny = cfg(256, 0, 0).effective_chunk_size_mb();
+        assert!(
+            tiny <= small,
+            "256MB chunk {tiny} must not exceed 512MB chunk {small}"
+        );
+        // Hard floor at 16MB keeps a chunk worth committing.
+        let floor = cfg(64, 0, 0).effective_chunk_size_mb();
+        assert!(floor >= 16, "chunk floors at 16MB, got {floor}");
+    }
+
+    #[test]
+    fn chunk_size_large_budget_behavior_unchanged() {
+        // The >=2GB path is untouched: still [128,768], derived from budget-2048.
+        let _env = EnvGuard::clear_overrides();
+        let big = cfg(8192, 0, 0).effective_chunk_size_mb();
+        assert!(
+            (128..=768).contains(&big),
+            "8GB budget chunk in [128,768], got {big}"
+        );
+        // An explicit chunk size still wins over the derivation.
+        assert_eq!(cfg(512, 200, 0).effective_chunk_size_mb(), 200);
     }
 
     #[test]

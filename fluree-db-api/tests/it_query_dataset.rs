@@ -413,12 +413,17 @@ async fn dataset_composed_across_connections_selecting_subgraph_depth_3() {
     );
 }
 
+/// Cross-LEDGER variant of the #1469 set-merge pin: two ledgers with
+/// byte-identical content unioned as default graphs RDF-merge into one triple
+/// set, even though each ledger encodes the same IRIs under its own
+/// dictionary (multi-ledger execution decodes bindings, so the dedup key
+/// compares by value, not by per-ledger sid).
 #[tokio::test]
-async fn dataset_multiple_default_graphs_no_dedup() {
+async fn dataset_multiple_default_graphs_set_merged_across_ledgers() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
 
-    // Create two ledgers with the SAME data (to test no-dedup semantics)
+    // Two ledgers with the SAME data: the set-merge must collapse them.
     let _ledger1 = seed_people_ledger(&fluree, "dup1:main").await;
     let _ledger2 = seed_people_ledger(&fluree, "dup2:main").await;
 
@@ -451,11 +456,13 @@ async fn dataset_multiple_default_graphs_no_dedup() {
         .await
         .expect("query should succeed");
 
-    // Union does NOT deduplicate - should get 4 results (2 people x 2 ledgers)
-    // Note: The exact semantics depend on whether the same SID is generated
-    // across ledgers. In practice, separate ledgers have different namespace
-    // encodings, so we may get 4 distinct rows.
-    assert!(result.row_count() >= 2, "should have results from union");
+    // 2 people, present identically in both ledgers: the RDF merge (§13.2)
+    // yields each person's name triple ONCE — 2 rows, not the bag's 4.
+    assert_eq!(
+        result.row_count(),
+        2,
+        "identical cross-ledger default graphs must set-merge, not double rows"
+    );
 }
 
 // =============================================================================
@@ -3072,5 +3079,90 @@ async fn sparql_within_ledger_from_union_var_var_join_is_set_merged() {
         rows,
         json!([["Shared", "Engineer"]]),
         "both scans must set-merge independently: 1×1 join row, not 2×2"
+    );
+}
+
+/// Seed mutual `schema:knows` edges — the shape that makes a join's right
+/// triple bind nothing new (`?a knows ?b . ?b knows ?a`).
+async fn seed_mutual_knows_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "schema:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "schema:knows": {"@id": "ex:alice"}}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert mutual knows")
+        .ledger
+}
+
+/// A join whose right triple binds nothing new is evaluated as a membership
+/// probe (`MembershipJoinOperator`) when the shape and cost gates allow. That
+/// rewrite is keep/drop, which is only join-equivalent when a ground triple
+/// matches at most once. Under #1469 the multi-member default union is a SET
+/// (RDF merge, SPARQL §13.2): identical triples across members collapse to
+/// one (see `dataset_multiple_default_graphs_set_merged_across_ledgers`), so
+/// unioning a graph with identical content must leave the mutual-knows join
+/// at its single-graph cardinality — not the pre-#1469 bag answer (8 = one
+/// row per graph per side) and not the half-collapsed 4 the operator's
+/// multi-graph guard was originally added against. That guard stays
+/// load-bearing for multi-graph *named* scopes, where no set-dedup arms and
+/// bag multiplicity is still the contract.
+#[tokio::test]
+async fn dataset_membership_shape_set_merges_identical_graphs() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let _g1 = seed_mutual_knows_ledger(&fluree, "knows1:main").await;
+    let _g2 = seed_mutual_knows_ledger(&fluree, "knows2:main").await;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "select": ["?a", "?b"],
+        "where": [
+            {"@id": "?a", "schema:knows": "?b"},
+            {"@id": "?b", "schema:knows": "?a"}
+        ]
+    });
+
+    let one_spec = DatasetSpec::new().with_default(GraphSource::new("knows1:main"));
+    let one = fluree
+        .build_dataset_view(&one_spec)
+        .await
+        .expect("single-graph dataset");
+    let single_rows = fluree
+        .query_dataset(&one, &query)
+        .await
+        .expect("single-graph query")
+        .row_count();
+    assert_eq!(
+        single_rows, 2,
+        "one graph: the mutual pair joins both ways (alice/bob, bob/alice)"
+    );
+
+    let two_spec = DatasetSpec::new()
+        .with_default(GraphSource::new("knows1:main"))
+        .with_default(GraphSource::new("knows2:main"));
+    let two = fluree
+        .build_dataset_view(&two_spec)
+        .await
+        .expect("two-graph dataset");
+    let union_rows = fluree
+        .query_dataset(&two, &query)
+        .await
+        .expect("two-graph query")
+        .row_count();
+
+    // The two members carry byte-identical triples, so the RDF merge is the
+    // same set as either member alone: the join must see each triple once,
+    // keeping the single-graph answer. 8 would be the pre-#1469 bag union;
+    // 4 would be the membership keep/drop collapse over a bag.
+    assert_eq!(
+        union_rows, single_rows,
+        "two identical default graphs RDF-merge to one triple set (§13.2); the join must not multiply"
     );
 }

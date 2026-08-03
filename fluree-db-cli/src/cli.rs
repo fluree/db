@@ -400,6 +400,26 @@ pub enum Commands {
         action: GraphAction,
     },
 
+    /// Create, list, sync, or drop BM25 full-text search indexes (graph sources).
+    ///
+    /// BM25 index creation has no HTTP endpoint today — it is a Rust-API-only
+    /// operation (`Bm25CreateConfig` + `create_full_text_index`). These commands
+    /// expose it: they run in-process against local storage (no server
+    /// round-trip), so they work under `docker exec` against a running server's
+    /// data directory. Querying the resulting index is done either through the
+    /// standalone `fluree-search-httpd` service (`POST /v1/search`) or, embedded,
+    /// via an FQL `f:searchText` query.
+    ///
+    /// Examples:
+    ///   fluree bm25 create --name silver-search --ledger silver:main -f index-query.json
+    ///   fluree bm25 list --stale
+    ///   fluree bm25 sync --index silver-search:main
+    ///   fluree bm25 drop --index silver-search:main
+    Bm25 {
+        #[command(subcommand)]
+        action: Bm25Action,
+    },
+
     /// Insert data into a ledger
     ///
     /// Examples:
@@ -782,7 +802,7 @@ pub enum Commands {
         #[arg(short = 'p', long)]
         predicate: Option<String>,
 
-        /// Output format (json, table, csv, or tsv)
+        /// Output format (json, table, or csv)
         #[arg(long, default_value = "table")]
         format: String,
 
@@ -1094,6 +1114,12 @@ pub enum Commands {
         action: ServerAction,
     },
 
+    /// Governance model tooling — access profiles, entities, reasoning
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+
     /// Developer memory — store and recall facts, decisions, constraints
     Memory {
         #[command(subcommand)]
@@ -1116,6 +1142,203 @@ pub enum Commands {
     Iceberg {
         #[command(subcommand)]
         action: IcebergAction,
+    },
+
+    /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg)
+    /// graph source: bulk-build every triple, verify it against the source, and
+    /// write it as a native ledger or a .flpack pack (DEC-003 Deliverable 1).
+    ///
+    /// MACHINE-SAFETY: the default posture is co-resident-tolerant (a modest
+    /// fixed memory budget + low parallelism, NOT own-the-box auto-sizing).
+    /// Raise it explicitly with `--memory-budget-mb` / `--parallelism`, or pass
+    /// `--max-performance` on a cleared machine to auto-size to the host.
+    ///
+    /// PARALLELISM: `--parallelism` sizes the produce-side worker pool (O1) — that
+    /// many threads render + encode table batches concurrently (it also bounds the
+    /// concurrent snapshot pins and FK pre-index scans, O5). Default 2 (co-resident).
+    ///
+    /// BUDGET MODEL: `--memory-budget-mb` now scales the chunk size for sub-2GB
+    /// budgets too (previously any budget below ~2GB underflowed to a fixed 128MB
+    /// chunk regardless — O6); below 2GB the chunk is ~budget×0.6 / working-set,
+    /// clamped to [16, 128] MB. Peak produce RAM ≈ parallelism × chunk × ~2.5 (one
+    /// chunk buffer + encoding sink per worker) plus the FK parent index. That
+    /// parent index — held resident for the whole build — is now CHARGED against the
+    /// budget (up to ~50% of it) and the build FAILS LOUD if it would overflow,
+    /// rather than silently OOM the host. Verify is memory-bounded in both modes
+    /// (O2): peak is O(sampled subjects) for `quick` and O(one external-sort run)
+    /// for `full`.
+    Materialize {
+        /// The virtual graph-source id to materialize (e.g. `dw-gs:main`).
+        graph_source: String,
+
+        /// Name for the twin ledger. Defaults to the graph-source id with a
+        /// `-twin` suffix (the `:branch` is preserved).
+        #[arg(long)]
+        into: Option<String>,
+
+        /// Output form: `pack` (a .flpack file, the default), `ledger` (a local
+        /// native ledger, left registered), or `s3` (direct-S3 CAS publish —
+        /// not yet wired in the file-backed CLI; see DEC-003 §3).
+        #[arg(long, value_enum, default_value_t = MaterializeOutput::Pack)]
+        output: MaterializeOutput,
+
+        /// Destination path for `--output pack` (default: `<twin>.flpack` in the
+        /// current directory).
+        #[arg(long)]
+        output_path: Option<PathBuf>,
+
+        /// Verification depth run against the built twin before it is announced.
+        /// `quick` (default): per-class instance counts + a seeded sample of 3
+        /// subjects per class, compared against the build's OWN enumerator — a
+        /// SHARED oracle, so it catches ingest/index corruption but NOT enumerator
+        /// logic bugs (a bug appears identically on both sides). `full`: a
+        /// whole-twin triple diff against the source (strongest; ~one extra full
+        /// source read). A failed gate drops the twin and exits non-zero.
+        #[arg(long, value_enum, default_value_t = MaterializeVerify::Quick)]
+        verify: MaterializeVerify,
+
+        /// Own-the-box: auto-size memory/parallelism to the host (~80% RAM).
+        /// Only on a cleared machine — the default is deliberately conservative
+        /// to stay co-resident-safe.
+        #[arg(long)]
+        max_performance: bool,
+
+        /// Proceed even if a source table carries Iceberg merge-on-read delete
+        /// files (sets `FLUREE_ICEBERG_ALLOW_MOR_DELETES`). The twin is then a
+        /// point-in-time snapshot that may include rows a MoR-aware reader would
+        /// hide — documented staleness. Default: fail closed.
+        #[arg(long)]
+        allow_mor_deletes: bool,
+
+        /// Proceed even if a foreign-key parent join key maps to MORE THAN ONE
+        /// parent row. By default the build is refused: the twin would bake one
+        /// deterministically-chosen parent per key (the lexicographically smallest)
+        /// and silently drop the rest — an R2RML RefObjectMap fan-out the builder
+        /// does not yet emit. With this flag the twin builds anyway and records the
+        /// anomaly (per-parent ambiguous-key counts) in its completion stamp.
+        /// Default: fail closed.
+        #[arg(long)]
+        allow_duplicate_parent_keys: bool,
+
+        /// Fluree home directory (overrides `$FLUREE_HOME` / the platform data
+        /// dir). Where the twin ledger and its storage live.
+        #[arg(long)]
+        home: Option<PathBuf>,
+
+        /// Scratch directory for `--verify full`'s on-disk spool + external-sort
+        /// runs. Defaults to a subdirectory of the twin's `.fluree` storage area.
+        /// Point it at fast local scratch if you like — but AVOID a tmpfs `/tmp`
+        /// (RAM-backed on many Linux hosts), which would undo full-verify's
+        /// bounded-memory design and can spill tens of GB back into RAM on a large
+        /// twin. Unused by `--verify quick`.
+        #[arg(long)]
+        tmp_dir: Option<PathBuf>,
+    },
+}
+
+/// Output form for `fluree materialize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MaterializeOutput {
+    /// A `.flpack` pack file (prebuilt commits + index) — the negotiated door
+    /// for solo delivery. The default.
+    Pack,
+    /// A local native ledger, left registered in this home.
+    Ledger,
+    /// Direct-S3 CAS publish (the >40GB escape hatch). Not yet wired in the
+    /// file-backed CLI — see DEC-003 §3.
+    S3,
+}
+
+/// Verification depth for `fluree materialize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MaterializeVerify {
+    /// Per-class counts + a seeded 3-subjects-per-class sample, against the build's
+    /// own enumerator (a shared oracle). The always-on default.
+    Quick,
+    /// A full-triple diff of the whole twin against the source. Strongest;
+    /// cost roughly a second full source read.
+    Full,
+}
+
+/// BM25 full-text index subcommands.
+#[derive(Subcommand)]
+pub enum Bm25Action {
+    /// Create a BM25 full-text search index over a ledger.
+    ///
+    /// The indexing query (FQL / JSON-LD) selects the documents and the text
+    /// properties to index; it MUST select `@id`. Example indexing query:
+    ///   {"@context":{"as":"https://www.w3.org/ns/activitystreams#"},
+    ///    "where":{"@id":"?s"},
+    ///    "select":{"?s":["@id","as:content","as:name","as:summary"]}}
+    Create {
+        /// Graph-source name for the index (no ':'). The alias is
+        /// `<name>:<branch>` (e.g. `silver-search:main`).
+        #[arg(long)]
+        name: String,
+
+        /// Source ledger alias to index (e.g. "silver:main").
+        #[arg(long)]
+        ledger: String,
+
+        /// Branch for the index graph source (default "main").
+        #[arg(long, default_value = "main")]
+        branch: String,
+
+        /// Inline indexing query (FQL / JSON-LD).
+        #[arg(short = 'e', long = "query")]
+        query: Option<String>,
+
+        /// Read the indexing query from a file (or pipe it via stdin).
+        #[arg(short = 'f', long = "query-file")]
+        query_file: Option<PathBuf>,
+
+        /// BM25 k1 (term-frequency saturation). Default 1.2.
+        #[arg(long)]
+        k1: Option<f64>,
+
+        /// BM25 b (document-length normalization, 0..=1). Default 0.75.
+        #[arg(long)]
+        b: Option<f64>,
+    },
+
+    /// Drop (retract) a BM25 full-text index and delete its snapshots.
+    Drop {
+        /// Index graph-source alias to drop (e.g. "silver-search:main").
+        #[arg(long)]
+        index: String,
+
+        /// Required flag to confirm deletion
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Sync a BM25 full-text index up to its source ledger's latest state.
+    ///
+    /// Incremental when possible — only re-indexes the subjects changed since
+    /// the index's stored watermark — falling back to a full rebuild if needed.
+    /// A no-op when the index is already current. Run this from a maintenance
+    /// job (once per index) to keep search fresh as the source ledger is
+    /// materialized/updated; it runs in-process against local storage, so it
+    /// works under `docker exec` against a running server's data directory
+    /// (same as `create`/`drop`).
+    Sync {
+        /// Index graph-source alias to sync (e.g. "silver-search:main").
+        #[arg(long)]
+        index: String,
+    },
+
+    /// List BM25 full-text indexes with their source ledger and staleness.
+    ///
+    /// For each index: its alias, the source ledger it covers, the index
+    /// watermark (`index_t`), the source ledger's current `t`, and whether the
+    /// index is STALE (source advanced past the index). This is what a
+    /// maintenance job enumerates to decide which indexes to `sync` — unlike
+    /// `fluree list`, it shows the source ledger and staleness. With `--stale`,
+    /// print only stale indexes (one alias per line, for scripting a sync loop).
+    List {
+        /// Print only stale indexes, one alias per line (script-friendly).
+        #[arg(long)]
+        stale: bool,
     },
 }
 
@@ -1480,6 +1703,245 @@ pub enum ClusterAction {
         /// Admin URL of the node to query.
         #[arg(long)]
         addr: String,
+    },
+}
+
+/// Governance model subcommands.
+#[derive(Subcommand)]
+pub enum ModelAction {
+    /// Access control — compile intent into ledger policies
+    Access {
+        #[command(subcommand)]
+        action: ModelAccessAction,
+    },
+
+    /// Entity definitions — author SHACL shapes (the single source of truth
+    /// that access profiles, validation, and codegen derive from)
+    Entity {
+        #[command(subcommand)]
+        action: ModelEntityAction,
+    },
+
+    /// Class hierarchy — RDFS subclass relations (the reasoning facet's
+    /// vocabulary; entailment follows rdfs:subClassOf in query and policy)
+    Class {
+        #[command(subcommand)]
+        action: ModelClassAction,
+    },
+}
+
+/// Class-facet subcommands of `fluree model`.
+#[derive(Subcommand)]
+pub enum ModelClassAction {
+    /// Define (or update) a class and its place in the hierarchy
+    Define {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Class IRI (absolute, e.g. https://example.org/Lead)
+        #[arg(long)]
+        class: String,
+
+        /// Parent class IRI (repeatable) — becomes rdfs:subClassOf
+        #[arg(long = "subclass-of")]
+        subclass_of: Vec<String>,
+
+        /// Remove ALL parents (deletes every rdfs:subClassOf edge). With
+        /// RDFS entailment, a stale parent widens every grant on it — use
+        /// this to sever the hierarchy; --subclass-of cannot express empty.
+        #[arg(long = "clear-subclass-of", conflicts_with = "subclass_of")]
+        clear_subclass_of: bool,
+
+        /// Human label for the class
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Print the compiled JSON-LD without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show the class hierarchy on a dataset (policy classes excluded)
+    Show {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Entity-facet subcommands of `fluree model`.
+#[derive(Subcommand)]
+pub enum ModelEntityAction {
+    /// Define (or update) an entity: compiles to a SHACL node shape
+    ///
+    /// NOTE: Fluree enforces SHACL at transaction time once any shapes exist
+    /// in a ledger (reject mode by default) — defining an entity activates
+    /// validation for its class.
+    Define {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Entity class IRI (absolute, e.g. https://example.org/Lead)
+        #[arg(long)]
+        entity: String,
+
+        /// Property spec: "<iri> [string|integer|decimal|boolean|date|datetime|iri] [required] [in[v1,v2,...]]"
+        /// (repeatable; type omitted = untyped)
+        #[arg(long = "property", required = true)]
+        properties: Vec<String>,
+
+        /// Human label for the class
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Closed shape: instances may carry ONLY the declared properties
+        /// (rdf:type excepted). Recommended for app-writable entities —
+        /// validation owns the property surface, so access grants stay
+        /// thin class policies.
+        #[arg(long)]
+        closed: bool,
+
+        /// Print the compiled JSON-LD without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show entity definitions (SHACL node shapes) on a dataset
+    Show {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Access-facet subcommands of `fluree model`.
+#[derive(Subcommand)]
+pub enum ModelAccessAction {
+    /// Enable an access profile on a dataset (emits thin verb policies)
+    ///
+    /// Declares WHO may cause which state transitions on a class, in the
+    /// engine's own vocabulary: read → a view policy; write → view +
+    /// create/update/delete on the class; intake → create-only. Verb
+    /// semantics are exact (class targeting matches pre ∪ post state and
+    /// rdf:type writes match the class they mint), so no property
+    /// allow-list is needed — the property SURFACE of the class belongs
+    /// to its SHACL shape (`model entity define --closed`). Re-running is
+    /// idempotent (deterministic policy ids); there is no stored intent
+    /// node and nothing to sync.
+    Enable {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Profile: read | write | intake
+        #[arg(long)]
+        profile: String,
+
+        /// Target class IRI whose instances the profile governs (absolute,
+        /// e.g. https://example.org/Lead) — compiles to f:onClass
+        #[arg(long)]
+        class: String,
+
+        /// Optional COLUMN narrowing for the write policy (absolute IRIs):
+        /// the grant covers only these properties of the class ("may edit
+        /// status of Leads, nothing else"). Omit for whole-instance access.
+        #[arg(long = "property")]
+        properties: Vec<String>,
+
+        /// Policy class IRI override (default: {class}/access/{profile}).
+        /// The policy class is the assignment unit grants and tokens carry
+        /// — how a request selects its policy set, not a data restriction.
+        #[arg(long)]
+        policy_class: Option<String>,
+
+        /// Attach the policy class to this space's grant on the dataset
+        /// (hosted stacks; requires --remote). Merges with existing classes.
+        #[arg(long)]
+        space: Option<String>,
+
+        /// Relationship gate (read profile only): a SPARQL property path
+        /// from the requesting identity to the instance, with angle-bracketed
+        /// IRIs. e.g. "^<https://example.org/owner>" (I see what I own) or
+        /// "<https://example.org/memberOf>/^<https://example.org/team>"
+        /// (I see entities whose team I'm a member of). Stored verbatim in
+        /// the policy via the engine's @path context term.
+        #[arg(long)]
+        connected: Option<String>,
+
+        /// Print the compiled JSON-LD without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Disable an access profile: delete its compiled policies from the
+    /// dataset and optionally detach the policy class from a space grant
+    ///
+    /// The inverse of `enable`. Identify the policy class either the same
+    /// way it was enabled (--profile + --class, deriving the default
+    /// {class}/access/{profile} id) or explicitly via --policy-class.
+    /// Deletes the policy class node and its owned policy nodes
+    /// ({policy-class}/view, {policy-class}/write) in one transaction.
+    /// With --space/--remote, first removes the policy class from the
+    /// space's grant on the dataset (other classes on the grant survive;
+    /// the grant itself and its access level are left in place).
+    Disable {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Profile the policy class was enabled with (with --class):
+        /// read | write | intake. Not needed with --policy-class.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Class IRI the profile was enabled on (with --profile).
+        /// Not needed with --policy-class.
+        #[arg(long)]
+        class: Option<String>,
+
+        /// Policy class IRI to disable (overrides --profile/--class
+        /// derivation; required if enable used a --policy-class override)
+        #[arg(long)]
+        policy_class: Option<String>,
+
+        /// Detach the policy class from this space's grant on the dataset
+        /// (hosted stacks; requires --remote)
+        #[arg(long)]
+        space: Option<String>,
+
+        /// Print the delete transaction without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show compiled access policies on a dataset (grouped by policy class)
+    Show {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 
@@ -2225,6 +2687,19 @@ pub enum AuthAction {
         #[arg(long)]
         remote: Option<String>,
     },
+
+    /// Print the stored access token for a remote (for scripting)
+    ///
+    /// Prints exactly the access token to stdout — nothing else — so it
+    /// composes into .env files and shell substitution:
+    /// `FLUREE_TOKEN=$(fluree auth token --remote prod)`. Warns on stderr
+    /// if the token is expired. The refresh token is never printed; use
+    /// `fluree config list` only if you truly need the raw config.
+    Token {
+        /// Remote name (defaults to only configured remote)
+        #[arg(long)]
+        remote: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2327,7 +2802,19 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub table: Option<String>,
 
-    /// S3 table location for direct mode (e.g., "s3://bucket/warehouse/ns/table")
+    /// S3 table location for direct mode (e.g., "s3://bucket/warehouse/ns/table").
+    ///
+    /// WAREHOUSE ROOT (multi-table): point this at the DATABASE/namespace root
+    /// (e.g. "s3://bucket/warehouse/dw") of a catalog-less copy — such as a
+    /// Snowflake-managed Iceberg database whose table dirs carry random suffixes
+    /// (`fact_order.UIHGsQex/`). With an `--r2rml` mapping, each `rr:tableName`
+    /// (e.g. `DW.FACT_ORDER`) is resolved to its own dir under the root via one
+    /// S3 LIST, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively
+    /// on the name (namespace stripped). Warehouse mode is auto-detected when the
+    /// location's leaf directory does not name the requested table; a bare
+    /// single-table location resolves as before. (A table named exactly after its
+    /// parent directory would read as single-table.) No catalog/OAuth flags are
+    /// needed — direct mode reads with ambient IAM credentials.
     #[arg(long)]
     pub table_location: Option<String>,
 

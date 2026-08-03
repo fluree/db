@@ -1,0 +1,8 @@
+# q022 current_customers_by_segment
+# Intent: SCD-aware dimension rollup (isCurrent true).
+# BI lineage (BI-13): "How are current customers distributed across segments?"
+# Predicates verified against enterprise.ttl — DimCustomer: isCurrent, segment.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?seg (COUNT(?c) AS ?n)
+WHERE { ?c a edw:Customer ; edw:isCurrent true ; edw:segment ?seg . }
+GROUP BY ?seg

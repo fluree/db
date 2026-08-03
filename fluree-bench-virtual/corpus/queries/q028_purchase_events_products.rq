@@ -1,0 +1,10 @@
+# q028 purchase_events_products
+# Intent: String-equality FILTER + fact->dim join over the largest fact.
+# BI lineage (BI-15): "Which products drew purchase events?"
+# Predicates verified against enterprise.ttl — FactWebEvent: eventType, product; DimProduct: name.
+# Determinism: unordered LIMIT truncates a larger set (any k rows are valid) -> hash_gate=rows_only; gated on row count + invariants, not an exact hash.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?pn
+WHERE { ?e a edw:WebEvent ; edw:eventType "purchase" ; edw:product ?p .
+        ?p edw:name ?pn . }
+LIMIT 5000

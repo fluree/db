@@ -115,6 +115,12 @@ mod vector;
 mod catalog_session;
 
 #[cfg(feature = "iceberg")]
+mod disk_catalog_cache;
+
+#[cfg(feature = "iceberg")]
+mod lazy_storage;
+
+#[cfg(feature = "iceberg")]
 pub(crate) mod crawl;
 
 #[cfg(feature = "iceberg")]
@@ -146,9 +152,10 @@ pub use config::{CatalogMode, IcebergConnectionConfig, IcebergCreateConfig, Rest
 
 #[cfg(feature = "iceberg")]
 pub use iceberg_catalog::{
-    browse_iceberg_catalog, guard_iceberg_connection_urls, preview_iceberg_table, BrowseDepth,
-    CatalogBrowse, ColumnInfo, ColumnStats, PartitionFieldInfo, SnapshotRef, SortFieldInfo,
-    StatsCompleteness, StatsTier, TableIdentifier, TablePreview, TableRef, TableSchema,
+    browse_iceberg_catalog, guard_iceberg_connection_urls, preview_iceberg_table,
+    verify_storage_access, BrowseDepth, CatalogBrowse, ColumnInfo, ColumnStats, PartitionFieldInfo,
+    SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StorageAccessReport, TableIdentifier,
+    TablePreview, TableRef, TableSchema,
 };
 
 #[cfg(feature = "iceberg")]

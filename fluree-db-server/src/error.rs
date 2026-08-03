@@ -103,6 +103,32 @@ impl ServerError {
             ServerError::Api(ApiError::Query(fluree_db_query::QueryError::Cancelled {
                 ..
             })) => errors::QUERY_CANCELLED,
+
+            // Storage-permission / fail-closed errors (403). Raised directly on
+            // the preview path or wrapped from the query engine on the scan
+            // path; both surface the same distinct `@type` so clients can branch.
+            // These MUST precede the generic `ApiError::Query(_)` arm below.
+            ServerError::Api(
+                ApiError::StorageAccessDenied { .. }
+                | ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied { .. }),
+            ) => errors::STORAGE_ACCESS_DENIED,
+            ServerError::Api(
+                ApiError::CatalogCredentialsNotVended { .. }
+                | ApiError::Query(fluree_db_query::QueryError::CatalogCredentialsNotVended {
+                    ..
+                }),
+            ) => errors::CATALOG_CREDENTIALS_NOT_VENDED,
+
+            // Virtual-dataset (R2RML) unsupported-pattern refusal: a distinct
+            // `@type` so Solo's browse UI can gate on the condition instead of
+            // matching prose. Stays HTTP 400 (well-formed request, unsupported on
+            // this source) — unlike the 403/507 distinct-status precedents — via
+            // the generic `Query(_)` arm in `status_code()`. MUST precede the
+            // generic `ApiError::Query(_)` arm below.
+            ServerError::Api(ApiError::Query(
+                fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. },
+            )) => errors::R2RML_UNSUPPORTED_PATTERN,
+
             ServerError::Api(ApiError::Query(_)) => errors::INVALID_QUERY,
             ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
             // Optimistic-concurrency conflicts: a distinct, retryable class so
@@ -176,6 +202,18 @@ impl ServerError {
                 | fluree_db_api::TransactError::PublishLostRace { .. }
                 | fluree_db_api::TransactError::NamespaceConflict(_),
             )) => StatusCode::CONFLICT,
+
+            // 403 - Forbidden (storage-permission / fail-closed). Raised
+            // directly (preview path) or wrapped from the query engine (scan
+            // path). MUST precede the generic `ApiError::Query(_)` arm below.
+            ServerError::Api(
+                ApiError::StorageAccessDenied { .. }
+                | ApiError::CatalogCredentialsNotVended { .. }
+                | ApiError::Query(
+                    fluree_db_query::QueryError::StorageAccessDenied { .. }
+                    | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. },
+                ),
+            ) => StatusCode::FORBIDDEN,
 
             // 400 - Bad Request (client errors)
             ServerError::Api(ApiError::Parse(_)) => StatusCode::BAD_REQUEST,
@@ -389,3 +427,131 @@ fn extract_cause(error: &ServerError) -> Option<Box<ErrorResponse>> {
 
 /// Result type alias for server operations
 pub type Result<T> = std::result::Result<T, ServerError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_vocab::errors;
+
+    fn storage_denied_direct() -> ApiError {
+        ApiError::StorageAccessDenied {
+            bucket: "b".into(),
+            key: "warehouse/t/data/f.parquet".into(),
+            region: Some("us-east-2".into()),
+            message: "service error: AccessDenied".into(),
+        }
+    }
+
+    fn storage_denied_via_query() -> ApiError {
+        ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied {
+            bucket: "b".into(),
+            key: "warehouse/t/data/f.parquet".into(),
+            region: Some("us-east-2".into()),
+            message: "service error: AccessDenied".into(),
+        })
+    }
+
+    fn not_vended_direct() -> ApiError {
+        ApiError::CatalogCredentialsNotVended {
+            catalog_uri: "https://catalog.example/v1".into(),
+        }
+    }
+
+    fn not_vended_via_query() -> ApiError {
+        ApiError::Query(fluree_db_query::QueryError::CatalogCredentialsNotVended {
+            catalog_uri: "https://catalog.example/v1".into(),
+        })
+    }
+
+    #[test]
+    fn storage_access_denied_is_403_both_paths() {
+        // Preview path (direct ApiError) and scan path (wrapped via Query) both
+        // surface HTTP 403 + the distinct STORAGE_ACCESS_DENIED @type.
+        for api in [storage_denied_direct(), storage_denied_via_query()] {
+            let se = ServerError::Api(api);
+            assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
+            assert_eq!(se.error_type(), errors::STORAGE_ACCESS_DENIED);
+        }
+    }
+
+    #[test]
+    fn credentials_not_vended_is_403_both_paths() {
+        for api in [not_vended_direct(), not_vended_via_query()] {
+            let se = ServerError::Api(api);
+            assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
+            assert_eq!(se.error_type(), errors::CATALOG_CREDENTIALS_NOT_VENDED);
+        }
+    }
+
+    #[test]
+    fn error_body_json_shape_for_storage_access_denied() {
+        // Exact body the solo code-first dispatch consumes: `@type` is the
+        // stable dispatch key; `status` is 403; the structured fields
+        // (bucket/key/region) are carried in the human-readable `error` string.
+        let se = ServerError::Api(storage_denied_via_query());
+        let body = ErrorResponse {
+            error: se.to_string(),
+            status: se.status_code().as_u16(),
+            error_type: se.error_type().to_string(),
+            cause: extract_cause(&se),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["status"], 403);
+        assert_eq!(json["@type"], errors::STORAGE_ACCESS_DENIED);
+        let msg = json["error"].as_str().unwrap();
+        assert!(msg.contains("s3://b/warehouse/t/data/f.parquet"), "{msg}");
+        assert!(msg.contains("region us-east-2"), "{msg}");
+        // No cause chain for these leaf errors.
+        assert!(json.get("cause").is_none());
+    }
+
+    #[test]
+    fn error_body_json_shape_for_credentials_not_vended() {
+        let se = ServerError::Api(not_vended_direct());
+        let body = ErrorResponse {
+            error: se.to_string(),
+            status: se.status_code().as_u16(),
+            error_type: se.error_type().to_string(),
+            cause: extract_cause(&se),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["status"], 403);
+        assert_eq!(json["@type"], errors::CATALOG_CREDENTIALS_NOT_VENDED);
+        let msg = json["error"].as_str().unwrap();
+        assert!(msg.contains("https://catalog.example/v1"), "{msg}");
+        assert!(msg.contains("vended_credentials=false"), "{msg}");
+    }
+
+    #[test]
+    fn r2rml_unsupported_pattern_is_400_with_distinct_type() {
+        // Well-formed but unsupported ON THIS SOURCE: stays HTTP 400 (not a
+        // distinct status like 403/507), but carries a distinct `@type` machine
+        // code so the Solo browse UI can branch on it instead of matching prose.
+        let se = ServerError::Api(ApiError::Query(
+            fluree_db_query::QueryError::r2rml_unsupported_pattern(
+                "graph source 'x' has 1 pattern(s) with a variable predicate and a bound term",
+            ),
+        ));
+        assert_eq!(se.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(se.error_type(), errors::R2RML_UNSUPPORTED_PATTERN);
+        let body = ErrorResponse {
+            error: se.to_string(),
+            status: se.status_code().as_u16(),
+            error_type: se.error_type().to_string(),
+            cause: extract_cause(&se),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["status"], 400);
+        assert_eq!(json["@type"], errors::R2RML_UNSUPPORTED_PATTERN);
+        // The human-readable message keeps the migration substring existing
+        // prose-matchers rely on.
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be converted to R2RML scans"),
+            "{}",
+            json["error"]
+        );
+    }
+}

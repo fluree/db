@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q067",
+  "result_hash": "bb843cabc320e2624d3c49c847025d42a30abbe2941e90d45fdc21bb988654f9",
+  "rows": 84,
+  "head_rows": [
+    "339\u001fHigh\u001f987\u001f2016",
+    "345\u001fUrgent\u001f1012\u001f2007",
+    "350\u001fLow\u001f1001\u001f2017",
+    "350\u001fLow\u001f1057\u001f2015",
+    "354\u001fLow\u001f1070\u001f2018",
+    "355\u001fHigh\u001f1061\u001f2009",
+    "355\u001fLow\u001f1057\u001f2021",
+    "356\u001fUrgent\u001f1042\u001f2022",
+    "357\u001fHigh\u001f1091\u001f2020",
+    "361\u001fLow\u001f1080\u001f2014",
+    "363\u001fUrgent\u001f1070\u001f2023",
+    "364\u001fLow\u001f1070\u001f2013",
+    "364\u001fLow\u001f1111\u001f2023",
+    "364\u001fUrgent\u001f1049\u001f2024",
+    "365\u001fUrgent\u001f1125\u001f2011",
+    "365\u001fUrgent\u001f1134\u001f2006",
+    "369\u001fLow\u001f1095\u001f2006",
+    "369\u001fUrgent\u001f1131\u001f2014",
+    "370\u001fHigh\u001f1125\u001f2026",
+    "370\u001fHigh\u001f1130\u001f2021"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KXSDYKA901PGKPSVV3T42Z0H",
+    "commit": "ece51d618"
+  }
+}

@@ -25,14 +25,19 @@
 //! - [`gen`] — deterministic data generators reused across benches.
 //! - [`fixtures`] — vendored / fetched fixture loaders.
 //! - [`budget`] — regression-budget loader and validator.
+//! - [`mem`], [`meta`] — per-scenario sidecars (allocation metrics; corpus
+//!   identity and phase timings) that `bench-baseline` merges into a baseline.
 //! - [`report`] — opt-in human-readable end-of-run summary tables.
 
 #![forbid(unsafe_code)]
 
+pub mod baseline;
 pub mod budget;
 pub mod fixtures;
 pub mod gen;
 pub mod ledger;
+pub mod mem;
+pub mod meta;
 pub mod normalize;
 pub mod report;
 pub mod runtime;

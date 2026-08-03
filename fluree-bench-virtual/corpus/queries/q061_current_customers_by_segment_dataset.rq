@@ -1,0 +1,14 @@
+# q061 current_customers_by_segment_dataset
+# Intent: C5 dataset-path (FROM <gs>) family-B OVER-COUNT TRAP. The `isCurrent true`
+#         flag folds into the R2RML pattern's star_constraints; the fused fold has
+#         NO star_constraints handling, so it MUST decline (the O1 guard) and
+#         materialize the CONSTRAINED count. The blessed oracle is the current-only
+#         count; a silent fuse would over-count (ALL customers) and fail this member.
+# BI lineage (BI-13): "How are current customers distributed across segments?"
+# Predicates verified against enterprise.ttl — DimCustomer: isCurrent, segment.
+# Exec path: query_from() with FROM <enterprise-sf01-v:main> (the deployed solo shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?seg (COUNT(?c) AS ?n)
+FROM <enterprise-sf01-v:main>
+WHERE { ?c a edw:Customer ; edw:isCurrent true ; edw:segment ?seg . }
+GROUP BY ?seg

@@ -1,0 +1,8 @@
+# q004 cities_in_region
+# Intent: String-equality filter on a dimension column.
+# BI lineage (BI-03): "Which cities do we cover in a given region?"
+# Predicates verified against enterprise.ttl — DimGeography: region, city.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?city
+WHERE { ?g a edw:Geography ; edw:region ?region ; edw:city ?city .
+        FILTER(?region = "Region-1") }

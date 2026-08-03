@@ -1192,6 +1192,8 @@ pub async fn explain_ledger(
 
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
+    } else if headers.is_cypher_query() {
+        "cypher"
     } else {
         "json-ld"
     };
@@ -1303,6 +1305,41 @@ pub async fn explain_ledger(
                 .map_err(ServerError::Api)?;
 
             tracing::info!(status = "success", query_kind = "sparql", "explain completed");
+            return Ok(Json(result));
+        }
+
+        // Handle Cypher explain (Content-Type: application/cypher). Same
+        // ledger resolution and `$param` envelope handling as the Cypher
+        // query path, so the reported plan matches what /query would run.
+        if headers.is_cypher_query() {
+            if let Some(p) = bearer.0.as_ref() {
+                if !credential.is_signed() && !p.can_read(&ledger) {
+                    set_span_error_code(&span, "error:Forbidden");
+                    return Err(ServerError::not_found("Ledger not found"));
+                }
+            }
+            let body = credential.body_string()?;
+            log_query_text(&body, &state.telemetry_config, &span);
+            let (cypher, cypher_params) = fluree_db_api::extract_cypher_envelope(&body);
+
+            let mut min_t_requirements = BTreeMap::new();
+            if let Some(min_t) = headers.min_t {
+                merge_min_t_requirement(&mut min_t_requirements, &ledger, min_t);
+            }
+            await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
+
+            let view = state
+                .fluree
+                .db_with_default_context(&ledger)
+                .await
+                .map_err(ServerError::Api)?;
+            let result = state
+                .fluree
+                .explain_cypher(&view, &cypher, cypher_params.as_ref())
+                .await
+                .map_err(ServerError::Api)?;
+
+            tracing::info!(status = "success", query_kind = "cypher", "explain completed");
             return Ok(Json(result));
         }
 
@@ -3189,6 +3226,15 @@ pub async fn explain(
             set_span_error_code(&span, "error:BadRequest");
             tracing::warn!(error = %error, "SPARQL UPDATE sent to explain endpoint");
             return Err(error);
+        }
+
+        // Cypher needs an explicit ledger; the connection-scoped endpoint
+        // can't resolve one — direct callers at the ledger-scoped route.
+        if headers.is_cypher_query() {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "Cypher explain must target a ledger; use the /v1/fluree/explain/<ledger> endpoint.",
+            ));
         }
 
         // Handle SPARQL explain (connection-scoped: ledger must be discoverable via header or FROM)

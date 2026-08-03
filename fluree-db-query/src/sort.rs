@@ -574,6 +574,17 @@ impl SortOperator {
 
 #[async_trait]
 impl Operator for SortOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — a full sort must consume ALL input
+    /// to order it; the scan-side top-k for `ORDER BY … LIMIT` travels a separate
+    /// channel (`set_topk`, PR-5/item 8), not the row budget. Explicit (was a
+    /// silent trait-default no-op) so the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "SORT row-budget swallowed (a full sort needs all input; top-k uses set_topk)"
+        );
+    }
+
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
     }

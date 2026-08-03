@@ -1,0 +1,9 @@
+# q032 onhand_by_store
+# Intent: Fact->dim rollup summed by store.
+# BI lineage (BI-16): "What is total on-hand inventory by store?"
+# Predicates verified against enterprise.ttl — FactInventorySnapshot: onHandQty, store; DimStore: name.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?sn (SUM(?oh) AS ?tot)
+WHERE { ?inv a edw:InventorySnapshot ; edw:onHandQty ?oh ; edw:store ?st .
+        ?st edw:name ?sn . }
+GROUP BY ?sn

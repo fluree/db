@@ -15,6 +15,10 @@ Coverage:
 - [Operational constraints and limits](#operational-constraints-and-limits)
 - [Security notes](#security-notes)
 
+For how Raft write availability fits with horizontal query scaling, serverless
+compute, and cross-cloud recovery, see
+[Scaling and resilience architecture](scaling-and-resilience.md).
+
 For the deeper architecture (log entry types, snapshot model, queue/worker design), see the design doc: [Raft command queue and replicated state machine](../design/raft-command-queue.md).
 
 ## When to use Raft mode

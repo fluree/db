@@ -538,6 +538,11 @@ pub struct TransactionReceipt {
     pub idempotency_key: Option<IdempotencyKey>,
     pub commit: CommitReceipt,
     pub tally: Option<TrackingTally>,
+    /// Answered trailing `RETURN` of a sequential (multi-clause) Cypher
+    /// write (Cypher-JSON envelope). Populated by the local committer only;
+    /// Raft submissions reject RETURN-carrying sequential statements
+    /// pre-submission.
+    pub cypher_return: Option<serde_json::Value>,
 }
 
 /// Revert submission payload.

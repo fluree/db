@@ -71,6 +71,23 @@ pub const SPARQL11_AGGREGATES: &[&str] = &[
     // dataset-model concern orthogonal to the UPDATE verbs). Permanent
     // divergence. (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-empty-group-count-graph",
+    // agg02 and agg-err-01 are both green and deliberately UNregistered — each
+    // was greened on a different branch, which is why they collided here:
+    //   * agg02 (`SELECT ?P (COUNT(?O) AS ?C) … GROUP BY ?P`) had TWO
+    //     independent faults, either one sufficient to fail it. (i) The count
+    //     VALUE: the per-predicate fast path answered from `StatsView`
+    //     planner estimates, fixed on this branch by counting exactly from
+    //     POST leaf directories (`stats_query.rs`). (ii) The count DATATYPE:
+    //     the same fast path tagged xsd:long, fixed on main by 45d6009bf
+    //     (SPARQL COUNT is xsd:integer, §18.5.1.6). An earlier note on this
+    //     branch dismissed the datatype theory — that was wrong; the suite
+    //     compares datatype IRIs strictly (`result_comparison::terms_match`),
+    //     so a re-typed count fails even with the right value. Both fixes are
+    //     now present; `it_count_datatype_pin` machine-enforces (ii) on an
+    //     indexed ledger, where this register cannot (the suite's ledgers are
+    //     memory-backed, so the fast path never fires under it).
+    //   * agg-err-01 (SUM/AVG must poison to unbound on a bound non-numeric
+    //     group member, §18.5) was greened on main by the same 45d6009bf.
     // COUNT(DISTINCT *): DEFERRED — the parser accepts it but the lowerer
     // rejects it (lower/aggregate.rs); greening needs a new CountDistinctAll IR
     // variant + whole-row group-operator plumbing (the operators feed each
@@ -333,15 +350,12 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     // data load: Turtle-star data won't parse (11)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-3",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-4",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-2",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-3",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-1",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-7",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-8-nomatch",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-9",
     // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
     // (D-8) — 'expected subject, found KwGraph' on data-4.trig (3)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
@@ -369,7 +383,6 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     // query execution error (5). (expr-1/graphs-1/graphs-2 also error at
     // execution, but each is registered once, above, under its data-load blocker.)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-7",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-5",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1j",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",

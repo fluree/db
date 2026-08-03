@@ -38,71 +38,84 @@ Implementation: `fluree-db-transact/src/namespace.rs`
 
 ## Fallback split modes (only for unmatched IRIs)
 
-Fluree uses a small set of fallback “splitters” that derive `(prefix, local)` for IRIs that do not
-match any known prefix.
+For IRIs that match no known prefix, the split is derived by `canonical_split(iri, mode)`, where
+`mode` is an **`NsSplitMode`** — a **ledger-level property**, not a per-call flag.
 
-The active fallback behavior is represented by `NsFallbackMode`:
+```rust
+pub enum NsSplitMode {
+    #[default]
+    MostGranular,      // finest-grained; the default for new ledgers
+    HostPlusN(u8),     // scheme://host/ plus n additional path segments
+}
+```
 
-- `LastSlashOrHash` (default): split on the last `/` or `#` (prefix is inclusive)
-- `CoarseHeuristic` (outlier mitigation):
-  - http(s): usually `scheme://host/<seg1>/`
-  - special-case: DBLP-style `.../pid/<digits>/` buckets may keep 2 segments
-  - non-http(s) with `:` but no `/` or `#`: split at the **2nd** `:` when present (e.g. `urn:isbn:`),
-    else the 1st `:`
-- `HostOnly` (“fallback to the fallback”):
-  - http(s): `scheme://host/`
-  - non-http(s) with `:` but no `/` or `#`: split at the **1st** `:`
-  - else: last-slash-or-hash
+- **`MostGranular`** (default): split at the last `/` or `#` for hierarchical IRIs, or the last
+  `/ | # | :` for opaque IRIs.
+- **`HostPlusN(n)`**: split at `scheme://host/` plus up to *n* additional non-empty path segments.
+  For opaque IRIs, split at `scheme:` plus the first segment plus up to *n* further
+  colon-delimited segments.
+  - `HostPlusN(0)` ≈ host-only splitting
+  - `HostPlusN(1)` ≈ host + one path segment
 
-Implementation: `fluree-db-transact/src/namespace.rs`
+The mode persists as a single byte on the ledger: `0x00` = `MostGranular`,
+`0x01..=0xFF` = `HostPlusN(n-1)`. `HOST_PLUS_N_MAX = 254`, because `HostPlusN(255)` would wrap to
+`MostGranular` on decode.
+
+Implementation: `fluree-db-core/src/ns_encoding.rs` (`NsSplitMode`, `canonical_split`).
+The registry reads it via `LedgerSnapshot::ns_split_mode()` and applies it in
+`fluree-db-transact/src/namespace.rs`.
 
 ## Bulk import: streaming preflight + dynamic mitigation
 
 For large Turtle streaming imports, Fluree attempts to detect “namespace explosion” early without
 an extra I/O pass:
 
-1. `StreamingTurtleReader` samples bounded byte windows within the first chunk region and counts
-   distinct prefixes under `LastSlashOrHash`.
-2. If the sample exceeds a budget (`NS_PREFLIGHT_BUDGET`, currently 255), the reader publishes a
-   preflight result recommending mitigation.
-3. The import forwarder enables `CoarseHeuristic` on the shared allocator **before parsing begins**
-   (so the earliest allocations are already coarse).
-4. If allocations under `CoarseHeuristic` still grow beyond the u8-ish threshold (>255), the shared
-   allocator switches to `HostOnly` so new, unseen hosts do not allocate deeper-than-host namespaces.
+1. `StreamingTurtleReader` samples bounded byte windows (`NS_PREFLIGHT_WINDOW_SIZE`, 8 MiB) within
+   the first chunk region and counts distinct prefixes under the default `MostGranular` split.
+2. If the sample exceeds `NS_PREFLIGHT_BUDGET` (currently 255), the reader publishes a
+   `NamespaceSuggestion::CoarseHeuristic` preflight result recommending mitigation.
+3. The import forwarder sets `NsSplitMode::HostPlusN(1)` on the shared allocator **before parsing
+   begins**, so the earliest allocations are already coarse.
 
 Implementation:
 
 - Preflight detector: `fluree-graph-turtle/src/splitter.rs`
 - Policy application: `fluree-db-api/src/import.rs`
-- Runtime switch: `SharedNamespaceAllocator::get_or_allocate` in `fluree-db-transact/src/namespace.rs`
+- Shared allocator: `SharedNamespaceAllocator::set_split_mode` in `fluree-db-transact/src/namespace.rs`
 
-## Transactions after import: preventing regression for unseen IRIs
+> Note: `NamespaceSuggestion::CoarseHeuristic` is an *import-side signal*, not a split mode. It is
+> the preflight's recommendation; the mode it selects is `HostPlusN(1)`.
 
-Bulk import can upgrade fallback behavior at runtime (shared allocator). For subsequent **normal
-transactions**, we also need “outlier mode” to persist so new IRIs do not regress to `LastSlashOrHash`.
+## The mode is a ledger property, not a per-open derivation
 
-Fluree derives this from the DB’s namespace table at open time:
+The split mode chosen at import time persists as part of the ledger, so subsequent **normal
+transactions** keep splitting unmatched IRIs the same way. There is no re-derivation from the size
+of the namespace table and no runtime escalation between modes.
 
-- When a `LedgerSnapshot` is opened, `NamespaceRegistry::from_db(db)` loads `db.namespace_codes`.
-- If the DB has already allocated namespace codes beyond the u8-ish threshold (>255), the registry
-  sets its fallback mode to `HostOnly`.
+- `LedgerSnapshot::ns_split_mode()` returns the persisted mode.
+- `NamespaceRegistry::from_db(snapshot)` seeds the registry with it.
+- `LedgerSnapshot::set_ns_split_mode(mode, commit_t)` is **immutable after user namespace
+  allocation**: if user namespaces already exist under a different mode, it returns an error
+  (`ns_split_mode conflict: commit t=… declares … but ledger already has user namespaces under …`)
+  rather than silently re-splitting.
 
-That means a new IRI like:
+That immutability is the point — a ledger whose IRIs were encoded under one split cannot have later
+IRIs encoded under another, or the same logical IRI would resolve to two different SIDs.
+
+So for a ledger imported under `HostPlusN(0)`, a later unseen IRI:
 
 `http://some-unseen-host/blah/123/456`
 
-will allocate (if needed) at:
+allocates (if needed) at:
 
 `http://some-unseen-host/`
 
-instead of falling back to a finer last-slash split.
-
 Implementation: `NamespaceRegistry::from_db` and `NamespaceRegistry::sid_for_iri` in
-`fluree-db-transact/src/namespace.rs`
+`fluree-db-transact/src/namespace.rs`; `set_ns_split_mode` in `fluree-db-core/src/db.rs`
 
 ## Notes and trade-offs
 
-- `HostOnly` can still result in many namespaces if a dataset genuinely contains many distinct hosts
+- `HostPlusN(0)` can still result in many namespaces if a dataset genuinely contains many distinct hosts
   (one per host), but it prevents deeper fragmentation that is common in path-heavy IRIs.
 - The `OVERFLOW` namespace code is a sentinel used when `u16` codes are exhausted; it is not a
   fallback mode. Overflow SIDs store the **full IRI** as the SID name.

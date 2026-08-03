@@ -1,0 +1,10 @@
+# q010 revenue_by_quarter
+# Intent: Time-series rollup via the FactOrder->DimDate link.
+# BI lineage (BI-07): "What is order revenue by fiscal year and quarter?"
+# Predicates verified against enterprise.ttl — FactOrder: orderTotal, dateDim(->DimDate); DimDate: year, quarter.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?year ?q (SUM(?tot) AS ?rev)
+WHERE { ?o a edw:Order ; edw:orderTotal ?tot ; edw:dateDim ?d .
+        ?d edw:year ?year ; edw:quarter ?q . }
+GROUP BY ?year ?q
+ORDER BY ?year ?q

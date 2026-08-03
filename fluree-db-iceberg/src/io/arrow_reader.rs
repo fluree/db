@@ -52,6 +52,15 @@ use crate::scan::predicate::{ComparisonOp, Expression, LiteralValue};
 /// row budget so the first batch already satisfies it.
 const ARROW_BATCH_ROWS: usize = 8192;
 
+/// Number of row groups in a Parquet file, read from its footer only (no column
+/// chunks are fetched). Used by the T2.3 row-group parallel decode to size the fan
+/// and honor the single-row-group decline before spawning the per-slice tasks.
+pub(crate) fn read_num_row_groups<R: ChunkReader + 'static>(chunk_reader: R) -> Result<usize> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(chunk_reader)
+        .map_err(|e| IcebergError::Storage(format!("Failed to open Parquet (arrow): {e}")))?;
+    Ok(builder.metadata().num_row_groups())
+}
+
 /// Decode a Parquet file to [`ColumnBatch`]es using the Arrow reader.
 ///
 /// `chunk_reader` is either the in-memory `Bytes` of a small file (already range
@@ -74,6 +83,7 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
     residual_filter: Option<&Expression>,
     iceberg_schema: Option<&Schema>,
     max_rows: Option<usize>,
+    row_group_subset: Option<&[usize]>,
 ) -> Result<Vec<ColumnBatch>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(chunk_reader)
         .map_err(|e| IcebergError::Storage(format!("Failed to open Parquet (arrow): {e}")))?;
@@ -147,6 +157,16 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
 
     let mut surviving =
         crate::io::send_parquet::surviving_row_groups(md, residual_filter, &field_id_to_leaf);
+
+    // T2.3: a parallel decode assigns each blocking task a contiguous slice of the
+    // file's row groups; keep only the surviving groups in this task's slice so the
+    // tasks partition the file with no overlap (their union == a full sequential
+    // decode; row groups are independently decodable). No-op for the sequential
+    // path (`None`). Does not co-occur with a `max_rows` peek (a parallel decode is
+    // never a bounded peek).
+    if let Some(subset) = row_group_subset {
+        surviving.retain(|rg| subset.contains(rg));
+    }
 
     // Bounded "peek": restrict to the first surviving row group so a small
     // `max_rows` fetches only that group's projected column chunks (+ footer) via
@@ -369,6 +389,14 @@ fn collect_and_comparisons(
             true
         }
         Expression::And(children) => children.iter().all(|c| collect_and_comparisons(c, out)),
+        // An `In`/`NotIn` set filter has no row-level Arrow representation here.
+        // Treat it as transparent (don't push, don't abort) so a sibling
+        // comparison in the same `And` still builds its row filter. Sound: the row
+        // filter may only ever keep MORE rows than the true predicate — file /
+        // row-group pruning (which DO evaluate `In`) and the in-engine FILTER stay
+        // the authority. A lone `In` yields an empty plan ⇒ no row filter, exactly
+        // as before this arm existed.
+        Expression::In { .. } | Expression::NotIn { .. } => true,
         _ => false,
     }
 }
@@ -432,7 +460,12 @@ fn literal_to_array(value: &LiteralValue) -> ArrayRef {
         LiteralValue::String(s) => Arc::new(StringArray::from(vec![s.clone()])),
         LiteralValue::Bytes(b) => Arc::new(BinaryArray::from(vec![b.as_slice()])),
         LiteralValue::Date(d) => Arc::new(Date32Array::from(vec![*d])),
-        LiteralValue::Timestamp(t) => Arc::new(TimestampMicrosecondArray::from(vec![*t])),
+        // Both timestamp flavors carry micros-since-epoch; `cast` adapts to the
+        // column's own (tz-tagged or not) timestamp type. If the cast can't adapt,
+        // `eval_comparison` keeps every row and the in-engine FILTER decides.
+        LiteralValue::Timestamp(t) | LiteralValue::TimestampTz(t) => {
+            Arc::new(TimestampMicrosecondArray::from(vec![*t]))
+        }
         LiteralValue::Decimal {
             unscaled,
             precision,

@@ -749,6 +749,20 @@ impl Fluree {
                 (None, None, None, None, None)
             };
 
+        // Wire the BM25 index provider so embedded `f:searchText` graph-source
+        // queries execute in-process over the standard query route.
+        // It is a zero-cost `&Fluree` wrapper and is only consulted by the
+        // `IndexSearch` operator, so non-search queries are unaffected. Declared
+        // before `config` so it outlives the borrow held by the context.
+        //
+        // `bm25_provider` (the "legacy" index-provider slot), NOT the
+        // "preferred" `bm25_search_provider` that `ContextConfig` steers you
+        // toward: view-policy enforcement on a hit only works in index-provider
+        // mode. Search-provider mode has no local flakes and fails closed
+        // (`operator.rs`), so it would return zero rows for every
+        // policy-enforced query. Do not "upgrade" this.
+        let index_provider = crate::FlureeIndexProvider::new(self);
+
         let config = ContextConfig {
             tracker: if tracker.is_enabled() {
                 Some(tracker)
@@ -759,6 +773,7 @@ impl Fluree {
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
             r2rml: Some((r2rml.provider, r2rml.table_provider)),
+            bm25_provider: Some(&index_provider),
             binary_g_id: primary.graph_id,
             binary_store,
             dict_novelty,
@@ -771,6 +786,7 @@ impl Fluree {
             // errors leave the variable unbound, not fail the query.
             strict_bind_errors: false,
             include_system_facts: executable.query.include_system_facts,
+            cypher_vocab: executable.query.cypher_vocab.clone(),
             trust_fk_refs: options.trust_fk_refs,
             ..Default::default()
         };
@@ -893,12 +909,26 @@ impl Fluree {
                 (None, None, None, None, None)
             };
 
+        // Wire the BM25 index provider so embedded `f:searchText` graph-source
+        // queries execute in-process over the standard query route.
+        // Zero-cost `&Fluree` wrapper, only consulted by the `IndexSearch`
+        // operator; declared before `config` so it outlives the context borrow.
+        //
+        // `bm25_provider` (the "legacy" index-provider slot), NOT the
+        // "preferred" `bm25_search_provider` that `ContextConfig` steers you
+        // toward: view-policy enforcement on a hit only works in index-provider
+        // mode. Search-provider mode has no local flakes and fails closed
+        // (`operator.rs`), so it would return zero rows for every
+        // policy-enforced query. Do not "upgrade" this.
+        let index_provider = crate::FlureeIndexProvider::new(self);
+
         let config = ContextConfig {
             tracker: Some(tracker),
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
             r2rml: Some((r2rml.provider, r2rml.table_provider)),
+            bm25_provider: Some(&index_provider),
             binary_g_id: primary.graph_id,
             binary_store,
             dict_novelty,
@@ -911,6 +941,7 @@ impl Fluree {
             // errors leave the variable unbound, not fail the query.
             strict_bind_errors: false,
             include_system_facts: executable.query.include_system_facts,
+            cypher_vocab: executable.query.cypher_vocab.clone(),
             trust_fk_refs: options.trust_fk_refs,
             ..Default::default()
         };

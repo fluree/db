@@ -1,0 +1,3 @@
+# Benchmark outputs (JSONL run records) are not checked in — they are host- and
+# run-specific. The corpus and target configs ARE tracked.
+results/

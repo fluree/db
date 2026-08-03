@@ -1,0 +1,9 @@
+# q011 orders_in_quarter
+# Intent: Date-range FILTER on a fact date column (prunable on virtual).
+# BI lineage (BI-07): "Which orders fell in the first quarter of 2024?"
+# Predicates verified against enterprise.ttl — FactOrder: orderId, orderDate.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?od
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderDate ?od .
+        FILTER(?od >= "2024-01-01"^^<http://www.w3.org/2001/XMLSchema#date>
+            && ?od <  "2024-04-01"^^<http://www.w3.org/2001/XMLSchema#date>) }

@@ -136,8 +136,41 @@ pub const STORAGE_READ: &str = "err:storage/ReadFailure";
 /// Storage write failure
 pub const STORAGE_WRITE: &str = "err:storage/WriteFailure";
 
+/// Object storage denied a read (S3 403 / `AccessDenied`).
+///
+/// Distinct from the policy-layer [`ACCESS_DENIED`]: this is the external
+/// object store (S3/GCS) refusing a read of an Iceberg data/metadata/manifest
+/// file, not a Fluree policy decision. Because S3 also returns `AccessDenied`
+/// for a missing object when the caller lacks `s3:ListBucket`, this means the
+/// credentials lack access **or** the object was moved/removed.
+pub const STORAGE_ACCESS_DENIED: &str = "err:storage/AccessDenied";
+
+/// The catalog authorized the table but vended no storage credentials while the
+/// source is configured to require them (`vended_credentials = true`).
+///
+/// Fail-closed signal: the query/preview is refused rather than silently
+/// downgrading to ambient (process-default) AWS credentials.
+pub const CATALOG_CREDENTIALS_NOT_VENDED: &str = "err:catalog/CredentialsNotVended";
+
 /// Connection error
 pub const CONNECTION: &str = "err:storage/ConnectionError";
+
+// =============================================================================
+// R2RML / virtual-dataset Errors (r2rml)
+// =============================================================================
+
+/// A syntactically valid query used a pattern shape the R2RML rewrite cannot
+/// convert to a table scan on a virtual (graph-source) dataset — currently a
+/// VARIABLE predicate paired with a BOUND term (`?s ?p <iri>` / `?s ?p "x"`), or
+/// a top-level VALUES clause on a subgraph crawl.
+///
+/// Distinct from the generic [`INVALID_QUERY`] (which means *malformed*): the
+/// request is well-formed, just unsupported ON THIS SOURCE, so it stays HTTP 400
+/// but carries this stable machine code so callers (Solo's virtual-dataset
+/// browse UI) can branch on the condition instead of matching the human-readable
+/// message. Mirrors the distinct-code precedent of [`STORAGE_ACCESS_DENIED`] /
+/// [`CATALOG_CREDENTIALS_NOT_VENDED`], but keeps the 400 status.
+pub const R2RML_UNSUPPORTED_PATTERN: &str = "err:r2rml/UnsupportedPattern";
 
 // =============================================================================
 // Policy/Auth Errors (policy)

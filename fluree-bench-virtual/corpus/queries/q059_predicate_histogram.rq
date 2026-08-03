@@ -1,0 +1,12 @@
+# q059 predicate_histogram
+# Intent: "Which fields dominate the data?" — the predicate-frequency profile an
+# analyst (or an LLM agent) runs to understand a new dataset's shape.
+# BI lineage (BI-explore-5): top predicates by triple count.
+# Exploration family: grouped wildcard COUNT + ORDER BY DESC(count) with a
+# secondary ?p tiebreak for determinism, LIMIT 10. Same predicate-less
+# materialization as q056, plus GROUP BY + ORDER BY.
+SELECT ?p (COUNT(*) AS ?n)
+WHERE { ?s ?p ?o }
+GROUP BY ?p
+ORDER BY DESC(?n) ?p
+LIMIT 10

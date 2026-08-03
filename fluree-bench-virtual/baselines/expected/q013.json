@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q013",
+  "result_hash": "631c1b91561e54673b7c011524a93d118df096452ce7e1c936578af36d71fad9",
+  "rows": 14246,
+  "head_rows": [
+    "Product 10\u001f153",
+    "Product 100\u001f112",
+    "Product 1000\u001f122",
+    "Product 10000\u001f112",
+    "Product 10001\u001f114",
+    "Product 10002\u001f180",
+    "Product 10003\u001f117",
+    "Product 10004\u001f116",
+    "Product 10006\u001f138",
+    "Product 10007\u001f137",
+    "Product 10008\u001f166",
+    "Product 10010\u001f138",
+    "Product 10011\u001f120",
+    "Product 10012\u001f111",
+    "Product 10013\u001f154",
+    "Product 10018\u001f125",
+    "Product 10019\u001f117",
+    "Product 10020\u001f115",
+    "Product 10021\u001f129",
+    "Product 10024\u001f129"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

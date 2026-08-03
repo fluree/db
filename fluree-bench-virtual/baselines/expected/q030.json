@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q030",
+  "result_hash": "29b0e2aca4eed445640a0d26422fff3990f19e1f556fbc0a691e1a9d99ac9e40",
+  "rows": 3912,
+  "head_rows": [
+    "<http://data.fluree.dev/edw/event/876974>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876975>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876976>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876977>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876978>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876979>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876980>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876981>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876982>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876983>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876984>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876985>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876986>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876987>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876988>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876989>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876990>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876991>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876992>\u001f2024-06-01",
+    "<http://data.fluree.dev/edw/event/876993>\u001f2024-06-01"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

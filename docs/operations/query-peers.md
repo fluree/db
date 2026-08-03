@@ -4,6 +4,10 @@ This document describes how to run `fluree-server` in **transaction** mode (even
 
 This guide is written from an **operator / end-user** standpoint: what to deploy, how to configure it, and what to expect from each mode.
 
+For the broader deployment model, including serverless compute, Raft write
+availability, and cross-cloud recovery, see
+[Scaling and resilience architecture](scaling-and-resilience.md).
+
 ## Server roles
 
 `fluree-server` supports two roles:

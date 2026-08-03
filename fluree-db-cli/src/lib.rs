@@ -11,6 +11,7 @@ pub mod config;
 pub mod context;
 pub mod detect;
 pub mod error;
+pub mod graph_source_display;
 pub mod input;
 pub mod output;
 pub mod remote_client;
@@ -59,6 +60,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                     "--from and --memory are mutually exclusive".into(),
                 ));
             }
+            let edge_policy: fluree_db_api::csv_import::EdgePolicy = edge_properties.into();
 
             // `--remote` doesn't write any local state, so it must work even
             // when the user has no project-local `.fluree/` directory — fall
@@ -87,14 +89,22 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                         )
                         .await
                     }
-                    // Other formats can't be bulk-imported server-side yet.
-                    Some(_) => Err(error::CliError::Usage(
-                        "--remote --from supports only .flpack archives; \
-                         for other formats, export to .flpack first \
-                         (`fluree export <ledger> --format ledger -o out.flpack`), \
-                         or create locally then `fluree publish <remote> <ledger>`."
-                            .to_string(),
-                    )),
+                    // Raw source data (TTL/JSON-LD/JSONL/CSV/Cypher …) uploads
+                    // to servers that advertise `source-upload` and runs the
+                    // bulk-import pipeline server-side; the handler falls back
+                    // to a clear error (export to .flpack / create locally)
+                    // when the server doesn't offer it.
+                    Some(path) => {
+                        commands::create::run_remote_source_import(
+                            &ledger,
+                            &remote_name,
+                            path,
+                            &fluree_dir,
+                            edge_policy,
+                            base_iri.as_deref(),
+                        )
+                        .await
+                    }
                     None => commands::create::run_remote(&ledger, &remote_name, &fluree_dir).await,
                 };
             }
@@ -129,7 +139,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 chunk_size_mb,
                 leaflet_rows,
                 leaflets_per_leaf,
-                edge_policy: edge_properties.into(),
+                edge_policy,
                 base_iri,
             };
             commands::create::run(
@@ -189,6 +199,11 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         Commands::Graph { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::graph::run(action, &fluree_dir, direct).await
+        }
+
+        Commands::Bm25 { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::bm25::run(action, &fluree_dir).await
         }
 
         Commands::Insert {
@@ -647,6 +662,11 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             "server support not compiled. Rebuild with `--features server`.".into(),
         )),
 
+        Commands::Model { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::model::run(&action, &fluree_dir, direct).await
+        }
+
         Commands::Memory { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::memory::run(action, &fluree_dir).await
@@ -687,6 +707,44 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 }
             }
         }
+
+        #[cfg(feature = "iceberg")]
+        Commands::Materialize {
+            graph_source,
+            into,
+            output,
+            output_path,
+            verify,
+            max_performance,
+            allow_mor_deletes,
+            allow_duplicate_parent_keys,
+            home,
+            tmp_dir,
+        } => {
+            // `--home` resolves through the same helper as `--config` (it takes
+            // precedence); else the tracked `.fluree/` or the global home.
+            let fluree_dir = config::require_fluree_dir_or_global(home.as_deref().or(config_path))?;
+            let params = commands::materialize::MaterializeParams {
+                graph_source: &graph_source,
+                into: into.as_deref(),
+                output,
+                output_path: output_path.as_deref(),
+                verify,
+                max_performance,
+                allow_mor_deletes,
+                allow_duplicate_parent_keys,
+                parallelism: cli.parallelism,
+                memory_budget_mb: cli.memory_budget_mb,
+                quiet: cli.quiet,
+                tmp_dir: tmp_dir.as_deref(),
+            };
+            commands::materialize::run(&fluree_dir, &params).await
+        }
+
+        #[cfg(not(feature = "iceberg"))]
+        Commands::Materialize { .. } => Err(error::CliError::Usage(
+            "`fluree materialize` requires the `iceberg` feature (enabled by default)".to_string(),
+        )),
 
         Commands::Mcp { action } => match action {
             cli::McpAction::Serve {

@@ -1408,7 +1408,7 @@ pub(crate) struct TriplePlanContext<'a> {
     var_counts: &'a HashMap<VarId, usize>,
     protected_vars: &'a HashSet<VarId>,
     group_by: &'a [VarId],
-    distinct_query: bool,
+    where_dedup_safe: bool,
     planning: &'a PlanningContext,
     stats: Option<&'a StatsView>,
 }
@@ -1488,7 +1488,7 @@ fn build_sequential_join_block(
             live.into_iter().collect::<Vec<VarId>>()
         });
 
-        let pruned_vars: Option<HashSet<VarId>> = if ctx.distinct_query {
+        let pruned_vars: Option<HashSet<VarId>> = if ctx.where_dedup_safe {
             live_vars.as_ref().map(|live| {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
                 vars_after
@@ -1527,12 +1527,12 @@ fn build_sequential_join_block(
             );
             pending_binds = new_binds;
             pending_filters = new_filters;
-            operator = if ctx.distinct_query && pruned_vars.as_ref().is_some_and(|s| !s.is_empty())
-            {
-                Some(Box::new(DistinctOperator::new(child)))
-            } else {
-                Some(child)
-            };
+            operator =
+                if ctx.where_dedup_safe && pruned_vars.as_ref().is_some_and(|s| !s.is_empty()) {
+                    Some(Box::new(DistinctOperator::new(child)))
+                } else {
+                    Some(child)
+                };
         }
     }
 
@@ -1579,12 +1579,20 @@ pub fn build_where_operators(
 ///
 /// `needed_vars` are the variables that must survive the WHERE stage (because they
 /// are used by GROUP BY, aggregates, HAVING, ORDER BY, projection, etc.).
+///
+/// `where_dedup_safe` asserts that downstream cannot observe WHERE-output row
+/// multiplicity (a non-grouped `SELECT DISTINCT`, or a grouping phase whose
+/// aggregates are all duplicate-insensitive — the caller owns that analysis;
+/// see `build_operator_tree_inner`). When set, the join chain collapses
+/// duplicate rows with a `DistinctOperator` at every step where projection
+/// trimming dropped a dead variable, preventing duplicate multiplicity from
+/// compounding through deep existential chains.
 pub fn build_where_operators_with_needed(
     patterns: &[Pattern],
     stats: Option<Arc<StatsView>>,
     needed_vars: &HashSet<VarId>,
     group_by: &[VarId],
-    distinct_query: bool,
+    where_dedup_safe: bool,
     required_where_vars: Option<&[VarId]>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
@@ -1594,7 +1602,7 @@ pub fn build_where_operators_with_needed(
         stats,
         needed_vars,
         group_by,
-        distinct_query,
+        where_dedup_safe,
         required_where_vars,
         planning,
     )
@@ -1798,7 +1806,7 @@ pub fn build_where_operators_seeded_with_needed(
     stats: Option<Arc<StatsView>>,
     needed_vars: &HashSet<VarId>,
     group_by: &[VarId],
-    distinct_query: bool,
+    where_dedup_safe: bool,
     required_where_vars: Option<&[VarId]>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
@@ -1949,7 +1957,7 @@ pub fn build_where_operators_seeded_with_needed(
                         var_counts: &var_counts,
                         protected_vars: &protected_vars,
                         group_by,
-                        distinct_query,
+                        where_dedup_safe,
                         planning,
                         stats: stats.as_deref(),
                     };
@@ -2157,7 +2165,7 @@ pub fn build_where_operators_seeded_with_needed(
                         var_counts: &var_counts,
                         protected_vars: &protected_vars,
                         group_by,
-                        distinct_query,
+                        where_dedup_safe,
                         planning,
                         stats: stats.as_deref(),
                     };
@@ -2261,6 +2269,27 @@ pub fn build_where_operators_seeded_with_needed(
                             i += 1;
                             continue;
                         }
+                    }
+
+                    // Value-only edge-annotation probe (a Cypher relationship
+                    // binding): answer the whole batch with three set-wise
+                    // reifies scans + hash lookups instead of per-row chains.
+                    if let Some(builder) = crate::optional::AnnotationValueOptionalBuilder::try_new(
+                        required_schema.clone(),
+                        inner_patterns.clone(),
+                        stats.clone(),
+                        *planning,
+                    ) {
+                        operator = Some(Box::new(
+                            OptionalOperator::with_builder(
+                                child,
+                                required_schema,
+                                Box::new(builder),
+                            )
+                            .with_out_schema(augmented_ref),
+                        ));
+                        i += 1;
+                        continue;
                     }
 
                     // General path: use PlanTreeOptionalBuilder for multi-pattern or
@@ -2579,6 +2608,31 @@ pub(crate) fn build_scan_or_join(
             // Extract object bounds if available for this pattern's object variable
             let bounds = tp.o.as_var().and_then(|v| object_bounds.get(&v).cloned());
 
+            // A right triple that binds nothing new is a pure existence
+            // filter (each ground row matches at most once in current-state
+            // mode). The nested-loop join re-opens a scan per driving row —
+            // ~ms each, ~30 s for a 21k-row `?o rdf:type :Class` membership
+            // check. Evaluate it as a build-once hash membership probe when
+            // the build side is bounded AND the driving side is large enough
+            // to amortize it; rows that do not fully ground the pattern keep
+            // exact join semantics via a per-row fallback.
+            if bounds.is_none() && inline_ops.is_empty() {
+                if let Some(key_vars) = membership_join_key_vars(
+                    &left_schema,
+                    tp,
+                    planning,
+                    hash_planner,
+                    left.estimated_rows(),
+                ) {
+                    return Box::new(crate::membership_join::MembershipJoinOperator::new(
+                        left,
+                        tp.clone(),
+                        key_vars,
+                        *planning,
+                    ));
+                }
+            }
+
             // For object→subject "path" joins, build a hash table from the small
             // (left/driving) side and probe a single contiguous scan of the large
             // predicate, instead of the per-driving-row OPST object seek that degrades
@@ -2637,6 +2691,86 @@ pub(crate) fn build_scan_or_join(
             )
         }
     }
+}
+
+/// Max estimated build-side rows for the membership-join hash lane: the
+/// one-time drain of the right triple (a single predicate slice / class
+/// extension) must stay bounded — beyond this the per-row nested loop is
+/// kept, since a huge build would cost more than the reopens it saves.
+const MEMBERSHIP_JOIN_MAX_BUILD: f64 = 250_000.0;
+
+/// Min estimated driving rows for the membership-join hash lane. Below this
+/// the nested loop's per-row probes are cheaper than one drain of the whole
+/// build side: three driving rows are three seeded probes, where the lane
+/// would drain up to [`MEMBERSHIP_JOIN_MAX_BUILD`] rows to answer them.
+/// Mirrors `HASH_ANNOTATION_MIN_DRIVING_ROWS` in
+/// [`crate::default_graph_source`], including its treatment of an unknown
+/// estimate as large — an unbounded driving stream is exactly what the
+/// build-once drain protects against.
+const MEMBERSHIP_JOIN_MIN_DRIVING: usize = 256;
+
+/// Recognize the membership-join shape for `build_scan_or_join`: every
+/// variable of `tp` (≥ 1) already appears in the left schema, the query is
+/// current-state (in history mode a ground triple matches once per
+/// `(t, op)` version, so keep/drop is not join-equivalent), the driving side
+/// is at least [`MEMBERSHIP_JOIN_MIN_DRIVING`] rows (or unknown), and stats
+/// bound the standalone build within [`MEMBERSHIP_JOIN_MAX_BUILD`].
+/// Returns the key vars in left-schema order (load-bearing for column
+/// lookup at open), or `None` to keep the nested-loop join.
+fn membership_join_key_vars(
+    left_schema: &[VarId],
+    tp: &TriplePattern,
+    planning: &PlanningContext,
+    hash_planner: &HashJoinPlanner,
+    driving_rows: Option<usize>,
+) -> Option<Vec<VarId>> {
+    if planning.is_history() {
+        return None;
+    }
+    // A small driving side is cheaper on the nested loop's per-row probes
+    // than on a one-shot drain of the whole build side. `{ ?a :knows ?b .
+    // ?b :knows ?a }` with a selective first triple is the canonical case:
+    // a handful of rows must not drain the entire `:knows` extension.
+    if driving_rows.is_some_and(|n| n < MEMBERSHIP_JOIN_MIN_DRIVING) {
+        return None;
+    }
+    // `(?s bound-from-left, const p, const o)` is the nested-loop join's own
+    // batched-EXISTS shape (`is_batched_subject_exists_eligible`): it probes
+    // PSOT for the driving subjects only — O(driving locality) — where this
+    // lane would drain the whole class/predicate extension. Leave that
+    // subset to the NLJ; membership handles the shapes it can't (a
+    // bound-VAR object or predicate).
+    if tp.s.as_var().is_some_and(|v| left_schema.contains(&v))
+        && tp.p.is_sid()
+        && !matches!(&tp.o, Term::Var(_))
+        && tp.dtc.is_none()
+    {
+        return None;
+    }
+    let mut tp_vars: Vec<VarId> = Vec::new();
+    for v in [tp.s.as_var(), tp.p.as_var(), tp.o.as_var()]
+        .into_iter()
+        .flatten()
+    {
+        if !left_schema.contains(&v) {
+            return None;
+        }
+        if !tp_vars.contains(&v) {
+            tp_vars.push(v);
+        }
+    }
+    if tp_vars.is_empty() {
+        return None;
+    }
+    let stats = hash_planner.stats()?;
+    let inner_est = crate::planner::estimate_triple_row_count(tp, &HashSet::new(), Some(stats));
+    (inner_est <= MEMBERSHIP_JOIN_MAX_BUILD).then(|| {
+        left_schema
+            .iter()
+            .copied()
+            .filter(|v| tp_vars.contains(v))
+            .collect()
+    })
 }
 
 #[inline]
@@ -2751,9 +2885,10 @@ fn build_sequential_triple_chain(
             &hash_planner,
         ));
 
-        // DISTINCT query optimization: if any variables seen so far are no longer live,
-        // collapse duplicates early to avoid downstream join blowups.
-        if ctx.distinct_query {
+        // Early dedup (sound because downstream is multiplicity-insensitive —
+        // see `where_dedup_safe`): if any variables seen so far are no longer
+        // live, collapse duplicates early to avoid downstream join blowups.
+        if ctx.where_dedup_safe {
             if let Some(live) = live_vars.as_ref() {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
                 let dead = seen_vars
@@ -2901,7 +3036,7 @@ mod tests {
             var_counts: &counts,
             protected_vars: &protected,
             group_by: &[],
-            distinct_query: false,
+            where_dedup_safe: false,
             planning: &crate::temporal_mode::PlanningContext::current(),
             stats: None,
         };
@@ -4603,5 +4738,102 @@ mod tests {
         let strategy = choose_exists_strategy(&outer_schema, &inner);
 
         assert_eq!(strategy, ExistsStrategy::Semijoin { key_vars: vec![a] },);
+    }
+
+    // --- membership-join lane admission ------------------------------------
+
+    /// Stats for a `:knows`-style predicate whose extension is inside the
+    /// membership build ceiling.
+    fn knows_stats(count: u64) -> StatsView {
+        let mut v = StatsView::default();
+        v.properties.insert(
+            Sid::new(100, "knows"),
+            PropertyStatData {
+                count,
+                ndv_values: count,
+                ndv_subjects: count,
+            },
+        );
+        v
+    }
+
+    /// `?a :knows ?b . ?b :knows ?a` — the mutual-relationship shape. Both
+    /// vars of the second triple come from the left, so it is a pure
+    /// existence filter and the lane is shape-eligible.
+    fn mutual_knows_right_triple() -> (Vec<VarId>, TriplePattern) {
+        let (a, b) = (VarId(0), VarId(1));
+        (vec![a, b], make_pattern(b, "knows", a))
+    }
+
+    #[test]
+    fn membership_lane_declines_small_driving_side() {
+        let stats = knows_stats(100_000);
+        let planner = HashJoinPlanner::new(Some(&stats));
+        let (left_schema, tp) = mutual_knows_right_triple();
+        assert!(
+            membership_join_key_vars(
+                &left_schema,
+                &tp,
+                &PlanningContext::current(),
+                &planner,
+                Some(3),
+            )
+            .is_none(),
+            "3 driving rows must stay on the nested loop rather than drain the \
+             whole :knows extension"
+        );
+    }
+
+    #[test]
+    fn membership_lane_admits_large_driving_side() {
+        let stats = knows_stats(100_000);
+        let planner = HashJoinPlanner::new(Some(&stats));
+        let (left_schema, tp) = mutual_knows_right_triple();
+        let key_vars = membership_join_key_vars(
+            &left_schema,
+            &tp,
+            &PlanningContext::current(),
+            &planner,
+            Some(MEMBERSHIP_JOIN_MIN_DRIVING),
+        )
+        .expect("a large driving side amortizes the one-shot build");
+        assert_eq!(
+            key_vars, left_schema,
+            "key vars are returned in left-schema order"
+        );
+    }
+
+    /// An unknown driving estimate is treated as large — an unbounded stream
+    /// is exactly what the build-once drain protects against (matches
+    /// `HASH_ANNOTATION_MIN_DRIVING_ROWS`'s handling of `None`).
+    #[test]
+    fn membership_lane_admits_unknown_driving_side() {
+        let stats = knows_stats(100_000);
+        let planner = HashJoinPlanner::new(Some(&stats));
+        let (left_schema, tp) = mutual_knows_right_triple();
+        assert!(membership_join_key_vars(
+            &left_schema,
+            &tp,
+            &PlanningContext::current(),
+            &planner,
+            None,
+        )
+        .is_some());
+    }
+
+    /// The build ceiling still applies independently of the driving side.
+    #[test]
+    fn membership_lane_declines_unbounded_build() {
+        let stats = knows_stats(5_000_000);
+        let planner = HashJoinPlanner::new(Some(&stats));
+        let (left_schema, tp) = mutual_knows_right_triple();
+        assert!(membership_join_key_vars(
+            &left_schema,
+            &tp,
+            &PlanningContext::current(),
+            &planner,
+            None,
+        )
+        .is_none());
     }
 }
