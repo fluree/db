@@ -866,8 +866,9 @@ fn spawn_produce_workers(
 
                         // Finish + ship this chunk (always non-empty: it holds
                         // `first`). Mirror build_stamp_chunk's finalize.
-                        let (writer, prefix_map, spool_ctx) =
-                            sink.into_parts().map_err(|e| format!("flake encode: {e}"))?;
+                        let (writer, prefix_map, spool_ctx) = sink
+                            .into_parts()
+                            .map_err(|e| format!("flake encode: {e}"))?;
                         let op_count = writer.op_count();
                         let new_codes = worker_cache.into_new_codes();
                         let spool_result = spool_ctx.map(SpoolContext::finish_buffered);
