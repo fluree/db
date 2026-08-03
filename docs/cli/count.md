@@ -1,22 +1,22 @@
-# fluree rdf count
+# fluree count
 
 Count the statements in an RDF document.
 
 ```bash
-fluree rdf count [<FILE>] [options]
+fluree count [<FILE>] [options]
 ```
 
 ```bash
-fluree rdf count dump.ttl
-fluree rdf count dump.nt.gz --time
-TRIPLES=$(fluree rdf count -q dump.ttl)
-cat dump.ttl | fluree rdf count --syntax turtle
+fluree count dump.ttl
+fluree count dump.nt.gz --time
+TRIPLES=$(fluree count -q dump.ttl)
+cat dump.ttl | fluree count --syntax turtle
 ```
 
 ## Output
 
 ```console
-$ fluree rdf count dump.ttl
+$ fluree count dump.ttl
 triples: 240000
 terms: 480001 (iri 120001, blank 0, literal 360000)
 grammar statements: 120001
@@ -32,7 +32,7 @@ Under `-q` the output is the bare total and nothing else, for capturing in a
 shell variable:
 
 ```console
-$ fluree rdf count -q dump.ttl
+$ fluree count -q dump.ttl
 240000
 ```
 
@@ -51,7 +51,7 @@ counting sink already accepts them, so the line appears the day they do.
 | `--no-hash` | Skip the corpus SHA-256 in `--profile` output |
 | `-q, --quiet` | Print the bare total only (global flag) |
 
-See [the `rdf` overview](README.md) for input handling, syntax resolution,
+See [RDF file tools](rdf-files.md) for input handling, syntax resolution,
 and profiling, which are shared by every verb.
 
 ## What counts as a statement
@@ -75,14 +75,14 @@ written with rather than being canonicalized.
 `--time` adds one line on stderr:
 
 ```console
-$ fluree rdf count dump.ttl --time
+$ fluree count dump.ttl --time
 triples: 240000
 ...
   240,000 triples in 2.49s (96,514 triples/s, 2.2 MiB/s)
 ```
 
 For a breakdown by phase — how much of that was I/O, decompression, and
-parsing — use `--profile`, documented in the [overview](README.md).
+parsing — use `--profile`, documented in the [overview](rdf-files.md).
 
 Counting is a parse whose results are discarded, which makes it the cheapest
 honest measurement of parser throughput available: no sink work, no
@@ -101,7 +101,7 @@ partial number that looks whole is worse than no number. The error names how
 far it got instead:
 
 ```console
-$ fluree rdf count broken.ttl
+$ fluree count broken.ttl
 error: broken.ttl:3:16: unexpected character '?'
   counted 1 triple(s) before the document stopped parsing
 ```

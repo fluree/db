@@ -4458,7 +4458,7 @@ fn continue_on_error_still_emits_the_profile() {
 //
 // Reviewers found three separate cases of one flag silently overriding
 // another (coe x profile, -o x profile-json, parallel x bnode-policy). The
-// documented table in `docs/cli/rdf/convert.md` is the contract; these are its
+// documented table in `docs/cli/convert.md` is the contract; these are its
 // assertions. Each interaction is exercised in BOTH the serial and the
 // parallel path, because two of the three defects existed only on one side.
 //

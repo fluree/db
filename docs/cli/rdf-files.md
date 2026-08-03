@@ -1,28 +1,36 @@
-# fluree rdf
+# RDF file tools
 
-RDF syntax tooling that never touches a ledger. `fluree rdf` reads files and
-reports on them — no `fluree init`, no ledger, no connection, no `.fluree/`
-directory anywhere on the path.
-
-```bash
-fluree rdf <verb> [<FILE>] [options]
-```
+Three verbs that never touch a ledger. They read files and report on them —
+no `fluree init`, no ledger, no connection, no `.fluree/` directory anywhere
+on the path.
 
 | Verb | Description |
 |------|-------------|
-| [`check`](check.md) | Parse a document and report syntax errors |
+| [`parse`](parse.md) | Parse a document and report syntax errors |
 | [`count`](count.md) | Count the statements in a document |
-| [`convert`](convert.md) | Convert between RDF syntaxes (not yet implemented) |
+| [`convert`](convert.md) | Convert between RDF syntaxes |
+
+This page is the shared half: input handling, syntax resolution, the flags all
+three take, profiling, memory, and exit codes. Each verb's own page covers what
+only it does.
+
+They are top-level commands rather than an `fluree rdf <verb>` group. Nothing
+else in the CLI converts or counts a file, so the group prefix bought
+disambiguation nobody needed and cost every invocation a word. `parse` was
+briefly called `check`; it was renamed because [`fluree validate`](validate.md)
+already has a file mode, and `check` beside it read as a shorter `validate` on
+a distinction nothing in `--help` could show. `check` still works as an
+undocumented alias.
 
 ## Input
 
 Every verb takes the same input handling.
 
 ```bash
-fluree rdf count dump.ttl            # a file
-fluree rdf count dump.nt.gz          # transparently decompressed
-cat dump.ttl | fluree rdf count      # stdin
-fluree rdf count - < dump.ttl        # stdin, named explicitly
+fluree count dump.ttl            # a file
+fluree count dump.nt.gz          # transparently decompressed
+cat dump.ttl | fluree count      # stdin
+fluree count - < dump.ttl        # stdin, named explicitly
 ```
 
 `.gz` and `.zst` inputs decompress transparently. gzip is decoded with a
@@ -79,7 +87,7 @@ matters. Use `--syntax` for those.
 stays clean:
 
 ```bash
-fluree rdf count dump.ttl --time | tee counts.txt
+fluree count dump.ttl --time | tee counts.txt
 ```
 
 ## Profiling
@@ -90,7 +98,7 @@ because a space-separated optional value could not be told apart from the
 input filename.
 
 ```console
-$ fluree rdf count corpus.ttl --profile
+$ fluree count corpus.ttl --profile
   ┌──────────┬──────────────┬──────────────┐
   │ phase    │           ms │       % wall │
   ├──────────┼──────────────┼──────────────┤
@@ -157,7 +165,7 @@ sampling error; nothing here bounds a deliberate one.
 `schema` set to `fluree.rdf.profile.v1`:
 
 ```bash
-fluree rdf count dump.ttl --profile=json --no-hash 2> run.json
+fluree count dump.ttl --profile=json --no-hash 2> run.json
 ```
 
 | Field | Meaning |
