@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{parse, tokenize, TokenKind};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 
 // ============================================================================
 // Configuration
@@ -890,7 +890,9 @@ impl GraphSink for PreludeSink {
         TermId::new(0)
     }
 
-    fn emit_triple(&mut self, _subject: TermId, _predicate: TermId, _object: TermId) {}
+    fn emit_triple(&mut self, _subject: TermId, _predicate: TermId, _object: TermId) -> SinkResult {
+        Ok(())
+    }
 
     fn emit_list_item(
         &mut self,
@@ -898,7 +900,8 @@ impl GraphSink for PreludeSink {
         _predicate: TermId,
         _object: TermId,
         _index: i32,
-    ) {
+    ) -> SinkResult {
+        Ok(())
     }
 }
 

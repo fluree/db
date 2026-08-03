@@ -13,6 +13,7 @@ use rustc_hash::FxHashMap;
 
 use crate::error::{Result, TurtleError};
 use crate::lex::{StreamingLexer, Token, TokenKind};
+use crate::options::{CollectionStyle, NumericStyle, ParserOptions};
 
 /// RDF well-known IRIs (imported from vocab crate)
 const RDF_TYPE: &str = rdf::TYPE;
@@ -65,11 +66,37 @@ pub struct Parser<'a, 'input, S> {
     /// [`crate::error::MAX_NESTING_DEPTH`] so adversarial nesting errors
     /// instead of overflowing the stack.
     nesting_depth: u32,
+    /// Conformance knobs; [`ParserOptions::default`] is the ingest shape.
+    options: ParserOptions,
+    /// Emissions so far. Compared against its value at the statement's start
+    /// to decide whether a failed statement needs
+    /// [`GraphSink::abort_statement`] — a statement that failed before
+    /// emitting has nothing to roll back.
+    emit_count: u64,
+    /// Whether the statement currently being parsed already committed itself
+    /// via [`Self::end_statement_at_dot`].
+    ///
+    /// Lives on `self` rather than riding a return value because the case it
+    /// exists for is the ERROR path: a statement commits at its `.`, then the
+    /// one-token lookahead hits a lexical error in the next statement, so the
+    /// commit has happened but `parse_statement` still returns `Err`. Without
+    /// this the error arm would also fire `abort_statement`, breaking the
+    /// published "exactly one of end/abort per statement" contract.
+    committed_current: bool,
 }
 
 impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
-    /// Create a new parser.
+    /// Create a new parser with the default (ingest) options.
     pub fn new(input: &'input str, sink: &'a mut S) -> Result<Self> {
+        Self::with_options(input, sink, ParserOptions::default())
+    }
+
+    /// Create a new parser with explicit conformance options.
+    pub fn with_options(
+        input: &'input str,
+        sink: &'a mut S,
+        options: ParserOptions,
+    ) -> Result<Self> {
         crate::error::check_input_len(input.len())?;
         let mut lexer = StreamingLexer::new(input);
         let current_token = lexer.next_token()?;
@@ -103,6 +130,9 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             base: None,
             annotation_depth: 0,
             nesting_depth: 0,
+            options,
+            emit_count: 0,
+            committed_current: false,
         })
     }
 
@@ -143,8 +173,39 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         let mut statement_count: u64 = 0;
         while !self.is_at_end() {
-            self.parse_statement()?;
-            statement_count += 1;
+            let emitted_before = self.emit_count;
+            self.committed_current = false;
+            match self.parse_statement() {
+                Ok(()) => {
+                    // Statements ending in `.` commit at the terminator; the
+                    // SPARQL-style `PREFIX`/`BASE` forms have none, so they
+                    // commit here.
+                    if !self.committed_current {
+                        self.sink.end_statement();
+                    }
+                    statement_count += 1;
+                }
+                Err(e) => {
+                    // The parser emits during descent, so a statement can
+                    // fail having already pushed triples. Tell the sink to
+                    // drop them, so "a rejected statement contributes
+                    // nothing" holds at the sink and not just in the error
+                    // return.
+                    //
+                    // Two guards, and both are load-bearing. Nothing emitted
+                    // means nothing to roll back. And a statement that
+                    // already committed is NOT rolled back at all: it reaches
+                    // here only because the one-token lookahead failed while
+                    // reading the NEXT statement, and it is complete and
+                    // valid. Firing abort there would also break the "exactly
+                    // one of end/abort per statement" contract this trait
+                    // publishes.
+                    if !self.committed_current && self.emit_count > emitted_before {
+                        self.sink.abort_statement();
+                    }
+                    return Err(e);
+                }
+            }
         }
         span.record("statement_count", statement_count);
         span.record("iri_cache_hits", self.iri_cache_hits);
@@ -247,9 +308,18 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         self.sink.term_literal_value(value, datatype)
     }
 
+    /// Emit a triple, mapping a sink refusal into a parse-level error so the
+    /// caller stops immediately (broken-pipe / early-termination semantics).
     #[inline]
-    fn sink_emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) {
-        self.sink.emit_triple(subject, predicate, object);
+    fn sink_emit_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<()> {
+        self.sink.emit_triple(subject, predicate, object)?;
+        self.emit_count += 1;
+        Ok(())
     }
 
     #[inline]
@@ -259,8 +329,25 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         predicate: TermId,
         object: TermId,
         index: i32,
-    ) {
-        self.sink.emit_list_item(subject, predicate, object, index);
+    ) -> Result<()> {
+        self.sink
+            .emit_list_item(subject, predicate, object, index)?;
+        self.emit_count += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn sink_emit_reified_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        reifier: TermId,
+    ) -> Result<()> {
+        self.sink
+            .emit_reified_triple(subject, predicate, object, reifier)?;
+        self.emit_count += 1;
+        Ok(())
     }
 
     // =========================================================================
@@ -395,7 +482,31 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     // Parsing
     // =========================================================================
 
+    /// Consume the `.` terminating a statement, committing the statement to
+    /// the sink BEFORE advancing.
+    ///
+    /// The commit has to happen before the advance because the parser keeps
+    /// one token of lookahead: advancing past the `.` lexes the first token
+    /// of the NEXT statement, and a lexical error there would otherwise be
+    /// reported while this statement is still in flight — rolling back a
+    /// statement that was in fact complete and valid.
+    fn end_statement_at_dot(&mut self) -> Result<()> {
+        if !self.check(&TokenKind::Dot) {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                format!("expected Dot, found {:?}", self.current().kind),
+            ));
+        }
+        self.sink.end_statement();
+        self.committed_current = true;
+        self.advance()
+    }
+
     /// Parse a single statement (directive or triples).
+    ///
+    /// Whether the statement committed itself is reported through
+    /// [`Self::committed_current`], not the return value, because the caller
+    /// needs that answer on the error path too.
     fn parse_statement(&mut self) -> Result<()> {
         match self.current().kind {
             TokenKind::KwPrefix | TokenKind::KwSparqlPrefix => self.parse_prefix_directive(),
@@ -450,7 +561,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         // Consume trailing dot (required for @prefix, not for PREFIX)
         if !is_sparql_style {
-            self.expect(&TokenKind::Dot)?;
+            return self.end_statement_at_dot();
         }
 
         Ok(())
@@ -484,7 +595,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         // Consume trailing dot (required for @base, not for BASE)
         if !is_sparql_style {
-            self.expect(&TokenKind::Dot)?;
+            return self.end_statement_at_dot();
         }
 
         Ok(())
@@ -500,8 +611,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         if !(bnode_list_subject && matches!(self.current().kind, TokenKind::Dot)) {
             self.parse_predicate_object_list(subject)?;
         }
-        self.expect(&TokenKind::Dot)?;
-        Ok(())
+        self.end_statement_at_dot()
     }
 
     /// Parse a subject term.
@@ -605,25 +715,31 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
     /// Parse an object list (comma-separated objects).
     ///
-    /// Collections in object position are emitted as indexed list items via
-    /// `emit_list_item()` instead of rdf:first/rdf:rest linked lists.
+    /// Under [`CollectionStyle::IndexedItems`] (the default), collections in
+    /// object position are emitted as indexed list items via
+    /// `emit_list_item()` instead of rdf:first/rdf:rest linked lists, and an
+    /// object-position `()` emits nothing. Under [`CollectionStyle::Spine`]
+    /// both fall through to the ordinary object path, which already builds a
+    /// spine for `( … )` and resolves `()` to `rdf:nil` — so the two
+    /// positions share one code path and one grammar.
     ///
     /// Each object may carry an RDF 1.2 annotation tail (`~ reifier` and/or
     /// `{| … |}` blocks) — see [`Self::parse_annotation_tail`].
     fn parse_object_list(&mut self, subject: TermId, predicate: TermId) -> Result<()> {
+        let indexed_lists = self.options.collections == CollectionStyle::IndexedItems;
         loop {
             match self.current().kind {
-                TokenKind::LParen => {
+                TokenKind::LParen if indexed_lists => {
                     self.parse_collection_as_list(subject, predicate)?;
                     self.reject_annotation_on_collection()?;
                 }
-                TokenKind::Nil => {
+                TokenKind::Nil if indexed_lists => {
                     self.advance()?;
                     self.reject_annotation_on_collection()?;
                 }
                 _ => {
                     let object = self.parse_object()?;
-                    self.sink_emit_triple(subject, predicate, object);
+                    self.sink_emit_triple(subject, predicate, object)?;
                     if matches!(
                         self.current().kind,
                         TokenKind::Tilde | TokenKind::AnnotationOpen
@@ -649,7 +765,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             let mut index: i32 = 0;
             while !matches!(p.current().kind, TokenKind::RParen) {
                 let item = p.parse_object()?;
-                p.sink_emit_list_item(subject, predicate, item, index);
+                p.sink_emit_list_item(subject, predicate, item, index)?;
                 index += 1;
             }
             p.expect(&TokenKind::RParen)?;
@@ -728,10 +844,27 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.advance()?;
                 self.parse_string_suffix_escaped(&value)
             }
-            TokenKind::Integer(n) => {
-                self.advance()?;
-                Ok(self.sink_term_literal_value(LiteralValue::Integer(n), Datatype::xsd_integer()))
-            }
+            // Branch on the option BEFORE touching the span: the default arm
+            // must stay exactly the work it did before options existed, since
+            // this is the ingest hot path.
+            TokenKind::Integer(n) => match self.options.numerics {
+                NumericStyle::Canonicalize => {
+                    self.advance()?;
+                    Ok(self
+                        .sink_term_literal_value(LiteralValue::Integer(n), Datatype::xsd_integer()))
+                }
+                // PreserveLexical routes through the typed-string lane, the
+                // same one `IntegerOverflow` and `Decimal` already use, so
+                // `+1` / `01` / `1` stay distinguishable instead of all
+                // collapsing to `Integer(1)`.
+                NumericStyle::PreserveLexical => {
+                    let s = self.current().start;
+                    let e = self.current().end;
+                    let text = self.decimal_content(s, e);
+                    self.advance()?;
+                    Ok(self.sink_term_literal(text, Datatype::xsd_integer(), None))
+                }
+            },
             TokenKind::IntegerOverflow => {
                 // Beyond i64: keep the lexical so downstream promotes to BigInt.
                 let s = self.current().start;
@@ -747,10 +880,22 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.advance()?;
                 Ok(self.sink_term_literal(text, Datatype::xsd_decimal(), None))
             }
-            TokenKind::Double(n) => {
-                self.advance()?;
-                Ok(self.sink_term_literal_value(LiteralValue::Double(n), Datatype::xsd_double()))
-            }
+            TokenKind::Double(n) => match self.options.numerics {
+                NumericStyle::Canonicalize => {
+                    self.advance()?;
+                    Ok(self
+                        .sink_term_literal_value(LiteralValue::Double(n), Datatype::xsd_double()))
+                }
+                // `1e0`, `1.0e0`, and `1.0E0` are three spellings of one
+                // value; canonicalizing keeps only the value.
+                NumericStyle::PreserveLexical => {
+                    let s = self.current().start;
+                    let e = self.current().end;
+                    let text = self.decimal_content(s, e);
+                    self.advance()?;
+                    Ok(self.sink_term_literal(text, Datatype::xsd_double(), None))
+                }
+            },
             TokenKind::KwTrue => {
                 self.advance()?;
                 Ok(self
@@ -903,14 +1048,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
             loop {
                 let item = p.parse_object()?;
-                p.sink_emit_triple(current_node, rdf_first, item);
+                p.sink_emit_triple(current_node, rdf_first, item)?;
 
                 if matches!(p.current().kind, TokenKind::RParen) {
-                    p.sink_emit_triple(current_node, rdf_rest, rdf_nil);
+                    p.sink_emit_triple(current_node, rdf_rest, rdf_nil)?;
                     break;
                 }
                 let next_node = p.sink_term_blank(None);
-                p.sink_emit_triple(current_node, rdf_rest, next_node);
+                p.sink_emit_triple(current_node, rdf_rest, next_node)?;
                 current_node = next_node;
             }
 
@@ -1025,9 +1170,8 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             // base triple, then the reifier attachment (documented divergence
             // from RDF 1.2's non-asserting `<< >>`; see the roadmap's construct
             // inventory).
-            p.sink_emit_triple(subject, predicate, object);
-            p.sink
-                .emit_reified_triple(subject, predicate, object, reifier);
+            p.sink_emit_triple(subject, predicate, object)?;
+            p.sink_emit_reified_triple(subject, predicate, object, reifier)?;
 
             Ok(reifier)
         })
@@ -1149,6 +1293,26 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         predicate: TermId,
         object: TermId,
     ) -> Result<()> {
+        // TERM-LIFETIME HAZARD, named here because this is the one place it
+        // can bite. `object` may be a LITERAL id, and it stays live across the
+        // annotation body — which mints further terms, including literals of
+        // its own — before being handed to `emit_reified_triple` below.
+        //
+        // Everywhere else the parser emits a literal immediately after minting
+        // it, so at most one literal id is live at a time and a sink may
+        // recycle literal slots per statement (see `GraphSink::end_statement`)
+        // without any live id being clobbered. Here that is not true: the
+        // invariant this code relies on is that a sink does NOT reuse a
+        // literal slot until `end_statement`, and the whole annotation tail is
+        // inside one statement.
+        //
+        // Unreachable today — star constructs require
+        // `supports_reified_triples()`, and the only recycling sink
+        // (`GraphCollectorSink`) returns false, so no sink both recycles and
+        // accepts these events. It becomes live the moment a writer sink
+        // supports both. A sink that does must either keep literal ids valid
+        // for the whole statement (what `end_statement` already promises) or
+        // this function must materialize `object` before parsing the body.
         let mut pending: Option<TermId> = None;
         loop {
             match self.current().kind {
@@ -1156,8 +1320,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                     self.check_star_allowed("reifier ('~')")?;
                     self.advance()?;
                     let reifier = self.parse_reifier_term()?;
-                    self.sink
-                        .emit_reified_triple(subject, predicate, object, reifier);
+                    self.sink_emit_reified_triple(subject, predicate, object, reifier)?;
                     pending = Some(reifier);
                 }
                 TokenKind::AnnotationOpen => {
@@ -1167,7 +1330,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                         Some(r) => r,
                         None => {
                             let r = self.sink_term_blank(None);
-                            self.sink.emit_reified_triple(subject, predicate, object, r);
+                            self.sink_emit_reified_triple(subject, predicate, object, r)?;
                             r
                         }
                     };
@@ -1234,9 +1397,24 @@ fn unescape_pn_local(local: &str) -> String {
     result
 }
 
-/// Parse a Turtle document into GraphSink events.
+/// Parse a Turtle document into GraphSink events, with the ingest-shaped
+/// [`ParserOptions::default`].
 pub fn parse<S: GraphSink>(input: &str, sink: &mut S) -> Result<()> {
     Parser::new(input, sink)?.parse()
+}
+
+/// Parse a Turtle document into GraphSink events under explicit
+/// [`ParserOptions`].
+///
+/// [`parse`] is this with [`ParserOptions::default`]; use
+/// [`ParserOptions::conformant`] for the faithful-RDF shape (spine
+/// collections, preserved numeric lexical forms).
+pub fn parse_with_options<S: GraphSink>(
+    input: &str,
+    sink: &mut S,
+    options: ParserOptions,
+) -> Result<()> {
+    Parser::with_options(input, sink, options)?.parse()
 }
 
 /// Parse Turtle input with a pre-seeded prefix map and optional base IRI.
@@ -1257,7 +1435,22 @@ pub fn parse_with_prefixes_base<S: GraphSink>(
     prefixes: &[(String, String)],
     base: Option<&str>,
 ) -> Result<()> {
-    let mut parser = Parser::new(input, sink)?;
+    parse_with_prefixes_base_options(input, sink, prefixes, base, ParserOptions::default())
+}
+
+/// [`parse_with_prefixes_base`] under explicit [`ParserOptions`].
+///
+/// This is the full entry point — every other `parse*` function is this one
+/// with something defaulted — so the chunked reader paths, which need the
+/// pre-seeded prelude, can opt into conformance options too.
+pub fn parse_with_prefixes_base_options<S: GraphSink>(
+    input: &str,
+    sink: &mut S,
+    prefixes: &[(String, String)],
+    base: Option<&str>,
+    options: ParserOptions,
+) -> Result<()> {
+    let mut parser = Parser::with_options(input, sink, options)?;
     if let Some(base) = base {
         parser.base = Some(base.to_string());
     }
@@ -1278,7 +1471,7 @@ mod tests {
     fn parse_to_graph(input: &str) -> Result<Graph> {
         let mut sink = GraphCollectorSink::new();
         parse(input, &mut sink)?;
-        Ok(sink.finish())
+        Ok(sink.into_graph())
     }
 
     #[test]
@@ -1693,7 +1886,7 @@ mod tests {
         ";
         let mut sink = GraphCollectorSink::new();
         parse(turtle, &mut sink).expect("bare [ ... ] . statement must parse");
-        assert_eq!(sink.finish().len(), 2);
+        assert_eq!(sink.into_graph().len(), 2);
     }
 
     // =========================================================================
@@ -1765,9 +1958,15 @@ mod tests {
         fn term_literal_value(&mut self, value: LiteralValue, _datatype: Datatype) -> TermId {
             self.add(RecTerm::Literal(value.lexical()))
         }
-        fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) {
+        fn emit_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+        ) -> fluree_graph_ir::SinkResult {
             let t = (self.t(subject), self.t(predicate), self.t(object));
             self.triples.push(t);
+            Ok(())
         }
         fn supports_reified_triples(&self) -> bool {
             true
@@ -1778,7 +1977,7 @@ mod tests {
             predicate: TermId,
             object: TermId,
             reifier: TermId,
-        ) {
+        ) -> fluree_graph_ir::SinkResult {
             let r = (
                 self.t(subject),
                 self.t(predicate),
@@ -1786,6 +1985,7 @@ mod tests {
                 self.t(reifier),
             );
             self.reified.push(r);
+            Ok(())
         }
     }
 
@@ -2086,6 +2286,757 @@ mod tests {
     #[test]
     fn deeply_nested_property_lists_do_not_overflow_the_stack() {
         assert_depth_err(parse_to_graph(&nested_property_lists(100_000)).expect_err("deep"));
+    }
+
+    /// End-to-end guard for the statement-scoped literal recycling that
+    /// `end_statement` enables in `GraphCollectorSink`: a later statement
+    /// reuses an earlier statement's literal slot, so if any triple held a
+    /// slot reference instead of a clone, the earlier values would be
+    /// overwritten here.
+    #[test]
+    fn recycled_literal_slots_do_not_corrupt_earlier_statements() {
+        let input = r#"
+            @prefix ex: <http://example.org/> .
+            ex:a ex:p "one" .
+            ex:b ex:p "two" .
+            ex:c ex:p "three", "four" .
+        "#;
+        let graph = parse_to_graph(input).unwrap();
+        assert_eq!(graph.len(), 4);
+
+        let mut pairs: Vec<(String, String)> = graph
+            .iter()
+            .map(|t| {
+                let subject = t.s.as_iri().expect("IRI subject").to_string();
+                let object = match &t.o {
+                    Term::Literal { value, .. } => value.lexical(),
+                    other => panic!("expected literal, got {other:?}"),
+                };
+                (subject, object)
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("http://example.org/a".to_string(), "one".to_string()),
+                ("http://example.org/b".to_string(), "two".to_string()),
+                ("http://example.org/c".to_string(), "four".to_string()),
+                ("http://example.org/c".to_string(), "three".to_string()),
+            ]
+        );
+    }
+
+    // =========================================================================
+    // Blank-node namespace disjointness
+    // =========================================================================
+
+    /// Count the DISTINCT blank-node identities in a graph.
+    fn distinct_blanks(graph: &Graph) -> Vec<String> {
+        let mut labels: Vec<String> = graph
+            .iter()
+            .flat_map(|t| [&t.s, &t.o])
+            .filter_map(|t| match t {
+                Term::BlankNode(b) => Some(b.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        labels.sort();
+        labels.dedup();
+        labels
+    }
+
+    /// User-written labels and parser-minted anonymous nodes must never
+    /// collide. An isomorphism check structurally CANNOT catch this: merged
+    /// nodes are isomorphic to themselves, so the merged graph looks
+    /// well-formed. Only counting distinct identities finds it.
+    ///
+    /// Both mint sites are covered, because they fail independently:
+    /// Spine-mode collections (systematic — every collection mints spine
+    /// nodes) and `[ … ]` property lists (which mint in EVERY mode, so a
+    /// spine-only test would pass while the bracket path stayed broken).
+    #[test]
+    fn minted_blanks_never_collide_with_user_written_labels() {
+        // Site 1: Spine collection. `( ex:a ex:b )` mints two spine nodes,
+        // which a `b{N}` counter would name `b1`/`b2` — exactly the labels
+        // this document already uses. Four distinct RDF nodes must stay four.
+        let spine_doc = r#"
+            @prefix ex: <http://example.org/> .
+            _:b1 ex:p "user-one" .
+            _:b2 ex:p "user-two" .
+            ex:s ex:list ( ex:a ex:b ) .
+        "#;
+        let mut sink = GraphCollectorSink::new();
+        parse_with_options(spine_doc, &mut sink, ParserOptions::conformant()).expect("spine parse");
+        let graph = sink.into_graph();
+        let blanks = distinct_blanks(&graph);
+        assert_eq!(
+            blanks.len(),
+            4,
+            "2 user labels + 2 spine nodes = 4 distinct nodes, got {blanks:?}"
+        );
+
+        // Site 2: blank-node property list, in the DEFAULT mode — `[ … ]`
+        // mints regardless of collection style, so this path is not covered
+        // by the spine case above. Two distinct nodes must stay two.
+        let bracket_doc = r#"
+            @prefix ex: <http://example.org/> .
+            _:b1 ex:p "user-one" .
+            ex:t ex:has [ ex:q "anon" ] .
+        "#;
+        let mut sink = GraphCollectorSink::new();
+        parse_with_options(bracket_doc, &mut sink, ParserOptions::default())
+            .expect("default parse");
+        let graph = sink.into_graph();
+        let blanks = distinct_blanks(&graph);
+        assert_eq!(
+            blanks.len(),
+            2,
+            "1 user label + 1 bracket node = 2 distinct nodes, got {blanks:?}"
+        );
+
+        // And in both modes: each user label owns exactly its own triple, and
+        // no minted label can lex as a user label — which is what makes the
+        // disjointness structural rather than lucky.
+        let doc = r#"
+            @prefix ex: <http://example.org/> .
+            _:b1 ex:p "user-one" .
+            _:b2 ex:p "user-two" .
+            ex:s ex:list ( ex:a ex:b ) .
+            ex:t ex:has [ ex:q "anon" ] .
+        "#;
+        for (mode, options) in [
+            ("spine", ParserOptions::conformant()),
+            ("default", ParserOptions::default()),
+        ] {
+            let mut sink = GraphCollectorSink::new();
+            parse_with_options(doc, &mut sink, options).expect("parses");
+            let graph = sink.into_graph();
+
+            for (label, object) in [("b1", "user-one"), ("b2", "user-two")] {
+                let owned: Vec<String> = graph
+                    .iter()
+                    .filter(|t| matches!(&t.s, Term::BlankNode(b) if b.as_str() == label))
+                    .map(|t| format!("{} {} {}", t.s, t.p, t.o))
+                    .collect();
+                assert_eq!(
+                    owned.len(),
+                    1,
+                    "[{mode}] _:{label} must own only its own triple; extra triples mean a \
+                     minted node merged into it: {owned:#?}"
+                );
+                assert!(owned[0].contains(object), "[{mode}] {owned:?}");
+            }
+
+            for label in distinct_blanks(&graph) {
+                if label == "b1" || label == "b2" {
+                    continue;
+                }
+                assert!(
+                    label.starts_with('-'),
+                    "[{mode}] minted label {label} can lex as BLANK_NODE_LABEL and so can collide"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // ParserOptions — collection + numeric conformance
+    // =========================================================================
+    //
+    // Two shapes out of one grammar: the DEFAULT is Fluree's ingest shape and
+    // is pinned bit-for-bit by the pre-existing tests above (`test_collection`,
+    // `test_empty_collection`, `test_integer_literal`) plus the explicit
+    // default-mode tests here; `ParserOptions::conformant()` is the RDF the
+    // document actually denotes, which is what the W3C Turtle suite tests.
+
+    const EX: &str = "http://example.org/";
+
+    fn parse_conformant(input: &str) -> Graph {
+        let mut sink = GraphCollectorSink::new();
+        parse_with_options(input, &mut sink, ParserOptions::conformant())
+            .expect("conformant parse");
+        sink.into_graph()
+    }
+
+    fn parse_spine(input: &str) -> Graph {
+        let mut sink = GraphCollectorSink::new();
+        parse_with_options(
+            input,
+            &mut sink,
+            ParserOptions::new().with_collections(CollectionStyle::Spine),
+        )
+        .expect("spine parse");
+        sink.into_graph()
+    }
+
+    /// Every triple as `(subject, predicate, object)` in `Term`'s N-Triples-ish
+    /// display form.
+    fn rendered(graph: &Graph) -> Vec<(String, String, String)> {
+        graph
+            .iter()
+            .map(|t| (t.s.to_string(), t.p.to_string(), t.o.to_string()))
+            .collect()
+    }
+
+    /// Follow an `rdf:first`/`rdf:rest` spine from `head`, returning each
+    /// item's rendered form. Panics if the chain is not well-formed, which is
+    /// the point: a partial spine must not read as a short list.
+    fn walk_spine(graph: &Graph, head: &Term) -> Vec<String> {
+        let mut items = Vec::new();
+        let mut node = head.clone();
+        loop {
+            if matches!(&node, Term::Iri(iri) if iri.as_ref() == RDF_NIL) {
+                return items;
+            }
+            let first = graph
+                .iter()
+                .find(|t| t.s == node && matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_FIRST))
+                .unwrap_or_else(|| panic!("no rdf:first for {node}"));
+            items.push(first.o.to_string());
+            let rest = graph
+                .iter()
+                .find(|t| t.s == node && matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_REST))
+                .unwrap_or_else(|| panic!("no rdf:rest for {node}"));
+            node = rest.o.clone();
+        }
+    }
+
+    /// The object of the single `ex:s ex:p ?o` triple.
+    fn object_of_p(graph: &Graph) -> Term {
+        let matches: Vec<_> = graph
+            .iter()
+            .filter(|t| matches!(&t.p, Term::Iri(p) if p.as_ref() == format!("{EX}p")))
+            .collect();
+        assert_eq!(matches.len(), 1, "expected exactly one ex:p triple");
+        matches[0].o.clone()
+    }
+
+    // -- Spine mode ---------------------------------------------------------
+
+    /// W3C `turtle-syntax-*` shape: a one-item object collection denotes
+    /// three triples. The default mode emits one `emit_list_item` event for
+    /// the same input.
+    #[test]
+    fn spine_object_collection_of_one_emits_three_triples() {
+        let graph = parse_spine(&format!("@prefix ex: <{EX}> .\nex:s ex:p ( ex:o ) ."));
+        assert_eq!(graph.len(), 3, "{:#?}", rendered(&graph));
+
+        let head = object_of_p(&graph);
+        assert!(head.is_blank(), "collection head must be a blank node");
+        assert_eq!(walk_spine(&graph, &head), vec![format!("<{EX}o>")]);
+        assert!(
+            graph.iter().all(|t| !t.is_list_element()),
+            "spine mode must not emit indexed list items"
+        );
+    }
+
+    #[test]
+    fn spine_object_collection_of_two_chains_through_a_second_node() {
+        let graph = parse_spine(&format!("@prefix ex: <{EX}> .\nex:s ex:p ( ex:a ex:b ) ."));
+        // 2 items x (first + rest) + the ex:p edge.
+        assert_eq!(graph.len(), 5, "{:#?}", rendered(&graph));
+
+        let head = object_of_p(&graph);
+        assert_eq!(
+            walk_spine(&graph, &head),
+            vec![format!("<{EX}a>"), format!("<{EX}b>")]
+        );
+    }
+
+    /// The silent-triple-loss bug: `()` in object position emitted NOTHING.
+    /// In spine mode it denotes `rdf:nil`, as RDF says.
+    #[test]
+    fn spine_empty_object_collection_is_rdf_nil() {
+        let graph = parse_spine(&format!("@prefix ex: <{EX}> .\nex:s ex:p () ."));
+        assert_eq!(
+            rendered(&graph),
+            vec![(
+                format!("<{EX}s>"),
+                format!("<{EX}p>"),
+                format!("<{RDF_NIL}>")
+            )]
+        );
+    }
+
+    /// Subject position already emitted a spine before this change; the point
+    /// of `Spine` is that both positions now share the one code path.
+    #[test]
+    fn spine_subject_and_object_collections_agree() {
+        let subject_side = parse_spine(&format!("@prefix ex: <{EX}> .\n( ex:a ) ex:p ex:o ."));
+        let object_side = parse_spine(&format!("@prefix ex: <{EX}> .\nex:s ex:p ( ex:a ) ."));
+        // Same shape either way: 1 first + 1 rest + 1 edge.
+        assert_eq!(subject_side.len(), 3);
+        assert_eq!(object_side.len(), 3);
+
+        let spine_of = |g: &Graph| {
+            let head = g
+                .iter()
+                .find(|t| matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_FIRST))
+                .map(|t| t.s.clone())
+                .expect("a spine node");
+            walk_spine(g, &head)
+        };
+        assert_eq!(spine_of(&subject_side), vec![format!("<{EX}a>")]);
+        assert_eq!(spine_of(&object_side), vec![format!("<{EX}a>")]);
+    }
+
+    #[test]
+    fn spine_nested_collections_nest_their_spines() {
+        let graph = parse_spine(&format!(
+            "@prefix ex: <{EX}> .\nex:s ex:p ( ( ex:a ) ex:b ) ."
+        ));
+        // outer: 2 nodes x 2 + inner: 1 node x 2 + the ex:p edge.
+        assert_eq!(graph.len(), 7, "{:#?}", rendered(&graph));
+
+        let outer = object_of_p(&graph);
+        let outer_items = walk_spine(&graph, &outer);
+        assert_eq!(outer_items.len(), 2);
+        assert_eq!(outer_items[1], format!("<{EX}b>"));
+
+        let inner_head = graph
+            .iter()
+            .find(|t| {
+                matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_FIRST)
+                    && t.s == outer
+                    && t.o.is_blank()
+            })
+            .map(|t| t.o.clone())
+            .expect("inner collection head");
+        assert_eq!(walk_spine(&graph, &inner_head), vec![format!("<{EX}a>")]);
+    }
+
+    /// An empty collection nested inside a collection is `rdf:nil` as an item.
+    #[test]
+    fn spine_nested_empty_collection_is_a_nil_item() {
+        let graph = parse_spine(&format!("@prefix ex: <{EX}> .\nex:s ex:p ( () ) ."));
+        assert_eq!(graph.len(), 3, "{:#?}", rendered(&graph));
+        let head = object_of_p(&graph);
+        assert_eq!(walk_spine(&graph, &head), vec![format!("<{RDF_NIL}>")]);
+    }
+
+    /// In `IndexedItems` a collection object has no single term to reify, so
+    /// annotations on it are refused. In `Spine` it has one — the head — so
+    /// the refusal does not apply.
+    #[test]
+    fn spine_mode_admits_annotations_on_collections() {
+        let mut sink = StarSink::default();
+        parse_with_options(
+            &format!("{P}:s :p ( :a ) {{| :q :z |}} ."),
+            &mut sink,
+            ParserOptions::new().with_collections(CollectionStyle::Spine),
+        )
+        .expect("a spine collection has a head term to reify");
+        assert_eq!(sink.reified.len(), 1);
+
+        // Same input, default mode: still refused.
+        let mut sink = StarSink::default();
+        let err = parse(&format!("{P}:s :p ( :a ) {{| :q :z |}} ."), &mut sink)
+            .expect_err("indexed items leave nothing to reify");
+        assert!(err.to_string().contains("collection objects"), "{err}");
+    }
+
+    // -- Default (IndexedItems) mode ----------------------------------------
+
+    /// The default shape, pinned explicitly: one indexed event per item, no
+    /// spine triples at all.
+    #[test]
+    fn default_object_collection_stays_indexed_with_no_spine() {
+        let graph =
+            parse_to_graph(&format!("@prefix ex: <{EX}> .\nex:s ex:p ( ex:a ex:b ) .")).unwrap();
+        assert_eq!(graph.len(), 2);
+        assert!(graph.iter().all(fluree_graph_ir::Triple::is_list_element));
+        assert!(
+            !graph
+                .iter()
+                .any(|t| matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_FIRST
+                    || p.as_ref() == RDF_REST)),
+            "default mode must not emit a spine"
+        );
+    }
+
+    /// Documented (lossy) default: an object-position `()` emits nothing.
+    /// Changing this is exactly what `Spine` is for.
+    #[test]
+    fn default_empty_object_collection_still_emits_nothing() {
+        let graph = parse_to_graph(&format!("@prefix ex: <{EX}> .\nex:s ex:p () .")).unwrap();
+        assert_eq!(graph.len(), 0);
+    }
+
+    /// Subject-position collections emitted a spine before this change and
+    /// still do in the default mode — the change is scoped to object position.
+    #[test]
+    fn default_subject_collection_still_emits_a_spine() {
+        let graph = parse_to_graph(&format!("@prefix ex: <{EX}> .\n( ex:a ) ex:p ex:o .")).unwrap();
+        assert_eq!(graph.len(), 3);
+        assert!(graph
+            .iter()
+            .any(|t| matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_FIRST)));
+    }
+
+    // -- Numerics -----------------------------------------------------------
+
+    /// `+1`, `01`, `1e0`, `1.0e0` are distinct lexical forms of two values.
+    /// Canonicalizing makes them unrepresentable; several W3C files depend on
+    /// them surviving.
+    #[test]
+    fn preserve_lexical_keeps_the_source_spelling_of_numerics() {
+        let cases = [
+            ("+1", "http://www.w3.org/2001/XMLSchema#integer"),
+            ("01", "http://www.w3.org/2001/XMLSchema#integer"),
+            ("-0", "http://www.w3.org/2001/XMLSchema#integer"),
+            ("1e0", "http://www.w3.org/2001/XMLSchema#double"),
+            ("1.0e0", "http://www.w3.org/2001/XMLSchema#double"),
+            ("1.0E0", "http://www.w3.org/2001/XMLSchema#double"),
+            ("+1.0e-1", "http://www.w3.org/2001/XMLSchema#double"),
+        ];
+        for (lexical, datatype) in cases {
+            let graph = parse_conformant(&format!("@prefix ex: <{EX}> .\nex:s ex:p {lexical} ."));
+            assert_eq!(graph.len(), 1, "{lexical}");
+            let triple = graph.iter().next().unwrap();
+            match &triple.o {
+                Term::Literal {
+                    value, datatype: d, ..
+                } => {
+                    assert_eq!(value.lexical(), lexical, "lexical form of {lexical}");
+                    assert_eq!(d.as_iri(), datatype, "datatype of {lexical}");
+                }
+                other => panic!("expected literal for {lexical}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The default: the value survives, the spelling does not.
+    #[test]
+    fn canonicalize_is_the_default_and_discards_the_spelling() {
+        let graph =
+            parse_to_graph(&format!("@prefix ex: <{EX}> .\nex:s ex:p +1 ; ex:q 1e0 .")).unwrap();
+        let mut objects: Vec<_> = graph.iter().map(|t| t.o.clone()).collect();
+        objects.sort();
+        assert!(
+            objects.iter().any(|o| matches!(
+                o,
+                Term::Literal {
+                    value: LiteralValue::Integer(1),
+                    ..
+                }
+            )),
+            "+1 must canonicalize to Integer(1): {objects:?}"
+        );
+        assert!(
+            objects.iter().any(|o| matches!(
+                o,
+                Term::Literal { value: LiteralValue::Double(d), .. } if *d == 1.0
+            )),
+            "1e0 must canonicalize to Double(1.0): {objects:?}"
+        );
+    }
+
+    /// Decimals and i64-overflowing integers already preserved their lexical
+    /// form; `PreserveLexical` extends that lane rather than adding a second
+    /// one, so these must be identical under both modes.
+    #[test]
+    fn decimal_and_bigint_lexicals_are_mode_independent() {
+        let doc =
+            format!("@prefix ex: <{EX}> .\nex:s ex:p 1.50 ; ex:q 123456789012345678901234567890 .");
+        let render = |g: &Graph| {
+            let mut r = rendered(g);
+            r.sort();
+            r
+        };
+        assert_eq!(
+            render(&parse_to_graph(&doc).unwrap()),
+            render(&parse_conformant(&doc))
+        );
+        let graph = parse_conformant(&doc);
+        let lexicals: Vec<String> = graph
+            .iter()
+            .map(|t| match &t.o {
+                Term::Literal { value, .. } => value.lexical(),
+                other => panic!("expected literal, got {other:?}"),
+            })
+            .collect();
+        assert!(lexicals.contains(&"1.50".to_string()), "{lexicals:?}");
+        assert!(
+            lexicals.contains(&"123456789012345678901234567890".to_string()),
+            "{lexicals:?}"
+        );
+    }
+
+    /// Booleans, strings, typed and language-tagged literals are untouched by
+    /// `NumericStyle` — the knob is numerics only.
+    #[test]
+    fn non_numeric_literals_are_identical_under_both_modes() {
+        let doc = format!(
+            r#"@prefix ex: <{EX}> .
+               @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+               ex:s ex:a true ; ex:b "plain" ; ex:c "tagged"@en ;
+                    ex:d "2000-01-01"^^xsd:date ."#
+        );
+        let render = |g: &Graph| {
+            let mut r = rendered(g);
+            r.sort();
+            r
+        };
+        assert_eq!(
+            render(&parse_to_graph(&doc).unwrap()),
+            render(&parse_conformant(&doc))
+        );
+    }
+
+    // -- Default-mode pinning across the whole surface ----------------------
+
+    /// One document exercising every construct the options touch, asserted
+    /// triple-for-triple in the DEFAULT mode. This is the regression guard
+    /// for "existing callers are unchanged": if adding options moved anything
+    /// on the ingest path, it moves here.
+    #[test]
+    fn default_mode_output_is_pinned_triple_for_triple() {
+        let doc = format!(
+            r#"@prefix ex: <{EX}> .
+               ex:s ex:int 30 ; ex:dbl 1.5e3 ; ex:dec 2.25 ; ex:list ( ex:a ex:b ) ;
+                    ex:empty () ; ex:str "v" ."#
+        );
+        let mut got = rendered(&parse_to_graph(&doc).unwrap());
+        got.sort();
+
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        let mut want = vec![
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}int>"),
+                format!("\"30\"^^<{xsd}integer>"),
+            ),
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}dbl>"),
+                format!("\"1.5E3\"^^<{xsd}double>"),
+            ),
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}dec>"),
+                format!("\"2.25\"^^<{xsd}decimal>"),
+            ),
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}list>"),
+                format!("<{EX}a>"),
+            ),
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}list>"),
+                format!("<{EX}b>"),
+            ),
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}str>"),
+                "\"v\"".to_string(),
+            ),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    /// And the same document under `conformant()`, so the two shapes are
+    /// visibly different in exactly the intended places.
+    #[test]
+    fn conformant_mode_differs_only_in_collections_and_numerics() {
+        let doc = format!(
+            r#"@prefix ex: <{EX}> .
+               ex:s ex:int 30 ; ex:dbl 1.5e3 ; ex:list ( ex:a ) ; ex:empty () ;
+                    ex:str "v" ."#
+        );
+        let graph = parse_conformant(&doc);
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        let rows = rendered(&graph);
+
+        // Numerics keep their spelling.
+        assert!(rows.contains(&(
+            format!("<{EX}s>"),
+            format!("<{EX}int>"),
+            format!("\"30\"^^<{xsd}integer>")
+        )));
+        assert!(rows.contains(&(
+            format!("<{EX}s>"),
+            format!("<{EX}dbl>"),
+            format!("\"1.5e3\"^^<{xsd}double>")
+        )));
+        // `()` is rdf:nil rather than nothing.
+        assert!(rows.contains(&(
+            format!("<{EX}s>"),
+            format!("<{EX}empty>"),
+            format!("<{RDF_NIL}>")
+        )));
+        // Non-numeric, non-collection terms are untouched.
+        assert!(rows.contains(&(
+            format!("<{EX}s>"),
+            format!("<{EX}str>"),
+            "\"v\"".to_string()
+        )));
+        // 4 scalar edges + 1 collection edge + 2 spine triples.
+        assert_eq!(graph.len(), 7, "{rows:#?}");
+    }
+
+    /// Options ride through the pre-seeded-prelude entry point too — that is
+    /// the one the chunked/parallel readers use.
+    #[test]
+    fn options_apply_on_the_prefixes_base_entry_point() {
+        let mut sink = GraphCollectorSink::new();
+        parse_with_prefixes_base_options(
+            "ex:s ex:p ( ex:a ) .",
+            &mut sink,
+            &[("ex".to_string(), EX.to_string())],
+            None,
+            ParserOptions::conformant(),
+        )
+        .expect("prelude-seeded conformant parse");
+        assert_eq!(sink.into_graph().len(), 3);
+
+        let mut sink = GraphCollectorSink::new();
+        parse_with_prefixes_base(
+            "ex:s ex:p ( ex:a ) .",
+            &mut sink,
+            &[("ex".to_string(), EX.to_string())],
+            None,
+        )
+        .expect("prelude-seeded default parse");
+        assert_eq!(sink.into_graph().len(), 1, "default entry point unchanged");
+    }
+
+    // =========================================================================
+    // Sink protocol: early termination + statement lifecycle
+    // =========================================================================
+
+    /// A sink that accepts `budget` triples and then fails, standing in for a
+    /// writer whose downstream pipe closed (`fluree rdf convert f.ttl | head`).
+    struct FailingSink {
+        budget: usize,
+        emitted: usize,
+        statements: usize,
+        finished: usize,
+    }
+
+    impl FailingSink {
+        fn new(budget: usize) -> Self {
+            Self {
+                budget,
+                emitted: 0,
+                statements: 0,
+                finished: 0,
+            }
+        }
+    }
+
+    impl GraphSink for FailingSink {
+        fn on_base(&mut self, _base_iri: &str) {}
+        fn on_prefix(&mut self, _prefix: &str, _namespace_iri: &str) {}
+        fn term_iri(&mut self, _iri: &str) -> TermId {
+            TermId::new(0)
+        }
+        fn term_blank(&mut self, _label: Option<&str>) -> TermId {
+            TermId::new(0)
+        }
+        fn term_literal(
+            &mut self,
+            _value: &str,
+            _datatype: Datatype,
+            _language: Option<&str>,
+        ) -> TermId {
+            TermId::new(0)
+        }
+        fn term_literal_value(&mut self, _value: LiteralValue, _datatype: Datatype) -> TermId {
+            TermId::new(0)
+        }
+        fn emit_triple(
+            &mut self,
+            _subject: TermId,
+            _predicate: TermId,
+            _object: TermId,
+        ) -> fluree_graph_ir::SinkResult {
+            if self.emitted >= self.budget {
+                return Err(fluree_graph_ir::SinkError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "downstream closed",
+                )));
+            }
+            self.emitted += 1;
+            Ok(())
+        }
+        fn end_statement(&mut self) {
+            self.statements += 1;
+        }
+        fn finish(&mut self) -> fluree_graph_ir::SinkResult {
+            self.finished += 1;
+            Ok(())
+        }
+    }
+
+    fn many_statements(n: usize) -> String {
+        let mut doc = String::from("@prefix ex: <http://example.org/> .\n");
+        for i in 0..n {
+            doc.push_str(&format!("ex:s{i} ex:p ex:o{i} .\n"));
+        }
+        doc
+    }
+
+    /// The `| head -5` case: once the sink refuses, parsing stops at that
+    /// statement instead of running to EOF against a dead pipe.
+    #[test]
+    fn sink_failure_terminates_the_parse_immediately() {
+        let mut sink = FailingSink::new(5);
+        let err = parse(&many_statements(10_000), &mut sink)
+            .expect_err("a refusing sink must fail the parse");
+
+        assert!(
+            matches!(&err, TurtleError::Sink(e) if e.is_broken_pipe()),
+            "the sink's error must survive, not be flattened into a generic parse error: {err}"
+        );
+        assert_eq!(sink.emitted, 5, "no emission past the budget");
+        // The `@prefix` directive plus five completed triple statements. The
+        // sixth failed mid-flight and so was never terminated — exactly what
+        // statement-scoped buffering needs.
+        assert_eq!(sink.statements, 6);
+    }
+
+    /// `end_statement` fires once per completed statement, and directives
+    /// count as statements (Turtle grammar: `statement ::= directive |
+    /// triples '.'`).
+    #[test]
+    fn end_statement_fires_once_per_completed_statement() {
+        let mut sink = FailingSink::new(usize::MAX);
+        parse(&many_statements(3), &mut sink).unwrap();
+        // 1 `@prefix` directive + 3 triple statements.
+        assert_eq!(sink.statements, 4);
+        assert_eq!(sink.emitted, 3);
+    }
+
+    /// A multi-triple statement is ONE statement: the boundary is the `.`,
+    /// not the triple, so statement-scoped literal ids stay live across the
+    /// whole predicate-object list.
+    #[test]
+    fn predicate_object_list_is_a_single_statement() {
+        let mut sink = FailingSink::new(usize::MAX);
+        parse(
+            r#"@prefix ex: <http://example.org/> .
+               ex:s ex:p "a", "b" ; ex:q "c" .
+            "#,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.emitted, 3);
+        assert_eq!(sink.statements, 2, "one directive + one triple statement");
+    }
+
+    /// The parser never calls the protocol `finish()`: a sink can be fed by
+    /// many `parse()` calls (one per chunk on the bulk-import path), so
+    /// flushing is the owner's call, not the producer's.
+    #[test]
+    fn the_parser_does_not_call_protocol_finish() {
+        let mut sink = FailingSink::new(usize::MAX);
+        parse(&many_statements(3), &mut sink).unwrap();
+        parse(&many_statements(3), &mut sink).unwrap();
+        assert_eq!(sink.finished, 0);
+        assert_eq!(sink.emitted, 6, "both parses fed the same sink");
     }
 
     /// Siblings at the same level do not accumulate depth: only the nesting

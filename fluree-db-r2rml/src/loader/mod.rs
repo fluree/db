@@ -52,7 +52,7 @@ impl R2rmlLoader {
     pub fn from_turtle(content: &str) -> R2rmlResult<Self> {
         let mut sink = GraphCollectorSink::new();
         parse_turtle(content, &mut sink).map_err(|e| R2rmlError::Parse(e.to_string()))?;
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         Ok(Self { graph })
     }
 

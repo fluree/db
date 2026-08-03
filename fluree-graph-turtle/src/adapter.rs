@@ -174,9 +174,9 @@ mod tests {
         let name = sink.term_iri("http://xmlns.com/foaf/0.1/name");
         let alice_name = sink.term_literal("Alice", Datatype::xsd_string(), None);
 
-        sink.emit_triple(alice, name, alice_name);
+        sink.emit_triple(alice, name, alice_name).unwrap();
 
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         let json = graph_to_transaction_json(&graph);
 
         assert!(json.is_array());
@@ -196,9 +196,9 @@ mod tests {
         let name = sink.term_iri("http://xmlns.com/foaf/0.1/name");
         let value = sink.term_literal("Bob", Datatype::xsd_string(), None);
 
-        sink.emit_triple(bnode, name, value);
+        sink.emit_triple(bnode, name, value).unwrap();
 
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         let json = graph_to_transaction_json(&graph);
 
         let arr = json.as_array().unwrap();
@@ -216,9 +216,9 @@ mod tests {
         let knows = sink.term_iri("http://xmlns.com/foaf/0.1/knows");
         let bob = sink.term_iri("http://example.org/bob");
 
-        sink.emit_triple(alice, knows, bob);
+        sink.emit_triple(alice, knows, bob).unwrap();
 
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         let json = graph_to_transaction_json(&graph);
 
         let arr = json.as_array().unwrap();
@@ -235,9 +235,9 @@ mod tests {
         let birthdate = sink.term_iri("http://example.org/birthdate");
         let date = sink.term_literal("2000-01-01", Datatype::xsd_date(), None);
 
-        sink.emit_triple(alice, birthdate, date);
+        sink.emit_triple(alice, birthdate, date).unwrap();
 
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         let json = graph_to_transaction_json(&graph);
 
         let arr = json.as_array().unwrap();
@@ -258,9 +258,9 @@ mod tests {
         let name = sink.term_iri("http://xmlns.com/foaf/0.1/name");
         let alice_name = sink.term_literal("Alice", Datatype::rdf_lang_string(), Some("en"));
 
-        sink.emit_triple(alice, name, alice_name);
+        sink.emit_triple(alice, name, alice_name).unwrap();
 
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         let json = graph_to_transaction_json(&graph);
 
         let arr = json.as_array().unwrap();

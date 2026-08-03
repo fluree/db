@@ -55,7 +55,7 @@ pub(crate) fn parse_inline_ontology_to_bundle(
     })?;
 
     let flakes: Vec<Flake> = sink
-        .finish()
+        .into_flakes()
         .map_err(|e| crate::ApiError::config(format!("inline ontology flake build failed: {e}")))?;
     if flakes.is_empty() {
         return Ok(None);
