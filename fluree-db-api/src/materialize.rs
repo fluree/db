@@ -246,7 +246,11 @@ impl TripleObserver for InterningObserver<'_, '_> {
         let s = intern_term(self.sink, subject);
         let p = self.sink.term_iri(predicate);
         let o = intern_term(self.sink, object);
-        self.sink.emit_triple(s, p, o);
+        // ImportSink uses deferred-error semantics: emit_* stashes the first
+        // encode failure and `into_parts()` surfaces it as a hard error, so
+        // discarding this Result is deliberate, not lossy. Propagating here
+        // instead would also be sound if a per-triple failure site is wanted.
+        let _ = self.sink.emit_triple(s, p, o);
         *self.bytes += triple_weight(subject, predicate, object);
         Ok(())
     }
@@ -325,7 +329,7 @@ pub fn build_stamp_chunk(
     let txn_meta = encode_stamp(&mut sink, stamp)?;
 
     let (writer, prefix_map, spool_ctx) = sink
-        .finish()
+        .into_parts()
         .map_err(|e| R2rmlError::Materialization(format!("flake encode: {e}")))?;
     let op_count = writer.op_count();
     let new_codes = worker_cache.into_new_codes();
@@ -866,8 +870,9 @@ fn spawn_produce_workers(
 
                         // Finish + ship this chunk (always non-empty: it holds
                         // `first`). Mirror build_stamp_chunk's finalize.
-                        let (writer, prefix_map, spool_ctx) =
-                            sink.finish().map_err(|e| format!("flake encode: {e}"))?;
+                        let (writer, prefix_map, spool_ctx) = sink
+                            .into_parts()
+                            .map_err(|e| format!("flake encode: {e}"))?;
                         let op_count = writer.op_count();
                         let new_codes = worker_cache.into_new_codes();
                         let spool_result = spool_ctx.map(SpoolContext::finish_buffered);
