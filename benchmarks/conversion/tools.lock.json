@@ -129,17 +129,17 @@
     }
   },
   "our_tool": {
-    "name": "fluree rdf",
+    "name": "fluree convert",
     "version_probe": ["fluree", "--version"],
     "binary": "target/release/fluree",
     "modes": {
       "default": {
-        "flags_disclosed": ["rdf", "convert", "--to", "ntriples"],
+        "flags_disclosed": ["convert", "--to", "ntriples"],
         "validation_level": "none",
         "note": "Our parser performs NO IRI validation today (fluree-vocab has only is_absolute_iri + resolve_iri). This cell is therefore comparable with riot's check_false, NOT with its default. Stated in the matrix rather than left for a reader to discover."
       },
       "validate": {
-        "flags_disclosed": ["rdf", "convert", "--to", "ntriples"],
+        "flags_disclosed": ["convert", "--to", "ntriples"],
         "validation_level": "iri+langtag",
         "available_from": "W-h8",
         "note": "DESIGNED NOW, FILLED LATER. When W-h8 lands, this becomes the primary cell opposite riot's check_true, and `default` gains --nocheck as the disclosed secondary. The matrix carries the column already so the comparison is never quietly asymmetric in the meantime."

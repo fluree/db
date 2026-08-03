@@ -282,26 +282,26 @@ done
 # Turtle, so they are our own ceiling, not a comparison.
 FLUREE_BIN="${FLUREE_BIN:-$REPO_ROOT/target/release/fluree}"
 if [ -x "$FLUREE_BIN" ]; then
-	if ! "$FLUREE_BIN" rdf convert "$ttl" --to ntriples >/dev/null 2>&1; then
-		info "fluree rdf convert did not run — our cells deferred (see $FLUREE_BIN rdf convert --help)"
+	if ! "$FLUREE_BIN" convert "$ttl" --to ntriples >/dev/null 2>&1; then
+		info "fluree convert did not run — our cells deferred (see $FLUREE_BIN convert --help)"
 	else
 		run_cell fluree serial-validate ttl "$ttl" \
-			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --parallelism 1
+			"$FLUREE_BIN" convert "$ttl" --to ntriples --parallelism 1
 		run_cell fluree serial-validate nt "$nt" \
-			"$FLUREE_BIN" rdf convert "$nt" --to ntriples --parallelism 1
+			"$FLUREE_BIN" convert "$nt" --to ntriples --parallelism 1
 		run_cell fluree serial-nocheck ttl "$ttl" \
-			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --nocheck --parallelism 1
+			"$FLUREE_BIN" convert "$ttl" --to ntriples --nocheck --parallelism 1
 		run_cell fluree serial-nocheck nt "$nt" \
-			"$FLUREE_BIN" rdf convert "$nt" --to ntriples --nocheck --parallelism 1
+			"$FLUREE_BIN" convert "$nt" --to ntriples --nocheck --parallelism 1
 		# Parallel rows are OURS ALONE — labelled with their worker count,
 		# never averaged with the serial rows.
-		run_cell fluree auto-validate ttl "$ttl" "$FLUREE_BIN" rdf convert "$ttl" --to ntriples
+		run_cell fluree auto-validate ttl "$ttl" "$FLUREE_BIN" convert "$ttl" --to ntriples
 		run_cell fluree auto-nocheck ttl "$ttl" \
-			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --nocheck
+			"$FLUREE_BIN" convert "$ttl" --to ntriples --nocheck
 		run_cell fluree par8-validate ttl "$ttl" \
-			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --parallelism 8
+			"$FLUREE_BIN" convert "$ttl" --to ntriples --parallelism 8
 		run_cell fluree par8-nocheck ttl "$ttl" \
-			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --nocheck --parallelism 8
+			"$FLUREE_BIN" convert "$ttl" --to ntriples --nocheck --parallelism 8
 	fi
 else
 	info "target/release/fluree not built — our cells skipped (cargo build --release -p fluree-db-cli)"
