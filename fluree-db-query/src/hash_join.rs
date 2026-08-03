@@ -1175,10 +1175,14 @@ mod tests {
         let driver = vars.get_or_insert("?driver");
         let s = vars.get_or_insert("?s");
 
-        // One build charges 1 row x 2 build-schema cols x 64 = 128 B. Pin the ceiling
-        // at 200 B: > one 128 B build, < the 256 B two-build running sum.
+        // One build charges 1 row x 2 build-schema cols x BINDING_EST_BYTES. Pin the
+        // ceiling above one build but below the two-build running sum, so the second
+        // build only fits once the first is released at the rebuild boundary. Derived
+        // from BINDING_EST_BYTES so the pin tracks the per-binding estimate (88 at
+        // this rung) instead of a hard-coded byte count.
+        let per_build = 2 * crate::context::BINDING_EST_BYTES; // 1 row x 2 build cols
         let cancel = QueryCancellation::new();
-        cancel.set_memory_limit(200);
+        cancel.set_memory_limit(per_build + per_build / 2);
         let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
 
         let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
@@ -1223,11 +1227,11 @@ mod tests {
         let accumulated = ctx.mem_used();
         assert_eq!(
             accumulated,
-            mem_before_1 + 128,
+            mem_before_1 + per_build,
             "the finished inner's build charge is retained until released"
         );
         assert!(
-            accumulated + 128 > 200,
+            accumulated + per_build > per_build + per_build / 2,
             "two un-released builds would exceed the pinned budget (the D1 false 507)"
         );
 
@@ -1239,8 +1243,8 @@ mod tests {
             "boundary release nets the finished rebuild to zero"
         );
 
-        // ---- Second rebuild on the SAME handle: true peak is again one 128 B build,
-        // so it MUST NOT false-abort now that the first was released.
+        // ---- Second rebuild on the SAME handle: true peak is again one build, so it
+        // MUST NOT false-abort now that the first was released.
         {
             let mut hj2 = make_hj();
             hj2.open(&ctx)

@@ -7,5 +7,13 @@
   },
   "min_delta_ms": 50,
   "cold": "advisory",
-  "overrides": {}
+  "_overrides_comment": "The loadTable-GET drift set (q002/q004/q022/q024/q030/q043) is network-flappy catalog latency, NOT engine — C2 §3/§4 measured up to ~3.8x run-to-run swing. Quarantined at a wider 300% budget so a Snowflake catalog-latency spike (backed by the compare auto-rerun) does not flap the gate, while a gross (>4x) regression still trips. Re-narrow if the catalog path stabilizes.",
+  "overrides": {
+    "q002": 300.0,
+    "q004": 300.0,
+    "q022": 300.0,
+    "q024": 300.0,
+    "q030": 300.0,
+    "q043": 300.0
+  }
 }

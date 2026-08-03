@@ -950,12 +950,14 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             "Range-reading Parquet file"
         );
 
-        // Fetch all ranges
-        let mut range_data: Vec<(u64, Bytes)> = Vec::with_capacity(coalesced.len());
-        for (start, end) in &coalesced {
-            let data = self.storage.read_range(path, *start..*end).await?;
-            range_data.push((*start, data));
-        }
+        // Item 12 (B1-AppD): fetch the coalesced ranges via `read_ranges` — bounded
+        // concurrent GETs on S3 (order-preserving), sequential on other backends
+        // (incl. the local-file wrapper, where the default sequential impl already
+        // does the right thing). Bytes return in input order → zip to their starts.
+        let range_reqs: Vec<std::ops::Range<u64>> = coalesced.iter().map(|(s, e)| *s..*e).collect();
+        let range_bytes = self.storage.read_ranges(path, range_reqs).await?;
+        let range_data: Vec<(u64, Bytes)> =
+            coalesced.iter().map(|(s, _)| *s).zip(range_bytes).collect();
 
         // Assemble into sparse buffer
         let sparse_buffer = assemble_sparse_buffer(file_size as usize, range_data);

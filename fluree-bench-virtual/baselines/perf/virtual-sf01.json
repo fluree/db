@@ -3,50 +3,94 @@
   "target": "virtual-sf01",
   "blessed_from": {
     "target": "virtual-sf01",
-    "run_id": "01KX95QXVKF2TYWRVVM8JH8PHN",
-    "commit": "7d77218e2"
+    "run_id": "01KXW3QGM72B1RAG37CSFBTENR",
+    "commit": "73a7694bf"
   },
   "entries": {
     "q001": {
-      "hot_wall_ms_median": 2189,
-      "cold_wall_ms": 19424,
+      "hot_wall_ms_median": 2,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 144,
+            "max_us": 144
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 49,
+            "max_us": 49
+          },
           "iceberg.parquet_read": {
-            "n": 7,
-            "total_us": 1332836,
-            "max_us": 270048
+            "n": 1,
+            "total_us": 246,
+            "max_us": 246
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 21,
+            "max_us": 21
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 0,
+            "max_us": 0
           },
           "r2rml.scan_table": {
-            "n": 7,
-            "total_us": 685341,
-            "max_us": 110023
+            "n": 1,
+            "total_us": 159,
+            "max_us": 159
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 7366656
+        "file_size": 7168
       }
     },
     "q002": {
-      "hot_wall_ms_median": 1136,
+      "hot_wall_ms_median": 1371,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 3,
+            "total_us": 637,
+            "max_us": 363
+          },
+          "iceberg.fetch_bytes": {
+            "n": 3,
+            "total_us": 556,
+            "max_us": 452
+          },
           "iceberg.parquet_read": {
             "n": 3,
-            "total_us": 425287,
-            "max_us": 232421
+            "total_us": 1450,
+            "max_us": 978
+          },
+          "iceberg.read_footer": {
+            "n": 3,
+            "total_us": 166,
+            "max_us": 106
           },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 411643,
-            "max_us": 411643
+            "total_us": 1336817,
+            "max_us": 1336817
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 986010,
+            "max_us": 986010
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 3,
+            "max_us": 3
           },
           "r2rml.scan_table": {
             "n": 3,
-            "total_us": 687303,
-            "max_us": 504061
+            "total_us": 1338341,
+            "max_us": 1337237
           }
         },
         "files_selected": 1,
@@ -56,18 +100,38 @@
       }
     },
     "q003": {
-      "hot_wall_ms_median": 310,
+      "hot_wall_ms_median": 28,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 1981,
+            "max_us": 1981
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 137,
+            "max_us": 137
+          },
           "iceberg.parquet_read": {
             "n": 1,
-            "total_us": 174789,
-            "max_us": 174789
+            "total_us": 2185,
+            "max_us": 2185
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 47,
+            "max_us": 47
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 1,
+            "max_us": 1
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 113882,
-            "max_us": 113882
+            "total_us": 295,
+            "max_us": 295
           }
         },
         "files_selected": 0,
@@ -77,23 +141,48 @@
       }
     },
     "q004": {
-      "hot_wall_ms_median": 415,
+      "hot_wall_ms_median": 1361,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 2609,
+            "max_us": 2609
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 355,
+            "max_us": 355
+          },
           "iceberg.parquet_read": {
             "n": 1,
-            "total_us": 48361,
-            "max_us": 48361
+            "total_us": 3069,
+            "max_us": 3069
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 72,
+            "max_us": 72
           },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 266527,
-            "max_us": 266527
+            "total_us": 1344940,
+            "max_us": 1344940
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 1000110,
+            "max_us": 1000110
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 361614,
-            "max_us": 361614
+            "total_us": 1345293,
+            "max_us": 1345293
           }
         },
         "files_selected": 1,
@@ -103,65 +192,125 @@
       }
     },
     "q005": {
-      "hot_wall_ms_median": 3392,
+      "hot_wall_ms_median": 65,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 4,
+            "total_us": 3738,
+            "max_us": 1558
+          },
+          "iceberg.fetch_bytes": {
+            "n": 4,
+            "total_us": 601,
+            "max_us": 350
+          },
           "iceberg.parquet_read": {
-            "n": 12,
-            "total_us": 2066857,
-            "max_us": 220916
+            "n": 4,
+            "total_us": 4590,
+            "max_us": 1695
+          },
+          "iceberg.read_footer": {
+            "n": 4,
+            "total_us": 170,
+            "max_us": 62
+          },
+          "r2rml.prefetch": {
+            "n": 3,
+            "total_us": 3,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 12,
-            "total_us": 1112793,
-            "max_us": 97777
+            "n": 4,
+            "total_us": 1045,
+            "max_us": 339
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 10510848
+        "file_size": 1897984
       }
     },
     "q006": {
-      "hot_wall_ms_median": 2480,
+      "hot_wall_ms_median": 1354,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 1265,
+            "max_us": 1265
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 109,
+            "max_us": 109
+          },
           "iceberg.parquet_read": {
-            "n": 7,
-            "total_us": 1377468,
-            "max_us": 253069
+            "n": 1,
+            "total_us": 1426,
+            "max_us": 1426
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 32,
+            "max_us": 32
           },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 252419,
-            "max_us": 252419
+            "total_us": 1337738,
+            "max_us": 1337738
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 1003098,
+            "max_us": 1003098
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 0,
+            "max_us": 0
           },
           "r2rml.scan_table": {
-            "n": 7,
-            "total_us": 928541,
-            "max_us": 345489
+            "n": 1,
+            "total_us": 1338047,
+            "max_us": 1338047
           }
         },
         "files_selected": 1,
         "files_pruned": 0,
         "estimated_row_count": 15000,
-        "file_size": 7634944
+        "file_size": 275456
       }
     },
     "q007": {
-      "hot_wall_ms_median": 304,
+      "hot_wall_ms_median": 7,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 2327,
+            "max_us": 2327
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 164,
+            "max_us": 164
+          },
           "iceberg.parquet_read": {
             "n": 1,
-            "total_us": 178799,
-            "max_us": 178799
+            "total_us": 2600,
+            "max_us": 2600
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 79,
+            "max_us": 79
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 112632,
-            "max_us": 112632
+            "total_us": 538,
+            "max_us": 538
           }
         },
         "files_selected": 0,
@@ -171,107 +320,171 @@
       }
     },
     "q008": {
-      "hot_wall_ms_median": 180000,
-      "cold_wall_ms": 180000,
+      "hot_wall_ms_median": 305,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 6287,
-            "total_us": 1458205226,
-            "max_us": 762816
+          "iceberg.decode": {
+            "n": 7672,
+            "total_us": 321215,
+            "max_us": 5680
           },
-          "r2rml.load_table": {
+          "iceberg.fetch_bytes": {
+            "n": 7672,
+            "total_us": 402192,
+            "max_us": 748
+          },
+          "iceberg.parquet_read": {
+            "n": 7672,
+            "total_us": 1445145,
+            "max_us": 6474
+          },
+          "iceberg.read_footer": {
+            "n": 7672,
+            "total_us": 135883,
+            "max_us": 99
+          },
+          "r2rml.prefetch": {
             "n": 1,
-            "total_us": 2441596,
-            "max_us": 2441596
+            "total_us": 465,
+            "max_us": 465
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2541291,
-            "max_us": 2541291
+            "n": 3,
+            "total_us": 4582,
+            "max_us": 4207
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 44756992
+        "file_size": 61219328
       }
     },
     "q009": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 302,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 6855,
-            "total_us": 1460205018,
-            "max_us": 714360
+          "iceberg.decode": {
+            "n": 7672,
+            "total_us": 293302,
+            "max_us": 3275
           },
-          "r2rml.load_table": {
+          "iceberg.fetch_bytes": {
+            "n": 7672,
+            "total_us": 405006,
+            "max_us": 331
+          },
+          "iceberg.parquet_read": {
+            "n": 7672,
+            "total_us": 1441650,
+            "max_us": 3649
+          },
+          "iceberg.read_footer": {
+            "n": 7672,
+            "total_us": 131948,
+            "max_us": 71
+          },
+          "r2rml.prefetch": {
             "n": 1,
-            "total_us": 2161785,
-            "max_us": 2161785
+            "total_us": 192,
+            "max_us": 192
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2265076,
-            "max_us": 2265076
+            "n": 3,
+            "total_us": 3944,
+            "max_us": 3716
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 48804352
+        "file_size": 61219328
       }
     },
     "q010": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 120,
       "counters": {
         "spans": {
-          "iceberg.oauth_token": {
-            "n": 1,
-            "total_us": 996704,
-            "max_us": 996704
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 321056,
+            "max_us": 449
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 613467,
+            "max_us": 2725
           },
           "iceberg.parquet_read": {
-            "n": 6887,
-            "total_us": 1453986776,
-            "max_us": 580400
+            "n": 7671,
+            "total_us": 1354061,
+            "max_us": 3314
           },
-          "r2rml.load_table": {
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 150044,
+            "max_us": 123
+          },
+          "r2rml.prefetch": {
             "n": 1,
-            "total_us": 3047214,
-            "max_us": 3047214
+            "total_us": 718,
+            "max_us": 718
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 3154575,
-            "max_us": 3154575
+            "n": 2,
+            "total_us": 9775,
+            "max_us": 9331
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 49031680
+        "file_size": 54657024
       }
     },
     "q011": {
-      "hot_wall_ms_median": 3265,
+      "hot_wall_ms_median": 1838,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 91,
+            "total_us": 3757,
+            "max_us": 88
+          },
+          "iceberg.fetch_bytes": {
+            "n": 91,
+            "total_us": 12063,
+            "max_us": 307
+          },
           "iceberg.parquet_read": {
             "n": 91,
-            "total_us": 19026346,
-            "max_us": 343298
+            "total_us": 20820,
+            "max_us": 409
+          },
+          "iceberg.read_footer": {
+            "n": 91,
+            "total_us": 1541,
+            "max_us": 62
           },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 649817,
-            "max_us": 649817
+            "total_us": 1829286,
+            "max_us": 1829286
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 1167119,
+            "max_us": 1167119
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 1,
+            "max_us": 1
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 764884,
-            "max_us": 764884
+            "total_us": 1829581,
+            "max_us": 1829581
           }
         },
         "files_selected": 91,
@@ -281,33 +494,47 @@
       }
     },
     "q012": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 225,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 6241,
-            "total_us": 1456690137,
-            "max_us": 652118
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 234754,
+            "max_us": 4461
           },
-          "r2rml.load_table": {
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 322795,
+            "max_us": 605
+          },
+          "iceberg.parquet_read": {
+            "n": 7671,
+            "total_us": 1816243,
+            "max_us": 5195
+          },
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 95231,
+            "max_us": 99
+          },
+          "r2rml.prefetch": {
             "n": 1,
-            "total_us": 2625953,
-            "max_us": 2625953
+            "total_us": 526,
+            "max_us": 526
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2744254,
-            "max_us": 2744254
+            "n": 2,
+            "total_us": 5329,
+            "max_us": 5033
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 36527104
+        "file_size": 45898240
       }
     },
     "q013": {
-      "hot_wall_ms_median": 2,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -317,195 +544,274 @@
       }
     },
     "q014": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 354,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 6984,
-            "total_us": 1462877919,
-            "max_us": 758783
+          "iceberg.decode": {
+            "n": 7670,
+            "total_us": 341492,
+            "max_us": 289
           },
-          "r2rml.load_table": {
-            "n": 1,
-            "total_us": 1805819,
-            "max_us": 1805819
+          "iceberg.fetch_bytes": {
+            "n": 7670,
+            "total_us": 4444796,
+            "max_us": 13420
+          },
+          "iceberg.parquet_read": {
+            "n": 7670,
+            "total_us": 5189871,
+            "max_us": 13516
+          },
+          "iceberg.read_footer": {
+            "n": 7670,
+            "total_us": 141747,
+            "max_us": 304
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 1925986,
-            "max_us": 1925986
+            "total_us": 7780,
+            "max_us": 7780
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 49718784
+        "file_size": 54603776
       }
     },
     "q015": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 1478,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 6294,
-            "total_us": 1461880511,
-            "max_us": 643110
+          "iceberg.decode": {
+            "n": 53690,
+            "total_us": 2227608,
+            "max_us": 596
           },
-          "r2rml.load_table": {
-            "n": 1,
-            "total_us": 1919187,
-            "max_us": 1919187
+          "iceberg.fetch_bytes": {
+            "n": 53690,
+            "total_us": 5845335,
+            "max_us": 3423
+          },
+          "iceberg.parquet_read": {
+            "n": 53690,
+            "total_us": 10486980,
+            "max_us": 77595
+          },
+          "iceberg.read_footer": {
+            "n": 53690,
+            "total_us": 969180,
+            "max_us": 144
+          },
+          "r2rml.prefetch": {
+            "n": 6,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2043014,
-            "max_us": 2043014
+            "n": 7,
+            "total_us": 39852,
+            "max_us": 16234
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 37027328
+        "file_size": 372756992
       }
     },
     "q016": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 887,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 6853,
-            "total_us": 1458236807,
-            "max_us": 546660
+          "iceberg.decode": {
+            "n": 15569,
+            "total_us": 541406,
+            "max_us": 369
           },
-          "r2rml.load_table": {
-            "n": 1,
-            "total_us": 2496410,
-            "max_us": 2496410
+          "iceberg.fetch_bytes": {
+            "n": 15569,
+            "total_us": 2564503,
+            "max_us": 1397
+          },
+          "iceberg.parquet_read": {
+            "n": 15569,
+            "total_us": 3668720,
+            "max_us": 1478
+          },
+          "iceberg.read_footer": {
+            "n": 15569,
+            "total_us": 272313,
+            "max_us": 207
+          },
+          "r2rml.prefetch": {
+            "n": 6,
+            "total_us": 5,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2618185,
-            "max_us": 2618185
+            "n": 3,
+            "total_us": 23665,
+            "max_us": 13699
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 48790016
+        "file_size": 101371392
       }
     },
     "q017": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 1974,
       "counters": {
         "spans": {
-          "iceberg.oauth_token": {
-            "n": 1,
-            "total_us": 435711,
-            "max_us": 435711
+          "iceberg.decode": {
+            "n": 38350,
+            "total_us": 1267650,
+            "max_us": 343
+          },
+          "iceberg.fetch_bytes": {
+            "n": 38350,
+            "total_us": 14453395,
+            "max_us": 2631
           },
           "iceberg.parquet_read": {
-            "n": 6670,
-            "total_us": 1449442490,
-            "max_us": 683883
+            "n": 38350,
+            "total_us": 17029395,
+            "max_us": 2722
           },
-          "r2rml.load_table": {
-            "n": 1,
-            "total_us": 3536404,
-            "max_us": 3536404
+          "iceberg.read_footer": {
+            "n": 38350,
+            "total_us": 682693,
+            "max_us": 136
+          },
+          "r2rml.prefetch": {
+            "n": 2,
+            "total_us": 686,
+            "max_us": 686
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 3645832,
-            "max_us": 3645832
+            "n": 5,
+            "total_us": 27287,
+            "max_us": 13296
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 39241728
+        "file_size": 242416640
       }
     },
     "q018": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 126,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 7670,
+            "total_us": 294818,
+            "max_us": 197
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7670,
+            "total_us": 473422,
+            "max_us": 658
+          },
           "iceberg.parquet_read": {
-            "n": 6421,
-            "total_us": 1414063600,
-            "max_us": 650914
+            "n": 7670,
+            "total_us": 1323969,
+            "max_us": 908
           },
-          "iceberg.scan_plan": {
-            "n": 1,
-            "total_us": 683078,
-            "max_us": 683078
-          },
-          "r2rml.load_table": {
-            "n": 1,
-            "total_us": 2376346,
-            "max_us": 2376346
+          "iceberg.read_footer": {
+            "n": 7670,
+            "total_us": 116296,
+            "max_us": 140
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 3180484,
-            "max_us": 3180484
+            "total_us": 14630,
+            "max_us": 14630
           }
         },
-        "files_selected": 7670,
+        "files_selected": 0,
         "files_pruned": 0,
-        "estimated_row_count": 200000,
-        "file_size": 36163072
+        "estimated_row_count": 0,
+        "file_size": 43197440
       }
     },
     "q019": {
-      "hot_wall_ms_median": 180000,
-      "cold_wall_ms": 180000,
+      "hot_wall_ms_median": 1892,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 6864,
-            "total_us": 1451989601,
-            "max_us": 442230
-          },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 531786,
-            "max_us": 531786
+            "total_us": 1872040,
+            "max_us": 1872040
           },
           "r2rml.load_table": {
             "n": 1,
-            "total_us": 2717597,
-            "max_us": 2717597
+            "total_us": 1199559,
+            "max_us": 1199559
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 1,
+            "max_us": 1
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 3347121,
-            "max_us": 3347121
+            "total_us": 1872559,
+            "max_us": 1872559
           }
         },
-        "files_selected": 7670,
-        "files_pruned": 0,
-        "estimated_row_count": 250000,
-        "file_size": 50081280
+        "files_selected": 0,
+        "files_pruned": 7670,
+        "estimated_row_count": 0,
+        "file_size": 0
       }
     },
     "q020": {
-      "hot_wall_ms_median": 3047,
+      "hot_wall_ms_median": 1220,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 91,
+            "total_us": 4205,
+            "max_us": 116
+          },
+          "iceberg.fetch_bytes": {
+            "n": 91,
+            "total_us": 12006,
+            "max_us": 259
+          },
           "iceberg.parquet_read": {
             "n": 91,
-            "total_us": 18586690,
-            "max_us": 369346
+            "total_us": 22147,
+            "max_us": 474
+          },
+          "iceberg.read_footer": {
+            "n": 91,
+            "total_us": 1944,
+            "max_us": 63
           },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 475245,
-            "max_us": 475245
+            "total_us": 1212598,
+            "max_us": 1212598
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 606775,
+            "max_us": 606775
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 0,
+            "max_us": 0
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 581836,
-            "max_us": 581836
+            "total_us": 1212736,
+            "max_us": 1212736
           }
         },
         "files_selected": 91,
@@ -515,49 +821,64 @@
       }
     },
     "q021": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 1867,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7432,
-            "total_us": 1454825518,
-            "max_us": 531978
-          },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 522589,
-            "max_us": 522589
+            "total_us": 1865396,
+            "max_us": 1865396
           },
           "r2rml.load_table": {
             "n": 1,
-            "total_us": 2359900,
-            "max_us": 2359900
+            "total_us": 1272547,
+            "max_us": 1272547
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 2996600,
-            "max_us": 2996600
+            "total_us": 1865767,
+            "max_us": 1865767
           }
         },
-        "files_selected": 7670,
-        "files_pruned": 0,
-        "estimated_row_count": 250000,
-        "file_size": 54223360
+        "files_selected": 0,
+        "files_pruned": 7670,
+        "estimated_row_count": 0,
+        "file_size": 0
       }
     },
     "q022": {
-      "hot_wall_ms_median": 675,
+      "hot_wall_ms_median": 87,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 31210,
+            "max_us": 31210
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 2055,
+            "max_us": 2055
+          },
           "iceberg.parquet_read": {
             "n": 1,
-            "total_us": 254699,
-            "max_us": 254699
+            "total_us": 33400,
+            "max_us": 33400
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 100,
+            "max_us": 100
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 110897,
-            "max_us": 110897
+            "total_us": 433,
+            "max_us": 433
           }
         },
         "files_selected": 0,
@@ -567,18 +888,33 @@
       }
     },
     "q023": {
-      "hot_wall_ms_median": 610,
+      "hot_wall_ms_median": 64,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 29425,
+            "max_us": 29425
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 1763,
+            "max_us": 1763
+          },
           "iceberg.parquet_read": {
             "n": 1,
-            "total_us": 167646,
-            "max_us": 167646
+            "total_us": 31326,
+            "max_us": 31326
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 105,
+            "max_us": 105
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 92084,
-            "max_us": 92084
+            "total_us": 367,
+            "max_us": 367
           }
         },
         "files_selected": 0,
@@ -588,23 +924,48 @@
       }
     },
     "q024": {
-      "hot_wall_ms_median": 510,
+      "hot_wall_ms_median": 1540,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 4636,
+            "max_us": 4636
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 593,
+            "max_us": 593
+          },
           "iceberg.parquet_read": {
             "n": 1,
-            "total_us": 54740,
-            "max_us": 54740
+            "total_us": 5300,
+            "max_us": 5300
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 51,
+            "max_us": 51
           },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 272263,
-            "max_us": 272263
+            "total_us": 1470979,
+            "max_us": 1470979
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 1116204,
+            "max_us": 1116204
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 1,
+            "max_us": 1
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 374833,
-            "max_us": 374833
+            "total_us": 1471356,
+            "max_us": 1471356
           }
         },
         "files_selected": 1,
@@ -614,164 +975,263 @@
       }
     },
     "q025": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 121,
       "counters": {
         "spans": {
-          "iceberg.oauth_token": {
-            "n": 1,
-            "total_us": 479125,
-            "max_us": 479125
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 282152,
+            "max_us": 4791
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 688084,
+            "max_us": 842
           },
           "iceberg.parquet_read": {
-            "n": 7266,
-            "total_us": 1460463499,
-            "max_us": 539973
+            "n": 7671,
+            "total_us": 1301651,
+            "max_us": 5591
           },
-          "r2rml.load_table": {
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 139518,
+            "max_us": 98
+          },
+          "r2rml.prefetch": {
             "n": 1,
-            "total_us": 2186873,
-            "max_us": 2186873
+            "total_us": 840,
+            "max_us": 840
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2290143,
-            "max_us": 2290143
+            "n": 2,
+            "total_us": 8361,
+            "max_us": 7880
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 49354752
+        "file_size": 53113344
       }
     },
     "q026": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 112,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7446,
-            "total_us": 1457883557,
-            "max_us": 384630
+          "iceberg.decode": {
+            "n": 7670,
+            "total_us": 324273,
+            "max_us": 209
           },
-          "r2rml.load_table": {
-            "n": 1,
-            "total_us": 2473198,
-            "max_us": 2473198
+          "iceberg.fetch_bytes": {
+            "n": 7670,
+            "total_us": 701073,
+            "max_us": 713
+          },
+          "iceberg.parquet_read": {
+            "n": 7670,
+            "total_us": 1358385,
+            "max_us": 968
+          },
+          "iceberg.read_footer": {
+            "n": 7670,
+            "total_us": 150954,
+            "max_us": 139
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 2571876,
-            "max_us": 2571876
+            "total_us": 15077,
+            "max_us": 15077
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 50572288
+        "file_size": 52092416
       }
     },
     "q027": {
-      "hot_wall_ms_median": 180000,
-      "cold_wall_ms": 180000,
+      "hot_wall_ms_median": 195,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 6841,
-            "total_us": 1423645435,
-            "max_us": 1505318
+          "iceberg.decode": {
+            "n": 7670,
+            "total_us": 436768,
+            "max_us": 285
           },
-          "r2rml.load_table": {
-            "n": 1,
-            "total_us": 1695760,
-            "max_us": 1695760
+          "iceberg.fetch_bytes": {
+            "n": 7670,
+            "total_us": 363131,
+            "max_us": 500
+          },
+          "iceberg.parquet_read": {
+            "n": 7670,
+            "total_us": 1896539,
+            "max_us": 1115
+          },
+          "iceberg.read_footer": {
+            "n": 7670,
+            "total_us": 134121,
+            "max_us": 110
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 1807612,
-            "max_us": 1807612
+            "total_us": 14115,
+            "max_us": 14115
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 66550784
+        "file_size": 74615808
       }
     },
     "q028": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 1605,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7485,
-            "total_us": 1463415887,
-            "max_us": 1094490
+          "iceberg.decode": {
+            "n": 7676,
+            "total_us": 352390,
+            "max_us": 1519
           },
-          "r2rml.load_table": {
-            "n": 1,
-            "total_us": 1787405,
-            "max_us": 1787405
+          "iceberg.fetch_bytes": {
+            "n": 7676,
+            "total_us": 683234,
+            "max_us": 701
           },
-          "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 1901577,
-            "max_us": 1901577
-          }
-        },
-        "files_selected": 0,
-        "files_pruned": 0,
-        "estimated_row_count": 0,
-        "file_size": 50835456
-      }
-    },
-    "q029": {
-      "hot_wall_ms_median": 180000,
-      "counters": {
-        "spans": {
           "iceberg.parquet_read": {
-            "n": 7182,
-            "total_us": 1415302081,
-            "max_us": 488071
+            "n": 7676,
+            "total_us": 1324904,
+            "max_us": 1612
+          },
+          "iceberg.read_footer": {
+            "n": 7676,
+            "total_us": 139374,
+            "max_us": 120
           },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 541627,
-            "max_us": 541627
+            "total_us": 1353750,
+            "max_us": 1353750
           },
           "r2rml.load_table": {
             "n": 1,
-            "total_us": 2315843,
-            "max_us": 2315843
+            "total_us": 768782,
+            "max_us": 768782
+          },
+          "r2rml.prefetch": {
+            "n": 6,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2981043,
-            "max_us": 2981043
+            "n": 7,
+            "total_us": 1355083,
+            "max_us": 1354170
           }
         },
         "files_selected": 7670,
         "files_pruned": 0,
         "estimated_row_count": 1000000,
-        "file_size": 69868032
+        "file_size": 80741376
       }
     },
-    "q030": {
-      "hot_wall_ms_median": 1221,
+    "q029": {
+      "hot_wall_ms_median": 1845,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 7703,
+            "total_us": 307246,
+            "max_us": 148
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7703,
+            "total_us": 694422,
+            "max_us": 596
+          },
           "iceberg.parquet_read": {
-            "n": 30,
-            "total_us": 3313038,
-            "max_us": 257885
+            "n": 7703,
+            "total_us": 1284864,
+            "max_us": 667
+          },
+          "iceberg.read_footer": {
+            "n": 7703,
+            "total_us": 136111,
+            "max_us": 91
           },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 604815,
-            "max_us": 604815
+            "total_us": 1691979,
+            "max_us": 1691979
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 1030150,
+            "max_us": 1030150
+          },
+          "r2rml.prefetch": {
+            "n": 2,
+            "total_us": 2,
+            "max_us": 2
+          },
+          "r2rml.scan_table": {
+            "n": 2,
+            "total_us": 1696421,
+            "max_us": 1692537
+          }
+        },
+        "files_selected": 7670,
+        "files_pruned": 0,
+        "estimated_row_count": 1000000,
+        "file_size": 74936832
+      }
+    },
+    "q030": {
+      "hot_wall_ms_median": 1709,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 30,
+            "total_us": 1566,
+            "max_us": 128
+          },
+          "iceberg.fetch_bytes": {
+            "n": 30,
+            "total_us": 4400,
+            "max_us": 282
+          },
+          "iceberg.parquet_read": {
+            "n": 30,
+            "total_us": 8189,
+            "max_us": 484
+          },
+          "iceberg.read_footer": {
+            "n": 30,
+            "total_us": 782,
+            "max_us": 63
+          },
+          "iceberg.scan_plan": {
+            "n": 1,
+            "total_us": 1696510,
+            "max_us": 1696510
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 1061065,
+            "max_us": 1061065
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 1,
+            "max_us": 1
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 745757,
-            "max_us": 745757
+            "total_us": 1696838,
+            "max_us": 1696838
           }
         },
         "files_selected": 30,
@@ -781,85 +1241,129 @@
       }
     },
     "q031": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 4459,
       "counters": {
         "spans": {
-          "iceberg.oauth_token": {
-            "n": 1,
-            "total_us": 353801,
-            "max_us": 353801
+          "iceberg.decode": {
+            "n": 7912,
+            "total_us": 633614,
+            "max_us": 4309
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7912,
+            "total_us": 816062,
+            "max_us": 1029
           },
           "iceberg.parquet_read": {
-            "n": 7232,
-            "total_us": 1461522167,
-            "max_us": 840151
+            "n": 7912,
+            "total_us": 1725524,
+            "max_us": 4408
           },
-          "r2rml.load_table": {
-            "n": 1,
-            "total_us": 1991660,
-            "max_us": 1991660
+          "iceberg.read_footer": {
+            "n": 7912,
+            "total_us": 119609,
+            "max_us": 112
+          },
+          "r2rml.prefetch": {
+            "n": 242,
+            "total_us": 10,
+            "max_us": 3
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2094777,
-            "max_us": 2094777
+            "n": 243,
+            "total_us": 36157,
+            "max_us": 11985
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 48136192
+        "file_size": 298116096
       }
     },
     "q032": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 116,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7380,
-            "total_us": 1461450593,
-            "max_us": 1919295
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 228155,
+            "max_us": 383
           },
-          "r2rml.load_table": {
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 534924,
+            "max_us": 884
+          },
+          "iceberg.parquet_read": {
+            "n": 7671,
+            "total_us": 1237649,
+            "max_us": 1036
+          },
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 103419,
+            "max_us": 107
+          },
+          "r2rml.prefetch": {
             "n": 1,
-            "total_us": 2076697,
-            "max_us": 2076697
+            "total_us": 336,
+            "max_us": 336
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2206298,
-            "max_us": 2206298
+            "n": 2,
+            "total_us": 13008,
+            "max_us": 12669
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 49121280
+        "file_size": 51058688
       }
     },
     "q033": {
-      "hot_wall_ms_median": 5320,
+      "hot_wall_ms_median": 54,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 3,
+            "total_us": 1836,
+            "max_us": 1208
+          },
+          "iceberg.fetch_bytes": {
+            "n": 3,
+            "total_us": 320,
+            "max_us": 137
+          },
           "iceberg.parquet_read": {
-            "n": 14,
-            "total_us": 2500311,
-            "max_us": 236115
+            "n": 3,
+            "total_us": 2466,
+            "max_us": 1485
+          },
+          "iceberg.read_footer": {
+            "n": 3,
+            "total_us": 218,
+            "max_us": 101
+          },
+          "r2rml.prefetch": {
+            "n": 6,
+            "total_us": 4,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 14,
-            "total_us": 1316584,
-            "max_us": 99665
+            "n": 3,
+            "total_us": 1353,
+            "max_us": 490
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 14817280
+        "file_size": 147456
       }
     },
     "q034": {
-      "hot_wall_ms_median": 0,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -869,97 +1373,121 @@
       }
     },
     "q035": {
-      "hot_wall_ms_median": 3243,
+      "hot_wall_ms_median": 50,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 7,
+            "total_us": 922,
+            "max_us": 311
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7,
+            "total_us": 467,
+            "max_us": 123
+          },
           "iceberg.parquet_read": {
-            "n": 12,
-            "total_us": 2103320,
-            "max_us": 223886
+            "n": 7,
+            "total_us": 1802,
+            "max_us": 567
+          },
+          "iceberg.read_footer": {
+            "n": 7,
+            "total_us": 276,
+            "max_us": 97
+          },
+          "r2rml.prefetch": {
+            "n": 6,
+            "total_us": 4,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 12,
-            "total_us": 1099214,
-            "max_us": 103125
+            "n": 7,
+            "total_us": 1634,
+            "max_us": 468
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 589824
+        "file_size": 344064
       }
     },
     "q036": {
-      "hot_wall_ms_median": 180000,
-      "cold_wall_ms": 180000,
+      "hot_wall_ms_median": 60,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7224,
-            "total_us": 1459440889,
-            "max_us": 773377
-          },
-          "r2rml.load_table": {
+          "r2rml.count_manifest": {
             "n": 1,
-            "total_us": 2271135,
-            "max_us": 2271135
-          },
-          "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2393401,
-            "max_us": 2393401
+            "total_us": 59696,
+            "max_us": 59696
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 51426304
+        "file_size": 0
       }
     },
     "q037": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 71,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7340,
-            "total_us": 1458776655,
-            "max_us": 519367
-          },
-          "r2rml.load_table": {
+          "r2rml.count_manifest": {
             "n": 1,
-            "total_us": 2140699,
-            "max_us": 2140699
-          },
-          "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2405931,
-            "max_us": 2405931
+            "total_us": 69034,
+            "max_us": 69034
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 71405568
+        "file_size": 0
       }
     },
     "q038": {
-      "hot_wall_ms_median": 54601,
+      "hot_wall_ms_median": 58154,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 3,
+            "total_us": 5490,
+            "max_us": 1977
+          },
+          "iceberg.fetch_bytes": {
+            "n": 3,
+            "total_us": 2701,
+            "max_us": 1356
+          },
           "iceberg.parquet_read": {
             "n": 3,
-            "total_us": 260008,
-            "max_us": 171057
+            "total_us": 8481,
+            "max_us": 3360
+          },
+          "iceberg.read_footer": {
+            "n": 3,
+            "total_us": 213,
+            "max_us": 104
           },
           "iceberg.scan_plan": {
             "n": 2,
-            "total_us": 531777,
-            "max_us": 304380
+            "total_us": 3003399,
+            "max_us": 1620049
+          },
+          "r2rml.load_table": {
+            "n": 2,
+            "total_us": 2320534,
+            "max_us": 1250128
+          },
+          "r2rml.prefetch": {
+            "n": 331,
+            "total_us": 373,
+            "max_us": 250
           },
           "r2rml.scan_table": {
             "n": 3,
-            "total_us": 855095,
-            "max_us": 421692
+            "total_us": 3004559,
+            "max_us": 1620201
           }
         },
         "files_selected": 2,
@@ -969,122 +1497,177 @@
       }
     },
     "q039": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 62,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7253,
-            "total_us": 1464950865,
-            "max_us": 711152
-          },
-          "r2rml.load_table": {
+          "r2rml.count_manifest": {
             "n": 1,
-            "total_us": 1633052,
-            "max_us": 1633052
-          },
-          "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 1757505,
-            "max_us": 1757505
+            "total_us": 61302,
+            "max_us": 61302
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 52918272
+        "file_size": 0
       }
     },
     "q040": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 209,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 6529,
-            "total_us": 1464976031,
-            "max_us": 748286
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 277771,
+            "max_us": 306
           },
-          "r2rml.load_table": {
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 736852,
+            "max_us": 641
+          },
+          "iceberg.parquet_read": {
+            "n": 7671,
+            "total_us": 1308960,
+            "max_us": 926
+          },
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 134701,
+            "max_us": 209
+          },
+          "r2rml.prefetch": {
             "n": 1,
-            "total_us": 1566147,
-            "max_us": 1566147
+            "total_us": 0,
+            "max_us": 0
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 1674637,
-            "max_us": 1674637
+            "n": 2,
+            "total_us": 7815,
+            "max_us": 7683
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 46481408
+        "file_size": 54610944
       }
     },
     "q041": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 357,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7326,
-            "total_us": 1442462256,
-            "max_us": 768161
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 278046,
+            "max_us": 257
           },
-          "r2rml.load_table": {
-            "n": 3,
-            "total_us": 3910255,
-            "max_us": 1625573
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 731297,
+            "max_us": 962
+          },
+          "iceberg.parquet_read": {
+            "n": 7671,
+            "total_us": 1296087,
+            "max_us": 1117
+          },
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 134809,
+            "max_us": 166
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 1,
+            "max_us": 1
           },
           "r2rml.scan_table": {
-            "n": 3,
-            "total_us": 4197850,
-            "max_us": 1719508
+            "n": 2,
+            "total_us": 9268,
+            "max_us": 9113
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 52194304
+        "file_size": 54610944
       }
     },
     "q042": {
-      "hot_wall_ms_median": 3425,
+      "hot_wall_ms_median": 1446,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 5,
+            "total_us": 1778,
+            "max_us": 605
+          },
+          "iceberg.fetch_bytes": {
+            "n": 5,
+            "total_us": 1187,
+            "max_us": 451
+          },
           "iceberg.parquet_read": {
-            "n": 9,
-            "total_us": 1555585,
-            "max_us": 324656
+            "n": 5,
+            "total_us": 3554,
+            "max_us": 1126
+          },
+          "iceberg.read_footer": {
+            "n": 5,
+            "total_us": 414,
+            "max_us": 178
           },
           "iceberg.scan_plan": {
             "n": 3,
-            "total_us": 991828,
-            "max_us": 460346
+            "total_us": 1400278,
+            "max_us": 1169371
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 854352,
+            "max_us": 854352
+          },
+          "r2rml.prefetch": {
+            "n": 3,
+            "total_us": 3,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 9,
-            "total_us": 1820658,
-            "max_us": 553351
+            "n": 5,
+            "total_us": 1402172,
+            "max_us": 1169838
           }
         },
         "files_selected": 3,
         "files_pruned": 0,
         "estimated_row_count": 1500,
-        "file_size": 2049024
+        "file_size": 697344
       }
     },
     "q043": {
-      "hot_wall_ms_median": 2125,
+      "hot_wall_ms_median": 7519,
       "counters": {
         "spans": {
           "iceberg.scan_plan": {
             "n": 6,
-            "total_us": 1558242,
-            "max_us": 325770
+            "total_us": 7511435,
+            "max_us": 1501376
+          },
+          "r2rml.load_table": {
+            "n": 6,
+            "total_us": 5470671,
+            "max_us": 1168598
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 1083,
+            "max_us": 1083
           },
           "r2rml.scan_table": {
             "n": 6,
-            "total_us": 2124954,
-            "max_us": 420263
+            "total_us": 7515575,
+            "max_us": 1502175
           }
         },
         "files_selected": 0,
@@ -1094,190 +1677,328 @@
       }
     },
     "q044": {
-      "hot_wall_ms_median": 120000,
+      "hot_wall_ms_median": 1726,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 7670,
+            "total_us": 224769,
+            "max_us": 124
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7670,
+            "total_us": 740265,
+            "max_us": 648
+          },
           "iceberg.parquet_read": {
-            "n": 4896,
-            "total_us": 981898510,
-            "max_us": 519259
+            "n": 7670,
+            "total_us": 1222918,
+            "max_us": 705
+          },
+          "iceberg.read_footer": {
+            "n": 7670,
+            "total_us": 116775,
+            "max_us": 92
           },
           "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 538395,
-            "max_us": 538395
+            "total_us": 1639364,
+            "max_us": 1639364
           },
           "r2rml.load_table": {
             "n": 1,
-            "total_us": 1520974,
-            "max_us": 1520974
+            "total_us": 998339,
+            "max_us": 998339
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 2163955,
-            "max_us": 2163955
+            "total_us": 1639946,
+            "max_us": 1639946
           }
         },
         "files_selected": 7670,
         "files_pruned": 0,
         "estimated_row_count": 250000,
-        "file_size": 35714560
+        "file_size": 55961088
       }
     },
     "q045": {
-      "hot_wall_ms_median": 266,
+      "hot_wall_ms_median": 22,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 16,
+            "total_us": 2102,
+            "max_us": 185
+          },
+          "iceberg.fetch_bytes": {
+            "n": 16,
+            "total_us": 7166,
+            "max_us": 672
+          },
           "iceberg.parquet_read": {
-            "n": 2,
-            "total_us": 310132,
-            "max_us": 155068
+            "n": 16,
+            "total_us": 11754,
+            "max_us": 887
+          },
+          "iceberg.read_footer": {
+            "n": 16,
+            "total_us": 883,
+            "max_us": 104
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 108130,
-            "max_us": 108130
+            "total_us": 14635,
+            "max_us": 14635
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 14336
+        "file_size": 114688
       }
     },
     "q046": {
-      "hot_wall_ms_median": 180000,
-      "cold_wall_ms": 180000,
+      "hot_wall_ms_median": 22,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7471,
-            "total_us": 1468039636,
-            "max_us": 387590
+          "iceberg.decode": {
+            "n": 10,
+            "total_us": 548,
+            "max_us": 149
           },
-          "r2rml.load_table": {
+          "iceberg.fetch_bytes": {
+            "n": 10,
+            "total_us": 690,
+            "max_us": 204
+          },
+          "iceberg.parquet_read": {
+            "n": 10,
+            "total_us": 1516,
+            "max_us": 435
+          },
+          "iceberg.read_footer": {
+            "n": 10,
+            "total_us": 256,
+            "max_us": 77
+          },
+          "iceberg.scan_plan": {
             "n": 1,
-            "total_us": 1181499,
-            "max_us": 1181499
+            "total_us": 0,
+            "max_us": 0
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 1296615,
-            "max_us": 1296615
+            "total_us": 20360,
+            "max_us": 20360
           }
         },
-        "files_selected": 0,
-        "files_pruned": 0,
+        "files_selected": 10,
+        "files_pruned": 7660,
         "estimated_row_count": 0,
-        "file_size": 53184512
+        "file_size": 71680
       }
     },
     "q047": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 592,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7502,
-            "total_us": 1463044365,
-            "max_us": 400380
+          "iceberg.decode": {
+            "n": 7670,
+            "total_us": 313729,
+            "max_us": 262
           },
-          "r2rml.load_table": {
+          "iceberg.fetch_bytes": {
+            "n": 7670,
+            "total_us": 6458551,
+            "max_us": 5398
+          },
+          "iceberg.parquet_read": {
+            "n": 7670,
+            "total_us": 7048689,
+            "max_us": 5505
+          },
+          "iceberg.read_footer": {
+            "n": 7670,
+            "total_us": 159814,
+            "max_us": 159
+          },
+          "r2rml.prefetch": {
             "n": 1,
-            "total_us": 1803980,
-            "max_us": 1803980
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
             "n": 1,
-            "total_us": 1912662,
-            "max_us": 1912662
+            "total_us": 15711,
+            "max_us": 15711
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 53406720
+        "file_size": 54603776
       }
     },
     "q048": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 1497,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7463,
-            "total_us": 1461423062,
-            "max_us": 339165
+          "iceberg.decode": {
+            "n": 7678,
+            "total_us": 306977,
+            "max_us": 2016
           },
-          "r2rml.load_table": {
-            "n": 1,
-            "total_us": 2126182,
-            "max_us": 2126182
+          "iceberg.fetch_bytes": {
+            "n": 7678,
+            "total_us": 724455,
+            "max_us": 1000
+          },
+          "iceberg.parquet_read": {
+            "n": 7678,
+            "total_us": 1324921,
+            "max_us": 2628
+          },
+          "iceberg.read_footer": {
+            "n": 7678,
+            "total_us": 142157,
+            "max_us": 142
+          },
+          "r2rml.prefetch": {
+            "n": 11,
+            "total_us": 3,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 2235340,
-            "max_us": 2235340
+            "n": 9,
+            "total_us": 14367,
+            "max_us": 12833
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 53128192
+        "file_size": 70341632
       }
     },
     "q049": {
-      "hot_wall_ms_median": 4788,
+      "hot_wall_ms_median": 1619,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 7,
+            "total_us": 9879,
+            "max_us": 4844
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7,
+            "total_us": 2355,
+            "max_us": 1565
+          },
           "iceberg.parquet_read": {
-            "n": 14,
-            "total_us": 2555428,
-            "max_us": 238701
+            "n": 7,
+            "total_us": 12616,
+            "max_us": 6501
+          },
+          "iceberg.read_footer": {
+            "n": 7,
+            "total_us": 249,
+            "max_us": 104
+          },
+          "iceberg.scan_plan": {
+            "n": 1,
+            "total_us": 1358595,
+            "max_us": 1358595
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 1019647,
+            "max_us": 1019647
+          },
+          "r2rml.prefetch": {
+            "n": 6,
+            "total_us": 1,
+            "max_us": 1
           },
           "r2rml.scan_table": {
-            "n": 14,
-            "total_us": 1307969,
-            "max_us": 99003
+            "n": 7,
+            "total_us": 1360648,
+            "max_us": 1358940
           }
         },
-        "files_selected": 0,
+        "files_selected": 1,
         "files_pruned": 0,
-        "estimated_row_count": 0,
-        "file_size": 39367168
+        "estimated_row_count": 390000,
+        "file_size": 9748992
       }
     },
     "q050": {
-      "hot_wall_ms_median": 120000,
+      "hot_wall_ms_median": 1494,
       "counters": {
         "spans": {
-          "iceberg.oauth_token": {
-            "n": 1,
-            "total_us": 360691,
-            "max_us": 360691
+          "iceberg.decode": {
+            "n": 4,
+            "total_us": 5110,
+            "max_us": 4658
+          },
+          "iceberg.fetch_bytes": {
+            "n": 4,
+            "total_us": 1001,
+            "max_us": 801
           },
           "iceberg.parquet_read": {
-            "n": 407,
-            "total_us": 66624795,
-            "max_us": 272758
+            "n": 4,
+            "total_us": 6447,
+            "max_us": 5686
+          },
+          "iceberg.read_footer": {
+            "n": 4,
+            "total_us": 247,
+            "max_us": 176
+          },
+          "iceberg.scan_plan": {
+            "n": 1,
+            "total_us": 974457,
+            "max_us": 974457
           },
           "r2rml.load_table": {
-            "n": 6,
-            "total_us": 9327732,
-            "max_us": 2071948
+            "n": 1,
+            "total_us": 639965,
+            "max_us": 639965
+          },
+          "r2rml.prefetch": {
+            "n": 61,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 407,
-            "total_us": 47719027,
-            "max_us": 2172231
+            "n": 4,
+            "total_us": 975392,
+            "max_us": 974920
           }
         },
-        "files_selected": 0,
+        "files_selected": 1,
         "files_pruned": 0,
-        "estimated_row_count": 0,
-        "file_size": 149951488
+        "estimated_row_count": 37500,
+        "file_size": 2077696
       }
     },
     "q051": {
-      "hot_wall_ms_median": 3,
       "counters": {
         "spans": {},
         "files_selected": 0,
@@ -1287,76 +2008,1061 @@
       }
     },
     "q052": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 538,
       "counters": {
         "spans": {
-          "iceberg.parquet_read": {
-            "n": 7279,
-            "total_us": 1439943027,
-            "max_us": 549694
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 364037,
+            "max_us": 339
           },
-          "r2rml.load_table": {
-            "n": 3,
-            "total_us": 4482588,
-            "max_us": 1520465
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 681312,
+            "max_us": 692
+          },
+          "iceberg.parquet_read": {
+            "n": 7671,
+            "total_us": 2361362,
+            "max_us": 212880
+          },
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 134675,
+            "max_us": 131
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 3,
-            "total_us": 4816254,
-            "max_us": 1624590
+            "n": 2,
+            "total_us": 13987,
+            "max_us": 13420
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 62288384
+        "file_size": 75636736
       }
     },
     "q053": {
-      "hot_wall_ms_median": 180000,
+      "hot_wall_ms_median": 2135,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 7672,
+            "total_us": 272077,
+            "max_us": 30004
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7672,
+            "total_us": 758630,
+            "max_us": 3392
+          },
           "iceberg.parquet_read": {
-            "n": 7249,
-            "total_us": 1463497302,
-            "max_us": 645066
+            "n": 7672,
+            "total_us": 1319297,
+            "max_us": 33554
+          },
+          "iceberg.read_footer": {
+            "n": 7672,
+            "total_us": 134195,
+            "max_us": 113
+          },
+          "iceberg.scan_plan": {
+            "n": 1,
+            "total_us": 1421740,
+            "max_us": 1421740
           },
           "r2rml.load_table": {
             "n": 1,
-            "total_us": 1741695,
-            "max_us": 1741695
+            "total_us": 1078264,
+            "max_us": 1078264
+          },
+          "r2rml.prefetch": {
+            "n": 2,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 1,
-            "total_us": 1852082,
-            "max_us": 1852082
+            "n": 3,
+            "total_us": 1437608,
+            "max_us": 1421904
           }
         },
-        "files_selected": 0,
+        "files_selected": 1,
         "files_pruned": 0,
-        "estimated_row_count": 0,
-        "file_size": 40826368
+        "estimated_row_count": 390000,
+        "file_size": 66581504
       }
     },
     "q054": {
-      "hot_wall_ms_median": 2669,
+      "hot_wall_ms_median": 16,
       "counters": {
         "spans": {
+          "iceberg.decode": {
+            "n": 2,
+            "total_us": 891,
+            "max_us": 808
+          },
+          "iceberg.fetch_bytes": {
+            "n": 2,
+            "total_us": 224,
+            "max_us": 132
+          },
           "iceberg.parquet_read": {
-            "n": 8,
-            "total_us": 1386746,
-            "max_us": 216598
+            "n": 2,
+            "total_us": 1321,
+            "max_us": 1070
+          },
+          "iceberg.read_footer": {
+            "n": 2,
+            "total_us": 145,
+            "max_us": 92
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
           },
           "r2rml.scan_table": {
-            "n": 8,
-            "total_us": 1086297,
-            "max_us": 189883
+            "n": 2,
+            "total_us": 770,
+            "max_us": 439
           }
         },
         "files_selected": 0,
         "files_pruned": 0,
         "estimated_row_count": 0,
-        "file_size": 7415808
+        "file_size": 56320
+      }
+    },
+    "q055": {
+      "hot_wall_ms_median": 841,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 7679,
+            "total_us": 244721,
+            "max_us": 2289
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7679,
+            "total_us": 5397151,
+            "max_us": 2501
+          },
+          "iceberg.parquet_read": {
+            "n": 7679,
+            "total_us": 5906869,
+            "max_us": 3004
+          },
+          "iceberg.read_footer": {
+            "n": 7679,
+            "total_us": 149890,
+            "max_us": 200
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2356,
+            "max_us": 2356
+          },
+          "r2rml.scan_table": {
+            "n": 25,
+            "total_us": 41136,
+            "max_us": 12226
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 62696448
+      }
+    },
+    "q056": {
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 69046,
+            "total_us": 6316606,
+            "max_us": 110368
+          },
+          "iceberg.fetch_bytes": {
+            "n": 69046,
+            "total_us": 29906878,
+            "max_us": 1783
+          },
+          "iceberg.parquet_read": {
+            "n": 69046,
+            "total_us": 38664124,
+            "max_us": 110722
+          },
+          "iceberg.read_footer": {
+            "n": 69046,
+            "total_us": 1323785,
+            "max_us": 8160
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 4032,
+            "max_us": 4032
+          },
+          "r2rml.scan_table": {
+            "n": 25,
+            "total_us": 49039,
+            "max_us": 7546
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 492216320
+      }
+    },
+    "q057": {
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 69046,
+            "total_us": 6754970,
+            "max_us": 156335
+          },
+          "iceberg.fetch_bytes": {
+            "n": 69046,
+            "total_us": 34647712,
+            "max_us": 3383
+          },
+          "iceberg.parquet_read": {
+            "n": 69046,
+            "total_us": 53170332,
+            "max_us": 4692354
+          },
+          "iceberg.read_footer": {
+            "n": 69046,
+            "total_us": 1296102,
+            "max_us": 3060
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 633441,
+            "max_us": 633441
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 753233,
+            "max_us": 753233
+          },
+          "r2rml.scan_table": {
+            "n": 25,
+            "total_us": 36553,
+            "max_us": 4679
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 492216320
+      }
+    },
+    "q058": {
+      "hot_wall_ms_median": 5383,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 61368,
+            "total_us": 1908078,
+            "max_us": 1674
+          },
+          "iceberg.fetch_bytes": {
+            "n": 61368,
+            "total_us": 44179360,
+            "max_us": 4523
+          },
+          "iceberg.parquet_read": {
+            "n": 61368,
+            "total_us": 51708067,
+            "max_us": 1770663
+          },
+          "iceberg.read_footer": {
+            "n": 61368,
+            "total_us": 1149086,
+            "max_us": 531
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 4947,
+            "max_us": 4947
+          },
+          "r2rml.scan_table": {
+            "n": 16,
+            "total_us": 36300,
+            "max_us": 9255
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 429573120
+      }
+    },
+    "q059": {
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 69046,
+            "total_us": 6104892,
+            "max_us": 98505
+          },
+          "iceberg.fetch_bytes": {
+            "n": 69046,
+            "total_us": 35375723,
+            "max_us": 2002
+          },
+          "iceberg.parquet_read": {
+            "n": 69046,
+            "total_us": 51798796,
+            "max_us": 7887074
+          },
+          "iceberg.read_footer": {
+            "n": 69046,
+            "total_us": 1326682,
+            "max_us": 8559
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 1203,
+            "max_us": 1203
+          },
+          "r2rml.scan_table": {
+            "n": 25,
+            "total_us": 37650,
+            "max_us": 5634
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 492216320
+      }
+    },
+    "q060": {
+      "hot_wall_ms_median": 3,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 340,
+            "max_us": 340
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 98,
+            "max_us": 98
+          },
+          "iceberg.parquet_read": {
+            "n": 1,
+            "total_us": 532,
+            "max_us": 532
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 61,
+            "max_us": 61
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 381,
+            "max_us": 381
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 7168
+      }
+    },
+    "q061": {
+      "hot_wall_ms_median": 93,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 30787,
+            "max_us": 30787
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 2597,
+            "max_us": 2597
+          },
+          "iceberg.parquet_read": {
+            "n": 1,
+            "total_us": 33520,
+            "max_us": 33520
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 86,
+            "max_us": 86
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 603,
+            "max_us": 603
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 5988864
+      }
+    },
+    "q062": {
+      "hot_wall_ms_median": 113,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 213906,
+            "max_us": 262
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 528186,
+            "max_us": 669
+          },
+          "iceberg.parquet_read": {
+            "n": 7671,
+            "total_us": 1210644,
+            "max_us": 813
+          },
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 93694,
+            "max_us": 101
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 481,
+            "max_us": 481
+          },
+          "r2rml.scan_table": {
+            "n": 2,
+            "total_us": 11525,
+            "max_us": 11274
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 51058688
+      }
+    },
+    "q063": {
+      "hot_wall_ms_median": 8,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 2319,
+            "max_us": 2319
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 173,
+            "max_us": 173
+          },
+          "iceberg.parquet_read": {
+            "n": 1,
+            "total_us": 2615,
+            "max_us": 2615
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 78,
+            "max_us": 78
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 650,
+            "max_us": 650
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 275456
+      }
+    },
+    "q064": {
+      "hot_wall_ms_median": 15,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 1,
+            "total_us": 4740,
+            "max_us": 4740
+          },
+          "iceberg.fetch_bytes": {
+            "n": 1,
+            "total_us": 585,
+            "max_us": 585
+          },
+          "iceberg.parquet_read": {
+            "n": 1,
+            "total_us": 5455,
+            "max_us": 5455
+          },
+          "iceberg.read_footer": {
+            "n": 1,
+            "total_us": 94,
+            "max_us": 94
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 422,
+            "max_us": 422
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 1020928
+      }
+    },
+    "q065": {
+      "hot_wall_ms_median": 279,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 221510,
+            "max_us": 29777
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 371260,
+            "max_us": 3180
+          },
+          "iceberg.parquet_read": {
+            "n": 7671,
+            "total_us": 1327965,
+            "max_us": 33093
+          },
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 103125,
+            "max_us": 120
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 484,
+            "max_us": 484
+          },
+          "r2rml.scan_table": {
+            "n": 2,
+            "total_us": 4064,
+            "max_us": 3713
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 60592640
+      }
+    },
+    "q066": {
+      "hot_wall_ms_median": 112,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 267326,
+            "max_us": 267
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 603047,
+            "max_us": 561
+          },
+          "iceberg.parquet_read": {
+            "n": 7671,
+            "total_us": 1265226,
+            "max_us": 719
+          },
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 112840,
+            "max_us": 91
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 420,
+            "max_us": 420
+          },
+          "r2rml.scan_table": {
+            "n": 2,
+            "total_us": 10191,
+            "max_us": 9959
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 45187584
+      }
+    },
+    "q067": {
+      "hot_wall_ms_median": 115,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 310351,
+            "max_us": 325
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 725935,
+            "max_us": 971
+          },
+          "iceberg.parquet_read": {
+            "n": 7671,
+            "total_us": 1370260,
+            "max_us": 1083
+          },
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 130615,
+            "max_us": 192
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 481,
+            "max_us": 481
+          },
+          "r2rml.scan_table": {
+            "n": 2,
+            "total_us": 10231,
+            "max_us": 9937
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 52145664
+      }
+    },
+    "q068": {
+      "hot_wall_ms_median": 1409,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 7707,
+            "total_us": 178655,
+            "max_us": 164
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7707,
+            "total_us": 739450,
+            "max_us": 688
+          },
+          "iceberg.parquet_read": {
+            "n": 7707,
+            "total_us": 1171368,
+            "max_us": 752
+          },
+          "iceberg.read_footer": {
+            "n": 7707,
+            "total_us": 108410,
+            "max_us": 74
+          },
+          "iceberg.scan_plan": {
+            "n": 1,
+            "total_us": 1205882,
+            "max_us": 1205882
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 592311,
+            "max_us": 592311
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
+          },
+          "r2rml.scan_table": {
+            "n": 3,
+            "total_us": 1210883,
+            "max_us": 1206407
+          }
+        },
+        "files_selected": 7670,
+        "files_pruned": 0,
+        "estimated_row_count": 600000,
+        "file_size": 55837696
+      }
+    },
+    "q069": {
+      "hot_wall_ms_median": 325,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 7671,
+            "total_us": 358226,
+            "max_us": 224
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7671,
+            "total_us": 712002,
+            "max_us": 695
+          },
+          "iceberg.parquet_read": {
+            "n": 7671,
+            "total_us": 1358269,
+            "max_us": 854
+          },
+          "iceberg.read_footer": {
+            "n": 7671,
+            "total_us": 136270,
+            "max_us": 88
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 1,
+            "max_us": 1
+          },
+          "r2rml.scan_table": {
+            "n": 2,
+            "total_us": 13904,
+            "max_us": 13762
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 54610944
+      }
+    },
+    "q070": {
+      "hot_wall_ms_median": 1259,
+      "counters": {
+        "spans": {
+          "iceberg.scan_plan": {
+            "n": 1,
+            "total_us": 1255635,
+            "max_us": 1255635
+          },
+          "r2rml.load_table": {
+            "n": 1,
+            "total_us": 628442,
+            "max_us": 628442
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 1256072,
+            "max_us": 1256072
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 7670,
+        "estimated_row_count": 0,
+        "file_size": 0
+      }
+    },
+    "q071": {
+      "hot_wall_ms_median": 250,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 7670,
+            "total_us": 290089,
+            "max_us": 405
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7670,
+            "total_us": 733152,
+            "max_us": 1113
+          },
+          "iceberg.parquet_read": {
+            "n": 7670,
+            "total_us": 1307425,
+            "max_us": 1229
+          },
+          "iceberg.read_footer": {
+            "n": 7670,
+            "total_us": 123329,
+            "max_us": 88
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 13961,
+            "max_us": 13961
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 54603776
+      }
+    },
+    "q072": {
+      "hot_wall_ms_median": 127,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 820,
+            "total_us": 46829,
+            "max_us": 223
+          },
+          "iceberg.fetch_bytes": {
+            "n": 820,
+            "total_us": 82452,
+            "max_us": 563
+          },
+          "iceberg.parquet_read": {
+            "n": 822,
+            "total_us": 333073,
+            "max_us": 60258
+          },
+          "iceberg.read_footer": {
+            "n": 820,
+            "total_us": 16338,
+            "max_us": 162
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 13491,
+            "max_us": 13491
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 7996416
+      }
+    },
+    "q073": {
+      "hot_wall_ms_median": 1991,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 30697,
+            "total_us": 1106423,
+            "max_us": 1054
+          },
+          "iceberg.fetch_bytes": {
+            "n": 30697,
+            "total_us": 14326782,
+            "max_us": 2111
+          },
+          "iceberg.parquet_read": {
+            "n": 30699,
+            "total_us": 21085586,
+            "max_us": 1942386
+          },
+          "iceberg.read_footer": {
+            "n": 30697,
+            "total_us": 594100,
+            "max_us": 178
+          },
+          "r2rml.prefetch": {
+            "n": 2,
+            "total_us": 389,
+            "max_us": 387
+          },
+          "r2rml.scan_table": {
+            "n": 6,
+            "total_us": 32410,
+            "max_us": 14243
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 230627328
+      }
+    },
+    "q074": {
+      "hot_wall_ms_median": 21,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 16,
+            "total_us": 1849,
+            "max_us": 204
+          },
+          "iceberg.fetch_bytes": {
+            "n": 16,
+            "total_us": 6036,
+            "max_us": 509
+          },
+          "iceberg.parquet_read": {
+            "n": 18,
+            "total_us": 19248,
+            "max_us": 4200
+          },
+          "iceberg.read_footer": {
+            "n": 16,
+            "total_us": 865,
+            "max_us": 116
+          },
+          "r2rml.prefetch": {
+            "n": 1,
+            "total_us": 2,
+            "max_us": 2
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 13200,
+            "max_us": 13200
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 129024
+      }
+    },
+    "q075": {
+      "hot_wall_ms_median": 120,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 7670,
+            "total_us": 231209,
+            "max_us": 165
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7670,
+            "total_us": 484068,
+            "max_us": 535
+          },
+          "iceberg.parquet_read": {
+            "n": 7670,
+            "total_us": 1279418,
+            "max_us": 734
+          },
+          "iceberg.read_footer": {
+            "n": 7670,
+            "total_us": 119447,
+            "max_us": 105
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 10892,
+            "max_us": 10892
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 54603776
+      }
+    },
+    "q076": {
+      "hot_wall_ms_median": 141,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 7670,
+            "total_us": 260955,
+            "max_us": 159
+          },
+          "iceberg.fetch_bytes": {
+            "n": 7670,
+            "total_us": 412120,
+            "max_us": 430
+          },
+          "iceberg.parquet_read": {
+            "n": 7670,
+            "total_us": 1385412,
+            "max_us": 743
+          },
+          "iceberg.read_footer": {
+            "n": 7670,
+            "total_us": 112637,
+            "max_us": 120
+          },
+          "r2rml.scan_table": {
+            "n": 1,
+            "total_us": 13971,
+            "max_us": 13971
+          }
+        },
+        "files_selected": 0,
+        "files_pruned": 0,
+        "estimated_row_count": 0,
+        "file_size": 54603776
+      }
+    },
+    "q077": {
+      "hot_wall_ms_median": 64122,
+      "counters": {
+        "spans": {
+          "iceberg.decode": {
+            "n": 333,
+            "total_us": 3602166,
+            "max_us": 13154
+          },
+          "iceberg.fetch_bytes": {
+            "n": 333,
+            "total_us": 377619,
+            "max_us": 3356
+          },
+          "iceberg.parquet_read": {
+            "n": 333,
+            "total_us": 4005461,
+            "max_us": 16231
+          },
+          "iceberg.read_footer": {
+            "n": 333,
+            "total_us": 18383,
+            "max_us": 127
+          },
+          "iceberg.scan_plan": {
+            "n": 332,
+            "total_us": 41051009,
+            "max_us": 262610
+          },
+          "r2rml.load_table": {
+            "n": 2,
+            "total_us": 2633239,
+            "max_us": 1370815
+          },
+          "r2rml.prefetch": {
+            "n": 382,
+            "total_us": 1450901,
+            "max_us": 1450884
+          },
+          "r2rml.scan_table": {
+            "n": 333,
+            "total_us": 41100823,
+            "max_us": 262736
+          }
+        },
+        "files_selected": 332,
+        "files_pruned": 0,
+        "estimated_row_count": 129127500,
+        "file_size": 1989323776
       }
     }
   }

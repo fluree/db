@@ -31,6 +31,13 @@ pub enum ScanCmpOp {
     LtEq,
     Gt,
     GtEq,
+    /// Set membership (`?x IN (c1..cN)`), lowered from a `FILTER … IN` or a
+    /// single-var `VALUES` block. The filter's `value` is a [`ScanValue::Set`];
+    /// the provider builds an Iceberg `Expression::In`, which keeps a file iff
+    /// ANY member could lie within the file's column bounds (a superset — the
+    /// in-engine FILTER / VALUES join still enforces exact membership). Never
+    /// paired with a scalar `value`; never mapped to a scalar `ComparisonOp`.
+    In,
 }
 
 /// A literal value for a pushed-down scan filter.
@@ -67,6 +74,26 @@ pub enum ScanValue {
     /// skipped for field types not yet supported. The R2RML operator still enforces
     /// the subject equality, so a skipped or imperfect push is never wrong.
     TemplateKey(String),
+    /// A bounded set of scalar values for a [`ScanCmpOp::In`] membership filter
+    /// (from a `FILTER … IN` or single-var `VALUES`). Every member is one of the
+    /// scalar variants above — never a nested `Set`, never a `TemplateKey`. Only
+    /// ever produced by the set-lowering emit path; it is never wrapped in an
+    /// [`ObjectConstant`] (a constant object is a single scalar term), so the
+    /// scalar-only match sites treat it defensively as "not a scalar constant".
+    Set(Vec<ScanValue>),
+    /// An `xsd:dateTime` value as microseconds since the Unix epoch, carrying
+    /// whether the source literal was timezone-AWARE (item 10). `tz = true` (an
+    /// explicit offset, e.g. `…Z`/`+05:00`) means the micros are in the UTC frame
+    /// and only push against a physically-`timestamptz` column; `tz = false` (a
+    /// naive literal) means wall-clock micros and only push against a physically
+    /// `timestamp` column. The frame is matched at pushdown-build time so the
+    /// micros are directly comparable to the Iceberg manifest bounds; a mismatch
+    /// declines the push (the in-engine FILTER stays the authority). Pruning is
+    /// MANIFEST-level only — see the row-group note in `fluree-db-iceberg`.
+    Timestamp {
+        micros: i64,
+        tz: bool,
+    },
 }
 
 /// A constant object in a triple pattern (`?s <pred> <const>`), enforced by the
@@ -103,22 +130,28 @@ pub struct ScanFilter {
     pub value: ScanValue,
 }
 
-/// A scan-side top-k directive for a single-column **DESCENDING** `ORDER BY …
-/// LIMIT k` directly above a single-table R2RML scan (PR-5). The scan reads files
-/// in `upper_bound(sort_column)`-DESC order, keeps a running k-th bound, and stops
+/// A scan-side top-k directive for a single-column `ORDER BY … LIMIT k` directly
+/// above a single-table R2RML scan (PR-5; ASC added in item 8, F-AUD-6). The scan
+/// reads files best-first (DESC: `upper_bound(sort_column)` descending; ASC:
+/// `lower_bound(sort_column)` ascending), keeps a running k-th bound, and stops
 /// once no unread file can beat it — reading far fewer than the whole table.
 ///
 /// A pure perf optimization: the scan still streams a strict SUPERSET of the true
 /// top-k (it only skips files that provably cannot contribute), and the
 /// authoritative `SortOperator` above applies the exact (compound) order + LIMIT.
 /// Ignored by the provider unless `sort_column` resolves to a pushable scalar
-/// column of the scanned table.
+/// column of the scanned table — and, for `ascending`, unless that column is
+/// REQUIRED (non-nullable) in the Iceberg schema, since SPARQL orders unbound
+/// values FIRST under ASC and a nullable column could hide an unread top-k row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanTopK {
-    /// The primary DESC sort column (an R2RML-mapped table column name).
+    /// The primary sort column (an R2RML-mapped table column name).
     pub sort_column: String,
     /// How many top rows the bound must retain — the query's `LIMIT + OFFSET`.
     pub k: usize,
+    /// `true` for an `ASC` sort (admitted only for a required column; the provider
+    /// re-checks nullability), `false` for `DESC`.
+    pub ascending: bool,
 }
 
 /// Provider for compiled R2RML mappings.

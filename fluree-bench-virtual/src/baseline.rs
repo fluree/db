@@ -236,9 +236,38 @@ pub fn write_expected(
     Ok(summary)
 }
 
+/// Whether a record's wall must **not** be blessed as a perf baseline because the
+/// query did not *successfully complete*. Only a `Status::Ok` run that finished
+/// inside its deadline yields a meaningful "how fast does this answer" wall. Every
+/// other outcome pins a wall that is not a completion time:
+/// - a [`Status::Dnf`] wall is the deadline cap (`exec.rs`: `wall = timeout`, e.g.
+///   180000ms) — the F-AUD-18 / C2 §1 pathology where 28 members sat at 180000ms and
+///   a now-fast query could regress ~1740× (to 216s under the 20%-over gate) before
+///   anything tripped;
+/// - a [`Status::Error`] wall is the time-to-abort (e.g. a `MemoryBudgetExceeded`
+///   507 at ~8.6GB), not a completion — blessing it would pin an abort as a "budget";
+/// - a [`Status::ExpectedError`] never produces a result at all.
+/// Defensively also true for any wall at/over the deadline (a mis-statused or
+/// imported record — belt and suspenders); a `timeout_ms == 0` (unknown deadline) is
+/// checked by status only. A non-blessable record blesses as *no baseline* (a
+/// must-fix), clearing any stale wall a prior bless left.
+fn is_unblessable_wall(status: Status, wall_ms: u64, timeout_ms: u64) -> bool {
+    status != Status::Ok || (timeout_ms > 0 && wall_ms >= timeout_ms)
+}
+
 /// Bless per-target perf references. Merges into any existing `perf/<target>.json`
-/// so a hot run and a later cold run can both populate a query's entry.
-pub fn write_perf(meta: &RunMeta, records: &[RunRecord], baselines: &Path) -> Result<Vec<String>> {
+/// so a hot run and a later cold run can both populate a query's entry. A record
+/// that did not successfully complete is **never** blessed as a wall (see
+/// [`is_unblessable_wall`]): the matching wall field is cleared to `None` (no
+/// baseline / must-fix) so a timeout cap or an abort time can never masquerade as a
+/// budget, while its counters are still recorded as telemetry. The corpus supplies
+/// each query's deadline for that check.
+pub fn write_perf(
+    meta: &RunMeta,
+    records: &[RunRecord],
+    corpus: &Corpus,
+    baselines: &Path,
+) -> Result<Vec<String>> {
     let dir = perf_dir(baselines);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
@@ -262,11 +291,20 @@ pub fn write_perf(meta: &RunMeta, records: &[RunRecord], baselines: &Path) -> Re
         baseline.blessed_from.run_id = meta.run_id.clone();
         baseline.blessed_from.commit = meta.git_commit.clone();
         for r in recs {
+            let timeout_ms = corpus
+                .get(&r.query_id)
+                .map(|q| q.timeout_s.saturating_mul(1000))
+                .unwrap_or(0);
+            let no_bless = is_unblessable_wall(r.status, r.wall_ms, timeout_ms);
             let entry = baseline.entries.entry(r.query_id.clone()).or_default();
+            // A non-completion (DNF timeout cap, error/abort time, expected-error)
+            // blesses as no-baseline (`None`), never as its wall; the `None` also
+            // clears any stale fast wall a prior bless left, so a query that
+            // regressed to a DNF/abort cannot keep an unearned budget.
             if r.cache_state == "cold" {
-                entry.cold_wall_ms = Some(r.wall_ms);
+                entry.cold_wall_ms = if no_bless { None } else { Some(r.wall_ms) };
             } else {
-                entry.hot_wall_ms_median = Some(r.wall_ms);
+                entry.hot_wall_ms_median = if no_bless { None } else { Some(r.wall_ms) };
             }
             // Prefer the hot record's counters; fall back to whatever we have.
             if r.cache_state != "cold" || entry.counters == Counters::default() {
@@ -757,5 +795,94 @@ mod tests {
             over_budget(100, 180, pct20()),
             "a real 80% regression stays red"
         );
+    }
+
+    // --- never-bless-a-non-completion guard (F-AUD-18) -------------------
+
+    #[test]
+    fn is_unblessable_wall_flags_non_completions_and_deadline_walls() {
+        // Only a Status::Ok wall inside its deadline is a real, blessable wall.
+        assert!(!is_unblessable_wall(Status::Ok, 432, 180_000));
+        // A terminal DNF is unblessable regardless of wall/timeout.
+        assert!(is_unblessable_wall(Status::Dnf, 180_000, 180_000));
+        assert!(is_unblessable_wall(Status::Dnf, 5, 0));
+        // An engine error (e.g. a MemoryBudgetExceeded 507 abort — the live-run
+        // q038/q056/q057/q059 case) is a time-to-abort, not a completion.
+        assert!(is_unblessable_wall(Status::Error, 38_355, 120_000));
+        // An expected-error query never produced a result.
+        assert!(is_unblessable_wall(Status::ExpectedError, 2, 120_000));
+        // Belt-and-suspenders: an Ok wall at/over the deadline (a mis-statused or
+        // imported record — the exact 28@180000 pathology) is unblessable.
+        assert!(is_unblessable_wall(Status::Ok, 180_000, 180_000));
+        assert!(is_unblessable_wall(Status::Ok, 181_000, 180_000));
+        // An unknown deadline (0) falls back to the status only.
+        assert!(!is_unblessable_wall(Status::Ok, 999_999, 0));
+        assert!(is_unblessable_wall(Status::Dnf, 999_999, 0));
+    }
+
+    /// The bless path must never pin a timeout as a perf budget: a DNF blesses as
+    /// *no baseline* (a must-fix), and a query that regressed to a DNF loses any
+    /// stale fast wall a prior bless left.
+    #[test]
+    fn write_perf_blesses_dnf_as_no_baseline_not_the_timeout_cap() {
+        let baselines = bless_dir("dnf-noperf");
+        // bless_corpus pins timeout_s = 120 for every query, so a DNF wall is 120000.
+        let corpus = bless_corpus(&[("q008", HashGate::Full), ("q016", HashGate::RowsOnly)]);
+
+        // q008 finishes at 550ms; q016 DNFs at its 120s deadline.
+        let mut r_ok = rec("q008", "native-sf01", "hot", "H8", 550);
+        r_ok.rows = 9;
+        let mut r_dnf = rec("q016", "native-sf01", "hot", "", 120_000);
+        r_dnf.status = Status::Dnf;
+        r_dnf.rows = 0;
+        let written = write_perf(&bless_meta("R1"), &[r_ok, r_dnf], &corpus, &baselines).unwrap();
+        assert_eq!(written.len(), 1, "one target → one perf file");
+
+        let pb = load_perf(&baselines, "native-sf01").unwrap().unwrap();
+        assert_eq!(
+            pb.entries["q008"].hot_wall_ms_median,
+            Some(550),
+            "a finishing query blesses its real wall"
+        );
+        assert_eq!(
+            pb.entries["q016"].hot_wall_ms_median, None,
+            "a DNF blesses as no-baseline, NOT the 120000ms timeout cap"
+        );
+        assert!(
+            pb.entries.contains_key("q016"),
+            "the must-fix entry still exists (DNF counters recorded), it just carries no wall"
+        );
+
+        // A re-bless where q008 regresses to a DNF must CLEAR its stale 550ms wall,
+        // and q016 now finishing must gain a real baseline.
+        let mut r_ok2 = rec("q016", "native-sf01", "hot", "H16", 400);
+        r_ok2.rows = 5;
+        let mut r_dnf2 = rec("q008", "native-sf01", "hot", "", 120_000);
+        r_dnf2.status = Status::Dnf;
+        write_perf(&bless_meta("R2"), &[r_ok2, r_dnf2], &corpus, &baselines).unwrap();
+        let pb2 = load_perf(&baselines, "native-sf01").unwrap().unwrap();
+        assert_eq!(
+            pb2.entries["q008"].hot_wall_ms_median, None,
+            "a query that regressed to a DNF loses its stale fast wall"
+        );
+        assert_eq!(
+            pb2.entries["q016"].hot_wall_ms_median,
+            Some(400),
+            "and a now-finishing query gains a real baseline"
+        );
+
+        // An engine error (a MemoryBudgetExceeded abort — the live-run q038 case)
+        // also blesses as no-baseline: its wall is the time-to-abort, not a
+        // completion, so it must not pin an abort time as a "budget".
+        let mut r_err = rec("q008", "native-sf01", "hot", "", 38_355);
+        r_err.status = Status::Error;
+        r_err.rows = 0;
+        write_perf(&bless_meta("R3"), &[r_err], &corpus, &baselines).unwrap();
+        let pb3 = load_perf(&baselines, "native-sf01").unwrap().unwrap();
+        assert_eq!(
+            pb3.entries["q008"].hot_wall_ms_median, None,
+            "an errored/aborted query blesses as no-baseline, not its abort wall"
+        );
+        let _ = std::fs::remove_dir_all(&baselines);
     }
 }
