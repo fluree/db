@@ -47,6 +47,34 @@ use tracing::{debug, error, info, warn};
 /// executor via `tokio::spawn`.
 type SyncFuture<'a> = Pin<Box<dyn Future<Output = (String, Result<()>)> + Send + 'a>>;
 
+/// Remove up to `capacity` graph sources from `pending` that have no sync
+/// running, and return them.
+///
+/// Sources in `in_flight` are left in `pending` rather than dropped: the commit
+/// that queued one still needs to reach the index, it just has to wait for the
+/// running sync to finish. Starting a second sync of the same index instead
+/// would have both publish a snapshot against the same manifest, orphaning one
+/// of them and moving the watermark backwards whenever the higher-`t` sync
+/// publishes first.
+fn take_ready_for_sync(
+    pending: &mut HashSet<String>,
+    in_flight: &HashSet<String>,
+    capacity: usize,
+) -> Vec<String> {
+    let ready: Vec<String> = pending
+        .iter()
+        .filter(|graph_source_id| !in_flight.contains(*graph_source_id))
+        .take(capacity)
+        .cloned()
+        .collect();
+
+    for graph_source_id in &ready {
+        pending.remove(graph_source_id);
+    }
+
+    ready
+}
+
 /// Configuration for the BM25 maintenance worker.
 #[derive(Debug, Clone)]
 pub struct Bm25WorkerConfig {
@@ -413,6 +441,11 @@ impl Bm25MaintenanceWorker {
         let mut in_flight: futures::stream::FuturesUnordered<SyncFuture<'_>> =
             futures::stream::FuturesUnordered::new();
 
+        // The graph sources those syncs are running against, so a commit
+        // arriving mid-sync re-queues the source instead of starting a second
+        // concurrent sync of the same index.
+        let mut in_flight_ids: HashSet<String> = HashSet::new();
+
         loop {
             // Check for stop request
             if self.stop_requested.load(Ordering::Relaxed) {
@@ -424,11 +457,13 @@ impl Bm25MaintenanceWorker {
             let now = Instant::now();
             let can_flush = next_flush.map(|t| now >= t).unwrap_or(false);
             if can_flush {
-                while in_flight.len() < self.config.max_concurrent_syncs {
-                    let Some(graph_source_id) = pending.iter().next().cloned() else {
-                        break;
-                    };
-                    pending.remove(&graph_source_id);
+                let capacity = self
+                    .config
+                    .max_concurrent_syncs
+                    .saturating_sub(in_flight.len());
+
+                for graph_source_id in take_ready_for_sync(&mut pending, &in_flight_ids, capacity) {
+                    in_flight_ids.insert(graph_source_id.clone());
 
                     // Spawn a non-Send future into our in-flight set (polled on this task).
                     let fut = async move {
@@ -438,7 +473,9 @@ impl Bm25MaintenanceWorker {
                     in_flight.push(Box::pin(fut));
                 }
 
-                // If we've drained pending, clear flush deadline; otherwise keep flushing.
+                // Anything left in `pending` is over the concurrency cap or is
+                // waiting behind a running sync of the same source, so keep the
+                // deadline armed to retry it.
                 if pending.is_empty() {
                     next_flush = None;
                 } else {
@@ -481,6 +518,7 @@ impl Bm25MaintenanceWorker {
 
                 // Complete one in-flight sync.
                 Some((graph_source_id, res)) = in_flight.next() => {
+                    in_flight_ids.remove(&graph_source_id);
                     if let Err(e) = res {
                         warn!(graph_source = %graph_source_id, error = %e, "Failed to sync graph source");
                     }
@@ -499,6 +537,53 @@ impl Bm25MaintenanceWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn id_set<const N: usize>(ids: [&str; N]) -> HashSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    #[test]
+    fn take_ready_for_sync_defers_a_source_that_is_already_syncing() {
+        let mut pending = id_set(["search:main"]);
+
+        let ready = take_ready_for_sync(&mut pending, &id_set(["search:main"]), 4);
+
+        assert!(ready.is_empty(), "a running sync blocks a second one");
+        assert!(
+            pending.contains("search:main"),
+            "the deferred source stays queued for a later flush"
+        );
+    }
+
+    #[test]
+    fn take_ready_for_sync_takes_sources_that_are_not_syncing() {
+        let mut pending = id_set(["search:main", "titles:main"]);
+
+        let ready = take_ready_for_sync(&mut pending, &id_set(["search:main"]), 4);
+
+        assert_eq!(ready, vec!["titles:main".to_string()]);
+        assert_eq!(pending, id_set(["search:main"]));
+    }
+
+    #[test]
+    fn take_ready_for_sync_stops_at_capacity() {
+        let mut pending = id_set(["a:main", "b:main", "c:main"]);
+
+        let ready = take_ready_for_sync(&mut pending, &HashSet::new(), 2);
+
+        assert_eq!(ready.len(), 2);
+        assert_eq!(pending.len(), 1, "the remainder waits for free capacity");
+    }
+
+    #[test]
+    fn take_ready_for_sync_takes_nothing_without_capacity() {
+        let mut pending = id_set(["search:main"]);
+
+        let ready = take_ready_for_sync(&mut pending, &HashSet::new(), 0);
+
+        assert!(ready.is_empty());
+        assert_eq!(pending, id_set(["search:main"]));
+    }
 
     #[test]
     fn test_worker_state_register_graph_source() {
