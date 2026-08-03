@@ -1093,6 +1093,41 @@ struct GroupKeyResolver {
     map: std::collections::HashMap<Vec<String>, Vec<GKey>>,
 }
 
+/// P3 (multi-fact branching-star join, crt_join_reorder class): one FK branch off
+/// the fact root — a linear sub-chain from the root's FK target to a terminal.
+/// Carried in a typed LIST ([`JoinBranch`]) so K-branch generalization is additive
+/// rather than a per-shape rewrite; v1 admission accepts exactly one of each variant.
+#[derive(Debug)]
+#[allow(dead_code)] // fields consumed by the P3 semi-join build (soundness core, follow-on)
+struct Branch<'p> {
+    /// The fact root's FK join var TO this branch's head (root → chain[0]).
+    root_join_var: VarId,
+    /// The branch's linear patterns, head..terminal (EXCLUDES the shared root).
+    chain: Vec<&'p R2rmlPattern>,
+    /// Within-branch join vars: `chain[i]` ref-joins `chain[i+1]` via `join_vars[i]`.
+    join_vars: Vec<VarId>,
+}
+
+/// P3: a classified FK branch. GROUP-KEY = the branch whose sub-chain binds a
+/// GROUP BY var (resolved via the existing FK→GKey [`GroupKeyResolver`]).
+/// SEMI-JOIN = a pure membership/constraint branch (e.g. order→customer=Enterprise),
+/// resolved to a keep-min-then-filter membership set the fact fold probes.
+#[derive(Debug)]
+enum JoinBranch<'p> {
+    GroupKey(Branch<'p>),
+    SemiJoin(Branch<'p>),
+}
+
+/// P3: the decomposition of a branching-star join — the fact root plus its
+/// classified branches. v1 admits exactly one GROUP-KEY + one SEMI-JOIN branch
+/// (the crt_join_reorder class); the list carries any K for the follow-on.
+#[derive(Debug)]
+#[allow(dead_code)] // `root` consumed by the P3 resolver build (soundness core, follow-on)
+struct BranchingStar<'p> {
+    root: &'p R2rmlPattern,
+    branches: Vec<JoinBranch<'p>>,
+}
+
 /// A native `SUM(expr)` / `AVG(expr)` plan: the arithmetic expression and the
 /// (variable, column, read-kind) of each referenced variable.
 struct ExprFold {
@@ -2537,6 +2572,135 @@ impl FusedR2rmlAggregateOperator {
         Some((order, join_vars))
     }
 
+    /// P3 kill switch (`FLUREE_FUSED_R2RML_MULTIFACT`, default **on**). Off restores
+    /// the pre-P3 behavior wholesale: a branching multi-fact shape simply declines to
+    /// the generic pipeline. Read once per process.
+    fn multifact_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"))
+    }
+
+    /// P3 (scaffolding): decompose a BRANCHING-STAR join — a fact ROOT with ≥2 FK
+    /// branches, each a linear sub-chain — into its root + classified branches, or
+    /// `None` when the shape is not the admitted class. This is the structural half
+    /// of P3 (the soundness core — the semi-join keep-min-then-filter build + the
+    /// fold probe — is a tracked follow-on); the caller currently DECLINES even a
+    /// recognized star, so behavior is byte-identical.
+    ///
+    /// Classification: a branch is GROUP-KEY if any of its patterns binds a GROUP BY
+    /// var (its terminal dim carries the group attribute); otherwise SEMI-JOIN (a
+    /// pure membership/constraint branch, e.g. `order → customer[segment=Enterprise]`).
+    /// v1 admits EXACTLY one of each (the crt_join_reorder class); the branch LIST is
+    /// the K-branch-ready carrier. Declines (`None`) on: <3 patterns, a non-unique
+    /// root (disconnected), a non-branching root (out-degree <2 — that is a linear
+    /// chain, [`Self::order_chain`]'s job), a merge (a pattern referenced by >1), a
+    /// nested branch inside a branch, a cycle, a disconnected pattern, or a
+    /// branch-set that is not {one GROUP-KEY, one SEMI-JOIN}.
+    fn decompose_branching_star<'p>(
+        pats: &[&'p R2rmlPattern],
+        group_by: &[VarId],
+    ) -> Option<BranchingStar<'p>> {
+        let n = pats.len();
+        if n < 3 {
+            return None; // a branching star needs a root + ≥2 branch heads
+        }
+        // Directed FK edges (child i → parent j). A pattern may have MULTIPLE
+        // out-edges (the branch point); each parent is referenced at most once.
+        let mut out: Vec<Vec<(VarId, usize)>> = vec![Vec::new(); n];
+        let mut indeg = vec![0usize; n];
+        for i in 0..n {
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                if let Some(jv) = Self::joins_via(pats[i], pats[j]) {
+                    out[i].push((jv, j));
+                    indeg[j] += 1;
+                    if indeg[j] > 1 {
+                        return None; // merge: a pattern referenced by >1 parent
+                    }
+                }
+            }
+        }
+        // Exactly one root (in-degree 0); more than one ⇒ disconnected.
+        let mut root_idx = None;
+        for (i, &d) in indeg.iter().enumerate() {
+            if d == 0 {
+                if root_idx.is_some() {
+                    return None;
+                }
+                root_idx = Some(i);
+            }
+        }
+        let root_idx = root_idx?;
+        // The root must BRANCH (≥2 FK targets); out-degree 1 is a linear chain and
+        // belongs to order_chain, not here.
+        if out[root_idx].len() < 2 {
+            return None;
+        }
+        // Walk each root edge into a LINEAR sub-chain; a branch interior with >1
+        // out-edge is a nested branch (v1 declines). Every non-root pattern must be
+        // visited exactly once (connected, no cycle, branches disjoint).
+        let mut visited = vec![false; n];
+        visited[root_idx] = true;
+        let mut branches: Vec<JoinBranch<'p>> = Vec::with_capacity(out[root_idx].len());
+        let root_edges = out[root_idx].clone();
+        for (root_jv, head) in root_edges {
+            let mut chain: Vec<&'p R2rmlPattern> = Vec::new();
+            let mut join_vars: Vec<VarId> = Vec::new();
+            let mut cur = head;
+            loop {
+                if visited[cur] {
+                    return None; // cycle, or a node shared between branches
+                }
+                visited[cur] = true;
+                chain.push(pats[cur]);
+                match out[cur].as_slice() {
+                    [] => break,
+                    [(jv, nxt)] => {
+                        join_vars.push(*jv);
+                        cur = *nxt;
+                    }
+                    _ => return None, // nested branch within a branch (v1 declines)
+                }
+            }
+            let is_group_key = group_by.iter().any(|gv| {
+                chain
+                    .iter()
+                    .any(|p| Self::predicate_for_var(p, *gv).is_some())
+            });
+            let branch = Branch {
+                root_join_var: root_jv,
+                chain,
+                join_vars,
+            };
+            branches.push(if is_group_key {
+                JoinBranch::GroupKey(branch)
+            } else {
+                JoinBranch::SemiJoin(branch)
+            });
+        }
+        if !visited.iter().all(|&v| v) {
+            return None; // a pattern is disconnected from the root
+        }
+        // v1 admission: exactly one GROUP-KEY branch + one SEMI-JOIN branch.
+        let group_keys = branches
+            .iter()
+            .filter(|b| matches!(b, JoinBranch::GroupKey(_)))
+            .count();
+        let semi_joins = branches
+            .iter()
+            .filter(|b| matches!(b, JoinBranch::SemiJoin(_)))
+            .count();
+        if branches.len() != 2 || group_keys != 1 || semi_joins != 1 {
+            return None;
+        }
+        Some(BranchingStar {
+            root: pats[root_idx],
+            branches,
+        })
+    }
+
     /// PR-6 (6a): resolve a fused aggregate over a single fact→dim FK hop. `pats`
     /// are the rewritten R2rml leaf patterns — here exactly two: the fact (chain
     /// root, carrying the aggregate measure columns) and one dimension carrying
@@ -2805,8 +2969,25 @@ impl FusedR2rmlAggregateOperator {
         // Order the patterns into a linear `fact → dim1 → … → dimk` chain (single
         // ref-join per hop, no branch, no cycle). `join_vars[h]` is dim_{h+1}'s
         // subject var — the object bound by the hop-`h` RefObjectMap.
-        let Some((chain, join_vars)) = Self::order_chain(pats) else {
-            return Ok(None);
+        let (chain, join_vars) = match Self::order_chain(pats) {
+            Some(c) => c,
+            None => {
+                // P3 (scaffolding): a non-linear shape may be the branching-star
+                // multi-fact join (crt_join_reorder class). Recognize it — gated by
+                // the P3 switch — for the follow-on soundness core (the semi-join
+                // keep-min-then-filter build + fold probe), but DECLINE for now, so
+                // this path is byte-identical to pre-P3.
+                if Self::multifact_enabled() {
+                    if let Some(star) = Self::decompose_branching_star(pats, &self.group_by) {
+                        tracing::debug!(
+                            branches = star.branches.len(),
+                            "fused R2RML multi-fact branching-star recognized; \
+                             soundness core (semi-join build) not yet implemented — declining"
+                        );
+                    }
+                }
+                return Ok(None);
+            }
         };
         let fact_p = chain[0];
         let terminal_p = *chain.last().expect("order_chain returns ≥2 patterns");
@@ -5283,6 +5464,89 @@ mod tests {
         let d1 = R2rmlPattern::new("gs", VarId(1), None);
         let d2 = R2rmlPattern::new("gs", VarId(2), None);
         assert!(FusedR2rmlAggregateOperator::order_chain(&[&branch_fact, &d1, &d2]).is_none());
+    }
+
+    // P3 (scaffolding): the branching-star detector must DECOMPOSE crt_join_reorder's
+    // shape correctly — the fact root, one group-key dim branch, one semi-join fact
+    // branch — even though full admission still declines (the soundness core lands
+    // separately).
+    #[test]
+    fn decompose_branching_star_recognizes_crt_join_reorder_shape() {
+        // Synthetic crt_join_reorder join graph (predicate strings arbitrary; only
+        // the subject-var edges + which branch binds the GROUP BY var matter):
+        //   ?ol(0) --order--> ?o(1) --customer--> ?c(3)      (semi-join branch)
+        //   ?ol(0) --product--> ?p(2)  [binds ?cat(12)]      (group-key branch)
+        // GROUP BY ?cat(12); ?qty(10) is the scalar measure (not a pattern subject).
+        let star = |subj: u16, binds: &[(&str, u16)]| {
+            let mut p = R2rmlPattern::new("gs", VarId(subj), None);
+            p.star_bindings = binds
+                .iter()
+                .map(|(pr, v)| ((*pr).to_string(), VarId(*v)))
+                .collect();
+            p
+        };
+        let ol = star(0, &[("order", 1), ("product", 2), ("quantity", 10)]);
+        let o = star(1, &[("customer", 3)]);
+        let c = star(3, &[("segment", 11)]);
+        let p = star(2, &[("category", 12)]);
+        let group_by = [VarId(12)];
+
+        // Pass shuffled; decomposition must recover the star regardless of order.
+        let starr =
+            FusedR2rmlAggregateOperator::decompose_branching_star(&[&c, &p, &ol, &o], &group_by)
+                .expect("crt_join_reorder shape must decompose");
+        assert_eq!(
+            starr.root.subject_var,
+            Some(VarId(0)),
+            "OrderLine is the fact root"
+        );
+        assert_eq!(starr.branches.len(), 2);
+        let gk = starr
+            .branches
+            .iter()
+            .find_map(|b| match b {
+                JoinBranch::GroupKey(br) => Some(br),
+                JoinBranch::SemiJoin(_) => None,
+            })
+            .expect("exactly one group-key branch");
+        let sj = starr
+            .branches
+            .iter()
+            .find_map(|b| match b {
+                JoinBranch::SemiJoin(br) => Some(br),
+                JoinBranch::GroupKey(_) => None,
+            })
+            .expect("exactly one semi-join branch");
+        // Group-key branch = product→category: chain [?p], root FK var = ?p(2).
+        assert_eq!(gk.root_join_var, VarId(2));
+        assert_eq!(
+            gk.chain
+                .iter()
+                .map(|p| p.subject_var.unwrap())
+                .collect::<Vec<_>>(),
+            vec![VarId(2)]
+        );
+        // Semi-join branch = order→customer: chain [?o, ?c], root FK var = ?o(1),
+        // within-branch hop = the customer join (?c=3).
+        assert_eq!(sj.root_join_var, VarId(1));
+        assert_eq!(
+            sj.chain
+                .iter()
+                .map(|p| p.subject_var.unwrap())
+                .collect::<Vec<_>>(),
+            vec![VarId(1), VarId(3)]
+        );
+        assert_eq!(sj.join_vars, vec![VarId(3)]);
+
+        // A LINEAR chain (no branch) is NOT a branching star — declines here (it is
+        // order_chain's shape). A single group-key branch with NO semi-join declines.
+        let lin_fact = star(0, &[("customer", 1)]);
+        let lin_dim = star(1, &[("region", 12)]);
+        assert!(FusedR2rmlAggregateOperator::decompose_branching_star(
+            &[&lin_fact, &lin_dim],
+            &group_by
+        )
+        .is_none());
     }
 
     // W4-2 gate Q1: route each GROUP BY var to its single source pattern (fact or
