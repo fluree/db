@@ -19,7 +19,9 @@ use fluree_db_api::materialize::{verify_twin, ParityReport, VerifyMode};
 // `mor_guard::ALLOW_MOR_DELETES_ENV`, re-exported by fluree-db-api (which the CLI
 // already depends on) — instead of a hard-copied literal that could silently drift
 // on a rename.
-use fluree_db_api::{DropMode, Fluree, FlureeR2rmlProvider, ALLOW_MOR_DELETES_ENV};
+use fluree_db_api::{
+    DropMode, Fluree, FlureeR2rmlProvider, NameServiceLookup, NsRecord, ALLOW_MOR_DELETES_ENV,
+};
 
 use crate::cli::{MaterializeOutput, MaterializeVerify};
 use crate::context;
@@ -114,6 +116,32 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
     // snapshot pin + watermark capture.
     let fluree: &'static Fluree = Box::leak(Box::new(context::build_fluree(dirs)?));
     let provider = Arc::new(FlureeR2rmlProvider::new(fluree));
+
+    // CRITICAL-1 (#1529 review): a failed parity gate drops the WHOLE ledger NAME
+    // — every branch, `DropMode::Hard`, no `--force` (admin.rs collects
+    // `all_records().filter(|r| r.name == ledger_name)`). But the build's freshness
+    // refusal is branch-SCOPED (keyed on `name:branch`), so `--into existing:new`
+    // initializes cleanly and a later gate failure — which can fire on a CORRECT
+    // twin (CRITICAL-3) — then purges every OTHER branch of that ledger too,
+    // irreversibly. Refuse up front unless the ledger NAME is fresh apart from the
+    // target branch, restoring by construction the invariant docs/cli/materialize.md
+    // rests on ("the drop can only ever hit a ledger this build just created").
+    let (twin_name, twin_branch) = fluree_db_core::ledger_id::split_ledger_id(&twin_ledger)?;
+    let existing_branches = fluree
+        .nameservice()
+        .list_branches(&twin_name)
+        .await
+        .map_err(|e| CliError::Import(format!("check twin ledger freshness: {e}")))?;
+    if let Some(other) = blocking_existing_branch(&existing_branches, &twin_branch) {
+        return Err(CliError::Usage(format!(
+            "materialize requires a fresh ledger name; '{twin_name}' already has branch \
+             '{other_branch}'. A failed parity gate hard-drops the entire ledger name (every \
+             branch), so materializing into a new branch of an existing ledger would risk purging \
+             '{twin_name}:{other_branch}'. Pick a ledger name that does not yet exist, or drop the \
+             existing ledger first.",
+            other_branch = other.branch,
+        )));
+    }
 
     if !params.quiet {
         println!(
@@ -242,6 +270,22 @@ fn default_twin_name(graph_source: &str) -> String {
     }
 }
 
+/// CRITICAL-1: given the nameservice records for the twin's ledger NAME and the
+/// build's target branch, return the first record that BLOCKS a fresh build, if
+/// any. Only a LIVE (non-retracted) branch OTHER than the target blocks: a
+/// retracted branch is already gone (the gate-fail drop purging it is no data
+/// loss), and the target branch itself is governed by the build's own
+/// branch-scoped freshness guard. A blocker means the name-scoped gate-fail drop
+/// could purge a branch this build did not create — so we refuse before building.
+fn blocking_existing_branch<'a>(
+    existing: &'a [NsRecord],
+    target_branch: &str,
+) -> Option<&'a NsRecord> {
+    existing
+        .iter()
+        .find(|r| !r.retracted && r.branch != target_branch)
+}
+
 /// The whole-ledger id (no `:branch` suffix), as `drop_ledger` requires.
 fn ledger_name_no_branch(ledger: &str) -> &str {
     ledger
@@ -337,6 +381,34 @@ mod tests {
         // build failure (no redundant re-suggestion of the flag).
         let err = classify_build_error("merge-on-read something else went wrong", true);
         assert!(!err.to_string().contains("--allow-mor-deletes"));
+    }
+
+    fn retracted(mut r: NsRecord) -> NsRecord {
+        r.retracted = true;
+        r
+    }
+
+    #[test]
+    fn blocking_existing_branch_refuses_a_live_non_target_branch() {
+        // CRITICAL-1: the name-scoped gate-fail drop would purge this live 'main'.
+        let existing = vec![NsRecord::new("analytics-twin", "main")];
+        let blocker = blocking_existing_branch(&existing, "v2");
+        assert!(blocker.is_some(), "a live non-target branch must block");
+        assert_eq!(blocker.unwrap().branch, "main");
+    }
+
+    #[test]
+    fn blocking_existing_branch_allows_fresh_or_target_only() {
+        // Empty name → fresh → no block.
+        assert!(blocking_existing_branch(&[], "main").is_none());
+        // Only the target branch present (governed by the build's own freshness
+        // guard, and the drop can only hit what this build created) → no block.
+        let target_only = vec![NsRecord::new("dw-twin", "main")];
+        assert!(blocking_existing_branch(&target_only, "main").is_none());
+        // A RETRACTED non-target branch is already gone → purging it is no data
+        // loss → no block.
+        let retracted_other = vec![retracted(NsRecord::new("dw-twin", "old"))];
+        assert!(blocking_existing_branch(&retracted_other, "main").is_none());
     }
 
     #[test]
