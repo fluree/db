@@ -193,7 +193,12 @@ fn escape_literal(value: &str) -> String {
 ///
 /// Returns an error for a join with no conditions (a cross-product ref), which
 /// the bulk materializer refuses rather than explode.
-fn canonical_join(rom: &RefObjectMap) -> R2rmlResult<(Vec<String>, Vec<String>)> {
+///
+/// Exported (MAJOR-1, #1529 review) so the VIRTUAL query path builds its parent
+/// lookup index and probes it through the SAME canonicalization the enumerator
+/// uses — otherwise a multi-column FK whose child-declared order disagrees with
+/// its parent-sorted order transposes the probe key and silently drops edges.
+pub fn canonical_join(rom: &RefObjectMap) -> R2rmlResult<(Vec<String>, Vec<String>)> {
     if rom.join_conditions.is_empty() {
         return Err(R2rmlError::Materialization(format!(
             "RefObjectMap referencing parent '{}' has no join conditions; \
