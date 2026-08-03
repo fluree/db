@@ -372,6 +372,30 @@ impl Fluree {
                 .insert((graph, subject));
         }
 
+        // Per-transaction size budget, derived from the ledger's novelty ceiling.
+        //
+        // A transaction whose flakes reach `reindex_max_bytes` is REJECTED outright
+        // (`TransactError::NoveltyWouldExceed`) — not delayed, not retried into
+        // success. This window used to become ONE transaction per target, so a wide
+        // source could never sync AT ALL: silver.observation produced 702k rows =
+        // 75,964,480 B of flakes against the configured 67,108,864 B ceiling and
+        // failed on every poll forever. The error carried `current=0`, proving
+        // novelty was empty and the single transaction was simply too big — so no
+        // amount of waiting or indexing could ever have cleared it.
+        //
+        // Raising the ceiling is the wrong lever: it is PER-LEDGER with no aggregate
+        // cap, so it multiplies by concurrently-hot ledgers, and no fixed value is
+        // safe because a larger window breaches any of them.
+        //
+        // The budget is measured in serialized JSON-LD bytes (cheap to estimate
+        // here) while the ceiling is in flake bytes. JSON-LD text runs several times
+        // larger than the flakes it yields — that window was ~108 flake-bytes per
+        // row against JSON nodes of a few hundred bytes — so budgeting JSON bytes at
+        // a QUARTER of the flake ceiling errs in the safe direction. Over-chunking is
+        // nearly free: `reindex_min_bytes` is 1 MiB, so the indexer drains novelty
+        // between chunks rather than letting it accumulate toward the ceiling.
+        let txn_budget = (self.index_config.reindex_max_bytes / 4).max(1 << 20);
+
         let mut subjects_retracted = 0usize;
         for (target, (live, deletions)) in by_target {
             // Retraction is skipped on a brand-new target (nothing to retract);
@@ -405,10 +429,12 @@ impl Fluree {
                     if iris.is_empty() {
                         continue;
                     }
-                    ledger = self
-                        .update(ledger, &build_retract_doc(iris, graph.as_deref()))
-                        .await?
-                        .ledger;
+                    for chunk in chunk_iris_by_size(iris, txn_budget) {
+                        ledger = self
+                            .update(ledger, &build_retract_doc(&chunk, graph.as_deref()))
+                            .await?
+                            .ledger;
+                    }
                 }
             }
 
@@ -428,8 +454,11 @@ impl Fluree {
                 // empty `[]` doc (the transactor rejects an upsert with no
                 // predicate/@type). The retracts above already applied.
                 let live_doc = nodes_by_graph_to_doc(nodes_by_graph);
-                if !live_doc.is_empty() {
-                    self.upsert(ledger, &JsonValue::Array(live_doc)).await?;
+                // Chunked: one window used to be one transaction, which a wide
+                // source cannot fit under the novelty ceiling at any window size
+                // (see `transaction_json_budget`).
+                for chunk in chunk_nodes_by_size(live_doc, txn_budget) {
+                    ledger = self.upsert(ledger, &JsonValue::Array(chunk)).await?.ledger;
                 }
             } else {
                 // Additive mode: assert `@type` via an idempotent `insert` so
@@ -449,11 +478,8 @@ impl Fluree {
                     }
                 }
                 let type_doc = nodes_by_graph_to_doc(type_by_graph);
-                if !type_doc.is_empty() {
-                    ledger = self
-                        .insert(ledger, &JsonValue::Array(type_doc))
-                        .await?
-                        .ledger;
+                for chunk in chunk_nodes_by_size(type_doc, txn_budget) {
+                    ledger = self.insert(ledger, &JsonValue::Array(chunk)).await?.ledger;
                 }
                 // A type-only source (e.g. an r2rml `entity_type` map: subject +
                 // rdf:type, no other predicates) leaves `pred_by_graph` empty, so
@@ -463,8 +489,8 @@ impl Fluree {
                 // its watermark advances — so the next poll full-rescans and
                 // re-fails forever (churn: a new @type-insert commit every poll).
                 let pred_doc = nodes_by_graph_to_doc(pred_by_graph);
-                if !pred_doc.is_empty() {
-                    self.upsert(ledger, &JsonValue::Array(pred_doc)).await?;
+                for chunk in chunk_nodes_by_size(pred_doc, txn_budget) {
+                    ledger = self.upsert(ledger, &JsonValue::Array(chunk)).await?.ledger;
                 }
             }
         }
@@ -915,6 +941,88 @@ fn nodes_by_graph_to_doc(by_graph: BTreeMap<Option<String>, Vec<JsonValue>>) -> 
                 }
             }
         }
+    }
+    out
+}
+
+/// Approximate serialized-JSON size of a value, without allocating.
+///
+/// Deliberately an estimate: it exists only to decide where to cut a batch, so
+/// being a few bytes out per node is irrelevant, and paying a full
+/// `to_string()` per node just to measure it would double serialization work on
+/// the exact path we are trying to keep cheap.
+fn estimated_json_bytes(v: &JsonValue) -> usize {
+    match v {
+        JsonValue::Null => 4,
+        JsonValue::Bool(_) => 5,
+        JsonValue::Number(_) => 8,
+        JsonValue::String(s) => s.len() + 2,
+        // + len for the separating commas.
+        JsonValue::Array(a) => 2 + a.len() + a.iter().map(estimated_json_bytes).sum::<usize>(),
+        JsonValue::Object(o) => {
+            2 + o.len()
+                + o.iter()
+                    .map(|(k, val)| k.len() + 3 + estimated_json_bytes(val))
+                    .sum::<usize>()
+        }
+    }
+}
+
+/// Split a flat JSON-LD node array into batches that stay within `budget`
+/// serialized bytes, so one materialize window becomes as many transactions as
+/// it needs instead of a single unbounded one.
+///
+/// Safe to split because [`nodes_by_graph_to_doc`] emits SELF-CONTAINED nodes: a
+/// named-graph node carries its own `@graph` string selector, so graph scoping
+/// travels with the node and never depends on its neighbours. Do not "optimise"
+/// this into splitting the envelope form — that form is not accepted by
+/// insert/upsert at all (see `nodes_by_graph_to_doc`).
+///
+/// A node bigger than the budget on its own is emitted alone rather than
+/// dropped: one oversized subject should fail loudly by itself rather than
+/// silently take a whole batch down with it.
+fn chunk_nodes_by_size(nodes: Vec<JsonValue>, budget: usize) -> Vec<Vec<JsonValue>> {
+    let mut out: Vec<Vec<JsonValue>> = Vec::new();
+    let mut current: Vec<JsonValue> = Vec::new();
+    let mut current_bytes = 0usize;
+    for node in nodes {
+        let bytes = estimated_json_bytes(&node);
+        if !current.is_empty() && current_bytes + bytes > budget {
+            out.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += bytes;
+        current.push(node);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Split a retraction IRI set into batches within `budget` serialized bytes.
+///
+/// `latest_by_key` retracts every subject the window touched, so the retraction
+/// doc scales with the window exactly as the upsert does and can breach the
+/// novelty ceiling on its own. Each batch becomes a complete `build_retract_doc`
+/// update carrying its own `graph` key, so batching preserves graph scoping.
+fn chunk_iris_by_size(iris: &BTreeSet<String>, budget: usize) -> Vec<BTreeSet<String>> {
+    // Per-IRI overhead of the `values` row: `[{"@type":"@id","@value":"…"}]`.
+    const ROW_OVERHEAD: usize = 40;
+    let mut out: Vec<BTreeSet<String>> = Vec::new();
+    let mut current: BTreeSet<String> = BTreeSet::new();
+    let mut current_bytes = 0usize;
+    for iri in iris {
+        let bytes = iri.len() + ROW_OVERHEAD;
+        if !current.is_empty() && current_bytes + bytes > budget {
+            out.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += bytes;
+        current.insert(iri.clone());
+    }
+    if !current.is_empty() {
+        out.push(current);
     }
     out
 }
@@ -1532,5 +1640,93 @@ mod tests {
             "rdf:type must be a class, not an ordinary predicate: {:?}",
             node.predicates
         );
+    }
+
+    fn node(id: &str, pad: usize) -> JsonValue {
+        json!({ "@id": id, "p": "x".repeat(pad) })
+    }
+
+    #[test]
+    fn chunk_nodes_empty_yields_no_chunks() {
+        // Load-bearing: callers iterate the chunks instead of guarding on
+        // `!doc.is_empty()`, and the transactor REJECTS an upsert/insert with no
+        // predicate or @type. If an empty doc produced one empty chunk we would
+        // send `[]`, which aborts the sync BEFORE its watermark advances — so the
+        // next poll full-rescans and re-fails forever.
+        assert!(chunk_nodes_by_size(vec![], 1024).is_empty());
+        assert!(chunk_iris_by_size(&BTreeSet::new(), 1024).is_empty());
+    }
+
+    #[test]
+    fn chunk_nodes_preserves_every_node_in_order() {
+        // The whole point is to split a transaction, never to lose or reorder a
+        // subject: materialize is a whole-subject REPLACE, so a dropped node
+        // silently leaves a subject retracted and not re-asserted.
+        let nodes: Vec<JsonValue> = (0..50).map(|i| node(&format!("s{i}"), 100)).collect();
+        let chunks = chunk_nodes_by_size(nodes.clone(), 512);
+        assert!(chunks.len() > 1, "expected a split at this budget");
+        let flat: Vec<JsonValue> = chunks.into_iter().flatten().collect();
+        assert_eq!(flat, nodes);
+    }
+
+    #[test]
+    fn chunk_nodes_respects_budget_and_never_drops_an_oversized_node() {
+        // A node larger than the whole budget cannot be split (it is one subject),
+        // so it must be emitted ALONE rather than dropped or merged.
+        let big = node("big", 4096);
+        let small = node("small", 10);
+        let chunks = chunk_nodes_by_size(vec![small.clone(), big.clone(), small.clone()], 512);
+        let flat: Vec<JsonValue> = chunks.iter().flatten().cloned().collect();
+        assert_eq!(flat, vec![small.clone(), big.clone(), small]);
+        let big_chunk = chunks
+            .iter()
+            .find(|c| c.contains(&big))
+            .expect("oversized node retained");
+        assert_eq!(big_chunk.len(), 1, "oversized node must be sent alone");
+        // Every other chunk stays within budget.
+        for chunk in chunks.iter().filter(|c| !c.contains(&big)) {
+            let bytes: usize = chunk.iter().map(estimated_json_bytes).sum();
+            assert!(bytes <= 512, "chunk over budget: {bytes}");
+        }
+    }
+
+    #[test]
+    fn chunk_nodes_keeps_the_named_graph_selector_on_every_node() {
+        // Chunking is only safe because `nodes_by_graph_to_doc` emits SELF-CONTAINED
+        // nodes — a named-graph node carries its own `@graph` string. If that ever
+        // moved to an envelope, splitting would silently drop graph scoping and
+        // cross-write tenants' graphs.
+        let mut by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+        by_graph.insert(
+            Some("urn:g1".to_string()),
+            (0..20).map(|i| node(&format!("a{i}"), 80)).collect(),
+        );
+        let doc = nodes_by_graph_to_doc(by_graph);
+        let chunks = chunk_nodes_by_size(doc, 256);
+        assert!(chunks.len() > 1, "expected a split at this budget");
+        for chunk in &chunks {
+            for n in chunk {
+                assert_eq!(
+                    n.get("@graph").and_then(JsonValue::as_str),
+                    Some("urn:g1"),
+                    "chunking dropped the per-node graph selector"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_iris_partitions_the_set_exactly() {
+        let iris: BTreeSet<String> = (0..40).map(|i| format!("urn:subject:{i}")).collect();
+        let chunks = chunk_iris_by_size(&iris, 200);
+        assert!(chunks.len() > 1, "expected a split at this budget");
+        let mut union: BTreeSet<String> = BTreeSet::new();
+        let mut total = 0usize;
+        for chunk in &chunks {
+            total += chunk.len();
+            union.extend(chunk.iter().cloned());
+        }
+        assert_eq!(union, iris, "retraction chunks must cover every subject");
+        assert_eq!(total, iris.len(), "chunks must not duplicate a subject");
     }
 }
