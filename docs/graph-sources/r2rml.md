@@ -344,6 +344,10 @@ Query Iceberg tables containing large-scale analytical data alongside Fluree led
 
 A single R2RML mapping file can define multiple `TriplesMap` entries, each targeting a different Iceberg table or logical view. This enables querying across related tables through a single graph source.
 
+## Materializing a Native Twin
+
+An R2RML graph source is *virtual* — every query re-reads the underlying tables. To snapshot it into a native, fully-indexed Fluree ledger (a *twin*), use [`fluree materialize`](../cli/materialize.md). The twin bulk-materializes every triple the mapping produces (foreign keys resolved into RDF references), stamps the mapping hash and per-table Iceberg watermark into its final commit, and verifies itself against the source before it is announced. See [Iceberg → Materializing a native twin](iceberg.md#materializing-a-native-twin) for the stamp/watermark contract and verification modes.
+
 ## Limitations
 
 1. **Read-Only:** R2RML graph sources are read-only (no writes via Fluree)
@@ -397,4 +401,5 @@ A single R2RML mapping file can define multiple `TriplesMap` entries, each targe
 
 - [Graph Sources Overview](overview.md) - Graph source concepts
 - [Iceberg](iceberg.md) - Data lake integration
+- [materialize](../cli/materialize.md) - Build a native twin ledger from a mapping
 - [Query Datasets](../query/datasets.md) - Multi-graph queries

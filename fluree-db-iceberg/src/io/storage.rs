@@ -77,6 +77,17 @@ pub trait SendIcebergStorage: Debug + Send + Sync {
         }
         Ok(out)
     }
+
+    /// List the immediate child directory names under `prefix` (one object-store
+    /// LIST with a `/` delimiter → common prefixes, child segment only). Used for
+    /// warehouse-root resolution in catalog-less Direct mode. Default: unsupported
+    /// — only the S3 backend (and its lazy wrapper) override it.
+    async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
+        let _ = prefix;
+        Err(IcebergError::storage(
+            "list_dir (warehouse-root listing) is not supported by this storage backend",
+        ))
+    }
 }
 
 /// S3 storage implementation using vended credentials.
@@ -683,6 +694,61 @@ impl SendIcebergStorage for S3IcebergStorage {
     /// `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` switch).
     async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
         self.read_ranges_bounded(path, ranges).await
+    }
+
+    /// One `ListObjectsV2` with a `/` delimiter → the immediate child directory
+    /// names under `prefix` (from the response's common prefixes), paginated.
+    async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
+        let (bucket, key) = Self::parse_s3_uri(prefix)?;
+        let list_prefix = if key.is_empty() || key.ends_with('/') {
+            key.to_string()
+        } else {
+            format!("{key}/")
+        };
+        let mut names = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&list_prefix)
+                .delimiter("/");
+            if let Some(token) = continuation.take() {
+                req = req.continuation_token(token);
+            }
+            let response = req.send().await.map_err(|e| {
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "ListObjectsV2",
+                    bucket,
+                    &list_prefix,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
+            })?;
+            for cp in response.common_prefixes() {
+                if let Some(p) = cp.prefix() {
+                    let child = p
+                        .strip_prefix(&list_prefix)
+                        .unwrap_or(p)
+                        .trim_end_matches('/');
+                    if !child.is_empty() {
+                        names.push(child.to_string());
+                    }
+                }
+            }
+            if response.is_truncated().unwrap_or(false) {
+                continuation = response.next_continuation_token().map(String::from);
+                if continuation.is_some() {
+                    continue;
+                }
+            }
+            break;
+        }
+        Ok(names)
     }
 }
 

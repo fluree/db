@@ -47,8 +47,8 @@ use fluree_db_r2rml::mapping::{
 };
 use fluree_db_r2rml::materialize::{
     expand_template, get_join_key_from_batch, materialize_object_from_batch,
-    materialize_predicate_from_batch, materialize_subject_from_batch, reverse_subject_template,
-    RdfTerm,
+    materialize_predicate_from_batch, materialize_subject_from_batch, parent_key_insert_keep_min,
+    reverse_subject_template, RdfTerm,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use fluree_vocab::xsd;
@@ -2573,6 +2573,7 @@ fn build_parent_lookup(
     batches: Vec<ColumnBatch>,
 ) -> Result<ParentLookup> {
     let mut lookup = ParentLookup::new();
+    let mut dup_key_collisions = 0u64;
 
     for batch in batches {
         // F-AUD-3 site A2: the fact-as-parent hazard (V2) — a RefObjectMap whose
@@ -2613,14 +2614,22 @@ fn build_parent_lookup(
                 None => continue, // Null in join key - skip
             };
 
-            // Insert into lookup (last wins for duplicate keys)
-            lookup.insert(key, subject_term);
+            // Deterministic keep-min on a duplicate join key (shared with the
+            // materialize twin builder via `parent_key_insert_keep_min`), so the
+            // virtual path and the twin resolve the SAME parent and both are
+            // reproducible regardless of scan / IO-completion order — NOT the old
+            // scan-order-dependent last-wins. The true R2RML fan-out (one edge per
+            // matching parent) is a tracked shared-path follow-up.
+            if parent_key_insert_keep_min(&mut lookup, key, subject_term) {
+                dup_key_collisions += 1;
+            }
         }
     }
 
     tracing::debug!(
         parent_tm = %parent_tm.iri,
         lookup_size = lookup.len(),
+        dup_key_collisions,
         "Built parent lookup table for RefObjectMap join"
     );
 

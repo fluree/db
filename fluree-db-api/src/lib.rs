@@ -70,6 +70,7 @@ mod inline_ontology;
 mod inline_shapes;
 mod ledger;
 pub mod ledger_info;
+pub mod materialize;
 mod merge;
 mod merge_preview;
 pub mod nameservice_query;
@@ -216,6 +217,14 @@ pub use graph_source::{
 /// tenant-agnostic and fails closed when a secret reference has no resolver.
 #[cfg(feature = "iceberg")]
 pub use fluree_db_iceberg::{SecretResolveError, SecretResolver};
+
+/// The env var that opts into materializing Iceberg merge-on-read delete files
+/// (the fail-closed MoR guard's escape hatch). Re-exported from
+/// [`fluree_db_iceberg::mor_guard`] so downstreams (the CLI's `fluree materialize
+/// --allow-mor-deletes`) reference the ONE definition — a rename shows up at the
+/// use site instead of silently diverging from a hard-copied literal.
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::mor_guard::ALLOW_MOR_DELETES_ENV;
 
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,

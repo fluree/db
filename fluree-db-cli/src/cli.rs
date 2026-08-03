@@ -1143,6 +1143,121 @@ pub enum Commands {
         #[command(subcommand)]
         action: IcebergAction,
     },
+
+    /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg)
+    /// graph source: bulk-build every triple, verify it against the source, and
+    /// write it as a native ledger or a .flpack pack (DEC-003 Deliverable 1).
+    ///
+    /// MACHINE-SAFETY: the default posture is co-resident-tolerant (a modest
+    /// fixed memory budget + low parallelism, NOT own-the-box auto-sizing).
+    /// Raise it explicitly with `--memory-budget-mb` / `--parallelism`, or pass
+    /// `--max-performance` on a cleared machine to auto-size to the host.
+    ///
+    /// PARALLELISM: `--parallelism` sizes the produce-side worker pool (O1) — that
+    /// many threads render + encode table batches concurrently (it also bounds the
+    /// concurrent snapshot pins and FK pre-index scans, O5). Default 2 (co-resident).
+    ///
+    /// BUDGET MODEL: `--memory-budget-mb` now scales the chunk size for sub-2GB
+    /// budgets too (previously any budget below ~2GB underflowed to a fixed 128MB
+    /// chunk regardless — O6); below 2GB the chunk is ~budget×0.6 / working-set,
+    /// clamped to [16, 128] MB. Peak produce RAM ≈ parallelism × chunk × ~2.5 (one
+    /// chunk buffer + encoding sink per worker) plus the FK parent index. That
+    /// parent index — held resident for the whole build — is now CHARGED against the
+    /// budget (up to ~50% of it) and the build FAILS LOUD if it would overflow,
+    /// rather than silently OOM the host. Verify is memory-bounded in both modes
+    /// (O2): peak is O(sampled subjects) for `quick` and O(one external-sort run)
+    /// for `full`.
+    Materialize {
+        /// The virtual graph-source id to materialize (e.g. `dw-gs:main`).
+        graph_source: String,
+
+        /// Name for the twin ledger. Defaults to the graph-source id with a
+        /// `-twin` suffix (the `:branch` is preserved).
+        #[arg(long)]
+        into: Option<String>,
+
+        /// Output form: `pack` (a .flpack file, the default), `ledger` (a local
+        /// native ledger, left registered), or `s3` (direct-S3 CAS publish —
+        /// not yet wired in the file-backed CLI; see DEC-003 §3).
+        #[arg(long, value_enum, default_value_t = MaterializeOutput::Pack)]
+        output: MaterializeOutput,
+
+        /// Destination path for `--output pack` (default: `<twin>.flpack` in the
+        /// current directory).
+        #[arg(long)]
+        output_path: Option<PathBuf>,
+
+        /// Verification depth run against the built twin before it is announced.
+        /// `quick` (default): per-class instance counts + a seeded sample of 3
+        /// subjects per class, compared against the build's OWN enumerator — a
+        /// SHARED oracle, so it catches ingest/index corruption but NOT enumerator
+        /// logic bugs (a bug appears identically on both sides). `full`: a
+        /// whole-twin triple diff against the source (strongest; ~one extra full
+        /// source read). A failed gate drops the twin and exits non-zero.
+        #[arg(long, value_enum, default_value_t = MaterializeVerify::Quick)]
+        verify: MaterializeVerify,
+
+        /// Own-the-box: auto-size memory/parallelism to the host (~80% RAM).
+        /// Only on a cleared machine — the default is deliberately conservative
+        /// to stay co-resident-safe.
+        #[arg(long)]
+        max_performance: bool,
+
+        /// Proceed even if a source table carries Iceberg merge-on-read delete
+        /// files (sets `FLUREE_ICEBERG_ALLOW_MOR_DELETES`). The twin is then a
+        /// point-in-time snapshot that may include rows a MoR-aware reader would
+        /// hide — documented staleness. Default: fail closed.
+        #[arg(long)]
+        allow_mor_deletes: bool,
+
+        /// Proceed even if a foreign-key parent join key maps to MORE THAN ONE
+        /// parent row. By default the build is refused: the twin would bake one
+        /// deterministically-chosen parent per key (the lexicographically smallest)
+        /// and silently drop the rest — an R2RML RefObjectMap fan-out the builder
+        /// does not yet emit. With this flag the twin builds anyway and records the
+        /// anomaly (per-parent ambiguous-key counts) in its completion stamp.
+        /// Default: fail closed.
+        #[arg(long)]
+        allow_duplicate_parent_keys: bool,
+
+        /// Fluree home directory (overrides `$FLUREE_HOME` / the platform data
+        /// dir). Where the twin ledger and its storage live.
+        #[arg(long)]
+        home: Option<PathBuf>,
+
+        /// Scratch directory for `--verify full`'s on-disk spool + external-sort
+        /// runs. Defaults to a subdirectory of the twin's `.fluree` storage area.
+        /// Point it at fast local scratch if you like — but AVOID a tmpfs `/tmp`
+        /// (RAM-backed on many Linux hosts), which would undo full-verify's
+        /// bounded-memory design and can spill tens of GB back into RAM on a large
+        /// twin. Unused by `--verify quick`.
+        #[arg(long)]
+        tmp_dir: Option<PathBuf>,
+    },
+}
+
+/// Output form for `fluree materialize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MaterializeOutput {
+    /// A `.flpack` pack file (prebuilt commits + index) — the negotiated door
+    /// for solo delivery. The default.
+    Pack,
+    /// A local native ledger, left registered in this home.
+    Ledger,
+    /// Direct-S3 CAS publish (the >40GB escape hatch). Not yet wired in the
+    /// file-backed CLI — see DEC-003 §3.
+    S3,
+}
+
+/// Verification depth for `fluree materialize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MaterializeVerify {
+    /// Per-class counts + a seeded 3-subjects-per-class sample, against the build's
+    /// own enumerator (a shared oracle). The always-on default.
+    Quick,
+    /// A full-triple diff of the whole twin against the source. Strongest;
+    /// cost roughly a second full source read.
+    Full,
 }
 
 /// BM25 full-text index subcommands.
@@ -2687,7 +2802,19 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub table: Option<String>,
 
-    /// S3 table location for direct mode (e.g., "s3://bucket/warehouse/ns/table")
+    /// S3 table location for direct mode (e.g., "s3://bucket/warehouse/ns/table").
+    ///
+    /// WAREHOUSE ROOT (multi-table): point this at the DATABASE/namespace root
+    /// (e.g. "s3://bucket/warehouse/dw") of a catalog-less copy — such as a
+    /// Snowflake-managed Iceberg database whose table dirs carry random suffixes
+    /// (`fact_order.UIHGsQex/`). With an `--r2rml` mapping, each `rr:tableName`
+    /// (e.g. `DW.FACT_ORDER`) is resolved to its own dir under the root via one
+    /// S3 LIST, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively
+    /// on the name (namespace stripped). Warehouse mode is auto-detected when the
+    /// location's leaf directory does not name the requested table; a bare
+    /// single-table location resolves as before. (A table named exactly after its
+    /// parent directory would read as single-table.) No catalog/OAuth flags are
+    /// needed — direct mode reads with ambient IAM credentials.
     #[arg(long)]
     pub table_location: Option<String>,
 

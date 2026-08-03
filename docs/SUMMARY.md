@@ -44,6 +44,7 @@
   - [mcp](cli/mcp.md)
   - [docs](cli/docs.md)
   - [iceberg](cli/iceberg.md)
+  - [materialize](cli/materialize.md)
   - [completions](cli/completions.md)
 
 - [Getting started](getting-started/README.md)

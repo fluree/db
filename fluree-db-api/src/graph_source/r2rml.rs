@@ -848,6 +848,20 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
 
         Ok(compiled)
     }
+
+    /// Report the per-table build watermark from this provider's catalog session
+    /// (DEC-003). Every scan of a table this build touches records its pinned
+    /// snapshot into `self.session` (see `scan_table_inner`); this surfaces those
+    /// captures as `{table → snapshot}` for `graph_source_id`. The bulk builder
+    /// fails loud if this is empty for a non-empty table set, so a provider that
+    /// never scanned (or a session that lost its pins) cannot publish an unstamped
+    /// twin.
+    fn build_watermark(
+        &self,
+        graph_source_id: &str,
+    ) -> std::collections::HashMap<String, fluree_db_query::r2rml::TableWatermark> {
+        self.session.pinned_tables(graph_source_id)
+    }
 }
 
 /// Bounded concurrency for warming per-table catalog contexts in
@@ -1337,6 +1351,67 @@ impl FlureeR2rmlProvider<'_> {
         None
     }
 
+    /// Resolve the effective table location for a Direct-mode scan. When
+    /// `table_location` is a warehouse ROOT (a catalog-less multi-table copy) —
+    /// detected because its leaf directory does not name the requested table —
+    /// LIST the root once (session-cached, one LIST per build) and match THIS
+    /// table's own `<name>.<suffix>/` (or bare `<name>/`) directory beneath it,
+    /// case-insensitively on the name part. Ambiguity or a miss fails loud, naming
+    /// the candidates. Otherwise (a single-table direct location) returns
+    /// `table_location` unchanged, so the caller's resolution is byte-identical.
+    ///
+    /// Detection is pure string logic; a table literally named after its parent
+    /// directory reads as single-table (documented in `iceberg map --help`).
+    async fn resolve_direct_table_location(
+        &self,
+        table_location: &str,
+        table_id: &TableIdentifier,
+        lt_key: &str,
+        iceberg_config: &IcebergGsConfig,
+    ) -> QueryResult<String> {
+        let trimmed = table_location.trim_end_matches('/');
+        let leaf = trimmed.rsplit('/').next().unwrap_or("");
+        let leaf_name = leaf.split('.').next().unwrap_or("");
+        let requested = table_id.table.trim();
+        let is_warehouse = !requested.is_empty() && !leaf_name.eq_ignore_ascii_case(requested);
+        if !is_warehouse {
+            return Ok(table_location.to_string());
+        }
+
+        let root = trimmed.to_string();
+        let listing = match self.session.cached_warehouse_listing(&root) {
+            Some(l) => l,
+            None => {
+                let storage = direct_session_storage(
+                    &self.session,
+                    lt_key,
+                    iceberg_config.io.s3_region.as_deref(),
+                    iceberg_config.io.s3_endpoint.as_deref(),
+                    iceberg_config.io.s3_path_style,
+                )
+                .await?;
+                let dirs = storage.list_dir(&root).await.map_err(|e| {
+                    storage_query_error(&format!("Failed to LIST warehouse root {root}"), e)
+                })?;
+                info!(
+                    warehouse_root = %root,
+                    tables_found = dirs.len(),
+                    "Listed catalog-less warehouse root (direct mode)"
+                );
+                self.session.store_warehouse_listing(root.clone(), dirs)
+            }
+        };
+
+        let matched = fluree_db_iceberg::catalog::match_warehouse_table_dir(requested, &listing)
+            .map_err(|e| {
+                QueryError::InvalidQuery(format!(
+                    "warehouse-root resolution for table '{}': {e}",
+                    table_id.table
+                ))
+            })?;
+        Ok(format!("{root}/{matched}"))
+    }
+
     async fn load_table_context(
         &self,
         graph_source_id: &str,
@@ -1673,11 +1748,6 @@ impl FlureeR2rmlProvider<'_> {
                 (load_response, storage)
             }
             CatalogConfig::Direct { table_location } => {
-                info!(
-                    table_location = %table_location,
-                    "Loading table via direct S3 access"
-                );
-
                 // Session cache key for this table's storage client — the same
                 // key the REST branch uses (source id + fully-qualified table),
                 // so repeated scans of one Direct table in a query reuse a single
@@ -1687,6 +1757,26 @@ impl FlureeR2rmlProvider<'_> {
                     graph_source_id,
                     &table_id.namespace,
                     &table_id.table,
+                );
+
+                // Warehouse-root resolution: when `table_location` is a warehouse
+                // ROOT (a catalog-less multi-table copy) rather than a single
+                // table dir, resolve THIS table's own directory beneath it via one
+                // session-cached LIST. Single-table direct returns `table_location`
+                // unchanged, so its behavior below is byte-identical.
+                let effective_location = self
+                    .resolve_direct_table_location(
+                        table_location,
+                        &table_id,
+                        &lt_key,
+                        &iceberg_config,
+                    )
+                    .await?;
+                let table_location = &effective_location;
+
+                info!(
+                    table_location = %table_location,
+                    "Loading table via direct S3 access"
                 );
 
                 let cache = self.fluree.r2rml_cache();
@@ -1838,6 +1928,23 @@ impl FlureeR2rmlProvider<'_> {
         // scan in one query read the same pinned Iceberg snapshot.
         let (storage, metadata, metadata_location) =
             self.load_table_context(graph_source_id, table_name).await?;
+
+        // Capture this table's pinned snapshot into the build watermark (DEC-003).
+        // The single caller of `load_table_context` records here (first-writer-wins),
+        // avoiding the multiple resolution paths inside it; the ids come straight off
+        // the already-parsed metadata (no extra I/O). Harmless for ordinary queries —
+        // `build_watermark` only reads it during a materialize build.
+        self.session.record_snapshot(
+            super::catalog_session::IcebergCatalogSession::snapshot_key(
+                graph_source_id,
+                table_name,
+            ),
+            fluree_db_query::r2rml::TableWatermark {
+                metadata_location: metadata_location.clone(),
+                snapshot_id: metadata.current_snapshot_id,
+                sequence_number: metadata.current_snapshot().map(|s| s.sequence_number),
+            },
+        );
 
         // Shared on-disk cache for data files (one global byte budget, deduped per
         // directory). Threaded into the Parquet readers, which apply a
