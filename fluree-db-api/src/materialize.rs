@@ -246,7 +246,9 @@ impl TripleObserver for InterningObserver<'_, '_> {
         let s = intern_term(self.sink, subject);
         let p = self.sink.term_iri(predicate);
         let o = intern_term(self.sink, object);
-        self.sink.emit_triple(s, p, o);
+        self.sink
+            .emit_triple(s, p, o)
+            .map_err(|e| R2rmlError::Materialization(format!("flake encode: {e}")))?;
         *self.bytes += triple_weight(subject, predicate, object);
         Ok(())
     }
