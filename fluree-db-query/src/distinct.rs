@@ -87,6 +87,17 @@ impl DistinctOperator {
 
 #[async_trait]
 impl Operator for DistinctOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — DISTINCT may collapse arbitrarily
+    /// many input rows into one, so producing `k` distinct rows can require
+    /// unboundedly many input rows. Explicit (was a silent trait-default no-op) so
+    /// the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "DISTINCT row-budget swallowed (unsound to forward: dedup collapses rows)"
+        );
+    }
+
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
     }

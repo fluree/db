@@ -315,6 +315,20 @@ fn rows_match(
 
 #[async_trait]
 impl Operator for MinusOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — MINUS is an anti-join whose output
+    /// is a SUBSET of the primary (each primary row emits 0 or 1), so a finite
+    /// budget on the primary can under-produce (the excluded rows don't count
+    /// toward `k`). This is the SAME reasoning the inner nested-loop join uses to
+    /// absorb rather than forward (`join.rs`). NOTE: this DEVIATES from the item's
+    /// brief ("MINUS forwards to primary"), on soundness grounds — see the audit
+    /// implementation log. Explicit (was a silent trait-default no-op).
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "MINUS row-budget swallowed (unsound: anti-join output ⊆ primary, multiplicity ≤1)"
+        );
+    }
+
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
     }

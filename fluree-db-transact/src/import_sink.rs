@@ -38,7 +38,7 @@ mod inner {
     use fluree_db_indexer::run_index::global_dict::{DictWorkerCache, SharedDictAllocator};
     use fluree_db_indexer::run_index::shared_pool::{SharedNumBigPool, SharedVectorArenaPool};
     use fluree_db_indexer::run_index::spool::{SpoolFileInfo, SpoolWriter};
-    use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
+    use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
     use rustc_hash::FxHashMap;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -76,7 +76,10 @@ mod inner {
     // -----------------------------------------------------------------------
 
     /// Configuration for creating a [`SpoolContext`] — bundles all shared
-    /// allocators needed by the parallel import pipeline.
+    /// allocators needed by the parallel import pipeline. All fields are `Arc`, so
+    /// `Clone` is cheap (a handle bump) — the materialize worker pool hands each
+    /// worker its own clone.
+    #[derive(Clone)]
     pub struct SpoolConfig {
         /// Shared predicate allocator (global IDs, no remap).
         pub predicate_alloc: Arc<SharedDictAllocator>,
@@ -522,7 +525,7 @@ mod inner {
     /// ```ignore
     /// let mut sink = ImportSink::new(&mut ns, t, txn_id, true)?;
     /// fluree_graph_turtle::parse(ttl, &mut sink)?;
-    /// let writer = sink.finish();
+    /// let writer = sink.into_parts();
     /// let result = writer.finish(&envelope)?;
     /// ```
     pub struct ImportSink<'a> {
@@ -596,11 +599,28 @@ mod inner {
             self.spool_ctx = Some(ctx);
         }
 
+        /// Intern a predicate IRI, returning its `(namespace_code, local_name)`.
+        /// Like [`GraphSink::term_iri`], this allocates + tracks the namespace code
+        /// so it is published in this chunk's `namespace_delta` — required when the
+        /// code names a `txn_meta` predicate (the materialize completion stamp),
+        /// whose namespace code must resolve when the commit is read back. Emits no
+        /// flake; only the code allocation is a side effect.
+        pub fn intern_meta_predicate(&mut self, iri: &str) -> (u16, String) {
+            let sid = self.ns.sid_for_iri(iri);
+            (sid.namespace_code, sid.name.to_string())
+        }
+
         /// Consume the sink and return the writer for finalization.
         ///
         /// Returns an error if any flake failed to encode during parsing.
+        ///
+        /// Distinct from the protocol's [`GraphSink::finish`] (flush /
+        /// finalize): this is the sink's *product*. Deferred-error semantics
+        /// are unchanged by the fallible protocol — `emit_*` still records the
+        /// first encode failure and keeps going, and this method is where it
+        /// becomes a hard error.
         #[allow(clippy::type_complexity)]
-        pub fn finish(
+        pub fn into_parts(
             self,
         ) -> Result<
             (
@@ -798,8 +818,14 @@ mod inner {
             })
         }
 
-        fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) {
+        fn emit_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+        ) -> SinkResult {
             self.push_triple(subject, predicate, object, None);
+            Ok(())
         }
 
         fn emit_list_item(
@@ -808,8 +834,9 @@ mod inner {
             predicate: TermId,
             object: TermId,
             index: i32,
-        ) {
+        ) -> SinkResult {
             self.push_triple(subject, predicate, object, Some(index));
+            Ok(())
         }
 
         fn supports_reified_triples(&self) -> bool {
@@ -829,18 +856,18 @@ mod inner {
             predicate: TermId,
             object: TermId,
             reifier: TermId,
-        ) {
+        ) -> SinkResult {
             let Some(s) = self.resolve_sid(subject) else {
-                return;
+                return Ok(());
             };
             let Some(p) = self.resolve_sid(predicate) else {
-                return;
+                return Ok(());
             };
             let Some((o, dtc)) = self.resolve_object(object) else {
-                return;
+                return Ok(());
             };
             let Some(ann) = self.resolve_sid(reifier) else {
-                return;
+                return Ok(());
             };
 
             let bundle =
@@ -852,7 +879,7 @@ mod inner {
                             tracing::error!("ImportSink: {msg}");
                             self.encode_error = Some(CommitCodecError::InvalidOp(msg));
                         }
-                        return;
+                        return Ok(());
                     }
                 };
             for flake in bundle {
@@ -861,7 +888,7 @@ mod inner {
                         tracing::error!("ImportSink: reifier bundle flake encode failed: {}", e);
                         self.encode_error = Some(e);
                     }
-                    return; // Don't spool a flake that failed to encode
+                    return Ok(()); // Don't spool a flake that failed to encode
                 }
                 if let Some(ctx) = &mut self.spool_ctx {
                     ctx.write_record(FlakeRecord {
@@ -875,6 +902,7 @@ mod inner {
                     });
                 }
             }
+            Ok(())
         }
     }
 
@@ -956,9 +984,9 @@ mod inner {
             let s = sink.term_iri("http://example.org/alice");
             let p = sink.term_iri("http://example.org/name");
             let o = sink.term_literal("Alice", Datatype::xsd_string(), None);
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
-            let (writer, _prefix_map, _spool) = sink.finish().unwrap();
+            let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
             assert_eq!(writer.op_count(), 1);
 
             let result = writer.finish(&make_envelope(1)).unwrap();
@@ -978,29 +1006,29 @@ mod inner {
             // String
             let p = sink.term_iri("http://example.org/str");
             let o = sink.term_literal("hello", Datatype::xsd_string(), None);
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
             // Integer
             let p = sink.term_iri("http://example.org/num");
             let o = sink.term_literal_value(LiteralValue::Integer(42), Datatype::xsd_integer());
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
             // Double
             let p = sink.term_iri("http://example.org/dbl");
             let o = sink.term_literal_value(LiteralValue::Double(3.13), Datatype::xsd_double());
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
             // Boolean
             let p = sink.term_iri("http://example.org/flag");
             let o = sink.term_literal_value(LiteralValue::Boolean(true), Datatype::xsd_boolean());
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
             // Ref (IRI in object position)
             let p = sink.term_iri("http://example.org/knows");
             let o = sink.term_iri("http://example.org/bob");
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
-            let (writer, _prefix_map, _spool) = sink.finish().unwrap();
+            let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
             assert_eq!(writer.op_count(), 5);
 
             let result = writer.finish(&make_envelope(1)).unwrap();
@@ -1021,9 +1049,9 @@ mod inner {
             let s = sink.term_iri("http://example.org/alice");
             let p = sink.term_iri("http://example.org/name");
             let o = sink.term_literal("Alice", Datatype::rdf_lang_string(), Some("en"));
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
-            let (writer, _prefix_map, _spool) = sink.finish().unwrap();
+            let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
             let result = writer.finish(&make_envelope(1)).unwrap();
             let decoded = read_commit(&result.bytes).unwrap();
 
@@ -1050,10 +1078,10 @@ mod inner {
             let p = sink.term_iri("http://example.org/worksFor");
             let o = sink.term_iri("http://example.org/acme");
             let r = sink.term_iri("http://example.org/reifier");
-            sink.emit_triple(s, p, o);
-            sink.emit_reified_triple(s, p, o, r);
+            sink.emit_triple(s, p, o).unwrap();
+            sink.emit_reified_triple(s, p, o, r).unwrap();
 
-            let (writer, _prefix_map, _spool) = sink.finish().unwrap();
+            let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
             assert_eq!(writer.op_count(), 4, "base + 3 bundle flakes");
 
             let result = writer.finish(&make_envelope(1)).unwrap();
@@ -1094,11 +1122,11 @@ mod inner {
             let o0 = sink.term_literal_value(LiteralValue::Integer(10), Datatype::xsd_integer());
             let o1 = sink.term_literal_value(LiteralValue::Integer(20), Datatype::xsd_integer());
             let o2 = sink.term_literal_value(LiteralValue::Integer(30), Datatype::xsd_integer());
-            sink.emit_list_item(s, p, o0, 0);
-            sink.emit_list_item(s, p, o1, 1);
-            sink.emit_list_item(s, p, o2, 2);
+            sink.emit_list_item(s, p, o0, 0).unwrap();
+            sink.emit_list_item(s, p, o1, 1).unwrap();
+            sink.emit_list_item(s, p, o2, 2).unwrap();
 
-            let (writer, _prefix_map, _spool) = sink.finish().unwrap();
+            let (writer, _prefix_map, _spool) = sink.into_parts().unwrap();
             assert_eq!(writer.op_count(), 3);
 
             let result = writer.finish(&make_envelope(1)).unwrap();
@@ -1137,11 +1165,11 @@ mod inner {
             let o_name = sink.term_literal("Alice", Datatype::xsd_string(), None);
             let o_age = sink.term_literal_value(LiteralValue::Integer(30), Datatype::xsd_integer());
             let bob = sink.term_iri("http://example.org/bob");
-            sink.emit_triple(s, p_name, o_name);
-            sink.emit_triple(s, p_age, o_age);
-            sink.emit_triple(s, p_knows, bob);
+            sink.emit_triple(s, p_name, o_name).unwrap();
+            sink.emit_triple(s, p_age, o_age).unwrap();
+            sink.emit_triple(s, p_knows, bob).unwrap();
 
-            let (writer, _prefix_map, spool_ctx) = sink.finish().unwrap();
+            let (writer, _prefix_map, spool_ctx) = sink.into_parts().unwrap();
             assert_eq!(writer.op_count(), 3);
 
             // Verify spool recorded the same number of records
@@ -1205,16 +1233,16 @@ mod inner {
             // Language-tagged string
             let p = sink.term_iri("http://example.org/name");
             let o = sink.term_literal("Alice", Datatype::rdf_lang_string(), Some("en"));
-            sink.emit_triple(s, p, o);
+            sink.emit_triple(s, p, o).unwrap();
 
             // List items
             let p = sink.term_iri("http://example.org/scores");
             let o0 = sink.term_literal_value(LiteralValue::Integer(10), Datatype::xsd_integer());
             let o1 = sink.term_literal_value(LiteralValue::Integer(20), Datatype::xsd_integer());
-            sink.emit_list_item(s, p, o0, 0);
-            sink.emit_list_item(s, p, o1, 1);
+            sink.emit_list_item(s, p, o0, 0).unwrap();
+            sink.emit_list_item(s, p, o1, 1).unwrap();
 
-            let (_writer, _prefix_map, spool_ctx) = sink.finish().unwrap();
+            let (_writer, _prefix_map, spool_ctx) = sink.into_parts().unwrap();
             let spool_ctx = spool_ctx.unwrap();
             assert_eq!(spool_ctx.record_count(), 3);
             let result = spool_ctx.finish().unwrap();
@@ -1257,10 +1285,10 @@ mod inner {
             let bob = sink.term_iri("http://example.org/bob");
             let p1 = sink.term_iri("http://example.org/knows");
             let p2 = sink.term_iri("http://example.org/likes");
-            sink.emit_triple(alice, p1, bob);
-            sink.emit_triple(alice, p2, bob);
+            sink.emit_triple(alice, p1, bob).unwrap();
+            sink.emit_triple(alice, p2, bob).unwrap();
 
-            let (_writer, _prefix_map, spool_ctx) = sink.finish().unwrap();
+            let (_writer, _prefix_map, spool_ctx) = sink.into_parts().unwrap();
             let spool_ctx = spool_ctx.unwrap();
             let result = spool_ctx.finish().unwrap();
 

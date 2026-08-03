@@ -81,12 +81,11 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         // Determine projection
         let (projected_field_ids, projected_columns) = self.resolve_projection(schema)?;
 
-        // Fail closed on merge-on-read delete files (F-AUD-1): the scan reads only
-        // live data files and never applies deletes, so a MoR snapshot would
-        // silently return deleted rows. Same shared guard as `ScanPlanner`: a
-        // zero-I/O summary check first, then the manifest-list belt-and-suspenders.
-        let allow_mor =
-            crate::mor_guard::ensure_summary_scannable(snapshot, &self.metadata.location)?;
+        // Fail closed on merge-on-read delete files (F-AUD-1): the scan reads
+        // only live data files and never applies deletes, so a MoR snapshot
+        // would silently return deleted rows. Cheap zero-I/O check first.
+        let allow_mor = crate::mor_guard::mor_deletes_allowed();
+        crate::mor_guard::ensure_no_summary_deletes(snapshot, &self.metadata.location, allow_mor)?;
 
         // Load manifest list
         let manifest_list_path = snapshot.manifest_list.as_ref().ok_or_else(|| {
@@ -99,11 +98,16 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         // Parse WITH delete manifests so the belt-and-suspenders guard can DETECT
         // them even when the snapshot summary omits/under-counts the counters.
         let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
-        crate::mor_guard::ensure_manifests_scannable(
-            &manifest_entries,
+        let delete_manifests = manifest_entries.iter().filter(|e| e.is_deletes()).count();
+        crate::mor_guard::ensure_no_delete_manifests(
+            delete_manifests,
             &self.metadata.location,
             allow_mor,
         )?;
+        // Only ever `true` under the override (else refused above); propagated so
+        // a cached scan-file selection can re-refuse if the override is later off.
+        let has_delete_manifests =
+            crate::mor_guard::summary_indicates_deletes(snapshot) || delete_manifests > 0;
 
         tracing::debug!(
             manifest_count = manifest_entries.len(),
@@ -168,6 +172,7 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
             estimated_row_count,
             files_selected,
             files_pruned,
+            has_delete_manifests,
         })
     }
 

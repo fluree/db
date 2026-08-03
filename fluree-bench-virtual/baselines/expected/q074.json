@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "query_id": "q074",
+  "result_hash": "6e0f430cd2728d4e8ddf6fe4a2022aa9cc116f3878d021e93a2632e4eec8e7c9",
+  "rows": 50,
+  "head_rows": [],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KXVT6C3DFJJWEWYXWX75QEWR",
+    "commit": "1441e0038"
+  }
+}

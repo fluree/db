@@ -389,6 +389,14 @@ fn collect_and_comparisons(
             true
         }
         Expression::And(children) => children.iter().all(|c| collect_and_comparisons(c, out)),
+        // An `In`/`NotIn` set filter has no row-level Arrow representation here.
+        // Treat it as transparent (don't push, don't abort) so a sibling
+        // comparison in the same `And` still builds its row filter. Sound: the row
+        // filter may only ever keep MORE rows than the true predicate — file /
+        // row-group pruning (which DO evaluate `In`) and the in-engine FILTER stay
+        // the authority. A lone `In` yields an empty plan ⇒ no row filter, exactly
+        // as before this arm existed.
+        Expression::In { .. } | Expression::NotIn { .. } => true,
         _ => false,
     }
 }
@@ -452,7 +460,12 @@ fn literal_to_array(value: &LiteralValue) -> ArrayRef {
         LiteralValue::String(s) => Arc::new(StringArray::from(vec![s.clone()])),
         LiteralValue::Bytes(b) => Arc::new(BinaryArray::from(vec![b.as_slice()])),
         LiteralValue::Date(d) => Arc::new(Date32Array::from(vec![*d])),
-        LiteralValue::Timestamp(t) => Arc::new(TimestampMicrosecondArray::from(vec![*t])),
+        // Both timestamp flavors carry micros-since-epoch; `cast` adapts to the
+        // column's own (tz-tagged or not) timestamp type. If the cast can't adapt,
+        // `eval_comparison` keeps every row and the in-engine FILTER decides.
+        LiteralValue::Timestamp(t) | LiteralValue::TimestampTz(t) => {
+            Arc::new(TimestampMicrosecondArray::from(vec![*t]))
+        }
         LiteralValue::Decimal {
             unscaled,
             precision,

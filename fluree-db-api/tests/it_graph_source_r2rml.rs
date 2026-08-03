@@ -4503,3 +4503,1418 @@ async fn f20_prebound_nonproduct_iri_dies_by_conjunction() {
         "a pre-bound non-product ?p must die via the ref-member conjunction, not survive"
     );
 }
+
+// =============================================================================
+// Bulk materializer (DEC-003 Deliverable 1) — driver over the scan path
+// =============================================================================
+
+/// Decode one result binding to an N-Triples term, matching the bulk
+/// materializer's own rendering: a subject `Sid` via `decode_sid`, a raw graph
+/// source `Iri` verbatim, and a plain string literal without an explicit
+/// `xsd:string` datatype (the materializer's convention for `dtc = None`).
+fn binding_to_nt<F>(b: &fluree_db_query::Binding, decode_sid: &F) -> String
+where
+    F: Fn(&fluree_db_core::Sid) -> Option<String>,
+{
+    if let Some(iri) = b.get_iri() {
+        return format!("<{iri}>");
+    }
+    match b {
+        fluree_db_query::Binding::Sid { sid, .. } => {
+            format!("<{}>", decode_sid(sid).expect("decode subject sid to IRI"))
+        }
+        fluree_db_query::Binding::Lit {
+            val: fluree_db_core::FlakeValue::String(s),
+            ..
+        } => format!("\"{s}\""),
+        other => panic!("materializer engine-diff: unexpected binding variant {other:?}"),
+    }
+}
+
+/// ENGINE-EQUIVALENCE (Chunk B checkpoint): the bulk materializer's streaming
+/// driver, run over the SAME airline mock the engine's `?s ?p ?o` wildcard scan
+/// uses, must emit EXACTLY the triple set the engine produces — subjects,
+/// predicates, and objects decoded to N-Triples and compared as sets. This is
+/// the deterministic, hermetic analog of the live native-sf01 full-triple diff:
+/// it proves the new whole-graph enumerator agrees with the proven query engine
+/// over an identical scan, not just with hand-written expectations.
+#[tokio::test]
+async fn materializer_driver_matches_engine_wildcard() {
+    use fluree_db_r2rml::materialize::NTriplesCollector;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "r2rml-mat:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    // Path A — the bulk materializer driver.
+    let mut collector = NTriplesCollector::default();
+    let stats = fluree_db_api::materialize::materialize_graph(
+        &provider,
+        "airlines-gs:main",
+        &mut collector,
+    )
+    .await
+    .expect("materialize driver should succeed");
+    let driver_triples = collector.sorted_unique();
+
+    // Path B — the engine `?s ?p ?o` wildcard scan, decoded to N-Triples.
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let tp = TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o));
+    let batches = run_airline_graph_scan(&ledger, &provider, &vars, tp, vec![s, p, o]).await;
+
+    let decode = |sid: &fluree_db_core::Sid| ledger.snapshot.decode_sid(sid);
+    let mut engine_triples: Vec<String> = Vec::new();
+    for b in &batches {
+        for r in 0..b.len() {
+            let subj = binding_to_nt(b.get(r, s).expect("?s bound"), &decode);
+            let pred = b
+                .get(r, p)
+                .and_then(fluree_db_query::Binding::get_iri)
+                .expect("?p is a predicate IRI")
+                .to_string();
+            let obj = binding_to_nt(b.get(r, o).expect("?o bound"), &decode);
+            engine_triples.push(format!("{subj} <{pred}> {obj} ."));
+        }
+    }
+    engine_triples.sort();
+    engine_triples.dedup();
+
+    assert_eq!(
+        driver_triples, engine_triples,
+        "materializer driver triple set must equal the engine wildcard scan's"
+    );
+    // 3 airlines × (name + country + iata + rdf:type) = 12 triples.
+    assert_eq!(
+        stats.total_triples(),
+        12,
+        "airline mapping yields 12 triples"
+    );
+    assert_eq!(driver_triples.len(), 12);
+}
+
+/// Returns different batches per logical table so a dim + fact + foreign-key
+/// mapping can be materialized over the streaming scan path.
+#[derive(Debug)]
+struct MultiTableMock {
+    mapping: Arc<CompiledR2rmlMapping>,
+    tables: HashMap<String, Vec<ColumnBatch>>,
+}
+
+#[async_trait]
+impl R2rmlProvider for MultiTableMock {
+    async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
+        true
+    }
+    async fn compiled_mapping(
+        &self,
+        _gs: &str,
+        _t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+
+    // Fake per-table watermarks so the builder's fail-loud stamp guard passes
+    // (DEC-003 §17(b): mocks override with fakes). Keyed by the logical table
+    // name the driver scans, matching the real provider's capture.
+    fn build_watermark(
+        &self,
+        _gs: &str,
+    ) -> std::collections::HashMap<String, fluree_db_query::r2rml::TableWatermark> {
+        self.tables
+            .keys()
+            .map(|t| {
+                (
+                    t.clone(),
+                    fluree_db_query::r2rml::TableWatermark {
+                        metadata_location: format!("mock://{t}/metadata.json"),
+                        snapshot_id: Some(1),
+                        sequence_number: Some(1),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for MultiTableMock {
+    async fn scan_table(
+        &self,
+        _gs: &str,
+        table: &str,
+        _p: &[String],
+        _f: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        Ok(vec_batch_stream(
+            self.tables.get(table).cloned().unwrap_or_default(),
+        ))
+    }
+}
+
+/// FK INTEGRATION: the streaming driver resolves a foreign-key edge across two
+/// separate tables (dims-first ordering + parent index over streamed scans),
+/// and drops a dangling FK — the async analog of the in-memory golden FK test.
+#[tokio::test]
+async fn materializer_driver_resolves_fk_across_tables() {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TriplesMap,
+    };
+    use fluree_db_r2rml::materialize::NTriplesCollector;
+
+    // Customer dim (parent) + Order fact (child, FK placedBy -> Customer).
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/name"),
+        object_map: ObjectMap::column("name"),
+    }];
+
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+        object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#Customer>", "cust_key", "c_key")),
+    }];
+
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "c_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "name".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    let cust_batch = ColumnBatch::new(
+        Arc::new(cust_schema),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+        ],
+    )
+    .unwrap();
+
+    let order_schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "o_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "cust_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    // order 1 -> cust 10 (match); order 2 -> cust 99 (dangling, dropped).
+    let order_batch = ColumnBatch::new(
+        Arc::new(order_schema),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::Int64(vec![Some(10), Some(99)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    let provider = MultiTableMock { mapping, tables };
+
+    let mut collector = NTriplesCollector::default();
+    let stats = fluree_db_api::materialize::materialize_graph(&provider, "gs:main", &mut collector)
+        .await
+        .expect("materialize driver should succeed");
+    let triples = collector.sorted_unique();
+
+    assert!(
+        triples.contains(
+            &"<http://ex.org/order/1> <http://ex.org/placedBy> <http://ex.org/customer/10> ."
+                .to_string()
+        ),
+        "matched FK edge must be present: {triples:?}"
+    );
+    assert!(
+        !triples
+            .iter()
+            .any(|t| t.contains("order/2") && t.contains("placedBy")),
+        "dangling FK (cust 99) must be dropped: {triples:?}"
+    );
+    assert_eq!(stats.ref_triples, 1, "exactly one FK edge resolves");
+    assert_eq!(stats.ref_dangling, 1, "order 2's FK is dangling");
+}
+
+/// END-TO-END (Chunk B complete): materialize a virtual R2RML source into a REAL
+/// native ledger through the bulk import pipeline (ImportSource::Virtual → commit
+/// → index → publish), then query the twin back and confirm term, datatype,
+/// language, and foreign-key fidelity round-trip. Tight EXPLICIT bounds per the
+/// machine-safety directive (parallelism + a small memory budget; never
+/// auto-detection). Multi-thread runtime: the virtual producer drives its async
+/// scan via Handle::block_on off a dedicated thread.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn materialize_builds_queryable_native_twin() {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    };
+
+    const LEDGER: &str = "test/twin:main";
+
+    // Customer dim: name (plain string) + label (lang-tagged @en).
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/name"),
+            object_map: ObjectMap::column("name"),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/label"),
+            object_map: ObjectMap::Column {
+                column: "label".to_string(),
+                datatype: None,
+                language: Some("en".to_string()),
+                term_type: TermType::Literal,
+            },
+        },
+    ];
+    // Order fact: amount (xsd:decimal) + placedBy (FK → Customer).
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/amount"),
+            object_map: ObjectMap::column_typed(
+                "amount",
+                "http://www.w3.org/2001/XMLSchema#decimal",
+            ),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Customer>",
+                "cust_key",
+                "c_key",
+            )),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "c_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "label".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+            Column::String(vec![Some("hola".to_string()), Some("mundo".to_string())]),
+        ],
+    )
+    .unwrap();
+    let order_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "o_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "amount".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "cust_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::String(vec![Some("9.99".to_string()), Some("5.00".to_string())]),
+            Column::Int64(vec![Some(10), Some(20)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    let provider = Arc::new(MultiTableMock { mapping, tables });
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    // Materialize the twin with TIGHT EXPLICIT bounds (machine-safety directive).
+    let result = fluree
+        .create(LEDGER)
+        .import_r2rml(provider, "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("materialize virtual twin");
+    assert!(result.root_id.is_some(), "twin index must be built");
+
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+    let json = |q: &'static str| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            support::query_sparql(fluree, ledger, q)
+                .await
+                .expect("query")
+                .to_sparql_json(&ledger.snapshot)
+                .expect("sparql json")
+        }
+    };
+
+    // Class count (parity-gate "counts" shape against the built twin).
+    let orders = json("SELECT (COUNT(*) AS ?c) WHERE { ?s a <http://ex.org/Order> }").await;
+    assert_eq!(orders["results"]["bindings"][0]["c"]["value"], "2");
+    let customers = json("SELECT (COUNT(*) AS ?c) WHERE { ?s a <http://ex.org/Customer> }").await;
+    assert_eq!(customers["results"]["bindings"][0]["c"]["value"], "2");
+
+    // Foreign-key edge fidelity: order 1 placedBy customer 10.
+    let fk = json("SELECT ?c WHERE { <http://ex.org/order/1> <http://ex.org/placedBy> ?c }").await;
+    assert_eq!(
+        fk["results"]["bindings"][0]["c"]["value"], "http://ex.org/customer/10",
+        "FK edge must resolve to the parent subject IRI"
+    );
+
+    // Typed-literal fidelity: xsd:decimal round-trips value + datatype.
+    let amt = json("SELECT ?a WHERE { <http://ex.org/order/1> <http://ex.org/amount> ?a }").await;
+    let amt_b = &amt["results"]["bindings"][0]["a"];
+    assert_eq!(amt_b["value"], "9.99", "decimal value must round-trip");
+    assert_eq!(
+        amt_b["datatype"], "http://www.w3.org/2001/XMLSchema#decimal",
+        "decimal datatype must round-trip (not narrowed to string)"
+    );
+
+    // Language-tag fidelity: label@en round-trips value + language.
+    let lbl =
+        json("SELECT ?l WHERE { <http://ex.org/customer/10> <http://ex.org/label> ?l }").await;
+    let lbl_b = &lbl["results"]["bindings"][0]["l"];
+    assert_eq!(lbl_b["value"], "hola", "lang literal value must round-trip");
+    assert_eq!(lbl_b["xml:lang"], "en", "language tag must round-trip");
+}
+
+/// Read the completion stamp off a ledger's HEAD commit by decoding its envelope
+/// `txn_meta`. Panics if the head commit carries no stamp.
+#[cfg(feature = "native")]
+async fn read_head_stamp(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+) -> fluree_db_api::materialize::WatermarkStamp {
+    use fluree_db_core::commit::codec::envelope::decode_envelope;
+    use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
+    use fluree_db_core::ContentStore;
+
+    let rec = fluree
+        .nameservice()
+        .lookup(ledger)
+        .await
+        .expect("ns lookup")
+        .expect("ledger exists");
+    let head = rec.commit_head_id.expect("ledger has commits");
+    let raw = fluree
+        .content_store(ledger)
+        .get(&head)
+        .await
+        .expect("read head commit blob");
+    let hdr = CommitHeader::read_from(&raw).expect("commit header");
+    let start = HEADER_LEN;
+    let end = start + hdr.envelope_len as usize;
+    let env = decode_envelope(&raw[start..end]).expect("decode envelope");
+    // The stamp predicates' ns code resolves via this commit's own namespace_delta
+    // (they were freshly interned into the final commit's sink).
+    fluree_db_api::materialize::read_stamp(&env.txn_meta, &env.namespace_delta)
+        .expect("head commit must carry the completion stamp")
+}
+
+/// D ROUND-TRIP: the twin's completion stamp is written to the FINAL commit's
+/// txn_meta, survives an archive_ledger → restore_ledger round-trip byte-for-byte,
+/// and parses back identically. This is the completion-marker contract — a valid
+/// twin is one whose head commit carries a parseable stamp.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_stamp_survives_pack_restore() {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TriplesMap,
+    };
+
+    const LEDGER: &str = "test/twin-stamp:main";
+    const RESTORED: &str = "test/twin-stamp-restored:main";
+
+    // Two tables (dim + fact with an FK) → two watermark entries.
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/name"),
+        object_map: ObjectMap::column("name"),
+    }];
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+        object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#Customer>", "cust_key", "c_key")),
+    }];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+    let expected_hash = fluree_db_api::materialize::mapping_hash(&mapping);
+
+    let cust_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "c_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+        ],
+    )
+    .unwrap();
+    let order_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "o_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "cust_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 2,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::Int64(vec![Some(10), Some(20)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    let provider = Arc::new(MultiTableMock { mapping, tables });
+
+    // Build twin A (TIGHT bounds — machine-safety directive).
+    let src_dir = tempfile::tempdir().expect("src tmpdir");
+    let src = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source Fluree");
+    src.create(LEDGER)
+        .import_r2rml(provider, "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("materialize twin");
+
+    // The head commit carries the stamp; it matches the assembled stamp.
+    let stamp_a = read_head_stamp(&src, LEDGER).await;
+    assert_eq!(
+        stamp_a.mapping_hash, expected_hash,
+        "stamp mapping hash matches"
+    );
+    assert!(
+        stamp_a.builder_version.starts_with("fluree-materialize/"),
+        "builder version stamped"
+    );
+    assert_eq!(
+        stamp_a.tables.len(),
+        2,
+        "both tables in the watermark vector"
+    );
+    assert!(
+        stamp_a.tables.contains_key("dw.customer") && stamp_a.tables.contains_key("dw.orders"),
+        "watermark keyed by logical table name"
+    );
+
+    // Pack + restore into a fresh instance under a different name.
+    let mut archive: Vec<u8> = Vec::new();
+    src.archive_ledger(LEDGER, true, &mut archive)
+        .await
+        .expect("archive twin");
+    let dst_dir = tempfile::tempdir().expect("dst tmpdir");
+    let dst = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination Fluree");
+    let mut reader = std::io::Cursor::new(archive);
+    dst.restore_ledger(RESTORED, &mut reader)
+        .await
+        .expect("restore twin");
+
+    // The stamp survives byte-for-byte and parses identically.
+    let stamp_b = read_head_stamp(&dst, RESTORED).await;
+    assert_eq!(stamp_b.builder_version, stamp_a.builder_version);
+    assert_eq!(stamp_b.mapping_hash, stamp_a.mapping_hash);
+    assert_eq!(
+        stamp_b.tables, stamp_a.tables,
+        "the watermark vector survives pack/restore byte-identical"
+    );
+}
+
+/// A dim + fact mock covering IRI, plain-string, lang-tagged, typed-decimal, and
+/// foreign-key-IRI objects — the parity-gate verification fixture.
+#[cfg(feature = "native")]
+fn verify_fixture_provider() -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    };
+
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/name"),
+            object_map: ObjectMap::column("name"),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/label"),
+            object_map: ObjectMap::Column {
+                column: "label".to_string(),
+                datatype: None,
+                language: Some("en".to_string()),
+                term_type: TermType::Literal,
+            },
+        },
+    ];
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/amount"),
+            object_map: ObjectMap::column_typed(
+                "amount",
+                "http://www.w3.org/2001/XMLSchema#decimal",
+            ),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Customer>",
+                "cust_key",
+                "c_key",
+            )),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "c_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "label".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+            Column::String(vec![Some("hola".to_string()), Some("mundo".to_string())]),
+        ],
+    )
+    .unwrap();
+    let order_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "o_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "amount".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "cust_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::String(vec![Some("9.99".to_string()), Some("5.00".to_string())]),
+            Column::Int64(vec![Some(10), Some(20)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// The same dim+fact shape as [`verify_fixture_provider`], but generated at
+/// `n_customers`/`n_orders` rows split into `batch_rows`-sized scan batches — so a
+/// small chunk budget yields a genuinely MULTI-CHUNK build (chunk boundaries fall
+/// between scan batches). Every order's FK resolves (`cust_key = o_key % n_customers`).
+#[cfg(feature = "native")]
+fn scaled_verify_provider(
+    n_customers: usize,
+    n_orders: usize,
+    batch_rows: usize,
+) -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    };
+
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/name"),
+            object_map: ObjectMap::column("name"),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/label"),
+            object_map: ObjectMap::Column {
+                column: "label".to_string(),
+                datatype: None,
+                language: Some("en".to_string()),
+                term_type: TermType::Literal,
+            },
+        },
+    ];
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/amount"),
+            object_map: ObjectMap::column_typed(
+                "amount",
+                "http://www.w3.org/2001/XMLSchema#decimal",
+            ),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Customer>",
+                "cust_key",
+                "c_key",
+            )),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "c_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "name".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+        FieldInfo {
+            name: "label".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 3,
+        },
+    ]));
+    let mut cust_batches = Vec::new();
+    let mut i = 0;
+    while i < n_customers {
+        let end = (i + batch_rows).min(n_customers);
+        cust_batches.push(
+            ColumnBatch::new(
+                Arc::clone(&cust_schema),
+                vec![
+                    Column::Int64((i..end).map(|k| Some(k as i64)).collect()),
+                    Column::String((i..end).map(|k| Some(format!("Customer {k}"))).collect()),
+                    Column::String((i..end).map(|k| Some(format!("label-{k}"))).collect()),
+                ],
+            )
+            .unwrap(),
+        );
+        i = end;
+    }
+
+    let order_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "o_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "amount".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+        FieldInfo {
+            name: "cust_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: true,
+            field_id: 3,
+        },
+    ]));
+    let mut order_batches = Vec::new();
+    let mut i = 0;
+    while i < n_orders {
+        let end = (i + batch_rows).min(n_orders);
+        order_batches.push(
+            ColumnBatch::new(
+                Arc::clone(&order_schema),
+                vec![
+                    Column::Int64((i..end).map(|k| Some(k as i64)).collect()),
+                    Column::String((i..end).map(|k| Some(format!("{k}.25"))).collect()),
+                    Column::Int64(
+                        (i..end)
+                            .map(|k| Some((k % n_customers.max(1)) as i64))
+                            .collect(),
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        i = end;
+    }
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), cust_batches);
+    tables.insert("dw.orders".to_string(), order_batches);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// PARITY GATE — FULL mode at multi-chunk scale (item #2): a twin built across many
+/// scan batches + a tiny chunk budget must pass the full-triple diff. This exercises
+/// the rewritten twin-read path — a SINGLE linear pass over the binary index (the
+/// export `scan_all` shape) instead of O(n^2) `ORDER BY ?s ?p ?o ... OFFSET` paging —
+/// proving it streams the WHOLE twin (every chunk/segment) and diffs byte-identically
+/// against the enumerator source. Peak memory is bounded by construction (cursor
+/// batches on the read side, `SORT_RUN_LINES` on the sort side); this asserts
+/// correctness + completeness at multi-chunk size.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_full_passes_on_multi_chunk_twin() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-full-multichunk:main";
+    const N_CUSTOMERS: usize = 4000;
+    const N_ORDERS: usize = 4000;
+    let provider = scaled_verify_provider(N_CUSTOMERS, N_ORDERS, 500);
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(64)
+        .chunk_size_mb(1) // tiny chunks × many scan batches → a genuinely multi-chunk build
+        .execute()
+        .await
+        .expect("build multi-chunk twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // Spool under the tempdir (a real .fluree-style scratch area, not tmpfs /tmp).
+    let verify_tmp = dir.path().join("materialize-verify");
+    let report = verify_twin(
+        &fluree,
+        &ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Full,
+        Some(&verify_tmp),
+    )
+    .await
+    .expect("full verify");
+
+    assert!(
+        report.passed,
+        "a faithful multi-chunk twin must pass full verify; failures: {:?}",
+        report.failures()
+    );
+    let full = report
+        .checks
+        .iter()
+        .find(|c| c.name == "full-triple-diff")
+        .expect("full-diff check present");
+    assert_eq!(
+        full.outcome,
+        CheckOutcome::Match,
+        "the index-streamed twin must diff byte-identically against the enumerator source"
+    );
+    // Both class counts match at scale (proving the linear pass read every segment).
+    let count_outcome = |class: &str| {
+        report
+            .checks
+            .iter()
+            .find(|c| c.name == format!("count:{class}"))
+            .map(|c| c.outcome.clone())
+    };
+    assert_eq!(
+        count_outcome("http://ex.org/Customer"),
+        Some(CheckOutcome::Match)
+    );
+    assert_eq!(
+        count_outcome("http://ex.org/Order"),
+        Some(CheckOutcome::Match)
+    );
+}
+
+/// A parent whose SUBJECT is keyed on `c_id` but is JOINED on `region` (non-unique):
+/// two customers in the same region mint DIFFERENT subjects for the same join key, so
+/// key `["EU"]` maps to both `customer/1` and `customer/2` — the duplicate-parent-key
+/// fan-out shape. The two customers are split across two scan BATCHES (the cross-file
+/// race the deterministic keep-min tie-break repairs); `reverse` flips their order.
+#[cfg(feature = "native")]
+fn dup_parent_key_provider(reverse_customer_batches: bool) -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TriplesMap,
+    };
+
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_id}").with_class("http://ex.org/Customer");
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_id}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/placedInRegion"),
+        object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+            "<#Customer>",
+            "cust_region",
+            "region",
+        )),
+    }];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "c_id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "region".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]));
+    let cust_batch = |c_id: i64| {
+        ColumnBatch::new(
+            Arc::clone(&cust_schema),
+            vec![
+                Column::Int64(vec![Some(c_id)]),
+                Column::String(vec![Some("EU".to_string())]),
+            ],
+        )
+        .unwrap()
+    };
+    let mut cust_batches = vec![cust_batch(1), cust_batch(2)];
+    if reverse_customer_batches {
+        cust_batches.reverse();
+    }
+
+    let order_schema = Arc::new(BatchSchema::new(vec![
+        FieldInfo {
+            name: "o_id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "cust_region".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]));
+    let order_batch = ColumnBatch::new(
+        order_schema,
+        vec![
+            Column::Int64(vec![Some(100)]),
+            Column::String(vec![Some("EU".to_string())]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), cust_batches);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// DUP-KEY DECLINE (dupkey-adjudication.md ruling C2): a source whose FK parent join
+/// key maps to more than one parent must be REFUSED by default, with an error that
+/// names the anomaly and points at the override.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_declines_duplicate_parent_keys_by_default() {
+    const LEDGER: &str = "test/dupkey-decline:main";
+    let provider = dup_parent_key_provider(false);
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    let err = fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect_err("a source with duplicate parent join keys must be declined by default");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate parent join keys"),
+        "the error must name the anomaly; got: {msg}"
+    );
+    assert!(
+        msg.contains("--allow-duplicate-parent-keys"),
+        "the error must point at the override; got: {msg}"
+    );
+}
+
+/// DUP-KEY OVERRIDE + DETERMINISM + STAMP: with `--allow-duplicate-parent-keys` the
+/// twin builds; the FK resolves to the SAME deterministic winner (keep-min =
+/// `customer/1`) regardless of scan-batch order; and the completion stamp records the
+/// ambiguous-key count so the overridden twin self-documents its anomaly.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_override_builds_deterministic_twin_and_records_stamp() {
+    for reverse in [false, true] {
+        let ledger = if reverse {
+            "test/dupkey-ovr-rev:main"
+        } else {
+            "test/dupkey-ovr:main"
+        };
+        let provider = dup_parent_key_provider(reverse);
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .build()
+            .expect("build Fluree");
+        fluree
+            .create(ledger)
+            .import_r2rml(Arc::clone(&provider), "gs:main")
+            .threads(2)
+            .memory_budget_mb(256)
+            .allow_duplicate_parent_keys(true)
+            .execute()
+            .await
+            .expect("override builds the twin");
+        let loaded = fluree.ledger(ledger).await.expect("load twin");
+
+        // Deterministic winner: order/100 -> customer/1 (the lexicographically smaller
+        // of {customer/1, customer/2}), independent of which batch was scanned first.
+        let json = support::query_sparql(
+            &fluree,
+            &loaded,
+            "SELECT ?c WHERE { <http://ex.org/order/100> <http://ex.org/placedInRegion> ?c }",
+        )
+        .await
+        .expect("query")
+        .to_sparql_json(&loaded.snapshot)
+        .expect("sparql json");
+        assert_eq!(
+            json["results"]["bindings"][0]["c"]["value"],
+            "http://ex.org/customer/1",
+            "keep-min must resolve the FK to customer/1 regardless of batch order (reverse={reverse})"
+        );
+
+        // The stamp self-documents the anomaly (exactly one ambiguous key: region=EU).
+        let stamp = read_head_stamp(&fluree, ledger).await;
+        assert!(
+            !stamp.dup_parent_keys.is_empty(),
+            "an override-built twin must record dup_parent_keys in its stamp (reverse={reverse})"
+        );
+        let total: u64 = stamp.dup_parent_keys.values().sum();
+        assert_eq!(
+            total, 1,
+            "exactly one ambiguous parent key (region=EU) regardless of order (reverse={reverse})"
+        );
+    }
+}
+
+/// PARITY GATE — pass case: a faithfully built twin matches its virtual source
+/// under both `Quick` (class counts + stratified sample) and `Full` (full-triple
+/// diff). Proves the twin-side N-Triples reader renders IRI, plain-string,
+/// lang-tagged, typed-decimal, and FK-IRI objects identically to the enumerator.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_passes_on_faithful_twin() {
+    use fluree_db_api::materialize::{verify_twin, VerifyMode};
+
+    const LEDGER: &str = "test/verify-pass:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    for mode in [VerifyMode::Quick, VerifyMode::Full] {
+        let report = verify_twin(&fluree, &ledger, &*provider, "gs:main", mode, None)
+            .await
+            .expect("verify");
+        assert!(
+            report.passed,
+            "a faithful twin must pass {mode:?}; failures: {:?}",
+            report.failures()
+        );
+        // Both classes are present and counted, and per-property is skip-with-note.
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "count:http://ex.org/Order"),
+            "class-count check ran for Order"
+        );
+        assert!(
+            report.checks.iter().any(|c| c.name == "per-property-counts"
+                && matches!(
+                    c.outcome,
+                    fluree_db_api::materialize::CheckOutcome::Skipped { .. }
+                )),
+            "per-property counts are skipped-with-note"
+        );
+    }
+}
+
+/// PARITY GATE — negative case: a twin corrupted after build (a spurious extra
+/// instance injected) must FAIL the gate. The class-count check catches the
+/// cardinality change, and `Full` reports the extra triple.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_fails_on_corrupted_twin() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-corrupt:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // Corrupt the twin: inject an Order that the virtual source does not have.
+    let extra = serde_json::json!({
+        "@id": "http://ex.org/order/999",
+        "@type": "http://ex.org/Order"
+    });
+    let committed = fluree
+        .insert(ledger, &extra)
+        .await
+        .expect("inject spurious order");
+
+    let report = verify_twin(
+        &fluree,
+        &committed.ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Full,
+        None,
+    )
+    .await
+    .expect("verify");
+    assert!(!report.passed, "a corrupted twin must FAIL the gate");
+
+    // The Order class count mismatches (twin=3, source=2), and the full diff
+    // reports exactly the one extra twin triple.
+    let order_count = report
+        .checks
+        .iter()
+        .find(|c| c.name == "count:http://ex.org/Order")
+        .expect("Order count check present");
+    assert_eq!(
+        order_count.outcome,
+        CheckOutcome::Mismatch { source: 2, twin: 3 },
+        "the injected Order must show as a count mismatch"
+    );
+    let full = report
+        .checks
+        .iter()
+        .find(|c| c.name == "full-triple-diff")
+        .expect("full-diff check present");
+    assert!(
+        matches!(
+            full.outcome,
+            CheckOutcome::TripleDiff { extra_in_twin, .. } if extra_in_twin >= 1
+        ),
+        "the full diff must report the extra twin triple, got {:?}",
+        full.outcome
+    );
+}
+
+/// PARITY GATE — Quick SAMPLE arm negative: a per-subject value corruption on a
+/// SAMPLED subject (an extra property, no new instance so the class counts stay
+/// equal) must fail the Quick gate on the sample's node compare — the check the
+/// stratified sample adds over the always-on counts.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_quick_catches_sampled_subject_corruption() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-quick-neg:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // Corrupt an existing (always-sampled, only 2/class) subject with a spurious
+    // extra property. No new instance → the class counts are unchanged, so ONLY
+    // the sample's per-subject node compare can catch it.
+    let extra = serde_json::json!({
+        "@id": "http://ex.org/customer/10",
+        "http://ex.org/name": "SPURIOUS"
+    });
+    let committed = fluree
+        .insert(ledger, &extra)
+        .await
+        .expect("inject spurious property");
+
+    let report = verify_twin(
+        &fluree,
+        &committed.ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Quick,
+        None,
+    )
+    .await
+    .expect("verify");
+    assert!(
+        !report.passed,
+        "Quick must catch a value corruption on a sampled subject"
+    );
+    // The class-count arm stays green (no new instance) — proving it is the
+    // SAMPLE arm that fired.
+    let cust_count = report
+        .checks
+        .iter()
+        .find(|c| c.name == "count:http://ex.org/Customer")
+        .expect("Customer count check present");
+    assert_eq!(
+        cust_count.outcome,
+        CheckOutcome::Match,
+        "class counts are unchanged by a per-subject property corruption"
+    );
+    assert!(
+        report
+            .failures()
+            .iter()
+            .any(|c| c.name == "sample:<http://ex.org/customer/10>"),
+        "the corrupted sampled subject must fail; failures: {:?}",
+        report.failures()
+    );
+}
+
+/// DROP-ON-FAIL mechanism: the CLI hard-drops a twin whose gate fails, so nothing
+/// unverified stays announced. Verify the drop actually UNPUBLISHES — after a
+/// hard drop, the twin is no longer a live, queryable ledger (its nameservice
+/// head is gone / retracted).
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_twin_is_unpublished() {
+    use fluree_db_api::DropMode;
+
+    const LEDGER: &str = "test/twin-drop:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+
+    // Announced before the drop: a published head is present.
+    let before = fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .expect("ns lookup")
+        .expect("built twin is registered");
+    assert!(
+        before.commit_head_id.is_some(),
+        "built twin has a published commit head"
+    );
+
+    // Drop it exactly as the gate-fail path does. drop_ledger drops the WHOLE
+    // ledger and rejects a `:branch` suffix, so strip it (this is the CLI bug the
+    // test surfaced: dropping with `:main` 400s and leaves the twin announced).
+    fluree
+        .drop_ledger("test/twin-drop", DropMode::Hard)
+        .await
+        .expect("hard drop");
+
+    // No live ledger remains — the record is absent or retracted (a drop leaves a
+    // retracted tombstone rather than purging the entry), so nothing unverified
+    // is left announced.
+    let after = fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .expect("ns lookup");
+    assert!(
+        after.is_none_or(|r| r.retracted),
+        "a hard-dropped twin must leave no live, queryable ledger"
+    );
+}
+
+/// RUNTIME GUARD: attempting a virtual materialize on a single-threaded tokio
+/// runtime must fail loud with a typed error, NOT deadlock in the producer's
+/// block_on. Production servers and the CLI run multi-thread; this guards a
+/// mis-wired caller.
+#[cfg(feature = "native")]
+#[tokio::test] // default flavor = current_thread
+async fn materialize_on_current_thread_runtime_fails_loud() {
+    use fluree_db_r2rml::mapping::{SubjectMap, TriplesMap};
+
+    let mut tm = TriplesMap::new("<#T>", "dw.t");
+    tm.subject_map = SubjectMap::template("http://ex.org/t/{id}").with_class("http://ex.org/T");
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+    let batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        }])),
+        vec![Column::Int64(vec![Some(1)])],
+    )
+    .unwrap();
+    let mut tables = HashMap::new();
+    tables.insert("dw.t".to_string(), vec![batch]);
+    let provider = Arc::new(MultiTableMock { mapping, tables });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let err = fluree
+        .create("test/rt:main")
+        .import_r2rml(provider, "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect_err("virtual import on a current-thread runtime must fail");
+    assert!(
+        format!("{err}").contains("multi-thread"),
+        "expected a typed multi-thread-runtime error, got: {err}"
+    );
+}

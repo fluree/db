@@ -30,11 +30,11 @@ pub use fused_aggregate::{detect_fused_r2rml_aggregate, FusedR2rmlAggregateOpera
 pub use operator::{R2rmlParentMemo, R2rmlScanOperator};
 pub use provider::{
     ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, R2rmlProvider, R2rmlTableProvider,
-    ScanCmpOp, ScanFilter, ScanTopK, ScanValue,
+    ScanCmpOp, ScanFilter, ScanTopK, ScanValue, TableWatermark,
 };
 pub use rewrite::{
-    convert_triple_to_r2rml, rewrite_patterns_for_r2rml, unsupported_subscope_error,
-    R2rmlRewriteResult,
+    convert_triple_to_r2rml, r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml,
+    unsupported_subscope_error, R2rmlRewriteResult,
 };
 
 /// Read an on/off environment switch that defaults to **on**. Only `0`, `false`,
@@ -104,4 +104,91 @@ pub(crate) fn parallel_catalog_resolution_enabled() -> bool {
 pub(crate) fn iceberg_numeric_stats_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_ICEBERG_NUMERIC_STATS"))
+}
+
+/// Item 10 (F-AUD-11): whether `xsd:dateTime` FILTER predicates may be pushed to
+/// the Iceberg scan for MANIFEST-level file pruning (mirrors
+/// [`iceberg_numeric_stats_enabled`]). Default on;
+/// `FLUREE_ICEBERG_TIMESTAMP_STATS=0|false|off|no` reverts to leaving them with the
+/// in-engine FILTER only (no timestamp `ScanValue` is produced, so the iceberg-side
+/// timestamp arms stay inert). Gating at the single push site (`to_scan_value`)
+/// keeps the widening inert when off. Cached in a `OnceLock` — set at process
+/// startup, not per query.
+pub(crate) fn iceberg_timestamp_stats_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_ICEBERG_TIMESTAMP_STATS"))
+}
+
+/// Item 7 (F-AUD-5): whether a bounded `FILTER … IN (…)` or single-var `VALUES`
+/// set over a scalar-column object var is lowered to an Iceberg `Expression::In`
+/// for file / row-group pruning (the backend already evaluates `In`; nothing
+/// emitted it). Default on; `FLUREE_R2RML_IN_PUSHDOWN=0|false|off|no` reverts to
+/// leaving the set to the in-engine FILTER / VALUES join (a full FACT scan). The
+/// push is a strict superset (keeps a file iff any member could be in range), so
+/// OFF is byte-identical in results, only slower. Read once (process-wide).
+pub(crate) fn in_pushdown_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_IN_PUSHDOWN"))
+}
+
+/// Item 11 (F-AUD-7): whether `OPTIONAL` (left-outer-join) forwards a top-of-tree
+/// `LIMIT` row budget to its REQUIRED (outer) side. Sound because each required
+/// row yields ≥1 output row (matched or padded-with-null), so bounding the
+/// required side to `k` still produces ≥`k` output for the `LIMIT` to truncate —
+/// the inner/optional side is NOT budgeted (it must produce every match for a
+/// given required row). This closes probe-04's 68,828× read amplification. Default
+/// on; `FLUREE_R2RML_BUDGET_OPTIONAL=0|false|off|no` reverts to swallowing the
+/// budget (byte-identical results, just the full outer scan). Read once.
+pub(crate) fn optional_budget_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_BUDGET_OPTIONAL"))
+}
+
+/// D7 (Cluster E / E1): whether a variable-predicate R2RML "crawl wildcard" scan
+/// with NO pruning key (no bound subject, no `class_filter`, no `class_prune_hint`,
+/// no pinned `triples_map_iri`) — which resolves to EVERY TriplesMap, i.e. a
+/// full-source scan — is cost-estimated as [`crate::planner`]'s `FULL_SCAN` so
+/// `reorder_patterns` places it LAST among the query's co-subject R2RML scans.
+/// That makes the wildcard the LIMIT-budgeted, correlated OUTER scan driven by the
+/// selective INNER scan (the property-scoped browse crawl `{?s <prop> ?v}` +
+/// `{?s ?p ?o}`), instead of the UNBUDGETED inner full-source scan it defaults to
+/// when both scans estimate equal (both `DEFAULT_PROPERTY_SCAN_SELECTIVITY`) and
+/// reorder keeps emit order — the D7 DNF. SOUND: reordering two co-subject scans
+/// preserves the solution set (the top LIMIT truncates the same rows; every
+/// driving subject has ≥1 triple so the budget never under-fills); it only lets
+/// the existing budget reach a scan that then terminates. Default on;
+/// `FLUREE_R2RML_BUDGET_PROPERTY_VAR=0|false|off|no` reverts to the equal estimate
+/// (byte-identical results, the property-var browse then runs unbudgeted). Read
+/// once (process-wide).
+pub(crate) fn property_var_budget_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_BUDGET_PROPERTY_VAR"))
+}
+
+/// Item 8 (F-AUD-6): whether an ASCENDING single-column `ORDER BY … LIMIT k` over
+/// an R2RML scan may offer a scan-side top-k directive. DESC top-k (PR-5) is
+/// always offered; ASC is admitted only for a REQUIRED (non-nullable) column (the
+/// provider re-checks — SPARQL orders unbound values first under ASC). Default on;
+/// `FLUREE_R2RML_TOPK_ASC=0|false|off|no` reverts to the pre-item-8 DESC-only
+/// behavior (byte-identical: an ASC sort then full-scans + sorts). Read once.
+pub(crate) fn topk_asc_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_TOPK_ASC"))
+}
+
+/// Item 7 (F-AUD-5): the maximum set size lowered to `Expression::In`. A larger
+/// set declines the pushdown (stays with the in-engine FILTER / VALUES join) so
+/// manifest evaluation stays cheap — every member is bound-checked against every
+/// candidate file, i.e. O(files × members). Default 64; override with
+/// `FLUREE_R2RML_IN_PUSHDOWN_MAX=<n>` (a non-numeric or zero value falls back to
+/// the default). Read once (process-wide).
+pub(crate) fn in_pushdown_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("FLUREE_R2RML_IN_PUSHDOWN_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(64)
+    })
 }

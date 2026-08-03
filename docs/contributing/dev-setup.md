@@ -10,9 +10,16 @@ This guide walks through setting up a development environment for contributing t
 ```bash
 # Install rustup
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# The repo pins its toolchain in rust-toolchain.toml (with rustfmt + clippy
+# components); rustup honors it automatically in this directory, and CI's
+# toolchain steps reference the same version explicitly. To bump the
+# toolchain: update rust-toolchain.toml AND the five workflow refs together,
+# fixing any new clippy lints in the same PR (the main clippy job runs
+# `-D warnings`, so a floating toolchain would break CI on every new lint).
+# Release builds inherit the pin transitively through rust-toolchain.toml.
 
 # Verify installation
-rustc --version  # Should be 1.75.0 or later
+rustc --version  # rust-toolchain.toml pins the exact version (currently 1.97.0)
 cargo --version
 ```
 

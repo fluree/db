@@ -241,6 +241,119 @@ fn resolve_hint_to_metadata_path(hint: &str, table_location: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Warehouse-root resolution (catalog-less multi-table Direct mode)
+// ---------------------------------------------------------------------------
+
+/// The table-name part of a warehouse child directory: the segment before the
+/// first `.` (a Snowflake-style random suffix, e.g. `fact_order.UIHGsQex`), with
+/// any trailing `/` trimmed. A bare `fact_order/` yields `fact_order`.
+pub fn warehouse_dir_name(dir: &str) -> &str {
+    dir.trim_end_matches('/').split('.').next().unwrap_or("")
+}
+
+/// Resolve a table name to its directory under a warehouse root, given the root's
+/// immediate child directory names. A catalog-less warehouse (e.g. a bucket copy
+/// of a Snowflake-managed Iceberg database) stores each table in
+/// `<name>.<random-suffix>/` or a bare `<name>/`. Matches the requested table
+/// (namespace already stripped) to exactly one such directory, case-INSENSITIVE
+/// on the name part. Ambiguity (two dirs matching one name) or a miss is a
+/// fail-loud [`IcebergError::Catalog`] naming what WAS found.
+pub fn match_warehouse_table_dir(table_name: &str, dir_names: &[String]) -> Result<String> {
+    let want = table_name.trim();
+    let matches: Vec<&String> = dir_names
+        .iter()
+        .filter(|d| warehouse_dir_name(d).eq_ignore_ascii_case(want))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok((*one).trim_end_matches('/').to_string()),
+        [] => Err(IcebergError::Catalog(format!(
+            "no directory under the warehouse root matches table '{table_name}' \
+             (matched on the name before '.', case-insensitive). Found {} directories: [{}]",
+            dir_names.len(),
+            dir_names.join(", ")
+        ))),
+        many => Err(IcebergError::Catalog(format!(
+            "table '{table_name}' is AMBIGUOUS under the warehouse root — {} directories match: [{}]",
+            many.len(),
+            many.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod warehouse_tests {
+    use super::*;
+
+    fn dirs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn matches_snowflake_suffixed_dir_case_insensitively() {
+        let d = dirs(&[
+            "fact_order.UIHGsQex/",
+            "dim_customer.AbCdEf/",
+            "dim_date.ZzZz/",
+        ]);
+        // rr:tableName `DW.FACT_ORDER` arrives here namespace-stripped + upper.
+        assert_eq!(
+            match_warehouse_table_dir("FACT_ORDER", &d).unwrap(),
+            "fact_order.UIHGsQex"
+        );
+        assert_eq!(
+            match_warehouse_table_dir("dim_customer", &d).unwrap(),
+            "dim_customer.AbCdEf"
+        );
+    }
+
+    #[test]
+    fn matches_bare_dir_without_suffix() {
+        let d = dirs(&["fact_order/", "dim_customer/"]);
+        assert_eq!(
+            match_warehouse_table_dir("Fact_Order", &d).unwrap(),
+            "fact_order"
+        );
+    }
+
+    #[test]
+    fn miss_lists_what_was_found() {
+        let d = dirs(&["fact_order.X/", "dim_customer.Y/"]);
+        let err = match_warehouse_table_dir("dim_geography", &d)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("dim_geography"),
+            "names the missing table: {err}"
+        );
+        assert!(
+            err.contains("fact_order.X") && err.contains("dim_customer.Y"),
+            "lists candidates: {err}"
+        );
+    }
+
+    #[test]
+    fn ambiguity_is_a_loud_error_naming_candidates() {
+        // Two dirs whose name part collides (a bare + a suffixed copy) — refuse.
+        let d = dirs(&["fact_order/", "fact_order.NEWSUFFIX/"]);
+        let err = match_warehouse_table_dir("fact_order", &d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AMBIGUOUS"), "flags ambiguity: {err}");
+        assert!(
+            err.contains("fact_order.NEWSUFFIX"),
+            "lists both candidates: {err}"
+        );
+    }
+
+    #[test]
+    fn warehouse_dir_name_strips_suffix_and_slash() {
+        assert_eq!(warehouse_dir_name("fact_order.UIHGsQex/"), "fact_order");
+        assert_eq!(warehouse_dir_name("dim_customer/"), "dim_customer");
+        assert_eq!(warehouse_dir_name("plain"), "plain");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

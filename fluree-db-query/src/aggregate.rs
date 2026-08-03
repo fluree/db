@@ -151,6 +151,16 @@ impl AggregateOperator {
 
 #[async_trait]
 impl Operator for AggregateOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — an aggregate consumes ALL input to
+    /// compute its result (a single output row folds every input row). Explicit
+    /// (was a silent trait-default no-op) so the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "AGGREGATE row-budget swallowed (unsound to forward: folds all input)"
+        );
+    }
+
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
     }

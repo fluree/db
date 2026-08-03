@@ -1,0 +1,13 @@
+# q071 asc_topk_order_total_dataset — promoted from A3 probe-01 (audit item 8, F-AUD-6)
+# Coverage: an ASCENDING single-column ORDER BY … LIMIT over a scalar scan column.
+#   Item 8 admits ASC scan-side top-k when the sort column is REQUIRED (non-nullable);
+#   the scan then reads files in lower_bound-ASC order and stops early (mirroring the
+#   DESC q046). A unique tiebreaker (?oid) makes the top-10 DETERMINISTIC, so this is
+#   a Full-hash member. edw:orderTotal is a required column on FACT_ORDER.
+# Exec path: query_from() FROM <enterprise-sf01-v:main> (the deployed solo/chat shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot . }
+ORDER BY ASC(?tot) ?oid
+LIMIT 10

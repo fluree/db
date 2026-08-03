@@ -49,12 +49,59 @@ pub fn query_memory_budget_bytes() -> usize {
     })
 }
 
-/// R3-B: conservative per-binding byte estimate for the approximate memory-budget
-/// accounting (a `Binding` is a small enum, occasionally with a heap `String`;
-/// over-counting is safe — a too-tight budget only aborts a query already near OOM).
-pub const BINDING_EST_BYTES: usize = 64;
+/// R3-B: per-binding byte estimate for the approximate memory-budget accounting.
+/// Derived from the true stack size of a [`Binding`](crate::binding::Binding)
+/// (`size_of::<Binding>()` = 88 bytes, documented at `binding.rs:14-17`) rather
+/// than a hand-picked number, so it can never silently under-count the stack
+/// footprint the way the previous `64` did (a 27% under-count of the 88-byte enum).
+///
+/// This still under-counts the HEAP a binding owns: an IRI-bearing row
+/// (`Binding::Iri(Arc<str>)`, `IriMatch { iri: Arc<str>, ledger_alias: Arc<str> }`,
+/// or a `Lit` with a `String` value) carries ~50-70 bytes of `Arc<str>` payload
+/// the stack size does not see, so a wide R2RML/Iceberg crawl of IRI rows is still
+/// counted at roughly 1/2.2 of its true resident bytes. Over-counting is safe (a
+/// too-tight budget only aborts a query already near OOM); this constant deliberately
+/// stays a floor. A heap-aware per-binding estimate is a documented follow-up.
+pub const BINDING_EST_BYTES: usize = std::mem::size_of::<crate::binding::Binding>();
+/// F-AUD-3 site D: compile-time guard. The estimate must never drop below the
+/// true `Binding` stack size — refusing any future edit that pins a smaller magic
+/// number (the very regression the `64` was). Trivially holds while it is DEFINED
+/// as `size_of`, and bites the moment someone changes that.
+const _: () = assert!(BINDING_EST_BYTES >= std::mem::size_of::<crate::binding::Binding>());
 /// R3-B: conservative per-group overhead estimate (key bindings + aggregate state).
+/// A flat estimate — like [`BINDING_EST_BYTES`] it ignores per-group heap (e.g. a
+/// `GROUP_CONCAT`/`Collect` accumulator), the same documented conservatism.
 pub const GROUP_EST_BYTES: usize = 128;
+
+/// F-AUD-3 site C: divisor applied to the process memory budget to derive a
+/// per-query ceiling, read from `FLUREE_QUERY_BUDGET_SHARE_DIV`. Default `1` (and
+/// any unparseable/zero value floors to `1`), which makes the per-query ceiling
+/// equal to the full budget — byte-for-byte today's behavior. Set it to the
+/// deployment's expected max query concurrency (e.g. a Lambda's reserved
+/// concurrency) so N concurrent queries share the budget instead of each
+/// comparing its own counter against the FULL budget (the over-admission V2 §3
+/// describes: two queries each accounting 5 GB both read "under 8 GB" while the
+/// node sits at 10 GB). See [`per_query_memory_ceiling`].
+///
+/// This is the sound, minimal static form. A dynamic divisor equal to the ACTUAL
+/// live concurrency (so a lone query keeps the full budget) needs a process-wide
+/// active-*top-level*-query count — which only the server request boundary
+/// (`fluree-db-server/src/query_control.rs`) can measure without miscounting
+/// nested policy/reasoning/sub-queries that re-enter the engine. Deferred there.
+pub fn query_budget_share_div() -> usize {
+    std::env::var("FLUREE_QUERY_BUDGET_SHARE_DIV")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// F-AUD-3 site C: the per-query memory ceiling = `full_budget / share_div`, with
+/// `share_div` floored at 1. `share_div == 1` returns the full budget unchanged.
+/// Pure so the division is unit-testable without touching the environment.
+pub fn per_query_memory_ceiling(full_budget: usize, share_div: usize) -> usize {
+    full_budget / share_div.max(1)
+}
 
 /// Best-effort container/system memory limit (cgroup v2 → cgroup v1 →
 /// `/proc/meminfo`). `None` where none is readable (e.g. macOS dev), where the
@@ -116,6 +163,12 @@ pub enum ConstSidKey {
 /// the memo is correctly scoped — no cross-ledger aliasing. `Arc<Mutex<…>>` so
 /// derived per-graph contexts can share it and the context stays `Send + Sync`.
 pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
+
+/// Per-query memo: binding-level `lang_id` → resolved language tag. Shared
+/// across per-graph context derivations like [`ConstSidCache`], so a
+/// lang-tagged FILTER pays the store's meta decode (and its `String` clone)
+/// once per distinct id instead of twice per row.
+pub type LangTagCache = Arc<Mutex<FxHashMap<u16, Option<Arc<str>>>>>;
 
 /// Shared handle to the per-query overlay-ops memo
 /// ([`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache)).
@@ -314,6 +367,8 @@ pub struct ExecutionContext<'a> {
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
+    /// Per-query memo for binding-level language-tag ids — see [`LangTagCache`].
+    pub lang_tag_cache: LangTagCache,
     /// Per-query parent-lookup memo (PR-8b): the cross-operator-rebuild extension
     /// of PR-4's per-operator parent cache, so an inner join that rebuilds its
     /// R2RML operator per driving batch (an interposed non-pushable FILTER + LIMIT)
@@ -401,6 +456,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -457,6 +513,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -517,6 +574,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -566,6 +624,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -614,6 +673,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -664,6 +724,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -1121,6 +1182,40 @@ impl<'a> ExecutionContext<'a> {
         Some(gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id))
     }
 
+    /// Resolve a binding-level `lang_id` to its language tag, memoized per
+    /// query (see [`LangTagCache`]). Returns `None` for `lang_id == 0` and for
+    /// an id the persisted store cannot resolve. Overlay-ephemeral lang ids
+    /// (`DictOverlay::assign_lang_id`) are scan-internal and do not escape
+    /// into eval-visible bindings today — any novelty drops scans to the
+    /// non-late-materialized `Lit` path (pinned by
+    /// `sparql_stored_lang_equality_with_post_index_novelty`) — so callers
+    /// that checked `lang_id != 0` must treat a `None` here as an
+    /// UNRESOLVABLE tag (unknown value), never as "no tag".
+    pub fn lang_tag_for_id(&self, lang_id: u16) -> Option<Arc<str>> {
+        if lang_id == 0 {
+            return None;
+        }
+        if let Some(hit) = self
+            .lang_tag_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&lang_id)
+        {
+            return hit.clone();
+        }
+        let resolved: Option<Arc<str>> = self
+            .binary_store
+            .as_deref()
+            .and_then(|s| s.decode_meta(lang_id, i32::MIN))
+            .and_then(|m| m.lang)
+            .map(Arc::from);
+        self.lang_tag_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(lang_id, resolved.clone());
+        resolved
+    }
+
     /// Resolve a subject ID to an IRI, using DictNovelty-aware routing.
     ///
     /// Thin wrapper around [`BinaryGraphView::resolve_subject_iri`] which
@@ -1228,6 +1323,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            lang_tag_cache: self.lang_tag_cache.clone(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
@@ -1287,6 +1383,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            lang_tag_cache: self.lang_tag_cache.clone(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
@@ -1349,6 +1446,7 @@ impl<'a> ExecutionContext<'a> {
             // (store-implicit), so sharing the parent's would alias an s_id
             // resolved in one graph/store into another.
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             // The R2RML parent-lookup memo, by contrast, is SAFE to share here
             // (F19): its key carries `graph_source_id` + `as_of_t`
             // (`R2rmlParentMemoKey`, r2rml/operator.rs), so a lookup cached under
@@ -1603,5 +1701,90 @@ impl WellKnownDatatypes {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::binding::Binding;
+    use crate::error::QueryError;
+    use crate::var_registry::VarRegistry;
+    use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+
+    /// F-AUD-3 site D: the per-binding estimate must never be below the true stack
+    /// size of a `Binding` (the 64→88 fix). Deriving it from `size_of` makes the
+    /// `>=` hold by construction; the equality canary documents the 88-byte size
+    /// (binding.rs:14-17) and fails loudly if the enum grows so the estimate is
+    /// re-examined for the heap it still omits.
+    #[test]
+    fn binding_est_bytes_is_at_least_binding_stack_size() {
+        // Derived from the type, so it equals the stack size and can never silently
+        // under-count it the way the previous hardcoded 64 did. The 88 canary
+        // documents binding.rs:14-17 and fails loudly if the enum grows (prompting a
+        // re-look at the heap the estimate still omits). The `>= size_of` invariant
+        // itself is a compile-time `const _` assertion next to the constant.
+        assert_eq!(BINDING_EST_BYTES, std::mem::size_of::<Binding>());
+        assert_eq!(
+            std::mem::size_of::<Binding>(),
+            88,
+            "binding.rs:14-17 documents size_of::<Binding>() == 88"
+        );
+    }
+
+    /// F-AUD-3 site C: the ceiling divides the full budget and floors the divisor
+    /// at 1, so `div == 1` (the default) is byte-for-byte the full budget.
+    #[test]
+    fn per_query_ceiling_divides_and_floors() {
+        let full = 8usize << 30; // 8 GiB
+        assert_eq!(
+            per_query_memory_ceiling(full, 1),
+            full,
+            "div=1 → full budget"
+        );
+        assert_eq!(
+            per_query_memory_ceiling(full, 4),
+            2usize << 30,
+            "div=4 → quarter"
+        );
+        assert_eq!(per_query_memory_ceiling(full, 0), full, "div=0 floors to 1");
+    }
+
+    /// F-AUD-3 site C: two concurrent queries pinned to a shared (divided) ceiling
+    /// each trip at their divided budget — neither can consume the full budget the
+    /// way today's undivided per-query counter allows (V2 §3 over-admission).
+    #[test]
+    fn shared_ceiling_trips_each_query_at_its_divided_budget() {
+        let full = 8usize << 30;
+        let ceiling = per_query_memory_ceiling(full, 2); // 4 GiB each
+        assert_eq!(ceiling, 4usize << 30);
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        // Two independent queries, each pinned to the divided ceiling as the runner
+        // attach point does under FLUREE_QUERY_BUDGET_SHARE_DIV=2.
+        for _ in 0..2 {
+            let cancel = QueryCancellation::new();
+            cancel.set_memory_limit(ceiling);
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+            // Recording just over the DIVIDED ceiling trips, though it is well under
+            // the full 8 GiB budget an undivided query would compare against.
+            ctx.record_alloc(ceiling + 1);
+            match ctx.checkpoint() {
+                Err(QueryError::MemoryBudgetExceeded {
+                    used_bytes,
+                    budget_bytes,
+                }) => {
+                    assert_eq!(
+                        budget_bytes, ceiling,
+                        "enforced ceiling is the divided budget"
+                    );
+                    assert_eq!(used_bytes, ceiling + 1);
+                }
+                other => {
+                    panic!("expected MemoryBudgetExceeded at the divided ceiling, got {other:?}")
+                }
+            }
+        }
     }
 }

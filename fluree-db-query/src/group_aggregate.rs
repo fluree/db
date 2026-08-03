@@ -785,6 +785,17 @@ impl GroupAggregateOperator {
 
 #[async_trait]
 impl Operator for GroupAggregateOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — a grouped aggregate must consume ALL
+    /// input before any group is closed, so a finite budget cannot bound it (the
+    /// last input row may open a new group or change an existing one). Explicit
+    /// (was a silent trait-default no-op) so the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "GROUP-AGGREGATE row-budget swallowed (unsound to forward: groups need all input)"
+        );
+    }
+
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
     }

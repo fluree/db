@@ -639,7 +639,7 @@ fn cmd_baseline(args: BaselineArgs) -> Result<()> {
         );
     }
     if args.perf {
-        let written = baseline::write_perf(&meta, &records, &baselines)?;
+        let written = baseline::write_perf(&meta, &records, &corpus, &baselines)?;
         for p in &written {
             eprintln!("baseline --perf: wrote {p}");
         }

@@ -72,12 +72,16 @@ pub fn canonicalize(doc: &Value) -> Result<Canonical> {
 }
 
 /// Canonicalize a JSON-LD graph: each `@graph` node is one canonical row (its
-/// key-ordered serialization), so `rows` is the node count and the hash is an
-/// order-independent multiset over nodes. The CONSTRUCT formatter already sorts
-/// the graph, so serialization is deterministic within one engine. Full
-/// cross-engine RDF isomorphism (blank-node relabeling) is a later refinement —
-/// native-vs-virtual CONSTRUCT hash equality is not yet asserted, only the
-/// node count and single-engine hash stability.
+/// KEY-SORTED serialization), so `rows` is the node count and the hash is an
+/// order-independent multiset over nodes whose per-node string is also
+/// independent of the emitting engine's key order. This is what makes a
+/// node-document result (a browse crawl, a CONSTRUCT) hash-comparable
+/// CROSS-ENGINE: native hydration emits a node's properties in alphabetical key
+/// order while the R2RML crawl emits them in table-column order — the SAME
+/// content, a different key order, which without the sort hashes differently.
+/// Array/`@list` element order is preserved (only object keys are sorted). Full
+/// cross-engine RDF isomorphism (blank-node relabeling) is still a later
+/// refinement.
 fn canonicalize_graph(doc: &Value) -> Canonical {
     let nodes: Vec<Value> = doc
         .get("@graph")
@@ -87,9 +91,29 @@ fn canonicalize_graph(doc: &Value) -> Canonical {
         .unwrap_or_default();
     let rows: Vec<String> = nodes
         .iter()
-        .map(|n| serde_json::to_string(n).unwrap_or_default())
+        .map(|n| serde_json::to_string(&sort_object_keys(n)).unwrap_or_default())
         .collect();
     finish(rows)
+}
+
+/// Recursively sort object keys so a node's canonical string does not depend on
+/// the emitting engine's key order (JSON-LD nodes are unordered maps). Array
+/// element order is preserved — a multi-valued property or an `@list` may be
+/// order-bearing, and the row multiset sort already handles node order.
+fn sort_object_keys(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for k in keys {
+                sorted.insert(k.clone(), sort_object_keys(&map[k]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sort_object_keys).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Canonicalize a SPARQL-results-JSON document (SELECT or ASK). A document
@@ -380,6 +404,43 @@ mod tests {
             vec![json!({"v":{"type":"uri","value":"http://x/1"}})],
         );
         assert_eq!(canonicalize(&sel).unwrap().rows, 1);
+    }
+
+    #[test]
+    fn node_key_order_does_not_affect_hash() {
+        // The SAME node content emitted in a DIFFERENT key order (native
+        // hydration is alphabetical; the R2RML crawl is table-column order) must
+        // hash EQUAL — otherwise a content-identical browse node document
+        // false-mismatches cross-engine. Nested value-objects and refs sort too;
+        // array element order is preserved.
+        let native = json!([{
+            "@id": "http://x/1",
+            "@type": "http://T",
+            "http://p/account": {"@id": "http://x/acct/9"},
+            "http://p/birthYear": 1974,
+            "http://p/name": "Alice",
+            "http://p/signup": {"@value": "2009-07-17", "@type": "http://date"},
+        }]);
+        let virtual_ = json!([{
+            "@id": "http://x/1",
+            "http://p/name": "Alice",
+            "http://p/birthYear": 1974,
+            "@type": "http://T",
+            "http://p/signup": {"@type": "http://date", "@value": "2009-07-17"},
+            "http://p/account": {"@id": "http://x/acct/9"},
+        }]);
+        assert_eq!(
+            canonicalize(&native).unwrap().hash,
+            canonicalize(&virtual_).unwrap().hash,
+            "content-identical nodes must hash equal regardless of key order"
+        );
+        // A genuine value difference still diverges.
+        let changed = json!([{"@id": "http://x/1", "http://p/name": "Bob"}]);
+        let same = json!([{"@id": "http://x/1", "http://p/name": "Alice"}]);
+        assert_ne!(
+            canonicalize(&changed).unwrap().hash,
+            canonicalize(&same).unwrap().hash
+        );
     }
 
     #[test]

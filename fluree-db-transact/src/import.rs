@@ -26,6 +26,7 @@ mod inner {
     use fluree_db_core::CommitId;
     use fluree_db_core::{
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid,
+        TxnMetaEntry,
     };
 
     /// Returns `Some(mode)` for the genesis commit (no parent), `None` otherwise.
@@ -179,7 +180,7 @@ mod inner {
         let (writer, op_count, spool_result, envelope) = {
             let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
             let (writer, chunk_prefix_map, spool_ctx) = sink
-                .finish()
+                .into_parts()
                 .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
             state.prefix_map.extend(chunk_prefix_map);
 
@@ -338,7 +339,7 @@ mod inner {
         let (writer, op_count, spool_result, envelope) = {
             let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
             let (writer, _chunk_prefix_map, spool_ctx) = sink
-                .finish()
+                .into_parts()
                 .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
 
             let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
@@ -520,7 +521,7 @@ mod inner {
         // root's `named_graphs` routing exactly like default-graph triples.
         // The spool is finished only after the named-graph loop completes.
         let (mut writer, chunk_prefix_map, mut spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         state.prefix_map.extend(chunk_prefix_map);
         let mut op_count = writer.op_count();
@@ -832,6 +833,13 @@ mod inner {
         /// buffered RunRecords with chunk-local IDs and chunk-local
         /// dictionaries for the post-parse sort + sorted commit write pipeline.
         pub spool_result: Option<crate::import_sink::BufferedSpoolResult>,
+        /// Transaction metadata for this chunk's commit envelope. EMPTY for every
+        /// text-import chunk (Turtle/TriG/JSON-LD) — those set `Vec::new()`, so the
+        /// commit is byte-identical to before this field existed. The materialize
+        /// (twin) builder sets it on ONE chunk — the FINAL commit — to carry the
+        /// completion stamp (watermark + mapping hash + builder version), so a
+        /// twin is valid iff a head-walk finds the stamp (DEC-003 §17).
+        pub txn_meta: Vec<TxnMetaEntry>,
     }
 
     /// Parse a TTL chunk into a `StreamingCommitWriter`. Thread-safe.
@@ -875,7 +883,7 @@ mod inner {
         drop(_parse_span);
 
         let (writer, prefix_map, spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
@@ -888,6 +896,7 @@ mod inner {
             new_codes,
             prefix_map,
             spool_result,
+            txn_meta: Vec::new(),
         })
     }
 
@@ -940,7 +949,7 @@ mod inner {
         drop(_parse_span);
 
         let (writer, _prefix_map, spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
@@ -955,6 +964,7 @@ mod inner {
             // need to contribute additional prefix mappings.
             prefix_map: HashMap::new(),
             spool_result,
+            txn_meta: Vec::new(),
         })
     }
 
@@ -1086,7 +1096,7 @@ mod inner {
         drop(_parse_span);
 
         let (writer, prefix_map, spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
@@ -1099,6 +1109,7 @@ mod inner {
             new_codes,
             prefix_map,
             spool_result,
+            txn_meta: Vec::new(),
         })
     }
 
@@ -1150,7 +1161,11 @@ mod inner {
                 time: Some(state.import_time.clone()),
 
                 txn_signature: None,
-                txn_meta: Vec::new(),
+                // Empty for every text-import chunk (unchanged behavior); the
+                // materialize builder sets it on the final commit to carry the twin's
+                // completion stamp. The predicate namespace codes were interned through
+                // this chunk's sink, so they are already in `ns_delta` above.
+                txn_meta: parsed.txn_meta,
                 graph_delta: HashMap::new(),
                 ns_split_mode,
             };

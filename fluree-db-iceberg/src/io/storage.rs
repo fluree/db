@@ -37,6 +37,18 @@ pub trait IcebergStorage: Debug {
     /// Used to determine where to read the Parquet footer from (last 8 bytes,
     /// then footer_length bytes before that).
     async fn file_size(&self, path: &str) -> Result<u64>;
+
+    /// Read several byte ranges, returning the bytes in the SAME order as `ranges`
+    /// (item 12, B1-AppD). The default reads them sequentially; a backend with
+    /// concurrent range GETs (S3) overrides this with bounded parallelism. Always
+    /// order-preserving so the sparse-buffer assembler can pair bytes to ranges.
+    async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        let mut out = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            out.push(self.read_range(path, range).await?);
+        }
+        Ok(out)
+    }
 }
 
 /// Send-safe storage for AWS SDK integration.
@@ -54,6 +66,28 @@ pub trait SendIcebergStorage: Debug + Send + Sync {
 
     /// Get the size of a file in bytes.
     async fn file_size(&self, path: &str) -> Result<u64>;
+
+    /// Read several byte ranges in input order (item 12, B1-AppD). Default is
+    /// sequential; S3 overrides with bounded parallelism. See
+    /// [`IcebergStorage::read_ranges`].
+    async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        let mut out = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            out.push(self.read_range(path, range).await?);
+        }
+        Ok(out)
+    }
+
+    /// List the immediate child directory names under `prefix` (one object-store
+    /// LIST with a `/` delimiter → common prefixes, child segment only). Used for
+    /// warehouse-root resolution in catalog-less Direct mode. Default: unsupported
+    /// — only the S3 backend (and its lazy wrapper) override it.
+    async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
+        let _ = prefix;
+        Err(IcebergError::storage(
+            "list_dir (warehouse-root listing) is not supported by this storage backend",
+        ))
+    }
 }
 
 /// S3 storage implementation using vended credentials.
@@ -446,15 +480,33 @@ impl S3IcebergStorage {
         Ok(body.into_bytes())
     }
 
-    /// Read multiple byte ranges concurrently with bounded parallelism.
-    pub async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+    /// Read multiple byte ranges, returning bytes in the SAME order as `ranges`
+    /// (item 12, B1-AppD). Wired into the coalesced-fetch loops of the sparse
+    /// Parquet readers. With `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` on (default) the
+    /// GETs run concurrently under a bounded semaphore, ORDER-PRESERVING via
+    /// `buffered` (NOT `buffer_unordered`, whose completion-order output cannot be
+    /// paired back to the input ranges); with the switch off it falls back to a
+    /// sequential loop, byte-identical to the pre-item-12 fetch.
+    pub(crate) async fn read_ranges_bounded(
+        &self,
+        path: &str,
+        ranges: Vec<Range<u64>>,
+    ) -> Result<Vec<Bytes>> {
         use futures::stream::{self, StreamExt};
         use std::sync::Arc;
         use tokio::sync::Semaphore;
 
         let (bucket, key) = Self::parse_s3_uri(path)?;
-        let semaphore = Arc::new(Semaphore::new(self.max_concurrent_reads));
 
+        if !parallel_range_gets_enabled() {
+            let mut out = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                out.push(self.get_object_range(bucket, key, range).await?);
+            }
+            return Ok(out);
+        }
+
+        let semaphore = Arc::new(Semaphore::new(self.max_concurrent_reads));
         let results: Vec<Result<Bytes>> = stream::iter(ranges)
             .map(|range| {
                 let sem = Arc::clone(&semaphore);
@@ -468,12 +520,31 @@ impl S3IcebergStorage {
                     self.get_object_range(&bucket, &key, range).await
                 }
             })
-            .buffer_unordered(self.max_concurrent_reads)
+            // `buffered` (not `buffer_unordered`) yields IN INPUT ORDER, so the
+            // caller can zip the returned bytes back to their `ranges`.
+            .buffered(self.max_concurrent_reads)
             .collect()
             .await;
 
         results.into_iter().collect()
     }
+}
+
+/// Item 12 kill switch (`FLUREE_ICEBERG_PARALLEL_RANGE_GETS`, default **on**).
+/// When off, `read_ranges_bounded` reads the coalesced ranges sequentially —
+/// byte-identical to the pre-item-12 loop. Read once (process-wide).
+#[cfg(feature = "aws")]
+fn parallel_range_gets_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("FLUREE_ICEBERG_PARALLEL_RANGE_GETS") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
 }
 
 #[cfg(feature = "aws")]
@@ -542,6 +613,13 @@ impl IcebergStorage for S3IcebergStorage {
             .map(|l| l as u64)
             .ok_or_else(|| IcebergError::storage("No content-length in HEAD response"))
     }
+
+    /// Item 12 (B1-AppD): concurrent, ORDER-PRESERVING range GETs (delegates to
+    /// [`S3IcebergStorage::read_ranges_bounded`], which honors the
+    /// `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` switch).
+    async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        self.read_ranges_bounded(path, ranges).await
+    }
 }
 
 #[cfg(feature = "aws")]
@@ -609,6 +687,68 @@ impl SendIcebergStorage for S3IcebergStorage {
             .content_length()
             .map(|l| l as u64)
             .ok_or_else(|| IcebergError::storage("No content-length in HEAD response"))
+    }
+
+    /// Item 12 (B1-AppD): concurrent, ORDER-PRESERVING range GETs (delegates to
+    /// [`S3IcebergStorage::read_ranges_bounded`], which honors the
+    /// `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` switch).
+    async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        self.read_ranges_bounded(path, ranges).await
+    }
+
+    /// One `ListObjectsV2` with a `/` delimiter → the immediate child directory
+    /// names under `prefix` (from the response's common prefixes), paginated.
+    async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
+        let (bucket, key) = Self::parse_s3_uri(prefix)?;
+        let list_prefix = if key.is_empty() || key.ends_with('/') {
+            key.to_string()
+        } else {
+            format!("{key}/")
+        };
+        let mut names = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&list_prefix)
+                .delimiter("/");
+            if let Some(token) = continuation.take() {
+                req = req.continuation_token(token);
+            }
+            let response = req.send().await.map_err(|e| {
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "ListObjectsV2",
+                    bucket,
+                    &list_prefix,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
+            })?;
+            for cp in response.common_prefixes() {
+                if let Some(p) = cp.prefix() {
+                    let child = p
+                        .strip_prefix(&list_prefix)
+                        .unwrap_or(p)
+                        .trim_end_matches('/');
+                    if !child.is_empty() {
+                        names.push(child.to_string());
+                    }
+                }
+            }
+            if response.is_truncated().unwrap_or(false) {
+                continuation = response.next_continuation_token().map(String::from);
+                if continuation.is_some() {
+                    continue;
+                }
+            }
+            break;
+        }
+        Ok(names)
     }
 }
 
@@ -908,6 +1048,26 @@ mod tests {
         // Start beyond end - should return empty
         let empty = storage.read_range("test.txt", 100..200).await.unwrap();
         assert!(empty.is_empty());
+    }
+
+    /// Item 12 (B1-AppD): `read_ranges` returns bytes in the SAME order as the
+    /// input ranges — the contract the sparse-buffer assembler relies on to pair
+    /// each range to its start offset. Exercises the trait's default (sequential)
+    /// impl; the S3 override preserves order too (via `buffered`, not
+    /// `buffer_unordered`).
+    #[tokio::test]
+    async fn read_ranges_returns_bytes_in_input_order() {
+        let mut storage = MemoryStorage::new();
+        storage.add_file("f.txt", "0123456789ABCDEF");
+        // Ranges deliberately NOT in ascending order.
+        let out = storage
+            .read_ranges("f.txt", vec![10..13, 0..3, 5..8])
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(&out[0][..], b"ABC", "range 10..13");
+        assert_eq!(&out[1][..], b"012", "range 0..3");
+        assert_eq!(&out[2][..], b"567", "range 5..8");
     }
 
     // ── Access-denied classification (feature-independent; no SDK types) ──
