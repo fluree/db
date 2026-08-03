@@ -506,7 +506,14 @@ async fn build_direct_fluree(
         let max_bytes = config
             .reindex_max_bytes
             .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes);
-        builder = builder.with_indexing_thresholds(config.reindex_min_bytes, max_bytes);
+        builder = builder
+            .with_indexing_thresholds(config.reindex_min_bytes, max_bytes)
+            // GC retention only matters when this process runs the indexer.
+            .with_gc_settings(
+                config.gc_max_old_indexes,
+                config.gc_min_time_mins,
+                config.gc_hard_max_old_indexes,
+            );
     } else {
         // Peer / external-indexer mode: skip spawning a background
         // indexer, but still set novelty thresholds so backpressure

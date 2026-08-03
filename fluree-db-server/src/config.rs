@@ -426,6 +426,29 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_REINDEX_MAX_BYTES")]
     pub reindex_max_bytes: Option<usize>,
 
+    /// Old index versions to retain before GC (default 5)
+    #[arg(long, env = "FLUREE_GC_MAX_OLD_INDEXES")]
+    pub gc_max_old_indexes: Option<u32>,
+
+    /// Minimum age in minutes before an index version can be GC'd (default 30)
+    ///
+    /// Protects concurrent readers of an older version. Note this is ANDed with
+    /// `--gc-max-old-indexes`, so the slower of the two wins.
+    #[arg(long, env = "FLUREE_GC_MIN_TIME_MINS")]
+    pub gc_min_time_mins: Option<u32>,
+
+    /// Retained old index versions past which the age guard is overridden and
+    /// versions are collected regardless of age (default: 4x max-old-indexes)
+    ///
+    /// This is the only setting that bounds index-history DISK use. Because the
+    /// two above are ANDed, a ledger publishing faster than the age guard
+    /// accumulates versions without limit and `--gc-max-old-indexes` bounds
+    /// nothing; only a count can bound bytes. Lower it if index history is
+    /// outgrowing the volume, accepting that a concurrent read of a collected
+    /// version fails and must retry.
+    #[arg(long, env = "FLUREE_GC_HARD_MAX_OLD_INDEXES")]
+    pub gc_hard_max_old_indexes: Option<u32>,
+
     /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 50% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
@@ -830,6 +853,9 @@ impl Default for ServerConfig {
             bm25_auto_sync: server_defaults::DEFAULT_BM25_AUTO_SYNC,
             reindex_min_bytes: server_defaults::DEFAULT_REINDEX_MIN_BYTES,
             reindex_max_bytes: None,
+            gc_max_old_indexes: None,
+            gc_min_time_mins: None,
+            gc_hard_max_old_indexes: None,
             cache_max_mb: None,
             disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
