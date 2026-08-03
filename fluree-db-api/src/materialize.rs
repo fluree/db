@@ -955,6 +955,13 @@ pub async fn drive_virtual_import(
     use std::sync::Mutex;
 
     let mapping = Arc::new(provider.compiled_mapping(graph_source_id, None).await?);
+    // MAJOR-2 (#1529 review): refuse UP FRONT if snapshot pinning is a no-op (the
+    // loadTable cache is disabled) — building a twin whose stamp cannot be trusted
+    // is worse than not building it. The mid-build snapshot-move check is re-run
+    // after every table has been scanned, before the completion stamp.
+    provider
+        .verify_build_snapshot_integrity(graph_source_id)
+        .map_err(|e| MaterializeError::from(R2rmlError::Materialization(e)))?;
     let mut parents = ParentIndexSet::new(&mapping)?;
     let materialization = plan(&mapping);
     let workers = parallelism.max(1);
@@ -1163,6 +1170,14 @@ pub async fn drive_virtual_import(
         });
     }
     total_stats.dup_parent_keys = dup_parent_keys.clone();
+
+    // MAJOR-2 (#1529 review): every table has now been scanned, so re-check that
+    // none moved snapshots mid-build (a source commit during the build). Fail loud
+    // BEFORE the completion stamp is assembled, so no twin is ever stamped with a
+    // watermark it does not contain.
+    provider
+        .verify_build_snapshot_integrity(graph_source_id)
+        .map_err(|e| MaterializeError::from(R2rmlError::Materialization(e)))?;
 
     // Assemble + ship the completion stamp on the FINAL chunk (highest idx →
     // committed last → the twin's head; a head-walk finds the stamp iff the build
