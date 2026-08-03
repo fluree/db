@@ -293,10 +293,7 @@ impl Fluree {
             QueryInput::Sparql(sparql) => {
                 let ast = parse_and_validate_sparql(sparql)?;
                 if sparql_ast_has_dataset(&ast) {
-                    return Err(ApiError::query(
-                        "SPARQL FROM/FROM NAMED clauses are not supported on a single-ledger \
-                         GraphDb. Use query_connection_sparql for multi-ledger queries.",
-                    ));
+                    return Err(single_ledger_dataset_clause_error());
                 }
                 Some(ast)
             }
@@ -831,23 +828,9 @@ impl Fluree {
     /// and only reject cross-ledger clause IRIs.
     pub(crate) fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
         let ast = parse_and_validate_sparql(sparql)?;
-
-        // Check for dataset clauses
-        let has_dataset = match &ast.body {
-            fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.is_some(),
-            fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.is_some(),
-            fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.is_some(),
-            fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.is_some(),
-            fluree_db_sparql::ast::QueryBody::Update(_) => false,
-        };
-
-        if has_dataset {
-            return Err(ApiError::query(
-                "SPARQL FROM/FROM NAMED clauses are not supported on a single-ledger GraphDb. \
-                 Use query_connection_sparql for multi-ledger queries.",
-            ));
+        if sparql_ast_has_dataset(&ast) {
+            return Err(single_ledger_dataset_clause_error());
         }
-
         Ok(())
     }
 
@@ -1332,6 +1315,16 @@ fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
 /// Map QueryError to HTTP-ish status code.
 fn query_error_to_status(err: &fluree_db_query::QueryError) -> u16 {
     status_for_query_error(err)
+}
+
+/// Rejection for a dataset clause on a surface that does not support datasets
+/// (streaming views, R2RML-provider queries). One definition so the message
+/// cannot drift between its call sites.
+fn single_ledger_dataset_clause_error() -> ApiError {
+    ApiError::query(
+        "SPARQL FROM/FROM NAMED clauses are not supported on a single-ledger GraphDb. \
+         Use query_connection_sparql for multi-ledger queries.",
+    )
 }
 
 /// Rejection for a `FROM` / `FROM NAMED` clause that references a graph outside

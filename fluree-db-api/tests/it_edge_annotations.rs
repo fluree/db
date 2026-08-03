@@ -5786,3 +5786,59 @@ async fn multi_hop_copy_rehomes_anchor_each_hop() {
         );
     }
 }
+
+/// Reviewer question (#1483): after `COPY <g1> TO <g2>` with an EXPLICIT
+/// reifier `@id`, the same reifier subject carries a full `f:reifies*` bundle
+/// in TWO graphs. The attachment indexer is proven graph-scoped
+/// (`transfer_named_to_named_survives_reindex`); this pins that the READ
+/// surfaces are too — a reader that assembled the bundle by subject ACROSS
+/// graphs would hit `from_reifies_facts`'s `Duplicate` and silently drop the
+/// annotation from BOTH graphs.
+#[tokio::test]
+async fn copy_with_explicit_reifier_reads_scoped_per_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cross-graph-reads";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    // Explicit reifier @id — the shape the question is about.
+    let ledger = seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
+
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{g1}> TO <{g2}>")).await;
+
+    // SPARQL annotation-tail surface, scoped per graph: both must decode.
+    for g in [g1, g2] {
+        assert_eq!(
+            sparql_role_in_named_graph(&fluree, &ledger, g, "ex:alice", "ex:acme")
+                .await
+                .as_deref(),
+            Some("Engineer"),
+            "SPARQL {{| |}} read in {g} must survive the cross-graph twin bundle"
+        );
+    }
+
+    // JSON-LD hydration surface (@annotation emission during subject
+    // expansion), scoped per graph via the composite graph selector on a
+    // GraphDb view (`fluree.db("ledger#graph")`).
+    for g in [g1, g2] {
+        let db = fluree
+            .db(&format!("{ledger_id}#{g}"))
+            .await
+            .expect("composite-scoped GraphDb");
+        let q = json!({
+            "@context": ctx(),
+            "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+            "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+        });
+        let result = fluree.query(&db, &q).await.expect("scoped hydration query");
+        let rows = result
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("format");
+        assert_eq!(
+            extract_role_from_hydration(&rows).as_deref(),
+            Some("Engineer"),
+            "hydration in {g} must surface the annotation (not Duplicate-drop it): {rows}"
+        );
+    }
+}

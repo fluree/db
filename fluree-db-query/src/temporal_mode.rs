@@ -119,7 +119,6 @@ impl PlanningContext {
     /// deliberately ignores, so a triple present in two members yields one row
     /// per member's event stream (user-facing corollary: `COUNT(*)` over a
     /// multi-`FROM` history query counts per member, not per merged triple).
-    /// full per-event stream rather than a deduplicated set.
     #[inline]
     pub const fn with_multi_default_graph(mut self, multi: bool) -> Self {
         self.multi_default_graph = multi && self.mode.is_current();

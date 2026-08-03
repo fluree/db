@@ -1393,7 +1393,19 @@ async fn stage_graph_mgmt(
                     //     one per reifier subject (keyed off the exactly-one
                     //     `f:reifiesSubject` flake per bundle).
                     let src_is_default = matches!(from, GraphSel::Default);
-                    let mut rehomed: Vec<Flake> = Vec::with_capacity(src_flakes.len() + 1);
+                    // default→named synthesizes ONE anchor per reifier subject
+                    // (below), so size for them exactly; other directions add
+                    // nothing beyond the re-homed source flakes.
+                    let synthesized = if src_is_default {
+                        src_flakes
+                            .iter()
+                            .filter(|f| fluree_db_core::is_reifies_subject(&f.p))
+                            .count()
+                    } else {
+                        0
+                    };
+                    let mut rehomed: Vec<Flake> =
+                        Vec::with_capacity(src_flakes.len() + synthesized);
                     for f in &src_flakes {
                         if fluree_db_core::is_reifies_graph(&f.p) {
                             if let Some(dest) = &dest_sid {
