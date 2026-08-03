@@ -3,22 +3,20 @@
 //! bulk-imported (lex-sorted) index.
 //!
 //! Kept as the ONLY test in its own `[[test]]` binary (not bundled into
-//! `grp_misc`), same convention as `it_cyclic_bgp_probe`. Two reasons it can't
-//! share a binary with parallel siblings: (1) the PRESENCE assertions depend on
-//! the fast-path callsite being `enabled`, but tracing's callsite-interest cache
-//! is process-global — a sibling that hits the callsite first under the no-op
-//! default caches it "disabled" and this test then sees nothing; (2) the
-//! `!has_event("fast path declined")` ABSENCE assertion would capture a
-//! *sibling's* decline (the event is emitted from the shared aggregate fast-path,
-//! which many grp_misc siblings exercise). A thread-local `set_default` capture is
-//! only sound when this is the single test in the process.
-//!
-//! Both mechanisms are PROCESS-scoped: they bite under thread-parallel
-//! `cargo test` (all bundled siblings share one process) but not under
-//! nextest's process-per-test model — so observing that nextest-run bundled
-//! siblings don't interfere does NOT disprove the above. The standalone bin
-//! keeps the test sound under both runners, and `cargo test` is what
-//! contributors reach for first.
+//! `grp_misc`), same convention as `it_cyclic_bgp_probe`. The assertions here
+//! are about instrumentation, which is process-shared in two ways that a
+//! bundled parallel run exposes: (1) tracing's callsite-interest cache is
+//! process-global — it is rebuilt when a dispatcher registers, but a callsite
+//! hit concurrently with that rebuild can briefly see stale interest and drop
+//! an event (this bit once under bare `cargo test` with heavy
+//! concurrent-build load); (2) the `set_default` capture is thread-local, so
+//! the assertions are sound only while every asserted event is emitted on
+//! this thread — fast-path internals fan work out to the shared work-stealing
+//! rayon pool, where an event lands on whichever participating thread's
+//! subscriber happens to be active. Neither hazard is deterministic; a
+//! standalone binary removes both under bare `cargo test` (bundled siblings
+//! share one process), which is what contributors reach for first. nextest
+//! already isolates per-process.
 #![cfg(feature = "native")]
 
 mod support;
