@@ -58,16 +58,18 @@ fn extract_lang_tag<R: RowAccess>(
     if let Expression::Var(var_id) = expr {
         match row.get(*var_id) {
             Some(Binding::Lit { dtc, .. }) => {
-                return dtc.lang_tag().map(Arc::from);
+                // Clone the constraint's existing Arc rather than
+                // re-allocating from the &str view.
+                if let fluree_db_core::DatatypeConstraint::LangTag(tag) = dtc {
+                    return Some(Arc::clone(tag));
+                }
+                return None;
             }
             Some(Binding::EncodedLit { lang_id, .. }) => {
-                if let Some(store) = ctx.and_then(|c| c.binary_store.as_deref()) {
-                    if let Some(meta) = store.decode_meta(*lang_id, i32::MIN) {
-                        if let Some(lang_str) = meta.lang {
-                            return Some(Arc::from(lang_str));
-                        }
-                    }
-                }
+                // Memoized per query (LangTagCache) — one store meta-decode
+                // per distinct id instead of a String + Arc allocation pair
+                // per row.
+                return ctx.and_then(|c| c.lang_tag_for_id(*lang_id));
             }
             _ => {}
         }

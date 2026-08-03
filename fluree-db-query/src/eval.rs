@@ -194,18 +194,20 @@ impl Expression {
                     // `binding_effective_bool`; one integer compare on the hot
                     // arm, the meta decode only runs for lang-tagged rows.
                     if *lang_id != 0 && matches!(&val, FlakeValue::String(_)) {
-                        if let Some(tag) = ctx
-                            .and_then(|c| c.binary_store.as_deref())
-                            .and_then(|s| s.decode_meta(*lang_id, i32::MIN))
-                            .and_then(|m| m.lang)
-                        {
-                            return Ok(Some(ComparableValue::TypedLiteral {
+                        return match ctx.and_then(|c| c.lang_tag_for_id(*lang_id)) {
+                            Some(tag) => Ok(Some(ComparableValue::TypedLiteral {
                                 val,
-                                dtc: Some(crate::parse::UnresolvedDatatypeConstraint::LangTag(
-                                    Arc::from(tag),
-                                )),
-                            }));
-                        }
+                                dtc: Some(crate::parse::UnresolvedDatatypeConstraint::LangTag(tag)),
+                            })),
+                            // An UNRESOLVABLE nonzero lang_id (an
+                            // overlay-ephemeral id the persisted store can't
+                            // see — unreachable through today's scan paths,
+                            // pinned by the post-index-novelty test) must
+                            // surface as an unknown value, never degrade to a
+                            // tag-blind bare string (the exact silent-equality
+                            // bug this arm exists to fix).
+                            None => Ok(None),
+                        };
                     }
                     Ok(ComparableValue::try_from(&val).ok())
                 }

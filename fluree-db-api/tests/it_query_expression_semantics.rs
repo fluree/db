@@ -2082,3 +2082,76 @@ async fn jsonld_stored_lang_equality_is_tag_aware_indexed() {
         json!([["ex:en"], ["ex:en2"]])
     );
 }
+
+// Review follow-up: a language-tagged literal staged AFTER indexing (novelty
+// on top of a binary store) must stay tag-aware however it materializes —
+// the encoded re-tag resolves lang_id through the PERSISTED store, so an
+// overlay/ephemeral lang id must never reach eval as a silently tag-blind
+// string.
+#[tokio::test]
+async fn sparql_stored_lang_equality_with_post_index_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    // Index the @en pair, then stage @fr + plain as NOVELTY on top.
+    let indexed_tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:en", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:en2", "ex:v": { "@value": "x", "@language": "en" } }
+        ]
+    });
+    let ledger = seed_indexed(&fluree, "d7/novelty:sparql", &indexed_tx).await;
+    let novelty_tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:fr", "ex:v": { "@value": "x", "@language": "fr" } },
+            { "@id": "ex:plain", "ex:v": "x" }
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger, &novelty_tx)
+        .await
+        .expect("stage novelty on top of the index")
+        .ledger;
+
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // Mixed materializations on both operands: indexed @en vs novelty @fr/plain.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a = ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:en"], ["ex:en2"]]),
+        "post-index novelty lang literals must stay tag-aware in `=`"
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a != ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:fr"], ["ex:plain"]])
+    );
+    // Constant-vs-stored over the novelty literal, and LANG() on both.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?l . FILTER(?l = \"x\"@fr) }}"),
+        )
+        .await,
+        json!([["ex:fr"]])
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?l . FILTER(LANG(?l) = \"fr\") }}"),
+        )
+        .await,
+        json!([["ex:fr"]]),
+        "LANG() must see the novelty literal's tag"
+    );
+}

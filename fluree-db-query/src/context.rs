@@ -56,6 +56,12 @@ pub enum ConstSidKey {
 /// derived per-graph contexts can share it and the context stays `Send + Sync`.
 pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
 
+/// Per-query memo: binding-level `lang_id` → resolved language tag. Shared
+/// across per-graph context derivations like [`ConstSidCache`], so a
+/// lang-tagged FILTER pays the store's meta decode (and its `String` clone)
+/// once per distinct id instead of twice per row.
+pub type LangTagCache = Arc<Mutex<FxHashMap<u16, Option<Arc<str>>>>>;
+
 /// Shared handle to the per-query overlay-ops memo
 /// ([`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache)).
 pub type SharedOverlayOpsCache = Arc<crate::fast_path_common::OverlayOpsCache>;
@@ -248,6 +254,8 @@ pub struct ExecutionContext<'a> {
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
+    /// Per-query memo for binding-level language-tag ids — see [`LangTagCache`].
+    pub lang_tag_cache: LangTagCache,
     /// Per-query memo: translated + resolved overlay ops per
     /// `(graph, order, predicate)` — see
     /// [`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache).
@@ -326,6 +334,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -380,6 +389,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -438,6 +448,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -485,6 +496,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -531,6 +543,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -579,6 +592,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -980,6 +994,40 @@ impl<'a> ExecutionContext<'a> {
         Some(gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id))
     }
 
+    /// Resolve a binding-level `lang_id` to its language tag, memoized per
+    /// query (see [`LangTagCache`]). Returns `None` for `lang_id == 0` and for
+    /// an id the persisted store cannot resolve. Overlay-ephemeral lang ids
+    /// (`DictOverlay::assign_lang_id`) are scan-internal and do not escape
+    /// into eval-visible bindings today — any novelty drops scans to the
+    /// non-late-materialized `Lit` path (pinned by
+    /// `sparql_stored_lang_equality_with_post_index_novelty`) — so callers
+    /// that checked `lang_id != 0` must treat a `None` here as an
+    /// UNRESOLVABLE tag (unknown value), never as "no tag".
+    pub fn lang_tag_for_id(&self, lang_id: u16) -> Option<Arc<str>> {
+        if lang_id == 0 {
+            return None;
+        }
+        if let Some(hit) = self
+            .lang_tag_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&lang_id)
+        {
+            return hit.clone();
+        }
+        let resolved: Option<Arc<str>> = self
+            .binary_store
+            .as_deref()
+            .and_then(|s| s.decode_meta(lang_id, i32::MIN))
+            .and_then(|m| m.lang)
+            .map(Arc::from);
+        self.lang_tag_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(lang_id, resolved.clone());
+        resolved
+    }
+
     /// Resolve a subject ID to an IRI, using DictNovelty-aware routing.
     ///
     /// Thin wrapper around [`BinaryGraphView::resolve_subject_iri`] which
@@ -1086,6 +1134,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            lang_tag_cache: self.lang_tag_cache.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
         }
@@ -1143,6 +1192,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            lang_tag_cache: self.lang_tag_cache.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
         }
@@ -1203,6 +1253,7 @@ impl<'a> ExecutionContext<'a> {
             // graph/store into another. (`with_active_graph`/`with_default_graph`
             // keep the same store, so they correctly share the parent's memo.)
             const_sid_cache: ConstSidCache::default(),
+            lang_tag_cache: LangTagCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
