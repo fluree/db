@@ -2556,6 +2556,16 @@ fn make_first_scan(
 ) -> BoxedOperator {
     let obj_bounds = tp.o.as_var().and_then(|v| object_bounds.get(&v).cloned());
     let index_hint = scan_index_hint_for_triple(tp, group_by, &inline_ops);
+    // The first-pattern scan is the only one that carries a pruned emit mask
+    // (joins/probes always emit `ALL`). Over a `>= 2`-member default union the
+    // `DatasetOperator` deduplicates on the emitted row, so a pruned variable
+    // column would collapse two *distinct* triples into one. Force full triple
+    // identity here so the dedup keys on `(s, p, o)`.
+    let emit = if planning.multi_default_graph {
+        EmitMask::ALL
+    } else {
+        emit
+    };
     Box::new(crate::dataset_operator::DatasetOperator::scan(
         tp.clone(),
         obj_bounds,

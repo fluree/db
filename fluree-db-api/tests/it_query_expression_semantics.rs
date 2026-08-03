@@ -743,6 +743,88 @@ async fn jsonld_in_uses_value_equality() {
     assert_eq!(jsonld_rows(&fluree, &ledger, &q).await, json!([["Alice"]]));
 }
 
+// O3 — IN / NOT IN propagate a three-valued error (§17.4.1.9): when no element
+// matches AND ≥1 element comparison errors, the whole expression is a type error
+// (unbound in BIND, row-dropped in FILTER, catchable by COALESCE), not `false`
+// (IN) / `true` (NOT IN). A definitive match still wins and discards the pending
+// error. On wave-3 the error half was swallowed, so `2 IN (1/0)` read as `false`.
+#[tokio::test]
+async fn sparql_in_error_propagation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/in-err:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+
+    // `BOUND(?r)` is true iff the IN/NOT IN expression did NOT error — an errored
+    // expression demotes to unbound in the BIND (was bound-to-false on wave-3).
+    for (expr, binds) in [
+        ("2 IN (1/0)", false),       // no match + demotable error → error → unbound
+        ("2 NOT IN (1/0)", false),   // no match + demotable error → error → unbound
+        ("2 IN (5, 3)", true),       // no match, no error → false (still bound)
+        ("2 IN (2, 3)", true),       // match → true (control)
+        ("2 IN (1/0, 2)", true),     // match discards the pending error → bound
+        ("2 NOT IN (1/0, 2)", true), // match discards the pending error → bound
+    ] {
+        let q = format!("{p} ASK {{ ?s ex:name ?n . BIND({expr} AS ?r) FILTER(BOUND(?r)) }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(binds),
+            "BOUND {expr}"
+        );
+    }
+
+    // The non-errored cases keep their correct boolean value: `FILTER(?r)` passes
+    // iff `?r` is true, so the ASK result equals the expression's truth value.
+    for (expr, truth) in [
+        ("2 IN (2, 3)", true),
+        ("2 IN (5, 3)", false),
+        ("2 IN (1/0, 2)", true),      // match wins → true
+        ("2 NOT IN (1/0, 2)", false), // match wins → false
+    ] {
+        let q = format!("{p} ASK {{ ?s ex:name ?n . BIND({expr} AS ?r) FILTER(?r) }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(truth),
+            "VALUE {expr}"
+        );
+    }
+
+    // COALESCE catches the demotable IN error and falls through to the next arm
+    // (proving the error is `can_demote_in_expression`). On wave-3 `2 IN (1/0)`
+    // was `false`, so COALESCE returned that boolean and the filter type-errored.
+    let q = format!(
+        "{p} ASK {{ ?s ex:name ?n . BIND(COALESCE(2 IN (1/0), \"recovered\") AS ?c) FILTER(?c = \"recovered\") }}"
+    );
+    assert_eq!(
+        sparql_rows(&fluree, &ledger, &q).await,
+        JsonValue::Bool(true)
+    );
+}
+
+// O3 (JSON-LD sibling) — same three-valued IN/NOT IN error propagation through
+// the JSON-LD filter surface. Shared IR: the same `eval_in`/`eval_not_in` fix
+// serves both surfaces. An errored BIND leaves the target unbound (null).
+#[tokio::test]
+async fn jsonld_in_error_propagation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/in-err:jsonld").await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?err", "?ok", "?win"],
+        "where": [
+            { "@id": "ex:alice", "ex:name": "?n" },
+            ["bind", "?err", "(in 2 [(/ 1 0)])"],
+            ["bind", "?ok", "(in 2 [2 3])"],
+            ["bind", "?win", "(in 2 [(/ 1 0) 2])"]
+        ]
+    });
+    // ?err errors → null (unbound); ?ok matches → true; ?win matches despite the
+    // errored element → true (the definitive match discards the pending error).
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([[null, true, true]])
+    );
+}
+
 /// Four one-property nodes spanning the EBV cases: numeric zero, empty string,
 /// a truthy number and a truthy string.
 async fn seed_ebv(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
@@ -1609,4 +1691,467 @@ async fn jsonld_ebv_of_cast_numeric_literals() {
         ]
     });
     assert_eq!(jsonld_rows(&fluree, &ledger, &q_falsy).await, json!([]));
+}
+
+// =============================================================================
+// D7 — a stored language-tagged literal carries its tag through the eval path
+// (#1468): `=`/`!=` are tag-aware, and the string builtins that accept a
+// language-tagged argument (§17.4.3) stay transparent to it.
+// =============================================================================
+
+/// A same-tag pair, a different-tag twin, and a plain-string twin — all on
+/// `ex:v`, so a self-join materializes both operands as `Binding::Lit` (the
+/// memory-backed Lit path, where `lit_to_comparable` runs).
+async fn seed_lang(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:en", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:en2", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:fr", "ex:v": { "@value": "x", "@language": "fr" } },
+            { "@id": "ex:plain", "ex:v": "x" }
+        ]
+    });
+    fluree.insert(ledger0, &tx).await.expect("insert").ledger
+}
+
+// `?a = "x"@en` matches only the same-lexeme same-tag literals (ex:en, ex:en2);
+// `"x"@fr` (different tag) and the plain string `"x"` are known-unequal. Before
+// #1468 the tag was dropped, so all four collapsed to the string "x" and matched.
+#[tokio::test]
+async fn sparql_stored_lang_equality_is_tag_aware() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_lang(&fluree, "x2/d7:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // `=`: only the @en subjects equal ex:en's "x"@en.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a = ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:en"], ["ex:en2"]])
+    );
+    // `!=`: the different-tag literal and the plain string are `!=`-true; the
+    // @en pair is `!=`-false (excluded).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a != ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:fr"], ["ex:plain"]])
+    );
+}
+
+#[tokio::test]
+async fn jsonld_stored_lang_equality_is_tag_aware() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_lang(&fluree, "x2/d7:jsonld").await;
+    let q_eq = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:v": "?a" },
+            { "@id": "ex:en", "ex:v": "?b" },
+            ["filter", ["=", "?a", "?b"]]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_eq).await,
+        json!([["ex:en"], ["ex:en2"]])
+    );
+    let q_ne = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:v": "?a" },
+            { "@id": "ex:en", "ex:v": "?b" },
+            ["filter", ["!=", "?a", "?b"]]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_ne).await,
+        json!([["ex:fr"], ["ex:plain"]])
+    );
+}
+
+// The string builtins that accept a language-tagged argument stay transparent
+// to the tag (no "requires string argument" type error), and LANG/LANGMATCHES
+// still read the tag off a stored lang literal.
+#[tokio::test]
+async fn sparql_string_builtins_accept_stored_lang() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_lang(&fluree, "x2/d7b:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:en ex:v ?a . FILTER(CONTAINS(?a, \"x\")) }}"),
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:en ex:v ?a . FILTER(LANG(?a) = \"en\") }}"),
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:en ex:v ?a . FILTER(LANGMATCHES(LANG(?a), \"en\")) }}"),
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+}
+
+#[tokio::test]
+async fn jsonld_string_builtins_accept_stored_lang() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_lang(&fluree, "x2/d7b:jsonld").await;
+    // CONTAINS accepts every stored value (all four contain "x") — no row errors
+    // out on the language-tagged literals.
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:v": "?a" },
+            ["filter", ["contains", "?a", "x"]]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([["ex:en"], ["ex:en2"], ["ex:fr"], ["ex:plain"]])
+    );
+}
+
+// The sweep must not accept a foreign-datatype literal as a string argument: it
+// is not a string, so CONTAINS stays a type error (the row is excluded).
+#[tokio::test]
+async fn sparql_string_builtin_rejects_foreign_datatype_arg() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_foreign(&fluree, "x2/d7c:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // ex:fa ex:v is "zzz"^^ex:myType — CONTAINS on it is a type error → ASK false.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:fa ex:v ?a . FILTER(CONTAINS(?a, \"zz\")) }}"),
+        )
+        .await,
+        JsonValue::Bool(false)
+    );
+}
+
+// =============================================================================
+// D5b (eval path) — encoded xsd:float keeps its datatype, and an encoded
+// language-tagged literal has no EBV (#1470). These exercise the
+// late-materialized `Binding::EncodedLit` path, which only fires on a
+// reindexed, novelty-free ledger (a trailing insert disables late
+// materialization and silently drops the test to the Lit path — §5.4).
+// =============================================================================
+
+// (`seed_indexed` is defined once, in the "Indexed twins" section above.)
+
+fn float_tx() -> JsonValue {
+    json!({
+        "@context": ctx(),
+        "@graph": [{ "@id": "ex:n", "ex:f": { "@value": "1.5", "@type": "xsd:float" } }]
+    })
+}
+
+// On decode the xsd:float is folded to a double (NUM_F64 fast path); #1470
+// re-tags it from `dt_id` so `datatype(?f + ?f)` is xsd:float — agreeing with
+// the Lit path (`sparql_numeric_promotion_result_datatype`). Without the fix
+// the encoded path yields xsd:double.
+#[tokio::test]
+async fn sparql_encoded_xsd_float_result_datatype() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "x2/encfloat:sparql", &float_tx()).await;
+    let p = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             PREFIX ex: <http://example.org/ns/> ";
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:n ex:f ?f . FILTER(datatype(?f + ?f) = xsd:float) }}"),
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+    // Not xsd:double (the pre-#1470 encoded result).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:n ex:f ?f . FILTER(datatype(?f + ?f) = xsd:double) }}"),
+        )
+        .await,
+        JsonValue::Bool(false)
+    );
+}
+
+#[tokio::test]
+async fn jsonld_encoded_xsd_float_result_datatype() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "x2/encfloat:jsonld", &float_tx()).await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?ft"],
+        "where": [
+            { "@id": "ex:n", "ex:f": "?f" },
+            ["bind", "?ft", ["expr", ["datatype", ["+", "?f", "?f"]]]]
+        ]
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([["xsd:float"]])
+    );
+}
+
+fn lang_ebv_tx() -> JsonValue {
+    json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:l", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:p", "ex:v": "y" }
+        ]
+    })
+}
+
+// FILTER(?v) has no effective boolean value for a language-tagged literal
+// (§17.2.2). On the encoded path the decode collapses it to a bare string that
+// previously read truthy; #1470 consults `lang_id` and errors, so the lang row
+// is excluded and only the plain-string control survives — matching the Lit
+// path (`sparql_lit_lang_literal_ebv_is_type_error`).
+#[tokio::test]
+async fn sparql_encoded_lang_literal_ebv_is_type_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "x2/enclangebv:sparql", &lang_ebv_tx()).await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?v . FILTER(?v) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:p"]])
+    );
+}
+
+#[tokio::test]
+async fn jsonld_encoded_lang_literal_ebv_is_type_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "x2/enclangebv:jsonld", &lang_ebv_tx()).await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:v": "?v" },
+            ["filter", "?v"]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &q).await, json!([["ex:p"]]));
+}
+
+// The Lit (non-encoded) path already errors on a lang literal's EBV; pin it so
+// the encoded-path fix above reads as *agreement*, not a new divergence.
+#[tokio::test]
+async fn sparql_lit_lang_literal_ebv_is_type_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_lang(&fluree, "x2/litlangebv:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // ex:en/ex:en2/ex:fr are language-tagged (no EBV → excluded); only the plain
+    // string "x" (ex:plain) survives.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?v . FILTER(?v) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:plain"]])
+    );
+}
+
+// =============================================================================
+// D7 on the INDEXED path (#1483 review blocker): the EncodedLit decode arm
+// re-tags a stored language-tagged literal from `lang_id`, so `=`/`!=` (and
+// IN, which routes through the same equality) are tag-aware on the
+// late-materialized path too — previously only the memory/Lit path was, making
+// stored-lang equality materialization-dependent.
+// =============================================================================
+
+fn lang_tx() -> JsonValue {
+    json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:en", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:en2", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:fr", "ex:v": { "@value": "x", "@language": "fr" } },
+            { "@id": "ex:plain", "ex:v": "x" }
+        ]
+    })
+}
+
+#[tokio::test]
+async fn sparql_stored_lang_equality_is_tag_aware_indexed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "d7/indexed:sparql", &lang_tx()).await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // Stored-vs-stored `=`: only the @en pair equals ex:en's "x"@en.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a = ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:en"], ["ex:en2"]]),
+        "indexed stored-lang `=` must be tag-aware (was: all four matched)"
+    );
+    // Stored-vs-stored `!=`.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a != ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:fr"], ["ex:plain"]])
+    );
+    // Constant-vs-stored: the constant lowers to a lang TypedLiteral; the
+    // stored side must arrive tagged too, or a value-matching query returns
+    // zero rows (the pre-fix false negative).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?l . FILTER(?l = \"x\"@fr) }}"),
+        )
+        .await,
+        json!([["ex:fr"]]),
+        "indexed constant-vs-stored lang `=` must match (was: zero rows)"
+    );
+    // IN routes through the same rdf_term_equal.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?l . FILTER(?l IN (\"x\"@en)) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:en"], ["ex:en2"]])
+    );
+}
+
+// JSON-LD twin (shared IR/eval): stored-lang equality on the indexed path.
+#[tokio::test]
+async fn jsonld_stored_lang_equality_is_tag_aware_indexed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "d7/indexed:jsonld", &lang_tx()).await;
+    let q_eq = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:v": "?a" },
+            { "@id": "ex:en", "ex:v": "?b" },
+            ["filter", ["=", "?a", "?b"]]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_eq).await,
+        json!([["ex:en"], ["ex:en2"]])
+    );
+}
+
+// Review follow-up: a language-tagged literal staged AFTER indexing (novelty
+// on top of a binary store) must stay tag-aware however it materializes —
+// the encoded re-tag resolves lang_id through the PERSISTED store, so an
+// overlay/ephemeral lang id must never reach eval as a silently tag-blind
+// string.
+#[tokio::test]
+async fn sparql_stored_lang_equality_with_post_index_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    // Index the @en pair, then stage @fr + plain as NOVELTY on top.
+    let indexed_tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:en", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:en2", "ex:v": { "@value": "x", "@language": "en" } }
+        ]
+    });
+    let ledger = seed_indexed(&fluree, "d7/novelty:sparql", &indexed_tx).await;
+    let novelty_tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:fr", "ex:v": { "@value": "x", "@language": "fr" } },
+            { "@id": "ex:plain", "ex:v": "x" }
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger, &novelty_tx)
+        .await
+        .expect("stage novelty on top of the index")
+        .ledger;
+
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // Mixed materializations on both operands: indexed @en vs novelty @fr/plain.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a = ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:en"], ["ex:en2"]]),
+        "post-index novelty lang literals must stay tag-aware in `=`"
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a != ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:fr"], ["ex:plain"]])
+    );
+    // Constant-vs-stored over the novelty literal, and LANG() on both.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?l . FILTER(?l = \"x\"@fr) }}"),
+        )
+        .await,
+        json!([["ex:fr"]])
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?l . FILTER(LANG(?l) = \"fr\") }}"),
+        )
+        .await,
+        json!([["ex:fr"]]),
+        "LANG() must see the novelty literal's tag"
+    );
 }

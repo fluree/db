@@ -70,6 +70,16 @@ pub struct PlanningContext {
     /// and the stats-cache key so a trusted view is never reused for a
     /// non-vouched (policy / dataset) execution at the same overlay epoch.
     pub allow_semantic_elision: bool,
+    /// Whether the query runs against a dataset whose default graph is the
+    /// union of **two or more** graphs (a SPARQL `FROM`-derived default union).
+    /// When set, the default union is an RDF merge (a *set*), not a bag
+    /// (SPARQL §13.2): the [`DatasetOperator`](crate::dataset_operator)
+    /// deduplicates emitted triples across members, and the planner both forces
+    /// `EmitMask::ALL` on the first scan (so a pruned column can't collapse
+    /// distinct triples) and declines the fused count/aggregate fast paths
+    /// (which assume bag cardinality over the union). Only ever `true` in
+    /// current mode — history datasets keep per-event (assert/retract) rows.
+    pub multi_default_graph: bool,
 }
 
 impl PlanningContext {
@@ -79,6 +89,7 @@ impl PlanningContext {
         Self {
             mode: TemporalMode::Current,
             allow_semantic_elision: false,
+            multi_default_graph: false,
         }
     }
 
@@ -88,6 +99,7 @@ impl PlanningContext {
         Self {
             mode: TemporalMode::History,
             allow_semantic_elision: false,
+            multi_default_graph: false,
         }
     }
 
@@ -97,6 +109,19 @@ impl PlanningContext {
     #[inline]
     pub const fn with_semantic_elision(mut self, allow: bool) -> Self {
         self.allow_semantic_elision = allow && self.mode.is_current();
+        self
+    }
+
+    /// Record that the default graph is a `>= 2`-member union (see
+    /// [`Self::multi_default_graph`]). No-op in history mode, which keeps the
+    /// multi-`FROM` default union a BAG — the one place it is not a set:
+    /// history rows carry per-event assert/retract provenance the dedup key
+    /// deliberately ignores, so a triple present in two members yields one row
+    /// per member's event stream (user-facing corollary: `COUNT(*)` over a
+    /// multi-`FROM` history query counts per member, not per merged triple).
+    #[inline]
+    pub const fn with_multi_default_graph(mut self, multi: bool) -> Self {
+        self.multi_default_graph = multi && self.mode.is_current();
         self
     }
 
