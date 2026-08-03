@@ -182,6 +182,18 @@ pub struct IndexerConfig {
     /// Default: 30 minutes
     pub gc_min_time_mins: u32,
 
+    /// Retained old index versions past which `gc_min_time_mins` is overridden
+    /// and versions are collected regardless of age. `None` derives
+    /// `gc_max_old_indexes * 4`.
+    ///
+    /// Needed because the two thresholds above are ANDed, so the age guard always
+    /// wins under a fast publish rate and `gc_max_old_indexes` then bounds
+    /// nothing: retention becomes "however many versions fit in the guard", which
+    /// is unbounded in bytes. Only a count can bound bytes. See
+    /// [`crate::gc::CleanGarbageConfig::hard_max_old_indexes`] for the reader
+    /// trade-off this accepts.
+    pub gc_hard_max_old_indexes: Option<u32>,
+
     /// Memory budget (bytes) for the run-sort buffer during index building.
     ///
     /// This total is split evenly across all sort orders (SPOT, PSOT, POST, OPST).
@@ -395,6 +407,7 @@ impl Default for IndexerConfig {
             branch_max_children: 200,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            gc_hard_max_old_indexes: None,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -431,6 +444,7 @@ impl IndexerConfig {
             branch_max_children,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            gc_hard_max_old_indexes: None,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -460,6 +474,7 @@ impl IndexerConfig {
             branch_max_children: 40,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            gc_hard_max_old_indexes: None,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -489,6 +504,7 @@ impl IndexerConfig {
             branch_max_children: 400,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            gc_hard_max_old_indexes: None,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,

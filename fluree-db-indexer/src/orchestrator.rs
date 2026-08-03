@@ -1501,7 +1501,7 @@ impl BackgroundIndexerWorker {
                             min_time_garbage_mins: Some(self.config.gc_min_time_mins),
                             // `None` takes the derived default of
                             // `max_old_indexes * DEFAULT_HARD_MAX_MULTIPLE`.
-                            hard_max_old_indexes: None,
+                            hard_max_old_indexes: self.config.gc_hard_max_old_indexes,
                             artifact_cache_dir: Some(
                                 self.config
                                     .data_dir
