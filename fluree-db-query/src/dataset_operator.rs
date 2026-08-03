@@ -210,6 +210,17 @@ struct DatasetMember {
 /// its decoded `Sid`/`Lit` twin collapse to one row. `Binding`'s manual
 /// `Eq`/`Hash` exclude history metadata, so this is only armed in current mode
 /// (see [`DatasetOperator::open`]).
+///
+/// MEMORY CLIFF (documented like `scan_graph_flakes`'s): unlike a
+/// single-graph scan, a `>= 2`-member default union is no longer
+/// bounded-memory streaming — the seen-set grows O(distinct emitted rows)
+/// with full normalized `Binding` signatures as keys, exactly like a
+/// user-requested `DISTINCT` (which is the price of §13.2 set semantics; a
+/// hash-only key was rejected because a collision would silently DROP a
+/// distinct row). Each RETAINED row charges one unit of fuel, so a fuel
+/// budget bounds the resident set; `drain_count` inherits the same cost when
+/// it forgoes the per-member count-only shortcut (surfaced to EXPLAIN via
+/// `plan_details.default_union_set_merge`).
 struct BatchDeduper {
     seen: HashMap<Vec<Binding>, (), FxBuildHasher>,
     norm: Option<EqualityNorm>,
@@ -459,7 +470,14 @@ impl Operator for DatasetOperator {
     }
 
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
-        self.builder.plan_details()
+        let mut details = self.builder.plan_details();
+        // Post-open, report the armed §13.2 set-merge so EXPLAIN can say why
+        // memory grows with distinct rows and why COUNT(*) forgoes the
+        // per-member count-only shortcut on a multi-FROM union.
+        if self.dedup.is_some() {
+            details.insert("default_union_set_merge".to_string(), true.into());
+        }
+        details
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
@@ -518,13 +536,21 @@ impl Operator for DatasetOperator {
                     // multi-default scan without setting the flag would key the
                     // dedup on a pruned mask and over-dedup distinct triples —
                     // fail loudly here rather than silently.
-                    debug_assert!(
-                        self.builder.emit_is_full(),
-                        "DatasetOperator armed cross-member set-dedup on a scan \
-                         with a pruned variable column; the multi_default_graph \
-                         planning flag must force EmitMask::ALL (make_first_scan) \
-                         so distinct triples are not collapsed"
-                    );
+                    if !self.builder.emit_is_full() {
+                        // A pruned variable column under an armed dedup would
+                        // COLLAPSE DISTINCT TRIPLES (silent wrong cardinality).
+                        // This was a debug_assert, which compiles out in
+                        // release — fail loud there too: every known dataset
+                        // path forces full emission (make_first_scan under
+                        // multi_default_graph; joins/OPTIONAL/property-join
+                        // widen or hard-code ALL), so reaching this is a
+                        // planner bug, not a user error.
+                        return Err(QueryError::Internal(
+                            "multi-default-graph set-dedup armed on a scan with a pruned \
+                             variable column; the plan must force full variable emission"
+                                .to_string(),
+                        ));
+                    }
                     Some(BatchDeduper::new(ctx))
                 } else {
                     None
@@ -608,6 +634,10 @@ impl Operator for DatasetOperator {
                     let result = match &mut self.dedup {
                         Some(dedup) => {
                             let deduped = dedup.retain_new(result)?;
+                            // Each RETAINED row grows the resident seen-set;
+                            // charge fuel so a budget bounds the memory cliff
+                            // (see the BatchDeduper doc).
+                            ctx.tracker.consume_fuel(deduped.len() as u64)?;
                             if deduped.is_empty() {
                                 continue;
                             }
