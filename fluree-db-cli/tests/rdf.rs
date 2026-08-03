@@ -1273,9 +1273,14 @@ fn check_is_a_hidden_alias_for_parse() {
         !parse_row.contains("aliases:"),
         "the `check` alias must stay hidden; clap advertises visible ones: {parse_row}"
     );
+    // Scoped to command rows, not the whole help text: a future top-level
+    // verb whose one-line description mentions "checks" (a `doctor`, say)
+    // must not read as a phantom alias regression. What this guards is
+    // someone adding `check` back as a real command.
+    let check_row = help.lines().find(|l| l.trim_start().starts_with("check"));
     assert!(
-        !help.contains("check"),
-        "the `check` spelling must not appear in top-level help:\n{help}"
+        check_row.is_none(),
+        "no top-level command row may be named `check`: {check_row:?}"
     );
 }
 

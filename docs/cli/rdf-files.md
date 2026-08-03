@@ -51,20 +51,21 @@ wins:
 
 | Syntax | `--syntax` value | Extensions | Read | Write |
 |--------|------------------|------------|------|-------|
-| Turtle | `turtle` (`ttl`, `n3`) | `.ttl`, `.n3` | yes | not yet |
-| N-Triples | `ntriples` (`nt`) | `.nt` | yes | not yet |
-| N-Quads | `nquads` (`nq`) | `.nq` | not yet | not yet |
-| TriG | `trig` | `.trig` | not yet | not yet |
-| JSON-LD | `jsonld` (`json-ld`) | `.jsonld`, `.json` | not yet | not yet |
+| Turtle | `turtle` (`ttl`, `n3`) | `.ttl`, `.n3` | yes | yes |
+| N-Triples | `ntriples` (`nt`) | `.nt` | yes | yes |
+| N-Quads | `nquads` (`nq`) | `.nq` | yes | yes |
+| TriG | `trig` | `.trig` | yes | yes |
+| JSON-LD | `jsonld` (`json-ld`) | `.jsonld`, `.json` | not yet | yes |
 | RDF/XML | `rdfxml` (`xml`) | `.rdf`, `.owl` | not yet | not yet |
 | RDF/JSON | `rdfjson` | `.rj` | not yet | not yet |
 | Jelly | `jelly` | `.jelly` | not yet | not yet |
 
 N-Triples is a subset of the Turtle grammar and is read by the same parser,
-so it is not an approximation. The syntaxes marked "not yet" are named so
-that passing one produces a clear refusal naming what it is waiting on,
-rather than a parse error partway through a file that was sniffed as
-something else.
+so it is not an approximation. JSON-LD is currently write-only: `convert`
+can produce it but not read it, so a JSON-LD round trip is not yet possible.
+The cells marked "not yet" are named so that passing one produces a clear
+refusal naming what it is waiting on, rather than a parse error partway
+through a file that was sniffed as something else.
 
 Content sniffing distinguishes the XML, JSON, and Turtle families and
 deliberately does not try to tell Turtle from TriG, or N-Triples from
@@ -162,7 +163,12 @@ corpus built to hide from it. `sink.relative_std_error_pct` bounds ordinary
 sampling error; nothing here bounds a deliberate one.
 
 `--profile=json` emits the same run as one JSON document on stderr, with
-`schema` set to `fluree.rdf.profile.v1`:
+`schema` set to `fluree.rdf.profile.v1`. The schema id is a stable contract
+token that scripts match on: it deliberately retains the historical `rdf`
+segment from before these commands were flattened, and it only changes when
+the document's *shape* changes (which would be a `.v2`), never to track a
+command rename. The `verb` field, by contrast, names the command as invoked
+and does follow the surface (`parse`, even via the `check` alias):
 
 ```bash
 fluree count dump.ttl --profile=json --no-hash 2> run.json
