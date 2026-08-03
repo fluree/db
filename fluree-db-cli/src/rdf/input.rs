@@ -1,4 +1,4 @@
-//! Getting bytes into the `fluree rdf` verbs: file or stdin, gzip or zstd or
+//! Getting bytes into the RDF file verbs: file or stdin, gzip or zstd or
 //! neither, with the phases the profiler needs kept apart.
 //!
 //! The existing [`crate::input::read_input`] is `read_to_string` with a source
@@ -39,7 +39,7 @@ impl RdfInput {
     /// Resolve the positional argument. Absent or `-` means stdin.
     ///
     /// Unlike [`crate::input::resolve_input`] there is no "stdin is a TTY, so
-    /// error" check here: `fluree rdf check` with no argument on a terminal
+    /// error" check here: `fluree parse` with no argument on a terminal
     /// should block on stdin exactly as `cat` does, which is what a user
     /// typing a document by hand expects and what a shell script that pipes
     /// in nothing gets anyway.

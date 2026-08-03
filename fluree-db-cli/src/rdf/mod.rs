@@ -1,14 +1,19 @@
-//! `fluree rdf` — RDF syntax tooling that does not touch a ledger.
+//! `fluree parse`, `fluree count`, `fluree convert` — RDF syntax tooling that
+//! does not touch a ledger.
 //!
 //! These verbs work on files, not databases. There is no `.fluree/` to find,
-//! no ledger to open, no connection to build: `fluree rdf check dump.ttl`
+//! no ledger to open, no connection to build: `fluree parse dump.ttl`
 //! reads a file and reports on it. `commands/validate.rs` set the precedent
 //! for a ledger-free file mode, and these go further — validate still spins up
 //! an ephemeral in-memory ledger to run SHACL through, and nothing here needs
 //! even that.
 //!
-//! Three verbs today. `check` and `count` are complete; `convert` is a named
-//! stub, because the surface is settled and the writers are not.
+//! They are top-level verbs rather than an `rdf` group: nothing else in the
+//! CLI converts or counts a file, so the group prefix bought disambiguation
+//! nobody needed and cost every invocation a word. `parse` carries the one
+//! rename — it was `check`, which reads as a shorter `validate`, and
+//! `validate` already has a file mode of its own. `check` survives as a
+//! hidden alias.
 
 pub mod check;
 pub mod convert;
@@ -22,7 +27,7 @@ pub mod recover;
 pub mod syntax;
 pub mod writer;
 
-use crate::cli::{RdfAction, RdfCommonArgs};
+use crate::cli::RdfCommonArgs;
 use crate::error::{CliError, CliResult, EXIT_ERROR};
 use fluree_graph_ir::{
     Datatype, GraphSink, LiteralValue, Phase, PhaseTimings, SinkCounts, SinkResult, SinkTiming,
@@ -33,40 +38,26 @@ use input::RdfInput;
 use std::time::Duration;
 use syntax::{RdfSyntax, Resolved};
 
-/// Dispatch an `rdf` subcommand.
-pub fn run(action: &RdfAction, quiet: bool, parallelism: usize) -> CliResult<()> {
-    let common = match action {
-        RdfAction::Convert { common, .. }
-        | RdfAction::Check { common, .. }
-        | RdfAction::Count { common } => common,
-    };
+/// Run `fluree parse`.
+pub fn run_parse(common: &RdfCommonArgs, format: check::CheckFormat, quiet: bool) -> CliResult<()> {
     reject_profile_space_form(common)?;
+    check::run(common, format, quiet)
+}
 
-    match action {
-        RdfAction::Convert {
-            common,
-            to,
-            output,
-            pretty,
-            bnode_policy,
-            prefixes,
-            continue_on_error,
-        } => convert::run(
-            common,
-            &convert::ConvertArgs {
-                to: *to,
-                output: output.as_deref(),
-                pretty: *pretty,
-                bnode_policy: *bnode_policy,
-                prefixes: prefixes.as_deref(),
-                parallelism,
-                continue_on_error: *continue_on_error,
-            },
-            quiet,
-        ),
-        RdfAction::Check { common, format } => check::run(common, *format, quiet),
-        RdfAction::Count { common } => count::run(common, quiet),
-    }
+/// Run `fluree count`.
+pub fn run_count(common: &RdfCommonArgs, quiet: bool) -> CliResult<()> {
+    reject_profile_space_form(common)?;
+    count::run(common, quiet)
+}
+
+/// Run `fluree convert`.
+pub fn run_convert(
+    common: &RdfCommonArgs,
+    args: &convert::ConvertArgs<'_>,
+    quiet: bool,
+) -> CliResult<()> {
+    reject_profile_space_form(common)?;
+    convert::run(common, args, quiet)
 }
 
 /// Catch `--profile json` (space) and say what was meant.
@@ -78,7 +69,7 @@ pub fn run(action: &RdfAction, quiet: bool, parallelism: usize) -> CliResult<()>
 /// and useless.
 ///
 /// The ambiguity is real and not clap's fault: with a space-separated optional
-/// value, `fluree rdf count --profile data.ttl` could not be told apart from a
+/// value, `fluree count --profile data.ttl` could not be told apart from a
 /// format named `data.ttl`. So the form stays attached-only, and this turns
 /// the confusing failure into an instruction.
 fn reject_profile_space_form(common: &RdfCommonArgs) -> CliResult<()> {
@@ -273,7 +264,7 @@ pub struct ParseOutcome {
     pub error: Option<TurtleError>,
 }
 
-/// Parser options for every `fluree rdf` verb.
+/// Parser options for every RDF file verb.
 ///
 /// One function so the verbs cannot drift: `check`, `count` and `convert` must
 /// describe the same parse, and the only knob a user turns is `--nocheck`.
@@ -294,7 +285,7 @@ pub fn verb_options(nocheck: bool) -> ParserOptions {
 /// `rdf:first`/`rdf:rest` spine W3C says they are, and numeric literals have
 /// to keep the lexical form they were written with. Under the ingest options
 /// a one-item collection would count as one statement instead of three, and
-/// `fluree rdf count` would disagree with every other tool in the field.
+/// `fluree count` would disagree with every other tool in the field.
 pub fn parse_document(
     text: &str,
     syntax: RdfSyntax,
@@ -380,7 +371,7 @@ pub fn parse_into<S: GraphSink>(
     // Four readers, one shape. The two line formats go through the STRICT
     // scanner rather than the Turtle parser: they are not Turtle subsets to a
     // reader, they are grammars defined by what they refuse, and reading them
-    // with the Turtle parser would accept documents `fluree rdf check` is
+    // with the Turtle parser would accept documents `fluree parse` is
     // being asked to reject.
     //
     // `base` is deliberately not threaded into the line formats: N-Triples
@@ -393,7 +384,7 @@ pub fn parse_into<S: GraphSink>(
     // containing a directive, a prefixed name, a bare number or a
     // long-quoted string used to be accepted (all of it is valid Turtle)
     // and is now rejected (none of it is valid N-Triples). That is the
-    // point of `fluree rdf check` on an N-Triples file; accepting it
+    // point of `fluree parse` on an N-Triples file; accepting it
     // would make the verb agree with no other tool in the field.
     let result = match syntax {
         RdfSyntax::NTriples => fluree_graph_turtle::parse_ntriples(text, &mut sink),
@@ -530,7 +521,7 @@ pub fn report_run(
 /// already written whatever it had to say.
 ///
 /// Distinct from [`CliError::Usage`], which exits 2 and means the *invocation*
-/// was wrong. Keeping the two apart is what lets `fluree rdf check` be used in
+/// was wrong. Keeping the two apart is what lets `fluree parse` be used in
 /// a script: a non-zero exit tells you there is a problem, and the code tells
 /// you whose.
 pub fn exit_document_invalid() -> CliError {

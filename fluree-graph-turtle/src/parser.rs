@@ -145,7 +145,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         // in-flight chunk at 2M distinct terms, on the bulk-import path whose
         // budget formula was calibrated with the reservation in place. Neither
         // default is right for both, and only the caller knows which side it is
-        // on: import knows its chunk size and corpus shape, `fluree rdf convert`
+        // on: import knows its chunk size and corpus shape, `fluree convert`
         // is handed an arbitrary document and knows nothing.
         //
         // The clamp is not a second guess at the right size — it is a bound on
@@ -3806,7 +3806,7 @@ mod tests {
     // =========================================================================
 
     /// A sink that accepts `budget` triples and then fails, standing in for a
-    /// writer whose downstream pipe closed (`fluree rdf convert f.ttl | head`).
+    /// writer whose downstream pipe closed (`fluree convert f.ttl | head`).
     struct FailingSink {
         budget: usize,
         emitted: usize,

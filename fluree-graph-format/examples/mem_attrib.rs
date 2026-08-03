@@ -1,4 +1,4 @@
-//! Where the bytes live in a `fluree rdf convert` run.
+//! Where the bytes live in a `fluree convert` run.
 //!
 //! The competitor matrix put `convert` at ~1 GB of peak RSS on a 118 MB Turtle
 //! corpus while `serdi` streamed the same document in 1.5 MB. This is the
@@ -12,7 +12,7 @@
 //! cargo run --release --example mem_attrib -- <file.ttl|file.nt> [--nocheck]
 //! ```
 //!
-//! The stages mirror `fluree rdf convert` exactly:
+//! The stages mirror `fluree convert` exactly:
 //!
 //! 1. `read`   — the CLI's input path, byte for byte (BufReader, `take`, `read_to_end`).
 //! 2. `parse`  — the same parse into a sink that only counts, so the peak is

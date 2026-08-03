@@ -676,8 +676,32 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::memory::run(action, &fluree_dir).await
         }
 
-        // No `.fluree/` lookup: the rdf verbs read files, not ledgers.
-        Commands::Rdf { action } => rdf::run(&action, quiet, cli.parallelism),
+        // No `.fluree/` lookup: these verbs read files, not ledgers.
+        Commands::Parse { common, format } => rdf::run_parse(&common, format, quiet),
+
+        Commands::Count { common } => rdf::run_count(&common, quiet),
+
+        Commands::Convert {
+            common,
+            to,
+            output,
+            pretty,
+            bnode_policy,
+            continue_on_error,
+            prefixes,
+        } => rdf::run_convert(
+            &common,
+            &rdf::convert::ConvertArgs {
+                to,
+                output: output.as_deref(),
+                pretty,
+                bnode_policy,
+                prefixes: prefixes.as_deref(),
+                parallelism: cli.parallelism,
+                continue_on_error,
+            },
+            quiet,
+        ),
 
         Commands::Iceberg { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;

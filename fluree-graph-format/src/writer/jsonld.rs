@@ -60,7 +60,7 @@ impl<W: Write> JsonLdWriter<W> {
     /// The two are separate because they answer different questions:
     /// [`WriterConfig`] decides what the *labels* are, the format config
     /// decides what the *document* looks like. Blank-node labelling is applied
-    /// here, by the writer, so `fluree rdf convert` has one blank-node
+    /// here, by the writer, so `fluree convert` has one blank-node
     /// contract across every output syntax; leave the format config's own
     /// [`BlankNodePolicy`](crate::BlankNodePolicy) at its default
     /// (`PreserveLabeled`) or it will relabel a second time.

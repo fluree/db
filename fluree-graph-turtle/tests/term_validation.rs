@@ -377,7 +377,7 @@ fn a_byte_order_mark_anywhere_else_is_still_an_error() {
 ///
 /// The case that forces this: a document declares a namespace that is not an
 /// IRI and then never uses the prefix. Waiting for an expansion means nothing
-/// is ever checked and `fluree rdf check` answers "valid RDF" — which it is
+/// is ever checked and `fluree parse` answers "valid RDF" — which it is
 /// not. `@base` matters more still, because a bad base is not inert: every
 /// relative reference in the document resolves against it.
 #[test]

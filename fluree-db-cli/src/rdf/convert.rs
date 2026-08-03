@@ -1,4 +1,4 @@
-//! `fluree rdf convert` — read one syntax, write another.
+//! `fluree convert` — read one syntax, write another.
 //!
 //! The whole verb is four moving parts, and three of them already existed:
 //! the input plumbing `check` and `count` use, the parser, the writers, and a
@@ -103,7 +103,7 @@ pub struct ConvertArgs<'a> {
     pub continue_on_error: bool,
 }
 
-/// Run `fluree rdf convert`.
+/// Run `fluree convert`.
 pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliResult<()> {
     let target = resolve_output_syntax(args.to, args.output)?;
 

@@ -1,6 +1,6 @@
 //! Bias probe for the [`TimingSink`] sampling estimator.
 //!
-//! Originally written as a scratch harness for the `fluree rdf` adversarial
+//! Originally written as a scratch harness for the RDF file verbs' adversarial
 //! review, and kept because it is the only thing that can answer the question
 //! the estimator raises: *is the number it reports the sink, or the clock?*
 //! Unit tests in `fluree-graph-ir::timing` cover the same properties at debug

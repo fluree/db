@@ -374,7 +374,7 @@ pub struct SinkCounts {
 impl SinkCounts {
     /// Total RDF triples emitted, counting quads, list items and reifiers —
     /// everything that becomes an edge in the graph. This is the number a user
-    /// means by "how big is this file", and the one `fluree rdf count` prints.
+    /// means by "how big is this file", and the one `fluree count` prints.
     pub fn emitted(&self) -> u64 {
         self.triples + self.quads + self.list_items + self.reified
     }
@@ -1068,7 +1068,7 @@ mod tests {
     // The three sinks below are the review probe's, reduced to what a unit
     // test needs: the cheap sink the estimator got wrong, a sink with real
     // measurable work, and the periodic corpus that defeats a fixed stride.
-    // Original probe: scratchpad/sink_bias_probe.rs from the `fluree rdf`
+    // Original probe: scratchpad/sink_bias_probe.rs from the RDF file verbs'
     // adversarial review.
     // ------------------------------------------------------------------
 

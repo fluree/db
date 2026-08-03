@@ -135,8 +135,8 @@ pub struct ParserOptions {
     /// the reservation was unconditional.
     ///
     /// So the estimate belongs to whoever actually has one. Bulk import knows
-    /// its chunk size and its corpus shape and passes a hint; `fluree rdf
-    /// convert` is handed an arbitrary document and passes nothing, because a
+    /// its chunk size and its corpus shape and passes a hint; `fluree convert`
+    /// is handed an arbitrary document and passes nothing, because a
     /// document's LENGTH is not evidence about its distinct-term COUNT — one
     /// subject with ten million properties and ten million subjects with one
     /// each are the same byte count and differ by six orders of magnitude here.

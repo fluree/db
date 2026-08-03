@@ -512,7 +512,7 @@ fn relabelling_preserves_blank_node_identity_counts() {
 }
 
 /// The carve-out: `_:fdb-…` are addressable identifiers (#1432), so
-/// `fluree export | fluree rdf convert` has to keep them. Everything else is
+/// `fluree export | fluree convert` has to keep them. Everything else is
 /// renamed.
 #[test]
 fn fdb_labels_pass_through_relabelling_verbatim() {

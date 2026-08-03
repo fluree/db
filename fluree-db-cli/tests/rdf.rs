@@ -1,4 +1,4 @@
-//! End-to-end tests for `fluree rdf`.
+//! End-to-end tests for the RDF file verbs: `parse`, `count`, `convert`.
 //!
 //! These drive the real binary, because most of what this surface promises is
 //! only true at the process boundary: exit codes, which stream output lands
@@ -90,15 +90,15 @@ fn stdout_of(cmd: &mut Command) -> String {
 }
 
 // ============================================================================
-// check
+// parse
 // ============================================================================
 
 #[test]
-fn check_accepts_a_valid_turtle_file() {
+fn parse_accepts_a_valid_turtle_file() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .success()
@@ -106,11 +106,11 @@ fn check_accepts_a_valid_turtle_file() {
 }
 
 #[test]
-fn check_rejects_a_broken_turtle_file_with_exit_1_and_a_located_diagnostic() {
+fn parse_rejects_a_broken_turtle_file_with_exit_1_and_a_located_diagnostic() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -123,20 +123,16 @@ fn check_rejects_a_broken_turtle_file_with_exit_1_and_a_located_diagnostic() {
 }
 
 #[test]
-fn check_reads_ntriples_by_extension() {
+fn parse_reads_ntriples_by_extension() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.nt", VALID_NTRIPLES);
-    rdf_cmd()
-        .args(["rdf", "check"])
-        .arg(&path)
-        .assert()
-        .success();
+    rdf_cmd().args(["parse"]).arg(&path).assert().success();
 }
 
 #[test]
-fn check_reads_stdin_when_no_file_is_named() {
+fn parse_reads_stdin_when_no_file_is_named() {
     rdf_cmd()
-        .args(["rdf", "check", "--syntax", "turtle"])
+        .args(["parse", "--syntax", "turtle"])
         .write_stdin(VALID_TURTLE)
         .assert()
         .success()
@@ -144,54 +140,50 @@ fn check_reads_stdin_when_no_file_is_named() {
 }
 
 #[test]
-fn check_reads_stdin_when_the_file_is_a_dash() {
+fn parse_reads_stdin_when_the_file_is_a_dash() {
     rdf_cmd()
-        .args(["rdf", "check", "-"])
+        .args(["parse", "-"])
         .write_stdin(VALID_TURTLE)
         .assert()
         .success();
 }
 
 #[test]
-fn check_sniffs_the_syntax_of_a_pipe_with_no_flag() {
+fn parse_sniffs_the_syntax_of_a_pipe_with_no_flag() {
     // Nothing names the syntax: no extension, no --syntax. The leading
     // `@prefix` has to be enough.
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .write_stdin(VALID_TURTLE)
         .assert()
         .success();
 }
 
 #[test]
-fn check_decompresses_a_gzipped_file() {
+fn parse_decompresses_a_gzipped_file() {
     let tmp = TempDir::new().unwrap();
     let path = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
-    rdf_cmd()
-        .args(["rdf", "check"])
-        .arg(&path)
-        .assert()
-        .success();
+    rdf_cmd().args(["parse"]).arg(&path).assert().success();
 }
 
 #[test]
-fn check_decompresses_a_gzipped_pipe_from_its_magic_bytes() {
+fn parse_decompresses_a_gzipped_pipe_from_its_magic_bytes() {
     // A pipe has no suffix to read. Without magic-byte detection this is a
     // UTF-8 error on compressed bytes.
     let tmp = TempDir::new().unwrap();
     let path = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
     let bytes = std::fs::read(&path).unwrap();
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "check", "--syntax", "turtle"]);
+    cmd.args(["parse", "--syntax", "turtle"]);
     cmd.write_stdin(bytes).assert().success();
 }
 
 #[test]
-fn check_json_format_reports_the_diagnostic_with_offsets() {
+fn parse_json_format_reports_the_diagnostic_with_offsets() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     let out = rdf_cmd()
-        .args(["rdf", "check", "--format", "json"])
+        .args(["parse", "--format", "json"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -214,23 +206,23 @@ fn check_json_format_reports_the_diagnostic_with_offsets() {
 }
 
 #[test]
-fn check_json_format_on_a_clean_document_reports_an_empty_diagnostic_array() {
+fn parse_json_format_on_a_clean_document_reports_an_empty_diagnostic_array() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "check", "--format", "json"]).arg(&path);
+    cmd.args(["parse", "--format", "json"]).arg(&path);
     let v: serde_json::Value = serde_json::from_str(&stdout_of(&mut cmd)).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["diagnostics"].as_array().unwrap().len(), 0);
 }
 
 #[test]
-fn check_under_quiet_says_nothing_on_success_and_still_exits_0() {
+fn parse_under_quiet_says_nothing_on_success_and_still_exits_0() {
     // The loop-over-ten-thousand-files case: the exit code is the answer.
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["-q", "rdf", "check"])
+        .args(["-q", "parse"])
         .arg(&path)
         .assert()
         .success()
@@ -247,7 +239,7 @@ fn count_reports_the_triple_count_of_a_known_fixture() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "count"])
+        .args(["count"])
         .arg(&path)
         .assert()
         .success()
@@ -262,11 +254,11 @@ fn count_under_quiet_prints_only_the_number() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).arg(&path);
+    cmd.args(["-q", "count"]).arg(&path);
     assert_eq!(
         stdout_of(&mut cmd).trim(),
         VALID_TURTLE_TRIPLES.to_string(),
-        "`$(fluree rdf count -q f.ttl)` has to be usable as a number"
+        "`$(fluree count -q f.ttl)` has to be usable as a number"
     );
 }
 
@@ -282,7 +274,7 @@ fn count_of_a_collection_matches_the_rdf_spine_not_flattened_list_items() {
         "<http://e/s> <http://e/p> ( \"a\" \"b\" \"c\" ) .\n",
     );
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).arg(&path);
+    cmd.args(["-q", "count"]).arg(&path);
     assert_eq!(stdout_of(&mut cmd).trim(), "7");
 }
 
@@ -291,7 +283,7 @@ fn count_reads_a_zstd_file() {
     let tmp = TempDir::new().unwrap();
     let path = zst_fixture(&tmp, "valid.ttl.zst", VALID_TURTLE);
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).arg(&path);
+    cmd.args(["-q", "count"]).arg(&path);
     assert_eq!(stdout_of(&mut cmd).trim(), VALID_TURTLE_TRIPLES.to_string());
 }
 
@@ -302,16 +294,16 @@ fn count_reads_a_gzipped_file_and_agrees_with_the_plain_one() {
     let gz = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
 
     let mut a = rdf_cmd();
-    a.args(["-q", "rdf", "count"]).arg(&plain);
+    a.args(["-q", "count"]).arg(&plain);
     let mut b = rdf_cmd();
-    b.args(["-q", "rdf", "count"]).arg(&gz);
+    b.args(["-q", "count"]).arg(&gz);
     assert_eq!(stdout_of(&mut a), stdout_of(&mut b));
 }
 
 #[test]
 fn count_reads_stdin() {
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).write_stdin(VALID_NTRIPLES);
+    cmd.args(["-q", "count"]).write_stdin(VALID_NTRIPLES);
     assert_eq!(stdout_of(&mut cmd).trim(), "2");
 }
 
@@ -320,7 +312,7 @@ fn count_refuses_to_print_a_partial_number_for_a_broken_document() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     rdf_cmd()
-        .args(["rdf", "count"])
+        .args(["count"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -333,7 +325,7 @@ fn count_time_writes_to_stderr_so_stdout_stays_pipeable() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let out = rdf_cmd()
-        .args(["-q", "rdf", "count", "--time"])
+        .args(["-q", "count", "--time"])
         .arg(&path)
         .assert()
         .success()
@@ -360,7 +352,7 @@ fn an_explicit_syntax_overrides_a_misleading_extension() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "actually-turtle.nq", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check", "--syntax", "turtle"])
+        .args(["parse", "--syntax", "turtle"])
         .arg(&path)
         .assert()
         .success();
@@ -375,7 +367,7 @@ fn a_syntax_with_no_reader_is_refused_by_name_with_what_it_waits_on() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "data.rdf", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "count"])
+        .args(["count"])
         .arg(&path)
         .assert()
         .code(EXIT_USAGE)
@@ -388,7 +380,7 @@ fn a_syntax_with_no_reader_is_refused_by_name_with_what_it_waits_on() {
 /// The scanner sliced the 4/8-byte hex window by byte index after checking
 /// only that the bytes existed. A multi-byte character straddling that window
 /// is not a char boundary, so the slice panicked and took the process with it
-/// — exit 101 out of `fluree rdf check`, on input a user can trivially have.
+/// — exit 101 out of `fluree parse`, on input a user can trivially have.
 /// Both escape positions (literal and IRI) went through the same scanner.
 #[test]
 fn a_multibyte_char_in_an_escape_window_is_an_error_not_a_panic() {
@@ -414,12 +406,12 @@ fn a_multibyte_char_in_an_escape_window_is_an_error_not_a_panic() {
         // a panic also fails `success()`, so that weaker assertion would
         // have passed against the bug.
         rdf_cmd()
-            .args(["rdf", "check"])
+            .args(["parse"])
             .arg(&path)
             .assert()
             .code(EXIT_DOCUMENT_INVALID);
         rdf_cmd()
-            .args(["rdf", "convert"])
+            .args(["convert"])
             .arg(&path)
             .arg("--syntax")
             .arg("nquads")
@@ -444,7 +436,7 @@ fn a_signed_hex_payload_is_refused_not_decoded() {
     ] {
         let path = fixture(&tmp, name, body);
         rdf_cmd()
-            .args(["rdf", "check"])
+            .args(["parse"])
             .arg(&path)
             .assert()
             .code(EXIT_DOCUMENT_INVALID);
@@ -463,7 +455,7 @@ fn well_formed_escapes_still_decode() {
     );
     let out = tmp.path().join("ok.out.nq");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .arg("-o")
         .arg(&out)
@@ -495,7 +487,7 @@ fn repeated_subject_blocks_round_trip_through_the_new_readers() {
 
     let written = tmp.path().join("written.trig");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&src)
         .arg("-o")
         .arg(&written)
@@ -513,7 +505,7 @@ fn repeated_subject_blocks_round_trip_through_the_new_readers() {
     // Now read THAT back through the TriG reader and out as N-Quads.
     let quads = tmp.path().join("rep.nq");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&written)
         .arg("-o")
         .arg(&quads)
@@ -539,7 +531,7 @@ fn repeated_subject_blocks_round_trip_through_the_new_readers() {
     // are presentation, not statements.
     let again = tmp.path().join("again.trig");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&quads)
         .arg("-o")
         .arg(&again)
@@ -548,7 +540,7 @@ fn repeated_subject_blocks_round_trip_through_the_new_readers() {
 
     let back = tmp.path().join("back.nq");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&again)
         .arg("-o")
         .arg(&back)
@@ -587,7 +579,7 @@ fn a_dataset_round_trips_through_trig_and_nquads() {
     let back = tmp.path().join("back.trig");
 
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&src)
         .arg("-o")
         .arg(&nq)
@@ -607,7 +599,7 @@ fn a_dataset_round_trips_through_trig_and_nquads() {
     );
 
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&nq)
         .arg("-o")
         .arg(&back)
@@ -626,7 +618,7 @@ fn an_unidentifiable_input_names_the_flag_instead_of_guessing() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "mystery", "42 is not a document\n");
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .code(EXIT_USAGE)
@@ -641,7 +633,7 @@ fn binary_input_is_reported_as_binary_not_as_an_unknown_syntax() {
     let path = tmp.path().join("mystery");
     std::fs::write(&path, [0xff, 0xfe, 0x00, 0x01]).unwrap();
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .code(EXIT_USAGE)
@@ -654,7 +646,7 @@ fn syntax_aliases_are_accepted() {
     let path = fixture(&tmp, "data.txt", VALID_NTRIPLES);
     for alias in ["nt", "ntriples", "n-triples"] {
         rdf_cmd()
-            .args(["rdf", "check", "--syntax", alias])
+            .args(["parse", "--syntax", alias])
             .arg(&path)
             .assert()
             .success();
@@ -670,7 +662,7 @@ fn a_missing_file_exits_2_not_1() {
     // The contract that makes these verbs scriptable: 1 means the RDF is
     // bad, 2 means the invocation is.
     rdf_cmd()
-        .args(["rdf", "check", "/nonexistent/nope.ttl"])
+        .args(["parse", "/nonexistent/nope.ttl"])
         .assert()
         .code(EXIT_USAGE)
         .stderr(predicate::str::contains("nope.ttl"));
@@ -680,7 +672,7 @@ fn a_missing_file_exits_2_not_1() {
 fn a_directory_given_as_input_exits_2() {
     let tmp = TempDir::new().unwrap();
     rdf_cmd()
-        .args(["rdf", "count", "--syntax", "turtle"])
+        .args(["count", "--syntax", "turtle"])
         .arg(tmp.path())
         .assert()
         .code(EXIT_USAGE);
@@ -701,13 +693,13 @@ fn every_exit_code_in_the_contract_is_reachable() {
         cmd.assert().get_output().status.code().unwrap()
     };
 
-    assert_eq!(code(&["rdf", "check"], Some(&valid)), 0);
-    assert_eq!(code(&["rdf", "check"], Some(&broken)), 1);
-    assert_eq!(code(&["rdf", "check", "/no/such.ttl"], None), 2);
+    assert_eq!(code(&["parse"], Some(&valid)), 0);
+    assert_eq!(code(&["parse"], Some(&broken)), 1);
+    assert_eq!(code(&["parse", "/no/such.ttl"], None), 2);
 }
 
 // ============================================================================
-// convert (stub)
+// convert defaults
 // ============================================================================
 
 #[test]
@@ -717,7 +709,7 @@ fn convert_writes_the_default_syntax_when_nothing_names_one() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "convert"]).arg(&path);
+    cmd.args(["convert"]).arg(&path);
     let out = stdout_of(&mut cmd);
 
     assert_eq!(out.lines().count(), VALID_TURTLE_TRIPLES as usize);
@@ -736,7 +728,7 @@ fn profile_json_carries_the_whole_schema_and_lands_on_stderr() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let out = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json"])
+        .args(["-q", "count", "--profile=json"])
         .arg(&path)
         .assert()
         .success()
@@ -793,7 +785,7 @@ fn profile_json_records_which_rule_resolved_the_syntax() {
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
 
     let explicit = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--syntax", "turtle"])
+        .args(["-q", "count", "--profile=json", "--syntax", "turtle"])
         .arg(&path)
         .assert()
         .success()
@@ -804,7 +796,7 @@ fn profile_json_records_which_rule_resolved_the_syntax() {
     assert_eq!(v["corpus"]["syntax_source"], "explicit");
 
     let sniffed = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json"])
+        .args(["-q", "count", "--profile=json"])
         .write_stdin(VALID_TURTLE)
         .assert()
         .success()
@@ -821,7 +813,7 @@ fn profile_json_reports_the_compression_layer_and_both_byte_counts() {
     let tmp = TempDir::new().unwrap();
     let path = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json"])
+        .args(["-q", "count", "--profile=json"])
         .arg(&path)
         .assert()
         .success()
@@ -854,7 +846,7 @@ fn no_hash_omits_the_fingerprint_entirely() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -879,7 +871,7 @@ fn the_same_document_fingerprints_identically_plain_and_compressed() {
 
     let hash_of = |path: &Path| -> String {
         let stderr = rdf_cmd()
-            .args(["-q", "rdf", "count", "--profile=json"])
+            .args(["-q", "count", "--profile=json"])
             .arg(path)
             .assert()
             .success()
@@ -898,7 +890,7 @@ fn profile_human_prints_a_table_to_stderr() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile"])
+        .args(["-q", "count", "--profile"])
         .arg(&path)
         .assert()
         .success()
@@ -909,11 +901,11 @@ fn profile_human_prints_a_table_to_stderr() {
 }
 
 #[test]
-fn profile_works_on_check_as_well_as_count() {
+fn profile_works_on_parse_as_well_as_count() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "check", "--profile=json"])
+        .args(["-q", "parse", "--profile=json"])
         .arg(&path)
         .assert()
         .success()
@@ -921,7 +913,29 @@ fn profile_works_on_check_as_well_as_count() {
         .stderr
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
-    assert_eq!(v["verb"], "check");
+    // The verb as typed, not the module it dispatches into. A baseline whose
+    // `verb` names a command that is not in `--help` sends whoever reads it
+    // looking for one.
+    assert_eq!(v["verb"], "parse");
+}
+
+#[test]
+fn the_alias_still_reports_the_verb_it_dispatched_to() {
+    // `check` is the spelling that works, `parse` is the spelling that is
+    // documented — a profile taken through the alias has to say the latter,
+    // or two baselines of the same run disagree on what ran.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let stderr = rdf_cmd()
+        .args(["-q", "check", "--profile=json"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(v["verb"], "parse");
 }
 
 #[test]
@@ -933,7 +947,7 @@ fn the_sink_estimate_declines_to_report_a_number_it_cannot_resolve() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", &VALID_TURTLE.repeat(400));
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -996,7 +1010,7 @@ fn git_sha_names_the_build_not_whatever_checkout_the_shell_is_in() {
     let corpus = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let stderr = rdf_cmd()
         .current_dir(&repo)
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&corpus)
         .assert()
         .success()
@@ -1020,7 +1034,7 @@ fn the_sink_line_is_absent_when_nothing_reached_the_sink() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "empty.ttl", "");
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -1032,7 +1046,7 @@ fn the_sink_line_is_absent_when_nothing_reached_the_sink() {
     assert!(v["sink"]["floor_ns_per_call"].is_null());
 
     let human = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile", "--no-hash"])
+        .args(["-q", "count", "--profile", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -1053,7 +1067,7 @@ fn the_below_floor_bound_is_stated_per_call_not_as_an_aggregate() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", &VALID_TURTLE.repeat(400));
     let out = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile", "--no-hash"])
+        .args(["-q", "count", "--profile", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -1064,7 +1078,7 @@ fn the_below_floor_bound_is_stated_per_call_not_as_an_aggregate() {
     assert!(text.contains("per call"), "{text}");
 
     let json = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -1092,7 +1106,7 @@ fn the_trusted_verdict_is_split_so_a_gate_can_key_on_the_phases() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", &VALID_TURTLE.repeat(400));
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -1113,7 +1127,7 @@ fn profiling_a_broken_document_still_emits_the_profile() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     let stderr = rdf_cmd()
-        .args(["rdf", "count", "--profile=json", "--no-hash"])
+        .args(["count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -1133,7 +1147,7 @@ fn profiling_a_broken_document_still_emits_the_profile() {
 #[test]
 fn profile_written_with_a_space_says_so_instead_of_hunting_for_a_file() {
     rdf_cmd()
-        .args(["rdf", "count", "--profile", "json"])
+        .args(["count", "--profile", "json"])
         .assert()
         .code(EXIT_USAGE)
         .stderr(predicate::str::contains("--profile=json"));
@@ -1146,20 +1160,12 @@ fn empty_input_exits_0_whether_it_is_a_file_or_a_pipe() {
     // the empty graph in every syntax.
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "empty.ttl", "");
-    rdf_cmd()
-        .args(["rdf", "check"])
-        .arg(&path)
-        .assert()
-        .success();
+    rdf_cmd().args(["parse"]).arg(&path).assert().success();
 
-    rdf_cmd()
-        .args(["rdf", "check"])
-        .write_stdin("")
-        .assert()
-        .success();
+    rdf_cmd().args(["parse"]).write_stdin("").assert().success();
 
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).write_stdin("");
+    cmd.args(["-q", "count"]).write_stdin("");
     assert_eq!(stdout_of(&mut cmd).trim(), "0");
 }
 
@@ -1175,7 +1181,7 @@ fn a_byte_order_mark_does_not_defeat_syntax_detection() {
         "\u{feff}<http://e/s> <http://e/p> \"o\" .\n",
     );
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .get_output()
@@ -1193,23 +1199,73 @@ fn a_byte_order_mark_does_not_defeat_syntax_detection() {
 // ============================================================================
 
 #[test]
-fn rdf_help_lists_every_verb() {
-    rdf_cmd()
-        .args(["rdf", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("check"))
-        .stdout(predicate::str::contains("count"))
-        .stdout(predicate::str::contains("convert"));
+fn every_verb_is_in_the_top_level_help() {
+    // They are top-level commands now, so the top-level help is the only
+    // place a user can discover them — there is no group page to drill into.
+    let mut cmd = rdf_cmd();
+    cmd.arg("--help");
+    let help = stdout_of(&mut cmd);
+    for verb in ["parse", "count", "convert"] {
+        assert!(help.contains(verb), "top-level help omits {verb}:\n{help}");
+    }
 }
 
 #[test]
-fn rdf_appears_in_the_top_level_help() {
+fn the_rdf_group_is_gone() {
+    // Pins the dissolution. `rdf` was never released — every PR carrying it
+    // is unmerged — so there is deliberately no compat shim, and a shim that
+    // came back later would silently reintroduce the two-word surface this
+    // rename removed. It has to fail as an unknown subcommand.
     rdf_cmd()
-        .arg("--help")
+        .args(["rdf", "convert", "f.ttl"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("rdf"));
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
+
+    let mut cmd = rdf_cmd();
+    cmd.arg("--help");
+    let help = stdout_of(&mut cmd);
+    for line in help.lines() {
+        assert!(
+            !line.trim_start().starts_with("rdf "),
+            "top-level help still advertises an `rdf` command: {line}"
+        );
+    }
+}
+
+#[test]
+fn check_is_a_hidden_alias_for_parse() {
+    // Muscle memory from the group era still works…
+    let tmp = TempDir::new().unwrap();
+    let ok = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let bad = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
+
+    rdf_cmd().args(["check"]).arg(&ok).assert().success();
+    rdf_cmd()
+        .args(["check"])
+        .arg(&bad)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID);
+
+    // …and it really is `parse`, not a second implementation: the flag only
+    // `parse` has resolves, and the profile names the verb the user should
+    // be typing rather than the alias they typed.
+    let mut cmd = rdf_cmd();
+    cmd.args(["check", "--format", "json"]).arg(&ok);
+    let report: serde_json::Value = serde_json::from_str(&stdout_of(&mut cmd)).unwrap();
+    assert_eq!(report["schema"], "fluree.rdf.check.v1");
+
+    // …but it stays out of `--help`, because listing both spellings would put
+    // the ambiguity with `validate` back on the page the rename cleared.
+    let mut cmd = rdf_cmd();
+    cmd.arg("--help");
+    let help = stdout_of(&mut cmd);
+    for line in help.lines() {
+        assert!(
+            !line.trim_start().starts_with("check"),
+            "the `check` alias must not be advertised: {line}"
+        );
+    }
 }
 
 #[test]
@@ -1217,7 +1273,7 @@ fn count_help_lists_every_nameable_syntax_including_the_unbuilt_ones() {
     // Naming a syntax is how a user finds out it is not built yet, so the
     // full set has to be discoverable from help.
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "count", "--help"]);
+    cmd.args(["count", "--help"]);
     let help = stdout_of(&mut cmd);
     for syntax in [
         "turtle", "ntriples", "nquads", "trig", "jsonld", "rdfxml", "rdfjson", "jelly",
@@ -1233,12 +1289,12 @@ fn no_rdf_verb_requires_a_fluree_directory() {
     // with HOME redirected so the global-config fallback cannot rescue it.
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
-    for verb in ["check", "count"] {
+    for verb in ["parse", "count"] {
         let mut cmd = rdf_cmd();
         cmd.current_dir(tmp.path());
         cmd.env("HOME", tmp.path());
         cmd.env("FLUREE_HOME", tmp.path().join("nowhere"));
-        cmd.args(["rdf", verb]).arg(&path).assert().success();
+        cmd.args([verb]).arg(&path).assert().success();
     }
 }
 
@@ -1426,7 +1482,7 @@ fn next_permutation(items: &mut [usize]) -> bool {
 
 fn convert_to_string(path: &Path, to: &str) -> String {
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "convert"]).arg(path).args(["--to", to]);
+    cmd.args(["convert"]).arg(path).args(["--to", to]);
     stdout_of(&mut cmd)
 }
 
@@ -1659,7 +1715,7 @@ fn the_output_file_extension_picks_the_syntax_and_the_flag_overrides_it() {
 
     let by_ext = tmp.path().join("out.nt");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(&by_ext)
@@ -1670,7 +1726,7 @@ fn the_output_file_extension_picks_the_syntax_and_the_flag_overrides_it() {
     // --to wins over an extension that says otherwise.
     let overridden = tmp.path().join("out2.nt");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(&overridden)
@@ -1687,7 +1743,7 @@ fn convert_reads_stdin_and_a_gzipped_file() {
     let tmp = TempDir::new().unwrap();
 
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "convert", "--syntax", "turtle", "--to", "nt"])
+    cmd.args(["convert", "--syntax", "turtle", "--to", "nt"])
         .write_stdin(VALID_TURTLE);
     let from_stdin = stdout_of(&mut cmd);
     assert_eq!(from_stdin.lines().count(), VALID_TURTLE_TRIPLES as usize);
@@ -1714,7 +1770,7 @@ fn a_closed_downstream_pipe_ends_the_run_quietly() {
     let path = fixture(&tmp, "big.ttl", &big);
 
     let mut convert = StdCommand::new(assert_cmd::cargo::cargo_bin!("fluree"))
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "nt"])
         .env("NO_COLOR", "1")
@@ -1750,7 +1806,7 @@ fn converting_a_broken_document_exits_1_and_says_the_output_is_partial() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "nt"])
         .assert()
@@ -1766,7 +1822,7 @@ fn an_output_syntax_with_no_writer_is_refused_by_name() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "rdfxml"])
         .assert()
@@ -1780,7 +1836,7 @@ fn a_compressed_output_name_is_refused_rather_than_written_plain() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .arg("-o")
         .arg(tmp.path().join("out.nt.gz"))
@@ -1795,7 +1851,7 @@ fn pretty_is_refused_rather_than_silently_ignored() {
     let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
     // Wrong syntax for it: the flag itself is the complaint.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "nt", "--pretty"])
         .assert()
@@ -1805,7 +1861,7 @@ fn pretty_is_refused_rather_than_silently_ignored() {
     // Right syntax, but not built: say so rather than emit blocks-tier output
     // under a flag that promised something else.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "turtle", "--pretty"])
         .assert()
@@ -1825,7 +1881,7 @@ fn the_bnode_policy_flag_changes_which_labels_come_out() {
     );
 
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "convert"])
+    cmd.args(["convert"])
         .arg(&path)
         .args(["--to", "nt", "--bnode-policy", "preserve"]);
     let preserved = stdout_of(&mut cmd);
@@ -1880,7 +1936,7 @@ fn over_threshold_blanks(head: &str) -> String {
 
 fn convert_preserving(path: &Path, threads: &str) -> String {
     let mut cmd = rdf_cmd();
-    cmd.args(["--parallelism", threads, "rdf", "convert"])
+    cmd.args(["--parallelism", threads, "convert"])
         .arg(path)
         .args(["--to", "nt", "--bnode-policy", "preserve"]);
     stdout_of(&mut cmd)
@@ -1895,7 +1951,7 @@ fn preserving_labels_says_so_in_the_profile() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&input)
         .arg("-o")
         .arg(&out)
@@ -1940,7 +1996,7 @@ fn supplied_prefixes_compact_turtle_output() {
     );
 
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "convert"]).arg(&path).args([
+    cmd.args(["convert"]).arg(&path).args([
         "--to",
         "turtle",
         "--prefixes",
@@ -1966,7 +2022,7 @@ fn convert_profile_json_carries_the_serialize_and_write_phases() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "convert"])
+        .args(["-q", "convert"])
         .arg(&path)
         .arg("-o")
         .arg(&out)
@@ -2003,7 +2059,7 @@ fn convert_time_reports_the_statements_it_wrote() {
     let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
     let out = tmp.path().join("out.nt");
     rdf_cmd()
-        .args(["-q", "rdf", "convert"])
+        .args(["-q", "convert"])
         .arg(&path)
         .arg("-o")
         .arg(&out)
@@ -2021,7 +2077,7 @@ fn a_conversion_to_a_file_reports_what_it_wrote_and_a_pipe_stays_clean() {
     // To a file: a summary is useful.
     let out = tmp.path().join("out.nt");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .arg("-o")
         .arg(&out)
@@ -2031,7 +2087,7 @@ fn a_conversion_to_a_file_reports_what_it_wrote_and_a_pipe_stays_clean() {
 
     // To stdout: the same line would sit beside the data it describes.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "nt"])
         .assert()
@@ -2047,7 +2103,7 @@ fn convert_needs_no_fluree_directory_either() {
     cmd.current_dir(tmp.path());
     cmd.env("HOME", tmp.path());
     cmd.env("FLUREE_HOME", tmp.path().join("nowhere"));
-    cmd.args(["rdf", "convert"])
+    cmd.args(["convert"])
         .arg(&path)
         .args(["--to", "nt"])
         .assert()
@@ -2064,7 +2120,7 @@ fn a_prefix_namespace_that_is_not_an_iri_is_refused_before_anything_is_written()
 
     // Inline form.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "turtle", "--prefixes", r#"{"ok":"not an iri"}"#])
         .assert()
@@ -2077,7 +2133,7 @@ fn a_prefix_namespace_that_is_not_an_iri_is_refused_before_anything_is_written()
     // File form, through a @context wrapper — the shape a user actually has.
     let ctx = fixture(&tmp, "ctx.json", r#"{"@context":{"bad":"nope"}}"#);
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "turtle"])
         .arg("--prefixes")
@@ -2089,7 +2145,7 @@ fn a_prefix_namespace_that_is_not_an_iri_is_refused_before_anything_is_written()
 
     // And a good namespace still works, so the check is not just "refuse".
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args([
             "--to",
@@ -2113,7 +2169,7 @@ fn a_prefixes_argument_of_the_wrong_json_shape_says_so() {
         (r#""x""#, "a string"),
     ] {
         rdf_cmd()
-            .args(["rdf", "convert"])
+            .args(["convert"])
             .arg(&input)
             .args(["--to", "turtle", "--prefixes", arg])
             .assert()
@@ -2125,7 +2181,7 @@ fn a_prefixes_argument_of_the_wrong_json_shape_says_so() {
     }
     // A genuinely missing path still reports a missing path.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "turtle", "--prefixes", "/nonexistent/ctx.json"])
         .assert()
@@ -2148,7 +2204,7 @@ fn a_refusal_names_its_cause_not_the_latch_and_offers_a_remedy() {
     );
 
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&collide)
         .args(["--to", "nt", "--bnode-policy", "preserve"])
         .assert()
@@ -2174,7 +2230,7 @@ fn a_refusal_names_its_cause_not_the_latch_and_offers_a_remedy() {
         ),
     );
     rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&big)
         .args(["--to", "nt", "--bnode-policy", "preserve"])
         .assert()
@@ -2193,7 +2249,7 @@ fn a_refusal_that_needs_no_input_does_not_truncate_the_output_file() {
     std::fs::write(&victim, "PRE-EXISTING\n").unwrap();
 
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(&victim)
@@ -2218,7 +2274,7 @@ fn profile_json_output_is_not_corrupted_by_the_completion_summary() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(&out)
@@ -2239,7 +2295,7 @@ fn profile_json_output_is_not_corrupted_by_the_completion_summary() {
 
     // The human profile still gets its summary, since nothing is parsing it.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(&out)
@@ -2257,7 +2313,7 @@ fn a_refusal_blames_the_output_syntax_the_way_it_was_chosen() {
     let input = fixture(&tmp, "in.ttl", VALID_TURTLE);
 
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("--pretty")
         .assert()
@@ -2267,7 +2323,7 @@ fn a_refusal_blames_the_output_syntax_the_way_it_was_chosen() {
 
     // Named explicitly: blame the flag.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nq", "--pretty"])
         .assert()
@@ -2276,7 +2332,7 @@ fn a_refusal_blames_the_output_syntax_the_way_it_was_chosen() {
 
     // From the extension: blame the extension.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(tmp.path().join("out.nq"))
@@ -2301,11 +2357,11 @@ const BAD_TERM_TURTLE: &str = concat!(
 const BAD_LANG_TURTLE: &str = "<http://example.org/s> <http://example.org/p> \"string\"@1 .\n";
 
 #[test]
-fn check_rejects_a_document_whose_terms_are_not_terms() {
+fn parse_rejects_a_document_whose_terms_are_not_terms() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "bad-term.ttl", BAD_TERM_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -2316,11 +2372,11 @@ fn check_rejects_a_document_whose_terms_are_not_terms() {
 }
 
 #[test]
-fn check_rejects_a_malformed_language_tag() {
+fn parse_rejects_a_malformed_language_tag() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "bad-lang.ttl", BAD_LANG_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -2335,7 +2391,7 @@ fn nocheck_accepts_what_validation_rejects() {
     for (name, content) in [("t.ttl", BAD_TERM_TURTLE), ("l.ttl", BAD_LANG_TURTLE)] {
         let path = fixture(&tmp, name, content);
         rdf_cmd()
-            .args(["rdf", "check", "--nocheck"])
+            .args(["parse", "--nocheck"])
             .arg(&path)
             .assert()
             .success()
@@ -2350,7 +2406,7 @@ fn nocheck_does_not_disable_syntax_checking() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check", "--nocheck"])
+        .args(["parse", "--nocheck"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -2361,13 +2417,9 @@ fn nocheck_does_not_disable_syntax_checking() {
 fn count_validates_by_default_and_nocheck_opts_out() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "bad-term.ttl", BAD_TERM_TURTLE);
+    rdf_cmd().args(["count"]).arg(&path).assert().failure();
     rdf_cmd()
-        .args(["rdf", "count"])
-        .arg(&path)
-        .assert()
-        .failure();
-    rdf_cmd()
-        .args(["rdf", "count", "--nocheck"])
+        .args(["count", "--nocheck"])
         .arg(&path)
         .assert()
         .success();
@@ -2382,7 +2434,7 @@ fn the_profile_reports_whether_terms_were_validated() {
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
 
     let out = rdf_cmd()
-        .args(["rdf", "count", "--profile=json"])
+        .args(["count", "--profile=json"])
         .arg(&path)
         .assert()
         .success()
@@ -2393,7 +2445,7 @@ fn the_profile_reports_whether_terms_were_validated() {
     assert_eq!(v["validated"], serde_json::json!(true));
 
     let out = rdf_cmd()
-        .args(["rdf", "count", "--profile=json", "--nocheck"])
+        .args(["count", "--profile=json", "--nocheck"])
         .arg(&path)
         .assert()
         .success()
@@ -2461,7 +2513,7 @@ impl ParseSite {
             Self::Parallel => cmd.args(["--parallelism", "8"]),
             Self::Recovery => &mut cmd,
         };
-        cmd.args(["rdf", "convert"]).arg(input).args(["--to", "nt"]);
+        cmd.args(["convert"]).arg(input).args(["--to", "nt"]);
         if matches!(self, Self::Recovery) {
             cmd.arg("--continue-on-error");
         }
@@ -2514,7 +2566,7 @@ fn nocheck_converts_identically_at_every_width() {
     for threads in ["1", "8"] {
         let out = tmp.path().join(format!("out{threads}.nt"));
         rdf_cmd()
-            .args(["--parallelism", threads, "-q", "rdf", "convert"])
+            .args(["--parallelism", threads, "-q", "convert"])
             .arg(&input)
             .args(["--to", "nt", "--nocheck"])
             .arg("-o")
@@ -2540,7 +2592,7 @@ fn a_byte_order_mark_does_not_break_the_verbs() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "bom.ttl", &format!("\u{FEFF}{VALID_TURTLE}"));
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .success()
@@ -2615,7 +2667,7 @@ fn a_line_format_is_read_strictly_at_every_parallelism() {
         let input = fixture(&tmp, &format!("{}.nt", name.replace(' ', "_")), doc);
         for threads in ["1", "8"] {
             rdf_cmd()
-                .args(["--parallelism", threads, "rdf", "convert"])
+                .args(["--parallelism", threads, "convert"])
                 .arg(&input)
                 .args(["--to", "nt"])
                 .assert()
@@ -2649,7 +2701,7 @@ fn an_input_that_cannot_be_cut_converts_serially() {
     let out = tmp.path().join("out.nq");
 
     let stderr = rdf_cmd()
-        .args(["--parallelism", "8", "-q", "rdf", "convert"])
+        .args(["--parallelism", "8", "-q", "convert"])
         .arg(&input)
         .args(["--to", "nq"])
         .arg("-o")
@@ -2690,7 +2742,7 @@ fn parallelism_does_not_change_the_output_bytes() {
     let convert_with = |threads: &str, out: &str| -> Vec<u8> {
         let path = tmp.path().join(out);
         rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt"])
             .arg("-o")
@@ -2733,7 +2785,7 @@ fn a_blank_node_named_in_two_chunks_stays_one_node_through_the_cli() {
 
     let out = tmp.path().join("out.nt");
     rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -2772,7 +2824,7 @@ fn a_syntax_that_chunking_would_change_falls_back_to_serial() {
     let with = |threads: &str, out: &str| -> Vec<u8> {
         let path = tmp.path().join(out);
         rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "turtle"])
             .arg("-o")
@@ -2797,7 +2849,7 @@ fn the_profile_reports_the_parallel_decision_and_its_phases() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["--parallelism", "4", "-q", "rdf", "convert"])
+        .args(["--parallelism", "4", "-q", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -2870,7 +2922,7 @@ fn a_serial_run_reports_no_chunk_phase() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["--parallelism", "1", "-q", "rdf", "convert"])
+        .args(["--parallelism", "1", "-q", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -2932,7 +2984,7 @@ fn a_parallel_parse_failure_is_located_like_a_serial_one() {
     let mut reports = Vec::new();
     for threads in ["1", "8"] {
         let assert = rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt"])
             .arg("-o")
@@ -2997,7 +3049,7 @@ fn a_run_that_falls_back_to_serial_still_reports_what_the_attempt_cost() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .args(["-q", "--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -3078,7 +3130,7 @@ fn a_long_literal_spanning_the_header_window_still_chunks() {
     for threads in ["1", "8"] {
         let out = tmp.path().join(format!("out{threads}.nt"));
         let stderr = rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt"])
             .arg("-o")
@@ -3129,7 +3181,7 @@ fn a_lexical_defect_after_the_header_does_not_force_serial() {
     let input = fixture(&tmp, "defect.ttl", &ttl);
 
     let assert = rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -3167,7 +3219,7 @@ fn a_malformed_header_is_still_refused() {
     let input = fixture(&tmp, "badhdr.ttl", &ttl);
 
     rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -3191,7 +3243,7 @@ fn json_profile_stderr_is_parseable_on_a_chunking_fallback() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -3228,7 +3280,7 @@ fn quiet_silences_courtesy_lines_and_never_the_diagnostics() {
             cmd.arg("-q");
         }
         let stderr = cmd
-            .args(["rdf", "convert"])
+            .args(["convert"])
             .arg(&input)
             .args(["--to", "nt", "--continue-on-error"])
             .arg("-o")
@@ -3258,7 +3310,7 @@ fn quiet_silences_courtesy_lines_and_never_the_diagnostics() {
             cmd.arg("-q");
         }
         let stderr = cmd
-            .args(["rdf", "convert"])
+            .args(["convert"])
             .arg(&input)
             .args(["--to", "nt", "--continue-on-error"])
             .arg("-o")
@@ -3298,7 +3350,7 @@ fn continue_on_error_keeps_the_good_statements_and_exits_1() {
     let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
 
     let out = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -3328,7 +3380,7 @@ fn without_the_flag_the_first_error_still_stops_the_run() {
     let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
 
     let out = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .assert()
@@ -3350,7 +3402,7 @@ fn a_clean_document_under_continue_on_error_exits_0() {
     let tmp = TempDir::new().unwrap();
     let input = fixture(&tmp, "clean.ttl", VALID_TURTLE);
     let out = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -3381,7 +3433,7 @@ fn a_skipped_statement_leaves_no_fragment_behind() {
     );
 
     let out = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -3406,7 +3458,7 @@ fn every_skip_is_located_in_the_original_document() {
     let tmp = TempDir::new().unwrap();
     let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -3433,7 +3485,7 @@ const TERMINATED_JUNK: &str = "@prefix ex: <http://example.org/> .\n\
 /// Convert with `--continue-on-error` and return `(stdout, stderr)`.
 fn recover(input: &Path) -> (String, String) {
     let assert = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -3643,7 +3695,7 @@ fn blank_heavy_corpus(statements: usize) -> String {
 fn convert_at(tmp: &TempDir, input: &Path, threads: &str, out: &str) -> String {
     let path = tmp.path().join(out);
     rdf_cmd()
-        .args(["--parallelism", threads, "rdf", "convert"])
+        .args(["--parallelism", threads, "convert"])
         .arg(input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -3820,7 +3872,7 @@ fn turtle_runs_parallel_and_declares_its_prefixes_exactly_once() {
     let convert = |threads: &str, out: &str| -> String {
         let path = tmp.path().join(out);
         rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "turtle"])
             .arg("-o")
@@ -3840,13 +3892,13 @@ fn turtle_runs_parallel_and_declares_its_prefixes_exactly_once() {
     // And the result is a document our own reader accepts, with every triple.
     let reparsed = tmp.path().join("p.ttl");
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).arg(&reparsed);
+    cmd.args(["-q", "count"]).arg(&reparsed);
     let parallel_count = stdout_of(&mut cmd).trim().to_string();
 
     let serial_path = tmp.path().join("s.ttl");
     std::fs::write(&serial_path, convert("1", "s.ttl")).unwrap();
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).arg(&serial_path);
+    cmd.args(["-q", "count"]).arg(&serial_path);
     assert_eq!(
         parallel_count,
         stdout_of(&mut cmd).trim(),
@@ -3862,7 +3914,7 @@ fn a_parallel_turtle_run_is_byte_identical_to_itself() {
     let convert = |out: &str| -> Vec<u8> {
         let path = tmp.path().join(out);
         rdf_cmd()
-            .args(["--parallelism", "8", "rdf", "convert"])
+            .args(["--parallelism", "8", "convert"])
             .arg(&input)
             .args(["--to", "turtle"])
             .arg("-o")
@@ -3883,7 +3935,7 @@ fn the_profile_records_the_load_average() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "convert"])
+        .args(["-q", "convert"])
         .arg(&input)
         .arg("-o")
         .arg(&out)
@@ -3977,7 +4029,7 @@ fn spawn_convert(input: &Path, threads: &str, out: Option<&Path>) -> std::proces
     use std::process::{Command as StdCommand, Stdio};
 
     let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("fluree"));
-    cmd.args(["--parallelism", threads, "rdf", "convert"])
+    cmd.args(["--parallelism", threads, "convert"])
         .arg(input)
         .args(["--to", "nt"]);
     if let Some(out) = out {
@@ -4243,7 +4295,7 @@ fn a_mid_file_directive_falls_back_to_serial_rather_than_refusing() {
     let out = tmp.path().join("out.nt");
 
     rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -4275,7 +4327,7 @@ fn a_mid_file_directive_falls_back_to_serial_rather_than_refusing() {
 
     // And the reason is reported rather than implicit.
     let stderr = rdf_cmd()
-        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .args(["-q", "--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -4317,7 +4369,7 @@ fn recovery_reads_a_line_format_strictly_too() {
     let out = tmp.path().join("out.nt");
 
     let assert = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .arg("-o")
@@ -4352,7 +4404,7 @@ fn continue_on_error_still_emits_the_profile() {
     let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
 
     let stderr = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args([
             "--to",
@@ -4380,7 +4432,7 @@ fn continue_on_error_still_emits_the_profile() {
 
     // Without --profile the human diagnostics are still there.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -4434,7 +4486,7 @@ fn continue_on_error_with_json_profile_keeps_stderr_parseable() {
     for threads in ["1", "8"] {
         let out = tmp.path().join(format!("out{threads}.nt"));
         let assert = rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt"])
             .arg("-o")
@@ -4461,7 +4513,7 @@ fn continue_on_error_with_human_profile_prints_both() {
     for threads in ["1", "8"] {
         let out = tmp.path().join(format!("h{threads}.nt"));
         rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt"])
             .arg("-o")
@@ -4493,7 +4545,7 @@ fn continue_on_error_forces_the_serial_path_and_reports_it() {
 
     // Control: the same corpus WITHOUT the flag does go parallel.
     let control = rdf_cmd()
-        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .args(["-q", "--parallelism", "8", "convert"])
         .arg(fixture(&tmp, "clean.nt", &interaction_corpus()))
         .args(["--to", "nt"])
         .arg("-o")
@@ -4510,7 +4562,7 @@ fn continue_on_error_forces_the_serial_path_and_reports_it() {
     );
 
     let assert = rdf_cmd()
-        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .args(["-q", "--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -4546,7 +4598,7 @@ fn output_file_and_json_profile_never_share_a_stream() {
     for threads in ["1", "8"] {
         let out = tmp.path().join(format!("o{threads}.nt"));
         let assert = rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt"])
             .arg("-o")
@@ -4565,7 +4617,7 @@ fn output_file_and_json_profile_never_share_a_stream() {
 
         // Without -o the converted bytes take stdout and the JSON still does not.
         let assert = rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt", "--profile=json", "--no-hash"])
             .assert()
@@ -4585,7 +4637,7 @@ fn preserve_bnode_labels_forces_the_serial_path_and_reports_it() {
     let reason_for = |policy: &str| -> (u64, String) {
         let out = tmp.path().join(format!("out-{policy}.nt"));
         let assert = rdf_cmd()
-            .args(["-q", "--parallelism", "8", "rdf", "convert"])
+            .args(["-q", "--parallelism", "8", "convert"])
             .arg(&input)
             .args(["--to", "nt", "--bnode-policy", policy])
             .arg("-o")
@@ -4618,7 +4670,7 @@ fn base_is_inert_for_line_formats_in_both_modes() {
     let input = fixture(&tmp, "abs.nt", "<http://e/s> <http://e/p> <http://e/o> .\n");
     for threads in ["1", "8"] {
         rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt", "--base", "http://other.example/"])
             .assert()
