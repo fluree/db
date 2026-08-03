@@ -99,7 +99,15 @@ pub enum ImportPhase {
 pub type ProgressFn = Arc<dyn Fn(ImportPhase) + Send + Sync>;
 
 /// Configuration for the bulk import pipeline.
+///
+/// `#[non_exhaustive]` (#1529 review, minor): this struct gained a `pub(crate)`
+/// field (`virtual_source`), so external crates can no longer build it with a
+/// struct literal. Marking it non-exhaustive makes that contract explicit — a
+/// clearer compile error than a bare E0451 — and reserves the right to add fields
+/// without a breaking change. Construct it via [`ImportConfig::default`] + the
+/// builder setters; in-crate literals are unaffected.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ImportConfig {
     /// Number of parallel TTL parse threads. `0` = auto: the machine's logical
     /// cores, capped so peak parse memory fits the budget (see

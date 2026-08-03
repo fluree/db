@@ -651,9 +651,21 @@ pub fn read_stamp(
         })
         .unwrap_or_else(|| sample_seed_from_hash(&mapping_hash));
     // Optional: present only for an override-built twin (absent ⇒ empty ⇒ clean twin).
-    let dup_parent_keys: HashMap<String, u64> = field(STAMP_PRED_DUP_PARENT_KEYS)
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    // #1529 review (minor): distinguish ABSENT (never had dup keys → clean) from
+    // PRESENT-but-malformed. The old `.ok().unwrap_or_default()` read a corrupt
+    // payload back as a CLEAN twin — failing OPEN on exactly the dup-key disclosure
+    // the --allow-duplicate-parent-keys override exists to preserve. Warn loudly on a
+    // malformed payload instead of silently swallowing it.
+    let dup_parent_keys: HashMap<String, u64> = match field(STAMP_PRED_DUP_PARENT_KEYS) {
+        Some(s) => serde_json::from_str(s).unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "materialize stamp: malformed dupParentKeys payload — treating as UNKNOWN, not clean"
+            );
+            HashMap::new()
+        }),
+        None => HashMap::new(),
+    };
     Some(WatermarkStamp {
         builder_version,
         mapping_hash,
@@ -1493,10 +1505,15 @@ where
     let base = tmp_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
+    // #1529 review (minor): a per-process atomic suffix so two concurrent full
+    // verifies of the SAME source in one process (a server) don't share a spool dir
+    // — otherwise the first `TmpDirGuard::drop` deletes the other's runs mid-sort.
+    static VERIFY_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = base.join(format!(
-        "fluree-verify-{}-{}",
+        "fluree-verify-{}-{}-{}",
         sanitize_tmp(graph_source_id),
-        std::process::id()
+        std::process::id(),
+        VERIFY_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir)
         .map_err(|e| R2rmlError::Materialization(format!("verify tmp dir: {e}")))?;
@@ -2742,6 +2759,36 @@ mod tests {
         assert!(super::check_parent_index_budget(&parents, 0).is_ok());
         // empty index (0 bytes) under a positive budget passes.
         assert!(super::check_parent_index_budget(&parents, 1024).is_ok());
+    }
+
+    #[test]
+    fn parent_index_budget_guard_trips_on_a_populated_index() {
+        // MAJOR-5 (#1529 review): the only budget-guard tests asserted the two PASS
+        // arms, so deleting the `if used > budget_bytes` block left every test green
+        // while `--help`'s "fails loud rather than OOM" promise went quietly false.
+        // Populate a parent index and assert a tiny budget trips it.
+        use fluree_db_r2rml::materialize::ParentIndexSet;
+        let fx = star_fixture();
+        let mut parents = ParentIndexSet::new(&fx.mapping).unwrap();
+        let cust_tm = fx
+            .mapping
+            .triples_maps
+            .get("<#Customer>")
+            .expect("star fixture has the Customer parent TM");
+        for batch in &fx.batches["cust"] {
+            parents.index_batch(cust_tm, batch).unwrap();
+        }
+        assert!(
+            parents.estimated_bytes() > 0,
+            "the index must be populated for this test to be meaningful"
+        );
+        assert!(
+            matches!(
+                super::check_parent_index_budget(&parents, 1),
+                Err(super::MaterializeError::ParentIndexBudgetExceeded { .. })
+            ),
+            "a populated index over a 1-byte budget must fail loud"
+        );
     }
 
     // --- O2 verify: bounded external sort + streaming diff ---

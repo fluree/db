@@ -415,6 +415,12 @@ impl ParentIndexSet {
         let mut ambiguous_this_batch: Vec<Vec<String>> = Vec::new();
         {
             let entry = self.index.entry(tm.iri.clone()).or_default();
+            // MAJOR-4 (#1529 review): create each canonical col-set's map ONCE (one
+            // column-name Vec clone per set), then probe it by borrow in the row loop
+            // — the old `entry.entry(cols.clone())` cloned that Vec on EVERY row.
+            for cols in &col_sets {
+                entry.entry(cols.clone()).or_default();
+            }
             for row in 0..batch.num_rows {
                 let subject = match materialize_subject_from_batch(&tm.subject_map, batch, row)? {
                     Some(s) => s,
@@ -422,9 +428,17 @@ impl ParentIndexSet {
                 };
                 for cols in &col_sets {
                     if let Some(key) = get_join_key_from_batch(cols, batch, row) {
-                        let map = entry.entry(cols.clone()).or_default();
-                        if parent_key_insert_keep_min(map, key.clone(), subject.clone()) {
-                            ambiguous_this_batch.push(key);
+                        let map = entry
+                            .get_mut(cols.as_slice())
+                            .expect("col-set map pre-created above");
+                        // Pass the key by value (no per-row clone). On the RARE
+                        // distinct-subject collision, re-read it from the batch for
+                        // the ambiguity record — so the key Vec is only rebuilt on a
+                        // genuine duplicate, not on every row.
+                        if parent_key_insert_keep_min(map, key, subject.clone()) {
+                            if let Some(dup) = get_join_key_from_batch(cols, batch, row) {
+                                ambiguous_this_batch.push(dup);
+                            }
                         }
                     }
                 }
@@ -511,6 +525,14 @@ pub fn emit_batch(
     // Fold this TriplesMap's triple total into `per_tm` ONCE at the end (one
     // `tm.iri` clone per batch, not one per emitted triple).
     let mut tm_triples: u64 = 0;
+    // MAJOR-4 (#1529 review): accumulate this batch's FK-edge counts per POM in a
+    // flat Vec (a bare `+= 1`, no alloc/hash), folded into `stats.ref_edges` ONCE at
+    // the end — the old per-edge `entry((tm.iri.clone(), predicate.to_string()))`
+    // did two heap allocations plus a composite-String hash on EVERY edge. Only
+    // constant-predicate ref POMs (the overwhelmingly common shape) take this fast
+    // path; a templated ref predicate (whose key varies per row) keeps the per-edge
+    // update below.
+    let mut local_ref_edges: Vec<u64> = vec![0; tm.predicate_object_maps.len()];
 
     for row in 0..batch.num_rows {
         let subject = match materialize_subject_from_batch(&tm.subject_map, batch, row)? {
@@ -549,10 +571,18 @@ pub fn emit_batch(
                         Some(parent_subject) => {
                             observer.observe(&subject, &predicate, parent_subject)?;
                             stats.ref_triples += 1;
-                            *stats
-                                .ref_edges
-                                .entry((tm.iri.clone(), predicate.to_string()))
-                                .or_default() += 1;
+                            // MAJOR-4: constant predicate → local per-POM counter
+                            // (folded once per batch); templated predicate → per-edge
+                            // update (its key varies per row, so it can't be batched).
+                            match const_preds[i] {
+                                Some(_) => local_ref_edges[i] += 1,
+                                None => {
+                                    *stats
+                                        .ref_edges
+                                        .entry((tm.iri.clone(), predicate.to_string()))
+                                        .or_default() += 1;
+                                }
+                            }
                             tm_triples += 1;
                         }
                         None => stats.ref_dangling += 1, // dangling/absent parent → no triple
@@ -572,6 +602,19 @@ pub fn emit_batch(
 
     if tm_triples > 0 {
         *stats.per_tm.entry(tm.iri.clone()).or_default() += tm_triples;
+    }
+    // MAJOR-4: fold the batch's per-POM FK-edge counts into `stats.ref_edges` once
+    // — one `tm.iri`/predicate clone per distinct constant predicate per batch,
+    // not per edge.
+    for (i, count) in local_ref_edges.iter().enumerate() {
+        if *count > 0 {
+            if let Some(pred) = const_preds[i] {
+                *stats
+                    .ref_edges
+                    .entry((tm.iri.clone(), pred.to_string()))
+                    .or_default() += count;
+            }
+        }
     }
     Ok(())
 }

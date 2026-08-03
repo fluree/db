@@ -5385,7 +5385,7 @@ async fn verify_twin_full_passes_on_multi_chunk_twin() {
     let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
         .build()
         .expect("build Fluree");
-    fluree
+    let build = fluree
         .create(LEDGER)
         .import_r2rml(Arc::clone(&provider), "gs:main")
         .threads(2)
@@ -5394,6 +5394,16 @@ async fn verify_twin_full_passes_on_multi_chunk_twin() {
         .execute()
         .await
         .expect("build multi-chunk twin");
+    // MAJOR-5 (#1529 review): this test's WHOLE point is exercising verify at
+    // multi-chunk scale, but it never asserted the build actually spanned >1 chunk
+    // (a config drift could quietly make it single-chunk). `t` is the final
+    // transaction number = the chunk count; assert the build was genuinely
+    // multi-chunk so the full-verify assertion below is testing what it claims.
+    assert!(
+        build.t > 1,
+        "the build must be genuinely multi-chunk (t={}) for this test to be meaningful",
+        build.t
+    );
     let ledger = fluree.ledger(LEDGER).await.expect("load twin");
 
     // Spool under the tempdir (a real .fluree-style scratch area, not tmpfs /tmp).

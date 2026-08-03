@@ -3234,6 +3234,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_parent_lookup_keeps_min_subject_on_duplicate_join_key() {
+        // MAJOR-5 (#1529 review): build_parent_lookup's last-wins -> keep-min swap
+        // changes which parent a LIVE virtual query binds on a duplicate join key,
+        // yet reverting it left the whole suite green. Two parent rows share join key
+        // 1 but mint distinct subjects; keep-min must bind the lexicographically
+        // smaller IRI regardless of row order (rows are a-then-b, so last-wins would
+        // pick 'b' — this pins the keep-min semantics on the live query path).
+        let parent_tm = TriplesMap::new("#Customer", "customers")
+            .with_subject_template("http://ex/customer/{SID}");
+        let schema = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "JK".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "SID".to_string(),
+                field_type: FieldType::String,
+                nullable: false,
+                field_id: 2,
+            },
+        ]));
+        let batch = ColumnBatch::new(
+            schema,
+            vec![
+                Column::Int64(vec![Some(1), Some(1)]),
+                Column::String(vec![Some("a".to_string()), Some("b".to_string())]),
+            ],
+        )
+        .unwrap();
+
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let lookup =
+            build_parent_lookup(&ctx, &parent_tm, &["JK".to_string()], vec![batch]).unwrap();
+        assert_eq!(
+            lookup.get(&["1".to_string()][..]),
+            Some(&RdfTerm::iri("http://ex/customer/a")),
+            "keep-min must bind the lexicographically smaller subject on a dup join key"
+        );
+    }
+
     /// PR-5 soundness: the top-k pushdown must be declined whenever the scan
     /// carries a residual filter the operator enforces after emitting rows —
     /// otherwise the heap is fed pre-filter values and could prune files whose
