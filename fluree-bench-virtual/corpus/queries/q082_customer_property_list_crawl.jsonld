@@ -1,0 +1,11 @@
+# q082 customer_property_list_crawl — browse-parity Cluster B (D4), the
+#   forward-predicate-list select-map form. Projects ONLY the requested predicates
+#   (edw:name, edw:segment) for the bound subject, omitting the FK refs and @type.
+#   Runs the single bound-subject wildcard scan and filters at assembly (so an
+#   absent requested predicate is simply omitted, never dropping the subject the
+#   way a per-predicate cross-scan would). Single subject = deterministic,
+#   hash-gated Full.
+{
+  "@context": {"edw": "http://ns.fluree.dev/edw#"},
+  "select": {"http://data.fluree.dev/edw/customer/1": ["edw:name", "edw:segment"]}
+}

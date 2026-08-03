@@ -653,32 +653,31 @@ pub fn expand_template_from_batch(
     static PLACEHOLDER_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
 
-    let mut result = template.to_string();
-    let mut error: Option<R2rmlError> = None;
-
+    // Single-pass build from the original template's literal/placeholder segments
+    // (O4). The previous body did `result.replace(full_match, ..)` once PER
+    // placeholder, each a full re-scan + re-alloc of the whole (growing) string —
+    // O(placeholders x len) allocations per row on the hot path — and could even
+    // double-expand a value that happened to contain another placeholder's text.
+    // Expanding each placeholder positionally from the ORIGINAL template into one
+    // reserved String is one pass, one allocation, and exact R2RML semantics.
+    let mut out = String::with_capacity(template.len() + 16);
+    let mut last = 0usize;
     for cap in PLACEHOLDER_RE.captures_iter(template) {
-        let full_match = cap.get(0).unwrap().as_str();
+        let m = cap.get(0).unwrap();
+        out.push_str(&template[last..m.start()]);
         let column = &cap[1];
-
         match column_value_as_string(batch, column, row_idx) {
-            Some(value) => {
-                let escaped = iri_escape(&value);
-                result = result.replace(full_match, &escaped);
-            }
+            Some(value) => out.push_str(&iri_escape(&value)),
             None => {
-                error = Some(R2rmlError::Materialization(format!(
+                return Err(R2rmlError::Materialization(format!(
                     "Column '{column}' is null or not found at row {row_idx}, cannot expand template"
                 )));
-                break;
             }
         }
+        last = m.end();
     }
-
-    if let Some(e) = error {
-        return Err(e);
-    }
-
-    Ok(result)
+    out.push_str(&template[last..]);
+    Ok(out)
 }
 
 /// Materialize a subject term from a SubjectMap and a ColumnBatch row

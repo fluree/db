@@ -1,0 +1,11 @@
+# q080 customer_detail_crawl — browse-parity Cluster B (D4). A "subject detail"
+#   select-map with a CONSTANT-IRI root and NO where clause: at 733cb2c8e this
+#   returned the empty {"@id":...} native-hydration stub on virtual (the deployed
+#   "subject detail is empty" bug), because the IRI root lowered to Root::Sid and
+#   hydrated against the absent binary index. Cluster B routes it onto the
+#   bound-subject wildcard scan (pruned to DIM_CUSTOMER via subject-template
+#   reversal) so it hydrates the FULL node document. Single subject =
+#   deterministic, so hash-gated Full against the native materialized-twin oracle.
+{
+  "select": {"http://data.fluree.dev/edw/customer/1": ["*"]}
+}

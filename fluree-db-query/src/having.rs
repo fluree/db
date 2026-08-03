@@ -76,6 +76,17 @@ impl HavingOperator {
 
 #[async_trait]
 impl Operator for HavingOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — HAVING filters whole GROUPS, so
+    /// producing `k` surviving groups needs the complete grouped input (an
+    /// arbitrary number of groups may fail the predicate). Explicit (was a silent
+    /// trait-default no-op) so the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "HAVING row-budget swallowed (unsound to forward: filters whole groups)"
+        );
+    }
+
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
     }

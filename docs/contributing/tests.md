@@ -90,6 +90,12 @@ binary. No new `[[test]]` entry is needed unless you are creating a new group.
   `cargo test`, so env mutation must stay in a dedicated binary to remain
   isolated. (Under `cargo nextest`, every test already runs in its own process,
   so this only matters for bare `cargo test`.)
+- Tests whose **assertions are about instrumentation** — presence/absence of
+  tracing events captured via a thread-local `span_capture` subscriber (e.g.
+  `it_cyclic_bgp_probe`, `it_minmax_fast_path_fired`). Tracing's
+  callsite-interest cache is process-global and the capture is thread-local,
+  so these assertions are only reliable when the test is alone in its
+  process. (Same caveat as above: bites bare `cargo test` only.)
 
 ### Example Tests
 

@@ -196,3 +196,10 @@ becomes resident-memory-bound for no gain. The gate errs toward the speed win. S
 (`apply_solution_modifiers` applies the subquery's `DISTINCT`) rather than
 per-step.
 
+
+## Related
+
+This document covers the pipeline and overlay-merge semantics. For the full
+performance picture — the cost model, the specialized join operators, the
+complete fast-path catalog, frontier traversal, and where parallelism is
+applied — see [Performance architecture](performance.md).

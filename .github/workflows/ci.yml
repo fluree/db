@@ -77,6 +77,14 @@ jobs:
       - name: Test
         run: cargo nextest run --workspace --all-features --no-fail-fast
 
+      # Clippy and the nextest run above are both --all-features, so a target
+      # that only fails to compile under DEFAULT features (e.g. an example
+      # using feature-gated API without a `required-features` gate) is
+      # invisible to them. This compiles the shape a contributor's bare
+      # `cargo test -p <crate>` reaches first.
+      - name: Check (default features)
+        run: cargo check --workspace --all-targets
+
   testsuite-sparql:
     runs-on: ubuntu-latest
     steps:

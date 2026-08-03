@@ -445,6 +445,10 @@ fn query_error_code(e: &fluree_db_query::QueryError) -> &'static str {
         } => "timeout",
         QE::Cancelled { .. } => "cancelled",
         QE::ResourceLimit(_) => "resource_limit",
+        // Virtual-dataset (R2RML) unsupported-pattern refusal — a distinct code
+        // (mirrors the server `@type` `err:r2rml/UnsupportedPattern`) so the
+        // streaming path is as machine-discriminable as the buffered one.
+        QE::R2rmlUnsupportedPattern { .. } => "r2rml_unsupported_pattern",
         QE::InvalidQuery(_) | QE::InvalidFilter(_) | QE::InvalidExpression(_) => "invalid_query",
         _ => "internal",
     }

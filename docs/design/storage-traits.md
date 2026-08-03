@@ -86,7 +86,7 @@ pub trait ContentStore: Debug + Send + Sync {
 - `ContentId` is a CIDv1 value encoding the hash function, digest, and content kind (multicodec). See [ContentId and ContentStore](content-id-and-contentstore.md).
 - `ContentKind` enables routing to different storage tiers (commit store vs index store) without parsing URL paths.
 - `put` computes the content hash and returns the derived `ContentId`.
-- Implementations include `MemoryContentStore` (for testing) and `BridgeContentStore` (adapts a `Storage` backend).
+- Implementations include `MemoryContentStore` (for testing), `StorageContentStore<S>` (adapts a `Storage` backend), and `BranchedContentStore` (branch-scoped reads).
 
 ## Physical Storage Traits (fluree-db-core)
 
@@ -210,25 +210,26 @@ pub trait ContentAddressedWrite: StorageWrite {
 A convenience marker trait indicating full storage capability.
 
 ```rust
-/// Full storage capability: read + content-addressed write
-pub trait Storage: StorageRead + ContentAddressedWrite {}
+/// Full storage capability: read + content-addressed write + method reporting.
+/// Used for type erasure in `AnyStorage`.
+pub trait Storage: StorageRead + ContentAddressedWrite + StorageMethod {}
 
-/// Blanket implementation for any type implementing both traits
-impl<T: StorageRead + ContentAddressedWrite> Storage for T {}
+/// Blanket implementation for any type implementing all three traits
+impl<T: StorageRead + ContentAddressedWrite + StorageMethod> Storage for T {}
 ```
 
 **Usage:**
 ```rust
 // Instead of this verbose bound:
-fn process<S: StorageRead + StorageWrite + ContentAddressedWrite>(storage: &S)
+fn process<S: StorageRead + ContentAddressedWrite + StorageMethod>(storage: &S)
 
 // Use this:
 fn process<S: Storage>(storage: &S)
 ```
 
-## Extension Traits (fluree-db-nameservice)
+## Extension Traits
 
-The nameservice crate defines additional traits with `StorageExtResult<T>` for richer error handling (e.g., `PreconditionFailed` for CAS operations).
+Additional traits using `StorageExtResult<T>` for richer error handling (e.g. `PreconditionFailed` for CAS operations). These live alongside the core traits in `fluree-db-core/src/storage.rs`.
 
 ### StorageList
 

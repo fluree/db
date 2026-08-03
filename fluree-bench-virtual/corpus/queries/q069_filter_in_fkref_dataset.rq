@@ -1,0 +1,14 @@
+# q069 filter_in_fkref_dataset — promoted from A3 probe-02 (audit item 7, F-AUD-5)
+# Coverage: a bounded FILTER(?fk IN (...)) over an FK-REF var. Item 7 lowers a
+#   bounded IN/VALUES set to an Iceberg Expression::In for scalar-column POMs; an
+#   FK-IRI IN (this shape) still declines to prune (the FK-key template reversal is
+#   a documented follow-on), so here it is a PARITY member (native==virtual) and a
+#   pruning member once FK-IRI lowering lands. The scalar prune win is shown by q070.
+# Exec path: query_from() FROM <enterprise-sf01-v:main> (the deployed solo/chat shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot ; edw:store ?st .
+        FILTER(?st IN (<http://data.fluree.dev/edw/store/1>,
+                       <http://data.fluree.dev/edw/store/2>,
+                       <http://data.fluree.dev/edw/store/3>)) }

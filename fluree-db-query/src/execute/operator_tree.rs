@@ -3497,18 +3497,27 @@ pub(crate) fn apply_solution_modifiers(
                 (Some(limit), None) => limit,
                 _ => 0,
             };
-            // PR-5: offer the primary DESC sort key + k to the row-preserving scan
-            // below, so a single-column `ORDER BY DESC(<scan col>) LIMIT k` over an
-            // R2RML scan can read only the files that can hold the top-k. Offered
-            // only for a DESCENDING primary key (ASC declines — SPARQL orders
-            // unbound first, so a null-bearing file can't be pruned); the scan
-            // honors it ONLY if the key resolves to a single scalar scan column,
-            // else no-op. Pure optimization — this `SortOperator` remains the
-            // authority for the exact (compound) order + LIMIT.
+            // PR-5 / item 8 (F-AUD-6): offer the primary sort key + k to the
+            // row-preserving scan below, so a single-column `ORDER BY <scan col>
+            // LIMIT k` over an R2RML scan can read only the files that can hold the
+            // top-k. DESC is offered for any scalar column; ASC is offered too but
+            // the scan honors it ONLY when the column is REQUIRED (non-nullable) —
+            // SPARQL orders unbound values FIRST under ASC, so a nullable column
+            // could hide an unread top-k row (the provider re-checks). The scan
+            // honors either direction ONLY if the key resolves to a single scalar
+            // scan column, else no-op. Pure optimization — this `SortOperator`
+            // remains the authority for the exact (compound) order + LIMIT.
             if can_topk {
                 if let Some(primary) = ordering.first() {
-                    if primary.direction == crate::sort::SortDirection::Descending {
-                        operator.set_topk(primary.var, k);
+                    use crate::sort::SortDirection;
+                    match primary.direction {
+                        SortDirection::Descending => operator.set_topk(primary.var, k, false),
+                        // Gated by FLUREE_R2RML_TOPK_ASC: OFF is byte-identical to
+                        // the pre-item-8 DESC-only behavior.
+                        SortDirection::Ascending if crate::r2rml::topk_asc_enabled() => {
+                            operator.set_topk(primary.var, k, true);
+                        }
+                        SortDirection::Ascending => {}
                     }
                 }
             }
@@ -3581,7 +3590,7 @@ mod tests {
 
         struct RecordingTopkOp {
             schema: Vec<VarId>,
-            recorded: Arc<Mutex<Option<(VarId, usize)>>>,
+            recorded: Arc<Mutex<Option<(VarId, usize, bool)>>>,
         }
         #[async_trait::async_trait]
         impl Operator for RecordingTopkOp {
@@ -3595,8 +3604,8 @@ mod tests {
                 Ok(None)
             }
             fn close(&mut self) {}
-            fn set_topk(&mut self, sort_var: VarId, k: usize) {
-                *self.recorded.lock().unwrap() = Some((sort_var, k));
+            fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+                *self.recorded.lock().unwrap() = Some((sort_var, k, ascending));
             }
         }
 
@@ -3623,8 +3632,68 @@ mod tests {
         .expect("apply_solution_modifiers");
         assert_eq!(
             *recorded.lock().unwrap(),
-            Some((VarId(1), 15)),
-            "k must be LIMIT(10) + OFFSET(5) = 15, so the scan retains the offset rows the sort then skips"
+            Some((VarId(1), 15, false)),
+            "k must be LIMIT(10) + OFFSET(5) = 15, so the scan retains the offset rows the sort then skips; DESC ⇒ ascending=false"
+        );
+    }
+
+    /// Item 8 (F-AUD-6): an ASC `ORDER BY … LIMIT` offers a top-k directive too,
+    /// carrying `ascending = true` (the scan/provider then gates on the column
+    /// being required). Mirrors the DESC test above.
+    #[test]
+    fn topk_directive_ascending_carries_direction() {
+        use crate::binding::Batch;
+        use crate::context::ExecutionContext;
+        use crate::error::Result as QResult;
+        use crate::operator::{BoxedOperator, Operator};
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingTopkOp {
+            schema: Vec<VarId>,
+            recorded: Arc<Mutex<Option<(VarId, usize, bool)>>>,
+        }
+        #[async_trait::async_trait]
+        impl Operator for RecordingTopkOp {
+            fn schema(&self) -> &[VarId] {
+                &self.schema
+            }
+            async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> QResult<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> QResult<Option<Batch>> {
+                Ok(None)
+            }
+            fn close(&mut self) {}
+            fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+                *self.recorded.lock().unwrap() = Some((sort_var, k, ascending));
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(None));
+        let op: BoxedOperator = Box::new(RecordingTopkOp {
+            schema: vec![VarId(0), VarId(1)],
+            recorded: Arc::clone(&recorded),
+        });
+        let planning = crate::temporal_mode::PlanningContext::current();
+        // ORDER BY ASC(?1) LIMIT 10.
+        let _tree = apply_solution_modifiers(
+            op,
+            None,
+            &[],
+            &[SortSpec::asc(VarId(1))],
+            None,
+            false,
+            None,
+            Some(10),
+            false,
+            None,
+            &planning,
+        )
+        .expect("apply_solution_modifiers");
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some((VarId(1), 10, true)),
+            "ASC ⇒ ascending=true (switch default-on); provider re-gates on required column"
         );
     }
 
