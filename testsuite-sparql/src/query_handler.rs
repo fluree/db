@@ -95,6 +95,29 @@ pub fn evaluate_update_evaluation_test(test: &Test) -> Result<()> {
         );
     }
 
+    // A PRESENT blank `mf:result` that carried outgoing predicates but whose
+    // recognized ones (ut:data/ut:graphData/ut:result) all resolved to nothing
+    // (e.g. `[ ut:graphData [ ut:graph <g> ] ]` with no `rdfs:label`, or a
+    // result carrying only non-content predicates) is a parse/resolution
+    // failure, not the deliberate `mf:result []` empty-store expectation — the
+    // latter has zero predicates and falls through both guards. Fail loud
+    // rather than pass trivially against a coincidentally-empty store. (An IRI
+    // `ut:graphData <file>` object resolves at parse time regardless of file
+    // existence and fails later at LOAD, so it is not this guard's case.)
+    if test.result_present
+        && test.result.is_none()
+        && test.result_data.is_none()
+        && test.result_graph_data.is_empty()
+        && !test.result_success
+        && test.result_has_predicates
+    {
+        bail!(
+            "UpdateEvaluationTest has a present-but-content-empty mf:result — a \
+             blank result node whose predicates none resolved to content \
+             (unresolvable ut:graphData / mis-parse)?\nTest: {test_id}"
+        );
+    }
+
     let descriptor = TestDescriptor::UpdateEval {
         test_id,
         request_url,

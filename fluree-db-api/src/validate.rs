@@ -703,7 +703,7 @@ mod tests {
         let turtle = sample_report().to_turtle();
         let mut sink = fluree_graph_ir::GraphCollectorSink::new();
         fluree_graph_turtle::parse(&turtle, &mut sink).expect("report Turtle must parse");
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         // report node (type + conforms + result) and the result node's fields
         assert!(graph.len() >= 8, "expected full report triples: {turtle}");
         assert!(turtle.contains("sh:MinCountConstraintComponent"));

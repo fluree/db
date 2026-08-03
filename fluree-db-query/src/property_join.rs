@@ -971,6 +971,19 @@ impl Operator for PropertyJoinOperator {
                         p: false,
                         o: true,
                     }
+                } else if ctx.default_graphs_slice().is_some_and(|g| g.len() >= 2) {
+                    // Existence-only over a MULTI-member default union: the
+                    // DatasetOperator arms the §13.2 set-dedup, whose key
+                    // needs every VARIABLE column emitted (a pruned object
+                    // column would collapse distinct triples — the operator
+                    // now fails loud on that combination). Widen to include
+                    // the object; the consumer below keys off `emit_obj` and
+                    // simply ignores the extra column.
+                    EmitMask {
+                        s: true,
+                        p: false,
+                        o: true,
+                    }
                 } else {
                     // Existence-only: only need the subject column.
                     EmitMask {

@@ -695,7 +695,7 @@ pub fn parse_expected_graph(url: &str) -> Result<Vec<Triple>> {
     let mut sink = GraphCollectorSink::new();
     parse_turtle(&with_base, &mut sink)
         .with_context(|| format!("Parsing expected graph: {url}"))?;
-    let graph = sink.finish();
+    let graph = sink.into_graph();
     Ok(graph
         .iter()
         .map(|t| Triple {
@@ -723,7 +723,7 @@ fn parse_ttl_result(content: &str, url: &str) -> Result<SparqlResults> {
     let with_base = format!("@base <{url}> .\n{content}");
     let mut sink = GraphCollectorSink::new();
     parse_turtle(&with_base, &mut sink).context("Turtle parse error")?;
-    let graph = sink.finish();
+    let graph = sink.into_graph();
 
     // Check for DAWG Result Set vocabulary
     let is_result_set = graph

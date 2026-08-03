@@ -245,12 +245,7 @@ fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<
         // integer pushes as an EXACT scale-0 decimal when numeric pushdown is
         // on (else stays `Int64` → no prune). An out-of-i32-range literal on an
         // `int` column is skipped rather than wrapped. See `int_pushdown_literal`.
-        ScanValue::Int(n) => {
-            match int_pushdown_literal(*n, field_type, iceberg_numeric_stats_enabled()) {
-                Some(v) => v,
-                None => return None,
-            }
-        }
+        ScanValue::Int(n) => int_pushdown_literal(*n, field_type, iceberg_numeric_stats_enabled())?,
         ScanValue::Str(s) => LiteralValue::String(s.clone()),
         // xsd:double / xsd:float FILTER value. Push only against a physically
         // `double` column (exact f64 bounds); a `float` column would need an

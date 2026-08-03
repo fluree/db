@@ -500,7 +500,7 @@ mod tests {
     fn parse_r2rml(turtle: &str) -> Graph {
         let mut sink = GraphCollectorSink::new();
         parse_turtle(turtle, &mut sink).unwrap();
-        sink.finish()
+        sink.into_graph()
     }
 
     #[test]

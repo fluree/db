@@ -247,6 +247,7 @@ pub fn write_expected(
 /// - a [`Status::Error`] wall is the time-to-abort (e.g. a `MemoryBudgetExceeded`
 ///   507 at ~8.6GB), not a completion — blessing it would pin an abort as a "budget";
 /// - a [`Status::ExpectedError`] never produces a result at all.
+///
 /// Defensively also true for any wall at/over the deadline (a mis-statused or
 /// imported record — belt and suspenders); a `timeout_ms == 0` (unknown deadline) is
 /// checked by status only. A non-blessable record blesses as *no baseline* (a
