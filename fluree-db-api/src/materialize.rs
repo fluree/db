@@ -809,7 +809,11 @@ fn spawn_produce_workers(
                         // Secure the first batch of a chunk BEFORE claiming an idx,
                         // so an idx is never wasted on an empty chunk (a gap would
                         // stall the in-order consumer forever).
-                        let first = match work_rx.lock().unwrap().recv() {
+                        let first = match work_rx
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv()
+                        {
                             Ok(item) => item,
                             Err(_) => break 'chunks, // driver closed the work channel
                         };
@@ -843,7 +847,11 @@ fn spawn_produce_workers(
                         loop {
                             let (tm_iri, batch) = match item.take() {
                                 Some(i) => i,
-                                None => match work_rx.lock().unwrap().recv() {
+                                None => match work_rx
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .recv()
+                                {
                                     Ok(i) => i,
                                     Err(_) => {
                                         ended = true;
@@ -1043,47 +1051,65 @@ pub async fn drive_virtual_import(
             chunk_size_bytes,
             ctx,
         )?;
+        // CRITICAL-2 (#1529 review): the workers own their `work_rx` clones, so drop
+        // the driver's copy NOW. Then once every worker exits (e.g. all died on a
+        // full spool disk, or one panic poisoned the shared lock — see the
+        // poison-tolerant lock in `spawn_produce_workers`), the receiver is fully
+        // gone and `work_tx.send` ERRORS instead of blocking forever on the bounded
+        // channel. Without this drop the `consumer_gone` path below is unreachable
+        // and an all-workers-dead pool hangs the whole build silently.
+        drop(work_rx);
 
         // Driver: scan each table in this wave, index non-preindex FK parents into
         // the wave-local set DURING the scan, and dispatch batches to the pool. A
-        // blocking send is natural backpressure; if the consumer dropped, stop.
-        for tm_iri in wave {
-            let Some(tm) = mapping.triples_maps.get(tm_iri) else {
-                continue;
-            };
-            let table = tm
-                .table_name()
-                .ok_or_else(|| MaterializeError::NoTable(tm.iri.clone()))?;
-            let index_here =
-                !materialization.preindex.contains(tm_iri) && arc_parents.is_parent(tm_iri);
-            let projection = scan_projection(tm, &arc_parents);
-            let table_start = std::time::Instant::now();
-            let mut stream = provider
-                .scan_table(graph_source_id, table, &projection, &[], None, None)
-                .await?;
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                if index_here {
-                    wave_local.index_batch(tm, &batch)?;
+        // blocking send is natural backpressure; if every worker died the send now
+        // errors (see the drop above) and we stop. Run under a scoped future so that
+        // WHATEVER the outcome — success, a scan/index error, or a dead pool — we
+        // still drop `work_tx` and JOIN the workers below before returning, so no
+        // detached worker is left writing spool files into a dir the failing import
+        // is about to clean up.
+        let scan_outcome: Result<(), MaterializeError> = async {
+            for tm_iri in wave {
+                let Some(tm) = mapping.triples_maps.get(tm_iri) else {
+                    continue;
+                };
+                let table = tm
+                    .table_name()
+                    .ok_or_else(|| MaterializeError::NoTable(tm.iri.clone()))?;
+                let index_here =
+                    !materialization.preindex.contains(tm_iri) && arc_parents.is_parent(tm_iri);
+                let projection = scan_projection(tm, &arc_parents);
+                let table_start = std::time::Instant::now();
+                let mut stream = provider
+                    .scan_table(graph_source_id, table, &projection, &[], None, None)
+                    .await?;
+                while let Some(batch) = stream.next().await {
+                    let batch = batch?;
+                    if index_here {
+                        wave_local.index_batch(tm, &batch)?;
+                    }
+                    if work_tx.send((tm_iri.clone(), batch)).is_err() {
+                        consumer_gone = true;
+                        break;
+                    }
                 }
-                if work_tx.send((tm_iri.clone(), batch)).is_err() {
-                    consumer_gone = true;
+                tracing::info!(
+                    table = %table,
+                    scan_ms = table_start.elapsed().as_millis() as u64,
+                    "materialize.phase table_scan"
+                );
+                if consumer_gone {
                     break;
                 }
             }
-            tracing::info!(
-                table = %table,
-                scan_ms = table_start.elapsed().as_millis() as u64,
-                "materialize.phase table_scan"
-            );
-            if consumer_gone {
-                break;
-            }
+            Ok(())
         }
-        drop(work_tx); // signal this wave's workers: no more batches
+        .await;
+        drop(work_tx); // signal this wave's workers: no more batches (happy + error path)
 
-        // Join this wave's workers, aggregating stats + encode time; surface the
-        // first worker error.
+        // Join this wave's workers UNCONDITIONALLY (even when the scan errored),
+        // aggregating stats + encode time and surfacing the first worker error, so
+        // no detached worker keeps running while the import cleans up.
         let mut worker_err: Option<String> = None;
         for handle in handles {
             match handle.join() {
@@ -1098,6 +1124,9 @@ pub async fn drive_virtual_import(
                 }
             }
         }
+        // Surface a driver-side scan/index error only AFTER the workers are joined
+        // (propagating is safe now — no thread is left running), then a worker error.
+        scan_outcome?;
         if let Some(e) = worker_err {
             return Err(MaterializeError::from(R2rmlError::Materialization(e)));
         }
@@ -3160,5 +3189,99 @@ mod tests {
             stats.ref_triples, 4,
             "chain must resolve 1 inRegion + 3 inCountry edges: {stats:?}"
         );
+    }
+
+    /// A poison fixture: one standalone TriplesMap whose subject map is EMPTY (no
+    /// template/column/constant, term_type IRI), so `emit_batch` fails with a hard
+    /// `MissingProperty` on the first row of every batch — killing every produce
+    /// worker. Many single-row batches so the bounded work channel (cap =
+    /// workers*2) fills while the driver is still sending, reproducing the exact
+    /// "all workers dead + driver mid-send" state CRITICAL-2 hangs on.
+    fn poison_fixture() -> MockBuildProvider {
+        use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, SubjectMap, TriplesMap};
+        use fluree_db_tabular::{BatchSchema, Column, FieldInfo, FieldType};
+
+        let mut poison = TriplesMap::new("<#Poison>", "poison");
+        poison.subject_map = SubjectMap::default(); // no term map → hard emit error
+
+        let schema = std::sync::Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "k".to_string(),
+            field_type: FieldType::Int64,
+            nullable: true,
+            field_id: 1,
+        }]));
+        let batches_vec: Vec<_> = (0..64)
+            .map(|i| {
+                fluree_db_tabular::ColumnBatch::new(
+                    schema.clone(),
+                    vec![Column::Int64(vec![Some(i)])],
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut batches = HashMap::new();
+        batches.insert("poison".to_string(), batches_vec);
+
+        MockBuildProvider {
+            mapping: Arc::new(CompiledR2rmlMapping::new(vec![poison])),
+            batches,
+        }
+    }
+
+    #[test]
+    fn worker_failure_errors_not_hangs() {
+        // CRITICAL-2 (#1529 review): before the fix, an all-workers-dead pool left
+        // the driver blocked in `send` forever (its own `Arc<Mutex<work_rx>>` pinned
+        // the receiver alive, so `send` never erred) and the consumer blocked in
+        // `recv` forever — a silent permanent hang. With `drop(work_rx)` after spawn,
+        // poison-tolerant worker locks, and an unconditional join, a worker failure
+        // must surface as a prompt BUILD ERROR. The build runs on its own thread and
+        // the assertion waits with a timeout, so a hang REGRESSION fails this test
+        // fast (via the timeout branch) instead of stalling the whole suite.
+        use fluree_db_transact::namespace::{NamespaceRegistry, SharedNamespaceAllocator};
+        use std::time::Duration;
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+        let _builder = std::thread::spawn(move || {
+            let provider = poison_fixture();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let shared_alloc = Arc::new(SharedNamespaceAllocator::from_registry(
+                &NamespaceRegistry::new(),
+            ));
+            let spool_dir =
+                std::env::temp_dir().join(format!("fluree-c2-test-{}", std::process::id()));
+            std::fs::create_dir_all(&spool_dir).unwrap();
+            let (tx, rx) = std::sync::mpsc::sync_channel::<super::ChunkResult>(2);
+            // Drain the result side so no worker/driver blocks on `result_tx.send`;
+            // exits when the driver drops `tx` (on success OR error).
+            let drain = std::thread::spawn(move || while rx.recv().is_ok() {});
+            let result = rt.block_on(async {
+                let ctx = super::VirtualChunkContext {
+                    shared_alloc: &shared_alloc,
+                    ledger_id: "poison-twin",
+                    compress: false,
+                    spool_dir: &spool_dir,
+                    spool_config: None,
+                };
+                super::drive_virtual_import(&provider, "mock-gs", 64, 2, 0, true, &ctx, tx).await
+            });
+            let _ = std::fs::remove_dir_all(&spool_dir);
+            drain.join().unwrap();
+            let _ = done_tx.send(result.is_err());
+        });
+
+        match done_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(errored) => assert!(
+                errored,
+                "the poison mapping must FAIL the build (worker emit error surfaced), not succeed"
+            ),
+            Err(_) => panic!(
+                "CRITICAL-2 regression: the build HUNG on a worker-pool failure (30s timeout)"
+            ),
+        }
     }
 }
