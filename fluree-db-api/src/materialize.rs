@@ -1206,13 +1206,33 @@ pub enum VerifyMode {
     Full,
 }
 
+/// CRITICAL-3 (#1529 review): the `count:{class}` checks compare a source MULTISET
+/// (the enumerator observers do `+= 1` per EMITTED `rdf:type` row) against a twin
+/// SET (a `COUNT` over the deduplicated store). A class whose subject template is
+/// non-unique per source row (a denormalized fact, an event table keyed wider than
+/// its template) therefore mismatches HERE even on a faithful twin — while the
+/// full-triple diff, which dedups both sides, PASSES on the same data. Surfaced with
+/// the mismatch so an operator does not read a spurious count delta as corruption.
+/// The durable fix (count DISTINCT subjects per class source-side) is tracked, not
+/// in this phase.
+const COUNT_MULTISET_NOTE: &str =
+    "count compares a source multiset (one per rdf:type row) against a twin set \
+     (distinct subjects); a non-unique subject template can mismatch here even on a \
+     faithful twin — the full-triple diff is authoritative";
+
 /// Outcome of one parity check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOutcome {
     /// Source and twin agree.
     Match,
-    /// A count differs between the source and the twin.
-    Mismatch { source: u64, twin: u64 },
+    /// A count differs between the source and the twin. `note` carries a caveat
+    /// (rendered with the failure) about why a count difference can be spurious even
+    /// on a faithful twin — see [`COUNT_MULTISET_NOTE`].
+    Mismatch {
+        source: u64,
+        twin: u64,
+        note: Option<&'static str>,
+    },
     /// Triple sets differ (full or per-subject sample).
     TripleDiff {
         missing_in_twin: usize,
@@ -1398,7 +1418,11 @@ where
             outcome: if source == twin {
                 CheckOutcome::Match
             } else {
-                CheckOutcome::Mismatch { source, twin }
+                CheckOutcome::Mismatch {
+                    source,
+                    twin,
+                    note: Some(COUNT_MULTISET_NOTE),
+                }
             },
         });
     }
@@ -1510,7 +1534,11 @@ where
             outcome: if source == twin {
                 CheckOutcome::Match
             } else {
-                CheckOutcome::Mismatch { source, twin }
+                CheckOutcome::Mismatch {
+                    source,
+                    twin,
+                    note: Some(COUNT_MULTISET_NOTE),
+                }
             },
         });
     }
@@ -2108,7 +2136,22 @@ fn canonicalize_value_nt(triple: &str) -> String {
     } else {
         return triple.to_string();
     };
-    format!("{s} {p} \"{canon}\"^^<{dt}> .")
+    // CRITICAL-3 (#1529 review): fold the datatype IRI xsd:float -> xsd:double so a
+    // value from a float column compares equal on both sides. The source renders the
+    // DECLARED type (xsd:float; naming.rs Float32 => "xsd:float"), while the twin
+    // stores the value as FlakeValue::Double and the export writer emits xsd:double
+    // — a per-triple missing/extra pair that false-rejected every correct twin with
+    // a float column. The lexical forms already collapse (normalize_numeric_lexical
+    // treats float and double identically, parsing to f64), so folding only the
+    // datatype IRI is the last step. Applied to BOTH sides (both flow through this
+    // canonicalizer), so it never masks a genuine float-vs-double VALUE difference —
+    // that lives in `canon`, which is unchanged.
+    let canon_dt = if local == "float" {
+        fluree_vocab::xsd::DOUBLE
+    } else {
+        dt
+    };
+    format!("{s} {p} \"{canon}\"^^<{canon_dt}> .")
 }
 
 /// Value-canonical lexical form of a numeric literal, so two lexically-different
@@ -2532,6 +2575,28 @@ mod tests {
         assert_eq!(
             big_enot, big_plain,
             "large-magnitude double forms must agree"
+        );
+    }
+
+    #[test]
+    fn float_and_double_same_value_canonicalize_equal() {
+        // CRITICAL-3: the source renders a float column as xsd:float; the twin stores
+        // it as Double and exports xsd:double. Same value, different datatype IRI —
+        // one missing + one extra per triple, false-rejecting a correct twin. The
+        // canonicalizer folds float -> double so the two collapse.
+        let float_dt = "http://www.w3.org/2001/XMLSchema#float";
+        let double_dt = "http://www.w3.org/2001/XMLSchema#double";
+        let as_float = super::canonicalize_value_nt(&format!("<s> <p> \"1.5\"^^<{float_dt}> ."));
+        let as_double = super::canonicalize_value_nt(&format!("<s> <p> \"1.5\"^^<{double_dt}> ."));
+        assert_eq!(
+            as_float, as_double,
+            "a float and a double with the same value must canonicalize equal"
+        );
+        // The fold must NOT mask a genuine value difference.
+        let other = super::canonicalize_value_nt(&format!("<s> <p> \"1.6\"^^<{float_dt}> ."));
+        assert_ne!(
+            as_float, other,
+            "distinct float values must stay distinct after the fold"
         );
     }
 
