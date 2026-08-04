@@ -5,9 +5,12 @@
 -- trailing surrogate key for compare against these integer keys (the cq040 IRI-reduction
 -- convention). IS NOT NULL matches the SPARQL UNBOUND-omit (product_key is nullable, so an
 -- absent product triple drops the ticket -- an inner join on both keys). COUNT -> exact.
-SELECT customer_key AS c,
-       product_key  AS p,
-       COUNT(*)     AS n
+-- Reconstruct the entity IRIs (cq040 convention) so the checker reduces BOTH engines'
+-- keys to the same trailing-key token; a bare integer key would normalize as a number and
+-- mis-compare against Fluree's IRI. Subject templates come from enterprise-sf01-mapping.ttl.
+SELECT 'http://data.fluree.dev/edw/customer/' || customer_key AS c,
+       'http://data.fluree.dev/edw/product/'  || product_key  AS p,
+       COUNT(*)                                              AS n
 FROM {{fact_support_ticket}}
 WHERE customer_key IS NOT NULL
   AND product_key IS NOT NULL
