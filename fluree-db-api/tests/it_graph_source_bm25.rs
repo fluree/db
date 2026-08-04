@@ -1296,6 +1296,38 @@ fn graph_source_blob_count(storage_path: &str) -> usize {
     walk(&std::path::Path::new(storage_path).join(STORAGE_SEGMENT_GRAPH_SOURCES))
 }
 
+/// Overwrite a graph source's BM25 manifest with bytes that are not valid JSON,
+/// so loading it fails to deserialize. Returns how many blobs were rewritten.
+///
+/// The manifest is published as a `ContentKind::IndexRoot`, so it lives under
+/// `<graph source>/index/roots/*.fir6` rather than in the graph-sources segment
+/// alongside the snapshots it references.
+fn corrupt_bm25_manifest(storage_path: &str, graph_source_name: &str) -> usize {
+    fn walk(dir: &std::path::Path, graph_source_name: &str) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| {
+                let path = e.path();
+                if path.is_dir() {
+                    return walk(&path, graph_source_name);
+                }
+                let manifest = path.extension().is_some_and(|ext| ext == "fir6")
+                    && path.to_string_lossy().contains(graph_source_name);
+                if manifest {
+                    std::fs::write(&path, b"{ not json").map_or(0, |()| 1)
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    walk(std::path::Path::new(storage_path), graph_source_name)
+}
+
 /// The generic `drop_graph_source` — what `POST /drop` and `fluree drop` reach
 /// — must sweep BM25 snapshot blobs in `Hard` mode, not just retract the
 /// nameservice record. It used to delete only Iceberg mapping blobs, so a BM25
@@ -1350,6 +1382,67 @@ async fn drop_graph_source_deletes_bm25_snapshots() {
     assert!(
         graph_source_blob_count(&storage_path) < before,
         "hard drop must remove snapshot blobs from storage (was {before})"
+    );
+}
+
+/// Drop is the recovery action for a wedged graph source, so it has to work
+/// even when the snapshot sweep cannot. The manifest load used to propagate
+/// with `?`, returning before the retract below it — so a BM25 index whose
+/// manifest blob was unreadable could not be dropped at all through
+/// `POST /drop`, which is the one path an operator has left at that point.
+#[tokio::test]
+async fn drop_graph_source_retracts_when_the_bm25_manifest_is_unreadable() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let storage_path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&storage_path)
+        .build()
+        .expect("build file fluree");
+
+    let ledger_id = "bm25/wedged-drop:main";
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" }
+        ]
+    });
+    fluree.insert(ledger, &tx).await.expect("insert");
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("wedged-search", ledger_id, query))
+        .await
+        .expect("create index");
+    assert!(created.index_id.is_some(), "expected a persisted snapshot");
+
+    assert!(
+        corrupt_bm25_manifest(&storage_path, "wedged-search") > 0,
+        "test needs the manifest blob to corrupt"
+    );
+
+    let report = fluree
+        .drop_graph_source("wedged-search", None, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop must still succeed when the manifest cannot be read");
+
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("manifest unreadable")),
+        "the skipped sweep should be reported as a warning, got: {:?}",
+        report.warnings
+    );
+    assert!(
+        fluree.sync_bm25_index("wedged-search:main").await.is_err(),
+        "the index must be retracted despite the sweep being skipped"
     );
 }
 

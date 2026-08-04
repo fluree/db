@@ -1325,12 +1325,31 @@ impl crate::Fluree {
         if matches!(mode, DropMode::Hard) {
             if let Some(ref record) = record {
                 if matches!(record.source_type, GraphSourceType::Bm25) {
-                    let manifest = self.load_or_create_bm25_manifest(&graph_source_id).await?;
-                    let (deleted, warnings) = self
-                        .delete_bm25_snapshots(&graph_source_id, &manifest)
-                        .await;
-                    report.files_deleted += deleted;
-                    report.warnings.extend(warnings);
+                    match self.load_or_create_bm25_manifest(&graph_source_id).await {
+                        Ok(manifest) => {
+                            let (deleted, warnings) = self
+                                .delete_bm25_snapshots(&graph_source_id, &manifest)
+                                .await;
+                            report.files_deleted += deleted;
+                            report.warnings.extend(warnings);
+                        }
+                        // An unreadable manifest costs the sweep, not the drop.
+                        // The snapshots leak, which `delete_bm25_snapshots`
+                        // already treats as no reason to leave the record
+                        // published — and drop is the recovery action for a
+                        // graph source wedged in exactly this way, so failing it
+                        // closed would strand the caller with no way out.
+                        Err(e) => {
+                            warn!(
+                                graph_source = %graph_source_id,
+                                error = %e,
+                                "BM25 snapshot sweep skipped; manifest unreadable"
+                            );
+                            report.warnings.push(format!(
+                                "BM25 snapshot sweep skipped, manifest unreadable: {e}"
+                            ));
+                        }
+                    }
                 }
             }
         }
