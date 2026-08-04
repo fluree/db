@@ -800,6 +800,27 @@ fn vector_fold_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_VECTOR_FOLD"))
 }
 
+/// Rows per bounded output chunk when output-bounding is on (see `pending_rows`). A
+/// GROUP BY rollup with more groups than this emits multiple batches instead of one
+/// giant one, so a high-cardinality result never fully materializes at once.
+const OUTPUT_BOUND_ROWS: usize = 8192;
+
+/// Output-bounding kill switch (`FLUREE_FUSED_R2RML_OUTPUT_BOUND`, default **on**).
+/// Off restores the single-batch emission wholesale (byte-identical to pre-bounding:
+/// one batch, groups in dict/map iteration order). Read uncached under cfg(test) so
+/// the on/off differential is testable without an `OnceLock` caching the first value.
+fn output_bound_enabled() -> bool {
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND"))
+    }
+    #[cfg(test)]
+    {
+        crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND")
+    }
+}
+
 /// N1: a BORROWED view of one composite-group-key component, read straight from
 /// the scanned batch (or the resolver's owned dim GKeys) with no per-row `String`
 /// clone. A null component drops the row before it reaches the key (matching
@@ -1236,6 +1257,16 @@ pub struct FusedR2rmlAggregateOperator {
     use_fallback: bool,
     state: OperatorState,
     done: bool,
+    /// Output-bounding: after the one-shot scan+fold, a GROUP BY rollup's finalized
+    /// rows are emitted in bounded batches across `next_batch` calls rather than as one
+    /// giant batch — so a high-cardinality rollup (crt_highcard's 259k groups) never
+    /// materializes its whole output at once. Each chunk pops from the BACK (group
+    /// order is unspecified — a wrapping Sort applies any ORDER BY), so the drained
+    /// key + accumulators are freed incrementally, not held to the last row. `None`
+    /// until the fold completes and there is more than one bounded chunk to emit; when
+    /// the switch is off (or the result fits one chunk) the single-batch path is taken
+    /// and this stays `None`.
+    pending_rows: Option<Vec<(Vec<GKey>, Vec<Acc>)>>,
 }
 
 impl FusedR2rmlAggregateOperator {
@@ -1263,6 +1294,7 @@ impl FusedR2rmlAggregateOperator {
             use_fallback: false,
             state: OperatorState::Created,
             done: false,
+            pending_rows: None,
         }
     }
 
@@ -1520,6 +1552,43 @@ impl FusedR2rmlAggregateOperator {
             _ => None,
         }
     }
+
+    /// Output-bounding: emit the next bounded chunk of `pending_rows`, finalizing up to
+    /// `OUTPUT_BOUND_ROWS` groups per call. Rows are POPPED from the back, so each
+    /// group's key + accumulators are freed as it is finalized (peak output-side memory
+    /// = one chunk, not the whole result). Group order is unspecified (a wrapping Sort
+    /// applies any ORDER BY), so back-to-front drain is sound. Sets `done` once drained.
+    fn emit_pending_chunk(&mut self) -> Result<Option<Batch>> {
+        let resolved = self
+            .resolved
+            .as_ref()
+            .ok_or_else(|| QueryError::Internal("fused aggregate not resolved".to_string()))?;
+        let gcols = &resolved.group_cols;
+        let folds = &resolved.folds;
+        let num_cols = gcols.len() + folds.len();
+        let rows = self
+            .pending_rows
+            .as_mut()
+            .ok_or_else(|| QueryError::Internal("no pending fused output".to_string()))?;
+        let take = OUTPUT_BOUND_ROWS.min(rows.len());
+        let mut out: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::with_capacity(take)).collect();
+        for _ in 0..take {
+            let (key, accs) = rows.pop().expect("take <= rows.len()");
+            for (i, g) in gcols.iter().enumerate() {
+                out[i].push(g.binding(&key[i]));
+            }
+            for (j, acc) in accs.into_iter().enumerate() {
+                out[gcols.len() + j].push(acc.finalize());
+            }
+            // `key` + `accs` drop here — this group's memory is freed before the next.
+        }
+        if rows.is_empty() {
+            self.pending_rows = None;
+            self.done = true;
+            self.state = OperatorState::Exhausted;
+        }
+        Ok(Some(Batch::new(Arc::clone(&self.schema), out)?))
+    }
 }
 
 #[async_trait]
@@ -1554,6 +1623,11 @@ impl Operator for FusedR2rmlAggregateOperator {
         }
         if self.done || self.state == OperatorState::Exhausted {
             return Ok(None);
+        }
+        // Output-bounding: a prior call built the full rollup and emitted the first
+        // bounded chunk; this call emits the next one (freeing its rows) until drained.
+        if self.pending_rows.is_some() {
+            return self.emit_pending_chunk();
         }
         let resolved = self
             .resolved
@@ -1920,44 +1994,55 @@ impl Operator for FusedR2rmlAggregateOperator {
             return self.fallback.next_batch(ctx).await;
         }
 
-        let columns: Vec<Vec<Binding>> = if gcols.is_empty() {
-            implicit.into_iter().map(|a| vec![a.finalize()]).collect()
+        // An implicit aggregate is exactly one row — no output-bounding needed.
+        if gcols.is_empty() {
+            let columns: Vec<Vec<Binding>> =
+                implicit.into_iter().map(|a| vec![a.finalize()]).collect();
+            self.done = true;
+            self.state = OperatorState::Exhausted;
+            return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
+        }
+
+        // Collect the grouped rows into a drainable Vec (MOVE, no clone — GKeys and
+        // accumulators are moved out of the dict/map). Group iteration order is
+        // unspecified either way (a wrapping Sort applies any ORDER BY).
+        let rows: Vec<(Vec<GKey>, Vec<Acc>)> = if vfold {
+            dict.into_iter()
+                .map(|(key, id)| (key, std::mem::take(&mut group_accs[id as usize])))
+                .collect()
         } else {
-            // One output row per group: key bindings then aggregate bindings. Group
-            // iteration order is unspecified either way (a wrapping Sort applies any
-            // ORDER BY), so the vector-fold dict and the owned-key map emit the same
-            // rows, only possibly in a different pre-sort order.
+            groups.into_iter().collect()
+        };
+
+        if !output_bound_enabled() || rows.len() <= OUTPUT_BOUND_ROWS {
+            // Switch off, or the whole result fits one bounded chunk: emit a single
+            // batch. Byte-identical to the pre-bounding path (same rows, dict/map
+            // iteration order — no reordering, since nothing is popped).
             let num_cols = gcols.len() + folds.len();
             let mut out: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
-            let emit = |out: &mut Vec<Vec<Binding>>, key: Vec<GKey>, accs: Vec<Acc>| {
+            for (key, accs) in rows {
                 for (i, g) in gcols.iter().enumerate() {
                     out[i].push(g.binding(&key[i]));
                 }
                 for (j, acc) in accs.into_iter().enumerate() {
                     out[gcols.len() + j].push(acc.finalize());
                 }
-            };
-            if vfold {
-                for (key, id) in dict {
-                    let accs = std::mem::take(&mut group_accs[id as usize]);
-                    emit(&mut out, key, accs);
-                }
-            } else {
-                for (key, accs) in groups {
-                    emit(&mut out, key, accs);
-                }
             }
-            out
-        };
+            self.done = true;
+            self.state = OperatorState::Exhausted;
+            return Ok(Some(Batch::new(Arc::clone(&self.schema), out)?));
+        }
 
-        self.done = true;
-        self.state = OperatorState::Exhausted;
-        Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?))
+        // Output-bounding: stash the full rollup and emit the first bounded chunk;
+        // subsequent next_batch calls drain the rest (the top-of-method fast path).
+        self.pending_rows = Some(rows);
+        self.emit_pending_chunk()
     }
 
     fn close(&mut self) {
         self.fallback.close();
         self.resolved = None;
+        self.pending_rows = None;
         self.state = OperatorState::Closed;
     }
 }
@@ -5558,27 +5643,33 @@ mod tests {
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
         op.open(&ctx).await.expect("open");
-        let batch = op
-            .next_batch(&ctx)
-            .await
-            .expect("next_batch")
-            .expect("the fused ref-IRI GROUP BY must produce an output batch, not decline");
-        let n = batch.column(c).map(<[Binding]>::len).unwrap_or(0);
-        let mut out = Vec::with_capacity(n);
-        for row in 0..n {
-            let iri = match batch.get(row, c).expect("group-key binding") {
-                Binding::Iri(s) => s.to_string(),
-                other => panic!("a RefObjectMap group key MUST be an IRI term, got {other:?}"),
-            };
-            let count = match batch.get(row, cnt).expect("count binding") {
-                Binding::Lit {
-                    val: FlakeValue::Long(n),
-                    ..
-                } => *n,
-                other => panic!("COUNT must be an xsd:integer Long, got {other:?}"),
-            };
-            out.push((iri, count));
+        // Drain ALL output batches: output-bounding emits a high-cardinality rollup in
+        // bounded chunks across multiple next_batch calls, so a single-call consumer
+        // would see only the first chunk. (This also exercises the multi-batch drain.)
+        let mut out = Vec::new();
+        let mut got_batch = false;
+        while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+            got_batch = true;
+            let n = batch.column(c).map(<[Binding]>::len).unwrap_or(0);
+            for row in 0..n {
+                let iri = match batch.get(row, c).expect("group-key binding") {
+                    Binding::Iri(s) => s.to_string(),
+                    other => panic!("a RefObjectMap group key MUST be an IRI term, got {other:?}"),
+                };
+                let count = match batch.get(row, cnt).expect("count binding") {
+                    Binding::Lit {
+                        val: FlakeValue::Long(n),
+                        ..
+                    } => *n,
+                    other => panic!("COUNT must be an xsd:integer Long, got {other:?}"),
+                };
+                out.push((iri, count));
+            }
         }
+        assert!(
+            got_batch,
+            "the fused ref-IRI GROUP BY must produce output, not decline"
+        );
         out.sort();
         out
     }
@@ -6554,23 +6645,21 @@ mod tests {
             .expect("resolve must not error")
             .expect("crt_join_reorder must FUSE (not decline)");
         op.resolved = Some(resolved);
-        let batch = op
-            .next_batch(&ctx)
-            .await
-            .expect("next_batch")
-            .expect("an output batch");
         let (cat, u) = (VarId(12), VarId(20));
-        let n = batch.column(cat).map(<[Binding]>::len).unwrap_or(0);
-        let mut out = Vec::with_capacity(n);
-        for row in 0..n {
-            let c = match batch.get(row, cat).expect("cat binding") {
-                Binding::Lit {
-                    val: FlakeValue::String(s),
-                    ..
-                } => s.clone(),
-                other => panic!("category key must be an xsd:string literal, got {other:?}"),
-            };
-            out.push((c, batch.get(row, u).expect("sum binding").clone()));
+        // Drain all output batches (output-bounding may chunk the rollup).
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+            let n = batch.column(cat).map(<[Binding]>::len).unwrap_or(0);
+            for row in 0..n {
+                let c = match batch.get(row, cat).expect("cat binding") {
+                    Binding::Lit {
+                        val: FlakeValue::String(s),
+                        ..
+                    } => s.clone(),
+                    other => panic!("category key must be an xsd:string literal, got {other:?}"),
+                };
+                out.push((c, batch.get(row, u).expect("sum binding").clone()));
+            }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -6745,6 +6834,103 @@ mod tests {
                 ("Widgets".to_string(), dec(1250)), // 5.25 + 7.25 = 12.50
             ],
             "fused decimal SUM must be byte-identical to the exact i128 → BigDecimal finalize"
+        );
+    }
+
+    /// OUTPUT-BOUNDING: a high-cardinality GROUP BY (> OUTPUT_BOUND_ROWS groups) emits
+    /// in bounded chunks with the switch ON — multiple batches, each ≤ the bound, whose
+    /// union is the full result — and in a SINGLE batch with the switch OFF (the
+    /// byte-identical pre-bounding path). Same total either way. Single-table ref-IRI
+    /// GROUP BY (one order per customer → one group per customer).
+    #[tokio::test]
+    async fn p3_output_bounding_chunks_high_card_and_off_single_batch() {
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let n: i64 = OUTPUT_BOUND_ROWS as i64 + 500; // spills past one chunk
+        let mapping = order_customer_mapping("http://ex/cust/{CID}");
+        let mut b = std::collections::HashMap::new();
+        b.insert(
+            "order".to_string(),
+            vec![mk_batch(vec![
+                icol("OID", 1, (0..n).map(Some).collect()),
+                icol("CFK", 2, (0..n).map(Some).collect()),
+            ])],
+        );
+        b.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![icol("CID", 1, (0..n).map(Some).collect())])],
+        );
+        let (o, c, cnt) = (VarId(0), VarId(1), VarId(20));
+        let build_op = || {
+            let mut fact = R2rmlPattern::new("gs", o, Some(c));
+            fact.triples_map_iri = Some("#Order".to_string());
+            fact.predicate_filter = Some("http://ex/custRef".to_string());
+            let plan = FusedAggregatePlan {
+                graph_iri: Arc::from("gs"),
+                inner_patterns: vec![Pattern::R2rml(fact)],
+                filter: None,
+                agg_binds: vec![],
+                group_by: vec![c],
+                aggregates: vec![(cnt, AggregateFn::CountAll)],
+            };
+            FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()))
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+
+        // ON: multiple bounded chunks, each ≤ the bound, union == full result.
+        std::env::set_var("FLUREE_FUSED_R2RML_OUTPUT_BOUND", "1");
+        assert!(output_bound_enabled());
+        let prov_on = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches: b.clone(),
+        };
+        let ctx_on =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&prov_on, &prov_on);
+        let mut op_on = build_op();
+        op_on.open(&ctx_on).await.expect("open");
+        let (mut nbatch_on, mut total_on, mut max_chunk) = (0usize, 0usize, 0usize);
+        while let Some(batch) = op_on.next_batch(&ctx_on).await.expect("next_batch") {
+            let rows = batch.column(c).map(<[Binding]>::len).unwrap_or(0);
+            nbatch_on += 1;
+            total_on += rows;
+            max_chunk = max_chunk.max(rows);
+        }
+        assert!(
+            nbatch_on > 1,
+            "ON must chunk a >{OUTPUT_BOUND_ROWS}-group rollup into multiple batches (got {nbatch_on})"
+        );
+        assert!(
+            max_chunk <= OUTPUT_BOUND_ROWS,
+            "each output chunk must be ≤ OUTPUT_BOUND_ROWS (got {max_chunk})"
+        );
+        assert_eq!(
+            total_on, n as usize,
+            "ON must emit every group exactly once"
+        );
+
+        // OFF: exactly one batch (byte-identical pre-bounding emission), same total.
+        std::env::set_var("FLUREE_FUSED_R2RML_OUTPUT_BOUND", "0");
+        assert!(!output_bound_enabled());
+        let prov_off = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches: b,
+        };
+        let ctx_off =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&prov_off, &prov_off);
+        let mut op_off = build_op();
+        op_off.open(&ctx_off).await.expect("open");
+        let (mut nbatch_off, mut total_off) = (0usize, 0usize);
+        while let Some(batch) = op_off.next_batch(&ctx_off).await.expect("next_batch") {
+            nbatch_off += 1;
+            total_off += batch.column(c).map(<[Binding]>::len).unwrap_or(0);
+        }
+        std::env::remove_var("FLUREE_FUSED_R2RML_OUTPUT_BOUND");
+        assert_eq!(nbatch_off, 1, "OFF emits a single batch");
+        assert_eq!(
+            total_off, n as usize,
+            "OFF must emit every group exactly once"
         );
     }
 
