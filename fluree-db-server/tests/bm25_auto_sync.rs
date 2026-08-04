@@ -7,7 +7,7 @@
 //! own — plus the registration pass that `auto_register` alone does not cover.
 
 use fluree_db_api::{Bm25CreateConfig, Bm25MaintenanceWorker, Bm25WorkerConfig};
-use fluree_db_server::{AppState, ServerConfig, TelemetryConfig};
+use fluree_db_server::{indexes_to_auto_sync, AppState, ServerConfig, TelemetryConfig};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -180,10 +180,7 @@ async fn dropped_indexes_are_not_registered() {
         .all_graph_source_records()
         .await
         .expect("list graph sources");
-    let live: Vec<_> = records
-        .iter()
-        .filter(|gs| gs.is_bm25() && !gs.retracted)
-        .collect();
+    let live = indexes_to_auto_sync(&records);
 
     assert!(
         live.is_empty(),

@@ -55,7 +55,57 @@ pub use telemetry::{init_logging, shutdown_tracer, TelemetryConfig};
 
 use axum::Router;
 use fluree_db_api::{Bm25MaintenanceWorker, Bm25WorkerHandle, Fluree};
+use fluree_db_nameservice::GraphSourceRecord;
 use std::sync::Arc;
+
+/// Whether this process runs a Raft node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Consensus {
+    /// Raft is configured, so the leader watcher owns leader-only tasks.
+    Raft,
+    /// No consensus layer; this process owns its tasks outright.
+    Standalone,
+}
+
+/// Which part of the deployment runs the BM25 maintenance worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bm25WorkerOwner {
+    /// Nothing: `--bm25-auto-sync` is off.
+    Disabled,
+    /// Nothing on this server. A peer forwards its writes, so the commit
+    /// events that drive a sync are published on the transaction server's
+    /// event bus rather than this one.
+    PeerForwardsWrites,
+    /// The Raft leader watcher, which spawns the worker on election. A sync
+    /// proposes `PublishGraphSourceIndex`, so it must originate on the leader.
+    RaftLeader,
+    /// This server, for the life of `serve()`.
+    ThisServer,
+}
+
+/// Decide who runs the BM25 maintenance worker for this deployment.
+fn bm25_worker_owner(config: &ServerConfig, consensus: Consensus) -> Bm25WorkerOwner {
+    if !config.bm25_auto_sync {
+        Bm25WorkerOwner::Disabled
+    } else if config.server_role == ServerRole::Peer {
+        Bm25WorkerOwner::PeerForwardsWrites
+    } else if consensus == Consensus::Raft {
+        Bm25WorkerOwner::RaftLeader
+    } else {
+        Bm25WorkerOwner::ThisServer
+    }
+}
+
+/// Select the graph sources the startup registration pass hands to the worker.
+///
+/// Retracted indexes are left out: syncing one is refused, so registering it
+/// would only log a failed sync on every commit to its source ledger.
+pub fn indexes_to_auto_sync(records: &[GraphSourceRecord]) -> Vec<&GraphSourceRecord> {
+    records
+        .iter()
+        .filter(|gs| gs.is_bm25() && !gs.retracted)
+        .collect()
+}
 
 /// Build a BM25 maintenance worker seeded with the indexes that already exist.
 ///
@@ -69,10 +119,7 @@ async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25W
 
     match fluree.nameservice().all_graph_source_records().await {
         Ok(records) => {
-            let indexes: Vec<_> = records
-                .iter()
-                .filter(|gs| gs.is_bm25() && !gs.retracted)
-                .collect();
+            let indexes = indexes_to_auto_sync(&records);
             for gs in &indexes {
                 handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies);
             }
@@ -366,32 +413,30 @@ impl FlureeServer {
         let ledger_maintenance_task = self.state.fluree.spawn_maintenance();
 
         // BM25 auto-sync.
-        //
-        // Skipped in peer mode: a peer forwards writes to the transaction
-        // server, so the commit events that drive a sync are published on
-        // *that* node's event bus, not this one. Under Raft the leader watcher
-        // owns the worker instead, since a sync proposes
-        // `PublishGraphSourceIndex` and must originate on the leader.
         #[cfg(feature = "raft")]
-        let raft_owns_bm25_worker = self.state.raft.is_some();
-        #[cfg(not(feature = "raft"))]
-        let raft_owns_bm25_worker = false;
-
-        let bm25_auto_sync = if !self.state.config.bm25_auto_sync {
-            None
-        } else if self.state.config.server_role == ServerRole::Peer {
-            info!("BM25 auto-sync requested but does not run in peer mode");
-            None
-        } else if raft_owns_bm25_worker {
-            None
+        let consensus = if self.state.raft.is_some() {
+            Consensus::Raft
         } else {
-            let (worker, handle) = build_bm25_worker(Arc::clone(&self.state.fluree)).await;
-            tokio::spawn(async move {
-                if let Err(e) = worker.run().await {
-                    tracing::error!(error = %e, "BM25 maintenance worker exited");
-                }
-            });
-            Some(handle)
+            Consensus::Standalone
+        };
+        #[cfg(not(feature = "raft"))]
+        let consensus = Consensus::Standalone;
+
+        let bm25_auto_sync = match bm25_worker_owner(&self.state.config, consensus) {
+            Bm25WorkerOwner::Disabled | Bm25WorkerOwner::RaftLeader => None,
+            Bm25WorkerOwner::PeerForwardsWrites => {
+                info!("BM25 auto-sync requested but does not run in peer mode");
+                None
+            }
+            Bm25WorkerOwner::ThisServer => {
+                let (worker, handle) = build_bm25_worker(Arc::clone(&self.state.fluree)).await;
+                tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        tracing::error!(error = %e, "BM25 maintenance worker exited");
+                    }
+                });
+                Some(handle)
+            }
         };
 
         // Spawn the private Raft listener. Carries the inter-node
@@ -1078,5 +1123,112 @@ async fn release_one(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_nameservice::GraphSourceType;
+
+    fn auto_sync_config(server_role: ServerRole) -> ServerConfig {
+        ServerConfig {
+            bm25_auto_sync: true,
+            server_role,
+            ..ServerConfig::default()
+        }
+    }
+
+    fn record(name: &str, source_type: GraphSourceType) -> GraphSourceRecord {
+        GraphSourceRecord::new(
+            name,
+            "main",
+            source_type,
+            "{}",
+            vec!["docs:main".to_string()],
+        )
+    }
+
+    fn retracted(name: &str, source_type: GraphSourceType) -> GraphSourceRecord {
+        GraphSourceRecord {
+            retracted: true,
+            ..record(name, source_type)
+        }
+    }
+
+    #[test]
+    fn auto_sync_is_off_unless_the_flag_is_set() {
+        let config = ServerConfig::default();
+
+        assert!(!config.bm25_auto_sync, "the flag must default off");
+        assert_eq!(
+            bm25_worker_owner(&config, Consensus::Standalone),
+            Bm25WorkerOwner::Disabled
+        );
+    }
+
+    #[test]
+    fn the_flag_alone_runs_the_worker_on_this_server() {
+        assert_eq!(
+            bm25_worker_owner(
+                &auto_sync_config(ServerRole::Transaction),
+                Consensus::Standalone
+            ),
+            Bm25WorkerOwner::ThisServer
+        );
+    }
+
+    #[test]
+    fn a_peer_does_not_run_the_worker() {
+        assert_eq!(
+            bm25_worker_owner(&auto_sync_config(ServerRole::Peer), Consensus::Standalone),
+            Bm25WorkerOwner::PeerForwardsWrites
+        );
+    }
+
+    #[test]
+    fn raft_hands_the_worker_to_the_leader_watcher() {
+        assert_eq!(
+            bm25_worker_owner(&auto_sync_config(ServerRole::Transaction), Consensus::Raft),
+            Bm25WorkerOwner::RaftLeader
+        );
+    }
+
+    /// Peer mode wins over Raft: a peer has no commit events to act on at all,
+    /// so there is nothing for a leader watcher to own either.
+    #[test]
+    fn a_raft_peer_does_not_run_the_worker() {
+        assert_eq!(
+            bm25_worker_owner(&auto_sync_config(ServerRole::Peer), Consensus::Raft),
+            Bm25WorkerOwner::PeerForwardsWrites
+        );
+    }
+
+    #[test]
+    fn registration_selects_live_bm25_indexes() {
+        let records = vec![record("search", GraphSourceType::Bm25)];
+
+        let selected = indexes_to_auto_sync(&records);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].graph_source_id, "search:main");
+    }
+
+    #[test]
+    fn registration_skips_retracted_indexes() {
+        let records = vec![retracted("search", GraphSourceType::Bm25)];
+
+        assert!(indexes_to_auto_sync(&records).is_empty());
+    }
+
+    #[test]
+    fn registration_skips_other_graph_source_types() {
+        let records = vec![
+            record("vectors", GraphSourceType::Vector),
+            record("tables", GraphSourceType::Iceberg),
+            record("geo", GraphSourceType::Geo),
+        ];
+
+        assert!(indexes_to_auto_sync(&records).is_empty());
     }
 }
