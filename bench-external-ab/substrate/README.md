@@ -21,16 +21,27 @@ docker compose ps            # wait for minio healthy + rest up
 
 ## Load the tables
 
-Needs a python with `pyiceberg[s3fs]` + `pyarrow`. `SF_PARQUET_SRC` points at a directory of `<table>/data_0.parquet` (the SF0.1 generator output — 16 tables).
+Needs a python with `pyiceberg[s3fs]` + `pyarrow` (the Wave-B `transform` spec also wants `pyiceberg_core`). `SF_PARQUET_SRC` points at a directory of `<table>/data_0.parquet` — the SF0.1 generator output (16 tables). Reproduce it with the committed, deterministic generator in `datagen/` (see `datagen/README.md` for the row-count + sha256 manifest):
 
 ```sh
-# Unpartitioned wave-1 layout (one data file per table), namespace DW_SF01:
-SF_PARQUET_SRC=/path/to/output-sf01 python load_tables.py
+# Reproduce the SF0.1 substrate parquet:
+cd datagen && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python generate.py --scale-factor 0.1 --out ./output-sf01 --threads 1
+cd ..
 
-# Wave-B probe: ONE fact table PARTITIONED BY date, namespace DW_SF01_PART:
-SF_PARQUET_SRC=/path/to/output-sf01 PART_TABLE=fact_web_event PART_COL=EVENT_DATE \
-  PART_TRANSFORM=month python load_tables_partitioned.py
+# Unpartitioned wave-1 layout (one data file per table), namespace DW_SF01:
+SF_PARQUET_SRC=./datagen/output-sf01 python load_tables.py
+
+# Wave-B probe, identity-bucket layout (namespace DW_SF01_PART; no pyiceberg_core needed):
+SF_PARQUET_SRC=./datagen/output-sf01 PART_TABLE=fact_web_event PART_COL=EVENT_DATE \
+  PART_GRAIN=month python load_tables_partitioned.py
+
+# Wave-B probe, GENUINE month-transform layout (namespace DW_SF01_PART_T; spec month(EVENT_DATE)):
+SF_PARQUET_SRC=./datagen/output-sf01 PART_TABLE=fact_web_event PART_COL=EVENT_DATE \
+  PART_GRAIN=month PART_SPEC=transform python load_tables_partitioned.py
 ```
+
+`PART_GRAIN` (year|month|day) is the time grain; `PART_SPEC` selects an identity partition on a derived integer bucket (`derived`, default) or a genuine iceberg transform on the raw date column (`transform`).
 
 Tables are written with UPPERCASE identifiers (Snowflake folds identifiers uppercase; the shared R2RML mapping references `ORDER_KEY` etc.), so the SAME uppercase mapping works on substrate A and B. DuckDB is case-insensitive, so its SQL is unaffected.
 
@@ -40,12 +51,12 @@ Target `duckdb-iceberg-minio-sf01` in `../harness/targets.json`. It attaches the
 
 ## Fluree side
 
-Register the virtual graph source ONCE against the local catalog, then point a vbench/CLI target at it:
+The R2RML mapping both engines' Fluree leg reads is committed here as `enterprise-sf01-mapping.ttl` (the substrate contract: 16 TriplesMaps, `rr:tableName "DW_SF01.<TABLE>"`, surrogate-`*_KEY` subjects under `http://data.fluree.dev/edw/...`, the same UPPERCASE mapping working on substrate A and B). Register the virtual graph source ONCE against the local catalog, then point a vbench/CLI target at it:
 
 ```sh
 fluree iceberg map enterprise-sf01-b --mode rest \
   --catalog-uri http://127.0.0.1:8181 \
-  --r2rml <path-to-enterprise-sf01-mapping.ttl> \
+  --r2rml ./enterprise-sf01-mapping.ttl \
   --s3-endpoint http://127.0.0.1:9000 --s3-path-style --no-vended-credentials
 # AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin in env.
 ```
@@ -54,8 +65,14 @@ GOTCHAS (all solved): use `127.0.0.1`, NOT `localhost` (localhost resolves to IP
 
 ## Run a pair
 
+Correctness FIRST (PROTOCOL §6): a pair's timings only count after its results MATCH across engines. Run the gate before timing and require a PASS:
+
 ```sh
 cd ../harness
+python check_pair.py \
+  --pairs p1_count_fact,p2_category_rollup,p3_open_tickets_by_segment \
+  --duckdb-target duckdb-iceberg-minio-sf01 --fluree-target fluree-minio-sf01-main
+# only on all-PASS, time them:
 python run_pair.py \
   --pairs p1_count_fact,p2_category_rollup,p3_open_tickets_by_segment \
   --engines duckdb,fluree \
