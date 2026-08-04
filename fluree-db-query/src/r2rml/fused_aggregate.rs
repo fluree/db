@@ -2828,6 +2828,43 @@ impl FusedR2rmlAggregateOperator {
         Some(checks)
     }
 
+    /// P3: gather ALL of a semi-join chain pattern's folded constant-object
+    /// constraints — from `star_constraints` AND from a STANDALONE const-object
+    /// member (`predicate_filter` + `object_constant`). The distinction is
+    /// load-bearing: the rewrite folds a constant object into `star_constraints` only
+    /// when the subject ALSO has a var-object member (the group-key branch's terminal,
+    /// e.g. `?p category ?cat ; isCurrent true`); a subject with NO var-object member —
+    /// the semi-join terminal `?c segment "Enterprise"` — "stays a standalone scan"
+    /// (`rewrite.rs`), so its constraint is `predicate_filter`/`object_constant`, NOT
+    /// `star_constraints`. Reading only `star_constraints` there would leave the
+    /// membership UNFILTERED and admit every row (a silent SUM over-count). Declines
+    /// (`None`) if the standalone constraint's predicate is not a scalar-column
+    /// `PredicateObjectMap` — never silently ignored.
+    fn resolve_semijoin_pattern_constraints(
+        pattern: &R2rmlPattern,
+        tm: &TriplesMap,
+    ) -> Option<Vec<ResolvedConstraint>> {
+        let mut checks = Self::resolve_star_constraint_checks(pattern, tm)?;
+        if let (Some(pred), Some(constant)) = (
+            pattern.predicate_filter.as_deref(),
+            pattern.object_constant.as_ref(),
+        ) {
+            let pom = tm
+                .predicate_object_maps
+                .iter()
+                .find(|p| p.predicate_map.as_constant() == Some(pred))?;
+            if !matches!(pom.object_map, ObjectMap::Column { .. }) {
+                return None; // RefObjectMap / template constraint: cannot enforce as a scalar
+            }
+            checks.push(ResolvedConstraint {
+                pom: pom.clone(),
+                constant: constant.clone(),
+                canon: decimal_canonical_of(constant),
+            });
+        }
+        Some(checks)
+    }
+
     /// F1 (audit F-AUD-8, the q038 ungrouped/direct-path filtered-COUNT class — the
     /// 886×-PARTIAL residual): when a subject-star carries NO variable-object
     /// member, the R2RML rewrite does NOT fold its class + constant-object members
@@ -3742,7 +3779,13 @@ impl FusedR2rmlAggregateOperator {
         // declines the fuse — never silently dropped, so no over-admission).
         let mut chain_checks: Vec<Vec<ResolvedConstraint>> = Vec::with_capacity(m);
         for h in 0..m {
-            let Some(checks) = Self::resolve_star_constraint_checks(chain[h], chain_tms[h]) else {
+            // Gather star_constraints AND the standalone const-object form: the
+            // semi-join terminal's constraint (`?c segment "Enterprise"`) is emitted
+            // standalone by the rewrite, so reading only star_constraints would admit
+            // every row (silent over-count). Declines if a constraint can't resolve to
+            // a scalar column.
+            let Some(checks) = Self::resolve_semijoin_pattern_constraints(chain[h], chain_tms[h])
+            else {
                 return Ok(None);
             };
             chain_checks.push(checks);
@@ -6362,7 +6405,15 @@ mod tests {
     /// shape-anchor test): fact `?ol(0)` {quantity=?qty(10), order=?o(1),
     /// product=?p(2)}; `?o(1)` {customer=?c(3)}; `?c(3)` [segment="Enterprise"];
     /// `?p(2)` {category=?cat(12)} [isCurrent=true].
-    fn crt_patterns() -> [R2rmlPattern; 4] {
+    ///
+    /// `segment_star` selects how the semi-join terminal's constraint is represented,
+    /// so the OR gatherer (`resolve_semijoin_pattern_constraints`) is fixtured on BOTH
+    /// forms: `false` = the STANDALONE const-object scan (`predicate_filter` +
+    /// `object_constant`) the rewrite actually emits for a subject with no var-object
+    /// member (the live shape, and the regression guard for the over-count bug);
+    /// `true` = the FOLDED `star_constraints` form (what the rewrite emits when the
+    /// subject also has a var-object member).
+    fn crt_patterns(segment_star: bool) -> [R2rmlPattern; 4] {
         let (ol, o, c, p) = (VarId(0), VarId(1), VarId(3), VarId(2));
         let (qty, cat) = (VarId(10), VarId(12));
         let mut olp = R2rmlPattern::new("gs", ol, None);
@@ -6377,10 +6428,14 @@ mod tests {
         op_.star_bindings = vec![("http://ex/customer".into(), c)];
         let mut cp = R2rmlPattern::new("gs", c, None);
         cp.triples_map_iri = Some("#Customer".into());
-        cp.star_constraints = vec![(
-            "http://ex/segment".into(),
-            crate::r2rml::ObjectConstant::Scalar(crate::r2rml::ScanValue::Str("Enterprise".into())),
-        )];
+        let seg =
+            crate::r2rml::ObjectConstant::Scalar(crate::r2rml::ScanValue::Str("Enterprise".into()));
+        if segment_star {
+            cp.star_constraints = vec![("http://ex/segment".into(), seg)];
+        } else {
+            cp.predicate_filter = Some("http://ex/segment".into());
+            cp.object_constant = Some(seg);
+        }
         let mut pp = R2rmlPattern::new("gs", p, None);
         pp.triples_map_iri = Some("#Product".into());
         pp.star_bindings = vec![("http://ex/category".into(), cat)];
@@ -6476,10 +6531,11 @@ mod tests {
     async fn run_crt(
         mapping: Arc<CompiledR2rmlMapping>,
         batches: std::collections::HashMap<String, Vec<ColumnBatch>>,
+        segment_star: bool,
     ) -> Vec<(String, Binding)> {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::LedgerSnapshot;
-        let pats = crt_patterns();
+        let pats = crt_patterns(segment_star);
         let refs: Vec<&R2rmlPattern> = pats.iter().collect();
         let provider = CrtProvider {
             mapping: Arc::clone(&mapping),
@@ -6587,7 +6643,12 @@ mod tests {
     /// (SMB customer).
     #[tokio::test]
     async fn p3_crt_join_reorder_value_identity_integer() {
-        let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), clean_batches()).await;
+        let out = run_crt(
+            crt_mapping(fluree_vocab::xsd::INTEGER),
+            clean_batches(),
+            false,
+        )
+        .await;
         assert_eq!(
             out,
             vec![
@@ -6595,6 +6656,31 @@ mod tests {
                 ("Widgets".to_string(), long_sum(12)),
             ],
             "fused SUM must equal the generic chained-inner-join answer, byte-identical"
+        );
+    }
+
+    /// (a-star) The OR gatherer's OTHER arm: the same clean fixture with the semi-join
+    /// terminal's segment constraint in the FOLDED `star_constraints` form (what the
+    /// rewrite emits when the subject also has a var-object member). Same correct answer
+    /// as the standalone-const-object form above — so `resolve_semijoin_pattern_constraints`
+    /// is fixtured on BOTH forms (the const-object form is the live shape + the
+    /// discriminator's regression guard; this pins the star_constraints arm).
+    #[tokio::test]
+    async fn p3_crt_join_reorder_semijoin_constraint_star_constraints_form() {
+        let out = run_crt(
+            crt_mapping(fluree_vocab::xsd::INTEGER),
+            clean_batches(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            out,
+            vec![
+                ("Gadgets".to_string(), long_sum(3)),
+                ("Widgets".to_string(), long_sum(12)),
+            ],
+            "the folded star_constraints form of the semi-join filter must produce the \
+             same filtered answer as the standalone const-object form"
         );
     }
 
@@ -6651,7 +6737,7 @@ mod tests {
             }
             .finalize()
         };
-        let out = run_crt(crt_mapping(fluree_vocab::xsd::DECIMAL), b).await;
+        let out = run_crt(crt_mapping(fluree_vocab::xsd::DECIMAL), b, false).await;
         assert_eq!(
             out,
             vec![
@@ -6706,7 +6792,7 @@ mod tests {
                 bcol("IS_CURRENT", 3, vec![Some(true)]),
             ])],
         );
-        let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), m).await;
+        let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), m, false).await;
         assert!(
             out.is_empty(),
             "keep-min Order row is SMB → the line drops; filter-then-union would wrongly \
@@ -6754,7 +6840,7 @@ mod tests {
                 bcol("IS_CURRENT", 3, vec![Some(true)]),
             ])],
         );
-        let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), m).await;
+        let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), m, false).await;
         assert_eq!(
             out,
             vec![("Widgets".to_string(), long_sum(50))],
@@ -6787,7 +6873,7 @@ mod tests {
                 ]),
             ],
         );
-        let pats = crt_patterns();
+        let pats = crt_patterns(false);
         let refs: Vec<&R2rmlPattern> = pats.iter().collect();
         let provider = CrtProvider {
             mapping: Arc::clone(&mapping),
@@ -6822,7 +6908,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::LedgerSnapshot;
         let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
-        let pats = crt_patterns();
+        let pats = crt_patterns(false);
         let refs: Vec<&R2rmlPattern> = pats.iter().collect();
         let snapshot = LedgerSnapshot::genesis("test/main");
         let vars = VarRegistry::new();
