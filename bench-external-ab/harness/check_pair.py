@@ -4,8 +4,10 @@ the manifest's per-pair equivalence rule BEFORE any timing counts (PROTOCOL §6)
 only after it MATCHES here. Engine-specifics come from the adapters in engines/.
 
 Equivalence handling (PROTOCOL §7):
-  - int/string cells      : exact multiset compare
-  - double cells / SUM    : numeric compare with relative tolerance (float reassociation)
+  - exact gate            : int/string AND numeric cells compared for LITERAL equality (a
+                            COUNT off-by-one must fail, even a ≤1e-6-relative one at scale)
+  - tolerance gate        : numeric cells / double SUM compared with relative tolerance
+                            (float reassociation); non-numeric cells still literal
   - templated-IRI subject : reduced to its trailing integer key (so a Fluree IRI
                             http://data.fluree.dev/edw/store/3 compares to SQL store_key 3)
   - rows_only gate        : compare ROW COUNT only (unordered LIMIT)
@@ -76,12 +78,17 @@ def run_sparql(pair, tgt):
     return vars, rows
 
 
-def cmp_cell(a, b):
+def cmp_cell(a, b, numeric_exact):
+    """numeric_exact=True (the `exact` gate) requires literal equality even for numeric
+    cells; False (the `tolerance` gate) allows REL_TOL on numeric cells for float
+    reassociation. Non-numeric cells are always compared literally."""
     if a is None or b is None:
         return a == b
     if a[0] == "n" and b[0] == "n":
         if a[1] == b[1]:
             return True
+        if numeric_exact:
+            return False
         denom = max(abs(a[1]), abs(b[1]), 1e-12)
         return abs(a[1] - b[1]) / denom <= REL_TOL
     return a == b
@@ -101,10 +108,11 @@ def cmp_rows(dres, fres, gate):
     if len(dk) != len(fl):
         return False, "ROW COUNT d=%d f=%d" % (len(dk), len(fl))
     cols = sorted(set(dnames))  # align by NAME, order-independent
+    numeric_exact = gate != "tolerance"  # exact (and any non-tolerance) gate => literal numeric
     ds = sorted(dk, key=lambda r: _key(r, cols))
     fs = sorted(fl, key=lambda r: _key(r, cols))
     for i, (a, b) in enumerate(zip(ds, fs)):
-        if not all(cmp_cell(a.get(c), b.get(c)) for c in cols):
+        if not all(cmp_cell(a.get(c), b.get(c), numeric_exact) for c in cols):
             return False, "row %d mismatch: %r vs %r" % (i, {c: a.get(c) for c in cols}, {c: b.get(c) for c in cols})
     return True, "%d rows match" % len(dk)
 

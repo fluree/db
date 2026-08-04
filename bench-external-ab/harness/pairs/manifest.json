@@ -43,7 +43,7 @@
     },
     "crt_join_reorder": {
       "shape": "join", "gate": "exact", "sum_is_double": false,
-      "note": "RT: 4-table join with two selective dim filters (OrderLine->order->customer[Enterprise], OrderLine->product[current]). DuckDB's hash-join-reorder strength. SUM(quantity) integer."
+      "note": "RT: 4-table join with two selective dim filters (OrderLine->order->customer[Enterprise], OrderLine->product[current]). A hash-join-reorder decision. SUM(quantity) integer."
     },
     "crt_minmax": {
       "shape": "single_table", "gate": "tolerance", "sum_is_double": false,

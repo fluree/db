@@ -3,7 +3,7 @@
 This adapter invokes an INDEPENDENTLY INSTALLED DuckDB CLI binary as an external process,
 solely for comparative performance measurement. No DuckDB source code, binaries, extensions,
 or platform components are included in, linked into, distributed with, or incorporated into
-this repository or any Fluree product. DuckDB(R) is a trademark of its owner; references
+this repository or any Fluree product. DuckDB® is a trademark of its owner; references
 here are nominative. The binary path lives in targets.json and is a documented user install
 step (see ../../README.md / ../../substrate/README.md) — it is never auto-fetched by this
 code, never committed. This adapter only emits the engine's DOCUMENTED SQL/dot-command and

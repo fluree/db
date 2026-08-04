@@ -1,6 +1,6 @@
 # PROTOCOL — external-engine A/B (binding rules)
 
-> **NOTICE.** This benchmark harness invokes an independently installed DuckDB CLI binary as an external process, solely for comparative performance measurement. No DuckDB source code, binaries, extensions, or platform components are included in, linked into, distributed with, or incorporated into this repository or any Fluree product. DuckDB® is a trademark of its owner; references here are nominative — identifying the third-party product being measured — and imply no affiliation or endorsement. Version, configuration, and full protocol are disclosed for reproducibility.
+> **Notice**: This benchmark harness invokes an independently installed DuckDB CLI binary as an external process, solely for comparative performance measurement. No DuckDB source code, binaries, extensions, or platform components are included in, linked into, distributed with, or incorporated into this repository or any Fluree product. DuckDB® is a trademark of its owner; references here are nominative — identifying the third-party product being measured — and imply no affiliation or endorsement. Versions, configuration, and the full protocol are disclosed for reproducibility.
 
 This is the condensed, binding rule-set for the external-engine A/B program. It supersedes any looser wording elsewhere. The harness is engine-agnostic; external engines are adapters in `harness/engines/`. The first external engine measured is DuckDB. Formatting: one paragraph per line for clean diffs.
 
@@ -31,7 +31,7 @@ Equal numeric memory caps are NOT parity: DuckDB `memory_limit` is an allocator-
 
 ## 4. Timing boundary — full result consumption
 
-The timed region for BOTH engines runs from query submission to FULL consumption of all result rows. DuckDB: `.mode csv` + `.output <sink>` so every row is produced AND serialized inside the timed statement (no duckbox display truncation, no lazy Arrow handle); rows counted from the sink. Fluree: complete SPARQL-results-JSON serialization (or the CLI's full-result tally). Recorded as `timing_boundary="query_exec_serialize"` in every row. This matters because Fluree's headline cost IS per-row RDF-binding materialization; timing Fluree to fully-built bindings while DuckDB streams lazily would be undefined and asymmetric.
+The timed region for BOTH engines runs from query submission to FULL consumption of all result rows. DuckDB: `.mode csv` + `.output <sink>` so every row is produced AND serialized inside the timed statement (no duckbox display truncation, no lazy Arrow handle); rows counted from the sink. Fluree: complete SPARQL-results-JSON serialization (or the CLI's full-result tally). Recorded as `timing_boundary="query_exec_serialize"` in every row. This matters because Fluree's headline cost IS per-row RDF-binding materialization; timing Fluree to fully-built bindings while DuckDB streams lazily would be undefined and asymmetric. Both `wall_ms` values are ENGINE SELF-TIMERS — Fluree = the CLI's `(N rows, X ms)` tally through full JSON serialization; DuckDB = the `.timer` `real` line — so every row ALSO records the harness-measured `extra.proc_wall_ms` (whole-process wall) as an independent cross-check of the self-reported tally; where the two diverge materially, `proc_wall_ms` is the honest upper bound.
 
 ## 5. Substrate field discipline
 

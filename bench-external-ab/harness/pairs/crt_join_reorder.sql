@@ -1,5 +1,5 @@
 -- crt_join_reorder : 4-table join with two selective dim filters -> a real join-order
--- decision (DuckDB's public strength: hash joins with reordering). Shape blends q012+q008.
+-- decision (hash-join reordering). Shape blends q012+q008.
 -- SUM(quantity) is xsd:integer -> exact compare.
 SELECT p.category AS cat, SUM(ol.quantity) AS u
 FROM {{fact_order_line}} ol
