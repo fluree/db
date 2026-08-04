@@ -20,7 +20,7 @@ use fluree_db_api::materialize::{verify_twin, ParityReport, VerifyMode};
 // already depends on) — instead of a hard-copied literal that could silently drift
 // on a rename.
 use fluree_db_api::{
-    DropMode, Fluree, FlureeR2rmlProvider, NameServiceLookup, NsRecord, ALLOW_MOR_DELETES_ENV,
+    DropMode, Fluree, FlureeR2rmlProvider, NsRecord, ALLOW_MOR_DELETES_ENV,
 };
 
 use crate::cli::{MaterializeOutput, MaterializeVerify};
