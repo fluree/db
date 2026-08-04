@@ -1,6 +1,6 @@
-# RESULTS — external-engine A/B (Fluree vs DuckDB, the first external engine)
+# RESULTS — external-engine A/B (Fluree and DuckDB, the first external engine)
 
-All rows follow `PROTOCOL.md`. Substrate B (local MinIO + Iceberg REST fixture, unpartitioned SF0.1) is the engine-pure headline substrate; harness v0.3 (fresh-process/rep, peak RSS, full-result-drain); N=5, median of steady-state reps 2..N with rep1 (cold-catalog first touch) noted separately. DuckDB's comparable cold number is `wall + setup` (query + ATTACH/OAuth). Engines: DuckDB v1.5.5 (`arch -arm64`); Fluree shipped-main and Fluree-with-#1528 (filter-over-join fusion), git-commit-stamped per row. Formatting: one paragraph per line.
+All rows follow `PROTOCOL.md`. Every number below is a median (or DNF verdict) over committed raw per-run rows in `results/` — see `results/README.md` for the file-per-section map, and `summarize_ab.py` to re-derive any cell. Substrate B (local MinIO + Iceberg REST fixture, unpartitioned SF0.1) is the engine-pure headline substrate; harness v0.3 (fresh-process/rep, peak RSS, full-result-drain); N=5, median of steady-state reps 2..N with rep1 (cold-catalog first touch) noted separately. DuckDB's comparable cold number is `wall + setup` (query + ATTACH/OAuth). Engines: DuckDB v1.5.5 (`arch -arm64`); Fluree shipped-main and Fluree-with-#1528 (filter-over-join fusion), git-commit-stamped per row. Formatting: one paragraph per line.
 
 ## Pair legend
 
@@ -12,7 +12,7 @@ All rows follow `PROTOCOL.md`. Substrate B (local MinIO + Iceberg REST fixture, 
 
 ## Wave A — clean p1/p2 confirmation (substrate B, SF0.1)
 
-STATUS: DONE (2026-07-30, load1 7.7-9.0 across the three legs, stamped). p1/p2 re-run clean on substrate B — DuckDB + both Fluree binaries, both cache modes, N=5. These replace the load-contaminated baseline rows (kept below for the record). p3 is noise-immune (its fused-vs-declined delta is ~27-76x) and already stands from 2026-07-29.
+STATUS: DONE (2026-07-30, load1 7.7-9.0 across the three legs, stamped). p1/p2 re-run clean on substrate B — DuckDB + both Fluree binaries, both cache modes, N=5. These replace the load-contaminated baseline rows (kept below for the record). p3 is noise-immune (its fused-vs-declined delta is ~27-76x) and already stands from 2026-07-29. Raw: `results/waveA.jsonl` (clean p1/p2); the 2026-07-29 baseline four-way (incl. the standing p3) is `results/{substrate_b_cold,substrate_b_warm,main_ab,1528_ab}.jsonl`.
 
 ### Wave A clean rows (2026-07-30) — median of steady-state reps 2..5 / peak RSS
 
@@ -85,7 +85,7 @@ FINDING 2 (bloom-filter JOIN gap) → **NOT tied to the partitioned multi-file l
 
 ## Wave C — pair-set widening (the core)
 
-STATUS: DONE (2026-07-30). Correctness gate PASSES all 10 pairs; then the full timed set on an UNCONTESTED cloud host (see host identity). Cold is the primary mode (fresh process/rep); warm is the reused-disk-cache secondary. N=5 (median of steady-state reps 2..5). DuckDB shown as `wall+setup`. Both Fluree binaries git-commit-stamped. Raw: `harness/out/waveC_ec2.jsonl` (250 rows = 50 DuckDB-cold + 100 fluree-main + 100 fluree-#1528; DuckDB has no separate cross-process warm mode, so 250 is the full count).
+STATUS: DONE (2026-07-30). Correctness gate PASSES all 10 pairs; then the full timed set on an UNCONTESTED cloud host (see host identity). Cold is the primary mode (fresh process/rep); warm is the reused-disk-cache secondary. N=5 (median of steady-state reps 2..5). DuckDB shown as `wall+setup`. Both Fluree binaries git-commit-stamped. Raw: `results/waveC_ec2.jsonl` (250 rows = 50 DuckDB-cold + 100 fluree-main + 100 fluree-#1528; DuckDB has no separate cross-process warm mode, so 250 is the full count).
 
 ### Host identity (Wave C primary)
 
@@ -128,13 +128,13 @@ Where Fluree LEADS: none cold on this uncontested host — DuckDB leads or ties 
 
 ### Secondary: local-host (contended) legs — SUPERSEDED, not mixed
 
-An earlier partial Wave C ran on the local macOS host under heavy sibling load (load1 30–146), which inflated absolute ms; those rows are NOT merged into the table above. Directionally they agreed with the uncontested EC2 numbers: cq038 ~54 s shipped / crt_join_reorder ~90 s shipped, #1528 fixing cq038 (~0.45 s) and cq016, not fixing crt_join_reorder. The EC2 uncontested run is authoritative; the contended local rows are retained only as `harness/out/waveC_{main,1528}.jsonl` provenance.
+An earlier partial Wave C ran on the local macOS host under heavy sibling load (load1 30–146), which inflated absolute ms; those rows are NOT merged into the table above. Directionally they agreed with the uncontested EC2 numbers: cq038 ~54 s shipped / crt_join_reorder ~90 s shipped, #1528 fixing cq038 (~0.45 s) and cq016, not fixing crt_join_reorder. The EC2 uncontested run is authoritative; the contended local rows are retained only as `results/waveC_{main,1528}.jsonl` provenance.
 
 ---
 
 ## Wave D — scale-up (SF=1, ~27.5M fact rows)
 
-STATUS: DONE (2026-07-30). SF=1 generated on the same uncontested `c7g.4xlarge` (host identity as Wave C; DuckDB v1.5.5 `d8cdaa33fd`, fluree `5598ffd6a` + `c81862d2a`), loaded into MinIO namespace DW_SF1, unpartitioned. Fact magnitudes: FACT_WEB_EVENT 10,000,000; FACT_ORDER_LINE 6,000,000; FACT_INVENTORY 3,000,000; FACT_GL 2,500,000; FACT_PAYMENT 2,000,000; FACT_ORDER 1,800,000; FACT_SHIPMENT 1,800,000; FACT_SUPPORT_TICKET 400,000 (~27.5M fact rows total; 10× SF0.1). Raw: `harness/out/waveD_ec2.jsonl`.
+STATUS: DONE (2026-07-30). SF=1 generated on the same uncontested `c7g.4xlarge` (host identity as Wave C; DuckDB v1.5.5 `d8cdaa33fd`, fluree `5598ffd6a` + `c81862d2a`), loaded into MinIO namespace DW_SF1, unpartitioned. Fact magnitudes: FACT_WEB_EVENT 10,000,000; FACT_ORDER_LINE 6,000,000; FACT_INVENTORY 3,000,000; FACT_GL 2,500,000; FACT_PAYMENT 2,000,000; FACT_ORDER 1,800,000; FACT_SHIPMENT 1,800,000; FACT_SUPPORT_TICKET 400,000 (~27.5M fact rows total; 10× SF0.1). Raw: `results/waveD_ec2.jsonl`.
 
 ### Row accounting (153 rows vs Wave C's 250 — by design, to bound instance-hours)
 

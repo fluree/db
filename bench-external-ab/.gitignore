@@ -1,4 +1,6 @@
-# Generated run artifacts (raw JSONL lives in the local working set; RESULTS.md is the committed summary)
+# Scratch/regenerated run artifacts. The raw JSONL behind every published RESULTS.md
+# number is copied into the tracked results/ dir (see results/README.md); harness/out/
+# stays ignored for local re-runs.
 harness/out/
 __pycache__/
 *.pyc
