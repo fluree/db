@@ -66,8 +66,9 @@ use crate::graph_source::FlureeR2rmlProvider;
 use crate::{ApiError, Fluree, Result};
 // `StreamExt::next` — the scan is consumed as a stream so the whole table is never
 // resident; see the note at the `scan_for_materialize_stream` call site.
+use crate::LedgerState;
 use futures::StreamExt;
-use tracing::info;
+use tracing::{info, warn};
 
 /// The shared ledger that holds materialization job watermarks (last materialized
 /// source snapshot id per `(source, target-spec, table)`), for EVERY job — plain
@@ -447,12 +448,19 @@ impl Fluree {
                     if iris.is_empty() {
                         continue;
                     }
-                    for chunk in chunk_iris_by_size(iris, txn_budget) {
-                        ledger = self
-                            .update(ledger, &build_retract_doc(&chunk, graph.as_deref()))
-                            .await?
-                            .ledger;
-                    }
+                    let iri_chunks: Vec<Vec<String>> = chunk_iris_by_size(iris, txn_budget)
+                        .into_iter()
+                        .map(|c| c.into_iter().collect())
+                        .collect();
+                    let g = graph.clone();
+                    ledger = self
+                        .transact_chunks_with_backpressure(
+                            ledger,
+                            iri_chunks,
+                            move |c: &[String]| build_retract_doc(c, g.as_deref()),
+                            ChunkVerb::Update,
+                        )
+                        .await?;
                 }
             }
 
@@ -475,9 +483,14 @@ impl Fluree {
                 // Chunked: one window used to be one transaction, which a wide
                 // source cannot fit under the novelty ceiling at any window size
                 // (see `transaction_json_budget`).
-                for chunk in chunk_nodes_by_size(live_doc, txn_budget) {
-                    ledger = self.upsert(ledger, &JsonValue::Array(chunk)).await?.ledger;
-                }
+                ledger = self
+                    .transact_chunks_with_backpressure(
+                        ledger,
+                        chunk_nodes_by_size(live_doc, txn_budget),
+                        |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+                        ChunkVerb::Upsert,
+                    )
+                    .await?;
             } else {
                 // Additive mode: assert `@type` via an idempotent `insert` so
                 // classes UNION across sources, and `upsert` only the remaining
@@ -496,9 +509,14 @@ impl Fluree {
                     }
                 }
                 let type_doc = nodes_by_graph_to_doc(type_by_graph);
-                for chunk in chunk_nodes_by_size(type_doc, txn_budget) {
-                    ledger = self.insert(ledger, &JsonValue::Array(chunk)).await?.ledger;
-                }
+                ledger = self
+                    .transact_chunks_with_backpressure(
+                        ledger,
+                        chunk_nodes_by_size(type_doc, txn_budget),
+                        |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+                        ChunkVerb::Insert,
+                    )
+                    .await?;
                 // A type-only source (e.g. an r2rml `entity_type` map: subject +
                 // rdf:type, no other predicates) leaves `pred_by_graph` empty, so
                 // the doc is `[]`; skip the upsert rather than send an empty doc.
@@ -507,10 +525,22 @@ impl Fluree {
                 // its watermark advances — so the next poll full-rescans and
                 // re-fails forever (churn: a new @type-insert commit every poll).
                 let pred_doc = nodes_by_graph_to_doc(pred_by_graph);
-                for chunk in chunk_nodes_by_size(pred_doc, txn_budget) {
-                    ledger = self.upsert(ledger, &JsonValue::Array(chunk)).await?.ledger;
-                }
+                ledger = self
+                    .transact_chunks_with_backpressure(
+                        ledger,
+                        chunk_nodes_by_size(pred_doc, txn_budget),
+                        |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+                        ChunkVerb::Upsert,
+                    )
+                    .await?;
             }
+
+            // `ledger` is a PER-TARGET handle and its final state is deliberately not
+            // carried past this point: the watermark commit below writes to the shared
+            // STATE ledger, not to this target. Dropped explicitly so the last
+            // assignment above is a use — otherwise it reads as dead code, and the
+            // next person to add a step after it would have to rediscover why.
+            drop(ledger);
         }
 
         // 5. Advance the job watermark(s) in the shared state ledger — AFTER every
@@ -908,7 +938,161 @@ impl MaterializeAccum {
 /// `?s ?p ?o` binds and deletes only that graph's flakes. `None` retracts in the
 /// default graph. This keeps a subject's statements in graph A untouched when its
 /// same-IRI twin in graph B is replaced.
-fn build_retract_doc(iris: &BTreeSet<String>, graph: Option<&str>) -> JsonValue {
+/// Which transaction verb a materialize chunk is applied with. All three share the
+/// shape `(LedgerState, &JsonValue) -> Result<TransactResult>`, which is what lets
+/// [`Fluree::transact_chunks_with_backpressure`] be verb-agnostic.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ChunkVerb {
+    /// Idempotent `@type` assertion (classes UNION across sources).
+    Insert,
+    /// Per-predicate upsert, or whole-subject replace under latest-by-key.
+    Upsert,
+    /// The graph-scoped retract that precedes a latest-by-key re-assert.
+    Update,
+}
+
+impl Fluree {
+    /// Apply pre-sized chunks as transactions, **absorbing novelty backpressure**
+    /// instead of failing the whole materialize on it.
+    ///
+    /// `TransactError::NoveltyWouldExceed` is not a validation failure. It is the
+    /// transactor saying "novelty is too full *right now*" — a transient, retryable
+    /// condition. Treating it as fatal is what made a single wide source
+    /// permanently unsyncable:
+    ///
+    ///   chunk 1..N-1 commit and fill novelty -> the indexer cannot drain it fast
+    ///   enough -> chunk N is rejected -> the whole materialize errors -> the
+    ///   watermark never advances -> the next poll re-reads the entire source and
+    ///   fails at the same place, forever.
+    ///
+    /// Measured on `silver.observation`: `current=53024023 delta=17701872
+    /// max=67108864` on every attempt. Note `current` sat at **79% of the ceiling
+    /// and never fell**, which disproves the assumption the chunk budget was built
+    /// on (that "the indexer drains novelty between chunks"). Note also that a
+    /// 16.7 MB JSON chunk yielded 17.7 MB of flakes — so the `/4` margin, justified
+    /// by JSON running "several times larger than the flakes it yields", is
+    /// *inverted* for this table.
+    ///
+    /// **Both of those are predictions about data, and both were wrong. So this does
+    /// not predict — it reacts:**
+    ///
+    /// - **Too big for the headroom left?** Split the chunk in half and retry. This
+    ///   needs no knowledge of the JSON->flake ratio, because the rejection itself
+    ///   supplies the information.
+    /// - **Novelty too full even for one node?** Splitting cannot help, so wait for
+    ///   the indexer to drain and retry, bounded.
+    ///
+    /// Why not just raise `reindex_max_bytes`: `txn_budget` is derived from it
+    /// (`/4`), so doubling the ceiling doubles the chunk. The failing ratio was
+    /// `current/max = 79%` against a 26% chunk; at 2x you get the same wall further
+    /// out. That lever cannot fix this shape.
+    async fn transact_chunks_with_backpressure<T, B>(
+        &self,
+        mut ledger: LedgerState,
+        chunks: Vec<Vec<T>>,
+        build: B,
+        verb: ChunkVerb,
+    ) -> Result<LedgerState>
+    where
+        B: Fn(&[T]) -> JsonValue,
+    {
+        /// Consecutive waits allowed for one indivisible chunk before giving up.
+        /// Bounded so a genuinely wedged indexer still surfaces as an error rather
+        /// than hanging the worker forever.
+        const MAX_DRAIN_WAITS: usize = 12;
+        const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        // A stack, because a rejected chunk is pushed back as two halves and both
+        // must be applied before moving on — order within a chunk list does not
+        // matter (insert/upsert are per-subject and idempotent), but completeness
+        // does.
+        let mut pending: Vec<Vec<T>> = chunks.into_iter().filter(|c| !c.is_empty()).rev().collect();
+        let mut drain_waits = 0usize;
+
+        while let Some(chunk) = pending.pop() {
+            let doc = build(&chunk);
+            let result = match verb {
+                ChunkVerb::Insert => self.insert(ledger.clone(), &doc).await,
+                ChunkVerb::Upsert => self.upsert(ledger.clone(), &doc).await,
+                ChunkVerb::Update => self.update(ledger.clone(), &doc).await,
+            };
+            match result {
+                Ok(r) => {
+                    ledger = r.ledger;
+                    // Progress resets the budget: a wait that let one chunk through
+                    // has done its job, and the next chunk deserves a full budget.
+                    drain_waits = 0;
+                }
+                Err(ApiError::Transact(
+                    fluree_db_transact::TransactError::NoveltyWouldExceed {
+                        current_bytes,
+                        delta_bytes,
+                        max_bytes,
+                    },
+                )) => {
+                    if chunk.len() > 1 {
+                        // Split and retry. Cheap, immediate, and needs no guess
+                        // about how JSON bytes map to flake bytes.
+                        let (left, right) = split_in_half(chunk);
+                        info!(
+                            items = left.len() + right.len(),
+                            current_bytes,
+                            delta_bytes,
+                            max_bytes,
+                            "materialize: novelty backpressure, splitting chunk"
+                        );
+                        pending.push(right);
+                        pending.push(left);
+                    } else {
+                        // Indivisible and still rejected: novelty itself is too
+                        // full. Only the indexer can fix that, so wait for it.
+                        if drain_waits >= MAX_DRAIN_WAITS {
+                            return Err(ApiError::Internal(format!(
+                                "materialize: novelty still full after {} waits                                  ({}s) for a single-node transaction                                  (current={current_bytes} delta={delta_bytes}                                  max={max_bytes}). The indexer is not draining                                  novelty; check for a wedged or failing index build.",
+                                MAX_DRAIN_WAITS,
+                                MAX_DRAIN_WAITS * DRAIN_WAIT.as_secs() as usize,
+                            )));
+                        }
+                        drain_waits += 1;
+                        warn!(
+                            attempt = drain_waits,
+                            max_attempts = MAX_DRAIN_WAITS,
+                            current_bytes,
+                            delta_bytes,
+                            max_bytes,
+                            "materialize: novelty full for an indivisible chunk,                              waiting for the indexer to drain"
+                        );
+                        tokio::time::sleep(DRAIN_WAIT).await;
+                        pending.push(chunk);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(ledger)
+    }
+}
+
+/// Split a chunk into two non-empty halves.
+///
+/// **Both halves MUST be non-empty.** An empty half is not a cosmetic problem: the
+/// backpressure loop pushes both halves back onto its pending stack, so an empty one
+/// would either be re-applied forever (never shrinking, never completing) or, if
+/// filtered, silently drop the items in it. Callers guarantee `len >= 2`, which makes
+/// `len / 2 >= 1` and both sides non-empty; this asserts that contract rather than
+/// trusting it.
+fn split_in_half<T>(chunk: Vec<T>) -> (Vec<T>, Vec<T>) {
+    debug_assert!(
+        chunk.len() >= 2,
+        "split_in_half needs at least 2 items; the caller must handle indivisible chunks"
+    );
+    let mid = (chunk.len() / 2).max(1);
+    let mut left = chunk;
+    let right = left.split_off(mid);
+    (left, right)
+}
+
+fn build_retract_doc(iris: &[String], graph: Option<&str>) -> JsonValue {
     let rows: Vec<JsonValue> = iris
         .iter()
         .map(|iri| JsonValue::Array(vec![json!({ "@type": "@id", "@value": iri })]))
@@ -1308,6 +1492,99 @@ mod tests {
     }
     /// Fixed target ledger for accumulator tests that don't exercise fan-out.
     const TGT: &str = "t:main";
+
+    /// Every split must yield two NON-EMPTY halves. An empty half would make the
+    /// backpressure loop either spin forever on an unshrinking chunk or drop the
+    /// items in the empty one — so this is a data-loss guard, not a tidiness check.
+    #[test]
+    fn split_in_half_never_produces_an_empty_side() {
+        for n in 2..=33usize {
+            let (l, r) = split_in_half((0..n).collect::<Vec<_>>());
+            assert!(
+                !l.is_empty() && !r.is_empty(),
+                "n={n} produced an empty half"
+            );
+            assert_eq!(l.len() + r.len(), n, "n={n} lost or duplicated items");
+            // Concatenation must be the original sequence: the loop relies on the
+            // two halves together covering exactly the chunk it rejected.
+            let mut back = l;
+            back.extend(r);
+            assert_eq!(back, (0..n).collect::<Vec<_>>(), "n={n} reordered items");
+        }
+    }
+
+    /// The smallest divisible chunk is the dangerous one: `len / 2` is 1, and an
+    /// off-by-one here yields `(0, 2)` — an empty half and an unshrunk chunk, i.e.
+    /// an infinite loop.
+    #[test]
+    fn split_in_half_of_two_gives_one_and_one() {
+        let (l, r) = split_in_half(vec!["a", "b"]);
+        assert_eq!(
+            (l.as_slice(), r.as_slice()),
+            (["a"].as_slice(), ["b"].as_slice())
+        );
+    }
+
+    /// Repeated splitting must converge to single items with nothing lost — the
+    /// property the backpressure loop depends on when novelty headroom is tiny and
+    /// a chunk is halved several times.
+    #[test]
+    fn repeated_splitting_converges_without_losing_items() {
+        let mut pending: Vec<Vec<usize>> = vec![(0..17).collect()];
+        let mut applied: Vec<usize> = Vec::new();
+        let mut guard = 0;
+        while let Some(c) = pending.pop() {
+            guard += 1;
+            assert!(guard < 1000, "did not converge");
+            if c.len() > 1 {
+                let (l, r) = split_in_half(c);
+                pending.push(r);
+                pending.push(l);
+            } else {
+                applied.extend(c);
+            }
+        }
+        applied.sort_unstable();
+        assert_eq!(applied, (0..17).collect::<Vec<_>>());
+    }
+
+    /// The retract path now hands `Vec<String>` to `build_retract_doc` (it took a
+    /// `&BTreeSet` before) so chunks can be split. Converting must preserve every
+    /// IRI — dropping one would silently skip a retraction, leaving stale data.
+    #[test]
+    fn iri_chunks_convert_to_vecs_without_losing_iris() {
+        let iris: BTreeSet<String> = (0..50).map(|i| format!("http://ex/{i}")).collect();
+        let chunks: Vec<Vec<String>> = chunk_iris_by_size(&iris, 200)
+            .into_iter()
+            .map(|c| c.into_iter().collect())
+            .collect();
+        assert!(
+            chunks.len() > 1,
+            "budget must actually split, or this proves nothing"
+        );
+        let mut flat: Vec<String> = chunks.into_iter().flatten().collect();
+        flat.sort();
+        let mut expected: Vec<String> = iris.into_iter().collect();
+        expected.sort();
+        assert_eq!(flat, expected);
+    }
+
+    /// `build_retract_doc` takes a slice now; it must still emit one `values` row
+    /// per IRI and carry the graph selector.
+    #[test]
+    fn build_retract_doc_accepts_a_slice() {
+        let doc = build_retract_doc(
+            &["http://ex/a".to_string(), "http://ex/b".to_string()],
+            Some("g:1"),
+        );
+        let rows = doc["values"][1].as_array().expect("values rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(doc["where"]["@id"], "?s");
+        assert!(
+            doc.to_string().contains("g:1"),
+            "graph selector must survive: {doc}"
+        );
+    }
     /// Default-graph key `(target, graph, subject)` for map/set assertions.
     fn dk(iri: &str) -> (String, Option<String>, String) {
         (TGT.to_string(), None, iri.to_string())
@@ -1438,10 +1715,11 @@ mod tests {
 
     #[test]
     fn build_retract_doc_shape() {
-        let mut set = BTreeSet::new();
-        set.insert("urn:a".to_string());
-        set.insert("urn:b".to_string());
-        let doc = build_retract_doc(&set, None);
+        // Still fed from a BTreeSet in production (so still sorted), but passed as
+        // a slice now — the backpressure loop must be able to split a chunk.
+        let set: BTreeSet<String> = ["urn:a".to_string(), "urn:b".to_string()].into();
+        let iris: Vec<String> = set.into_iter().collect();
+        let doc = build_retract_doc(&iris, None);
         // Subjects MUST be typed @id values, not bare strings (a bare string
         // parses to a literal that never joins a real subject Sid). BTreeSet
         // => sorted order.
@@ -1461,9 +1739,7 @@ mod tests {
 
     #[test]
     fn build_retract_doc_scopes_to_named_graph() {
-        let mut set = BTreeSet::new();
-        set.insert("urn:a".to_string());
-        let doc = build_retract_doc(&set, Some("urn:g:tenant/user"));
+        let doc = build_retract_doc(&["urn:a".to_string()], Some("urn:g:tenant/user"));
         // The `graph` key scopes the whole-subject retract to that named graph
         // (WHERE + DELETE), so a same-IRI twin in another graph is untouched.
         assert_eq!(doc["graph"], json!("urn:g:tenant/user"));
