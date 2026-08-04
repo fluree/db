@@ -44,6 +44,7 @@
   - [mcp](cli/mcp.md)
   - [docs](cli/docs.md)
   - [iceberg](cli/iceberg.md)
+  - [bm25](cli/bm25.md)
   - [materialize](cli/materialize.md)
   - [completions](cli/completions.md)
 

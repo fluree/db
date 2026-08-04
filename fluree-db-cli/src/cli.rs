@@ -402,13 +402,13 @@ pub enum Commands {
 
     /// Create, list, sync, or drop BM25 full-text search indexes (graph sources).
     ///
-    /// BM25 index creation has no HTTP endpoint today — it is a Rust-API-only
-    /// operation (`Bm25CreateConfig` + `create_full_text_index`). These commands
-    /// expose it: they run in-process against local storage (no server
-    /// round-trip), so they work under `docker exec` against a running server's
-    /// data directory. Querying the resulting index is done either through the
-    /// standalone `fluree-search-httpd` service (`POST /v1/search`) or, embedded,
-    /// via an FQL `f:searchText` query.
+    /// These commands run against a server when one is reachable — `--remote
+    /// <name>` picks a configured remote, and otherwise a locally-running server
+    /// is used automatically. Pass `--direct` to force in-process execution
+    /// against local storage, which also works under `docker exec` against a
+    /// running server's data directory. Querying the resulting index is done
+    /// either through the standalone `fluree-search-httpd` service
+    /// (`POST /v1/search`) or, embedded, via an FQL `f:searchText` query.
     ///
     /// Examples:
     ///   fluree bm25 create --name silver-search --ledger silver:main -f index-query.json
@@ -1299,6 +1299,10 @@ pub enum Bm25Action {
         /// BM25 b (document-length normalization, 0..=1). Default 0.75.
         #[arg(long)]
         b: Option<f64>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Drop (retract) a BM25 full-text index and delete its snapshots.
@@ -1310,6 +1314,10 @@ pub enum Bm25Action {
         /// Required flag to confirm deletion
         #[arg(long)]
         force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Sync a BM25 full-text index up to its source ledger's latest state.
@@ -1318,13 +1326,20 @@ pub enum Bm25Action {
     /// the index's stored watermark — falling back to a full rebuild if needed.
     /// A no-op when the index is already current. Run this from a maintenance
     /// job (once per index) to keep search fresh as the source ledger is
-    /// materialized/updated; it runs in-process against local storage, so it
-    /// works under `docker exec` against a running server's data directory
-    /// (same as `create`/`drop`).
+    /// materialized/updated — or start the server with `--bm25-auto-sync` to
+    /// have it sync on every source commit.
     Sync {
         /// Index graph-source alias to sync (e.g. "silver-search:main").
         #[arg(long)]
         index: String,
+
+        /// Sync through this source-ledger `t` instead of the source's head.
+        #[arg(long)]
+        t: Option<i64>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// List BM25 full-text indexes with their source ledger and staleness.
@@ -1339,6 +1354,10 @@ pub enum Bm25Action {
         /// Print only stale indexes, one alias per line (script-friendly).
         #[arg(long)]
         stale: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 

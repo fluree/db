@@ -2,6 +2,7 @@
 
 mod admin;
 pub(crate) mod admin_auth;
+mod bm25;
 mod commits;
 mod context;
 mod events;
@@ -86,6 +87,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/rebase", post(ledger::rebase))
         .route("/merge", post(ledger::merge))
         .route("/revert", post(ledger::revert))
+        // BM25 full-text index creation and sync. Both publish through
+        // `GraphSourcePublisher`, which under Raft proposes
+        // `PublishGraphSource` / `PublishGraphSourceIndex` — so they have to
+        // originate on the leader. Listing, inspection, and drop reuse the
+        // graph-source fallbacks in `/ledgers`, `/info`, and `/drop`.
+        .route("/bm25/create", post(bm25::bm25_create))
+        .route("/bm25/sync", post(bm25::bm25_sync))
         // Wholesale .flpack restore: creates a new ledger from a trusted
         // archive. Writes prebuilt index artifacts, so admin-gated.
         .route("/import/*ledger", post(import::import_ledger_tail))

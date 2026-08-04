@@ -126,6 +126,8 @@ pub struct IndexingFileConfig {
     pub enabled: Option<bool>,
     pub reindex_min_bytes: Option<usize>,
     pub reindex_max_bytes: Option<usize>,
+    /// Keep BM25 full-text indexes current automatically.
+    pub bm25_auto_sync: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -425,6 +427,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "cache_max_mb",
     "disk_cache_max_mb",
     "indexing_enabled",
+    "bm25_auto_sync",
     "reindex_min_bytes",
     "reindex_max_bytes",
     "events_auth_mode",
@@ -569,6 +572,11 @@ pub fn apply_to_server_config(
         if is_default("indexing_enabled") {
             if let Some(v) = idx.enabled {
                 config.indexing_enabled = v;
+            }
+        }
+        if is_default("bm25_auto_sync") {
+            if let Some(v) = idx.bm25_auto_sync {
+                config.bm25_auto_sync = v;
             }
         }
         if is_default("reindex_min_bytes") {
@@ -1111,6 +1119,7 @@ default_policy_class = "ex:DefaultPolicy"
                 enabled: Some(false),
                 reindex_min_bytes: Some(100_000),
                 reindex_max_bytes: Some(1_000_000),
+                bm25_auto_sync: None,
             }),
             ..Default::default()
         };
@@ -1121,6 +1130,7 @@ default_policy_class = "ex:DefaultPolicy"
                 enabled: Some(true),
                 reindex_min_bytes: None, // should NOT override
                 reindex_max_bytes: None, // should NOT override
+                bm25_auto_sync: None,
             }),
             ..Default::default()
         };
