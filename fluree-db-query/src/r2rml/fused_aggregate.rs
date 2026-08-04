@@ -1077,13 +1077,14 @@ struct Resolved {
     /// fact row — mirroring the R2RML/inner-join row-drop. `group_cols` still
     /// describes the key kinds/datatypes for materializing the output binding.
     group_resolver: Option<GroupKeyResolver>,
-    /// P3 (crt_join_reorder class): `Some` for a branching-star multi-fact join whose
-    /// SEMI-JOIN branch resolved to a membership set. Each streamed fact row is probed
-    /// against it (drop on miss) BEFORE the group-key resolve/fold — an existence
-    /// semi-join, byte-identical to the generic chained inner join
-    /// (`build_semi_join_membership`). `None` for the single-table and pure-linear
-    /// join folds.
-    semi_join: Option<SemiJoinSet>,
+    /// P3 (crt_join_reorder class) + S1 (K≥2 generality): one membership set per
+    /// SEMI-JOIN branch of a branching-star multi-fact join. Each streamed fact row is
+    /// probed against EVERY set (AND — a miss on any one drops the row) BEFORE the
+    /// group-key resolve/fold — the existence semi-join, byte-identical to the generic
+    /// chained inner join (`build_semi_join_membership`). Empty for the single-table and
+    /// pure-linear join folds; length 1 is the #1582 crt_join_reorder case; length ≥2 is
+    /// the S1 widening (multi-filter BI shape, gated by `multifact_gen_enabled`).
+    semi_joins: Vec<SemiJoinSet>,
     /// W4-2: per GROUP BY position (SPARQL order), whether that key is read inline
     /// from the fact batch (`Fact`) or from the dim FK→GKey map (`Dim(slot)`). All
     /// `Fact` for the single-table fold; all `Dim` for a pure fact⋈dim fold; mixed
@@ -1375,6 +1376,26 @@ impl FusedR2rmlAggregateOperator {
             key.push(k);
         }
         Some(key)
+    }
+
+    /// P3 + S1: a fact row survives the branching-star's SEMI-JOIN branches iff it is a
+    /// member of EVERY set (AND — one membership set per semi-join branch). Returns
+    /// `false` on the first branch whose fact-side FK is null (no branch triple ⇒ inner
+    /// join drops the row) or whose stringified FK value is not in that branch's
+    /// keep-min-then-filter membership. Empty `sets` ⇒ `true` (the single-table /
+    /// pure-linear path, a no-op byte-identical to pre-P3). Each set is probed with the
+    /// same `get_join_key_from_batch` stringification the membership build used, so both
+    /// sides encode the join value identically.
+    fn row_passes_semi_joins(sets: &[SemiJoinSet], batch: &ColumnBatch, row: usize) -> bool {
+        for sj in sets {
+            let Some(fk) = get_join_key_from_batch(&sj.fact_fk_cols, batch, row) else {
+                return false;
+            };
+            if !sj.membership.contains(&fk) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Resolve the single scalar column (and its declared datatype) a variable's
@@ -1793,24 +1814,19 @@ impl Operator for FusedR2rmlAggregateOperator {
                         continue;
                     }
                 }
-                // P3 (crt_join_reorder class): probe the SEMI-JOIN membership set BEFORE
-                // resolving the group key — a fact row whose root→branch FK does not
-                // resolve to a branch chain satisfying the branch constraints DROPS, the
-                // existence-semantics of the inner join. Byte-identical to the generic
-                // chained join because `membership` was built keep-min-THEN-filter (the
-                // discarded-dup soundness line). A null FK ⇒ no branch triple ⇒ drop; it
-                // is also already null-dropped by `validity_cols` (the FK child columns),
-                // so this probe never sees a null-FK row on the reachable path. Mirrors
-                // the `group_resolver` FK probe's key stringification
-                // (`get_join_key_from_batch`) so both sides encode the join value the
-                // same way. #1583: rests on the FK being single-valued (see `SemiJoinSet`).
-                if let Some(sj) = &resolved.semi_join {
-                    let Some(fk) = get_join_key_from_batch(&sj.fact_fk_cols, &batch, row) else {
-                        continue;
-                    };
-                    if !sj.membership.contains(&fk) {
-                        continue;
-                    }
+                // P3 (crt_join_reorder class) + S1 (K≥2): probe EVERY SEMI-JOIN
+                // membership set BEFORE resolving the group key — a fact row whose
+                // root→branch FK does not resolve to a branch chain satisfying that
+                // branch's constraints DROPS, the existence-semantics of the inner join.
+                // With K≥2 the probes AND (a miss on ANY branch drops the row), exactly
+                // as the K chained inner joins compose. Byte-identical to the generic
+                // chained join because each `membership` was built keep-min-THEN-filter
+                // (the discarded-dup soundness line). A null FK ⇒ no branch triple ⇒
+                // drop; each set's FK child columns are also null-dropped by
+                // `validity_cols`, so this probe never sees a null-FK row on the reachable
+                // path. #1583: rests on each FK being single-valued (see `SemiJoinSet`).
+                if !Self::row_passes_semi_joins(&resolved.semi_joins, &batch, row) {
+                    continue;
                 }
                 let accs: &mut Vec<Acc> = if gcols.is_empty() {
                     &mut implicit
@@ -2531,7 +2547,7 @@ impl FusedR2rmlAggregateOperator {
             validity_cols,
             count_non_null_cols,
             group_resolver,
-            semi_join: None,
+            semi_joins: Vec::new(),
             group_key_plan,
             fact_constraints,
             minmax_folds,
@@ -2755,22 +2771,49 @@ impl FusedR2rmlAggregateOperator {
         }
     }
 
-    /// P3 (scaffolding): decompose a BRANCHING-STAR join — a fact ROOT with ≥2 FK
-    /// branches, each a linear sub-chain — into its root + classified branches, or
-    /// `None` when the shape is not the admitted class. This is the structural half
-    /// of P3 (the soundness core — the semi-join keep-min-then-filter build + the
-    /// fold probe — is a tracked follow-on); the caller currently DECLINES even a
-    /// recognized star, so behavior is byte-identical.
+    /// Generality kill switch (`FLUREE_FUSED_R2RML_MULTIFACT_GEN`, default **on**).
+    /// Gates ONLY the multi-fact generality WIDENING beyond #1582's exactly-one-of-each
+    /// cut — the K≥2 semi-join admission (S1) and the ≥2 ref-IRI group-key admission
+    /// (S2). OFF restores #1582's behavior byte-for-byte: a K=1 (one group-key + one
+    /// semi-join) branching star and a single ref-IRI group key still fuse; a K≥2 or
+    /// ≥2-ref shape declines to the generic pipeline. It rides ON TOP of the #1582
+    /// switches (`FLUREE_FUSED_R2RML_MULTIFACT` for the branching path,
+    /// `FLUREE_FUSED_R2RML_AGG_JOIN` for the join path), which remain independently
+    /// killable underneath — turning either of those off declines the whole family
+    /// regardless of this flag. Read once per process (test reads live, as the sibling
+    /// switches do).
+    fn multifact_gen_enabled() -> bool {
+        #[cfg(not(test))]
+        {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT_GEN")
+            })
+        }
+        #[cfg(test)]
+        {
+            crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT_GEN")
+        }
+    }
+
+    /// P3 + S1: decompose a BRANCHING-STAR join — a fact ROOT with ≥2 FK branches, each
+    /// a linear sub-chain — into its root + classified branches, or `None` when the
+    /// shape is not the admitted class. The structural half of the branching path; the
+    /// soundness core (per-branch keep-min-then-filter membership + the AND fold probe)
+    /// lives in `resolve_branching_star_at_open` / `build_semi_join_membership`.
     ///
     /// Classification: a branch is GROUP-KEY if any of its patterns binds a GROUP BY
     /// var (its terminal dim carries the group attribute); otherwise SEMI-JOIN (a
     /// pure membership/constraint branch, e.g. `order → customer[segment=Enterprise]`).
-    /// v1 admits EXACTLY one of each (the crt_join_reorder class); the branch LIST is
-    /// the K-branch-ready carrier. Declines (`None`) on: <3 patterns, a non-unique
-    /// root (disconnected), a non-branching root (out-degree <2 — that is a linear
-    /// chain, [`Self::order_chain`]'s job), a merge (a pattern referenced by >1), a
-    /// nested branch inside a branch, a cycle, a disconnected pattern, or a
-    /// branch-set that is not {one GROUP-KEY, one SEMI-JOIN}.
+    /// Admits exactly ONE group-key branch plus K≥1 semi-join branches; K=1 is #1582's
+    /// crt_join_reorder class (always admitted), K≥2 is the S1 widening (multi-filter BI
+    /// shape) gated behind `multifact_gen_enabled` so an OFF run declines it to the
+    /// generic pipeline byte-identically to #1582. Declines (`None`) on: <3 patterns, a
+    /// non-unique root (disconnected), a non-branching root (out-degree <2 — that is a
+    /// linear chain, [`Self::order_chain`]'s job), a merge (a pattern referenced by >1),
+    /// a nested branch inside a branch, a cycle, a disconnected pattern, a branch-set
+    /// without exactly one GROUP-KEY branch or with zero SEMI-JOIN branches, or (switch
+    /// off) a K≥2 SEMI-JOIN star.
     fn decompose_branching_star<'p>(
         pats: &[&'p R2rmlPattern],
         group_by: &[VarId],
@@ -2858,7 +2901,13 @@ impl FusedR2rmlAggregateOperator {
         if !visited.iter().all(|&v| v) {
             return None; // a pattern is disconnected from the root
         }
-        // v1 admission: exactly one GROUP-KEY branch + one SEMI-JOIN branch.
+        // Admission: exactly one GROUP-KEY branch + at least one SEMI-JOIN branch.
+        // #1582 admitted exactly {1 group-key, 1 semi-join} (K=1). S1 widens the
+        // SEMI-JOIN count to K≥2 (the multi-filter BI shape) — but ONLY behind the
+        // generality switch, so an OFF run declines a K≥2 star to the generic pipeline
+        // byte-identically to #1582. Every non-group-key branch is a semi-join, so
+        // `semi_joins == branches.len() - 1`; requiring exactly one group-key already
+        // fixes that, and the branch count is `1 + semi_joins`.
         let group_keys = branches
             .iter()
             .filter(|b| matches!(b, JoinBranch::GroupKey(_)))
@@ -2867,7 +2916,11 @@ impl FusedR2rmlAggregateOperator {
             .iter()
             .filter(|b| matches!(b, JoinBranch::SemiJoin(_)))
             .count();
-        if branches.len() != 2 || group_keys != 1 || semi_joins != 1 {
+        if group_keys != 1 || semi_joins < 1 {
+            return None;
+        }
+        // K≥2 semi-join branches is the S1 widening increment; gated so OFF = #1582.
+        if semi_joins >= 2 && !Self::multifact_gen_enabled() {
             return None;
         }
         Some(BranchingStar {
@@ -3201,7 +3254,7 @@ impl FusedR2rmlAggregateOperator {
                 return Ok(None);
             }
         };
-        self.resolve_linear_chain_at_open(ctx, mapping, chain, join_vars, &[], None)
+        self.resolve_linear_chain_at_open(ctx, mapping, chain, join_vars, &[], Vec::new())
             .await
     }
 
@@ -3211,12 +3264,13 @@ impl FusedR2rmlAggregateOperator {
     /// ([`Self::resolve_branching_star_at_open`]).
     ///
     /// `strip_fact_fk_vars` are fact object vars that are FK roots of OTHER branches
-    /// (the SEMI-JOIN branch) — they are covered by `semi_join` (a membership probe),
+    /// (the SEMI-JOIN branches) — they are covered by `semi_joins` (membership probes),
     /// NOT scalar/group objects, so they are excluded from the fact's required-object
-    /// validity here (their FK child columns are still null-dropped + projected via
-    /// `semi_join.fact_fk_cols`). `semi_join`, when present, is the resolved SEMI-JOIN
-    /// membership set threaded into the returned `Resolved` for the fold probe. Both
-    /// are empty/`None` on the pure-linear path, making it byte-identical to pre-P3.
+    /// validity here (their FK child columns are still null-dropped + projected via each
+    /// set's `fact_fk_cols`). `semi_joins` carries one resolved SEMI-JOIN membership set
+    /// per semi-join branch (one for #1582's K=1, ≥2 for S1), threaded into the returned
+    /// `Resolved` for the fold probe. Both are empty on the pure-linear path, making it
+    /// byte-identical to pre-P3.
     async fn resolve_linear_chain_at_open(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -3224,7 +3278,7 @@ impl FusedR2rmlAggregateOperator {
         chain: Vec<&R2rmlPattern>,
         join_vars: Vec<VarId>,
         strip_fact_fk_vars: &[VarId],
-        semi_join: Option<SemiJoinSet>,
+        semi_joins: Vec<SemiJoinSet>,
     ) -> Result<Option<Resolved>> {
         let fact_p = chain[0];
         let terminal_p = *chain.last().expect("order_chain returns ≥2 patterns");
@@ -3453,8 +3507,8 @@ impl FusedR2rmlAggregateOperator {
         fact_obj_vars.extend(fact_p.star_bindings.iter().map(|(_, v)| *v));
         for v in fact_obj_vars {
             // Skip this chain's own FK to dim1 (a RefObjectMap object, covered by the
-            // FK cols) and — P3 — any other branch's FK root (the SEMI-JOIN FK, covered
-            // by `semi_join.fact_fk_cols` below). Both are FK objects, not scalars.
+            // FK cols) and — P3/S1 — any other branch's FK root (a SEMI-JOIN FK, covered
+            // by that set's `fact_fk_cols` below). Both are FK objects, not scalars.
             if v == first_join_var || strip_fact_fk_vars.contains(&v) {
                 continue;
             }
@@ -3463,12 +3517,12 @@ impl FusedR2rmlAggregateOperator {
             };
             validity_cols.push(col);
         }
-        // P3: the SEMI-JOIN branch FK is a fact object (an FK to the branch root),
-        // stripped from the scalar/group objects above. Its child columns must still
-        // null-drop the fact row (a null FK ⇒ no branch triple ⇒ the inner join drops
-        // the row) and be projected so `next_batch` can read them to probe the
-        // membership set. Empty (no-op) on the pure-linear path.
-        if let Some(sj) = &semi_join {
+        // P3 + S1: each SEMI-JOIN branch FK is a fact object (an FK to that branch's
+        // root), stripped from the scalar/group objects above. Every set's child columns
+        // must still null-drop the fact row (a null FK ⇒ no branch triple ⇒ the inner
+        // join drops the row) and be projected so `next_batch` can read them to probe the
+        // membership sets. Empty (no-op) on the pure-linear path.
+        for sj in &semi_joins {
             validity_cols.extend(sj.fact_fk_cols.iter().cloned());
         }
         for c in &validity_cols {
@@ -3695,7 +3749,7 @@ impl FusedR2rmlAggregateOperator {
             // The COUNT(*) manifest shortcut is single-table only.
             count_non_null_cols: Vec::new(),
             group_resolver: Some(GroupKeyResolver { fact_fk_cols, map }),
-            semi_join,
+            semi_joins,
             group_key_plan,
             fact_constraints: fact_checks,
             minmax_folds,
@@ -3703,15 +3757,19 @@ impl FusedR2rmlAggregateOperator {
         }))
     }
 
-    /// P3 (crt_join_reorder class): resolve a fused aggregate over a decomposed
-    /// BRANCHING-STAR join — a fact root with exactly one GROUP-KEY branch and one
-    /// SEMI-JOIN branch (`decompose_branching_star`). Builds the SEMI-JOIN membership
-    /// (keep-min-then-filter, `build_semi_join_membership`), then resolves the
-    /// GROUP-KEY branch as a linear chain `[root, group_branch.chain…]` via the shared
-    /// [`Self::resolve_linear_chain_at_open`], with the SEMI-JOIN root FK stripped from
-    /// the fact's required objects and the membership set threaded in for the fold
-    /// probe. Declines (`Ok(None)` → materialize) on any sub-shape the linear resolver
-    /// or the membership build cannot handle soundly.
+    /// P3 (crt_join_reorder class) + S1 (K≥2 generality): resolve a fused aggregate over
+    /// a decomposed BRANCHING-STAR join — a fact root with exactly one GROUP-KEY branch
+    /// and one-or-more SEMI-JOIN branches (`decompose_branching_star`). Builds one
+    /// SEMI-JOIN membership set PER semi-join branch (keep-min-then-filter,
+    /// `build_semi_join_membership`), then resolves the GROUP-KEY branch as a linear
+    /// chain `[root, group_branch.chain…]` via the shared
+    /// [`Self::resolve_linear_chain_at_open`], with EVERY semi-join branch's root FK
+    /// stripped from the fact's required objects and the membership sets threaded in for
+    /// the fold probe (which ANDs them — a fact row survives iff it is a member of every
+    /// set). Declines (`Ok(None)` → materialize) on any sub-shape the linear resolver or
+    /// any membership build cannot handle soundly. Each set is an independent inner-join
+    /// existence test on a distinct root FK, so K sets compose exactly as K chained inner
+    /// joins; #1583 (each FK single-valued) applies per set (see [`SemiJoinSet`]).
     async fn resolve_branching_star_at_open(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -3719,42 +3777,52 @@ impl FusedR2rmlAggregateOperator {
         star: BranchingStar<'_>,
     ) -> Result<Option<Resolved>> {
         let root = star.root;
-        // decompose_branching_star's admission guarantees exactly one of each; find
-        // both defensively (decline if either is absent).
+        // decompose_branching_star's admission guarantees exactly one GROUP-KEY and ≥1
+        // SEMI-JOIN; gather them defensively (decline if the group-key is absent).
         let mut group_branch: Option<&Branch> = None;
-        let mut semi_branch: Option<&Branch> = None;
+        let mut semi_branches: Vec<&Branch> = Vec::new();
         for b in &star.branches {
             match b {
                 JoinBranch::GroupKey(br) => group_branch = Some(br),
-                JoinBranch::SemiJoin(br) => semi_branch = Some(br),
+                JoinBranch::SemiJoin(br) => semi_branches.push(br),
             }
         }
-        let (Some(group_branch), Some(semi_branch)) = (group_branch, semi_branch) else {
+        let Some(group_branch) = group_branch else {
             return Ok(None);
         };
+        if semi_branches.is_empty() {
+            return Ok(None);
+        }
         let Some(root_tm) = Self::resolve_triples_map(root, mapping) else {
             return Ok(None);
         };
-        // Build the SEMI-JOIN membership set first (keep-min-then-filter). A shape it
-        // cannot resolve soundly declines the whole fuse.
-        let Some(semi_join) = self
-            .build_semi_join_membership(ctx, mapping, root, root_tm, semi_branch)
-            .await?
-        else {
-            return Ok(None);
-        };
+        // Build every SEMI-JOIN branch's membership set first (keep-min-then-filter). A
+        // branch it cannot resolve soundly declines the whole fuse. The strip set is
+        // every semi-join branch's root FK var — all covered by the membership probes,
+        // not scalar/group objects.
+        let mut semi_joins: Vec<SemiJoinSet> = Vec::with_capacity(semi_branches.len());
+        let mut strip: Vec<VarId> = Vec::with_capacity(semi_branches.len());
+        for semi_branch in &semi_branches {
+            let Some(sj) = self
+                .build_semi_join_membership(ctx, mapping, root, root_tm, semi_branch)
+                .await?
+            else {
+                return Ok(None);
+            };
+            semi_joins.push(sj);
+            strip.push(semi_branch.root_join_var);
+        }
         // The GROUP-KEY branch resolves as the linear chain [root, group_branch.chain…]
         // (root → group_branch.head via group_branch.root_join_var, then the branch's
-        // own within-chain joins). The SEMI-JOIN root FK var is stripped from the
-        // fact's required scalar objects — it is covered by the membership probe.
+        // own within-chain joins). Every SEMI-JOIN root FK var is stripped from the
+        // fact's required scalar objects — each is covered by a membership probe.
         let mut chain: Vec<&R2rmlPattern> = Vec::with_capacity(group_branch.chain.len() + 1);
         chain.push(root);
         chain.extend(group_branch.chain.iter().copied());
         let mut join_vars: Vec<VarId> = Vec::with_capacity(group_branch.join_vars.len() + 1);
         join_vars.push(group_branch.root_join_var);
         join_vars.extend(group_branch.join_vars.iter().copied());
-        let strip = [semi_branch.root_join_var];
-        self.resolve_linear_chain_at_open(ctx, mapping, chain, join_vars, &strip, Some(semi_join))
+        self.resolve_linear_chain_at_open(ctx, mapping, chain, join_vars, &strip, semi_joins)
             .await
     }
 
@@ -7134,6 +7202,600 @@ mod tests {
         assert!(
             on.is_some(),
             "switch ON must FUSE the branching star (contrast proving the gate controls it)"
+        );
+    }
+
+    // ===================================================================
+    // S1: K≥2 SEMI-JOIN branches (the multi-filter BI shape). A support-ticket
+    // rollup with ONE group-key branch (product→category) and TWO semi-join
+    // branches (customer[segment="Enterprise"] AND agent→employee[department=
+    // "Support"]). SupportTicket is the only ≥3-FK fact in the SF01 schema —
+    // OrderLine has just {order, product}, so a supplier branch there would
+    // COLLIDE with the product group-key branch (branches must be disjoint).
+    // ===================================================================
+
+    /// Serializes tests that read/write `FLUREE_FUSED_R2RML_MULTIFACT_GEN`. The K≥2
+    /// admission gate in `decompose_branching_star` reads it live under cfg(test), so the
+    /// switch test's set/remove window must not race a concurrent K≥2 decompose. Held
+    /// ONLY around the (synchronous) `decompose` call — never across an `.await`.
+    static GEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gen_lock() -> std::sync::MutexGuard<'static, ()> {
+        GEN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// S1 mapping: SupportTicket(fact) `--product-->` Product (group-key branch,
+    /// category + isCurrent), `--customer-->` Customer (semi-join, segment), and
+    /// `--agent-->` Employee (semi-join, department). Employee's SUBJECT is keyed on a
+    /// surrogate `AID`, NOT the join key `EMPLOYEE_KEY`, so a duplicate EMPLOYEE_KEY can
+    /// carry two distinct subjects — the keep-min discriminator for the NEW (2nd)
+    /// semi-join membership site. The measure datatype is caller-chosen (integer /
+    /// decimal) to cover both the Long and the exact-i128 folds in the K≥2 shape.
+    fn s1_mapping(qty_dt: &str) -> Arc<CompiledR2rmlMapping> {
+        use fluree_db_r2rml::mapping::PredicateMap;
+        use fluree_vocab::xsd;
+        Arc::new(CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("#Ticket", "ticket")
+                .with_subject_template("http://ex/t/{TID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/quantity"),
+                    object_map: ObjectMap::column_typed("QTY", qty_dt),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/product"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Product",
+                        "PRODUCT_KEY",
+                        "PRODUCT_KEY",
+                    )),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/customer"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Customer",
+                        "CUSTOMER_KEY",
+                        "CUSTOMER_KEY",
+                    )),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/agent"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Employee",
+                        "AGENT_KEY",
+                        "EMPLOYEE_KEY",
+                    )),
+                }),
+            TriplesMap::new("#Product", "product")
+                .with_subject_template("http://ex/prod/{PRODUCT_KEY}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/category"),
+                    object_map: ObjectMap::column("CATEGORY"),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/isCurrent"),
+                    object_map: ObjectMap::column_typed("IS_CURRENT", xsd::BOOLEAN),
+                }),
+            TriplesMap::new("#Customer", "customer")
+                .with_subject_template("http://ex/cust/{CUSTOMER_KEY}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/segment"),
+                    object_map: ObjectMap::column("SEGMENT"),
+                }),
+            TriplesMap::new("#Employee", "employee")
+                .with_subject_template("http://ex/emp/{AID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/department"),
+                    object_map: ObjectMap::column("DEPARTMENT"),
+                }),
+        ]))
+    }
+
+    /// The S1 BGP as rewritten R2rml leaf patterns: fact `?t(0)` {quantity=?q(10),
+    /// product=?p(2), customer=?c(3), agent=?a(4)}; `?p(2)` {category=?cat(12)}
+    /// [isCurrent=true]; `?c(3)` [segment="Enterprise"]; `?a(4)` [department="Support"].
+    /// `seg_star` / `dept_star` select each semi-join terminal's constraint form so the
+    /// OR gatherer is fixtured on BOTH forms at BOTH sites (standalone const-object = the
+    /// live rewrite shape and the over-count regression guard; star_constraints = the
+    /// folded form).
+    fn s1_patterns(seg_star: bool, dept_star: bool) -> [R2rmlPattern; 4] {
+        let (t, p, c, a) = (VarId(0), VarId(2), VarId(3), VarId(4));
+        let (qty, cat) = (VarId(10), VarId(12));
+        let mut tp = R2rmlPattern::new("gs", t, None);
+        tp.triples_map_iri = Some("#Ticket".into());
+        tp.star_bindings = vec![
+            ("http://ex/quantity".into(), qty),
+            ("http://ex/product".into(), p),
+            ("http://ex/customer".into(), c),
+            ("http://ex/agent".into(), a),
+        ];
+        let mut pp = R2rmlPattern::new("gs", p, None);
+        pp.triples_map_iri = Some("#Product".into());
+        pp.star_bindings = vec![("http://ex/category".into(), cat)];
+        pp.star_constraints = vec![(
+            "http://ex/isCurrent".into(),
+            crate::r2rml::ObjectConstant::Scalar(crate::r2rml::ScanValue::Bool(true)),
+        )];
+        let seg =
+            crate::r2rml::ObjectConstant::Scalar(crate::r2rml::ScanValue::Str("Enterprise".into()));
+        let mut cp = R2rmlPattern::new("gs", c, None);
+        cp.triples_map_iri = Some("#Customer".into());
+        if seg_star {
+            cp.star_constraints = vec![("http://ex/segment".into(), seg)];
+        } else {
+            cp.predicate_filter = Some("http://ex/segment".into());
+            cp.object_constant = Some(seg);
+        }
+        let dept =
+            crate::r2rml::ObjectConstant::Scalar(crate::r2rml::ScanValue::Str("Support".into()));
+        let mut ap = R2rmlPattern::new("gs", a, None);
+        ap.triples_map_iri = Some("#Employee".into());
+        if dept_star {
+            ap.star_constraints = vec![("http://ex/department".into(), dept)];
+        } else {
+            ap.predicate_filter = Some("http://ex/department".into());
+            ap.object_constant = Some(dept);
+        }
+        [tp, pp, cp, ap]
+    }
+
+    fn s1_op() -> FusedR2rmlAggregateOperator {
+        use crate::ir::grouping::InputSemantics;
+        use crate::seed::EmptyOperator;
+        let (qty, cat, u) = (VarId(10), VarId(12), VarId(20));
+        let plan = FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![],
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![cat],
+            aggregates: vec![(u, AggregateFn::Sum(qty, InputSemantics::List))],
+        };
+        FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()))
+    }
+
+    /// Resolve + fold an S1 fixture through the branching-star path
+    /// (`decompose_branching_star` + `resolve_branching_star_at_open`, called directly),
+    /// returning `(category, SUM)` sorted by category. The GEN switch is default-on
+    /// (unset), so the K≥2 shape decomposes; the lock excludes the switch test's mutation
+    /// window from this (synchronous) decompose. Panics if the shape does not FUSE.
+    async fn run_s1(
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: std::collections::HashMap<String, Vec<ColumnBatch>>,
+        seg_star: bool,
+        dept_star: bool,
+    ) -> Vec<(String, Binding)> {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let pats = s1_patterns(seg_star, dept_star);
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let star = {
+            let _g = gen_lock();
+            FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+                .expect("S1 K=2 shape must decompose (GEN default-on)")
+        };
+        let provider = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches,
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let mut op = s1_op();
+        let resolved = op
+            .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+            .await
+            .expect("resolve must not error")
+            .expect("S1 K=2 shape must FUSE (not decline)");
+        op.resolved = Some(resolved);
+        let (cat, u) = (VarId(12), VarId(20));
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+            let n = batch.column(cat).map(<[Binding]>::len).unwrap_or(0);
+            for row in 0..n {
+                let c = match batch.get(row, cat).expect("cat binding") {
+                    Binding::Lit {
+                        val: FlakeValue::String(s),
+                        ..
+                    } => s.clone(),
+                    other => panic!("category key must be an xsd:string literal, got {other:?}"),
+                };
+                out.push((c, batch.get(row, u).expect("sum binding").clone()));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Clean (unique-key) S1 fixture. Six tickets; the answer keeps only rows passing
+    /// BOTH semi-joins AND the group-key dim constraint:
+    ///  T1 Widgets/Ent/Support qty5 ✓, T2 Widgets/Ent/Support qty7 ✓,
+    ///  T3 Gadgets/Ent/Support qty3 ✓, T4 Widgets/SMB/Support qty9 ✗ (customer),
+    ///  T5 Widgets/Ent/Sales qty11 ✗ (agent — the 2nd semi-join),
+    ///  T6 non-current/Ent/Support qty13 ✗ (product group-key dim constraint).
+    /// ⇒ Widgets=12, Gadgets=3.
+    fn s1_clean_batches() -> std::collections::HashMap<String, Vec<ColumnBatch>> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "ticket".to_string(),
+            vec![mk_batch(vec![
+                icol(
+                    "TID",
+                    1,
+                    vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)],
+                ),
+                icol(
+                    "PRODUCT_KEY",
+                    2,
+                    vec![
+                        Some(100),
+                        Some(100),
+                        Some(200),
+                        Some(100),
+                        Some(100),
+                        Some(300),
+                    ],
+                ),
+                icol(
+                    "CUSTOMER_KEY",
+                    3,
+                    vec![
+                        Some(1000),
+                        Some(1001),
+                        Some(1000),
+                        Some(1002),
+                        Some(1000),
+                        Some(1000),
+                    ],
+                ),
+                icol(
+                    "AGENT_KEY",
+                    4,
+                    vec![
+                        Some(500),
+                        Some(500),
+                        Some(501),
+                        Some(500),
+                        Some(502),
+                        Some(500),
+                    ],
+                ),
+                icol(
+                    "QTY",
+                    5,
+                    vec![Some(5), Some(7), Some(3), Some(9), Some(11), Some(13)],
+                ),
+            ])],
+        );
+        m.insert(
+            "product".to_string(),
+            vec![mk_batch(vec![
+                icol("PRODUCT_KEY", 1, vec![Some(100), Some(200), Some(300)]),
+                scol("CATEGORY", 2, vec!["Widgets", "Gadgets", "Widgets"]),
+                bcol("IS_CURRENT", 3, vec![Some(true), Some(true), Some(false)]),
+            ])],
+        );
+        m.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![
+                icol("CUSTOMER_KEY", 1, vec![Some(1000), Some(1001), Some(1002)]),
+                scol("SEGMENT", 2, vec!["Enterprise", "Enterprise", "SMB"]),
+            ])],
+        );
+        m.insert(
+            "employee".to_string(),
+            vec![mk_batch(vec![
+                scol("AID", 1, vec!["e500", "e501", "e502"]),
+                icol("EMPLOYEE_KEY", 2, vec![Some(500), Some(501), Some(502)]),
+                scol("DEPARTMENT", 3, vec!["Support", "Support", "Sales"]),
+            ])],
+        );
+        m
+    }
+
+    /// (S1-a) VALUE-IDENTITY: the clean K=2 fixture folds to the generic chained
+    /// inner-join answer, byte-identical. Standalone const-object form for both
+    /// semi-join terminals (the live rewrite shape).
+    #[tokio::test]
+    async fn s1_k2_semijoin_value_identity_integer() {
+        let out = run_s1(
+            s1_mapping(fluree_vocab::xsd::INTEGER),
+            s1_clean_batches(),
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(
+            out,
+            vec![
+                ("Gadgets".to_string(), long_sum(3)),
+                ("Widgets".to_string(), long_sum(12)),
+            ],
+            "K=2 fused SUM must equal the generic two-semi-join inner-join answer"
+        );
+    }
+
+    /// (S1-a-star) The OR gatherer's OTHER arm at BOTH new membership sites: the same
+    /// clean fixture with EACH semi-join terminal's constraint in the folded
+    /// `star_constraints` form. Same correct answer — pinning
+    /// `resolve_semijoin_pattern_constraints` on both forms at the K≥2 sites (the 6×
+    /// over-count class, now guarded at the 2nd site too).
+    #[tokio::test]
+    async fn s1_k2_semijoin_both_constraint_forms() {
+        let out = run_s1(
+            s1_mapping(fluree_vocab::xsd::INTEGER),
+            s1_clean_batches(),
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(
+            out,
+            vec![
+                ("Gadgets".to_string(), long_sum(3)),
+                ("Widgets".to_string(), long_sum(12)),
+            ],
+            "the star_constraints form of BOTH semi-join filters must match the standalone form"
+        );
+    }
+
+    /// (S1-a′) VALUE-IDENTITY, exact i128 path in the K≥2 shape: a decimal measure folds
+    /// through `Acc::Exact`. Same six rows; qty 5.25, 7.25, 3.50 on the survivors.
+    /// Widgets=12.50, Gadgets=3.50, byte-identical to the exact finalize.
+    #[tokio::test]
+    async fn s1_k2_semijoin_value_identity_decimal() {
+        let mut b = s1_clean_batches();
+        b.insert(
+            "ticket".to_string(),
+            vec![mk_batch(vec![
+                icol(
+                    "TID",
+                    1,
+                    vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)],
+                ),
+                icol(
+                    "PRODUCT_KEY",
+                    2,
+                    vec![
+                        Some(100),
+                        Some(100),
+                        Some(200),
+                        Some(100),
+                        Some(100),
+                        Some(300),
+                    ],
+                ),
+                icol(
+                    "CUSTOMER_KEY",
+                    3,
+                    vec![
+                        Some(1000),
+                        Some(1001),
+                        Some(1000),
+                        Some(1002),
+                        Some(1000),
+                        Some(1000),
+                    ],
+                ),
+                icol(
+                    "AGENT_KEY",
+                    4,
+                    vec![
+                        Some(500),
+                        Some(500),
+                        Some(501),
+                        Some(500),
+                        Some(502),
+                        Some(500),
+                    ],
+                ),
+                (
+                    field(
+                        "QTY",
+                        5,
+                        FieldType::Decimal {
+                            precision: 12,
+                            scale: 2,
+                        },
+                    ),
+                    Column::Decimal {
+                        values: vec![
+                            Some(525),
+                            Some(725),
+                            Some(350),
+                            Some(900),
+                            Some(1100),
+                            Some(1300),
+                        ],
+                        precision: 12,
+                        scale: 2,
+                    },
+                ),
+            ])],
+        );
+        let dec = |unscaled: i128| {
+            Acc::Exact {
+                sum: unscaled,
+                scale: 2,
+                decimal: true,
+                count: 1,
+                is_avg: false,
+            }
+            .finalize()
+        };
+        let out = run_s1(s1_mapping(fluree_vocab::xsd::DECIMAL), b, false, false).await;
+        assert_eq!(
+            out,
+            vec![
+                ("Gadgets".to_string(), dec(350)),  // 3.50
+                ("Widgets".to_string(), dec(1250)), // 5.25 + 7.25 = 12.50
+            ],
+            "K=2 fused decimal SUM must be byte-identical to the exact i128 → BigDecimal finalize"
+        );
+    }
+
+    /// (S1-b) KEEP-MIN-THEN-FILTER at the NEW (2nd) semi-join site (the agent branch):
+    /// two Employee rows share EMPLOYEE_KEY=500 with distinct subjects. Keep-min subject
+    /// `emp/a` is department "Sales" (fails); the discarded dup `emp/b` is "Support"
+    /// (passes). The ticket must DROP — filter-then-union would wrongly admit it. Guards
+    /// the discarded-dup soundness line at the branch S1 adds, not just #1582's site.
+    #[tokio::test]
+    async fn s1_keep_min_then_filter_excludes_on_agent_branch() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "ticket".to_string(),
+            vec![mk_batch(vec![
+                icol("TID", 1, vec![Some(1)]),
+                icol("PRODUCT_KEY", 2, vec![Some(100)]),
+                icol("CUSTOMER_KEY", 3, vec![Some(1000)]),
+                icol("AGENT_KEY", 4, vec![Some(500)]),
+                icol("QTY", 5, vec![Some(50)]),
+            ])],
+        );
+        m.insert(
+            "product".to_string(),
+            vec![mk_batch(vec![
+                icol("PRODUCT_KEY", 1, vec![Some(100)]),
+                scol("CATEGORY", 2, vec!["Widgets"]),
+                bcol("IS_CURRENT", 3, vec![Some(true)]),
+            ])],
+        );
+        m.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![
+                icol("CUSTOMER_KEY", 1, vec![Some(1000)]),
+                scol("SEGMENT", 2, vec!["Enterprise"]),
+            ])],
+        );
+        // Same EMPLOYEE_KEY=500, distinct subjects: emp/a (keep-min) → Sales; emp/b → Support.
+        m.insert(
+            "employee".to_string(),
+            vec![mk_batch(vec![
+                scol("AID", 1, vec!["a", "b"]),
+                icol("EMPLOYEE_KEY", 2, vec![Some(500), Some(500)]),
+                scol("DEPARTMENT", 3, vec!["Sales", "Support"]),
+            ])],
+        );
+        let out = run_s1(s1_mapping(fluree_vocab::xsd::INTEGER), m, false, false).await;
+        assert!(
+            out.is_empty(),
+            "keep-min agent row is Sales → the ticket drops; filter-then-union would wrongly \
+             admit it (Widgets=50). Got {out:?}"
+        );
+    }
+
+    /// (S1-b-control) The SAME agent duplicate-key fixture with departments SWAPPED so
+    /// the keep-min row is now "Support" — the ticket must be INCLUDED. The contrast with
+    /// the test above proves keep-min (not "any duplicate matches") decides membership at
+    /// the S1 site.
+    #[tokio::test]
+    async fn s1_keep_min_control_includes_on_agent_branch() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "ticket".to_string(),
+            vec![mk_batch(vec![
+                icol("TID", 1, vec![Some(1)]),
+                icol("PRODUCT_KEY", 2, vec![Some(100)]),
+                icol("CUSTOMER_KEY", 3, vec![Some(1000)]),
+                icol("AGENT_KEY", 4, vec![Some(500)]),
+                icol("QTY", 5, vec![Some(50)]),
+            ])],
+        );
+        m.insert(
+            "product".to_string(),
+            vec![mk_batch(vec![
+                icol("PRODUCT_KEY", 1, vec![Some(100)]),
+                scol("CATEGORY", 2, vec!["Widgets"]),
+                bcol("IS_CURRENT", 3, vec![Some(true)]),
+            ])],
+        );
+        m.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![
+                icol("CUSTOMER_KEY", 1, vec![Some(1000)]),
+                scol("SEGMENT", 2, vec!["Enterprise"]),
+            ])],
+        );
+        // emp/a (keep-min) → Support; emp/b (discarded) → Sales.
+        m.insert(
+            "employee".to_string(),
+            vec![mk_batch(vec![
+                scol("AID", 1, vec!["a", "b"]),
+                icol("EMPLOYEE_KEY", 2, vec![Some(500), Some(500)]),
+                scol("DEPARTMENT", 3, vec!["Support", "Sales"]),
+            ])],
+        );
+        let out = run_s1(s1_mapping(fluree_vocab::xsd::INTEGER), m, false, false).await;
+        assert_eq!(
+            out,
+            vec![("Widgets".to_string(), long_sum(50))],
+            "keep-min agent row is Support → the ticket is included"
+        );
+    }
+
+    /// (S1-decompose) The K=2 shape decomposes into exactly one GROUP-KEY branch (product)
+    /// and two SEMI-JOIN branches (customer, agent), all rooted at the ticket fact.
+    #[tokio::test]
+    async fn s1_decompose_recognizes_k2_shape() {
+        let _g = gen_lock();
+        let pats = s1_patterns(false, false);
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+            .expect("K=2 shape must decompose with GEN on");
+        assert_eq!(
+            star.branches.len(),
+            3,
+            "one group-key + two semi-join branches"
+        );
+        let group = star
+            .branches
+            .iter()
+            .filter(|b| matches!(b, JoinBranch::GroupKey(_)))
+            .count();
+        let semi = star
+            .branches
+            .iter()
+            .filter(|b| matches!(b, JoinBranch::SemiJoin(_)))
+            .count();
+        assert_eq!(
+            (group, semi),
+            (1, 2),
+            "exactly one group-key + two semi-join branches"
+        );
+    }
+
+    /// (S1-switch) `FLUREE_FUSED_R2RML_MULTIFACT_GEN=0` gates ONLY the widening: a K≥2
+    /// star DECLINES (decompose → None → generic pipeline), while a K=1 (#1582
+    /// crt_join_reorder) star STILL decomposes — so OFF is byte-identical to #1582. Sole
+    /// reader/writer of the GEN var; the lock excludes concurrent `run_s1` decomposes.
+    #[tokio::test]
+    async fn s1_gen_switch_gates_only_the_widening() {
+        let _g = gen_lock();
+        let s1 = s1_patterns(false, false);
+        let s1_refs: Vec<&R2rmlPattern> = s1.iter().collect();
+        let k1 = crt_patterns(false);
+        let k1_refs: Vec<&R2rmlPattern> = k1.iter().collect();
+
+        // OFF: K≥2 declines, K=1 still admits.
+        std::env::set_var("FLUREE_FUSED_R2RML_MULTIFACT_GEN", "0");
+        assert!(!FusedR2rmlAggregateOperator::multifact_gen_enabled());
+        assert!(
+            FusedR2rmlAggregateOperator::decompose_branching_star(&s1_refs, &[VarId(12)]).is_none(),
+            "GEN off must DECLINE the K≥2 star (widening gated)"
+        );
+        assert!(
+            FusedR2rmlAggregateOperator::decompose_branching_star(&k1_refs, &[VarId(12)]).is_some(),
+            "GEN off must STILL admit the #1582 K=1 star (byte-identical to #1582)"
+        );
+
+        // ON (unset): K≥2 admits.
+        std::env::remove_var("FLUREE_FUSED_R2RML_MULTIFACT_GEN");
+        assert!(FusedR2rmlAggregateOperator::multifact_gen_enabled());
+        assert!(
+            FusedR2rmlAggregateOperator::decompose_branching_star(&s1_refs, &[VarId(12)]).is_some(),
+            "GEN on must ADMIT the K≥2 star"
         );
     }
 }
