@@ -510,9 +510,17 @@ impl Bm25MaintenanceWorker {
             tokio::pin!(sleep_fut);
 
             tokio::select! {
+                // Polled in source order: events first, then sync completions,
+                // then the tick. Events lead because the broadcast channel is
+                // the only lossy input — a receiver that falls behind gets
+                // `Lagged` and the commits it missed are gone, leaving those
+                // indexes stale until something commits to them again. A sync
+                // completion or a debounce tick loses nothing by waiting for
+                // the next poll. Stopping is unaffected by the order: it is
+                // checked at the top of the loop, which every branch returns
+                // to.
                 biased;
 
-                // Prefer stop checks + flushing, but still service events promptly.
                 res = subscription.receiver.recv() => {
                     match res {
                         Ok(event) => {
