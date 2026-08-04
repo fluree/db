@@ -915,17 +915,23 @@ fn hash_key_refs(scratch: &[GKeyRef]) -> u64 {
     h.finish()
 }
 
-/// W4-2: the source of one GROUP BY key position in a fused fold, in SPARQL order.
-/// A single-table fold is all `Fact`; a pure fact⋈dim fold is all `Dim`; a MIXED
-/// rollup interleaves the two (a fact-column key alongside a dim-attribute key,
-/// e.g. #7's `shipMethod` and `yearNum`). `Dim(slot)` indexes the dim-subset `GKey`
-/// tuple the `GroupKeyResolver.map` stores for a fact FK.
+/// W4-2 + S2: the source of one GROUP BY key position in a fused fold, in SPARQL
+/// order. A single-table plain-column fold is all `Fact`; a pure fact⋈dim fold is all
+/// `Dim`; a MIXED rollup interleaves the two (a fact-column key alongside a
+/// dim-attribute key, e.g. #7's `shipMethod` and `yearNum`).
+///
+/// `Dim { resolver, slot }` reads from the `resolver`-th [`GroupKeyResolver`] in
+/// `Resolved.group_resolvers`, at `slot` within that resolver's `GKey` tuple. The join
+/// path has exactly one resolver (the terminal dim's FK→GKey map, possibly several
+/// slots), so all its `Dim`s use `resolver: 0`. S2's single-table multi-ref-key fold
+/// has ONE resolver PER ref-IRI group key (each a distinct FK→IRI map probed by its own
+/// FK), so its `Dim`s use `resolver: i, slot: 0`.
 #[derive(Clone, Copy)]
 enum KeySource {
     /// Read inline from the scanned fact batch via `group_cols[pos].key_at`.
     Fact,
-    /// Read from the FK→GKey map's value at this dim-subset slot.
-    Dim(usize),
+    /// Read from `group_resolvers[resolver]`'s probed GKey tuple at `slot`.
+    Dim { resolver: usize, slot: usize },
 }
 
 /// Insert a dim join-key → group-keys mapping for the fused-aggregate FK chain,
@@ -1069,14 +1075,16 @@ struct Resolved {
     /// columns. Empty means a constant subject (present on every row → the
     /// shortcut needs no null proof). Consumed only for the bare-COUNT fast path.
     count_non_null_cols: Vec<String>,
-    /// PR-6: `None` for the single-table fold (GROUP BY keys read straight from
-    /// the scanned fact batch via `group_cols`). `Some` for a fact⋈dim fold: the
-    /// GROUP BY keys live on a dimension reached by an FK, so they are resolved
-    /// per fact row by probing this dim lookup with the fact's FK columns. A miss
-    /// (dangling or null FK, or a dim row with a null group attribute) drops the
-    /// fact row — mirroring the R2RML/inner-join row-drop. `group_cols` still
-    /// describes the key kinds/datatypes for materializing the output binding.
-    group_resolver: Option<GroupKeyResolver>,
+    /// PR-6 + S2: FK→GKey resolvers for dim-sourced GROUP BY keys, indexed by
+    /// `KeySource::Dim.resolver`. EMPTY for a single-table plain-column fold (keys read
+    /// straight from the scanned fact batch via `group_cols`). ONE entry for a fact⋈dim
+    /// fold (the terminal dim's map, keyed by the fact's FK; several slots when multiple
+    /// group attrs come from that one dim). ONE ENTRY PER ref-IRI group key for S2's
+    /// single-table multi-ref fold (each a distinct FK→IRI map probed by its own FK). A
+    /// miss on ANY resolver (dangling/null FK, or a null group attribute) drops the fact
+    /// row — mirroring the R2RML/inner-join row-drop. `group_cols` still describes the
+    /// key kinds/datatypes for materializing each output binding.
+    group_resolvers: Vec<GroupKeyResolver>,
     /// P3 (crt_join_reorder class) + S1 (K≥2 generality): one membership set per
     /// SEMI-JOIN branch of a branching-star multi-fact join. Each streamed fact row is
     /// probed against EVERY set (AND — a miss on any one drops the row) BEFORE the
@@ -1349,26 +1357,26 @@ impl FusedR2rmlAggregateOperator {
         Some(out)
     }
 
-    /// W4-2: assemble the composite group key for one fact row, interleaving
+    /// W4-2 + S2: assemble the composite group key for one fact row, interleaving
     /// fact-inline positions (`key_at` on the scanned fact batch) with dim-resolved
-    /// positions (the probed FK→GKey slice) in SPARQL order per `plan`. A NULL in
-    /// ANY position — a null fact key column OR a null dim gkey — drops the row
-    /// (`None`), the BGP unbound-object semantics, symmetric across both sources and
-    /// matching the materialize path's row-drop. `dim_gkeys` is the resolver's
-    /// probed value (already existence-checked by the caller); a `Dim` slot with no
-    /// resolver value drops defensively.
+    /// positions (a probed FK→GKey slice) in SPARQL order per `plan`. A NULL in ANY
+    /// position — a null fact key column OR a null dim gkey — drops the row (`None`), the
+    /// BGP unbound-object semantics, symmetric across both sources and matching the
+    /// materialize path's row-drop. `dim_probes[r]` is resolver `r`'s probed value
+    /// (already existence-checked by the caller); a `Dim` slot with no resolver value
+    /// drops defensively.
     fn assemble_group_key(
         plan: &[KeySource],
         group_cols: &[GroupCol],
         key_cols: &[Option<&Column>],
-        dim_gkeys: Option<&[GKey]>,
+        dim_probes: &[&[GKey]],
         row: usize,
     ) -> Option<Vec<GKey>> {
         let mut key = Vec::with_capacity(plan.len());
         for (pos, slot) in plan.iter().enumerate() {
             let k = match slot {
                 KeySource::Fact => group_cols[pos].key_at(key_cols[pos], row),
-                KeySource::Dim(slot) => dim_gkeys?.get(*slot)?.clone(),
+                KeySource::Dim { resolver, slot } => dim_probes.get(*resolver)?.get(*slot)?.clone(),
             };
             if matches!(k, GKey::Null) {
                 return None;
@@ -1777,6 +1785,10 @@ impl Operator for FusedR2rmlAggregateOperator {
             // this batch's columns + the resolver's dim GKeys); cleared each row so
             // its allocation is paid once per batch, not once per row.
             let mut scratch: Vec<GKeyRef> = Vec::with_capacity(gcols.len());
+            // S2: reused per-batch scratch for the per-row resolver probes (one slice
+            // per group resolver, borrowing that resolver's map — not `batch`); cleared
+            // each row, so multi-resolver folds pay the alloc once per batch, not per row.
+            let mut dim_probes: Vec<&[GKey]> = Vec::with_capacity(resolved.group_resolvers.len());
             for row in 0..batch.num_rows {
                 // Row-validity (R2RML star row-drop): the subject and every
                 // predicate's object column must be non-null.
@@ -1831,29 +1843,37 @@ impl Operator for FusedR2rmlAggregateOperator {
                 let accs: &mut Vec<Acc> = if gcols.is_empty() {
                     &mut implicit
                 } else {
-                    // W4-2: probe the FK→GKey map once (join existence + the
-                    // dim-subset group keys) when this is a join fold, then assemble
-                    // the composite key by interleaving fact-inline and dim-resolved
+                    // W4-2 + S2: probe EVERY group resolver by its own FK — join
+                    // existence + the dim-sourced group-key slices — then assemble the
+                    // composite key by interleaving fact-inline and dim-resolved
                     // positions in SPARQL order. A null/missing FK or a
-                    // dim-constraint/existence miss drops the fact row here; a null in
-                    // ANY key position drops it in `assemble_group_key` — both the
-                    // R2RML/inner-join row-drop. For an all-fact plan over a join
-                    // (empty dim subset) the map stores `[]` per FK, so this probe is
-                    // a pure existence filter and the key comes wholly from the fact.
-                    let dim_gkeys: Option<&[GKey]> = if let Some(resolver) =
-                        &resolved.group_resolver
-                    {
+                    // dim-constraint/existence miss on ANY resolver drops the fact row
+                    // here; a null in ANY key position drops it below — both the
+                    // R2RML/inner-join row-drop. Empty `group_resolvers` (single-table
+                    // plain-column fold) → a no-op, the key is wholly fact; for an
+                    // all-fact plan over a join (empty dim subset) the single map stores
+                    // `[]` per FK, so its probe is a pure existence filter. S2's multiple
+                    // ref-IRI keys probe one map per key, each by its own FK — the AND of
+                    // K independent inner-join existence tests.
+                    dim_probes.clear();
+                    let mut resolver_miss = false;
+                    for resolver in &resolved.group_resolvers {
                         let Some(fk) = get_join_key_from_batch(&resolver.fact_fk_cols, &batch, row)
                         else {
-                            continue;
+                            resolver_miss = true;
+                            break;
                         };
                         match resolver.map.get(&fk) {
-                            Some(gk) => Some(gk.as_slice()),
-                            None => continue,
+                            Some(gk) => dim_probes.push(gk.as_slice()),
+                            None => {
+                                resolver_miss = true;
+                                break;
+                            }
                         }
-                    } else {
-                        None
-                    };
+                    }
+                    if resolver_miss {
+                        continue;
+                    }
                     if vfold {
                         // N1: assemble the composite key BORROWED into the reused
                         // scratch — no per-row `String` clone / `Vec<GKey>` alloc.
@@ -1865,8 +1885,9 @@ impl Operator for FusedR2rmlAggregateOperator {
                         for (pos, slot) in resolved.group_key_plan.iter().enumerate() {
                             let comp = match slot {
                                 KeySource::Fact => gcols[pos].key_ref_at(key_cols[pos], row),
-                                KeySource::Dim(s) => dim_gkeys
-                                    .and_then(|g| g.get(*s))
+                                KeySource::Dim { resolver, slot } => dim_probes
+                                    .get(*resolver)
+                                    .and_then(|g| g.get(*slot))
                                     .and_then(GKeyRef::from_owned),
                             };
                             match comp {
@@ -1905,7 +1926,7 @@ impl Operator for FusedR2rmlAggregateOperator {
                             &resolved.group_key_plan,
                             gcols,
                             &key_cols,
-                            dim_gkeys,
+                            &dim_probes,
                             row,
                         ) else {
                             continue;
@@ -2263,14 +2284,16 @@ impl FusedR2rmlAggregateOperator {
         // key binding's datatype Sid is encoded from the snapshot so it matches
         // what the normal materialization path produces.
         let mut group_cols = Vec::with_capacity(self.group_by.len());
-        // P2a: per GROUP BY position, whether the key reads inline from the fact
-        // (`Fact`) or from the FK→IRI resolver (`Dim(0)`, for the one admitted
-        // RefObjectMap key). All-`Fact` keeps the fold byte-identical to before.
+        // P2a + S2: per GROUP BY position, whether the key reads inline from the fact
+        // (`Fact`) or from a FK→IRI resolver (`Dim { resolver, slot: 0 }`, one resolver
+        // per admitted RefObjectMap key). All-`Fact` keeps the fold byte-identical.
         let mut group_key_plan: Vec<KeySource> = Vec::with_capacity(self.group_by.len());
-        // P2a: the one RefObjectMap group key's (fact FK child cols, parent join
-        // cols, parent TM IRI), captured in SPARQL order; the FK→IRI resolver is
-        // built after the scan projection below. At most one (≥2 declines).
-        let mut ref_group_key: Option<(Vec<String>, Vec<String>, String)> = None;
+        // P2a + S2: each RefObjectMap group key's (fact FK child cols, parent join cols,
+        // parent TM IRI), captured in SPARQL order; a FK→IRI resolver is built per entry
+        // after the scan projection below. #1582 admitted at most ONE (crt_highcard); S2
+        // admits ≥2 behind `multifact_gen_enabled`, so an OFF run declines the 2nd ref
+        // key exactly as P2a did.
+        let mut ref_group_keys: Vec<(Vec<String>, Vec<String>, String)> = Vec::new();
         for gv in &self.group_by {
             let Some((col, datatype)) = Self::scalar_column_for_var(&pattern, tm, *gv) else {
                 // P2a (#1583 fan-out caveat): admit a RefObjectMap group key — the
@@ -2290,8 +2313,8 @@ impl FusedR2rmlAggregateOperator {
                 else {
                     return Ok(None); // neither a scalar column nor a ref object
                 };
-                if ref_group_key.is_some() {
-                    return Ok(None); // ≥2 ref group keys: follow-on scope
+                if !ref_group_keys.is_empty() && !Self::multifact_gen_enabled() {
+                    return Ok(None); // ≥2 ref group keys: the S2 widening, gated (OFF = P2a)
                 }
                 // The parent subject must be a pure IRI (the fold emits an IRI term);
                 // a blank-node / literal parent subject declines to the generic path.
@@ -2311,13 +2334,18 @@ impl FusedR2rmlAggregateOperator {
                 for c in &child_cols {
                     projection.push(c.clone());
                 }
-                group_key_plan.push(KeySource::Dim(0));
+                // This ref key gets its own resolver; its index is the entry's position
+                // in `ref_group_keys` (resolvers are built below in the same order).
+                group_key_plan.push(KeySource::Dim {
+                    resolver: ref_group_keys.len(),
+                    slot: 0,
+                });
                 group_cols.push(GroupCol {
                     column: child_cols.first().cloned().unwrap_or_default(),
                     kind: GKind::Iri,
                     dt_sid,
                 });
-                ref_group_key = Some((child_cols, parent_cols, parent_tm.iri.clone()));
+                ref_group_keys.push((child_cols, parent_cols, parent_tm.iri.clone()));
                 continue;
             };
             // C5 slice-1: default an un-annotated column group key to `xsd:string`
@@ -2462,17 +2490,17 @@ impl FusedR2rmlAggregateOperator {
         projection.sort();
         projection.dedup();
 
-        // P2a: build the FK→IRI resolver for the one admitted RefObjectMap group key
-        // by scanning the parent dimension ONCE — minting the parent-subject IRI per
-        // row exactly as `build_parent_lookup` does, with deterministic keep-min on a
-        // duplicate parent join key (matching the generic query path post-#1529), so
-        // the fused group key is byte-identical to the materialized `?c`. Null parent
-        // subject / null join key rows are skipped (they can never satisfy the join);
-        // a fact-row probe miss then folds "dangling FK" and "null parent" into one
-        // drop, exactly as the generic path does.
-        let group_resolver = if let Some((fk_child_cols, parent_cols, parent_tm_iri)) =
-            ref_group_key
-        {
+        // P2a + S2: build one FK→IRI resolver per admitted RefObjectMap group key by
+        // scanning its parent dimension ONCE — minting the parent-subject IRI per row
+        // exactly as `build_parent_lookup` does, with deterministic keep-min on a
+        // duplicate parent join key (matching the generic query path post-#1529), so each
+        // fused group key is byte-identical to the materialized IRI. Null parent subject /
+        // null join key rows are skipped (they can never satisfy the join); a fact-row
+        // probe miss then folds "dangling FK" and "null parent" into one drop, exactly as
+        // the generic path does. The resolvers are built in `ref_group_keys` order, so
+        // resolver index `i` matches the `KeySource::Dim { resolver: i, .. }` plan above.
+        let mut group_resolvers: Vec<GroupKeyResolver> = Vec::with_capacity(ref_group_keys.len());
+        for (fk_child_cols, parent_cols, parent_tm_iri) in ref_group_keys {
             let Some(parent_tm) = mapping.triples_maps.get(&parent_tm_iri) else {
                 return Ok(None);
             };
@@ -2528,13 +2556,11 @@ impl FusedR2rmlAggregateOperator {
                 }
                 ctx.record_alloc((map.len() - map_before) * crate::context::GROUP_EST_BYTES);
             }
-            Some(GroupKeyResolver {
+            group_resolvers.push(GroupKeyResolver {
                 fact_fk_cols: fk_child_cols,
                 map,
-            })
-        } else {
-            None
-        };
+            });
+        }
 
         Ok(Some(Resolved {
             pattern,
@@ -2546,7 +2572,7 @@ impl FusedR2rmlAggregateOperator {
             expr_folds,
             validity_cols,
             count_non_null_cols,
-            group_resolver,
+            group_resolvers,
             semi_joins: Vec::new(),
             group_key_plan,
             fact_constraints,
@@ -3406,7 +3432,12 @@ impl FusedR2rmlAggregateOperator {
                 group_key_plan.push(KeySource::Fact);
                 fact_key_cols.push(col);
             } else {
-                group_key_plan.push(KeySource::Dim(dim_group_cols.len()));
+                // The join path has ONE resolver (the terminal dim's FK→GKey map);
+                // every dim-sourced key is a slot within it (resolver 0).
+                group_key_plan.push(KeySource::Dim {
+                    resolver: 0,
+                    slot: dim_group_cols.len(),
+                });
                 dim_attr_cols.push(col);
                 dim_group_cols.push(gcol.clone());
             }
@@ -3748,7 +3779,9 @@ impl FusedR2rmlAggregateOperator {
             validity_cols,
             // The COUNT(*) manifest shortcut is single-table only.
             count_non_null_cols: Vec::new(),
-            group_resolver: Some(GroupKeyResolver { fact_fk_cols, map }),
+            // The join path is a single terminal-dim resolver (resolver index 0),
+            // matching the `KeySource::Dim { resolver: 0, .. }` plan above.
+            group_resolvers: vec![GroupKeyResolver { fact_fk_cols, map }],
             semi_joins,
             group_key_plan,
             fact_constraints: fact_checks,
@@ -5892,6 +5925,454 @@ mod tests {
         assert_eq!(out[0].0, "http://ex/cust/0");
     }
 
+    // --- S2: MULTIPLE RefObjectMap (IRI) group keys (single-table, ≥2 ref keys) ---
+
+    /// A `#Event --customerRef--> #Customer` + `--productRef--> #Product` mapping with a
+    /// scalar `AMT` measure. `GROUP BY ?c ?p (SUM(?amt))` where BOTH `?c` and `?p` are
+    /// referenced parent IRIs — S2's two-ref-group-key shape. Subject templates are
+    /// caller-chosen so a test can key a dim on a column OTHER than its join column (the
+    /// keep-min case on the 2nd ref key).
+    fn event_cust_prod_mapping(
+        cust_tmpl: &str,
+        prod_tmpl: &str,
+        amt_dt: &str,
+    ) -> Arc<CompiledR2rmlMapping> {
+        use fluree_db_r2rml::mapping::PredicateMap;
+        Arc::new(CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("#Event", "event")
+                .with_subject_template("http://ex/event/{EID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/customerRef"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Customer",
+                        "CFK",
+                        "CID",
+                    )),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/productRef"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Product", "PFK", "PID",
+                    )),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/amount"),
+                    object_map: ObjectMap::column_typed("AMT", amt_dt),
+                }),
+            TriplesMap::new("#Customer", "customer").with_subject_template(cust_tmpl),
+            TriplesMap::new("#Product", "product").with_subject_template(prod_tmpl),
+        ]))
+    }
+
+    /// Build the S2 fact pattern: `?e customerRef ?c ; productRef ?p ; amount ?amt`, both
+    /// ref objects group keys (star_bindings), one scalar measure. GROUP BY (?c, ?p),
+    /// SUM(?amt).
+    fn s2_two_ref_plan() -> FusedAggregatePlan {
+        use crate::ir::grouping::InputSemantics;
+        let (e, c, p, amt, sum) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(20));
+        let mut fact = R2rmlPattern::new("gs", e, None);
+        fact.triples_map_iri = Some("#Event".to_string());
+        fact.star_bindings = vec![
+            ("http://ex/customerRef".into(), c),
+            ("http://ex/productRef".into(), p),
+            ("http://ex/amount".into(), amt),
+        ];
+        FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![Pattern::R2rml(fact)],
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![c, p],
+            aggregates: vec![(sum, AggregateFn::Sum(amt, InputSemantics::List))],
+        }
+    }
+
+    /// Run the S2 two-ref-key fold, returning `(customer IRI, product IRI, SUM binding)`
+    /// sorted by (customer, product). PANICS if a key is not an IRI term or the shape
+    /// declines. Holds the GEN lock across `open` (which reads the ≥2-ref gate under
+    /// cfg(test)) so the switch test's mutation window cannot flip the admission mid-run;
+    /// the runtime is current-thread, so holding across this single await is safe.
+    #[allow(clippy::await_holding_lock)]
+    async fn run_s2_two_ref(
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: std::collections::HashMap<String, fluree_db_tabular::ColumnBatch>,
+    ) -> Vec<(String, String, Binding)> {
+        use crate::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use async_trait::async_trait;
+        use fluree_db_core::LedgerSnapshot;
+
+        #[derive(Debug)]
+        struct P {
+            m: Arc<CompiledR2rmlMapping>,
+            b: std::collections::HashMap<String, fluree_db_tabular::ColumnBatch>,
+        }
+        #[async_trait]
+        impl R2rmlProvider for P {
+            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
+                true
+            }
+            async fn compiled_mapping(
+                &self,
+                _gs: &str,
+                _t: Option<i64>,
+            ) -> Result<Arc<CompiledR2rmlMapping>> {
+                Ok(Arc::clone(&self.m))
+            }
+        }
+        #[async_trait]
+        impl R2rmlTableProvider for P {
+            async fn scan_table(
+                &self,
+                _gs: &str,
+                table: &str,
+                _p: &[String],
+                _f: &[ScanFilter],
+                _tk: Option<&crate::r2rml::ScanTopK>,
+                _t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                let b = self
+                    .b
+                    .get(table)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("no batch for table {table}"));
+                Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
+            }
+        }
+
+        let (c, p, sum) = (VarId(1), VarId(2), VarId(20));
+        let mut op =
+            FusedR2rmlAggregateOperator::new(s2_two_ref_plan(), Box::new(EmptyOperator::new()));
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let provider = P {
+            m: mapping,
+            b: batches,
+        };
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        {
+            // GEN read (the ≥2-ref gate) happens inside open(); serialize it.
+            let _g = gen_lock();
+            op.open(&ctx).await.expect("open");
+        }
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+            let n = batch.column(c).map(<[Binding]>::len).unwrap_or(0);
+            for row in 0..n {
+                let ci = match batch.get(row, c).expect("customer key") {
+                    Binding::Iri(s) => s.to_string(),
+                    other => panic!("customer group key must be an IRI, got {other:?}"),
+                };
+                let pi = match batch.get(row, p).expect("product key") {
+                    Binding::Iri(s) => s.to_string(),
+                    other => panic!("product group key must be an IRI, got {other:?}"),
+                };
+                out.push((ci, pi, batch.get(row, sum).expect("sum binding").clone()));
+            }
+        }
+        out.sort_by_key(|(c, p, _)| (c.clone(), p.clone()));
+        out
+    }
+
+    /// (S2-a) VALUE-IDENTITY: SUM(amount) grouped by TWO ref-IRI keys equals the generic
+    /// two-inner-join answer, byte-identical. Two resolvers, one per FK; a dangling FK on
+    /// EITHER key drops the row (E5 dangling customer, E6 dangling product).
+    #[tokio::test]
+    async fn s2_two_ref_iri_value_identity_integer() {
+        let mapping = event_cust_prod_mapping(
+            "http://ex/cust/{CID}",
+            "http://ex/prod/{PID}",
+            fluree_vocab::xsd::INTEGER,
+        );
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "event".to_string(),
+            batch_of(vec![
+                i64_col(
+                    "EID",
+                    1,
+                    vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)],
+                ),
+                i64_col(
+                    "CFK",
+                    2,
+                    vec![Some(10), Some(10), Some(10), Some(20), Some(99), Some(10)],
+                ),
+                i64_col(
+                    "PFK",
+                    3,
+                    vec![
+                        Some(100),
+                        Some(100),
+                        Some(200),
+                        Some(100),
+                        Some(100),
+                        Some(999),
+                    ],
+                ),
+                i64_col(
+                    "AMT",
+                    4,
+                    vec![Some(5), Some(7), Some(3), Some(4), Some(9), Some(11)],
+                ),
+            ]),
+        );
+        batches.insert(
+            "customer".to_string(),
+            batch_of(vec![i64_col("CID", 1, vec![Some(10), Some(20)])]),
+        );
+        batches.insert(
+            "product".to_string(),
+            batch_of(vec![i64_col("PID", 1, vec![Some(100), Some(200)])]),
+        );
+        let out = run_s2_two_ref(mapping, batches).await;
+        assert_eq!(
+            out,
+            vec![
+                ("http://ex/cust/10".into(), "http://ex/prod/100".into(), long_sum(12)),
+                ("http://ex/cust/10".into(), "http://ex/prod/200".into(), long_sum(3)),
+                ("http://ex/cust/20".into(), "http://ex/prod/100".into(), long_sum(4)),
+            ],
+            "two-ref-key SUM must equal the generic two-inner-join answer (both dangling FKs dropped)"
+        );
+    }
+
+    /// (S2-a′) VALUE-IDENTITY, exact i128 path with two ref keys: a decimal measure folds
+    /// through `Acc::Exact` while the composite (customer, product) IRI key is resolved
+    /// via two FK→IRI maps. Amounts 5.25, 7.25, 3.50, 4.00.
+    #[tokio::test]
+    async fn s2_two_ref_iri_value_identity_decimal() {
+        let mapping = event_cust_prod_mapping(
+            "http://ex/cust/{CID}",
+            "http://ex/prod/{PID}",
+            fluree_vocab::xsd::DECIMAL,
+        );
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "event".to_string(),
+            batch_of(vec![
+                i64_col("EID", 1, vec![Some(1), Some(2), Some(3), Some(4)]),
+                i64_col("CFK", 2, vec![Some(10), Some(10), Some(10), Some(20)]),
+                i64_col("PFK", 3, vec![Some(100), Some(100), Some(200), Some(100)]),
+                (
+                    field(
+                        "AMT",
+                        4,
+                        FieldType::Decimal {
+                            precision: 12,
+                            scale: 2,
+                        },
+                    ),
+                    Column::Decimal {
+                        values: vec![Some(525), Some(725), Some(350), Some(400)],
+                        precision: 12,
+                        scale: 2,
+                    },
+                ),
+            ]),
+        );
+        batches.insert(
+            "customer".to_string(),
+            batch_of(vec![i64_col("CID", 1, vec![Some(10), Some(20)])]),
+        );
+        batches.insert(
+            "product".to_string(),
+            batch_of(vec![i64_col("PID", 1, vec![Some(100), Some(200)])]),
+        );
+        let dec = |unscaled: i128| {
+            Acc::Exact {
+                sum: unscaled,
+                scale: 2,
+                decimal: true,
+                count: 1,
+                is_avg: false,
+            }
+            .finalize()
+        };
+        let out = run_s2_two_ref(mapping, batches).await;
+        assert_eq!(
+            out,
+            vec![
+                ("http://ex/cust/10".into(), "http://ex/prod/100".into(), dec(1250)), // 12.50
+                ("http://ex/cust/10".into(), "http://ex/prod/200".into(), dec(350)),  // 3.50
+                ("http://ex/cust/20".into(), "http://ex/prod/100".into(), dec(400)),  // 4.00
+            ],
+            "two-ref-key decimal SUM must be byte-identical to the exact i128 → BigDecimal finalize"
+        );
+    }
+
+    /// (S2-b) KEEP-MIN on the SECOND ref key (product): a duplicate product join key
+    /// PID=100 with DISTINCT subjects prod/b (row 0) and prod/a (row 1). The generic path
+    /// keeps the lexicographically smaller subject (prod/a), so the fused resolver must
+    /// too — the same keep-min P2a proved for one ref key, now at the 2nd resolver.
+    #[tokio::test]
+    async fn s2_two_ref_iri_keep_min_on_second_ref() {
+        let mapping = event_cust_prod_mapping(
+            "http://ex/cust/{CID}",
+            "http://ex/prod/{PSID}",
+            fluree_vocab::xsd::INTEGER,
+        );
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "event".to_string(),
+            batch_of(vec![
+                i64_col("EID", 1, vec![Some(1)]),
+                i64_col("CFK", 2, vec![Some(10)]),
+                i64_col("PFK", 3, vec![Some(100)]),
+                i64_col("AMT", 4, vec![Some(50)]),
+            ]),
+        );
+        batches.insert(
+            "customer".to_string(),
+            batch_of(vec![i64_col("CID", 1, vec![Some(10)])]),
+        );
+        // PID=100 twice, subjects prod/b then prod/a → keep-min is prod/a.
+        batches.insert(
+            "product".to_string(),
+            batch_of(vec![
+                str_col("PSID", 1, vec![Some("b".into()), Some("a".into())]),
+                i64_col("PID", 2, vec![Some(100), Some(100)]),
+            ]),
+        );
+        let out = run_s2_two_ref(mapping, batches).await;
+        assert_eq!(
+            out,
+            vec![(
+                "http://ex/cust/10".into(),
+                "http://ex/prod/a".into(),
+                long_sum(50)
+            )],
+            "the 2nd ref resolver must keep-min the product subject (prod/a), not last-wins prod/b"
+        );
+    }
+
+    /// (S2-switch) `FLUREE_FUSED_R2RML_MULTIFACT_GEN=0` gates ONLY the widening: a
+    /// two-ref-key single-table fold DECLINES (`resolve_at_open` → None → generic path),
+    /// while a ONE-ref-key fold (P2a) STILL fuses — so OFF is byte-identical to P2a. Holds
+    /// the GEN lock (shared with the run helpers) across the reads.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn s2_gen_switch_gates_only_the_widening() {
+        use crate::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use async_trait::async_trait;
+        use fluree_db_core::LedgerSnapshot;
+
+        #[derive(Debug)]
+        struct P {
+            m: Arc<CompiledR2rmlMapping>,
+            b: std::collections::HashMap<String, fluree_db_tabular::ColumnBatch>,
+        }
+        #[async_trait]
+        impl R2rmlProvider for P {
+            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
+                true
+            }
+            async fn compiled_mapping(
+                &self,
+                _gs: &str,
+                _t: Option<i64>,
+            ) -> Result<Arc<CompiledR2rmlMapping>> {
+                Ok(Arc::clone(&self.m))
+            }
+        }
+        #[async_trait]
+        impl R2rmlTableProvider for P {
+            async fn scan_table(
+                &self,
+                _gs: &str,
+                table: &str,
+                _p: &[String],
+                _f: &[ScanFilter],
+                _tk: Option<&crate::r2rml::ScanTopK>,
+                _t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                let b = self
+                    .b
+                    .get(table)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("no batch for table {table}"));
+                Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
+            }
+        }
+
+        // Minimal valid batches so a fused plan resolves (empty dims are fine — we only
+        // check Some/None from resolve_at_open, not the fold output).
+        let mut b = std::collections::HashMap::new();
+        b.insert(
+            "event".to_string(),
+            batch_of(vec![
+                i64_col("EID", 1, vec![]),
+                i64_col("CFK", 2, vec![]),
+                i64_col("PFK", 3, vec![]),
+                i64_col("AMT", 4, vec![]),
+            ]),
+        );
+        b.insert(
+            "customer".to_string(),
+            batch_of(vec![i64_col("CID", 1, vec![])]),
+        );
+        b.insert(
+            "product".to_string(),
+            batch_of(vec![i64_col("PID", 1, vec![])]),
+        );
+        let mapping = event_cust_prod_mapping(
+            "http://ex/cust/{CID}",
+            "http://ex/prod/{PID}",
+            fluree_vocab::xsd::INTEGER,
+        );
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let provider = P {
+            m: Arc::clone(&mapping),
+            b,
+        };
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+
+        // One-ref-key plan (P2a): GROUP BY ?c only.
+        let one_ref_op = || {
+            let mut op = s2_two_ref_plan();
+            op.group_by = vec![VarId(1)];
+            FusedR2rmlAggregateOperator::new(op, Box::new(EmptyOperator::new()))
+        };
+        let two_ref_op =
+            || FusedR2rmlAggregateOperator::new(s2_two_ref_plan(), Box::new(EmptyOperator::new()));
+
+        let _g = gen_lock();
+        // OFF: two-ref declines, one-ref still fuses.
+        std::env::set_var("FLUREE_FUSED_R2RML_MULTIFACT_GEN", "0");
+        assert!(
+            two_ref_op()
+                .resolve_at_open(&ctx)
+                .await
+                .expect("resolve")
+                .is_none(),
+            "GEN off must DECLINE the ≥2 ref-key fold"
+        );
+        assert!(
+            one_ref_op()
+                .resolve_at_open(&ctx)
+                .await
+                .expect("resolve")
+                .is_some(),
+            "GEN off must STILL fuse a single ref-key fold (byte-identical to P2a)"
+        );
+        // ON: two-ref fuses.
+        std::env::remove_var("FLUREE_FUSED_R2RML_MULTIFACT_GEN");
+        assert!(
+            two_ref_op()
+                .resolve_at_open(&ctx)
+                .await
+                .expect("resolve")
+                .is_some(),
+            "GEN on must FUSE the ≥2 ref-key fold"
+        );
+    }
+
     #[test]
     fn declines_with_group_by() {
         // Slice 1 is implicit aggregation only.
@@ -6240,28 +6721,37 @@ mod tests {
         let ground = Column::String(vec![Some("Ground".into())]);
         let null_str = Column::String(vec![None]);
 
-        // plan [Fact(shipMethod), Dim(0)=year] → [Str, Int] in order.
+        // Resolver-0 probe slices (S2: `dim_probes` is one slice per resolver).
+        let year: &[GKey] = &[GKey::Int(2024)];
+        let nullp: &[GKey] = &[GKey::Null];
+        let empty_dim: &[GKey] = &[];
+        let dim0 = KeySource::Dim {
+            resolver: 0,
+            slot: 0,
+        };
+
+        // plan [Fact(shipMethod), Dim{0,0}=year] → [Str, Int] in order.
         let gc = vec![s_col.clone(), i_col.clone()];
         let kc = vec![Some(&ground), None];
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
-                &[KeySource::Fact, KeySource::Dim(0)],
+                &[KeySource::Fact, dim0],
                 &gc,
                 &kc,
-                Some(&[GKey::Int(2024)]),
+                &[year],
                 0
             ),
             Some(vec![GKey::Str("Ground".into()), GKey::Int(2024)])
         );
-        // Swapped order [Dim(0)=year, Fact(shipMethod)] → [Int, Str].
+        // Swapped order [Dim{0,0}=year, Fact(shipMethod)] → [Int, Str].
         let gc2 = vec![i_col.clone(), s_col.clone()];
         let kc2 = vec![None, Some(&ground)];
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
-                &[KeySource::Dim(0), KeySource::Fact],
+                &[dim0, KeySource::Fact],
                 &gc2,
                 &kc2,
-                Some(&[GKey::Int(2024)]),
+                &[year],
                 0
             ),
             Some(vec![GKey::Int(2024), GKey::Str("Ground".into())])
@@ -6270,10 +6760,10 @@ mod tests {
         let kc_null = vec![Some(&null_str), None];
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
-                &[KeySource::Fact, KeySource::Dim(0)],
+                &[KeySource::Fact, dim0],
                 &gc,
                 &kc_null,
-                Some(&[GKey::Int(2024)]),
+                &[year],
                 0
             ),
             None
@@ -6281,47 +6771,47 @@ mod tests {
         // Null DIM key position → drop.
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
-                &[KeySource::Fact, KeySource::Dim(0)],
+                &[KeySource::Fact, dim0],
                 &gc,
                 &kc,
-                Some(&[GKey::Null]),
+                &[nullp],
                 0
             ),
             None
         );
-        // Dim slot present but no resolver value → drop (defensive).
+        // Dim slot present but no resolver value (empty probes) → drop (defensive).
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
-                &[KeySource::Dim(0)],
+                &[dim0],
                 std::slice::from_ref(&i_col),
                 &[None],
-                None,
+                &[],
                 0
             ),
             None
         );
-        // All-fact plan, no resolver: key wholly inline (invariant #1 fold side).
+        // All-fact plan, no resolvers: key wholly inline (invariant #1 fold side).
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[KeySource::Fact],
                 std::slice::from_ref(&s_col),
                 &[Some(&ground)],
-                None,
+                &[],
                 0
             ),
             Some(vec![GKey::Str("Ground".into())])
         );
         // W4-2 invariant #1, the DEGENERATE join branch: an all-fact plan over a
-        // join yields `Some(&[])` from the FK→GKey map (existence passed, no dim
-        // keys). assemble must take the key wholly from the fact and NOT index the
-        // empty dim slice — the empty-dim-subset join reduces to an FK-existence
+        // join yields an empty dim slice `&[]` from the FK→GKey map (existence passed,
+        // no dim keys). assemble must take the key wholly from the fact and NOT index
+        // the empty dim slice — the empty-dim-subset join reduces to an FK-existence
         // filter + inline fact grouping.
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[KeySource::Fact],
                 std::slice::from_ref(&s_col),
                 &[Some(&ground)],
-                Some(&[]),
+                &[empty_dim],
                 0
             ),
             Some(vec![GKey::Str("Ground".into())])
