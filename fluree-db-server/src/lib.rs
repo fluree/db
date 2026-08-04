@@ -430,12 +430,12 @@ impl FlureeServer {
             }
             Bm25WorkerOwner::ThisServer => {
                 let (worker, handle) = build_bm25_worker(Arc::clone(&self.state.fluree)).await;
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     if let Err(e) = worker.run().await {
                         tracing::error!(error = %e, "BM25 maintenance worker exited");
                     }
                 });
-                Some(handle)
+                Some((handle, task))
             }
         };
 
@@ -535,10 +535,22 @@ impl FlureeServer {
         if let Some(task) = ledger_maintenance_task {
             task.abort();
         }
-        // Ask the BM25 worker to stop rather than aborting it, so an in-flight
-        // sync finishes its publish instead of being cut mid-write.
-        if let Some(handle) = bm25_auto_sync {
+        // Ask the BM25 worker to stop rather than aborting it, then await the
+        // task: `run()` drains the syncs already in flight before returning, so
+        // a publish in progress completes instead of being cut mid-write. The
+        // `stop()` alone only sets a flag — without the await, the runtime goes
+        // away underneath the sync and cancels it at its next await point.
+        //
+        // Bounded, because a sync re-runs the whole indexing query over the
+        // source ledger; a large corpus must not hold teardown open.
+        if let Some((handle, task)) = bm25_auto_sync {
             handle.stop();
+            if tokio::time::timeout(SHUTDOWN_GRACE, task).await.is_err() {
+                tracing::warn!(
+                    grace_secs = SHUTDOWN_GRACE.as_secs(),
+                    "BM25 worker did not finish its in-flight syncs; abandoning them"
+                );
+            }
         }
         #[cfg(feature = "raft")]
         if let Some(task) = raft_listener_task {
@@ -984,6 +996,12 @@ impl FlureeServerBuilder {
                 // happens inside the task because this closure is sync and
                 // re-runs on every leadership acquisition, by which point the
                 // set of indexes may have changed.
+                //
+                // Losing leadership abort-and-awaits this task rather than
+                // asking it to stop, so unlike the standalone shutdown path it
+                // does cut an in-flight sync. That is the wanted behavior for a
+                // demotion: an ex-leader's publish proposal no longer carries,
+                // so finishing the sync would only delay the handover.
                 if bm25_auto_sync {
                     tasks.push(tokio::spawn(run_bm25_worker(Arc::clone(&bm25_fluree))));
                 }

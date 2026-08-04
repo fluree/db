@@ -47,6 +47,16 @@ use tracing::{debug, error, info, warn};
 /// executor via `tokio::spawn`.
 type SyncFuture<'a> = Pin<Box<dyn Future<Output = (String, Result<()>)> + Send + 'a>>;
 
+/// Log a sync that ended in an error.
+///
+/// A failed sync leaves the index at its previous watermark, so the next commit
+/// on the source ledger re-queues it; the worker keeps running either way.
+fn log_sync_failure(graph_source_id: &str, res: Result<()>) {
+    if let Err(e) = res {
+        warn!(graph_source = %graph_source_id, error = %e, "Failed to sync graph source");
+    }
+}
+
 /// Remove up to `capacity` graph sources from `pending` that have no sync
 /// running, and return them.
 ///
@@ -447,9 +457,18 @@ impl Bm25MaintenanceWorker {
         let mut in_flight_ids: HashSet<String> = HashSet::new();
 
         loop {
-            // Check for stop request
+            // Stop requested. Drain the syncs already running before returning:
+            // dropping `in_flight` cancels them at their next await point, which
+            // can leave a snapshot written to storage but never published, and
+            // the manifest still pointing at the previous one.
             if self.stop_requested.load(Ordering::Relaxed) {
-                info!("BM25 maintenance worker stopping");
+                info!(
+                    draining = in_flight.len(),
+                    "BM25 maintenance worker stopping"
+                );
+                while let Some((graph_source_id, res)) = in_flight.next().await {
+                    log_sync_failure(&graph_source_id, res);
+                }
                 break;
             }
 
@@ -519,9 +538,7 @@ impl Bm25MaintenanceWorker {
                 // Complete one in-flight sync.
                 Some((graph_source_id, res)) = in_flight.next() => {
                     in_flight_ids.remove(&graph_source_id);
-                    if let Err(e) = res {
-                        warn!(graph_source = %graph_source_id, error = %e, "Failed to sync graph source");
-                    }
+                    log_sync_failure(&graph_source_id, res);
                 }
 
                 // Debounce tick / stop-check tick
