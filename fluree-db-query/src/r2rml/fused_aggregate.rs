@@ -5958,6 +5958,12 @@ mod tests {
                 .with_predicate_object(PredicateObjectMap {
                     predicate_map: PredicateMap::constant("http://ex/amount"),
                     object_map: ObjectMap::column_typed("AMT", amt_dt),
+                })
+                // S2-interleave: a scalar FACT-column group key (plain xsd:string),
+                // grouped alongside the two ref-IRI keys. Ignored by the two-ref tests.
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/device"),
+                    object_map: ObjectMap::column("DEVICE"),
                 }),
             TriplesMap::new("#Customer", "customer").with_subject_template(cust_tmpl),
             TriplesMap::new("#Product", "product").with_subject_template(prod_tmpl),
@@ -6370,6 +6376,126 @@ mod tests {
                 .expect("resolve")
                 .is_some(),
             "GEN on must FUSE the ≥2 ref-key fold"
+        );
+    }
+
+    /// (S2-interleave) A FACT-column group key interleaved with the two ref-IRI keys:
+    /// GROUP BY (device[Fact], customer[ref], product[ref]) SUM(amount). Pins the
+    /// positional lockstep between `group_key_plan` positions and their sources — the
+    /// Fact position reads the fact batch inline, each `Dim { resolver, slot }` position
+    /// reads its OWN resolver probe. Two events sharing (customer, product) but differing
+    /// in device must land in DIFFERENT groups, proving the fact-column position is part
+    /// of the composite key and is not confused with a resolver slot.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn s2_fact_col_interleaved_with_two_ref_keys() {
+        use crate::ir::grouping::InputSemantics;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let (e, c, p, amt, dev, sum) =
+            (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4), VarId(20));
+        let mut fact = R2rmlPattern::new("gs", e, None);
+        fact.triples_map_iri = Some("#Event".to_string());
+        fact.star_bindings = vec![
+            ("http://ex/customerRef".into(), c),
+            ("http://ex/productRef".into(), p),
+            ("http://ex/amount".into(), amt),
+            ("http://ex/device".into(), dev),
+        ];
+        let plan = FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![Pattern::R2rml(fact)],
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![dev, c, p], // fact-column key FIRST, then the two ref keys
+            aggregates: vec![(sum, AggregateFn::Sum(amt, InputSemantics::List))],
+        };
+        let mapping = event_cust_prod_mapping(
+            "http://ex/cust/{CID}",
+            "http://ex/prod/{PID}",
+            fluree_vocab::xsd::INTEGER,
+        );
+        let mut batches = std::collections::HashMap::new();
+        // Same (c=10,p=100) on E1/E2 (mobile) vs E3 (desktop) → device splits the group.
+        batches.insert(
+            "event".to_string(),
+            vec![mk_batch(vec![
+                icol("EID", 1, vec![Some(1), Some(2), Some(3), Some(4)]),
+                icol("CFK", 2, vec![Some(10), Some(10), Some(10), Some(20)]),
+                icol("PFK", 3, vec![Some(100), Some(100), Some(100), Some(100)]),
+                icol("AMT", 4, vec![Some(5), Some(7), Some(3), Some(4)]),
+                scol("DEVICE", 5, vec!["mobile", "mobile", "desktop", "mobile"]),
+            ])],
+        );
+        batches.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![icol("CID", 1, vec![Some(10), Some(20)])])],
+        );
+        batches.insert(
+            "product".to_string(),
+            vec![mk_batch(vec![icol("PID", 1, vec![Some(100)])])],
+        );
+        let provider = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches,
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let mut op =
+            FusedR2rmlAggregateOperator::new(plan, Box::new(crate::seed::EmptyOperator::new()));
+        {
+            let _g = gen_lock();
+            op.open(&ctx).await.expect("open");
+        }
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+            let n = batch.column(dev).map(<[Binding]>::len).unwrap_or(0);
+            for row in 0..n {
+                let d = match batch.get(row, dev).expect("device key") {
+                    Binding::Lit {
+                        val: FlakeValue::String(s),
+                        ..
+                    } => s.clone(),
+                    other => panic!("device key must be an xsd:string literal, got {other:?}"),
+                };
+                let ci = match batch.get(row, c).expect("customer key") {
+                    Binding::Iri(s) => s.to_string(),
+                    other => panic!("customer key must be an IRI, got {other:?}"),
+                };
+                let pi = match batch.get(row, p).expect("product key") {
+                    Binding::Iri(s) => s.to_string(),
+                    other => panic!("product key must be an IRI, got {other:?}"),
+                };
+                out.push((d, ci, pi, batch.get(row, sum).expect("sum binding").clone()));
+            }
+        }
+        out.sort_by_key(|(d, c, p, _)| (d.clone(), c.clone(), p.clone()));
+        assert_eq!(
+            out,
+            vec![
+                (
+                    "desktop".to_string(),
+                    "http://ex/cust/10".to_string(),
+                    "http://ex/prod/100".to_string(),
+                    long_sum(3)
+                ),
+                (
+                    "mobile".to_string(),
+                    "http://ex/cust/10".to_string(),
+                    "http://ex/prod/100".to_string(),
+                    long_sum(12)
+                ),
+                (
+                    "mobile".to_string(),
+                    "http://ex/cust/20".to_string(),
+                    "http://ex/prod/100".to_string(),
+                    long_sum(4)
+                ),
+            ],
+            "the fact-column key must interleave positionally with the two ref-IRI keys \
+             (same customer+product but different device => different groups)"
         );
     }
 
@@ -8031,6 +8157,31 @@ mod tests {
         );
     }
 
+    /// (S1-a-mixed) The two semi-join branches in DIFFERENT const-object forms in ONE
+    /// query: customer.segment folded as star_constraints, agent.department standalone.
+    /// The other S1 tests are form-symmetric (both standalone, or both star); this pins
+    /// the MIXED path -- resolve_semijoin_pattern_constraints must gather each branch's
+    /// constraint in whichever form the rewrite emitted, independently, in the same fuse.
+    #[tokio::test]
+    async fn s1_k2_semijoin_mixed_constraint_forms() {
+        let out = run_s1(
+            s1_mapping(fluree_vocab::xsd::INTEGER),
+            s1_clean_batches(),
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(
+            out,
+            vec![
+                ("Gadgets".to_string(), long_sum(3)),
+                ("Widgets".to_string(), long_sum(12)),
+            ],
+            "a star_constraints semi-join branch + a standalone const-object semi-join branch \
+             in the same query must produce the same filtered answer as either symmetric form"
+        );
+    }
+
     /// (S1-a′) VALUE-IDENTITY, exact i128 path in the K≥2 shape: a decimal measure folds
     /// through `Acc::Exact`. Same six rows; qty 5.25, 7.25, 3.50 on the survivors.
     /// Widgets=12.50, Gadgets=3.50, byte-identical to the exact finalize.
@@ -8286,6 +8437,198 @@ mod tests {
         assert!(
             FusedR2rmlAggregateOperator::decompose_branching_star(&s1_refs, &[VarId(12)]).is_some(),
             "GEN on must ADMIT the K≥2 star"
+        );
+    }
+
+    // --- S1 (same-table semi-branches): two SEMI-JOIN branches on the SAME dim table ---
+
+    /// A `#Deal` fact with a product group-key branch and TWO semi-join branches that both
+    /// reference `#Customer` (the SAME dim table) via DIFFERENT FK columns (BUYER_KEY,
+    /// SELLER_KEY) with DIFFERENT constraints (buyer segment='Enterprise', seller
+    /// segment='SMB'). Each branch builds its own membership set from an independent scan
+    /// of the shared table, keyed/filtered on its own FK — the reviewer verified the
+    /// semantics are sound; this pins it.
+    fn s1_same_table_mapping() -> Arc<CompiledR2rmlMapping> {
+        use fluree_db_r2rml::mapping::PredicateMap;
+        use fluree_vocab::xsd;
+        Arc::new(CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("#Deal", "deal")
+                .with_subject_template("http://ex/deal/{DID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/quantity"),
+                    object_map: ObjectMap::column_typed("QTY", xsd::INTEGER),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/product"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Product",
+                        "PRODUCT_KEY",
+                        "PRODUCT_KEY",
+                    )),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/buyer"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Customer",
+                        "BUYER_KEY",
+                        "CUSTOMER_KEY",
+                    )),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/seller"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Customer",
+                        "SELLER_KEY",
+                        "CUSTOMER_KEY",
+                    )),
+                }),
+            TriplesMap::new("#Product", "product")
+                .with_subject_template("http://ex/prod/{PRODUCT_KEY}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/category"),
+                    object_map: ObjectMap::column("CATEGORY"),
+                }),
+            TriplesMap::new("#Customer", "customer")
+                .with_subject_template("http://ex/cust/{CUSTOMER_KEY}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/segment"),
+                    object_map: ObjectMap::column("SEGMENT"),
+                }),
+        ]))
+    }
+
+    /// Deal fact `?d(0)` {quantity=?q(10), product=?p(2), buyer=?b(3), seller=?s(4)};
+    /// `?p(2)` {category=?cat(12)}; `?b(3)` [segment="Enterprise"] (standalone);
+    /// `?s(4)` [segment="SMB"] (standalone) — both terminals on `#Customer`.
+    fn s1_same_table_patterns() -> [R2rmlPattern; 4] {
+        let (d, prod, buyer, seller) = (VarId(0), VarId(2), VarId(3), VarId(4));
+        let (qty, cat) = (VarId(10), VarId(12));
+        let mut dp = R2rmlPattern::new("gs", d, None);
+        dp.triples_map_iri = Some("#Deal".into());
+        dp.star_bindings = vec![
+            ("http://ex/quantity".into(), qty),
+            ("http://ex/product".into(), prod),
+            ("http://ex/buyer".into(), buyer),
+            ("http://ex/seller".into(), seller),
+        ];
+        let mut pp = R2rmlPattern::new("gs", prod, None);
+        pp.triples_map_iri = Some("#Product".into());
+        pp.star_bindings = vec![("http://ex/category".into(), cat)];
+        let mut bp = R2rmlPattern::new("gs", buyer, None);
+        bp.triples_map_iri = Some("#Customer".into());
+        bp.predicate_filter = Some("http://ex/segment".into());
+        bp.object_constant = Some(crate::r2rml::ObjectConstant::Scalar(
+            crate::r2rml::ScanValue::Str("Enterprise".into()),
+        ));
+        let mut sp = R2rmlPattern::new("gs", seller, None);
+        sp.triples_map_iri = Some("#Customer".into());
+        sp.predicate_filter = Some("http://ex/segment".into());
+        sp.object_constant = Some(crate::r2rml::ObjectConstant::Scalar(
+            crate::r2rml::ScanValue::Str("SMB".into()),
+        ));
+        [dp, pp, bp, sp]
+    }
+
+    async fn run_s1_same_table(
+        batches: std::collections::HashMap<String, Vec<ColumnBatch>>,
+    ) -> Vec<(String, Binding)> {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let mapping = s1_same_table_mapping();
+        let pats = s1_same_table_patterns();
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let star = {
+            let _g = gen_lock();
+            FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+                .expect("same-table K=2 shape must decompose")
+        };
+        let provider = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches,
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let mut op = s1_op();
+        let resolved = op
+            .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+            .await
+            .expect("resolve must not error")
+            .expect("same-table K=2 shape must FUSE");
+        op.resolved = Some(resolved);
+        let (cat, u) = (VarId(12), VarId(20));
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+            let n = batch.column(cat).map(<[Binding]>::len).unwrap_or(0);
+            for row in 0..n {
+                let c = match batch.get(row, cat).expect("cat binding") {
+                    Binding::Lit {
+                        val: FlakeValue::String(s),
+                        ..
+                    } => s.clone(),
+                    other => panic!("category key must be an xsd:string literal, got {other:?}"),
+                };
+                out.push((c, batch.get(row, u).expect("sum binding").clone()));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// (S1-same-table) The two same-table semi-join branches are enforced INDEPENDENTLY:
+    /// buyer must be Enterprise AND seller must be SMB. D4 (buyer SMB) drops on the buyer
+    /// branch; D5 (seller Enterprise) drops on the seller branch — proving the two
+    /// membership sets, though built from the same `#Customer` table, filter on their own
+    /// FK + constraint and are not conflated.
+    #[tokio::test]
+    async fn s1_same_table_semi_branches_independent() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "deal".to_string(),
+            vec![mk_batch(vec![
+                icol("DID", 1, vec![Some(1), Some(2), Some(3), Some(4), Some(5)]),
+                icol(
+                    "BUYER_KEY",
+                    2,
+                    vec![Some(1), Some(3), Some(1), Some(2), Some(1)],
+                ),
+                icol(
+                    "SELLER_KEY",
+                    3,
+                    vec![Some(2), Some(4), Some(2), Some(4), Some(1)],
+                ),
+                icol(
+                    "PRODUCT_KEY",
+                    4,
+                    vec![Some(100), Some(100), Some(200), Some(100), Some(100)],
+                ),
+                icol("QTY", 5, vec![Some(5), Some(7), Some(3), Some(9), Some(11)]),
+            ])],
+        );
+        m.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![
+                icol("CUSTOMER_KEY", 1, vec![Some(1), Some(2), Some(3), Some(4)]),
+                scol("SEGMENT", 2, vec!["Enterprise", "SMB", "Enterprise", "SMB"]),
+            ])],
+        );
+        m.insert(
+            "product".to_string(),
+            vec![mk_batch(vec![
+                icol("PRODUCT_KEY", 1, vec![Some(100), Some(200)]),
+                scol("CATEGORY", 2, vec!["Widgets", "Gadgets"]),
+            ])],
+        );
+        let out = run_s1_same_table(m).await;
+        assert_eq!(
+            out,
+            vec![
+                ("Gadgets".to_string(), long_sum(3)),
+                ("Widgets".to_string(), long_sum(12)),
+            ],
+            "two semi-join branches on the SAME dim table enforce independently: buyer=Enterprise \
+             drops D4 (SMB buyer), seller=SMB drops D5 (Enterprise seller)"
         );
     }
 }
