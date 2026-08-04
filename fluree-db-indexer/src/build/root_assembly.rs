@@ -174,37 +174,77 @@ async fn load_prev_annotation_index(
 /// manifests via `collect_root_cas_ids_expanded`. Diffing only the direct
 /// CAS refs (`all_cas_ids()`) would silently leak those leaves on every
 /// reindex.
-// Kept for: shared GC chain computation for both rebuild and incremental pipelines.
-// Use when: rebuild.rs Phase F.7 is refactored to use this shared helper.
-#[expect(dead_code)]
+/// Note the ORDER of concerns: the `prev_index` link is established as soon as the
+/// previous root decodes, and the garbage diff is best-effort ON TOP of it. That
+/// separation is deliberate and load-bearing.
+///
+/// The two are independent facts — the link says "this version follows that one",
+/// the manifest says "these blobs were replaced" — and conflating them severs
+/// chains. An earlier shape returned `None` if either CAS expansion failed, which
+/// would publish a root with NO `prev_index`, silently starting a fresh lineage and
+/// making every earlier version unreachable. Unreachable means GC cannot see it,
+/// and nothing else reclaims by reachability, so that space is gone for good.
+///
+/// Measured on a live ledger while the rebuild path passed no chain context at all:
+/// 226 roots on disk, **15 reachable**, 211 orphaned — with 0 fork points and 211
+/// distinct `index_t` (so not a race), traced to two roots carrying no `prev_index`
+/// at `index_t` 6739 and 8627, each severing everything below it.
+///
+/// Failing to compute garbage costs some unreleased blobs, which a later sweep can
+/// still find. Failing to link the chain costs the entire history, permanently.
+/// Never trade the second for the first.
 pub(crate) async fn compute_garbage_from_prev_root(
     content_store: &dyn fluree_db_core::storage::ContentStore,
     new_root: &IndexRoot,
     prev_root_id: &ContentId,
 ) -> Option<GarbageContext> {
+    // The only unrecoverable case: without decoding the previous root there is no
+    // `t` for the link, so there is nothing well-formed to point at.
     let prev_bytes = content_store.get(prev_root_id).await.ok()?;
     let prev_root = IndexRoot::decode(&prev_bytes).ok()?;
 
-    let prev_t = prev_root.index_t;
-    // Strict expansion: a partial new-root set would misclassify
-    // still-reachable leaves as garbage; a partial prev-root set would
-    // leave replaced blobs unreleased. Either way silently — propagate
-    // the error so the caller can decide whether to skip publishing
-    // garbage rather than write a corrupt manifest.
-    let old_ids = fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, &prev_root)
-        .await
-        .ok()?;
-    let new_ids = fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, new_root)
-        .await
-        .ok()?;
-    let garbage_cids: Vec<ContentId> = old_ids.difference(&new_ids).cloned().collect();
+    let prev_index = Some(BinaryPrevIndexRef {
+        t: prev_root.index_t,
+        id: prev_root_id.clone(),
+    });
+
+    // Strict expansion: a partial new-root set would misclassify still-reachable
+    // leaves as garbage; a partial prev-root set would leave replaced blobs
+    // unreleased. On failure record NO garbage but KEEP the link.
+    let diff = async {
+        let old_ids =
+            fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, &prev_root)
+                .await
+                .ok()?;
+        let new_ids =
+            fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, new_root)
+                .await
+                .ok()?;
+        Some(
+            old_ids
+                .difference(&new_ids)
+                .cloned()
+                .collect::<Vec<ContentId>>(),
+        )
+    }
+    .await;
+
+    let garbage_cids = diff.unwrap_or_else(|| {
+        tracing::warn!(
+            prev_root_id = %prev_root_id,
+            prev_t = prev_root.index_t,
+            new_t = new_root.index_t,
+            "Could not expand CAS sets to diff garbage; publishing with the \
+             prev_index link and an EMPTY garbage manifest. Replaced blobs persist \
+             until an orphan sweep finds them, which is recoverable — dropping the \
+             link would not be."
+        );
+        Vec::new()
+    });
 
     Some(GarbageContext {
         garbage_cids,
-        prev_index: Some(BinaryPrevIndexRef {
-            t: prev_t,
-            id: prev_root_id.clone(),
-        }),
+        prev_index,
     })
 }
 
@@ -274,11 +314,20 @@ pub(crate) struct Fir6Inputs {
 /// `IndexRoot`, encodes it, writes to CAS with `ContentKind::IndexRoot`,
 /// and derives the CID.
 ///
-/// `gc_ctx` is `None` for this milestone (V3 GC chain is deferred).
+/// Takes `prev_root_id` — the ledger's CURRENT published index head, if it has one
+/// — and derives the GC chain itself, rather than accepting a pre-built
+/// `GarbageContext`. That is deliberate: the previous shape let a caller pass
+/// `None` and silently publish a root with no `prev_index`, which is exactly what
+/// happened. `rebuild.rs` passed `None, // GC chain deferred for V3 milestone`, so
+/// **every full rebuild severed the chain** and orphaned the whole prior history —
+/// 226 roots on a live ledger with only 15 reachable. Deriving it here means the
+/// link cannot be forgotten, only genuinely absent.
+///
+/// Pass `None` **only** when the ledger truly has no prior index (genesis).
 pub(crate) async fn encode_and_write_root_v6(
     content_store: &dyn ContentStore,
     inputs: Fir6Inputs,
-    gc_ctx: Option<GarbageContext>,
+    prev_root_id: Option<ContentId>,
     result_stats: IndexStats,
 ) -> Result<IndexResult> {
     reconcile_ns_at_publish(
@@ -523,7 +572,33 @@ pub(crate) async fn encode_and_write_root_v6(
         root.had_annotation_arena = true;
     }
 
-    // Attach garbage manifest and prev_index if provided.
+    // Derive the GC chain from the previous head, then attach it.
+    //
+    // Done HERE rather than taken from the caller so that publishing a root without
+    // a `prev_index` requires there to be no previous head — it can no longer
+    // happen because a call site omitted it.
+    let gc_ctx = match prev_root_id.as_ref() {
+        Some(prev) => {
+            let ctx = compute_garbage_from_prev_root(content_store, &root, prev).await;
+            if ctx.is_none() {
+                // The head exists but would not decode. Publishing anyway severs the
+                // chain and orphans everything behind it permanently, so say so
+                // loudly rather than leaving it to be discovered as lost disk.
+                tracing::warn!(
+                    prev_root_id = %prev,
+                    index_t = inputs.index_t,
+                    ledger_id = %inputs.ledger_id,
+                    "Previous index head could not be read; publishing WITHOUT a \
+                     prev_index link. Every earlier index version becomes \
+                     unreachable and unreclaimable — expect an orphan-sweep report \
+                     to grow by roughly one version's artifacts."
+                );
+            }
+            ctx
+        }
+        None => None,
+    };
+
     if let Some(ctx) = gc_ctx {
         if let Some(prev) = ctx.prev_index {
             root.prev_index = Some(prev);
@@ -600,6 +675,55 @@ mod tests {
         pairs.iter().map(|&(c, p)| (c, p.to_string())).collect()
     }
 
+    /// A root whose reverse dict tree points at a leaf that is not in the store.
+    /// Useful because it is cheap to build and needs no real index.
+    fn unresolvable_root(ledger: &str, t: i64, tag: &[u8]) -> fluree_db_binary_index::IndexRoot {
+        use fluree_db_binary_index::{DictPackRefs, DictTreeRefs, IndexRoot};
+        use fluree_db_core::{ContentId, ContentKind};
+        let tree = DictTreeRefs {
+            branch: ContentId::new(ContentKind::IndexBranch, tag),
+            leaves: vec![ContentId::new(ContentKind::IndexLeaf, tag)],
+        };
+        IndexRoot {
+            ledger_id: ledger.to_string(),
+            index_t: t,
+            base_t: 0,
+            subject_id_encoding: fluree_db_core::SubjectIdEncoding::Narrow,
+            namespace_codes: BTreeMap::new(),
+            predicate_sids: Vec::new(),
+            graph_iris: Vec::new(),
+            datatype_iris: Vec::new(),
+            language_tags: Vec::new(),
+            dict_refs: DictRefs {
+                forward_packs: DictPackRefs {
+                    string_fwd_packs: Vec::new(),
+                    subject_fwd_ns_packs: Vec::new(),
+                },
+                subject_reverse: tree.clone(),
+                string_reverse: tree,
+            },
+            subject_watermarks: Vec::new(),
+            string_watermark: 0,
+            lex_sorted_string_ids: false,
+            total_commit_size: 0,
+            total_asserts: 0,
+            total_retracts: 0,
+            graph_arenas: Vec::new(),
+            default_graph_orders: Vec::new(),
+            named_graphs: Vec::new(),
+            stats: None,
+            schema: None,
+            prev_index: None,
+            garbage: None,
+            sketch_ref: None,
+            has_annotations: false,
+            annotation_index: None,
+            had_annotation_arena: false,
+            o_type_table: IndexRoot::build_o_type_table(&[], &[]),
+            ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
+        }
+    }
+
     #[test]
     fn reconcile_ns_at_publish_matching_tables() {
         let root = btree(&[(1, "http://a.org/"), (2, "http://b.org/")]);
@@ -666,6 +790,78 @@ mod tests {
         assert!(
             msg.contains("code 5") && msg.contains("root=None"),
             "should report missing root entry: {msg}"
+        );
+    }
+
+    /// A decodable previous head ALWAYS yields a `prev_index` link.
+    ///
+    /// This is the regression that matters. A root published without `prev_index`
+    /// silently starts a fresh lineage: every earlier version becomes unreachable,
+    /// and since nothing reclaims by reachability their artifacts can never be
+    /// freed. Live evidence before the fix: 226 roots on one ledger, 15 reachable,
+    /// 211 orphaned.
+    ///
+    /// The previous root here references a leaf that is not in the store — which,
+    /// usefully, turned out NOT to make `collect_root_cas_ids_expanded` fail:
+    /// expansion tolerates unresolvable leaves. So the "diff failed, keep the link
+    /// anyway" branch is **not covered by this test**; triggering it needs a store
+    /// that errors on `get`, and it is left uncovered rather than faked. What is
+    /// covered is the property that actually broke production: the link is derived
+    /// from the head and cannot be omitted.
+    #[tokio::test]
+    async fn decodable_prev_head_always_yields_a_prev_index_link() {
+        use fluree_db_core::prelude::*;
+        use fluree_db_core::storage::content_store_for;
+
+        const LEDGER: &str = "chainlink:main";
+
+        let store = content_store_for(MemoryStorage::new(), LEDGER);
+
+        let prev = unresolvable_root(LEDGER, 10, b"prev");
+        let prev_id = store
+            .put(ContentKind::IndexRoot, &prev.encode())
+            .await
+            .expect("write prev root");
+
+        let new_root = unresolvable_root(LEDGER, 11, b"new");
+
+        let ctx = compute_garbage_from_prev_root(&store, &new_root, &prev_id)
+            .await
+            .expect("a decodable previous head must always yield a context");
+
+        let link = ctx
+            .prev_index
+            .expect("prev_index MUST be set even when the garbage diff fails");
+        assert_eq!(link.id, prev_id, "link must point at the previous head");
+        assert_eq!(
+            link.t, 10,
+            "link must carry the previous index_t, or GC cannot order the chain"
+        );
+    }
+
+    /// An UNREADABLE previous head yields `None` — never a bogus link.
+    ///
+    /// `None` here is honest: without decoding the head there is no `index_t`, so no
+    /// well-formed link exists. The caller logs a loud warning in that case, because
+    /// publishing anyway severs the chain. What must never happen is inventing a
+    /// link, or dropping one that was available.
+    #[tokio::test]
+    async fn unreadable_prev_head_yields_no_link_rather_than_a_bogus_one() {
+        use fluree_db_core::prelude::*;
+        use fluree_db_core::storage::content_store_for;
+
+        const LEDGER: &str = "absent:main";
+        let store = content_store_for(MemoryStorage::new(), LEDGER);
+
+        // Never written, so `get` cannot resolve it.
+        let never_written = ContentId::new(ContentKind::IndexRoot, b"absent-head");
+        let new_root = unresolvable_root(LEDGER, 5, b"new");
+
+        assert!(
+            compute_garbage_from_prev_root(&store, &new_root, &never_written)
+                .await
+                .is_none(),
+            "an unreadable previous head must yield None"
         );
     }
 }
