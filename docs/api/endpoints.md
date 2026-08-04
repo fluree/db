@@ -2904,9 +2904,9 @@ An already-current index returns `200` with `upserted`/`removed` of `0` and an u
 - `400 Bad Request` — `t` is unparseable or less than `1`
 - `401/403` — admin auth required
 - `404 Not Found` — no such index
-- `500 Internal Server Error` — currently also returned for the two client errors below
+- `500 Internal Server Error` — two request errors land here today; see the note below
 
-Syncing an index that has been dropped is refused (`Cannot sync retracted graph source: …`), as is requesting a `t` beyond the source ledger's head (`Target t=… is beyond current head t=…`). Both are client errors and neither will ever succeed on retry, but both currently reach the client as `500` with `"@type": "err:system/InternalError"` — the server blanket-maps the `ApiError::Drop` and `ApiError::Ledger` variants that carry them, discarding the distinction the API crate already draws. Tracked in `issue-server-ledger-notfound-maps-to-500`. Until that is fixed, do not treat a `500` from this endpoint as retryable without reading the message.
+Two errors that are the caller's fault currently come back as `500` with `"@type": "err:system/InternalError"`: syncing an index that has been dropped (`Cannot sync retracted graph source: …`), and asking for a `t` beyond the source ledger's head (`Target t=… is beyond current head t=…`). Neither succeeds on retry. Until the mapping is corrected to 4xx, match on the message before deciding whether to retry a `500` from this endpoint.
 
 By default the server does not sync on commit, so an index only advances when something calls this endpoint — run it from a maintenance job, using `fluree bm25 list --stale` to enumerate the indexes whose source has moved past their watermark. Starting the server with `--bm25-auto-sync` (env `FLUREE_BM25_AUTO_SYNC`, or `indexing.bm25_auto_sync` in the config file) instead keeps every index current automatically, syncing each one when its source ledger commits.
 
