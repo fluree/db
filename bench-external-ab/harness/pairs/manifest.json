@@ -1,5 +1,5 @@
 {
-  "_doc": "Pair classification + per-pair equivalence rules (PROTOCOL §6-§7). gate: exact (int/string multiset), tolerance (numeric cells compared with relative tolerance for float reassociation), rows_only (unordered LIMIT -> row count only). sum_is_double flags float aggregates. shape: single_table | join. Wave-1 (p1-p3) + Wave-C (cq*/crt_*).",
+  "_doc": "Pair classification + per-pair equivalence rules (PROTOCOL §6-§7). gate: exact (int/string multiset), tolerance (numeric cells compared with relative tolerance for float reassociation), rows_only (unordered LIMIT -> row count only). sum_is_double flags float aggregates. shape: single_table | join. Wave-1 (p1-p3) + Wave-C (cq*/crt_*) + Wave-S1/S2 (s1_*/s2_*, db #1589). pending_engine (optional): a pair that DNFs on every SHIPPED binary and only fuses on a named unmerged branch; run_pair.py + check_pair.py SKIP it unless --include-pending, so the default corpus never acquires a guaranteed-DNF row until that branch lands.",
   "pairs": {
     "p1_count_fact": {
       "shape": "single_table", "gate": "exact", "sum_is_double": false, "fluree_corpus": "q036",
@@ -52,6 +52,16 @@
     "crt_highcard_groupby": {
       "shape": "single_table", "gate": "exact", "sum_is_double": false,
       "note": "RT: high-cardinality GROUP BY (~customer count groups) over the 1M-row fact; run at normal memory AND with DuckDB memory_limit pinned LOW (spill candidate). customer_key IS NOT NULL matches SPARQL UNBOUND-omit. Large result fully materialized+sorted."
+    },
+    "s1_multifilter_tickets_by_category": {
+      "shape": "join", "gate": "exact", "sum_is_double": false,
+      "pending_engine": "fluree@perf/multifact-generality (db #1589)",
+      "note": "S1: ONE group-key branch (product.category) + TWO semi-join branches (customer.segment='Enterprise' AND agent.department='Support') off FactSupportTicket -- the K>=2 semi-join widening. DNFs on shipped binaries (declines to full materialize); fuses only on #1589. COUNT -> exact."
+    },
+    "s2_tickets_by_customer_product": {
+      "shape": "single_table", "gate": "exact", "sum_is_double": false,
+      "pending_engine": "fluree@perf/multifact-generality (db #1589)",
+      "note": "S2: GROUP BY two referenced-entity IRIs (customer AND product) over FactSupportTicket -- two FK->IRI resolvers. Fluree ?c/?p IRIs reduced to trailing keys for compare (cq040 convention); both keys IS NOT NULL matches SPARQL UNBOUND-omit (product nullable). DNFs on shipped binaries (>=2 ref group keys declines pre-#1589); fuses only on #1589. COUNT -> exact."
     }
   }
 }

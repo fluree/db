@@ -123,12 +123,19 @@ def main():
     ap.add_argument("--targets-file", default=os.path.join(HERE, "targets.json"))
     ap.add_argument("--duckdb-target", default="duckdb-iceberg-minio-sf01")
     ap.add_argument("--fluree-target", default="fluree-minio-sf01-main")
+    ap.add_argument("--include-pending", action="store_true",
+                    help="also check pairs marked pending_engine (fuse only on a named unmerged "
+                         "branch); off by default so the shipped corpus never checks a DNF pair")
     args = ap.parse_args()
     targets = load(args.targets_file)
     man = load(os.path.join(PAIRS, "manifest.json"))["pairs"]
     dt, ft = targets[args.duckdb_target], targets[args.fluree_target]
     allok = True
     for pair in [p.strip() for p in args.pairs.split(",") if p.strip()]:
+        pending = man.get(pair, {}).get("pending_engine")
+        if pending and not args.include_pending:
+            print("%-34s SKIPPED (pending_engine=%s; pass --include-pending)" % (pair, pending))
+            continue
         gate = man.get(pair, {}).get("gate", "exact")
         try:
             ok, msg = cmp_rows(run_sql(pair, dt), run_sparql(pair, ft), gate)

@@ -1,0 +1,14 @@
+# s1_multifilter_tickets_by_category -- Fluree/SPARQL side of the S1 K>=2 semi-join shape
+# (db #1589). Shape-equivalent, no verbatim corpus member. Enterprise-customer support
+# tickets handled by the Support department, counted by product category. Fact
+# edw:SupportTicket branches to product (group-key: category), customer (semi-join:
+# segment="Enterprise") and agent (semi-join: department="Support") -- one group-key
+# branch + TWO membership branches, each an existence semi-join the fused fold ANDs.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?cat (COUNT(?t) AS ?n)
+WHERE { ?t a edw:SupportTicket ; edw:product ?p ; edw:customer ?c ; edw:agent ?a .
+        ?p edw:category ?cat .
+        ?c edw:segment "Enterprise" .
+        ?a edw:department "Support" . }
+GROUP BY ?cat
+ORDER BY DESC(?n) ?cat

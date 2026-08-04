@@ -166,9 +166,14 @@ def main():
     ap.add_argument("--out", default=os.path.join(HERE, "out", "run.jsonl"))
     ap.add_argument("--run-fluree", action="store_true",
                     help="execute the live-catalog Fluree leg (needs a built vbench)")
+    ap.add_argument("--include-pending", action="store_true",
+                    help="also run pairs marked pending_engine in manifest.json (they DNF on "
+                         "shipped binaries and only fuse on a named unmerged branch); off by "
+                         "default so the shipped corpus never runs a guaranteed-DNF pair")
     args = ap.parse_args()
 
     targets = load_targets(args.targets_file)
+    manifest = load_targets(os.path.join(PAIRS_DIR, "manifest.json")).get("pairs", {})
     pairs = [p.strip() for p in args.pairs.split(",") if p.strip()]
     engines = [e.strip() for e in args.engines.split(",") if e.strip()]
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
@@ -176,6 +181,11 @@ def main():
 
     with open(args.out, "a") as out_fh:
         for pair_id in pairs:
+            pending = manifest.get(pair_id, {}).get("pending_engine")
+            if pending and not args.include_pending:
+                print("== pair %s SKIPPED (pending_engine=%s; pass --include-pending) =="
+                      % (pair_id, pending))
+                continue
             print("== pair %s (harness v%s, boundary=%s) =="
                   % (pair_id, HARNESS_VERSION, TIMING_BOUNDARY))
             if "duckdb" in engines:

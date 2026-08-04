@@ -1,0 +1,11 @@
+# s2_tickets_by_customer_product -- Fluree/SPARQL side of the S2 multi-ref-IRI group-key
+# shape (db #1589). Shape-equivalent, no verbatim corpus member. Support tickets counted per
+# (customer, product) pair. Both ?c and ?p are referenced parent ENTITY IRIs, so the fused
+# single-table fold resolves EACH via its own FK->IRI map (two resolvers) and groups on the
+# composite IRI key. The bare `?t customer ?c ; product ?p` requires both bound, so a null
+# product FK drops the ticket -- the inner join the SQL's IS NOT NULL mirrors.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?c ?p (COUNT(?t) AS ?n)
+WHERE { ?t a edw:SupportTicket ; edw:customer ?c ; edw:product ?p . }
+GROUP BY ?c ?p
+ORDER BY DESC(?n) ?c ?p
