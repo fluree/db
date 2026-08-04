@@ -64,6 +64,9 @@ use fluree_vocab::UnresolvedDatatypeConstraint;
 
 use crate::graph_source::FlureeR2rmlProvider;
 use crate::{ApiError, Fluree, Result};
+// `StreamExt::next` — the scan is consumed as a stream so the whole table is never
+// resident; see the note at the `scan_for_materialize_stream` call site.
+use futures::StreamExt;
 use tracing::info;
 
 /// The shared ledger that holds materialization job watermarks (last materialized
@@ -250,8 +253,22 @@ impl Fluree {
                 .await?
             };
 
-            let (to_id, incremental, batches) = provider
-                .scan_for_materialize(source_graph_source_id, table_name, &[], from_t)
+            // STREAM the scan; do not collect it. A full read is mandatory whenever
+            // the snapshot window contains overwrite/delete, so on some sources this
+            // path runs on every poll — collecting made peak memory proportional to
+            // the source TABLE (735k rows drove 21.4 GiB of anon and an OOMKill
+            // every 4-6 min), and the OOM also prevented the commit that would have
+            // advanced the watermark, so the next poll re-read the same table.
+            //
+            // Each batch is folded into `accum` and dropped here, so only
+            // O(iceberg_scan_concurrency) file decodes are resident. NOTE this
+            // bounds the RAW SCAN only: `accum` still grows with the number of
+            // distinct subjects in the window, which latest-by-key semantics
+            // require (finalize() must see every row for a key). That is a smaller
+            // and more predictable term than the raw columnar data, but it is not
+            // O(1) — a window with millions of distinct subjects is still large.
+            let (to_id, incremental, mut batch_stream) = provider
+                .scan_for_materialize_stream(source_graph_source_id, table_name, &[], from_t)
                 .await?;
             // Only count a table as contributing once it actually has a snapshot.
             if let Some(to) = to_id {
@@ -263,7 +280,8 @@ impl Fluree {
                 table_watermarks.push(((*table_name).to_string(), from_t, to));
             }
 
-            for batch in &batches {
+            while let Some(batch) = batch_stream.next().await {
+                let batch = &batch?;
                 // Configured marker / ordering columns must exist (and the
                 // ordering column must be a value-orderable type); otherwise a
                 // null-match convention would treat every row as a tombstone and

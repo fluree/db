@@ -906,25 +906,30 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Ok((storage, metadata, metadata_location))
     }
 
-    /// Read a set of scan tasks into column batches with bounded parallelism.
-    async fn read_scan_tasks(
+    /// Stream a set of scan tasks as column batches, with bounded parallelism.
+    ///
+    /// Only `O(iceberg_scan_concurrency)` file decodes are resident at a time, so a
+    /// consumer that processes and drops each batch never holds the whole table.
+    /// This is the shared core of both [`Self::read_scan_tasks`] (which collects)
+    /// and [`Self::scan_for_materialize_stream`] (which does not).
+    fn stream_scan_tasks(
         &self,
         storage: &Arc<S3IcebergStorage>,
         tasks: Vec<FileScanTask>,
-    ) -> QueryResult<Vec<ColumnBatch>> {
+    ) -> ColumnBatchStream {
         if tasks.is_empty() {
-            return Ok(Vec::new());
+            return empty_batch_stream();
         }
         let footers = self.fluree.r2rml_cache().parquet_footers();
         let concurrency = iceberg_scan_concurrency(tasks.len());
         debug!(
             files = tasks.len(),
-            concurrency, "reading Parquet files (bounded parallel)"
+            concurrency, "streaming Parquet files (bounded parallel)"
         );
-        use futures::stream::{StreamExt, TryStreamExt};
-        let all_batches: Vec<ColumnBatch> = futures::stream::iter(tasks)
-            .map(|task| {
-                let storage = Arc::clone(storage);
+        let storage = Arc::clone(storage);
+        let stream = futures::stream::iter(tasks)
+            .map(move |task| {
+                let storage = Arc::clone(&storage);
                 let footers = Arc::clone(&footers);
                 async move {
                     tokio::spawn(async move {
@@ -942,12 +947,29 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 }
             })
             .buffer_unordered(concurrency)
-            .try_collect::<Vec<Vec<ColumnBatch>>>()
-            .await?
-            .into_iter()
-            .flatten()
-            .collect();
-        Ok(all_batches)
+            // One file's `Result<Vec<ColumnBatch>>` becomes individual
+            // `Result<ColumnBatch>` items; a read error becomes one error item.
+            .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
+                Ok(batches) => {
+                    futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
+                }
+                Err(e) => futures::stream::iter(vec![Err(e)]),
+            });
+        Box::pin(stream)
+    }
+
+    /// Read a set of scan tasks into column batches with bounded parallelism.
+    ///
+    /// Collects the whole scan into memory. Prefer [`Self::stream_scan_tasks`] for
+    /// anything that can process incrementally — on a wide source this `Vec` is
+    /// gigabytes.
+    async fn read_scan_tasks(
+        &self,
+        storage: &Arc<S3IcebergStorage>,
+        tasks: Vec<FileScanTask>,
+    ) -> QueryResult<Vec<ColumnBatch>> {
+        use futures::stream::TryStreamExt;
+        self.stream_scan_tasks(storage, tasks).try_collect().await
     }
 
     /// The source table's current snapshot id (the materialization "to" point),
@@ -1063,20 +1085,42 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// an added-files scan would miss). This keeps routine appends and periodic
     /// compaction on the cheap incremental path while staying correct across
     /// updates/deletes.
-    pub async fn scan_for_materialize(
+    /// Yields batches rather than collecting them, so a consumer that processes and
+    /// drops each batch never holds the whole table in memory.
+    ///
+    /// There is deliberately **no collecting variant of this**. One existed
+    /// (`scan_for_materialize`, returning `Vec<ColumnBatch>`) and it was the only
+    /// caller's default, which is how the memory problem below shipped. Removing it
+    /// rather than leaving it beside this makes the memory shape structural instead
+    /// of advisory — collecting is still one `try_collect()` away for a caller that
+    /// genuinely needs it, but it has to be asked for.
+    ///
+    /// **This is the memory-shape difference that matters on a full read.** A full
+    /// read is not a degradation to be avoided — it is required whenever the
+    /// snapshot window contains `overwrite`/`delete`, which an added-files scan
+    /// cannot see (see [`ScanChoice`]). So a deployment can legitimately full-read a
+    /// large table on every poll, forever. Collecting that into a `Vec` made peak
+    /// memory proportional to the *table*; streaming makes it proportional to
+    /// `iceberg_scan_concurrency` file decodes.
+    ///
+    /// Measured on a 735,446-row source polled every ~50s: collecting drove the
+    /// process to 21.4 GiB of anonymous memory against a 24 GiB limit and it was
+    /// OOMKilled every 4–6 minutes, which also meant the transaction never committed
+    /// and the watermark never advanced — so the next poll re-read the same table.
+    pub async fn scan_for_materialize_stream(
         &self,
         graph_source_id: &str,
         table_name: &str,
         projection: &[String],
         from_snapshot_id: Option<i64>,
-    ) -> QueryResult<(Option<i64>, bool, Vec<ColumnBatch>)> {
+    ) -> QueryResult<(Option<i64>, bool, ColumnBatchStream)> {
         let (storage, metadata, _loc) = self
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
 
         let Some(to_snapshot_id) = metadata.current_snapshot().map(|s| s.snapshot_id) else {
             // Table has no snapshots: nothing to materialize.
-            return Ok((None, false, Vec::new()));
+            return Ok((None, false, empty_batch_stream()));
         };
 
         let schema = metadata
@@ -1157,8 +1201,8 @@ impl<'a> FlureeR2rmlProvider<'a> {
             plan.tasks
         };
 
-        let batches = self.read_scan_tasks(&storage, tasks).await?;
-        Ok((Some(to_snapshot_id), incremental, batches))
+        let stream = self.stream_scan_tasks(&storage, tasks);
+        Ok((Some(to_snapshot_id), incremental, stream))
     }
 }
 
