@@ -83,7 +83,7 @@
     "config": "<PATH_TO>/substrate/fluree-home/.fluree/config.toml",
     "source": "enterprise-sf01-b",
     "env": {"AWS_ACCESS_KEY_ID": "minioadmin", "AWS_SECRET_ACCESS_KEY": "minioadmin"},
-    "note": "SUBSTRATE B Fluree leg on SHIPPED MAIN. Representative current-shipped engine. Main does NOT carry #1528 filter-over-join fusion, so the filtered-join pair declines here. Registration: fluree iceberg map enterprise-sf01-b --mode rest --catalog-uri http://127.0.0.1:8181 --r2rml <mapping> --s3-endpoint http://127.0.0.1:9000 --s3-path-style --no-vended-credentials (127.0.0.1 not localhost -> IPv4; omit --warehouse -> empty REST prefix). engine_version auto-derived per row from the binary's worktree git commit."
+    "note": "SUBSTRATE B Fluree leg on SHIPPED MAIN. Representative current-shipped engine. Main does NOT carry #1528 filter-over-join fusion, so the filtered-join pair declines here. Registration: fluree iceberg map enterprise-sf01-b --mode rest --catalog-uri http://127.0.0.1:8181 --r2rml ../substrate/enterprise-sf01-mapping.ttl --s3-endpoint http://127.0.0.1:9000 --s3-path-style --no-vended-credentials (127.0.0.1 not localhost -> IPv4; omit --warehouse -> empty REST prefix). engine_version auto-derived per row from the binary's worktree git commit."
   },
   "fluree-minio-sf01-1528": {
     "engine": "fluree_cli",
