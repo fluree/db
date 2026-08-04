@@ -15,6 +15,11 @@ use std::path::PathBuf;
 /// Storage method for local filesystem storage.
 pub const STORAGE_METHOD_FILE: &str = "file";
 
+/// Unique suffix source for atomic-write temp files. Two writers storing the same
+/// content-addressed blob concurrently is normal and must not have them clobber each
+/// other's temp file, so the name carries pid + counter.
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// File-based storage backed by `tokio::fs`.
 #[derive(Debug, Clone)]
 pub struct FileStorage {
@@ -94,21 +99,59 @@ impl FileStorage {
 impl StorageRead for FileStorage {
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         let path = self.resolve_path(address)?;
-        tokio::fs::read(&path).await.map_err(|e| {
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 crate::error::Error::not_found(format!("{}: {}", address, path.display()))
             } else {
                 crate::error::Error::io(format!("Failed to read {}: {}", path.display(), e))
             }
-        })
+        })?;
+        // A ZERO-LENGTH blob is not content — it is debris, and reporting it as
+        // absent is strictly better than returning it.
+        //
+        // Blobs here are content-addressed, so the address commits to a digest and
+        // no real artifact hashes to empty. An empty file at such an address can
+        // therefore only be a failed write (create succeeded, write did not — the
+        // classic ENOSPC shape, which left ~4,000 of these on one deployment).
+        //
+        // The distinction matters because the two outcomes are not equally
+        // recoverable: "absent" makes callers re-fetch or rebuild, while empty
+        // content propagates as a parse failure at some distant call site
+        // ("pack header: need 40 bytes, got 0") that no caller knows how to repair.
+        if bytes.is_empty() {
+            tracing::warn!(
+                address,
+                path = %path.display(),
+                "zero-length blob treated as absent (failed write debris); it will be \
+                 re-fetched or rebuilt. Delete it to reclaim the inode."
+            );
+            return Err(crate::error::Error::not_found(format!(
+                "{}: {} (zero-length blob, treated as absent)",
+                address,
+                path.display()
+            )));
+        }
+        Ok(bytes)
     }
 
     fn resolve_local_path(&self, address: &str) -> Option<std::path::PathBuf> {
         let path = self.resolve_path(address).ok()?;
-        if path.exists() {
-            Some(path)
-        } else {
-            None
+        // PRESENCE IS NOT VALIDITY. This returned any path that merely `exists()`,
+        // and callers then mmap or parse it directly — so a zero-length blob became
+        // an unrecoverable error at the reader instead of a miss that the CAS could
+        // heal. Excluding empty files here is what converts that poison back into a
+        // fetch. See `read_bytes` for why empty can never be legitimate content.
+        match std::fs::metadata(&path) {
+            Ok(m) if m.len() > 0 => Some(path),
+            Ok(_) => {
+                tracing::warn!(
+                    address,
+                    path = %path.display(),
+                    "zero-length blob ignored for local resolution; falling back to fetch"
+                );
+                None
+            }
+            Err(_) => None,
         }
     }
 
@@ -284,10 +327,56 @@ impl StorageWrite for FileStorage {
             })?;
         }
 
-        // Write file (overwrites if exists - idempotent for content-addressed)
-        tokio::fs::write(&path, bytes).await.map_err(|e| {
-            crate::error::Error::io(format!("Failed to write {}: {}", path.display(), e))
-        })
+        // ATOMIC: temp file -> fsync -> rename. Never write in place.
+        //
+        // This used to be `tokio::fs::write(&path, bytes)`, justified as "overwrites
+        // if exists - idempotent for content-addressed". Rewriting identical content
+        // IS idempotent — but only if the write COMPLETES. `write` is
+        // create+truncate+write, so an abnormal termination mid-write leaves a
+        // TRUNCATED blob at the final path, having destroyed the valid one that was
+        // there.
+        //
+        // That is not theoretical. On a production deployment a SIGBUS during a dict
+        // upload left a 7,778,304-byte fragment of a ~56 MB pack — a pack that 15
+        // already-published index roots referenced. Every subsequent index load of
+        // that ledger failed with "page directory at offset 55962372 exceeds pack
+        // length 7778304", and because a content-addressed store treats presence as
+        // validity, the fragment was permanent: rebuilds found the path occupied and
+        // reused it. The same flaw under ENOSPC (create succeeds, write fails) left
+        // ~4,000 zero-length blobs across the same deployment earlier the same day.
+        //
+        // Rename is atomic on POSIX, so a reader sees either the old complete blob or
+        // the new complete blob, never a partial one. The `fsync` before rename is
+        // what makes that true across a machine crash rather than just a process
+        // crash: without it the rename can be durable while the data is not.
+        let tmp = path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let write_result = async {
+            let mut f = tokio::fs::File::create(&tmp).await?;
+            tokio::io::AsyncWriteExt::write_all(&mut f, bytes).await?;
+            // Durability before visibility.
+            f.sync_all().await?;
+            drop(f);
+            tokio::fs::rename(&tmp, &path).await
+        }
+        .await;
+
+        match write_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Leave no partial temp behind; a failed write must not turn into
+                // disk that nothing will ever reclaim.
+                let _ = tokio::fs::remove_file(&tmp).await;
+                Err(crate::error::Error::io(format!(
+                    "Failed to write {}: {}",
+                    path.display(),
+                    e
+                )))
+            }
+        }
     }
 
     async fn delete(&self, address: &str) -> Result<()> {
@@ -505,5 +594,138 @@ impl StorageCas for FileStorage {
             CasAction::Abort(t) => Ok(CasOutcome::Aborted(t)),
         }
         // Lock released when `locked` is dropped (on Abort path, dropped here)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "fluree_filestorage_{tag}_{}_{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A write must leave NO temp files behind. A leaked temp is disk that nothing
+    /// reclaims, on the same volume whose exhaustion started this whole class of bug.
+    #[tokio::test]
+    async fn atomic_write_leaves_no_temp_files() {
+        let dir = tmpdir("notmp");
+        let s = FileStorage::new(&dir);
+        s.write_bytes("a/b/blob.dict", b"hello").await.unwrap();
+
+        let strays: Vec<_> = walkdir_files(&dir)
+            .into_iter()
+            .filter(|p| p.to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(strays.is_empty(), "temp files left behind: {strays:?}");
+        assert_eq!(s.read_bytes("a/b/blob.dict").await.unwrap(), b"hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE CRASH-SAFETY PROPERTY. Rewriting an existing blob must never be able to
+    /// leave it shorter than it was: the new content lands via rename, so a reader
+    /// sees the old complete blob or the new complete blob. Verified by checking the
+    /// final path is never truncated mid-write — approximated here by asserting the
+    /// destination is only ever the full old or full new content, and that a
+    /// same-content rewrite (the idempotent case that justified the old in-place
+    /// write) still works.
+    #[tokio::test]
+    async fn rewriting_an_existing_blob_never_shortens_it() {
+        let dir = tmpdir("rewrite");
+        let s = FileStorage::new(&dir);
+        let big = vec![b'x'; 200_000];
+
+        s.write_bytes("p/big.dict", &big).await.unwrap();
+        assert_eq!(s.read_bytes("p/big.dict").await.unwrap().len(), 200_000);
+
+        // Idempotent rewrite of identical content — the case the old code was
+        // justified by. Must still be a no-op from the reader's point of view.
+        s.write_bytes("p/big.dict", &big).await.unwrap();
+        assert_eq!(s.read_bytes("p/big.dict").await.unwrap().len(), 200_000);
+
+        // A shorter write is a *different* blob at a different address in real use;
+        // if it ever targets the same path, the result must be complete, not spliced.
+        s.write_bytes("p/big.dict", b"short").await.unwrap();
+        assert_eq!(s.read_bytes("p/big.dict").await.unwrap(), b"short");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A zero-length blob must read as ABSENT, not as empty content. This is the
+    /// ENOSPC debris case: ~4,000 such files survived one outage and turned every
+    /// later read into "pack header: need 40 bytes, got 0" — a parse failure no
+    /// caller can repair, where a miss would have been re-fetched.
+    #[tokio::test]
+    async fn zero_length_blob_reads_as_absent() {
+        let dir = tmpdir("empty");
+        let s = FileStorage::new(&dir);
+        // Write the fixture at the RESOLVED path: a bare address gets `.json`
+        // appended (see `resolve_path`), so constructing the path by hand would test
+        // a file the reader never looks at — which is exactly what it did first time.
+        let path = s.resolve_path("z/empty.dict").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+
+        let err = s
+            .read_bytes("z/empty.dict")
+            .await
+            .expect_err("must not succeed");
+        assert!(
+            format!("{err}").contains("zero-length"),
+            "error should say why it is absent, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `resolve_local_path` must not hand out a zero-length blob. Callers mmap or
+    /// parse that path directly, so returning it converts recoverable debris into an
+    /// unrecoverable reader error — this is the `exists()`-is-validity flaw.
+    #[test]
+    fn resolve_local_path_rejects_a_zero_length_blob() {
+        let dir = tmpdir("resolve");
+        let s = FileStorage::new(&dir);
+
+        let good = s.resolve_path("g/ok.dict").unwrap();
+        std::fs::create_dir_all(good.parent().unwrap()).unwrap();
+        std::fs::write(&good, b"content").unwrap();
+        assert!(
+            s.resolve_local_path("g/ok.dict").is_some(),
+            "valid blob must resolve"
+        );
+
+        let empty = s.resolve_path("g/empty.dict").unwrap();
+        std::fs::write(&empty, b"").unwrap();
+        assert!(
+            s.resolve_local_path("g/empty.dict").is_none(),
+            "zero-length blob must NOT resolve as a local path"
+        );
+
+        assert!(s.resolve_local_path("g/missing.dict").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn walkdir_files(root: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 }
