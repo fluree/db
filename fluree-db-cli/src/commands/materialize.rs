@@ -19,9 +19,7 @@ use fluree_db_api::materialize::{verify_twin, ParityReport, VerifyMode};
 // `mor_guard::ALLOW_MOR_DELETES_ENV`, re-exported by fluree-db-api (which the CLI
 // already depends on) — instead of a hard-copied literal that could silently drift
 // on a rename.
-use fluree_db_api::{
-    DropMode, Fluree, FlureeR2rmlProvider, NsRecord, ALLOW_MOR_DELETES_ENV,
-};
+use fluree_db_api::{DropMode, Fluree, FlureeR2rmlProvider, NsRecord, ALLOW_MOR_DELETES_ENV};
 
 use crate::cli::{MaterializeOutput, MaterializeVerify};
 use crate::context;
