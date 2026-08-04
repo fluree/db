@@ -148,6 +148,73 @@ fn int_pushdown_literal(
             scale: 0,
         }),
         _ => Some(LiteralValue::Int64(n)),
+/// Why a materialize poll reads added files only, or re-reads the whole table.
+///
+/// This type exists because the decision used to be one expression:
+///
+/// ```ignore
+/// let incremental = from_snapshot_id.is_some()
+///     && metadata.window_is_incremental_safe(from, to).unwrap_or(false);
+/// ```
+///
+/// `unwrap_or(false)` collapses three different situations into one boolean and
+/// discards the error that distinguishes them. That matters more than it looks,
+/// because the two branches are not comparable in cost: an added-files scan
+/// reads what changed, while the fallback reads the **entire table** into
+/// `Vec<ColumnBatch>` in memory. So a swallowed error silently escalates a
+/// few-MB read into an unbounded one.
+///
+/// It cost us a production outage. A source table's snapshot retention expired
+/// the stored watermark, every poll took the fallback, and on a 728,876-row
+/// table the process reached 21.4 GiB of anonymous memory and was OOMKilled
+/// every 8–17 minutes. **Not one log line said a full read had been chosen, let
+/// alone why** — the two branches were indistinguishable from outside, so the
+/// symptom presented as "Fluree uses all the memory" and took days to trace.
+///
+/// The distinction the boolean threw away is the whole diagnosis:
+///
+/// - [`FullUnsafeWindow`](Self::FullUnsafeWindow) is **correct and routine**. An
+///   `overwrite`/`delete` carries row-level changes an added-files scan cannot
+///   see, so a full read is the right answer, not a degradation.
+/// - [`FullUndeterminable`](Self::FullUndeterminable) is **a configuration
+///   problem to fix**. Retention is shorter than the poll interval, or the job
+///   was stopped for longer than retention. A full read still produces correct
+///   data, so this deliberately does not fail — but it must be visible, because
+///   left alone it repeats every poll forever and never self-heals.
+///
+/// Both used to log nothing. Now they log differently, which is the fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanChoice {
+    /// Window is `append`/`replace`-only: an added-files scan sees every change.
+    Incremental,
+    /// No stored watermark — first materialization of this source. Expected once
+    /// per source, and a full read is the only option.
+    FullInitial,
+    /// The window genuinely contains `overwrite`/`delete`. Full read is correct.
+    FullUnsafeWindow,
+    /// Safety could not be determined: the watermark snapshot is expired,
+    /// unknown, or not an ancestor of the current one. Carries the underlying
+    /// reason so the log says which.
+    FullUndeterminable(String),
+}
+
+impl ScanChoice {
+    fn decide(metadata: &TableMetadata, from: Option<i64>, to: i64) -> Self {
+        // A missing watermark is not a failure to classify — it is a first run.
+        // Kept separate from the error case so "expected once" and "someone
+        // should look at this" never share a log line.
+        if from.is_none() {
+            return Self::FullInitial;
+        }
+        match metadata.window_is_incremental_safe(from, to) {
+            Ok(true) => Self::Incremental,
+            Ok(false) => Self::FullUnsafeWindow,
+            Err(e) => Self::FullUndeterminable(e.to_string()),
+        }
+    }
+
+    fn is_incremental(&self) -> bool {
+        matches!(self, Self::Incremental)
     }
 }
 
@@ -976,7 +1043,9 @@ impl<'a> FlureeR2rmlProvider<'a> {
     }
 
     /// Resolve the source table's current snapshot and read the rows to
-    /// materialize, choosing incremental vs full automatically.
+    /// materialize, choosing incremental vs full automatically. The choice and
+    /// its reason are [`ScanChoice`] — read that first, because "full" covers
+    /// one routine case and one that should page someone.
     ///
     /// Returns `(to_snapshot_id, incremental, batches)`:
     /// - `to_snapshot_id` — the source's current snapshot id (the new
@@ -1027,10 +1096,34 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 .collect()
         };
 
-        let incremental = from_snapshot_id.is_some()
-            && metadata
-                .window_is_incremental_safe(from_snapshot_id, to_snapshot_id)
-                .unwrap_or(false);
+        let choice = ScanChoice::decide(&metadata, from_snapshot_id, to_snapshot_id);
+        let incremental = choice.is_incremental();
+
+        // Say WHY, at a level that matches how alarming it is. The routine
+        // reasons are `info`; an undeterminable window is `warn` because it is
+        // operator-actionable and unbounded in cost.
+        match &choice {
+            ScanChoice::Incremental | ScanChoice::FullInitial => {}
+            ScanChoice::FullUnsafeWindow => info!(
+                graph_source_id = %graph_source_id,
+                table = %table_name,
+                from_snapshot_id = ?from_snapshot_id,
+                to_snapshot_id,
+                "materialize: window contains overwrite/delete, full read required"
+            ),
+            ScanChoice::FullUndeterminable(reason) => warn!(
+                graph_source_id = %graph_source_id,
+                table = %table_name,
+                from_snapshot_id = ?from_snapshot_id,
+                to_snapshot_id,
+                reason = %reason,
+                "materialize: CANNOT DETERMINE incremental safety — falling back to a FULL \
+                 table read, which loads the whole table into memory. Usually means the stored \
+                 watermark snapshot has been expired by the source table's snapshot retention: \
+                 either retention is shorter than this job's poll interval, or the job was \
+                 stopped for longer than retention."
+            ),
+        }
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
@@ -3046,6 +3139,162 @@ mod tests {
                 field(6, "double_key", json!("double")),
                 field(7, "float_key", json!("float")),
             ],
+        }
+    }
+
+    /// Build `TableMetadata` from a snapshot chain, through the real JSON
+    /// deserializer rather than a struct literal — `meta_with` in the iceberg
+    /// crate is `#[cfg(test)]`-private, and going through `from_json_str` has
+    /// the side benefit of exercising the path production actually takes.
+    ///
+    /// `chain` is `(snapshot_id, parent_id, operation)`.
+    fn meta_with_chain(chain: &[(i64, Option<i64>, Option<&str>)]) -> TableMetadata {
+        let snapshots: Vec<serde_json::Value> = chain
+            .iter()
+            .enumerate()
+            .map(|(i, (id, parent, op))| {
+                let mut s = json!({
+                    "snapshot-id": id,
+                    "sequence-number": i as i64 + 1,
+                    "timestamp-ms": 0,
+                    "manifest-list": format!("s3://b/t/snap-{id}.avro"),
+                    "summary": match op {
+                        Some(o) => json!({"operation": o}),
+                        // A snapshot with no recorded operation is a real
+                        // Iceberg shape and must stay representable: the
+                        // safety check treats it as unsafe (fail closed).
+                        None => json!({}),
+                    },
+                });
+                if let Some(pid) = parent {
+                    s["parent-snapshot-id"] = json!(pid);
+                }
+                s
+            })
+            .collect();
+
+        let current = chain.last().map(|(id, _, _)| *id);
+        let doc = json!({
+            "format-version": 2,
+            "location": "s3://b/t",
+            "last-sequence-number": chain.len() as i64,
+            "last-updated-ms": 0,
+            "last-column-id": 1,
+            "current-schema-id": 0,
+            "schemas": [],
+            "current-snapshot-id": current,
+            "snapshots": snapshots,
+            "snapshot-log": [],
+            "default-spec-id": 0,
+            "partition-specs": [],
+            "last-partition-id": 0,
+            "sort-orders": [],
+            "default-sort-order-id": 0,
+            "properties": {}
+        });
+        TableMetadata::from_json_str(&doc.to_string()).expect("metadata fixture must parse")
+    }
+
+    /// An append-only window takes the cheap path. The baseline: if this ever
+    /// stops holding, every poll is reading whole tables.
+    #[test]
+    fn append_only_window_scans_incrementally() {
+        let meta = meta_with_chain(&[
+            (1, None, Some("append")),
+            (2, Some(1), Some("append")),
+            (3, Some(2), Some("replace")),
+        ]);
+        assert_eq!(
+            ScanChoice::decide(&meta, Some(1), 3),
+            ScanChoice::Incremental
+        );
+        assert!(ScanChoice::decide(&meta, Some(1), 3).is_incremental());
+    }
+
+    /// No watermark is a FIRST RUN, not a failure to classify. It must not be
+    /// reported as undeterminable, or every new source looks like an incident.
+    #[test]
+    fn missing_watermark_is_initial_not_a_failure() {
+        let meta = meta_with_chain(&[(1, None, Some("append"))]);
+        assert_eq!(ScanChoice::decide(&meta, None, 1), ScanChoice::FullInitial);
+        assert!(!ScanChoice::decide(&meta, None, 1).is_incremental());
+    }
+
+    /// `overwrite` in the window: a full read is CORRECT here, and must be
+    /// distinguishable from the case below. Both were `false` before.
+    #[test]
+    fn overwrite_window_is_unsafe_not_undeterminable() {
+        let meta = meta_with_chain(&[(1, None, Some("append")), (2, Some(1), Some("overwrite"))]);
+        assert_eq!(
+            ScanChoice::decide(&meta, Some(1), 2),
+            ScanChoice::FullUnsafeWindow
+        );
+    }
+
+    /// THE REGRESSION TEST. An expired watermark — the snapshot is simply gone
+    /// from the table's history, which is what aggressive snapshot retention
+    /// does — must be `FullUndeterminable` carrying a reason, NOT silently
+    /// folded in with the routine case.
+    ///
+    /// This is the exact production failure: retention expired the stored
+    /// watermark, `.unwrap_or(false)` turned the resulting error into "not
+    /// safe", every poll full-read a 728,876-row table, and the process was
+    /// OOMKilled every 8-17 minutes with no log line explaining why.
+    #[test]
+    fn expired_watermark_is_undeterminable_with_a_reason() {
+        // Current history is 10 -> 11. Snapshot 1 has been expired away.
+        let meta = meta_with_chain(&[(10, None, Some("append")), (11, Some(10), Some("append"))]);
+
+        let choice = ScanChoice::decide(&meta, Some(1), 11);
+        match &choice {
+            ScanChoice::FullUndeterminable(reason) => {
+                assert!(
+                    !reason.is_empty(),
+                    "the reason is the whole point — it is what tells an operator \
+                     retention is shorter than the poll interval"
+                );
+            }
+            other => panic!("expired watermark must be FullUndeterminable, got {other:?}"),
+        }
+        assert!(
+            !choice.is_incremental(),
+            "must not attempt an incremental scan"
+        );
+    }
+
+    /// A watermark from a different lineage (branch/rewind) is also
+    /// undeterminable rather than unsafe — same treatment, different cause.
+    #[test]
+    fn non_ancestor_watermark_is_undeterminable() {
+        let meta = meta_with_chain(&[(1, None, Some("append")), (2, Some(1), Some("append"))]);
+        // 2 is a DESCENDANT of 1, so asking for the window (2, 1] walks off the
+        // root without finding 2 -> not an ancestor.
+        assert!(matches!(
+            ScanChoice::decide(&meta, Some(2), 1),
+            ScanChoice::FullUndeterminable(_)
+        ));
+    }
+
+    /// The four outcomes must stay four. Collapsing any two back together is
+    /// how the original bug is reintroduced, so assert they are all distinct.
+    #[test]
+    fn the_four_outcomes_are_distinguishable() {
+        let ok = meta_with_chain(&[(1, None, Some("append")), (2, Some(1), Some("append"))]);
+        let bad = meta_with_chain(&[(1, None, Some("append")), (2, Some(1), Some("delete"))]);
+        let gone = meta_with_chain(&[(9, None, Some("append")), (10, Some(9), Some("append"))]);
+
+        let all = [
+            ScanChoice::decide(&ok, Some(1), 2),
+            ScanChoice::decide(&ok, None, 2),
+            ScanChoice::decide(&bad, Some(1), 2),
+            ScanChoice::decide(&gone, Some(1), 10),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "outcomes {i} and {j} collapsed into one another");
+                }
+            }
         }
     }
 
