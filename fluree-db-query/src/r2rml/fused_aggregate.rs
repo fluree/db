@@ -1056,6 +1056,13 @@ struct Resolved {
     /// fact row — mirroring the R2RML/inner-join row-drop. `group_cols` still
     /// describes the key kinds/datatypes for materializing the output binding.
     group_resolver: Option<GroupKeyResolver>,
+    /// P3 (crt_join_reorder class): `Some` for a branching-star multi-fact join whose
+    /// SEMI-JOIN branch resolved to a membership set. Each streamed fact row is probed
+    /// against it (drop on miss) BEFORE the group-key resolve/fold — an existence
+    /// semi-join, byte-identical to the generic chained inner join
+    /// (`build_semi_join_membership`). `None` for the single-table and pure-linear
+    /// join folds.
+    semi_join: Option<SemiJoinSet>,
     /// W4-2: per GROUP BY position (SPARQL order), whether that key is read inline
     /// from the fact batch (`Fact`) or from the dim FK→GKey map (`Dim(slot)`). All
     /// `Fact` for the single-table fold; all `Dim` for a pure fact⋈dim fold; mixed
@@ -1099,7 +1106,6 @@ struct GroupKeyResolver {
 /// Carried in a typed LIST ([`JoinBranch`]) so K-branch generalization is additive
 /// rather than a per-shape rewrite; v1 admission accepts exactly one of each variant.
 #[derive(Debug)]
-#[allow(dead_code)] // fields consumed by the P3 semi-join build (soundness core, follow-on)
 struct Branch<'p> {
     /// The fact root's FK join var TO this branch's head (root → chain[0]).
     root_join_var: VarId,
@@ -1123,10 +1129,60 @@ enum JoinBranch<'p> {
 /// classified branches. v1 admits exactly one GROUP-KEY + one SEMI-JOIN branch
 /// (the crt_join_reorder class); the list carries any K for the follow-on.
 #[derive(Debug)]
-#[allow(dead_code)] // `root` consumed by the P3 resolver build (soundness core, follow-on)
 struct BranchingStar<'p> {
     root: &'p R2rmlPattern,
     branches: Vec<JoinBranch<'p>>,
+}
+
+/// P3 (crt_join_reorder class): the resolved SEMI-JOIN branch, built once at `open`.
+/// A fact row survives iff its `fact_fk_cols` value (the root→branch first-hop FK)
+/// is in `membership` — the set of root-FK join keys whose keep-min-resolved branch
+/// chain satisfies every branch constraint (`build_semi_join_membership`). Because
+/// the set is built KEEP-MIN-THEN-FILTER (each hop resolves to the keep-min parent
+/// SUBJECT, byte-identical to the generic `build_parent_lookup`, THEN the kept row is
+/// filtered), the probe is byte-identical to the generic chained inner join even on a
+/// duplicate intermediate key.
+///
+/// #1583: semi-join ≡ inner join here rests on each FK being SINGLE-VALUED — one fact
+/// row matches at most one branch row per hop. A fan-out `RefObjectMap` (one child →
+/// many parents) would make a discarded-dup row a legitimate join partner, so a
+/// membership *set* would then under-represent the fan-out; the fan-out follow-on must
+/// revisit this site (mirrors the P2a #1583 caveat on the FK→IRI group key).
+struct SemiJoinSet {
+    /// Root-fact columns forming the probe key — the root→branch first-hop CHILD
+    /// columns, in join-condition order (mirrors [`GroupKeyResolver::fact_fk_cols`]).
+    fact_fk_cols: Vec<String>,
+    /// The admitted root-FK join keys, stringified via `get_join_key_from_batch`
+    /// exactly as the fact probe stringifies its own key (same encoding both sides).
+    membership: std::collections::HashSet<Vec<String>>,
+}
+
+/// P3 keep-min bookkeeping for one join key while building a [`SemiJoinSet`] level:
+/// the keep-min parent SUBJECT decides which duplicate row wins (matching the generic
+/// `parent_key_insert_keep_min`), and the WINNING row's own-constraint result +
+/// next-hop FK value decide membership — the load-bearing keep-min-THEN-filter order.
+struct KeptChainRow {
+    /// The kept row's parent subject term; the keep-min tie-break key.
+    subject: RdfTerm,
+    /// Whether the kept row satisfies this chain pattern's own folded constraints.
+    passes_own: bool,
+    /// The kept row's FK value to the NEXT hop (interior levels only); `None` on the
+    /// terminal level or when that FK column is null (a null FK breaks the chain).
+    next_fk: Option<Vec<String>>,
+}
+
+/// Comparable ordering key for a parent SUBJECT term — a LOCAL mirror of the
+/// materialize crate's private `subject_sort_key` (`graph.rs`). The two MUST agree:
+/// the P3 semi-join keep-min must pick the SAME parent row the generic
+/// `build_parent_lookup` (via `parent_key_insert_keep_min`) picks, so a fused probe is
+/// byte-identical to the generic chained inner join on duplicate intermediate keys.
+/// The dup-ORDER_KEY differential (kept row failing, discarded dup passing) guards any
+/// drift between the two.
+fn semijoin_subject_sort_key(term: &RdfTerm) -> &str {
+    match term {
+        RdfTerm::Iri(s) | RdfTerm::BlankNode(s) => s,
+        RdfTerm::Literal { value, .. } => value,
+    }
 }
 
 /// A native `SUM(expr)` / `AVG(expr)` plan: the arithmetic expression and the
@@ -1660,6 +1716,25 @@ impl Operator for FusedR2rmlAggregateOperator {
                     // this is behavior-identical to the prior inline block on every
                     // reachable input.)
                     if !Self::row_passes_filter_plan(fp, &batch, row, ctx)? {
+                        continue;
+                    }
+                }
+                // P3 (crt_join_reorder class): probe the SEMI-JOIN membership set BEFORE
+                // resolving the group key — a fact row whose root→branch FK does not
+                // resolve to a branch chain satisfying the branch constraints DROPS, the
+                // existence-semantics of the inner join. Byte-identical to the generic
+                // chained join because `membership` was built keep-min-THEN-filter (the
+                // discarded-dup soundness line). A null FK ⇒ no branch triple ⇒ drop; it
+                // is also already null-dropped by `validity_cols` (the FK child columns),
+                // so this probe never sees a null-FK row on the reachable path. Mirrors
+                // the `group_resolver` FK probe's key stringification
+                // (`get_join_key_from_batch`) so both sides encode the join value the
+                // same way. #1583: rests on the FK being single-valued (see `SemiJoinSet`).
+                if let Some(sj) = &resolved.semi_join {
+                    let Some(fk) = get_join_key_from_batch(&sj.fact_fk_cols, &batch, row) else {
+                        continue;
+                    };
+                    if !sj.membership.contains(&fk) {
                         continue;
                     }
                 }
@@ -2371,6 +2446,7 @@ impl FusedR2rmlAggregateOperator {
             validity_cols,
             count_non_null_cols,
             group_resolver,
+            semi_join: None,
             group_key_plan,
             fact_constraints,
             minmax_folds,
@@ -2577,8 +2653,21 @@ impl FusedR2rmlAggregateOperator {
     /// the pre-P3 behavior wholesale: a branching multi-fact shape simply declines to
     /// the generic pipeline. Read once per process.
     fn multifact_enabled() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"))
+        // Production: read once (process-wide), like the sibling fused switches.
+        #[cfg(not(test))]
+        {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED
+                .get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"))
+        }
+        // Test: read the env each call so the switch-off decline path is testable
+        // without a process-wide `OnceLock` caching the first observed value. Only the
+        // gate test toggles this var (under a lock); the resolver tests call
+        // `resolve_branching_star_at_open` directly and never read it.
+        #[cfg(test)]
+        {
+            crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT")
+        }
     }
 
     /// P3 (scaffolding): decompose a BRANCHING-STAR join — a fact ROOT with ≥2 FK
@@ -2973,23 +3062,48 @@ impl FusedR2rmlAggregateOperator {
         let (chain, join_vars) = match Self::order_chain(pats) {
             Some(c) => c,
             None => {
-                // P3 (scaffolding): a non-linear shape may be the branching-star
-                // multi-fact join (crt_join_reorder class). Recognize it — gated by
-                // the P3 switch — for the follow-on soundness core (the semi-join
-                // keep-min-then-filter build + fold probe), but DECLINE for now, so
-                // this path is byte-identical to pre-P3.
+                // P3: a non-linear shape may be the branching-star multi-fact join
+                // (crt_join_reorder class). Gated by the P3 switch, the branching
+                // resolver builds the SEMI-JOIN membership + the GROUP-KEY linear
+                // resolution and FUSES; it declines (`Ok(None)` → materialize) on any
+                // shape outside the admitted class. With the switch OFF this is the
+                // pre-P3 decline (byte-identical), so a branching shape reverts to the
+                // generic pipeline wholesale.
                 if Self::multifact_enabled() {
                     if let Some(star) = Self::decompose_branching_star(pats, &self.group_by) {
-                        tracing::debug!(
-                            branches = star.branches.len(),
-                            "fused R2RML multi-fact branching-star recognized; \
-                             soundness core (semi-join build) not yet implemented — declining"
-                        );
+                        return self
+                            .resolve_branching_star_at_open(ctx, mapping, star)
+                            .await;
                     }
                 }
                 return Ok(None);
             }
         };
+        self.resolve_linear_chain_at_open(ctx, mapping, chain, join_vars, &[], None)
+            .await
+    }
+
+    /// Resolve a fused aggregate over an already-ordered linear `fact → dim1 → … →
+    /// dimk` FK chain. Shared by the pure-linear join path
+    /// ([`Self::resolve_join_at_open`]) and the P3 branching-star's GROUP-KEY branch
+    /// ([`Self::resolve_branching_star_at_open`]).
+    ///
+    /// `strip_fact_fk_vars` are fact object vars that are FK roots of OTHER branches
+    /// (the SEMI-JOIN branch) — they are covered by `semi_join` (a membership probe),
+    /// NOT scalar/group objects, so they are excluded from the fact's required-object
+    /// validity here (their FK child columns are still null-dropped + projected via
+    /// `semi_join.fact_fk_cols`). `semi_join`, when present, is the resolved SEMI-JOIN
+    /// membership set threaded into the returned `Resolved` for the fold probe. Both
+    /// are empty/`None` on the pure-linear path, making it byte-identical to pre-P3.
+    async fn resolve_linear_chain_at_open(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        mapping: &CompiledR2rmlMapping,
+        chain: Vec<&R2rmlPattern>,
+        join_vars: Vec<VarId>,
+        strip_fact_fk_vars: &[VarId],
+        semi_join: Option<SemiJoinSet>,
+    ) -> Result<Option<Resolved>> {
         let fact_p = chain[0];
         let terminal_p = *chain.last().expect("order_chain returns ≥2 patterns");
         let Some(fact_tm) = Self::resolve_triples_map(fact_p, mapping) else {
@@ -3216,13 +3330,24 @@ impl FusedR2rmlAggregateOperator {
         let mut fact_obj_vars: Vec<VarId> = fact_p.object_var.into_iter().collect();
         fact_obj_vars.extend(fact_p.star_bindings.iter().map(|(_, v)| *v));
         for v in fact_obj_vars {
-            if v == first_join_var {
+            // Skip this chain's own FK to dim1 (a RefObjectMap object, covered by the
+            // FK cols) and — P3 — any other branch's FK root (the SEMI-JOIN FK, covered
+            // by `semi_join.fact_fk_cols` below). Both are FK objects, not scalars.
+            if v == first_join_var || strip_fact_fk_vars.contains(&v) {
                 continue;
             }
             let Some((col, _)) = Self::scalar_column_for_var(fact_p, fact_tm, v) else {
                 return Ok(None);
             };
             validity_cols.push(col);
+        }
+        // P3: the SEMI-JOIN branch FK is a fact object (an FK to the branch root),
+        // stripped from the scalar/group objects above. Its child columns must still
+        // null-drop the fact row (a null FK ⇒ no branch triple ⇒ the inner join drops
+        // the row) and be projected so `next_batch` can read them to probe the
+        // membership set. Empty (no-op) on the pure-linear path.
+        if let Some(sj) = &semi_join {
+            validity_cols.extend(sj.fact_fk_cols.iter().cloned());
         }
         for c in &validity_cols {
             projection.push(c.clone());
@@ -3448,10 +3573,299 @@ impl FusedR2rmlAggregateOperator {
             // The COUNT(*) manifest shortcut is single-table only.
             count_non_null_cols: Vec::new(),
             group_resolver: Some(GroupKeyResolver { fact_fk_cols, map }),
+            semi_join,
             group_key_plan,
             fact_constraints: fact_checks,
             minmax_folds,
             minmax_encoder,
+        }))
+    }
+
+    /// P3 (crt_join_reorder class): resolve a fused aggregate over a decomposed
+    /// BRANCHING-STAR join — a fact root with exactly one GROUP-KEY branch and one
+    /// SEMI-JOIN branch (`decompose_branching_star`). Builds the SEMI-JOIN membership
+    /// (keep-min-then-filter, `build_semi_join_membership`), then resolves the
+    /// GROUP-KEY branch as a linear chain `[root, group_branch.chain…]` via the shared
+    /// [`Self::resolve_linear_chain_at_open`], with the SEMI-JOIN root FK stripped from
+    /// the fact's required objects and the membership set threaded in for the fold
+    /// probe. Declines (`Ok(None)` → materialize) on any sub-shape the linear resolver
+    /// or the membership build cannot handle soundly.
+    async fn resolve_branching_star_at_open(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        mapping: &CompiledR2rmlMapping,
+        star: BranchingStar<'_>,
+    ) -> Result<Option<Resolved>> {
+        let root = star.root;
+        // decompose_branching_star's admission guarantees exactly one of each; find
+        // both defensively (decline if either is absent).
+        let mut group_branch: Option<&Branch> = None;
+        let mut semi_branch: Option<&Branch> = None;
+        for b in &star.branches {
+            match b {
+                JoinBranch::GroupKey(br) => group_branch = Some(br),
+                JoinBranch::SemiJoin(br) => semi_branch = Some(br),
+            }
+        }
+        let (Some(group_branch), Some(semi_branch)) = (group_branch, semi_branch) else {
+            return Ok(None);
+        };
+        let Some(root_tm) = Self::resolve_triples_map(root, mapping) else {
+            return Ok(None);
+        };
+        // Build the SEMI-JOIN membership set first (keep-min-then-filter). A shape it
+        // cannot resolve soundly declines the whole fuse.
+        let Some(semi_join) = self
+            .build_semi_join_membership(ctx, mapping, root, root_tm, semi_branch)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // The GROUP-KEY branch resolves as the linear chain [root, group_branch.chain…]
+        // (root → group_branch.head via group_branch.root_join_var, then the branch's
+        // own within-chain joins). The SEMI-JOIN root FK var is stripped from the
+        // fact's required scalar objects — it is covered by the membership probe.
+        let mut chain: Vec<&R2rmlPattern> = Vec::with_capacity(group_branch.chain.len() + 1);
+        chain.push(root);
+        chain.extend(group_branch.chain.iter().copied());
+        let mut join_vars: Vec<VarId> = Vec::with_capacity(group_branch.join_vars.len() + 1);
+        join_vars.push(group_branch.root_join_var);
+        join_vars.extend(group_branch.join_vars.iter().copied());
+        let strip = [semi_branch.root_join_var];
+        self.resolve_linear_chain_at_open(ctx, mapping, chain, join_vars, &strip, Some(semi_join))
+            .await
+    }
+
+    /// P3 SEMI-JOIN membership build (crt_join_reorder class) — KEEP-MIN-THEN-FILTER,
+    /// the load-bearing soundness invariant.
+    ///
+    /// The branch is a linear FK sub-chain `root ─root_join_var→ chain[0] ─…→
+    /// chain[m-1]`, its terminal carrying the membership constraint (e.g.
+    /// `order → customer[segment="Enterprise"]`). Returns the set of ROOT-FK join keys
+    /// whose chain — resolved the way the generic pipeline resolves it — satisfies
+    /// every constraint. The generic pipeline resolves each FK to the keep-min parent
+    /// SUBJECT (`build_parent_lookup` via `parent_key_insert_keep_min`) and then filters
+    /// THAT one row, so on a duplicate intermediate key it tests the keep-min row, not
+    /// "any duplicate". Building the set the other way — union every key some duplicate
+    /// row admits (filter-then-union) — would WRONGLY admit a key whose keep-min row
+    /// fails but a discarded duplicate passes. So each level is built keep-min-then-
+    /// filter and composed terminal→root: for a key, keep the row with the smallest
+    /// parent subject, then admit the key iff THAT row passes its own constraints AND
+    /// (interior) its next-hop FK is in the next level's admitted set.
+    ///
+    /// Bounded: each level's keep-min map is charged via `record_alloc` and the scan
+    /// loop `checkpoint`s per batch, so an oversized branch aborts typed
+    /// (`MemoryBudgetExceeded`, 507) before OOM — the same fail-loud shape
+    /// `build_parent_lookup` uses. Declines (`Ok(None)` → materialize) on any hop that
+    /// is not a single-column `RefObjectMap`, a missing parent TM/table, or a
+    /// constraint not reducible to a scalar column.
+    ///
+    /// #1583: the membership *set* models an inner join only while each FK is
+    /// single-valued (one fact row → at most one branch row per hop). A fan-out
+    /// `RefObjectMap` must revisit this (see [`SemiJoinSet`]).
+    async fn build_semi_join_membership(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        mapping: &CompiledR2rmlMapping,
+        root: &R2rmlPattern,
+        root_tm: &TriplesMap,
+        branch: &Branch<'_>,
+    ) -> Result<Option<SemiJoinSet>> {
+        use std::collections::hash_map::Entry;
+        let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
+            QueryError::InvalidQuery("R2RML table provider not configured".to_string())
+        })?;
+        let as_of_t = if ctx.dataset.is_some() {
+            None
+        } else {
+            Some(ctx.to_t)
+        };
+        let gs = &root.graph_source_id;
+
+        let chain = &branch.chain;
+        let m = chain.len();
+        if m == 0 {
+            return Ok(None); // a branch with no dim is not a semi-join (defensive)
+        }
+        // Per-hop FK resolution. hop `h` connects source `h` (index 0 = root, then
+        // chain[0..m-1]) to chain[h] via join var (root_join_var, then branch.join_vars):
+        // (child cols on the source, parent cols on chain[h], chain[h]'s TM). Single-
+        // column FK per hop (the 6b constraint). `chain_tms[h]` is chain[h]'s TM.
+        let mut hop_join_vars: Vec<VarId> = Vec::with_capacity(m);
+        hop_join_vars.push(branch.root_join_var);
+        hop_join_vars.extend(branch.join_vars.iter().copied());
+        if hop_join_vars.len() != m {
+            return Ok(None); // malformed branch (decompose guarantees this shape)
+        }
+        let mut src_pats: Vec<&R2rmlPattern> = Vec::with_capacity(m);
+        src_pats.push(root);
+        src_pats.extend(chain.iter().take(m - 1).copied());
+        let mut hops: Vec<(Vec<String>, Vec<String>)> = Vec::with_capacity(m);
+        let mut chain_tms: Vec<&TriplesMap> = Vec::with_capacity(m);
+        let mut src_tm = root_tm;
+        for h in 0..m {
+            let Some(join_pred) = Self::predicate_for_var(src_pats[h], hop_join_vars[h]) else {
+                return Ok(None);
+            };
+            let rom = src_tm.predicate_object_maps.iter().find_map(|pom| {
+                if pom.predicate_map.as_constant() == Some(join_pred) {
+                    if let ObjectMap::RefObjectMap(rom) = &pom.object_map {
+                        return Some(rom);
+                    }
+                }
+                None
+            });
+            let Some(rom) = rom else {
+                return Ok(None);
+            };
+            if rom.join_conditions.len() != 1 {
+                return Ok(None); // single-column FK per hop (6b)
+            }
+            let Some(parent_tm) = mapping.triples_maps.get(&rom.parent_triples_map) else {
+                return Ok(None);
+            };
+            hops.push((
+                rom.child_columns()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                rom.parent_columns()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            ));
+            chain_tms.push(parent_tm);
+            src_tm = parent_tm;
+        }
+        // Each chain pattern's folded constant-object constraints, resolved to scalar-
+        // column checks against ITS TM (a constraint that is not a scalar column
+        // declines the fuse — never silently dropped, so no over-admission).
+        let mut chain_checks: Vec<Vec<ResolvedConstraint>> = Vec::with_capacity(m);
+        for h in 0..m {
+            let Some(checks) = Self::resolve_star_constraint_checks(chain[h], chain_tms[h]) else {
+                return Ok(None);
+            };
+            chain_checks.push(checks);
+        }
+
+        // Build the admitted key set per level, terminal (m-1) → root (0). `admitted`
+        // after level `i` = the set of hop[i].parent-key values whose keep-min chain
+        // from chain[i] onward satisfies every constraint.
+        let mut admitted: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+        for level in (0..m).rev() {
+            let tm = chain_tms[level];
+            let Some(table) = tm.table_name().map(str::to_string) else {
+                return Ok(None);
+            };
+            let is_terminal = level == m - 1;
+            // This level's own join key (the columns hop `level` probes it by).
+            let parent_cols = hops[level].1.clone();
+            // chain[level]'s FK to the NEXT hop (interior levels only).
+            let next_fk_cols: Vec<String> = if is_terminal {
+                Vec::new()
+            } else {
+                hops[level + 1].0.clone()
+            };
+            let checks = &chain_checks[level];
+
+            let mut proj = parent_cols.clone();
+            if let Some(t) = tm.subject_map.template.as_deref() {
+                proj.extend(extract_template_columns(t));
+            }
+            if let Some(c) = &tm.subject_map.column {
+                proj.push(c.clone());
+            }
+            for c in checks {
+                proj.push(c.column().to_string());
+            }
+            proj.extend(next_fk_cols.iter().cloned());
+            proj.sort();
+            proj.dedup();
+
+            // key → keep-min(parent subject) row bookkeeping.
+            let mut kept: std::collections::HashMap<Vec<String>, KeptChainRow> =
+                std::collections::HashMap::new();
+            let mut s = table_provider
+                .scan_table(gs, &table, &proj, &[], None, as_of_t)
+                .await?;
+            while let Some(batch) = s.next().await {
+                // Bound the keep-min build: charge each new key + checkpoint per batch,
+                // so an oversized branch aborts typed before OOM (build_parent_lookup
+                // parity).
+                ctx.checkpoint()?;
+                let batch = batch?;
+                let kept_before = kept.len();
+                for row in 0..batch.num_rows {
+                    let Some(key) = get_join_key_from_batch(&parent_cols, &batch, row) else {
+                        continue; // null join key → never matched (skip, as build_parent_lookup does)
+                    };
+                    let subject = match materialize_subject_from_batch(&tm.subject_map, &batch, row)
+                    {
+                        Ok(Some(t)) => t,
+                        _ => continue, // null / non-materializable subject → skip
+                    };
+                    let passes_own = Self::row_satisfies_constraints(checks, &batch, row)?;
+                    let next_fk = if is_terminal {
+                        None
+                    } else {
+                        get_join_key_from_batch(&next_fk_cols, &batch, row)
+                    };
+                    // Deterministic keep-min on the parent SUBJECT, byte-identical to
+                    // `parent_key_insert_keep_min`: the lexicographically smaller subject
+                    // wins; an equal subject is a benign duplicate (no replace). The
+                    // WINNING row's `passes_own` + `next_fk` are what decide membership.
+                    match kept.entry(key) {
+                        Entry::Vacant(v) => {
+                            v.insert(KeptChainRow {
+                                subject,
+                                passes_own,
+                                next_fk,
+                            });
+                        }
+                        Entry::Occupied(mut e) => {
+                            if semijoin_subject_sort_key(&subject)
+                                < semijoin_subject_sort_key(&e.get().subject)
+                            {
+                                e.insert(KeptChainRow {
+                                    subject,
+                                    passes_own,
+                                    next_fk,
+                                });
+                            }
+                        }
+                    }
+                }
+                ctx.record_alloc((kept.len() - kept_before) * crate::context::GROUP_EST_BYTES);
+            }
+
+            // Reduce the kept (keep-min) rows to this level's admitted set.
+            let prev_admitted = std::mem::take(&mut admitted);
+            let mut level_admitted: std::collections::HashSet<Vec<String>> =
+                std::collections::HashSet::new();
+            for (key, k) in kept {
+                if !k.passes_own {
+                    continue; // kept row fails its own constraint → key excluded
+                }
+                let ok = if is_terminal {
+                    true
+                } else {
+                    match &k.next_fk {
+                        Some(fk) => prev_admitted.contains(fk),
+                        None => false, // null next-hop FK → chain breaks → excluded
+                    }
+                };
+                if ok {
+                    level_admitted.insert(key);
+                }
+            }
+            admitted = level_admitted;
+        }
+
+        Ok(Some(SemiJoinSet {
+            // The fact probes with the root→branch first-hop CHILD columns; the level-0
+            // build keyed by the matching PARENT columns, same stringified join value.
+            fact_fk_cols: hops[0].0.clone(),
+            membership: admitted,
         }))
     }
 }
@@ -5874,5 +6288,580 @@ mod tests {
             eval_dec(&nested, &big_and_null),
             DecEval::Overflow
         ));
+    }
+
+    // ===================================================================
+    // P3: branching-star multi-fact join (crt_join_reorder class) — the
+    // soundness core (SEMI-JOIN keep-min-then-filter membership + fold probe).
+    // ===================================================================
+
+    use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+    /// The crt_join_reorder mapping (integer `SUM(quantity)`): OrderLine(fact)
+    /// `--order-->` Order `--customer-->` Customer, and OrderLine `--product-->`
+    /// Product. The measure's declared datatype is caller-chosen so a decimal variant
+    /// exercises the exact i128 → BigDecimal fold. Order's SUBJECT is keyed on a
+    /// surrogate `OID`, NOT the join key `ORDER_KEY`, so a duplicate ORDER_KEY can
+    /// carry two distinct subjects — the keep-min discriminator.
+    fn crt_mapping(qty_dt: &str) -> Arc<CompiledR2rmlMapping> {
+        use fluree_db_r2rml::mapping::PredicateMap;
+        use fluree_vocab::xsd;
+        Arc::new(CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("#OrderLine", "order_line")
+                .with_subject_template("http://ex/ol/{OLID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/quantity"),
+                    object_map: ObjectMap::column_typed("QTY", qty_dt),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/order"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Order",
+                        "ORDER_KEY",
+                        "ORDER_KEY",
+                    )),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/product"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Product",
+                        "PRODUCT_KEY",
+                        "PRODUCT_KEY",
+                    )),
+                }),
+            TriplesMap::new("#Order", "order_t")
+                .with_subject_template("http://ex/order/{OID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/customer"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Customer",
+                        "CUSTOMER_KEY",
+                        "CUSTOMER_KEY",
+                    )),
+                }),
+            TriplesMap::new("#Customer", "customer")
+                .with_subject_template("http://ex/cust/{CUSTOMER_KEY}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/segment"),
+                    object_map: ObjectMap::column("SEGMENT"),
+                }),
+            TriplesMap::new("#Product", "product")
+                .with_subject_template("http://ex/prod/{PRODUCT_KEY}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/category"),
+                    object_map: ObjectMap::column("CATEGORY"),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/isCurrent"),
+                    object_map: ObjectMap::column_typed("IS_CURRENT", xsd::BOOLEAN),
+                }),
+        ]))
+    }
+
+    /// The crt_join_reorder BGP as rewritten R2rml leaf patterns (var ids match the
+    /// shape-anchor test): fact `?ol(0)` {quantity=?qty(10), order=?o(1),
+    /// product=?p(2)}; `?o(1)` {customer=?c(3)}; `?c(3)` [segment="Enterprise"];
+    /// `?p(2)` {category=?cat(12)} [isCurrent=true].
+    fn crt_patterns() -> [R2rmlPattern; 4] {
+        let (ol, o, c, p) = (VarId(0), VarId(1), VarId(3), VarId(2));
+        let (qty, cat) = (VarId(10), VarId(12));
+        let mut olp = R2rmlPattern::new("gs", ol, None);
+        olp.triples_map_iri = Some("#OrderLine".into());
+        olp.star_bindings = vec![
+            ("http://ex/quantity".into(), qty),
+            ("http://ex/order".into(), o),
+            ("http://ex/product".into(), p),
+        ];
+        let mut op_ = R2rmlPattern::new("gs", o, None);
+        op_.triples_map_iri = Some("#Order".into());
+        op_.star_bindings = vec![("http://ex/customer".into(), c)];
+        let mut cp = R2rmlPattern::new("gs", c, None);
+        cp.triples_map_iri = Some("#Customer".into());
+        cp.star_constraints = vec![(
+            "http://ex/segment".into(),
+            crate::r2rml::ObjectConstant::Scalar(crate::r2rml::ScanValue::Str("Enterprise".into())),
+        )];
+        let mut pp = R2rmlPattern::new("gs", p, None);
+        pp.triples_map_iri = Some("#Product".into());
+        pp.star_bindings = vec![("http://ex/category".into(), cat)];
+        pp.star_constraints = vec![(
+            "http://ex/isCurrent".into(),
+            crate::r2rml::ObjectConstant::Scalar(crate::r2rml::ScanValue::Bool(true)),
+        )];
+        [olp, op_, cp, pp]
+    }
+
+    fn crt_op() -> FusedR2rmlAggregateOperator {
+        use crate::ir::grouping::InputSemantics;
+        use crate::seed::EmptyOperator;
+        let (qty, cat, u) = (VarId(10), VarId(12), VarId(20));
+        let plan = FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![],
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![cat],
+            aggregates: vec![(u, AggregateFn::Sum(qty, InputSemantics::List))],
+        };
+        FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()))
+    }
+
+    /// A mock provider serving multiple tables (each 0+ batches) plus the mapping —
+    /// the SEMI-JOIN dim builds (customer, order) + the GROUP-KEY dim build (product)
+    /// scan here at resolve, and the fact (order_line) scans here in `next_batch`.
+    #[derive(Debug)]
+    struct CrtProvider {
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: std::collections::HashMap<String, Vec<ColumnBatch>>,
+    }
+    #[async_trait]
+    impl crate::r2rml::R2rmlProvider for CrtProvider {
+        async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
+            true
+        }
+        async fn compiled_mapping(
+            &self,
+            _gs: &str,
+            _t: Option<i64>,
+        ) -> Result<Arc<CompiledR2rmlMapping>> {
+            Ok(Arc::clone(&self.mapping))
+        }
+    }
+    #[async_trait]
+    impl crate::r2rml::R2rmlTableProvider for CrtProvider {
+        async fn scan_table(
+            &self,
+            _gs: &str,
+            table: &str,
+            _p: &[String],
+            _f: &[crate::r2rml::ScanFilter],
+            _tk: Option<&crate::r2rml::ScanTopK>,
+            _t: Option<i64>,
+        ) -> Result<crate::r2rml::ColumnBatchStream> {
+            let bs = self.batches.get(table).cloned().unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(bs.into_iter().map(Ok))))
+        }
+    }
+
+    fn mk_batch(cols: Vec<(FieldInfo, Column)>) -> ColumnBatch {
+        let (fields, columns): (Vec<_>, Vec<_>) = cols.into_iter().unzip();
+        let schema = Arc::new(BatchSchema::new(fields));
+        ColumnBatch::new(schema, columns).unwrap()
+    }
+    fn field(name: &str, id: i32, ft: FieldType) -> FieldInfo {
+        FieldInfo {
+            name: name.to_string(),
+            field_type: ft,
+            nullable: true,
+            field_id: id,
+        }
+    }
+    fn icol(name: &str, id: i32, v: Vec<Option<i64>>) -> (FieldInfo, Column) {
+        (field(name, id, FieldType::Int64), Column::Int64(v))
+    }
+    fn scol(name: &str, id: i32, v: Vec<&str>) -> (FieldInfo, Column) {
+        (
+            field(name, id, FieldType::String),
+            Column::String(v.into_iter().map(|s| Some(s.to_string())).collect()),
+        )
+    }
+    fn bcol(name: &str, id: i32, v: Vec<Option<bool>>) -> (FieldInfo, Column) {
+        (field(name, id, FieldType::Boolean), Column::Boolean(v))
+    }
+
+    /// Resolve + fold the crt_join_reorder fixture through the P3 branching-star path
+    /// (calling `resolve_branching_star_at_open` DIRECTLY — no env dependence — after
+    /// `decompose_branching_star`), returning `(category, SUM)` rows sorted by
+    /// category. Panics if the shape does not FUSE.
+    async fn run_crt(
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: std::collections::HashMap<String, Vec<ColumnBatch>>,
+    ) -> Vec<(String, Binding)> {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let pats = crt_patterns();
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let provider = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches,
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+            .expect("crt_join_reorder must decompose");
+        let mut op = crt_op();
+        let resolved = op
+            .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+            .await
+            .expect("resolve must not error")
+            .expect("crt_join_reorder must FUSE (not decline)");
+        op.resolved = Some(resolved);
+        let batch = op
+            .next_batch(&ctx)
+            .await
+            .expect("next_batch")
+            .expect("an output batch");
+        let (cat, u) = (VarId(12), VarId(20));
+        let n = batch.column(cat).map(<[Binding]>::len).unwrap_or(0);
+        let mut out = Vec::with_capacity(n);
+        for row in 0..n {
+            let c = match batch.get(row, cat).expect("cat binding") {
+                Binding::Lit {
+                    val: FlakeValue::String(s),
+                    ..
+                } => s.clone(),
+                other => panic!("category key must be an xsd:string literal, got {other:?}"),
+            };
+            out.push((c, batch.get(row, u).expect("sum binding").clone()));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    fn long_sum(n: i64) -> Binding {
+        Binding::lit(FlakeValue::Long(n), Sid::xsd_integer())
+    }
+
+    /// Batches for a clean (unique-key) crt_join_reorder fixture: two Enterprise
+    /// orders on `Widgets`, one on `Gadgets`, one order on an SMB customer (dropped by
+    /// the semi-join), and one line on a non-current product (dropped by the
+    /// group-key dim constraint). Integer quantities.
+    fn clean_batches() -> std::collections::HashMap<String, Vec<ColumnBatch>> {
+        let mut m = std::collections::HashMap::new();
+        // OrderLine: OLID, ORDER_KEY, PRODUCT_KEY, QTY.
+        m.insert(
+            "order_line".to_string(),
+            vec![mk_batch(vec![
+                icol("OLID", 1, vec![Some(1), Some(2), Some(3), Some(4), Some(5)]),
+                icol(
+                    "ORDER_KEY",
+                    2,
+                    vec![Some(10), Some(11), Some(12), Some(13), Some(10)],
+                ),
+                icol(
+                    "PRODUCT_KEY",
+                    3,
+                    vec![Some(100), Some(100), Some(200), Some(100), Some(300)],
+                ),
+                icol("QTY", 4, vec![Some(5), Some(7), Some(3), Some(9), Some(2)]),
+            ])],
+        );
+        // Order: OID (subject surrogate), ORDER_KEY (join key), CUSTOMER_KEY (FK).
+        m.insert(
+            "order_t".to_string(),
+            vec![mk_batch(vec![
+                scol("OID", 1, vec!["o10", "o11", "o12", "o13"]),
+                icol("ORDER_KEY", 2, vec![Some(10), Some(11), Some(12), Some(13)]),
+                icol(
+                    "CUSTOMER_KEY",
+                    3,
+                    vec![Some(1000), Some(1000), Some(1001), Some(1002)],
+                ),
+            ])],
+        );
+        // Customer: CUSTOMER_KEY, SEGMENT. 1002 is SMB (drops order 13).
+        m.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![
+                icol("CUSTOMER_KEY", 1, vec![Some(1000), Some(1001), Some(1002)]),
+                scol("SEGMENT", 2, vec!["Enterprise", "Enterprise", "SMB"]),
+            ])],
+        );
+        // Product: PRODUCT_KEY, CATEGORY, IS_CURRENT. 300 is not current (drops OL5).
+        m.insert(
+            "product".to_string(),
+            vec![mk_batch(vec![
+                icol("PRODUCT_KEY", 1, vec![Some(100), Some(200), Some(300)]),
+                scol("CATEGORY", 2, vec!["Widgets", "Gadgets", "Widgets"]),
+                bcol("IS_CURRENT", 3, vec![Some(true), Some(true), Some(false)]),
+            ])],
+        );
+        m
+    }
+
+    /// (a) VALUE-IDENTITY: the clean fixture folds to the generic inner join's answer,
+    /// byte-identical (integer `SUM(quantity)` → xsd:integer Long). Widgets = OL1(5) +
+    /// OL2(7) = 12 (OL5 dropped: product not current); Gadgets = OL3(3); OL4 dropped
+    /// (SMB customer).
+    #[tokio::test]
+    async fn p3_crt_join_reorder_value_identity_integer() {
+        let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), clean_batches()).await;
+        assert_eq!(
+            out,
+            vec![
+                ("Gadgets".to_string(), long_sum(3)),
+                ("Widgets".to_string(), long_sum(12)),
+            ],
+            "fused SUM must equal the generic chained-inner-join answer, byte-identical"
+        );
+    }
+
+    /// (a′) VALUE-IDENTITY, Dec i128 path: the same shape with an xsd:decimal measure
+    /// folds through the exact i128 → BigDecimal accumulator. Quantities 5.25, 7.25,
+    /// 3.50 (scale 2). Widgets = 5.25 + 7.25 = 12.50; Gadgets = 3.50. The reference is
+    /// the SAME `Acc::Exact` finalize the fold uses, so this pins the exact-decimal
+    /// binding bit for bit.
+    #[tokio::test]
+    async fn p3_crt_join_reorder_value_identity_decimal() {
+        let mut b = clean_batches();
+        // Replace QTY with a scale-2 decimal column; keep the same rows.
+        b.insert(
+            "order_line".to_string(),
+            vec![mk_batch(vec![
+                icol("OLID", 1, vec![Some(1), Some(2), Some(3), Some(4), Some(5)]),
+                icol(
+                    "ORDER_KEY",
+                    2,
+                    vec![Some(10), Some(11), Some(12), Some(13), Some(10)],
+                ),
+                icol(
+                    "PRODUCT_KEY",
+                    3,
+                    vec![Some(100), Some(100), Some(200), Some(100), Some(300)],
+                ),
+                (
+                    field(
+                        "QTY",
+                        4,
+                        FieldType::Decimal {
+                            precision: 12,
+                            scale: 2,
+                        },
+                    ),
+                    Column::Decimal {
+                        values: vec![Some(525), Some(725), Some(350), Some(900), Some(200)],
+                        precision: 12,
+                        scale: 2,
+                    },
+                ),
+            ])],
+        );
+        // `finalize_sum` only branches on count==0 (→ integer 0) vs >0; the exact
+        // value is independent of count for SUM, so any positive count reproduces the
+        // fold's decimal binding bit for bit.
+        let dec = |unscaled: i128| {
+            Acc::Exact {
+                sum: unscaled,
+                scale: 2,
+                decimal: true,
+                count: 1,
+                is_avg: false,
+            }
+            .finalize()
+        };
+        let out = run_crt(crt_mapping(fluree_vocab::xsd::DECIMAL), b).await;
+        assert_eq!(
+            out,
+            vec![
+                ("Gadgets".to_string(), dec(350)),  // 3.50
+                ("Widgets".to_string(), dec(1250)), // 5.25 + 7.25 = 12.50
+            ],
+            "fused decimal SUM must be byte-identical to the exact i128 → BigDecimal finalize"
+        );
+    }
+
+    /// (b) KEEP-MIN-THEN-FILTER DISCRIMINATOR: a duplicate ORDER_KEY where the keep-min
+    /// Order row (smaller subject) points at a NON-Enterprise customer and the
+    /// DISCARDED duplicate points at an Enterprise customer. The generic join resolves
+    /// the FK to the keep-min parent subject and tests THAT row, so the order line
+    /// DROPS. A naive filter-then-union membership set (admit the key because SOME
+    /// duplicate matches) would WRONGLY include it — this fixture is built so that
+    /// bug would produce Widgets=50 instead of the correct empty result.
+    #[tokio::test]
+    async fn p3_crt_join_reorder_keep_min_then_filter_excludes() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "order_line".to_string(),
+            vec![mk_batch(vec![
+                icol("OLID", 1, vec![Some(1)]),
+                icol("ORDER_KEY", 2, vec![Some(1)]),
+                icol("PRODUCT_KEY", 3, vec![Some(100)]),
+                icol("QTY", 4, vec![Some(50)]),
+            ])],
+        );
+        // Two Order rows, SAME ORDER_KEY=1, distinct subjects: order/a (keep-min) →
+        // customer 200 (SMB); order/b (discarded) → customer 100 (Enterprise).
+        m.insert(
+            "order_t".to_string(),
+            vec![mk_batch(vec![
+                scol("OID", 1, vec!["a", "b"]),
+                icol("ORDER_KEY", 2, vec![Some(1), Some(1)]),
+                icol("CUSTOMER_KEY", 3, vec![Some(200), Some(100)]),
+            ])],
+        );
+        m.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![
+                icol("CUSTOMER_KEY", 1, vec![Some(100), Some(200)]),
+                scol("SEGMENT", 2, vec!["Enterprise", "SMB"]),
+            ])],
+        );
+        m.insert(
+            "product".to_string(),
+            vec![mk_batch(vec![
+                icol("PRODUCT_KEY", 1, vec![Some(100)]),
+                scol("CATEGORY", 2, vec!["Widgets"]),
+                bcol("IS_CURRENT", 3, vec![Some(true)]),
+            ])],
+        );
+        let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), m).await;
+        assert!(
+            out.is_empty(),
+            "keep-min Order row is SMB → the line drops; filter-then-union would wrongly \
+             admit it (Widgets=50). Got {out:?}"
+        );
+    }
+
+    /// (b-control) The SAME duplicate-key fixture with the subjects SWAPPED so the
+    /// keep-min row is now the Enterprise one — the order line must be INCLUDED. The
+    /// contrast with the test above proves the keep-min tie-break (not "any duplicate
+    /// matches") decides membership.
+    #[tokio::test]
+    async fn p3_crt_join_reorder_keep_min_control_includes() {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "order_line".to_string(),
+            vec![mk_batch(vec![
+                icol("OLID", 1, vec![Some(1)]),
+                icol("ORDER_KEY", 2, vec![Some(1)]),
+                icol("PRODUCT_KEY", 3, vec![Some(100)]),
+                icol("QTY", 4, vec![Some(50)]),
+            ])],
+        );
+        // order/a (keep-min) → customer 100 (Enterprise); order/b (discarded) → 200 (SMB).
+        m.insert(
+            "order_t".to_string(),
+            vec![mk_batch(vec![
+                scol("OID", 1, vec!["a", "b"]),
+                icol("ORDER_KEY", 2, vec![Some(1), Some(1)]),
+                icol("CUSTOMER_KEY", 3, vec![Some(100), Some(200)]),
+            ])],
+        );
+        m.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![
+                icol("CUSTOMER_KEY", 1, vec![Some(100), Some(200)]),
+                scol("SEGMENT", 2, vec!["Enterprise", "SMB"]),
+            ])],
+        );
+        m.insert(
+            "product".to_string(),
+            vec![mk_batch(vec![
+                icol("PRODUCT_KEY", 1, vec![Some(100)]),
+                scol("CATEGORY", 2, vec!["Widgets"]),
+                bcol("IS_CURRENT", 3, vec![Some(true)]),
+            ])],
+        );
+        let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), m).await;
+        assert_eq!(
+            out,
+            vec![("Widgets".to_string(), long_sum(50))],
+            "keep-min Order row is Enterprise → the line is included"
+        );
+    }
+
+    /// (c) BUDGET: the SEMI-JOIN membership build is charged via `record_alloc` and
+    /// checkpoints per batch, so an oversized branch aborts typed
+    /// (`MemoryBudgetExceeded`, 507) instead of OOMing. A tiny pinned budget + a
+    /// multi-batch terminal dim trips it inside `build_semi_join_membership`.
+    #[tokio::test]
+    async fn p3_crt_join_reorder_budget_exceeded_fails_typed() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+        let mut m = std::collections::HashMap::new();
+        // Terminal Customer dim served as TWO batches: batch 1 charges the running
+        // total past the budget, batch 2's checkpoint aborts.
+        m.insert(
+            "customer".to_string(),
+            vec![
+                mk_batch(vec![
+                    icol("CUSTOMER_KEY", 1, vec![Some(1000), Some(1001)]),
+                    scol("SEGMENT", 2, vec!["Enterprise", "Enterprise"]),
+                ]),
+                mk_batch(vec![
+                    icol("CUSTOMER_KEY", 1, vec![Some(1002), Some(1003)]),
+                    scol("SEGMENT", 2, vec!["Enterprise", "Enterprise"]),
+                ]),
+            ],
+        );
+        let pats = crt_patterns();
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let provider = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches: m,
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(64); // < GROUP_EST_BYTES → the first batch's charge trips
+        let ctx = ExecutionContext::new(&snapshot, &vars)
+            .with_r2rml_providers(&provider, &provider)
+            .with_cancellation(cancel);
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+            .expect("decompose");
+        match crt_op()
+            .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+            .await
+        {
+            Err(QueryError::MemoryBudgetExceeded { .. }) => {}
+            Err(other) => panic!("expected MemoryBudgetExceeded, got a different error: {other:?}"),
+            Ok(_) => panic!("an over-budget semi-join build must fail typed, not succeed/OOM"),
+        }
+    }
+
+    /// (d) SWITCH: `FLUREE_FUSED_R2RML_MULTIFACT=0` disables the whole branching path,
+    /// so `resolve_join_at_open` DECLINES the star (Ok(None) → the pre-P3 fallback,
+    /// byte-identical); unset/on FUSES it. This is the sole reader/writer of the env
+    /// var (the resolver tests call `resolve_branching_star_at_open` directly), so no
+    /// lock is needed. `multifact_enabled` is read uncached under cfg(test).
+    #[tokio::test]
+    async fn p3_multifact_switch_gates_the_branching_path() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+        let pats = crt_patterns();
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+
+        // OFF → decline (Ok(None)).
+        std::env::set_var("FLUREE_FUSED_R2RML_MULTIFACT", "0");
+        assert!(!FusedR2rmlAggregateOperator::multifact_enabled());
+        let provider_off = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches: std::collections::HashMap::new(),
+        };
+        let ctx_off = ExecutionContext::new(&snapshot, &vars)
+            .with_r2rml_providers(&provider_off, &provider_off);
+        let off = crt_op()
+            .resolve_join_at_open(&ctx_off, &refs, mapping.as_ref())
+            .await
+            .expect("resolve must not error");
+        assert!(
+            off.is_none(),
+            "switch OFF must DECLINE the branching star (pre-P3 byte-identical path)"
+        );
+
+        // ON (the same shape + a valid fixture) → fuse (Ok(Some)).
+        std::env::set_var("FLUREE_FUSED_R2RML_MULTIFACT", "1");
+        assert!(FusedR2rmlAggregateOperator::multifact_enabled());
+        let provider_on = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches: clean_batches(),
+        };
+        let ctx_on = ExecutionContext::new(&snapshot, &vars)
+            .with_r2rml_providers(&provider_on, &provider_on);
+        let on = crt_op()
+            .resolve_join_at_open(&ctx_on, &refs, mapping.as_ref())
+            .await
+            .expect("resolve must not error");
+        std::env::remove_var("FLUREE_FUSED_R2RML_MULTIFACT");
+        assert!(
+            on.is_some(),
+            "switch ON must FUSE the branching star (contrast proving the gate controls it)"
+        );
     }
 }
