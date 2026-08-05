@@ -2406,11 +2406,29 @@ impl FusedR2rmlAggregateOperator {
                 }
                 None => {
                     // P2a: a RefObjectMap object var (e.g. the `?c` group key) has no
-                    // scalar column. Its row-validity is "the FK child columns are
-                    // non-null" — a NULL FK yields no ref triple, exactly as
-                    // `materialize_pom_object` returns None on a null join key, so the
-                    // fact row drops. (A present-but-dangling FK is dropped later by
-                    // the resolver probe.) Any other unresolvable object declines.
+                    // scalar column. It is admitted ONLY when it is the RefObjectMap
+                    // GROUP BY key — the one var for which the `group_resolver` below is
+                    // built (a resolver exists ONLY inside `if let Some(..) =
+                    // ref_group_key`, and `ref_group_key` is set ONLY by the GROUP BY
+                    // loop above). The resolver's per-row parent probe drops a
+                    // present-but-dangling FK, matching the generic inner join. A ref
+                    // object var that is NOT the group key — any pattern object var, or
+                    // an ungrouped `COUNT`/`SUM` over `?o :ref ?c` — has NO resolver, so
+                    // admitting it on FK-non-null validity alone would COUNT a
+                    // present-but-dangling FK the generic path drops (an over-count;
+                    // every prior P2a fixture had a GROUP BY, which is why this slipped).
+                    // Decline it to the generic path (never over-count). Declining here,
+                    // before `count_shortcut_eligible` (reached only from `next_batch` on
+                    // a resolved plan), also closes the secondary manifest `record_count`
+                    // over-count for this shape.
+                    if !self.group_by.contains(&v) {
+                        return Ok(None);
+                    }
+                    // Its row-validity is "the FK child columns are non-null" — a NULL FK
+                    // yields no ref triple, exactly as `materialize_pom_object` returns
+                    // None on a null join key, so the fact row drops. (A present-but-
+                    // dangling FK is dropped by the `group_resolver` probe.) Any other
+                    // unresolvable object declines.
                     let Some((rom, _parent)) =
                         Self::ref_object_map_for_var(&pattern, tm, v, &mapping)
                     else {
@@ -5761,6 +5779,70 @@ mod tests {
                 ("http://ex/cust/20".to_string(), 1),
             ],
             "fused ref-IRI GROUP BY must equal the generic answer (dangling FK dropped)"
+        );
+    }
+
+    /// B1 (review id=3717339897): an UNGROUPED aggregate (`group_by:[]`, COUNT(*))
+    /// over a RefObjectMap object var (`?o <custRef> ?c`) must DECLINE the fuse. A
+    /// `group_resolver` — whose per-row parent probe drops a present-but-dangling FK —
+    /// is built ONLY for a RefObjectMap GROUP BY key (inside `if let Some(..) =
+    /// ref_group_key`). Without a resolver the single-table fold admits the object var
+    /// on FK-non-null validity alone, so a present-but-dangling FK passes and is folded
+    /// in — an over-count vs the generic inner join (which drops it). Here orders carry
+    /// CFK {10,10,20,99} against customers {10,20}: pre-fix `resolve_at_open` ADMITTED
+    /// (would fold COUNT=4), the generic answer is 3. Every prior P2a fixture has a
+    /// GROUP BY, which is exactly why this slipped. The fix declines → the generic path
+    /// answers 3 (fused == generic by construction). Declining before
+    /// `count_shortcut_eligible` (reached only from `next_batch` on a RESOLVED plan)
+    /// also closes the secondary manifest `record_count` over-count for this shape.
+    #[tokio::test]
+    async fn ungrouped_ref_object_var_declines_dangling_fk_over_count() {
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let (o, c, cnt) = (VarId(0), VarId(1), VarId(20));
+        // `?o <custRef> ?c` — the SAME single-table representation the grouped P2a
+        // fixtures use (predicate_filter + object_var bound by a RefObjectMap), only
+        // UNGROUPED.
+        let mut fact = R2rmlPattern::new("gs", o, Some(c));
+        fact.triples_map_iri = Some("#Order".to_string());
+        fact.predicate_filter = Some("http://ex/custRef".to_string());
+        let plan = FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![Pattern::R2rml(fact)],
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![], // UNGROUPED — no ref_group_key, so no dangling-FK resolver
+            aggregates: vec![(cnt, AggregateFn::CountAll)],
+        };
+        let op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
+        let mapping = order_customer_mapping("http://ex/cust/{CID}");
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "order".to_string(),
+            vec![batch_of(vec![
+                i64_col("OID", 1, vec![Some(1), Some(2), Some(3), Some(4)]),
+                i64_col("CFK", 2, vec![Some(10), Some(10), Some(20), Some(99)]),
+            ])],
+        );
+        batches.insert(
+            "customer".to_string(),
+            vec![batch_of(vec![i64_col("CID", 1, vec![Some(10), Some(20)])])],
+        );
+        let provider = CrtProvider { mapping, batches };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let resolved = op
+            .resolve_at_open(&ctx)
+            .await
+            .expect("resolve must not error");
+        assert!(
+            resolved.is_none(),
+            "an ungrouped aggregate over a RefObjectMap object var must DECLINE (no \
+             resolver drops the present-but-dangling FK); pre-fix it admitted and \
+             over-counted 4 vs the generic 3"
         );
     }
 
