@@ -501,6 +501,11 @@ pub async fn iceberg_tracking_status(State(state): State<Arc<AppState>>) -> Resp
                 "polls": stats.polls,
                 "syncs_committed": stats.syncs_committed,
                 "syncs_noop": stats.syncs_noop,
+                // Surfaced separately from failures on purpose: a non-zero rate here
+                // means the INDEXER is the bottleneck, which is a capacity signal, not
+                // a fault. Counting deferrals as failures is how 1,050 of them once
+                // presented as an outage and hid the real cause.
+                "syncs_deferred": stats.syncs_deferred,
                 "syncs_failed": stats.syncs_failed,
                 "tracked_jobs": stats.tracked_jobs,
             }

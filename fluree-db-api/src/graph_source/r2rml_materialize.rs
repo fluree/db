@@ -237,7 +237,9 @@ impl Fluree {
         let mut rows_read = 0usize;
         let mut incremental_all = true;
         let mut any_table = false;
-        let mut all_watermarks_unchanged = true;
+        // Set when at least one table's window has aged past the refresh bound, so a
+        // no-data poll must still persist its watermark to keep it resolvable.
+        let mut watermark_refresh_due = false;
         // (table, from-snapshot, advanced to-snapshot) per source table.
         let mut table_watermarks: Vec<(String, Option<i64>, i64)> = Vec::new();
 
@@ -268,16 +270,23 @@ impl Fluree {
             // require (finalize() must see every row for a key). That is a smaller
             // and more predictable term than the raw columnar data, but it is not
             // O(1) — a window with millions of distinct subjects is still large.
-            let (to_id, incremental, mut batch_stream) = provider
+            let scan = provider
                 .scan_for_materialize_stream(source_graph_source_id, table_name, &[], from_t)
                 .await?;
+            let (to_id, incremental) = (scan.to_snapshot_id, scan.incremental);
+            // A window older than the refresh bound must persist its watermark even
+            // with zero rows — see `watermark_refresh_bound_ms`.
+            if scan
+                .window_age_ms
+                .is_none_or(|age| age >= watermark_refresh_bound_ms())
+            {
+                watermark_refresh_due = true;
+            }
+            let mut batch_stream = scan.stream;
             // Only count a table as contributing once it actually has a snapshot.
             if let Some(to) = to_id {
                 any_table = true;
                 incremental_all = incremental_all && incremental;
-                if Some(to) != from_t {
-                    all_watermarks_unchanged = false;
-                }
                 table_watermarks.push(((*table_name).to_string(), from_t, to));
             }
 
@@ -352,8 +361,21 @@ impl Fluree {
         let (live, deletions) = accum.finalize();
         let subjects_upserted = live.len();
 
-        // No-delta short-circuit: nothing read and no watermark advanced.
-        if live.is_empty() && deletions.is_empty() && all_watermarks_unchanged {
+        // No-delta short-circuit.
+        //
+        // This used to require `all_watermarks_unchanged`, which made it almost never
+        // fire: the watermark is the source's snapshot id, and the upstream Kafka
+        // sink bumps that 37-72 times an hour per table whether or not any row
+        // concerns us. So a poll that read NOTHING still wrote a watermark commit.
+        // Seventeen sources at a ~50 s poll interval produced ~1,200 commits/hour of
+        // two-triple payloads into the shared state ledger, which reached 27,179
+        // commits against 3 index roots, saturated its novelty, and — because the
+        // watermark write is the LAST step of every materialize — halted every sync
+        // in the deployment.
+        //
+        // SNAPSHOT-ID MOVEMENT IS NOT WORK. What matters is whether we wrote rows.
+        // The one exception is staleness: see `watermark_refresh_due`.
+        if live.is_empty() && deletions.is_empty() && !watermark_refresh_due {
             return Ok(MaterializeResult {
                 to_snapshot_id,
                 from_snapshot_id,
@@ -1006,35 +1028,11 @@ impl Fluree {
     where
         B: Fn(&[T]) -> JsonValue,
     {
-        // Consecutive waits allowed for one chunk before giving up. Bounded so a
-        // genuinely wedged indexer surfaces as an error rather than hanging the
-        // worker forever — but the bound has to exceed how long a drain ACTUALLY
-        // takes, and the first version did not.
-        //
-        // MEASURED on a live deployment: the interval between consecutive index
-        // builds of the SAME ledger was median 144 s, p90 174 s, max 202 s (31
-        // samples over 30 min, 22 ledgers). Novelty for a given ledger cannot drain
-        // faster than its own next index build, so a 60 s budget (the original
-        // 12 x 5 s) was ~2.4x too small at the median — it would have exhausted and
-        // errored on most stuck chunks, which is exactly the failure it exists to
-        // prevent.
-        //
-        // 72 x 5 s = 360 s covers the observed max with ~1.8x headroom. The counter
-        // RESETS on every successful chunk, so this is a per-stall budget, not a
-        // total: a long materialize that keeps making progress is never capped.
-        // Override for a deployment whose indexer is slower still.
-        let max_drain_waits: usize = std::env::var("FLUREE_MATERIALIZE_MAX_DRAIN_WAITS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(72);
-        const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
         // A stack, because a rejected chunk is pushed back as two halves and both
         // must be applied before moving on — order within a chunk list does not
         // matter (insert/upsert are per-subject and idempotent), but completeness
         // does.
         let mut pending: Vec<Vec<T>> = chunks.into_iter().filter(|c| !c.is_empty()).rev().collect();
-        let mut drain_waits = 0usize;
 
         while let Some(chunk) = pending.pop() {
             let doc = build(&chunk);
@@ -1044,60 +1042,93 @@ impl Fluree {
                 ChunkVerb::Update => self.update(ledger.clone(), &doc).await,
             };
             match result {
-                Ok(r) => {
-                    ledger = r.ledger;
-                    // Progress resets the budget: a wait that let one chunk through
-                    // has done its job, and the next chunk deserves a full budget.
-                    drain_waits = 0;
-                }
+                Ok(r) => ledger = r.ledger,
                 Err(e) => {
                     // Classification lives in `classify_novelty` so it is testable;
-                    // see the note there. `None` = a real failure, fail fast.
+                    // `None` means a real failure — fail fast.
                     let Some(pressure) = classify_novelty(&e) else {
                         return Err(e);
                     };
-                    // Splitting only helps a SIZED rejection. When novelty is already
-                    // at the ceiling no chunk is small enough, so go straight to the
-                    // wait — that distinction is the whole reason for the enum.
-                    let splittable =
-                        matches!(pressure, NoveltyPressure::WouldExceed { .. }) && chunk.len() > 1;
-                    if splittable {
-                        let (left, right) = split_in_half(chunk);
-                        info!(
-                            items = left.len() + right.len(),
-                            ?pressure,
-                            "materialize: novelty backpressure, splitting chunk"
-                        );
-                        pending.push(right);
-                        pending.push(left);
-                    } else {
-                        if drain_waits >= max_drain_waits {
-                            return Err(ApiError::Internal(format!(
-                                "materialize: novelty still under pressure after {} waits \
-                                 ({}s) — {:?}. The indexer is not draining novelty; check \
-                                 for a wedged or failing index build on the target ledger.",
-                                max_drain_waits,
-                                max_drain_waits * DRAIN_WAIT.as_secs() as usize,
-                                pressure,
-                            )));
+                    match pressure {
+                        // SIZED rejection: this transaction was too big for the
+                        // headroom left. Halving reduces `delta` and can succeed, and
+                        // it costs nothing but a retry — no sleeping, nothing held.
+                        NoveltyPressure::WouldExceed { .. } if chunk.len() > 1 => {
+                            let (left, right) = split_in_half(chunk);
+                            info!(
+                                items = left.len() + right.len(),
+                                ?pressure,
+                                "materialize: novelty backpressure, splitting chunk"
+                            );
+                            pending.push(right);
+                            pending.push(left);
                         }
-                        drain_waits += 1;
-                        warn!(
-                            attempt = drain_waits,
-                            max_attempts = max_drain_waits,
-                            items = chunk.len(),
-                            ?pressure,
-                            "materialize: novelty under pressure, waiting for the indexer \
-                             to drain"
-                        );
-                        tokio::time::sleep(DRAIN_WAIT).await;
-                        pending.push(chunk);
+                        // DEFER, do not wait.
+                        //
+                        // This replaces an in-process sleep-and-retry, and the reason
+                        // is a deadlock it caused in production: novelty can only be
+                        // drained by the INDEXER, and the materialize worker holds
+                        // what the indexer needs to publish. Sleeping therefore
+                        // guarantees the condition being waited on cannot clear — the
+                        // indexer produced ZERO builds for six minutes, and recovered
+                        // only when the wait was disabled.
+                        //
+                        // A bigger budget makes that worse, not better. The fix is to
+                        // stop holding: return, let the caller record this target as
+                        // deferred, and let the materialize worker's own 30-57 s poll
+                        // interval be the backoff. Nothing is lost — the target keeps
+                        // its watermark and retries next cycle.
+                        _ => {
+                            let remaining: usize =
+                                chunk.len() + pending.iter().map(Vec::len).sum::<usize>();
+                            warn!(
+                                ?pressure,
+                                items_deferred = remaining,
+                                "materialize: novelty under pressure — DEFERRING this target to \
+                                 the next poll. Not waiting in-process: only the indexer can \
+                                 drain novelty, and holding the ledger while waiting starves it."
+                            );
+                            return Err(ApiError::NoveltyDeferred { remaining });
+                        }
                     }
                 }
             }
         }
         Ok(ledger)
     }
+}
+
+/// How stale a stored watermark may get before a no-data poll persists it anyway.
+///
+/// This bound is the whole reason skipping the write is safe. Skipping is what stops
+/// the state ledger taking ~1,200 empty commits/hour — but skipping *unconditionally*
+/// is worse than the problem it solves:
+///
+///   a stored watermark that never advances eventually falls outside the SOURCE
+///   TABLE's snapshot retention -> `snapshot_window` can no longer resolve it ->
+///   `ScanChoice::FullUndeterminable` -> a FULL table read, on every poll, forever.
+///
+/// That is not hypothetical: one source reached exactly this state and full-read
+/// 739,446 rows per poll until the watermark was repaired.
+///
+/// So the bound must sit comfortably under the source's snapshot retention. Ours is
+/// **4 hours** (`snapshotRetentionHours` in the lakehouse maintenance module, cut
+/// from 24 h to keep BigLake's 1 MiB `metadata.json` cap in reach), hence a 30-minute
+/// default — 8x margin, and still ~60x fewer commits than persisting every poll.
+///
+/// RAISE THIS ONLY WITH THE RETENTION IN HAND. If a deployment shortens snapshot
+/// retention, this must shorten with it, or watermarks silently expire and every
+/// poll becomes a full read. Override with `FLUREE_MATERIALIZE_WATERMARK_REFRESH_MINS`.
+fn watermark_refresh_bound_ms() -> i64 {
+    static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let mins = std::env::var("FLUREE_MATERIALIZE_WATERMARK_REFRESH_MINS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|m| *m > 0)
+            .unwrap_or(30);
+        mins.saturating_mul(60_000)
+    })
 }
 
 /// Novelty backpressure, classified by what can actually resolve it.
@@ -1569,6 +1600,54 @@ mod tests {
     }
     /// Fixed target ledger for accumulator tests that don't exercise fan-out.
     const TGT: &str = "t:main";
+
+    /// The refresh bound must sit well under the source's snapshot retention, or
+    /// watermarks expire and every poll degrades to a full table read.
+    ///
+    /// Asserted as a RATIO against the retention we actually run (4 h), not as a bare
+    /// number, so that someone raising the bound has to confront the relationship
+    /// rather than just moving a constant.
+    #[test]
+    fn watermark_refresh_bound_is_well_inside_snapshot_retention() {
+        const DEPLOYED_RETENTION_MS: i64 = 4 * 60 * 60 * 1000;
+        let bound = watermark_refresh_bound_ms();
+        assert!(
+            bound > 0,
+            "a non-positive bound would persist on every poll"
+        );
+        assert!(
+            bound * 4 <= DEPLOYED_RETENTION_MS,
+            "refresh bound {bound} ms leaves under 4x margin against {DEPLOYED_RETENTION_MS} ms \
+             of snapshot retention; an expired watermark makes EVERY poll a full read"
+        );
+    }
+
+    /// A window whose age is unknown must be treated as due, not as fresh.
+    ///
+    /// `window_age_ms` is `None` on a first run and — critically — when the stored
+    /// snapshot is no longer resolvable, which is precisely the case where the
+    /// watermark most needs rewriting. Defaulting the unknown to "fresh" would make
+    /// the expired-watermark state permanent.
+    #[test]
+    fn unknown_window_age_counts_as_refresh_due() {
+        let bound = watermark_refresh_bound_ms();
+        let unknown: Option<i64> = None;
+        assert!(
+            unknown.is_none_or(|age| age >= bound),
+            "an unknown window age must force a watermark refresh"
+        );
+        // A fresh window must NOT force one — otherwise we are back to a commit per
+        // poll, which is the failure this whole change exists to remove.
+        assert!(
+            Some(0i64).is_some_and(|age| age < bound),
+            "a zero-age window must not force a refresh"
+        );
+        assert!(Some(bound - 1).is_some_and(|age| age < bound));
+        assert!(
+            Some(bound).is_none_or(|age| age >= bound),
+            "at the bound, refresh"
+        );
+    }
 
     /// BOTH novelty variants must classify as backpressure, and they must classify
     /// DIFFERENTLY — because the two need opposite responses.

@@ -148,6 +148,26 @@ fn int_pushdown_literal(
             scale: 0,
         }),
         _ => Some(LiteralValue::Int64(n)),
+/// One materialize scan: what to read, how it was chosen, and how stale the window is.
+///
+/// A struct rather than a tuple because `window_age_ms` is easy to drop silently
+/// from a positional return, and dropping it reintroduces the watermark-staleness
+/// failure it exists to prevent.
+pub struct MaterializeScan {
+    /// The source's current snapshot — the new watermark to persist. `None` when
+    /// the table has no snapshots at all (nothing to materialize).
+    pub to_snapshot_id: Option<i64>,
+    /// Whether an added-files scan was used, rather than a full read.
+    pub incremental: bool,
+    /// Wall-clock span of the window, from Iceberg snapshot timestamps: how far the
+    /// stored watermark now lags the current snapshot. `None` on a first run (no
+    /// stored watermark) or when the stored snapshot is no longer resolvable —
+    /// both of which mean "persist regardless".
+    pub window_age_ms: Option<i64>,
+    /// Column batches, streamed. See [`Self::stream`] usage notes on the method.
+    pub stream: ColumnBatchStream,
+}
+
 /// Why a materialize poll reads added files only, or re-reads the whole table.
 ///
 /// This type exists because the decision used to be one expression:
@@ -1113,14 +1133,19 @@ impl<'a> FlureeR2rmlProvider<'a> {
         table_name: &str,
         projection: &[String],
         from_snapshot_id: Option<i64>,
-    ) -> QueryResult<(Option<i64>, bool, ColumnBatchStream)> {
+    ) -> QueryResult<MaterializeScan> {
         let (storage, metadata, _loc) = self
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
 
         let Some(to_snapshot_id) = metadata.current_snapshot().map(|s| s.snapshot_id) else {
             // Table has no snapshots: nothing to materialize.
-            return Ok((None, false, empty_batch_stream()));
+            return Ok(MaterializeScan {
+                to_snapshot_id: None,
+                incremental: false,
+                window_age_ms: None,
+                stream: empty_batch_stream(),
+            });
         };
 
         let schema = metadata
@@ -1201,8 +1226,31 @@ impl<'a> FlureeR2rmlProvider<'a> {
             plan.tasks
         };
 
+        // How OLD is the window we are about to read? Measured from Iceberg's own
+        // snapshot timestamps, so it survives restarts and needs no bookkeeping.
+        //
+        // The caller uses this to decide whether to persist a watermark when it
+        // wrote NO data. Skipping that write is what stops the state ledger taking
+        // ~1,200 empty commits/hour — but skipping it forever is worse than the
+        // disease: the stored watermark eventually falls outside the source table's
+        // snapshot retention, `snapshot_window` can no longer resolve it, and every
+        // subsequent poll degrades to a FULL table read. That is exactly how one
+        // source ended up full-reading 739k rows on every poll.
+        let window_age_ms = from_snapshot_id
+            .and_then(|from| metadata.snapshot(from).map(|s| s.timestamp_ms))
+            .and_then(|from_ms| {
+                metadata
+                    .snapshot(to_snapshot_id)
+                    .map(|to| to.timestamp_ms.saturating_sub(from_ms))
+            });
+
         let stream = self.stream_scan_tasks(&storage, tasks);
-        Ok((Some(to_snapshot_id), incremental, stream))
+        Ok(MaterializeScan {
+            to_snapshot_id: Some(to_snapshot_id),
+            incremental,
+            window_age_ms,
+            stream,
+        })
     }
 }
 

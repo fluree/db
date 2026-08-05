@@ -39,6 +39,7 @@ use std::time::Instant;
 use tokio::time::{self, Duration, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use crate::ApiError;
 use crate::Fluree;
 
 /// Configuration for the materialization tracking worker.
@@ -65,6 +66,11 @@ pub struct MaterializeWorkerStats {
     pub syncs_committed: u64,
     /// Polls that found no delta (nothing committed).
     pub syncs_noop: u64,
+    /// Polls DEFERRED by novelty backpressure. Counted separately from failures on
+    /// purpose: a non-zero rate here is the indexer being the bottleneck, which is a
+    /// capacity signal, not a fault. Lumping the two together is how 1,050 deferrals
+    /// once presented as 1,050 failures and hid the actual cause.
+    pub syncs_deferred: u64,
     /// Polls that errored.
     pub syncs_failed: u64,
     /// Currently tracked jobs.
@@ -345,6 +351,20 @@ impl MaterializeTrackingWorker {
             Ok(_) => {
                 self.bump(|s| s.syncs_noop += 1);
                 debug!(source = %job.source, target = %job.target, "materialize tracking: no delta");
+            }
+            // A deferral is NOT a failure and must not be counted as one. Novelty is
+            // at capacity and only the indexer can clear it; this poll released
+            // everything so the indexer can run, and the next poll retries. Counting
+            // it as a failure would make a healthy backpressure cycle look like an
+            // outage — and during one it hid the real problem behind 1,050 "failures".
+            Err(ApiError::NoveltyDeferred { remaining }) => {
+                self.bump(|s| s.syncs_deferred += 1);
+                info!(
+                    source = %job.source,
+                    target = %job.target,
+                    remaining,
+                    "materialize tracking: deferred on novelty backpressure, will retry next poll"
+                );
             }
             Err(e) => {
                 self.bump(|s| s.syncs_failed += 1);

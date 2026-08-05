@@ -250,6 +250,24 @@ pub enum ApiError {
     #[error("Ledger already exists: {0}")]
     LedgerExists(String),
 
+    /// Materialization deferred by novelty backpressure — NOT a failure.
+    ///
+    /// The target ledger's novelty is at its ceiling, and only the indexer can drain
+    /// it. Deliberately a distinct variant rather than an `Internal` string so callers
+    /// can treat it as "retry next poll" instead of logging a fault: the materialize
+    /// worker polls every 30-57 s, which is the correct backoff.
+    ///
+    /// Waiting in-process instead of deferring caused a production deadlock — the
+    /// worker holds what the indexer needs to publish, so the wait guaranteed the
+    /// condition could not clear. See `transact_chunks_with_backpressure`.
+    #[error(
+        "Materialization deferred: novelty at capacity, {remaining} items pending (will retry)"
+    )]
+    NoveltyDeferred {
+        /// Items not applied in this window; they are re-derived on the next poll.
+        remaining: usize,
+    },
+
     /// Internal errors (ledger_info, etc.)
     #[error("Internal error: {0}")]
     Internal(String),
@@ -467,7 +485,11 @@ impl ApiError {
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
             ApiError::LedgerExists(_) => 409,
             ApiError::ReindexConflict { .. } => 409,
-            ApiError::IndexTimeout(_) => 504,  // Gateway Timeout
+            ApiError::IndexTimeout(_) => 504, // Gateway Timeout
+            // 503 + retryable: novelty is at capacity and only the indexer can clear
+            // it. Not the caller's fault (no 4xx) and not a fault at all (no 500) —
+            // the correct client behaviour is to try again shortly.
+            ApiError::NoveltyDeferred { .. } => 503,
             ApiError::IndexingDisabled => 400, // Bad Request
             ApiError::Indexer(e) => {
                 use fluree_db_indexer::IndexerError;
