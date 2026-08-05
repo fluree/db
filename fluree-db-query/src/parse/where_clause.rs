@@ -335,6 +335,7 @@ pub fn parse_where_array_element(
                     // Non-array values (strings, etc.) use the standard parser
                     _ => parse_filter_value(expr_val)?,
                 };
+                super::filter_common::reject_constant_bool_expr(&filter_expr, "filter")?;
                 query.add_filter(filter_expr);
             }
             // Propagate counter updates back
