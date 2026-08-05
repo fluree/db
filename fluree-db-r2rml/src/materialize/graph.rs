@@ -223,7 +223,14 @@ type KeyToSubject = HashMap<Vec<String>, RdfTerm>;
 
 /// A comparable ordering key for a parent SUBJECT term. Parent subjects are IRIs
 /// (occasionally blank nodes); the inner string gives a total lexicographic order.
-fn subject_sort_key(term: &RdfTerm) -> &str {
+///
+/// Exported (id=3717339907) so the VIRTUAL query path's fused keep-min uses the SAME
+/// comparator this crate's `parent_key_insert_keep_min` uses — otherwise the fused
+/// semi-join could pick a different parent row than the generic chained inner join on a
+/// duplicate intermediate key. Reused directly at the RdfTerm keep-min sites; the P2a
+/// IRI-string site compares the pure-IRI subjects it already extracted, which for
+/// `RdfTerm::Iri` is exactly this function's inner-string ordering.
+pub fn subject_sort_key(term: &RdfTerm) -> &str {
     match term {
         RdfTerm::Iri(s) | RdfTerm::BlankNode(s) => s,
         RdfTerm::Literal { value, .. } => value,

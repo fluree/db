@@ -53,7 +53,7 @@ use fluree_db_r2rml::mapping::{
 };
 use fluree_db_r2rml::materialize::{
     canonical_join, get_join_key_from_batch, materialize_object_from_batch,
-    materialize_subject_from_batch, RdfTerm,
+    materialize_subject_from_batch, subject_sort_key, RdfTerm,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use futures::StreamExt;
@@ -1190,20 +1190,6 @@ struct KeptChainRow {
     /// The kept row's FK value to the NEXT hop (interior levels only); `None` on the
     /// terminal level or when that FK column is null (a null FK breaks the chain).
     next_fk: Option<Vec<String>>,
-}
-
-/// Comparable ordering key for a parent SUBJECT term — a LOCAL mirror of the
-/// materialize crate's private `subject_sort_key` (`graph.rs`). The two MUST agree:
-/// the P3 semi-join keep-min must pick the SAME parent row the generic
-/// `build_parent_lookup` (via `parent_key_insert_keep_min`) picks, so a fused probe is
-/// byte-identical to the generic chained inner join on duplicate intermediate keys.
-/// The dup-ORDER_KEY differential (kept row failing, discarded dup passing) guards any
-/// drift between the two.
-fn semijoin_subject_sort_key(term: &RdfTerm) -> &str {
-    match term {
-        RdfTerm::Iri(s) | RdfTerm::BlankNode(s) => s,
-        RdfTerm::Literal { value, .. } => value,
-    }
 }
 
 /// A native `SUM(expr)` / `AVG(expr)` plan: the arithmetic expression and the
@@ -2514,7 +2500,11 @@ impl FusedR2rmlAggregateOperator {
                         };
                     // Deterministic keep-min on a duplicate parent join key: keep the
                     // lexicographically smaller IRI, byte-identical to
-                    // `parent_key_insert_keep_min` on the generic path.
+                    // `parent_key_insert_keep_min` on the generic path. The subject is a
+                    // pure IRI here (blank node declined above), so this raw-string `<` is
+                    // exactly the shared `subject_sort_key` comparator applied to
+                    // `RdfTerm::Iri` — the third keep-min copy shares that ordering
+                    // (id=3717339907).
                     match map.entry(key) {
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert(vec![GKey::Str(iri)]);
@@ -4007,8 +3997,8 @@ impl FusedR2rmlAggregateOperator {
                                 {
                                     return Ok(None);
                                 }
-                            } else if semijoin_subject_sort_key(&subject)
-                                < semijoin_subject_sort_key(&e.get().subject)
+                            } else if subject_sort_key(&subject)
+                                < subject_sort_key(&e.get().subject)
                             {
                                 e.insert(KeptChainRow {
                                     subject,
