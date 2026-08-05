@@ -319,6 +319,13 @@ fn mmap_readonly(path: &Path) -> io::Result<memmap2::Mmap> {
 /// before closing, so no partial record can straddle a close/reopen boundary.
 /// Within-bucket record order is irrelevant — the materialization pass sorts —
 /// which is what makes append-reopen lossless.
+///
+/// Performance: bucket choice is a hash, so under a pool smaller than 256 the
+/// access pattern is LRU's worst case and evictions are proportional to the
+/// shortfall. That tax is intended to be RARE — the startup/preflight
+/// `RLIMIT_NOFILE` raise normally lifts macOS's 256 default well above the
+/// point where the pool binds — so don't "optimize" the pool away; it exists
+/// for the environments where the raise cannot succeed.
 struct BucketWriterPool {
     dir: PathBuf,
     max_open: usize,
@@ -576,7 +583,7 @@ impl ClassMembership {
         let mut non_empty_buckets = 0usize;
         let bucket_build_start = Instant::now();
         for bucket in 0..CLASS_MEMBERSHIP_BUCKETS {
-            let partition_path = partition_dir.join(format!("bucket_{bucket:03}.typ"));
+            let partition_path = BucketWriterPool::bucket_path(&partition_dir, bucket);
             // Bucket files are created lazily by the writer pool: a bucket
             // that never received an entry has no file at all.
             let partition_bytes = match std::fs::metadata(&partition_path) {

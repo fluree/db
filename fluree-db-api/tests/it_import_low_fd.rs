@@ -40,7 +40,12 @@ const RESULT_ENV: &str = "FLUREE_LOW_FD_RESULT";
 const LOW_FD_LIMIT: u64 = 96;
 
 const LEDGER: &str = "test/import-low-fd:main";
-const USERS: u64 = 30_000;
+/// Sized so the whole test (two baselines + two constrained children, four
+/// imports total) stays well inside nextest's slow-test kill window on a
+/// 2-vCPU CI runner. The FD mechanics under test depend on chunk counts and
+/// typed-subject presence, not data volume, so shrinking users loses no
+/// coverage. Must divide evenly by the 30 files of scenario B.
+const USERS: u64 = 12_000;
 
 /// Typed subjects are required: `rdf:type` + id-stats is what unconditionally
 /// triggered the 256-file scatter. Mixed literal/ref properties give the
@@ -239,8 +244,8 @@ fn run_child(
 ///    scatter pool (56 open writers instead of 256) and overall descriptor
 ///    discipline survive the stock-macOS-sized limit.
 /// B. 30-file directory import with `FLUREE_FD_BUDGET=40` shrinking the
-///    *plan* (spot_fan_in 24, merge fan-in 12) while the kernel still
-///    enforces 96. 30 chunks > 24 forces the hierarchical SPOT merge, and
+///    *plan* (spot_fan_in 16, merge fan-in 12) while the kernel still
+///    enforces 96. 30 chunks > 16 forces the hierarchical SPOT merge, and
 ///    ≥30 run files per order > 12 forces cascaded secondary merges — both
 ///    fallbacks run against a real limit, not a synthetic plan.
 ///

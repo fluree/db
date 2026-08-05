@@ -14,10 +14,10 @@
 //!
 //! | soft limit          | A      | scatter | SPOT fan-in | workers | merge fan-in/order |
 //! |---------------------|--------|---------|-------------|---------|--------------------|
-//! | 96 (regression test)| 64     | 56      | 56          | 8       | 17                 |
-//! | 256 (raise failed)  | 192    | 184     | 184         | 24      | 60                 |
-//! | 1024 (AWS Lambda)   | 960    | 256     | 952         | 120     | 316                |
-//! | 10240 (raised macOS)| 10 176 | 256     | 10 168      | 1272    | 3388               |
+//! | 96 (regression test)| 64     | 56      | 32          | 8       | 17                 |
+//! | 256 (raise failed)  | 192    | 184     | 96          | 24      | 60                 |
+//! | 1024 (AWS Lambda)   | 960    | 256     | 480         | 120     | 316                |
+//! | 10240 (raised macOS)| 10 176 | 256     | 5088        | 1272    | 3388               |
 //!
 //! Every value floors well above zero (see [`FdBudget::available`]'s floor of
 //! 32), so even a degenerate limit produces a plan that makes progress and
@@ -60,7 +60,13 @@ pub fn plan_fd_usage(budget: FdBudget, worker_count: usize, concurrent_orders: u
     let order_concurrency = worker_count.clamp(1, concurrent_orders.max(1));
     FdPlan {
         scatter_pool: a.saturating_sub(8).clamp(16, 256),
-        spot_fan_in: a.saturating_sub(8).max(16),
+        // Half of A, not A-minus-slack: the SPOT phase could safely claim
+        // nearly everything (phases are sequential), but the reserve is an
+        // estimate — object-store connection pools and OTEL sockets draw
+        // from it invisibly — and a 50% share keeps real margin at the cost
+        // of at most one extra grouping pass when chunk counts land between
+        // A/2 and A.
+        spot_fan_in: (a / 2).max(16),
         worker_cap: (a / 8).max(1),
         merge_fan_in_per_order: (a / order_concurrency).saturating_sub(4).max(8),
     }
@@ -83,28 +89,28 @@ mod tests {
         // S=96: the shipped end-to-end regression limit.
         let p = plan_fd_usage(FdBudget::from_soft(96), 8, IMPORT_CONCURRENT_ORDERS);
         assert_eq!(p.scatter_pool, 56);
-        assert_eq!(p.spot_fan_in, 56);
+        assert_eq!(p.spot_fan_in, 32);
         assert_eq!(p.worker_cap, 8);
         assert_eq!(p.merge_fan_in_per_order, 17);
 
         // S=256 with a failed raise: the historical worst case must still plan.
         let p = plan_fd_usage(FdBudget::from_soft(256), 8, IMPORT_CONCURRENT_ORDERS);
         assert_eq!(p.scatter_pool, 184);
-        assert_eq!(p.spot_fan_in, 184);
+        assert_eq!(p.spot_fan_in, 96);
         assert_eq!(p.worker_cap, 24);
         assert_eq!(p.merge_fan_in_per_order, 60);
 
         // S=1024 (AWS Lambda's fixed hard limit).
         let p = plan_fd_usage(FdBudget::from_soft(1024), 8, IMPORT_CONCURRENT_ORDERS);
         assert_eq!(p.scatter_pool, 256);
-        assert_eq!(p.spot_fan_in, 952);
+        assert_eq!(p.spot_fan_in, 480);
         assert_eq!(p.worker_cap, 120);
         assert_eq!(p.merge_fan_in_per_order, 316);
 
         // S=10240 (macOS after a successful raise).
         let p = plan_fd_usage(FdBudget::from_soft(10_240), 16, IMPORT_CONCURRENT_ORDERS);
         assert_eq!(p.scatter_pool, 256);
-        assert_eq!(p.spot_fan_in, 10_168);
+        assert_eq!(p.spot_fan_in, 5088);
         assert_eq!(p.worker_cap, 1272);
         assert_eq!(p.merge_fan_in_per_order, 3388);
     }

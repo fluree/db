@@ -5137,10 +5137,16 @@ where
             vocab_concurrent_peak,
             "serializing dictionary merges to fit fd budget"
         );
-        if fd_available < vocab_serial_peak {
+        // Warn against the KERNEL limit, not the plan: a deliberately
+        // shrunken FLUREE_FD_BUDGET plan can serialize the merges while the
+        // real limit still fits them comfortably.
+        let kernel_headroom = fluree_db_core::fd_limit::nofile_limits().map_or(fd_available, |l| {
+            fluree_db_core::fd_limit::FdBudget::from_soft(l.soft).available()
+        });
+        if kernel_headroom < vocab_serial_peak {
             tracing::warn!(
                 chunks = vocab_chunks,
-                fd_available,
+                kernel_headroom,
                 vocab_serial_peak,
                 "dictionary merge may exceed the open-file limit even serialized; \
                  raise the limit or import fewer/larger chunks"
