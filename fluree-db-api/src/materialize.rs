@@ -1245,7 +1245,7 @@ pub enum VerifyMode {
 /// the mismatch so an operator does not read a spurious count delta as corruption.
 /// The durable fix (count DISTINCT subjects per class source-side) is tracked, not
 /// in this phase.
-const COUNT_MULTISET_NOTE: &str =
+pub const COUNT_MULTISET_NOTE: &str =
     "count compares a source multiset (one per rdf:type row) against a twin set \
      (distinct subjects); a non-unique subject template can mismatch here even on a \
      faithful twin — the full-triple diff is authoritative";
@@ -1255,14 +1255,12 @@ const COUNT_MULTISET_NOTE: &str =
 pub enum CheckOutcome {
     /// Source and twin agree.
     Match,
-    /// A count differs between the source and the twin. `note` carries a caveat
-    /// (rendered with the failure) about why a count difference can be spurious even
-    /// on a faithful twin — see [`COUNT_MULTISET_NOTE`].
-    Mismatch {
-        source: u64,
-        twin: u64,
-        note: Option<&'static str>,
-    },
+    /// A count differs between the source and the twin. A count difference can be
+    /// spurious even on a faithful twin (a non-unique subject template makes the
+    /// source multiset larger than the twin's distinct-subject set); the reporting
+    /// layer renders that caveat for `count:*` checks — see [`COUNT_MULTISET_NOTE`].
+    /// (id=3717339914: the note is no longer a vacuous enum field.)
+    Mismatch { source: u64, twin: u64 },
     /// Triple sets differ (full or per-subject sample).
     TripleDiff {
         missing_in_twin: usize,
@@ -1448,11 +1446,7 @@ where
             outcome: if source == twin {
                 CheckOutcome::Match
             } else {
-                CheckOutcome::Mismatch {
-                    source,
-                    twin,
-                    note: Some(COUNT_MULTISET_NOTE),
-                }
+                CheckOutcome::Mismatch { source, twin }
             },
         });
     }
@@ -1569,11 +1563,7 @@ where
             outcome: if source == twin {
                 CheckOutcome::Match
             } else {
-                CheckOutcome::Mismatch {
-                    source,
-                    twin,
-                    note: Some(COUNT_MULTISET_NOTE),
-                }
+                CheckOutcome::Mismatch { source, twin }
             },
         });
     }

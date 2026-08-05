@@ -14,7 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use fluree_db_api::materialize::{verify_twin, ParityReport, VerifyMode};
+use fluree_db_api::materialize::{
+    verify_twin, CheckOutcome, ParityReport, VerifyMode, COUNT_MULTISET_NOTE,
+};
 // The MoR-guard env var comes from ONE definition — fluree-db-iceberg's
 // `mor_guard::ALLOW_MOR_DELETES_ENV`, re-exported by fluree-db-api (which the CLI
 // already depends on) — instead of a hard-copied literal that could silently drift
@@ -333,7 +335,20 @@ fn format_failures(report: &ParityReport) -> String {
     report
         .failures()
         .iter()
-        .map(|c| format!("  - {}: {:?}", c.name, c.outcome))
+        .map(|c| {
+            // id=3717339914: the multiset-vs-set caveat is rendered HERE (the reporting
+            // layer), for count checks only, rather than carried as a vacuous enum
+            // field. A `count:*` mismatch can be spurious on a faithful twin; the
+            // full-triple diff is authoritative.
+            let note = if c.name.starts_with("count:")
+                && matches!(c.outcome, CheckOutcome::Mismatch { .. })
+            {
+                format!("\n      ({COUNT_MULTISET_NOTE})")
+            } else {
+                String::new()
+            };
+            format!("  - {}: {:?}{note}", c.name, c.outcome)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
