@@ -3802,7 +3802,10 @@ impl FusedR2rmlAggregateOperator {
     ///
     /// #1583: the membership *set* models an inner join only while each FK is
     /// single-valued (one fact row → at most one branch row per hop). A fan-out
-    /// `RefObjectMap` must revisit this (see [`SemiJoinSet`]).
+    /// `RefObjectMap` must revisit this (see [`SemiJoinSet`]). Relatedly, the keep-min
+    /// build DECLINES a same-key/same-subject SCD-2 collision whose rows disagree on the
+    /// constraint result or next-hop FK (id=3717339904) — keep-min alone would let scan
+    /// order decide the answer.
     async fn build_semi_join_membership(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -3988,7 +3991,23 @@ impl FusedR2rmlAggregateOperator {
                             });
                         }
                         Entry::Occupied(mut e) => {
-                            if semijoin_subject_sort_key(&subject)
+                            // id=3717339904 (SCD-2 same-key/same-subject gap): two dim
+                            // rows sharing the join key that mint the SAME subject but
+                            // disagree on `passes_own` (the constraint result) or
+                            // `next_fk` (the next hop) are the normal SCD-2 case (multiple
+                            // versions per key, same subject template, differing on
+                            // IS_CURRENT / a versioned FK). keep-min discriminates only by
+                            // subject, so it would keep whichever row the scan hit first —
+                            // a scan-order-dependent ANSWER (the generic chained join
+                            // materializes every version's triples; this fold tests one).
+                            // Decline to the generic path. An IDENTICAL duplicate (same
+                            // subject, same constraint result, same next FK) is benign.
+                            if subject == e.get().subject {
+                                if passes_own != e.get().passes_own || next_fk != e.get().next_fk
+                                {
+                                    return Ok(None);
+                                }
+                            } else if semijoin_subject_sort_key(&subject)
                                 < semijoin_subject_sort_key(&e.get().subject)
                             {
                                 e.insert(KeptChainRow {
@@ -6919,6 +6938,59 @@ mod tests {
             "a semi-join chain pattern with a leaf var-object member must DECLINE the \
              fuse (the membership build cannot honor the region existence requirement); \
              pre-fix it admitted and over-counted"
+        );
+    }
+
+    /// id=3717339904 (SCD-2 same-key/same-subject semi-join gap): when two semi-join
+    /// dim rows share the join key AND mint the SAME subject but disagree on the
+    /// constraint result (`passes_own`) or the next-hop FK, keep-min — which
+    /// discriminates only by subject — would let SCAN ORDER decide membership, a
+    /// non-deterministic ANSWER (the generic chained join materializes every version's
+    /// triples; the fused keep-min tests ONE). This is exactly the SCD-2 shape P3
+    /// targets. Two customers keyed 1000 both minting cust/1000, one Enterprise (passes)
+    /// and one SMB (fails segment) → the fuse must DECLINE to the generic path. Pre-fix
+    /// it kept whichever row the scan hit first and admitted (or excluded) key 1000
+    /// accordingly.
+    #[tokio::test]
+    async fn p3_semijoin_same_key_same_subject_conflicting_constraint_declines() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+        let mut batches = clean_batches();
+        // Customer: TWO rows keyed 1000 (same join key → same subject cust/1000) with
+        // DIFFERING segment — the SCD-2 collision. 1001/1002 unchanged.
+        batches.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![
+                icol(
+                    "CUSTOMER_KEY",
+                    1,
+                    vec![Some(1000), Some(1000), Some(1001), Some(1002)],
+                ),
+                scol("SEGMENT", 2, vec!["Enterprise", "SMB", "Enterprise", "SMB"]),
+            ])],
+        );
+        let pats = crt_patterns(false); // standalone const-object segment form
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let provider = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches,
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+            .expect("crt_join_reorder must decompose");
+        let mut op = crt_op();
+        let resolved = op
+            .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+            .await
+            .expect("resolve must not error");
+        assert!(
+            resolved.is_none(),
+            "a same-key/same-subject SCD-2 collision with differing constraint results \
+             must DECLINE (keep-min would let scan order decide the answer)"
         );
     }
 
