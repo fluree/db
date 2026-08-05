@@ -161,6 +161,94 @@ fn child_main() {
     .expect("write result file");
 }
 
+/// Same triples as [`generate_ttl`], split across `files` self-contained
+/// Turtle files so the directory import produces one chunk per file — enough
+/// chunks to push the SPOT merge past a shrunken fan-in cap.
+fn generate_ttl_directory(dir: &std::path::Path, files: u64) {
+    let per_file = USERS / files;
+    for f in 0..files {
+        let mut w = std::io::BufWriter::new(
+            std::fs::File::create(dir.join(format!("users_{f:03}.ttl"))).expect("create ttl"),
+        );
+        writeln!(
+            w,
+            "@prefix ex: <http://example.org/ns/> .\n@prefix schema: <http://schema.org/> ."
+        )
+        .expect("write prefix");
+        for i in (f * per_file)..((f + 1) * per_file) {
+            writeln!(
+                w,
+                "ex:user{i} a ex:User ;\n    schema:name \"User {i}\" ;\n    schema:age {} ;\n    ex:score {} ;\n    ex:friend ex:user{} .",
+                i % 90 + 10,
+                i * 7 % 1000,
+                (i + 1) % USERS,
+            )
+            .expect("write subject");
+        }
+        w.flush().expect("flush ttl");
+    }
+}
+
+/// Spawn this test binary in child mode against `source`, under the real
+/// 96-descriptor kernel limit, with scenario-specific extra env. Returns the
+/// child's reported flake count (the positive ran-marker: a missing/invalid
+/// result file fails the test, so a child that silently did nothing cannot
+/// pass).
+fn run_child(
+    exe: &std::path::Path,
+    db_dir: &std::path::Path,
+    source: &std::path::Path,
+    result_path: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    scenario: &str,
+) -> u64 {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["import_under_low_fd_limit", "--exact", "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .env(DB_DIR_ENV, db_dir)
+        .env(TTL_ENV, source)
+        .env(RESULT_ENV, result_path)
+        // Determinism: never inherit budget/compression overrides from the
+        // invoking environment; scenarios set what they need explicitly.
+        .env_remove("FLUREE_FD_BUDGET")
+        .env_remove("FLUREE_RUN_ZSTD")
+        .env_remove("FLUREE_RUN_ZSTD_LEVEL")
+        .env_remove("FLUREE_IMPORT_COALESCE_THRESHOLD");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("spawn child");
+    assert!(
+        output.status.success(),
+        "constrained child import failed (scenario {scenario}, limit {LOW_FD_LIMIT}).\n\
+         --- child stdout ---\n{}\n--- child stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let child_result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result_path).expect("child result file must exist"))
+            .expect("child result json");
+    child_result["flake_count"]
+        .as_u64()
+        .expect("flake_count in child result")
+}
+
+/// Two constrained scenarios, both under a REAL kernel limit of 96:
+///
+/// A. Single-file import (one chunk). End-to-end proof that the bounded
+///    scatter pool (56 open writers instead of 256) and overall descriptor
+///    discipline survive the stock-macOS-sized limit.
+/// B. 30-file directory import with `FLUREE_FD_BUDGET=40` shrinking the
+///    *plan* (spot_fan_in 24, merge fan-in 12) while the kernel still
+///    enforces 96. 30 chunks > 24 forces the hierarchical SPOT merge, and
+///    ≥30 run files per order > 12 forces cascaded secondary merges — both
+///    fallbacks run against a real limit, not a synthetic plan.
+///
+/// Equality is asserted via flake counts and a content fingerprint (row
+/// count, sorted first/last names, age sum) — not `root_id`, which embeds
+/// commit CIDs with timestamps and is not stable across separate imports.
+/// Byte-level identity of the cascade/hierarchical outputs is pinned by the
+/// leaf-CID-equality unit tests in fluree-db-indexer.
 #[tokio::test]
 async fn import_under_low_fd_limit() {
     if std::env::var(CHILD_ENV).is_ok() {
@@ -173,46 +261,55 @@ async fn import_under_low_fd_limit() {
     }
 
     let data_dir = tempfile::tempdir().expect("data tmpdir");
-    let baseline_db = tempfile::tempdir().expect("baseline db tmpdir");
-    let child_db = tempfile::tempdir().expect("child db tmpdir");
+    let exe = std::env::current_exe().expect("current exe");
 
+    // --- Scenario A: single file ---
     let ttl_path = data_dir.path().join("users.ttl");
     generate_ttl(&ttl_path);
 
-    // Unconstrained baseline in this process.
+    let baseline_db = tempfile::tempdir().expect("baseline db tmpdir");
     let (baseline_flakes, _t) = run_import(baseline_db.path(), &ttl_path).await;
     let baseline_print = fingerprint(baseline_db.path()).await;
-
-    // Constrained import in a re-exec'd child.
-    let result_path = data_dir.path().join("child_result.json");
-    let exe = std::env::current_exe().expect("current exe");
-    let output = std::process::Command::new(&exe)
-        .args(["import_under_low_fd_limit", "--exact", "--nocapture"])
-        .env(CHILD_ENV, "1")
-        .env(DB_DIR_ENV, child_db.path())
-        .env(TTL_ENV, &ttl_path)
-        .env(RESULT_ENV, &result_path)
-        .output()
-        .expect("spawn child");
-    assert!(
-        output.status.success(),
-        "constrained child import failed (limit {LOW_FD_LIMIT}).\n--- child stdout ---\n{}\n--- child stderr ---\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-
-    // Ran-marker + flake-count equality.
-    let child_result: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&result_path).expect("child result file must exist"))
-            .expect("child result json");
-    assert_eq!(
-        child_result["flake_count"].as_u64(),
-        Some(baseline_flakes),
-        "constrained import wrote a different flake count"
-    );
-
-    // Content equality, queried through a fresh handle on each dir.
-    let child_print = fingerprint(child_db.path()).await;
-    assert_eq!(baseline_print, child_print);
     assert_eq!(baseline_print.0 as u64, USERS);
+
+    let child_db = tempfile::tempdir().expect("child db tmpdir");
+    let child_flakes = run_child(
+        &exe,
+        child_db.path(),
+        &ttl_path,
+        &data_dir.path().join("child_a.json"),
+        &[],
+        "A/single-file",
+    );
+    assert_eq!(child_flakes, baseline_flakes);
+    assert_eq!(fingerprint(child_db.path()).await, baseline_print);
+
+    // --- Scenario B: 30-chunk directory, shrunken plan ---
+    let ttl_dir = data_dir.path().join("chunks");
+    std::fs::create_dir_all(&ttl_dir).expect("chunks dir");
+    generate_ttl_directory(&ttl_dir, 30);
+
+    let dir_baseline_db = tempfile::tempdir().expect("dir baseline tmpdir");
+    let (dir_baseline_flakes, _t) = run_import(dir_baseline_db.path(), &ttl_dir).await;
+    let dir_baseline_print = fingerprint(dir_baseline_db.path()).await;
+    assert_eq!(dir_baseline_print.0 as u64, USERS);
+
+    let dir_child_db = tempfile::tempdir().expect("dir child tmpdir");
+    let dir_child_flakes = run_child(
+        &exe,
+        dir_child_db.path(),
+        &ttl_dir,
+        &data_dir.path().join("child_b.json"),
+        &[
+            // Shrink the PLAN below the chunk/run counts so the hierarchical
+            // SPOT merge and the cascade both fire; the kernel limit stays 96.
+            ("FLUREE_FD_BUDGET", "40"),
+            // One chunk per file: don't let the producer coalesce the small
+            // files back into few chunks.
+            ("FLUREE_IMPORT_COALESCE_THRESHOLD", "0"),
+        ],
+        "B/directory-cascades",
+    );
+    assert_eq!(dir_child_flakes, dir_baseline_flakes);
+    assert_eq!(fingerprint(dir_child_db.path()).await, dir_baseline_print);
 }

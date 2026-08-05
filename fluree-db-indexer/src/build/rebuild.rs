@@ -739,7 +739,14 @@ where
                     zstd_level: 1,
                     run_budget_bytes: config.run_budget_bytes,
                     worker_count: 1,
-                    fd_budget: fluree_db_core::fd_limit::FdBudget::detect(),
+                    // The rebuild path has no CLI/server-style entry point,
+                    // so raise the soft limit here before detecting the
+                    // budget (library embedders reach this cold).
+                    fd_budget: {
+                        let raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
+                        fluree_db_core::fd_limit::log_raise_outcome(&raise);
+                        fluree_db_core::fd_limit::FdBudget::detect()
+                    },
                     remap_progress: None,
                     build_progress: None,
                     stage_marker: None,

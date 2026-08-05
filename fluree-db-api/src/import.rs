@@ -2959,24 +2959,30 @@ where
         // Best-effort raise (idempotent — covers library embedders that never
         // ran a CLI/server entry point), then fail fast on limits so low that
         // even the descriptor-conserving build strategies cannot run, instead
-        // of dying twenty minutes into the index build.
+        // of dying twenty minutes into the index build. The gate reads the
+        // OBSERVED kernel limit, deliberately not `effective_fd_budget()`:
+        // the FLUREE_FD_BUDGET override shapes how the build *plans*, but
+        // only the real limit decides whether an import can run at all. The
+        // floor of 96 covers the budgeted build's worst phase plus the
+        // ~20–25 descriptors the rest of the process holds concurrently
+        // (stdio, tokio, the dictionary upload).
         let fd_raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
         fluree_db_core::fd_limit::log_raise_outcome(&fd_raise);
-        let fd_budget = config.effective_fd_budget();
-        if fd_budget.soft < 64 {
-            return Err(ImportError::FdLimit(format!(
-                "process open-file limit is {}; bulk import needs at least 64 \
-                 (raise it with `ulimit -n <n>` or launchd/systemd LimitNOFILE)",
-                fd_budget.soft
-            )));
-        }
-        if fd_budget.soft < 256 {
-            tracing::warn!(
-                soft = fd_budget.soft,
-                reserve = fd_budget.reserve,
-                "open-file limit is low; import will conserve descriptors \
-                 (bounded scatter pool, cascaded merges)"
-            );
+        if let Some(limits) = fluree_db_core::fd_limit::nofile_limits() {
+            if limits.soft < 96 {
+                return Err(ImportError::FdLimit(format!(
+                    "process open-file limit is {}; bulk import needs at least 96 \
+                     (raise it with `ulimit -n <n>` or launchd/systemd LimitNOFILE)",
+                    limits.soft
+                )));
+            }
+            if limits.soft < 256 {
+                tracing::warn!(
+                    soft = limits.soft,
+                    "open-file limit is low; import will conserve descriptors \
+                     (bounded scatter pool, cascaded merges)"
+                );
+            }
         }
 
         // ---- Log effective settings and resolve chunk source ----
@@ -5109,9 +5115,54 @@ where
     use fluree_db_indexer::run_index::vocab_merge;
 
     // Phase B can use more CPU: subject, string, and language merges are independent.
-    // Run them concurrently to better utilize cores while this phase is otherwise I/O-bound.
+    // Run them concurrently to better utilize cores while this phase is otherwise I/O-bound —
+    // unless the FD budget can't cover the concurrent peak. Each merge holds
+    // one reader per chunk, the subject/string merges additionally hold one
+    // remap writer per chunk, plus a handful of output streams: ~5 descriptors
+    // per chunk when all three run at once, ~2 per chunk serialized. This was
+    // the import's first unbudgeted EMFILE site on multi-chunk imports at low
+    // limits — before the index build even starts.
     let run_dir_path = run_dir.to_path_buf();
     let remap_dir_path = remap_dir.to_path_buf();
+
+    let vocab_chunks = sorted_commit_infos.len();
+    let vocab_concurrent_peak = 5 * vocab_chunks + 16;
+    let vocab_serial_peak = 2 * vocab_chunks + 8;
+    let fd_available = config.effective_fd_budget().available();
+    let vocab_merge_serial = fd_available < vocab_concurrent_peak;
+    if vocab_merge_serial {
+        tracing::info!(
+            chunks = vocab_chunks,
+            fd_available,
+            vocab_concurrent_peak,
+            "serializing dictionary merges to fit fd budget"
+        );
+        if fd_available < vocab_serial_peak {
+            tracing::warn!(
+                chunks = vocab_chunks,
+                fd_available,
+                vocab_serial_peak,
+                "dictionary merge may exceed the open-file limit even serialized; \
+                 raise the limit or import fewer/larger chunks"
+            );
+        }
+    }
+
+    /// Map a vocab-merge failure, upgrading descriptor exhaustion into the
+    /// actionable open-file-limit error.
+    fn vocab_merge_error(e: std::io::Error) -> ImportError {
+        if fluree_db_core::fd_limit::is_fd_exhaustion(&e) {
+            let soft = fluree_db_core::fd_limit::nofile_limits()
+                .map_or_else(|| "unknown".to_string(), |l| l.soft.to_string());
+            ImportError::FdLimit(format!(
+                "{e} during dictionary merge; the process open-file limit (currently \
+                 {soft}) is too low for this many import chunks — raise it \
+                 (`ulimit -n <n>`, LimitNOFILE) or use fewer/larger chunks"
+            ))
+        } else {
+            ImportError::Io(e)
+        }
+    }
 
     let subj_vocab_paths_for_task = subject_vocab_paths.clone();
     let chunk_ids_for_subj = chunk_ids.clone();
@@ -5130,6 +5181,17 @@ where
             namespace_codes_for_subj.as_ref(),
         )
     });
+    // Serial mode: drain each merge before spawning the next, so only one
+    // merge's per-chunk descriptors are live at a time.
+    let (subj_stats_serial, subj_handle) = if vocab_merge_serial {
+        let stats = subj_handle
+            .await
+            .map_err(|e| ImportError::RunGeneration(format!("subject vocab merge panicked: {e}")))?
+            .map_err(vocab_merge_error)?;
+        (Some(stats), None)
+    } else {
+        (None, Some(subj_handle))
+    };
 
     let str_vocab_paths_for_task = string_vocab_paths.clone();
     let chunk_ids_for_str = chunk_ids.clone();
@@ -5145,6 +5207,15 @@ where
             &run_dir_for_str,
         )
     });
+    let (str_stats_serial, str_handle) = if vocab_merge_serial {
+        let stats = str_handle
+            .await
+            .map_err(|e| ImportError::RunGeneration(format!("string vocab merge panicked: {e}")))?
+            .map_err(vocab_merge_error)?;
+        (Some(stats), None)
+    } else {
+        (None, Some(str_handle))
+    };
 
     let lang_vocab_paths_for_task = lang_vocab_paths.clone();
     let lang_span = merge_parent_span;
@@ -5153,14 +5224,22 @@ where
         fluree_db_indexer::run_index::build_lang_remap_from_vocabs(&lang_vocab_paths_for_task)
     });
 
-    let subj_stats = subj_handle
-        .await
-        .map_err(|e| ImportError::RunGeneration(format!("subject vocab merge panicked: {e}")))?
-        .map_err(ImportError::Io)?;
-    let str_stats = str_handle
-        .await
-        .map_err(|e| ImportError::RunGeneration(format!("string vocab merge panicked: {e}")))?
-        .map_err(ImportError::Io)?;
+    let subj_stats = match (subj_stats_serial, subj_handle) {
+        (Some(stats), _) => stats,
+        (None, Some(handle)) => handle
+            .await
+            .map_err(|e| ImportError::RunGeneration(format!("subject vocab merge panicked: {e}")))?
+            .map_err(vocab_merge_error)?,
+        (None, None) => unreachable!("serial mode stores stats, concurrent mode stores handle"),
+    };
+    let str_stats = match (str_stats_serial, str_handle) {
+        (Some(stats), _) => stats,
+        (None, Some(handle)) => handle
+            .await
+            .map_err(|e| ImportError::RunGeneration(format!("string vocab merge panicked: {e}")))?
+            .map_err(vocab_merge_error)?,
+        (None, None) => unreachable!("serial mode stores stats, concurrent mode stores handle"),
+    };
     let (unified_lang_dict, lang_remaps) = lang_handle
         .await
         .map_err(|e| ImportError::RunGeneration(format!("language vocab merge panicked: {e}")))?

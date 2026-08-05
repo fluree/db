@@ -290,6 +290,23 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
     let result = writer.finish()?;
     let graph_results = vec![result];
 
+    // Reclaim the cascade's final-pass intermediates (a full zstd copy of
+    // this order) now that the merge has consumed them, instead of carrying
+    // them until the whole run dir is torn down. Best-effort: the build
+    // result is already complete, and on an error path above the import-level
+    // teardown removes the run dir wholesale anyway.
+    drop(merge);
+    let cascade_dir = config.run_dir.join("cascade");
+    if cascade_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&cascade_dir) {
+            tracing::warn!(
+                order = config.sort_order.dir_name(),
+                error = %e,
+                "failed to remove cascade scratch dir"
+            );
+        }
+    }
+
     Ok(IndexBuildResult {
         graphs: graph_results,
         total_rows,

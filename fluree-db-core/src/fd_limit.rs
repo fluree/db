@@ -178,8 +178,13 @@ pub fn is_fd_exhaustion(_e: &std::io::Error) -> bool {
 
 /// The file-descriptor budget an FD-heavy operation may plan against: the
 /// observed soft limit minus a reserve for descriptors owned by everything
-/// else in the process (stdio, tokio's poller/wakeup pipes, tracing/OTEL
-/// sockets, storage-backend I/O, the concurrent dictionary upload).
+/// else in the process. The reserve's largest audited consumer is the
+/// dictionary upload that runs concurrently with the index build (~15–19
+/// simultaneous handles across its four `try_join` arms), plus stdio, the
+/// tokio poller/wakeup pipes, and tracing/OTEL sockets — hence the floor of
+/// 32. The reserve is storage-backend-blind: an object-store backend's
+/// connection pool also draws from it, so callers on such backends at very
+/// low limits should prefer `FLUREE_FD_BUDGET` to shrink the plan further.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdBudget {
     /// Observed (or overridden) soft limit.
@@ -191,7 +196,9 @@ pub struct FdBudget {
 impl FdBudget {
     /// Budget from the live `getrlimit` soft limit, overridable with the
     /// `FLUREE_FD_BUDGET` environment variable (ops/test escape hatch: the
-    /// override replaces the *soft* value the reserve is derived from).
+    /// override replaces the *soft* value the reserve is derived from — it
+    /// changes how the build *plans*, never what the kernel enforces, and
+    /// preflight limit checks deliberately read the real limit instead).
     pub fn detect() -> Self {
         if let Some(soft) = std::env::var("FLUREE_FD_BUDGET")
             .ok()
@@ -206,17 +213,20 @@ impl FdBudget {
         }
     }
 
-    /// Budget for a given soft limit; reserve is `min(soft/4, 64)`.
+    /// Budget for a given soft limit; reserve is `min(max(soft/4, 32), 64)`
+    /// (see the struct docs for what the 32-descriptor floor covers).
     pub fn from_soft(soft: u64) -> Self {
         Self {
             soft,
-            reserve: (soft / 4).min(64),
+            reserve: (soft / 4).clamp(32, 64),
         }
     }
 
     /// No budgeting: every stage plans as if descriptors were free. This is
     /// the pre-budget legacy behavior, used by tests and callers that manage
-    /// limits themselves.
+    /// limits themselves. (The `u64::MAX` sentinel coincides with Linux's
+    /// `RLIM_INFINITY`; that collision is benign — a genuinely uncapped
+    /// process and "no budgeting" want identical plans.)
     pub fn unlimited() -> Self {
         Self {
             soft: u64::MAX,
@@ -241,8 +251,9 @@ mod tests {
 
     #[test]
     fn budget_reserve_formula() {
-        // Low limits reserve a quarter; high limits cap the reserve at 64.
-        assert_eq!(FdBudget::from_soft(96).reserve, 24);
+        // A quarter of the limit, floored at 32 (stdio + tokio + the
+        // concurrent dict upload), capped at 64.
+        assert_eq!(FdBudget::from_soft(96).reserve, 32);
         assert_eq!(FdBudget::from_soft(256).reserve, 64);
         assert_eq!(FdBudget::from_soft(1024).reserve, 64);
         assert_eq!(FdBudget::from_soft(10_240).reserve, 64);
@@ -250,7 +261,7 @@ mod tests {
 
     #[test]
     fn budget_available_floors_and_saturates() {
-        assert_eq!(FdBudget::from_soft(96).available(), 72);
+        assert_eq!(FdBudget::from_soft(96).available(), 64);
         assert_eq!(FdBudget::from_soft(256).available(), 192);
         assert_eq!(FdBudget::from_soft(1024).available(), 960);
         // Degenerate limits floor at 32 rather than planning zero fan-in.

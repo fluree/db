@@ -7,9 +7,11 @@
 //! Bulk import now writes V2-native sorted-commit artifacts directly, so this
 //! module consumes those artifacts without a bulk-import-only V1 → V2 pass.
 
-use crate::run_index::build::fd_plan::{plan_fd_usage, FdPlan};
+use crate::run_index::build::fd_plan::{
+    plan_fd_usage, FdPlan, IMPORT_CONCURRENT_ORDERS, REBUILD_CONCURRENT_ORDERS,
+};
 use crate::run_index::build::index_build::{
-    build_all_indexes, cascade_runs_to_fan_in, BuildAllConfig, IndexBuildResult,
+    build_all_indexes, cascade_runs_to_fan_in, BuildAllConfig, IndexBuildError, IndexBuildResult,
     PersistingLeafWriter,
 };
 use crate::run_index::build::merge::KWayMerge;
@@ -1055,7 +1057,11 @@ pub fn build_indexes_from_commits(
     mut stats_hook: Option<&mut crate::stats::IdStatsHook>,
 ) -> io::Result<(BuildResult, Option<SpotClassStats>)> {
     let overall_start = Instant::now();
-    let fd_plan = plan_fd_usage(config.fd_budget, config.worker_count);
+    let fd_plan = plan_fd_usage(
+        config.fd_budget,
+        config.worker_count,
+        IMPORT_CONCURRENT_ORDERS,
+    );
     tracing::info!(
         chunks = commits.len(),
         worker_count = config.worker_count,
@@ -1114,6 +1120,13 @@ pub fn build_indexes_from_commits(
         stage.store(BUILD_STAGE_REMAP, Ordering::Relaxed);
     }
     let remap_start = Instant::now();
+    // The fd cap changes worker_count → per_thread_budget_bytes → run-file
+    // boundaries, which permutes equal-comparing records across a chunk's
+    // run files (RunWriter sorts unstably per flush). That is unobservable
+    // because bulk import assigns one t per chunk, so records comparing
+    // Equal under a secondary-order comparator within a chunk are equal in
+    // every serialized field. (Pre-existing worker_count variation by CPU
+    // count already leaned on the same invariant.)
     let worker_count = config
         .worker_count
         .max(1)
@@ -1271,7 +1284,7 @@ pub fn build_indexes_from_commits(
         fan_in_cap: fd_plan.merge_fan_in_per_order,
     };
 
-    let mut order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
+    let mut order_results = build_all_indexes(&build_config).map_err(index_build_err_to_io)?;
     log_index_memory("secondary_index_merge:complete");
     order_results.push((RunSortOrder::Spot, spot_result));
 
@@ -1369,6 +1382,7 @@ fn build_spot_index_from_commits(
         pump_spot_merge(
             &mut merge,
             &mut writer,
+            g_id,
             class_stats_collector.as_mut(),
             progress.as_deref(),
         )?
@@ -1423,6 +1437,7 @@ fn build_spot_index_from_commits(
         let rows = pump_spot_merge(
             &mut merge,
             &mut writer,
+            g_id,
             class_stats_collector.as_mut(),
             progress.as_deref(),
         )?;
@@ -1452,6 +1467,17 @@ fn build_spot_index_from_commits(
     ))
 }
 
+/// Unwrap an [`IndexBuildError`] into an `io::Error` **preserving the
+/// original OS error** — a plain `io::Error::other` wrapper erases
+/// `raw_os_error`, which would make descriptor exhaustion (`EMFILE`) inside
+/// the secondary-order merges invisible to the import layer's diagnostics.
+fn index_build_err_to_io(e: IndexBuildError) -> io::Error {
+    match e {
+        IndexBuildError::Io(io_err) => io_err,
+        other => io::Error::other(other),
+    }
+}
+
 /// Open one remapping SPOT reader per commit chunk. Each holds one real file
 /// descriptor (the sorted-commit `BufReader`) for its lifetime; the two remap
 /// mmaps drop their `File` on open and cost address space only.
@@ -1479,9 +1505,18 @@ fn open_spot_commit_readers(
 /// Drain a SPOT merge into the leaf writer (and class-stats collector),
 /// batching progress updates. Shared by the flat and hierarchical SPOT
 /// arms so both consume the merged sequence identically.
+///
+/// `g_id` is restamped onto every record before consumption: the FRN2 run
+/// wire format carries no g_id (readers decode it as 0), so records arriving
+/// through the hierarchical arm's intermediate run files would otherwise
+/// reach the class-stats collector as g_id 0 — silently folding a named
+/// graph's class stats into the default graph's. The flat arm's records
+/// already carry `g_id` (its readers filter on it), so the stamp is a no-op
+/// there; the pipeline is graph-scoped by construction either way.
 fn pump_spot_merge<T, F>(
     merge: &mut KWayMerge<T, F>,
     writer: &mut PersistingLeafWriter,
+    g_id: u16,
     mut class_stats_collector: Option<&mut SpotClassStatsCollector>,
     progress: Option<&AtomicU64>,
 ) -> io::Result<u64>
@@ -1491,10 +1526,11 @@ where
 {
     let mut total_rows = 0u64;
     let mut progress_batch = 0u64;
-    while let Some((record, op)) = merge.next_record()? {
+    while let Some((mut record, op)) = merge.next_record()? {
         if op == 0 {
             continue;
         }
+        record.g_id = g_id;
         if let Some(collector) = class_stats_collector.as_deref_mut() {
             collector.on_record(&record);
         }
@@ -1596,12 +1632,18 @@ pub fn build_indexes_from_remapped_commits(
         g_id: config.g_id,
         progress: config.build_progress.clone(),
         // Rebuild path builds all 4 orders here (no separate SPOT thread), so
-        // concurrency can cover all of them, bounded by the core budget.
+        // concurrency can cover all of them, bounded by the core budget —
+        // which is why the fan-in share divides by 4, not the import path's 3.
         max_concurrency: config.worker_count,
-        fan_in_cap: plan_fd_usage(config.fd_budget, config.worker_count).merge_fan_in_per_order,
+        fan_in_cap: plan_fd_usage(
+            config.fd_budget,
+            config.worker_count,
+            REBUILD_CONCURRENT_ORDERS,
+        )
+        .merge_fan_in_per_order,
     };
 
-    let order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
+    let order_results = build_all_indexes(&build_config).map_err(index_build_err_to_io)?;
 
     let build_elapsed = build_start.elapsed();
 
@@ -1860,7 +1902,7 @@ mod tests {
                 .0
         };
 
-        let unlimited = plan_fd_usage(FdBudget::unlimited(), 1);
+        let unlimited = plan_fd_usage(FdBudget::unlimited(), 1, IMPORT_CONCURRENT_ORDERS);
         let constrained = FdPlan {
             spot_fan_in: 2,
             ..unlimited
@@ -1884,6 +1926,136 @@ mod tests {
 
         // The hierarchical arm must clean up its intermediate copy.
         assert!(!dir.path().join("runs_hier/spot_cascade").exists());
+    }
+
+    /// Regression for the FRN2 g_id round-trip bug: run wire records carry no
+    /// g_id (readers decode 0), so the hierarchical arm's intermediates used
+    /// to hand the class-stats collector g_id-0 records — silently folding a
+    /// named graph's class stats into the default graph and resolving ref
+    /// targets against the wrong graph. The pump now restamps g_id; this test
+    /// runs both arms at g_id 5 with a live collector + membership and
+    /// requires identical, correctly-keyed stats.
+    #[test]
+    fn spot_hierarchical_matches_flat_stats_nonzero_graph() {
+        const G: u16 = 5;
+        const TYPE_P: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // 5 chunks × 40 subjects (disjoint, interleaved). Each subject: one
+        // rdf:type assertion, one literal, one ref into a typed neighbor.
+        let mut commits = Vec::new();
+        for j in 0..5u64 {
+            let commit_path = dir.path().join(format!("commit_{j:05}.fsv2"));
+            let mut recs: Vec<RunRecordV2> = Vec::new();
+            for i in 0..40u64 {
+                let s = i * 5 + j;
+                recs.push(RunRecordV2 {
+                    s_id: SubjectId(s),
+                    o_key: 1000 + s % 3,
+                    p_id: TYPE_P,
+                    t: j as u32 + 1,
+                    o_i: fluree_db_binary_index::format::run_record::LIST_INDEX_NONE,
+                    o_type: OType::IRI_REF.as_u16(),
+                    g_id: G,
+                });
+                recs.push(RunRecordV2 {
+                    s_id: SubjectId(s),
+                    o_key: ObjKey::encode_i64(s as i64).as_u64(),
+                    p_id: 1,
+                    t: j as u32 + 1,
+                    o_i: fluree_db_binary_index::format::run_record::LIST_INDEX_NONE,
+                    o_type: OType::XSD_INTEGER.as_u16(),
+                    g_id: G,
+                });
+                recs.push(RunRecordV2 {
+                    s_id: SubjectId(s),
+                    o_key: (s + 1) % 200,
+                    p_id: 2,
+                    t: j as u32 + 1,
+                    o_i: fluree_db_binary_index::format::run_record::LIST_INDEX_NONE,
+                    o_type: OType::IRI_REF.as_u16(),
+                    g_id: G,
+                });
+            }
+            recs.sort_by(cmp_v2_spot);
+
+            let mut spool = SortedCommitWriterV2::new(&commit_path, 0).unwrap();
+            for rec in &recs {
+                spool.push(rec).unwrap();
+            }
+            let info = spool.finish().unwrap();
+
+            let subj_path = dir.path().join(format!("subjects_{j:05}.rmp"));
+            let subj_data: Vec<u8> = (0u64..1024).flat_map(u64::to_le_bytes).collect();
+            std::fs::write(&subj_path, &subj_data).unwrap();
+            let str_path = dir.path().join(format!("strings_{j:05}.rmp"));
+            let str_data: Vec<u8> = (0u32..10).flat_map(u32::to_le_bytes).collect();
+            std::fs::write(&str_path, &str_data).unwrap();
+
+            commits.push(CommitInput {
+                commit_path,
+                record_count: info.record_count,
+                subject_remap_path: subj_path,
+                string_remap_path: str_path,
+                lang_remap: vec![],
+                types_map_path: None,
+            });
+        }
+
+        // Membership keyed under g_id 5 so ref-target class resolution only
+        // succeeds when the collector sees correctly-stamped records.
+        let types_path = dir.path().join("global.types");
+        let entries: Vec<(u16, u64, u64)> = (0..200u64).map(|s| (G, s, 1000 + s % 3)).collect();
+        write_types_sidecar(&types_path, &entries);
+
+        let build = |tag: &str, plan: &FdPlan| {
+            let membership =
+                ClassMembership::build_from_global_types(std::slice::from_ref(&types_path))
+                    .unwrap()
+                    .expect("membership");
+            let config = BuildConfig {
+                run_dir: dir.path().join(format!("runs_{tag}")),
+                index_dir: dir.path().join(format!("index_{tag}")),
+                g_id: G,
+                leaflet_target_rows: 16,
+                leaf_target_rows: 64,
+                zstd_level: 1,
+                run_budget_bytes: 256 * 1024,
+                worker_count: 1,
+                fd_budget: FdBudget::unlimited(),
+                remap_progress: None,
+                build_progress: None,
+                stage_marker: None,
+            };
+            std::fs::create_dir_all(&config.run_dir).unwrap();
+            build_spot_index_from_commits(&commits, &config, Some(TYPE_P), Some(membership), plan)
+                .unwrap()
+        };
+
+        let unlimited = plan_fd_usage(FdBudget::unlimited(), 1, IMPORT_CONCURRENT_ORDERS);
+        let constrained = FdPlan {
+            spot_fan_in: 2,
+            ..unlimited
+        };
+
+        let (flat_result, flat_stats) = build("statflat", &unlimited);
+        let (hier_result, hier_stats) = build("stathier", &constrained);
+        let flat_stats = flat_stats.expect("flat stats");
+        let hier_stats = hier_stats.expect("hier stats");
+
+        assert_eq!(flat_result.total_rows, hier_result.total_rows);
+
+        // Non-vacuous: counts exist, keyed under the named graph, and ref
+        // targets resolved through the membership.
+        assert!(!flat_stats.class_counts.is_empty());
+        assert!(flat_stats.class_counts.keys().all(|&(g, _)| g == G));
+        assert!(!flat_stats.class_prop_refs.is_empty());
+
+        assert_eq!(flat_stats.class_counts, hier_stats.class_counts);
+        assert_eq!(flat_stats.class_prop_dts, hier_stats.class_prop_dts);
+        assert_eq!(flat_stats.class_prop_langs, hier_stats.class_prop_langs);
+        assert_eq!(flat_stats.class_prop_refs, hier_stats.class_prop_refs);
     }
 
     /// Helper: write `.types` sidecar entries (g_id: u16, s_id: u64, class_sid64: u64).
