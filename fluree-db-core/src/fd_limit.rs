@@ -286,8 +286,6 @@ mod tests {
         assert!(!is_fd_exhaustion(&std::io::Error::from_raw_os_error(
             libc::ENOENT
         )));
-        assert!(!is_fd_exhaustion(&std::io::Error::other(
-            "no raw os error"
-        )));
+        assert!(!is_fd_exhaustion(&std::io::Error::other("no raw os error")));
     }
 }
