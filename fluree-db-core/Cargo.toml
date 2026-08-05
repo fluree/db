@@ -53,6 +53,10 @@ tracing = { workspace = true }
 # Optional: commit signing (used by commit_v2 writer)
 fluree-db-credential = { path = "../fluree-db-credential", optional = true }
 
+# RLIMIT_NOFILE introspection/raise (fd_limit module)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true }
 postcard = { workspace = true }
