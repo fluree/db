@@ -325,6 +325,14 @@ impl ImportConfig {
         }
     }
 
+    /// Effective file-descriptor budget for this import: the live soft
+    /// `RLIMIT_NOFILE` (read fresh, so it reflects the pipeline's best-effort
+    /// raise) minus a reserve, overridable via `FLUREE_FD_BUDGET`. The index
+    /// build plans every fan-in/fan-out stage within it.
+    pub fn effective_fd_budget(&self) -> fluree_db_core::fd_limit::FdBudget {
+        fluree_db_core::fd_limit::FdBudget::detect()
+    }
+
     /// Effective coalesce threshold (number of small files above which the local
     /// directory rechunk producer merges sub-`chunk_size` files into larger work
     /// items). Overridable via `FLUREE_IMPORT_COALESCE_THRESHOLD`; `0` disables.
@@ -612,6 +620,26 @@ pub enum ImportError {
     /// tokio runtime. Its producer drives an async scan via `Handle::block_on`
     /// off a dedicated thread, which deadlocks on a current-thread runtime.
     UnsupportedRuntime(String),
+    /// The process open-file limit is too low for a bulk import even with
+    /// descriptor-conserving strategies. Raised by preflight so the import
+    /// fails in milliseconds instead of mid-build.
+    FdLimit(String),
+}
+
+/// Wrap an index-build I/O failure, upgrading descriptor exhaustion
+/// (`EMFILE`/`ENFILE`) into an actionable message carrying the observed limit.
+fn index_build_error(e: &std::io::Error) -> ImportError {
+    if fluree_db_core::fd_limit::is_fd_exhaustion(e) {
+        let soft = fluree_db_core::fd_limit::nofile_limits()
+            .map_or_else(|| "unknown".to_string(), |l| l.soft.to_string());
+        ImportError::IndexBuild(format!(
+            "{e}. The process open-file limit (currently {soft}) was exhausted \
+             despite descriptor budgeting; raise it (`ulimit -n <n>`, or \
+             launchd/systemd LimitNOFILE) or lower import parallelism"
+        ))
+    } else {
+        ImportError::IndexBuild(e.to_string())
+    }
 }
 
 impl std::fmt::Display for ImportError {
@@ -634,6 +662,7 @@ impl std::fmt::Display for ImportError {
                 e.limit_fuel()
             ),
             Self::UnsupportedRuntime(msg) => write!(f, "unsupported runtime: {msg}"),
+            Self::FdLimit(msg) => write!(f, "open-file limit: {msg}"),
         }
     }
 }
@@ -2926,6 +2955,30 @@ where
     let span = tracing::debug_span!("bulk_import", alias = %alias);
 
     async {
+        // ---- FD preflight ----
+        // Best-effort raise (idempotent — covers library embedders that never
+        // ran a CLI/server entry point), then fail fast on limits so low that
+        // even the descriptor-conserving build strategies cannot run, instead
+        // of dying twenty minutes into the index build.
+        let fd_raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
+        fluree_db_core::fd_limit::log_raise_outcome(&fd_raise);
+        let fd_budget = config.effective_fd_budget();
+        if fd_budget.soft < 64 {
+            return Err(ImportError::FdLimit(format!(
+                "process open-file limit is {}; bulk import needs at least 64 \
+                 (raise it with `ulimit -n <n>` or launchd/systemd LimitNOFILE)",
+                fd_budget.soft
+            )));
+        }
+        if fd_budget.soft < 256 {
+            tracing::warn!(
+                soft = fd_budget.soft,
+                reserve = fd_budget.reserve,
+                "open-file limit is low; import will conserve descriptors \
+                 (bounded scatter pool, cascaded merges)"
+            );
+        }
+
         // ---- Log effective settings and resolve chunk source ----
         config.log_effective_settings();
         let chunk_source = match &import_source {
@@ -5520,7 +5573,7 @@ where
                     stage_marker: Some(v3_stage_marker),
                 };
                 std::fs::create_dir_all(&cfg_g0.run_dir)
-                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    .map_err(|e| index_build_error(&e))?;
 
                 let (g0_result, mut spot_class_stats) =
                     fluree_db_indexer::build_indexes_from_commits(
@@ -5528,7 +5581,7 @@ where
                         &cfg_g0,
                         stats_hook.as_mut(),
                     )
-                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    .map_err(|e| index_build_error(&e))?;
 
                 // Meta chunk is always the last chunk when present. We build
                 // it BEFORE stats finalize and share the IdStatsHook so the
@@ -5550,7 +5603,7 @@ where
                         stage_marker: None,
                     };
                     std::fs::create_dir_all(&cfg_g1.run_dir)
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                        .map_err(|e| index_build_error(&e))?;
 
                     Some(
                         fluree_db_indexer::build_indexes_from_commits(
@@ -5558,7 +5611,7 @@ where
                             &cfg_g1,
                             stats_hook.as_mut(),
                         )
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?,
+                        .map_err(|e| index_build_error(&e))?,
                     )
                 } else {
                     None
@@ -5588,7 +5641,7 @@ where
                         stage_marker: None,
                     };
                     std::fs::create_dir_all(&cfg_ng.run_dir)
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                        .map_err(|e| index_build_error(&e))?;
 
                     // Fold this named graph's per-class SPOT stats into the
                     // default-graph accumulator. All `SpotClassStats` maps are
@@ -5603,7 +5656,7 @@ where
                         &cfg_ng,
                         stats_hook.as_mut(),
                     )
-                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    .map_err(|e| index_build_error(&e))?;
                     if let Some(ng) = ng_spot {
                         match &mut spot_class_stats {
                             Some(acc) => acc.merge(ng),
@@ -5744,8 +5797,7 @@ where
                     let stage = stage_marker.load(std::sync::atomic::Ordering::Relaxed);
                     emit_index_progress(stage, &mut current_stage, &mut stage_start);
                     break result
-                        .map_err(|e| ImportError::IndexBuild(format!("build task panicked: {e}")))?
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                        .map_err(|e| ImportError::IndexBuild(format!("build task panicked: {e}")))??;
                 }
                 () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                     let stage = stage_marker.load(std::sync::atomic::Ordering::Relaxed);
