@@ -1006,10 +1006,27 @@ impl Fluree {
     where
         B: Fn(&[T]) -> JsonValue,
     {
-        /// Consecutive waits allowed for one indivisible chunk before giving up.
-        /// Bounded so a genuinely wedged indexer still surfaces as an error rather
-        /// than hanging the worker forever.
-        const MAX_DRAIN_WAITS: usize = 12;
+        // Consecutive waits allowed for one chunk before giving up. Bounded so a
+        // genuinely wedged indexer surfaces as an error rather than hanging the
+        // worker forever — but the bound has to exceed how long a drain ACTUALLY
+        // takes, and the first version did not.
+        //
+        // MEASURED on a live deployment: the interval between consecutive index
+        // builds of the SAME ledger was median 144 s, p90 174 s, max 202 s (31
+        // samples over 30 min, 22 ledgers). Novelty for a given ledger cannot drain
+        // faster than its own next index build, so a 60 s budget (the original
+        // 12 x 5 s) was ~2.4x too small at the median — it would have exhausted and
+        // errored on most stuck chunks, which is exactly the failure it exists to
+        // prevent.
+        //
+        // 72 x 5 s = 360 s covers the observed max with ~1.8x headroom. The counter
+        // RESETS on every successful chunk, so this is a per-stall budget, not a
+        // total: a long materialize that keeps making progress is never capped.
+        // Override for a deployment whose indexer is slower still.
+        let max_drain_waits: usize = std::env::var("FLUREE_MATERIALIZE_MAX_DRAIN_WAITS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(72);
         const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
         // A stack, because a rejected chunk is pushed back as two halves and both
@@ -1054,20 +1071,20 @@ impl Fluree {
                         pending.push(right);
                         pending.push(left);
                     } else {
-                        if drain_waits >= MAX_DRAIN_WAITS {
+                        if drain_waits >= max_drain_waits {
                             return Err(ApiError::Internal(format!(
                                 "materialize: novelty still under pressure after {} waits \
                                  ({}s) — {:?}. The indexer is not draining novelty; check \
                                  for a wedged or failing index build on the target ledger.",
-                                MAX_DRAIN_WAITS,
-                                MAX_DRAIN_WAITS * DRAIN_WAIT.as_secs() as usize,
+                                max_drain_waits,
+                                max_drain_waits * DRAIN_WAIT.as_secs() as usize,
                                 pressure,
                             )));
                         }
                         drain_waits += 1;
                         warn!(
                             attempt = drain_waits,
-                            max_attempts = MAX_DRAIN_WAITS,
+                            max_attempts = max_drain_waits,
                             items = chunk.len(),
                             ?pressure,
                             "materialize: novelty under pressure, waiting for the indexer \
