@@ -557,8 +557,18 @@ impl Fluree {
                     watermark_node(source_graph_source_id, target_ledger_id, table, *to)
                 })
                 .collect();
-            self.upsert(state, &JsonValue::Array(watermark_nodes))
-                .await?;
+            // Through the backpressure helper, not a bare upsert. This write is
+            // last, so failing it discards the whole window's work and the next
+            // poll redoes all of it — the most expensive possible place to give up
+            // on a transient novelty condition. One chunk: the watermark nodes are
+            // a handful of small records, so this is purely about the retry.
+            self.transact_chunks_with_backpressure(
+                state,
+                vec![watermark_nodes],
+                |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+                ChunkVerb::Upsert,
+            )
+            .await?;
         }
 
         Ok(MaterializeResult {
@@ -1023,53 +1033,103 @@ impl Fluree {
                     // has done its job, and the next chunk deserves a full budget.
                     drain_waits = 0;
                 }
-                Err(ApiError::Transact(
-                    fluree_db_transact::TransactError::NoveltyWouldExceed {
-                        current_bytes,
-                        delta_bytes,
-                        max_bytes,
-                    },
-                )) => {
-                    if chunk.len() > 1 {
-                        // Split and retry. Cheap, immediate, and needs no guess
-                        // about how JSON bytes map to flake bytes.
+                Err(e) => {
+                    // Classification lives in `classify_novelty` so it is testable;
+                    // see the note there. `None` = a real failure, fail fast.
+                    let Some(pressure) = classify_novelty(&e) else {
+                        return Err(e);
+                    };
+                    // Splitting only helps a SIZED rejection. When novelty is already
+                    // at the ceiling no chunk is small enough, so go straight to the
+                    // wait — that distinction is the whole reason for the enum.
+                    let splittable =
+                        matches!(pressure, NoveltyPressure::WouldExceed { .. }) && chunk.len() > 1;
+                    if splittable {
                         let (left, right) = split_in_half(chunk);
                         info!(
                             items = left.len() + right.len(),
-                            current_bytes,
-                            delta_bytes,
-                            max_bytes,
+                            ?pressure,
                             "materialize: novelty backpressure, splitting chunk"
                         );
                         pending.push(right);
                         pending.push(left);
                     } else {
-                        // Indivisible and still rejected: novelty itself is too
-                        // full. Only the indexer can fix that, so wait for it.
                         if drain_waits >= MAX_DRAIN_WAITS {
                             return Err(ApiError::Internal(format!(
-                                "materialize: novelty still full after {} waits                                  ({}s) for a single-node transaction                                  (current={current_bytes} delta={delta_bytes}                                  max={max_bytes}). The indexer is not draining                                  novelty; check for a wedged or failing index build.",
+                                "materialize: novelty still under pressure after {} waits \
+                                 ({}s) — {:?}. The indexer is not draining novelty; check \
+                                 for a wedged or failing index build on the target ledger.",
                                 MAX_DRAIN_WAITS,
                                 MAX_DRAIN_WAITS * DRAIN_WAIT.as_secs() as usize,
+                                pressure,
                             )));
                         }
                         drain_waits += 1;
                         warn!(
                             attempt = drain_waits,
                             max_attempts = MAX_DRAIN_WAITS,
-                            current_bytes,
-                            delta_bytes,
-                            max_bytes,
-                            "materialize: novelty full for an indivisible chunk,                              waiting for the indexer to drain"
+                            items = chunk.len(),
+                            ?pressure,
+                            "materialize: novelty under pressure, waiting for the indexer \
+                             to drain"
                         );
                         tokio::time::sleep(DRAIN_WAIT).await;
                         pending.push(chunk);
                     }
                 }
-                Err(e) => return Err(e),
             }
         }
         Ok(ledger)
+    }
+}
+
+/// Novelty backpressure, classified by what can actually resolve it.
+///
+/// Extracted as a named function rather than left as match arms inside the retry
+/// loop for one reason: **a test of match arms buried in an async loop cannot
+/// guard them.** A first attempt at a canary here asserted against a copy of the
+/// classification written inside the test, which would have passed happily while
+/// production regressed — the same vacuous shape as building a fixture path by
+/// hand. Testing THIS function tests what the loop actually does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoveltyPressure {
+    /// The transaction was sized and rejected: `current + delta > max`. Splitting
+    /// the chunk reduces `delta` and can therefore succeed.
+    WouldExceed {
+        current_bytes: usize,
+        delta_bytes: usize,
+        max_bytes: usize,
+    },
+    /// Novelty is already at the ceiling, raised BEFORE the transaction is sized —
+    /// which is why it carries no numbers. No chunk is small enough; only the
+    /// indexer draining helps.
+    AtMax,
+}
+
+/// Classify an error as novelty backpressure, or `None` if it is a real failure.
+///
+/// Both novelty variants are transient and retryable — `NoveltyAtMax`'s own doc
+/// comment in `fluree-db-transact` reads "Novelty at maximum size (backpressure)".
+/// Handling only one made this fix INERT in production: a forced full
+/// re-materialize failed instantly on all 17 sources, 74 `NoveltyAtMax` against 0
+/// `NoveltyWouldExceed`, and the split path logged zero times.
+fn classify_novelty(e: &ApiError) -> Option<NoveltyPressure> {
+    match e {
+        ApiError::Transact(fluree_db_transact::TransactError::NoveltyWouldExceed {
+            current_bytes,
+            delta_bytes,
+            max_bytes,
+        }) => Some(NoveltyPressure::WouldExceed {
+            current_bytes: *current_bytes,
+            delta_bytes: *delta_bytes,
+            max_bytes: *max_bytes,
+        }),
+        ApiError::Transact(fluree_db_transact::TransactError::NoveltyAtMax) => {
+            Some(NoveltyPressure::AtMax)
+        }
+        // Anything else is a genuine failure. Retrying a validation error forever is
+        // worse than failing fast, so this must stay a closed set.
+        _ => None,
     }
 }
 
@@ -1492,6 +1552,51 @@ mod tests {
     }
     /// Fixed target ledger for accumulator tests that don't exercise fan-out.
     const TGT: &str = "t:main";
+
+    /// BOTH novelty variants must classify as backpressure, and they must classify
+    /// DIFFERENTLY — because the two need opposite responses.
+    ///
+    /// This asserts against `classify_novelty`, the function the retry loop actually
+    /// calls. An earlier version of this test defined its own copy of the
+    /// classification and asserted against that, which would have passed while
+    /// production regressed. Testing a replica of the logic is not testing the logic.
+    #[test]
+    fn classify_novelty_covers_both_variants_distinctly() {
+        use fluree_db_transact::TransactError;
+
+        // Sized rejection -> splittable, and the numbers must survive for the log.
+        let exceed = ApiError::Transact(TransactError::NoveltyWouldExceed {
+            current_bytes: 53_024_023,
+            delta_bytes: 17_701_872,
+            max_bytes: 67_108_864,
+        });
+        assert_eq!(
+            classify_novelty(&exceed),
+            Some(NoveltyPressure::WouldExceed {
+                current_bytes: 53_024_023,
+                delta_bytes: 17_701_872,
+                max_bytes: 67_108_864,
+            })
+        );
+
+        // Ceiling already reached -> NOT splittable. This is the variant whose
+        // absence made the whole fix inert: 74 of these in production against 0 of
+        // the above, with the split path never firing.
+        let at_max = ApiError::Transact(TransactError::NoveltyAtMax);
+        assert_eq!(classify_novelty(&at_max), Some(NoveltyPressure::AtMax));
+
+        // They must NOT collapse together — splitting on AtMax would loop forever
+        // shrinking a chunk that can never fit.
+        assert_ne!(classify_novelty(&exceed), classify_novelty(&at_max));
+
+        // A real failure must fail fast. Retrying a validation error forever is
+        // worse than erroring, so this set stays closed.
+        assert_eq!(
+            classify_novelty(&ApiError::Transact(TransactError::InvalidTerm("x".into()))),
+            None
+        );
+        assert_eq!(classify_novelty(&ApiError::Internal("boom".into())), None);
+    }
 
     /// Every split must yield two NON-EMPTY halves. An empty half would make the
     /// backpressure loop either spin forever on an unshrinking chunk or drop the
