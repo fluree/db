@@ -299,6 +299,208 @@ pub struct RunFileInfo {
     pub max_t: u32,
 }
 
+/// Records per streamed block (matches `write_run_file`'s block size, so
+/// streamed output is byte-compatible with the slice-based writers).
+const STREAM_BLOCK_RECORDS: usize = 8192;
+
+/// Streaming V2 run-file writer: writes a placeholder header, streams records
+/// in [`STREAM_BLOCK_RECORDS`]-sized blocks (same wire format as
+/// [`write_run_file`] / [`write_run_file_with_op`]), then seeks back and
+/// patches `record_count`/`min_t`/`max_t` on [`Self::finish`].
+///
+/// Exists for cascaded merges, whose output is produced record-at-a-time from
+/// a k-way merge and must not be buffered wholesale in memory. Version is 2
+/// (with-op, 31-byte records) when `with_op` is set, else 1 —
+/// `StreamingRunReader` auto-detects both, so cascade output is transparently
+/// readable wherever original run files are.
+pub(crate) struct StreamingRunFileWriter {
+    file: io::BufWriter<std::fs::File>,
+    sort_order: RunSortOrder,
+    with_op: bool,
+    compress: bool,
+    zstd_level: i32,
+    block_records: Vec<RunRecordV2>,
+    /// Parallel to `block_records`; only populated when `with_op`.
+    block_ops: Vec<u8>,
+    record_count: u64,
+    min_t: u32,
+    max_t: u32,
+    path: std::path::PathBuf,
+}
+
+impl StreamingRunFileWriter {
+    /// Create with compression settings from the environment — the same
+    /// `FLUREE_RUN_ZSTD` / `FLUREE_RUN_ZSTD_LEVEL` contract as
+    /// [`write_run_file`].
+    pub(crate) fn create(path: &Path, sort_order: RunSortOrder, with_op: bool) -> io::Result<Self> {
+        let compress = std::env::var("FLUREE_RUN_ZSTD")
+            .ok()
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        let zstd_level = std::env::var("FLUREE_RUN_ZSTD_LEVEL")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(1);
+        Self::create_with_options(path, sort_order, with_op, compress, zstd_level)
+    }
+
+    /// Create with explicit compression settings (tests exercise both paths
+    /// without mutating process-global environment variables).
+    pub(crate) fn create_with_options(
+        path: &Path,
+        sort_order: RunSortOrder,
+        with_op: bool,
+        compress: bool,
+        zstd_level: i32,
+    ) -> io::Result<Self> {
+        let raw = std::fs::File::create(path)?;
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                let _ = libc::fcntl(raw.as_raw_fd(), libc::F_NOCACHE, 1);
+            }
+        }
+        let mut file = io::BufWriter::new(raw);
+
+        // Placeholder header; patched in `finish`.
+        let header = Self::header(with_op, sort_order, compress, 0, 0, 0);
+        let mut header_buf = [0u8; RUN_V2_HEADER_LEN];
+        header.write_to(&mut header_buf);
+        file.write_all(&header_buf)?;
+
+        Ok(Self {
+            file,
+            sort_order,
+            with_op,
+            compress,
+            zstd_level,
+            block_records: Vec::with_capacity(STREAM_BLOCK_RECORDS),
+            block_ops: if with_op {
+                Vec::with_capacity(STREAM_BLOCK_RECORDS)
+            } else {
+                Vec::new()
+            },
+            record_count: 0,
+            min_t: u32::MAX,
+            max_t: 0,
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn header(
+        with_op: bool,
+        sort_order: RunSortOrder,
+        compress: bool,
+        record_count: u64,
+        min_t: u32,
+        max_t: u32,
+    ) -> RunFileHeader {
+        RunFileHeader {
+            version: if with_op {
+                RUN_V2_VERSION_WITH_OP
+            } else {
+                RUN_V2_VERSION
+            },
+            sort_order,
+            flags: if compress { RUN_FLAG_ZSTD_BLOCKS } else { 0 },
+            record_count,
+            records_offset: RUN_V2_HEADER_LEN as u64,
+            min_t,
+            max_t,
+        }
+    }
+
+    /// Append one record (with its op byte; ignored unless `with_op`).
+    pub(crate) fn push(&mut self, record: RunRecordV2, op: u8) -> io::Result<()> {
+        self.min_t = self.min_t.min(record.t);
+        self.max_t = self.max_t.max(record.t);
+        self.record_count += 1;
+        self.block_records.push(record);
+        if self.with_op {
+            self.block_ops.push(op);
+        }
+        if self.block_records.len() >= STREAM_BLOCK_RECORDS {
+            self.flush_block()?;
+        }
+        Ok(())
+    }
+
+    fn flush_block(&mut self) -> io::Result<()> {
+        if self.block_records.is_empty() {
+            return Ok(());
+        }
+        let record_size = if self.with_op {
+            RECORD_V2_WITH_OP_WIRE_SIZE
+        } else {
+            RECORD_V2_WIRE_SIZE
+        };
+        let mut raw_buf = vec![0u8; self.block_records.len() * record_size];
+        if self.with_op {
+            let mut rec_buf = [0u8; RECORD_V2_WITH_OP_WIRE_SIZE];
+            for (i, (rec, &op)) in self
+                .block_records
+                .iter()
+                .zip(self.block_ops.iter())
+                .enumerate()
+            {
+                rec.write_run_le_with_op(op, &mut rec_buf);
+                let off = i * record_size;
+                raw_buf[off..off + record_size].copy_from_slice(&rec_buf);
+            }
+        } else {
+            let mut rec_buf = [0u8; RECORD_V2_WIRE_SIZE];
+            for (i, rec) in self.block_records.iter().enumerate() {
+                rec.write_run_le(&mut rec_buf);
+                let off = i * record_size;
+                raw_buf[off..off + record_size].copy_from_slice(&rec_buf);
+            }
+        }
+        if self.compress {
+            let compressed = zstd::bulk::compress(&raw_buf, self.zstd_level)?;
+            self.file
+                .write_all(&(self.block_records.len() as u32).to_le_bytes())?;
+            self.file.write_all(&(raw_buf.len() as u32).to_le_bytes())?;
+            self.file
+                .write_all(&(compressed.len() as u32).to_le_bytes())?;
+            self.file.write_all(&compressed)?;
+        } else {
+            self.file.write_all(&raw_buf)?;
+        }
+        self.block_records.clear();
+        self.block_ops.clear();
+        Ok(())
+    }
+
+    /// Flush the trailing block, patch the header, and sync buffered bytes.
+    pub(crate) fn finish(mut self) -> io::Result<RunFileInfo> {
+        use std::io::Seek;
+
+        self.flush_block()?;
+        let min_t = if self.record_count == 0 { 0 } else { self.min_t };
+        let header = Self::header(
+            self.with_op,
+            self.sort_order,
+            self.compress,
+            self.record_count,
+            min_t,
+            self.max_t,
+        );
+        let mut header_buf = [0u8; RUN_V2_HEADER_LEN];
+        header.write_to(&mut header_buf);
+        self.file.seek(io::SeekFrom::Start(0))?;
+        self.file.write_all(&header_buf)?;
+        self.file.flush()?;
+        Ok(RunFileInfo {
+            path: self.path,
+            record_count: self.record_count,
+            sort_order: self.sort_order,
+            min_t,
+            max_t: self.max_t,
+        })
+    }
+}
+
 // ── Language dictionary serialization (format-independent) ─────────────────
 
 use crate::run_index::resolve::global_dict::LanguageTagDict;
@@ -443,6 +645,110 @@ mod tests {
         assert!(header.has_op());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The streaming writer must be byte-identical to the slice-based
+    /// writers (same header, same 8192-record zstd blocks) — cascade
+    /// intermediates are read by the same `StreamingRunReader` as originals.
+    #[test]
+    fn streaming_writer_matches_slice_writers() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Multi-block volume (> 8192 records) with wrapping t values.
+        let records: Vec<RunRecordV2> = (0..20_000u64)
+            .map(|i| {
+                make_rec(
+                    i,
+                    1,
+                    OType::XSD_INTEGER.as_u16(),
+                    i * 3,
+                    (i % 7) as u32 + 1,
+                )
+            })
+            .collect();
+        let ops: Vec<u8> = (0..20_000u64).map(|i| (i % 2) as u8).collect();
+        let min_t = 1;
+        let max_t = 7;
+
+        // No-op variant (version 1), compressed level 1 — the slice writer's
+        // defaults with no FLUREE_RUN_ZSTD* env set.
+        let slice_path = dir.path().join("slice.frn");
+        write_run_file(&slice_path, &records, RunSortOrder::Spot, min_t, max_t).unwrap();
+        let stream_path = dir.path().join("stream.frn");
+        let mut writer =
+            StreamingRunFileWriter::create_with_options(&stream_path, RunSortOrder::Spot, false, true, 1)
+                .unwrap();
+        for rec in &records {
+            writer.push(*rec, 1).unwrap();
+        }
+        let info = writer.finish().unwrap();
+        assert_eq!(info.record_count, records.len() as u64);
+        assert_eq!(info.min_t, min_t);
+        assert_eq!(info.max_t, max_t);
+        assert_eq!(
+            std::fs::read(&slice_path).unwrap(),
+            std::fs::read(&stream_path).unwrap()
+        );
+
+        // With-op variant (version 2).
+        let slice_op_path = dir.path().join("slice_op.frn");
+        write_run_file_with_op(&slice_op_path, &records, &ops, RunSortOrder::Spot, min_t, max_t)
+            .unwrap();
+        let stream_op_path = dir.path().join("stream_op.frn");
+        let mut writer =
+            StreamingRunFileWriter::create_with_options(&stream_op_path, RunSortOrder::Spot, true, true, 1)
+                .unwrap();
+        for (rec, &op) in records.iter().zip(ops.iter()) {
+            writer.push(*rec, op).unwrap();
+        }
+        writer.finish().unwrap();
+        assert_eq!(
+            std::fs::read(&slice_op_path).unwrap(),
+            std::fs::read(&stream_op_path).unwrap()
+        );
+    }
+
+    /// Uncompressed streaming output round-trips through the auto-detecting
+    /// reader (the compressed path is covered byte-for-byte above).
+    #[test]
+    fn streaming_writer_uncompressed_roundtrip() {
+        use crate::run_index::runs::streaming_reader::{MergeSource, StreamingRunReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.frn");
+        let records: Vec<RunRecordV2> = (0..100u64)
+            .map(|i| make_rec(i, 1, OType::XSD_INTEGER.as_u16(), i, i as u32 + 1))
+            .collect();
+
+        let mut writer =
+            StreamingRunFileWriter::create_with_options(&path, RunSortOrder::Spot, true, false, 1)
+                .unwrap();
+        for (i, rec) in records.iter().enumerate() {
+            writer.push(*rec, (i % 2) as u8).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let mut reader = StreamingRunReader::open(&path).unwrap();
+        let mut n = 0usize;
+        while let Some(rec) = reader.peek() {
+            assert_eq!(rec.s_id.as_u64(), n as u64);
+            assert_eq!(reader.peek_op(), (n % 2) as u8);
+            n += 1;
+            reader.advance().unwrap();
+        }
+        assert_eq!(n, records.len());
+
+        // Empty output: header must read back with zero records.
+        let empty_path = dir.path().join("empty.frn");
+        let writer =
+            StreamingRunFileWriter::create_with_options(&empty_path, RunSortOrder::Post, false, true, 1)
+                .unwrap();
+        let info = writer.finish().unwrap();
+        assert_eq!(info.record_count, 0);
+        let mut reader = StreamingRunReader::open(&empty_path).unwrap();
+        assert!(reader.peek().is_none());
+        assert!(MergeSource::is_exhausted(&reader));
+        let _ = reader.advance();
     }
 
     #[test]
