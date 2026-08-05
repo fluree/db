@@ -256,7 +256,7 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
                     None => vec![None; num_rows],
                 })
                 .collect();
-            build_columns_from_values(column_data, &batch_schema)?
+            build_columns_from_values(column_data, &batch_schema)
         };
         let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
         if !batch.is_empty() {

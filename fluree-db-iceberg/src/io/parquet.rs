@@ -305,7 +305,7 @@ impl<'a, S: IcebergStorage> ParquetReader<'a, S> {
             }
 
             // Convert to Column format and create batch for this row group
-            let columns = build_columns_from_values(column_data, &batch_schema)?;
+            let columns = build_columns_from_values(column_data, &batch_schema);
             let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
 
             if !batch.is_empty() {
@@ -623,11 +623,13 @@ fn decimal_bytes_to_i128(bytes: &[u8]) -> i128 {
     i128::from_be_bytes(arr)
 }
 
-/// Build Column vectors from row-collected values.
+/// Build Column vectors from row-collected values. Infallible (id=3717339925: the
+/// per-column mapping was extracted into the infallible [`column_from_values`], so this
+/// no longer returns a `Result`).
 pub fn build_columns_from_values(
     column_data: Vec<Vec<Option<ColumnValue>>>,
     schema: &BatchSchema,
-) -> Result<Vec<Column>> {
+) -> Vec<Column> {
     let mut columns = Vec::with_capacity(schema.fields.len());
 
     for (col_idx, field) in schema.fields.iter().enumerate() {
@@ -635,7 +637,7 @@ pub fn build_columns_from_values(
         columns.push(column_from_values(values, &field.field_type));
     }
 
-    Ok(columns)
+    columns
 }
 
 /// Map one column's row-collected `ColumnValue`s to the typed [`Column`] for
