@@ -9,19 +9,22 @@
 
 use crate::run_index::build::fd_plan::{plan_fd_usage, FdPlan};
 use crate::run_index::build::index_build::{
-    build_all_indexes, BuildAllConfig, IndexBuildResult, PersistingLeafWriter,
+    build_all_indexes, cascade_runs_to_fan_in, BuildAllConfig, IndexBuildResult,
+    PersistingLeafWriter,
 };
 use crate::run_index::build::merge::KWayMerge;
+use crate::run_index::runs::run_file::StreamingRunFileWriter;
 use crate::run_index::runs::run_writer::{
     MultiOrderConfig, MultiOrderRunWriter, MultiOrderRunWriterWithOp,
 };
+use crate::run_index::runs::streaming_reader::{MergeSource, StreamingRunReader};
 use crate::run_index::runs::spool::{
     link_chunk_run_files_to_flat, remap_commit_to_runs_with_op, remap_sorted_commit_v2_to_runs,
     MmapStringRemap, MmapSubjectRemap, SortedCommitMergeReaderV2, SubjectRemap,
 };
 use crate::stats::{stats_record_from_v2, SpotClassStats, DT_REF_ID};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::cmp_v2_spot;
+use fluree_db_binary_index::format::run_record_v2::{cmp_v2_spot, RunRecordV2};
 use fluree_db_core::fd_limit::FdBudget;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::o_type_registry::OTypeRegistry;
@@ -1321,26 +1324,12 @@ fn build_spot_index_from_commits(
     tracing::info!(
         chunks = commits.len(),
         g_id,
+        spot_fan_in = fd_plan.spot_fan_in,
         "starting direct SPOT build from sorted commits"
     );
     log_index_memory("spot_build:start");
-    let streams: Vec<SortedCommitMergeReaderV2<MmapSubjectRemap, MmapStringRemap>> = commits
-        .iter()
-        .map(|commit| {
-            let s_remap = MmapSubjectRemap::open(&commit.subject_remap_path)?;
-            let str_remap = MmapStringRemap::open(&commit.string_remap_path)?;
-            SortedCommitMergeReaderV2::open(
-                &commit.commit_path,
-                commit.record_count,
-                s_remap,
-                str_remap,
-                commit.lang_remap.clone(),
-                g_id,
-            )
-        })
-        .collect::<io::Result<Vec<_>>>()?;
 
-    if streams.is_empty() {
+    if commits.is_empty() {
         return Ok((
             IndexBuildResult {
                 graphs: Vec::new(),
@@ -1352,7 +1341,6 @@ fn build_spot_index_from_commits(
         ));
     }
 
-    let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
     let order = RunSortOrder::Spot;
 
     // Streams each completed leaf to disk as produced (see PersistingLeafWriter)
@@ -1368,32 +1356,80 @@ fn build_spot_index_from_commits(
     )?;
     writer.set_skip_history(true);
 
-    let mut total_rows = 0u64;
-    let mut progress_batch = 0u64;
     let mut class_stats_collector =
         rdf_type_p_id.map(|p_id| SpotClassStatsCollector::new(p_id, class_membership));
-    while let Some((record, op)) = merge.next_record()? {
-        if op == 0 {
-            continue;
+
+    let total_rows = if commits.len() <= fd_plan.spot_fan_in {
+        // Flat merge: one long-lived reader per chunk, all open at once.
+        // The common case, and byte-for-byte the pre-budget behavior.
+        let streams = open_spot_commit_readers(commits, g_id)?;
+        let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
+        pump_spot_merge(
+            &mut merge,
+            &mut writer,
+            class_stats_collector.as_mut(),
+            progress.as_deref(),
+        )?
+    } else {
+        // More chunks than the FD budget allows open at once: merge
+        // consecutive chunk groups into globally-remapped intermediate run
+        // files first (each group holds ≤ spot_fan_in readers), then feed
+        // the final merge from those. Grouping is consecutive and the group
+        // outputs are consumed in group order, so the emitted record
+        // sequence — and therefore every leaf byte — is identical to the
+        // flat merge (see `cascade_runs_to_fan_in` for the full argument).
+        tracing::info!(
+            chunks = commits.len(),
+            spot_fan_in = fd_plan.spot_fan_in,
+            "chunk count exceeds fd budget; hierarchical SPOT merge"
+        );
+        let scratch = config.run_dir.join("spot_cascade");
+        if scratch.exists() {
+            std::fs::remove_dir_all(&scratch)?;
         }
-        if let Some(ref mut collector) = class_stats_collector {
-            collector.on_record(&record);
-        }
-        writer.push_record(record)?;
-        total_rows += 1;
-        progress_batch += 1;
-        if progress_batch >= PROGRESS_BATCH_SIZE {
-            if let Some(ref ctr) = progress {
-                ctr.fetch_add(progress_batch, Ordering::Relaxed);
+        let pass_dir = scratch.join("pass_1");
+        std::fs::create_dir_all(&pass_dir)?;
+
+        let mut intermediates = Vec::with_capacity(commits.len().div_ceil(fd_plan.spot_fan_in));
+        for (i, group) in commits.chunks(fd_plan.spot_fan_in).enumerate() {
+            let streams = open_spot_commit_readers(group, g_id)?;
+            let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
+            let out_path = pass_dir.join(format!("merged_{i:06}.frn"));
+            // Spool sources carry no op sideband (`peek_op` is uniformly 1
+            // on the import path), so version-1 intermediates lose nothing.
+            let mut inter = StreamingRunFileWriter::create(&out_path, order, false)?;
+            while let Some((record, _op)) = merge.next_record()? {
+                inter.push(record, 1)?;
             }
-            progress_batch = 0;
+            inter.finish()?;
+            intermediates.push(out_path);
         }
-    }
-    if progress_batch > 0 {
-        if let Some(ref ctr) = progress {
-            ctr.fetch_add(progress_batch, Ordering::Relaxed);
-        }
-    }
+        // chunks > spot_fan_in² leaves the first pass still over the cap;
+        // reduce the intermediates themselves (rare, tiny-budget case).
+        let intermediates = cascade_runs_to_fan_in(
+            intermediates,
+            order,
+            fd_plan.spot_fan_in,
+            &scratch.join("cascade"),
+        )?;
+
+        let streams: Vec<StreamingRunReader> = intermediates
+            .iter()
+            .map(|p| StreamingRunReader::open(p))
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
+        let rows = pump_spot_merge(
+            &mut merge,
+            &mut writer,
+            class_stats_collector.as_mut(),
+            progress.as_deref(),
+        )?;
+        drop(merge);
+        // Reclaim the intermediate copy of the dataset before the
+        // secondary-order phases start writing their own run files.
+        std::fs::remove_dir_all(&scratch)?;
+        rows
+    };
 
     let result = writer.finish()?;
     tracing::info!(
@@ -1412,6 +1448,70 @@ fn build_spot_index_from_commits(
         },
         class_stats_collector.map(SpotClassStatsCollector::finish),
     ))
+}
+
+/// Open one remapping SPOT reader per commit chunk. Each holds one real file
+/// descriptor (the sorted-commit `BufReader`) for its lifetime; the two remap
+/// mmaps drop their `File` on open and cost address space only.
+fn open_spot_commit_readers(
+    commits: &[CommitInput],
+    g_id: u16,
+) -> io::Result<Vec<SortedCommitMergeReaderV2<MmapSubjectRemap, MmapStringRemap>>> {
+    commits
+        .iter()
+        .map(|commit| {
+            let s_remap = MmapSubjectRemap::open(&commit.subject_remap_path)?;
+            let str_remap = MmapStringRemap::open(&commit.string_remap_path)?;
+            SortedCommitMergeReaderV2::open(
+                &commit.commit_path,
+                commit.record_count,
+                s_remap,
+                str_remap,
+                commit.lang_remap.clone(),
+                g_id,
+            )
+        })
+        .collect()
+}
+
+/// Drain a SPOT merge into the leaf writer (and class-stats collector),
+/// batching progress updates. Shared by the flat and hierarchical SPOT
+/// arms so both consume the merged sequence identically.
+fn pump_spot_merge<T, F>(
+    merge: &mut KWayMerge<T, F>,
+    writer: &mut PersistingLeafWriter,
+    mut class_stats_collector: Option<&mut SpotClassStatsCollector>,
+    progress: Option<&AtomicU64>,
+) -> io::Result<u64>
+where
+    T: MergeSource,
+    F: Fn(&RunRecordV2, &RunRecordV2) -> std::cmp::Ordering,
+{
+    let mut total_rows = 0u64;
+    let mut progress_batch = 0u64;
+    while let Some((record, op)) = merge.next_record()? {
+        if op == 0 {
+            continue;
+        }
+        if let Some(collector) = class_stats_collector.as_deref_mut() {
+            collector.on_record(&record);
+        }
+        writer.push_record(record)?;
+        total_rows += 1;
+        progress_batch += 1;
+        if progress_batch >= PROGRESS_BATCH_SIZE {
+            if let Some(ctr) = progress {
+                ctr.fetch_add(progress_batch, Ordering::Relaxed);
+            }
+            progress_batch = 0;
+        }
+    }
+    if progress_batch > 0 {
+        if let Some(ctr) = progress {
+            ctr.fetch_add(progress_batch, Ordering::Relaxed);
+        }
+    }
+    Ok(total_rows)
 }
 
 /// Build V3 indexes from globally-remapped sorted commit files (rebuild path).
@@ -1661,6 +1761,127 @@ mod tests {
         assert_eq!(leaf_dir[1].p_const, Some(2));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hierarchical SPOT merge (chunk count above the fan-in cap) must
+    /// produce byte-identical leaves to the flat merge — leaf and branch
+    /// CIDs are content-addressed, so CID equality is byte equality.
+    #[test]
+    fn spot_hierarchical_matches_flat() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = OTypeRegistry::builtin_only();
+
+        // 5 chunks × 41 records: interleaved disjoint subjects plus one
+        // shared identical-comparing record per chunk (comparators exclude
+        // t), so the cross-group tie-break seam is exercised.
+        let mut commits = Vec::new();
+        for j in 0..5u64 {
+            let commit_path = dir.path().join(format!("commit_{j:05}.fsv2"));
+            let mut recs: Vec<RunRecordV2> = (0..40u64)
+                .map(|i| {
+                    let s = i * 5 + j;
+                    RunRecordV2::from_v1(
+                        &RunRecord::new(
+                            0,
+                            SubjectId(s),
+                            1,
+                            ObjKind::NUM_INT,
+                            ObjKey::encode_i64(s as i64),
+                            j as u32 + 1,
+                            true,
+                            3,
+                            0,
+                            None,
+                        ),
+                        &registry,
+                    )
+                })
+                .collect();
+            recs.push(RunRecordV2::from_v1(
+                &RunRecord::new(
+                    0,
+                    SubjectId(1000),
+                    1,
+                    ObjKind::NUM_INT,
+                    ObjKey::encode_i64(7),
+                    j as u32 + 1,
+                    true,
+                    3,
+                    0,
+                    None,
+                ),
+                &registry,
+            ));
+            recs.sort_by(cmp_v2_spot);
+
+            let mut spool = SortedCommitWriterV2::new(&commit_path, 0).unwrap();
+            for rec in &recs {
+                spool.push(rec).unwrap();
+            }
+            let info = spool.finish().unwrap();
+
+            let subj_path = dir.path().join(format!("subjects_{j:05}.rmp"));
+            let subj_data: Vec<u8> = (0u64..1024).flat_map(u64::to_le_bytes).collect();
+            std::fs::write(&subj_path, &subj_data).unwrap();
+            let str_path = dir.path().join(format!("strings_{j:05}.rmp"));
+            let str_data: Vec<u8> = (0u32..10).flat_map(u32::to_le_bytes).collect();
+            std::fs::write(&str_path, &str_data).unwrap();
+
+            commits.push(CommitInput {
+                commit_path,
+                record_count: info.record_count,
+                subject_remap_path: subj_path,
+                string_remap_path: str_path,
+                lang_remap: vec![],
+                types_map_path: None,
+            });
+        }
+
+        let build = |tag: &str, plan: &FdPlan| {
+            let config = BuildConfig {
+                run_dir: dir.path().join(format!("runs_{tag}")),
+                index_dir: dir.path().join(format!("index_{tag}")),
+                g_id: 0,
+                leaflet_target_rows: 16,
+                leaf_target_rows: 64,
+                zstd_level: 1,
+                run_budget_bytes: 256 * 1024,
+                worker_count: 1,
+                fd_budget: FdBudget::unlimited(),
+                remap_progress: None,
+                build_progress: None,
+                stage_marker: None,
+            };
+            std::fs::create_dir_all(&config.run_dir).unwrap();
+            build_spot_index_from_commits(&commits, &config, None, None, plan)
+                .unwrap()
+                .0
+        };
+
+        let unlimited = plan_fd_usage(FdBudget::unlimited(), 1);
+        let constrained = FdPlan {
+            spot_fan_in: 2,
+            ..unlimited
+        };
+
+        let flat = build("flat", &unlimited);
+        let hier = build("hier", &constrained);
+
+        assert_eq!(flat.total_rows, 5 * 41);
+        assert_eq!(flat.total_rows, hier.total_rows);
+        let cids = |r: &IndexBuildResult| {
+            r.graphs
+                .iter()
+                .flat_map(|g| {
+                    std::iter::once(g.branch_cid.clone())
+                        .chain(g.leaf_infos.iter().map(|l| l.leaf_cid.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(cids(&flat), cids(&hier));
+
+        // The hierarchical arm must clean up its intermediate copy.
+        assert!(!dir.path().join("runs_hier/spot_cascade").exists());
     }
 
     /// Helper: write `.types` sidecar entries (g_id: u16, s_id: u64, class_sid64: u64).

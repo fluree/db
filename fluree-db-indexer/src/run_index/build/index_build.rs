@@ -521,7 +521,7 @@ pub fn discover_run_files_v2(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// run files, typically symlinks into per-chunk dirs — are never touched).
 /// Passes needed: `ceil(log_fan_in(runs)) - 1`; disk overhead: one extra
 /// zstd-compressed copy of the order per live pass.
-fn cascade_runs_to_fan_in(
+pub(crate) fn cascade_runs_to_fan_in(
     mut run_paths: Vec<PathBuf>,
     order: RunSortOrder,
     fan_in: usize,
