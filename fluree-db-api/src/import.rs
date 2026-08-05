@@ -766,6 +766,16 @@ impl DocChunk {
 /// contiguity rather than trusting it silently — a producer that interleaved
 /// documents would otherwise re-issue sub-chunk 0 and merge two documents'
 /// anonymous nodes.
+///
+/// Debug-only, unlike the analogous guard in [`DocIds::new`], because the two
+/// watch different things. `DocIds::new` validates *caller-supplied input* — a
+/// `Remote` `OrderedObjects` list names the addresses, and a caller can repeat
+/// one — so no amount of testing this crate rules it out and the check has to
+/// hold in release. This one guards an invariant of an internal producer loop,
+/// which no external input can perturb: whether a producer walks its documents
+/// contiguously is fixed by the code, so a violation is a bug in this file that
+/// a debug build catches before it ships, not a condition to re-check per chunk
+/// on the hot path.
 #[derive(Default)]
 struct SubChunkCounter {
     current: Option<u64>,

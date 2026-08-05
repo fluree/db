@@ -12,7 +12,8 @@
 //! fdb-d<13 lowercase base36 digits>-<label>
 //!     ^ ^                          ^
 //!     | |                          `- the label as written in the source
-//!     | `- xxh64(namespace ‖ 0x00 ‖ doc_key), zero-padded to a fixed width
+//!     | `- xxh64(namespace ‖ 0x00 ‖ doc_key ‖ 0x00 ‖ segment), zero-padded
+//!     |    to a fixed width
 //!     `- the document-scope marker
 //! ```
 //!

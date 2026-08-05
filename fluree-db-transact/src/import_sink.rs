@@ -523,7 +523,7 @@ mod inner {
     /// # Example
     ///
     /// ```ignore
-    /// let mut sink = ImportSink::new(&mut ns, t, skolem_base, true)?;
+    /// let mut sink = ImportSink::new(&mut ns, t, skolem_base, 0, true)?;
     /// fluree_graph_turtle::parse(ttl, &mut sink)?;
     /// let writer = sink.into_parts();
     /// let result = writer.finish(&envelope)?;
