@@ -1544,6 +1544,10 @@ impl FusedR2rmlAggregateOperator {
     /// group's key + accumulators are freed as it is finalized (peak output-side memory
     /// = one chunk, not the whole result). Group order is unspecified (a wrapping Sort
     /// applies any ORDER BY), so back-to-front drain is sound. Sets `done` once drained.
+    /// Corollary (id=3717339912): a bare `LIMIT` with NO `ORDER BY` may therefore return
+    /// a DIFFERENT set of rows with output-bounding on vs off (the two drains yield the
+    /// groups in opposite order, and LIMIT keeps a prefix) — permitted, since SPARQL
+    /// leaves the row order of an unsorted result unspecified.
     fn emit_pending_chunk(&mut self) -> Result<Option<Batch>> {
         let resolved = self
             .resolved
