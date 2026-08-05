@@ -2513,6 +2513,7 @@ dependencies = [
  "hex",
  "indexmap 2.13.0",
  "itoa",
+ "libc",
  "lru 0.12.5",
  "mimalloc",
  "moka",
