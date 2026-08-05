@@ -208,7 +208,13 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
     if !report.passed {
         // drop_ledger drops the WHOLE ledger and rejects a `:branch` suffix, so
         // strip it — otherwise the drop 400s and the unverified twin stays
-        // announced (the exact hazard this path guards against).
+        // announced (the exact hazard this path guards against). This is name-scoped
+        // (every branch); the `blocking_existing_branch` up-front refusal makes it safe
+        // for the CLI (the name is fresh apart from the target branch). A branch-scoped
+        // HARD purge, to make this belt-and-braces for API drivers too, is tracked in
+        // https://github.com/fluree/db/issues/1592 (review id=3717339919) — no such
+        // capability exists today (drop_ledger is name-only, drop_branch is
+        // record-only).
         let drop_result = fluree
             .drop_ledger(ledger_name_no_branch(&twin_ledger), DropMode::Hard)
             .await;
