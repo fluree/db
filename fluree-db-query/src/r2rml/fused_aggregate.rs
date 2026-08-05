@@ -3827,6 +3827,25 @@ impl FusedR2rmlAggregateOperator {
         if m == 0 {
             return Ok(None); // a branch with no dim is not a semi-join (defensive)
         }
+        // A chain pattern's VAR-OBJECT members (`star_bindings`) OTHER than its next-hop
+        // FK impose a BGP existence requirement (the object column must be non-null for
+        // the triple to match) — and, across two branches sharing the object var, a
+        // cross-branch equality — NEITHER of which this keep-min membership build honors:
+        // it projects only join / subject / constraint / next-FK columns and never
+        // consults `star_bindings`. Silently dropping such a member OVER-ADMITS the root
+        // FK (e.g. `?c :segment "Enterprise" ; :region ?r` with a null region admits a
+        // customer the generic BGP excludes). The ONLY star_binding a chain pattern may
+        // carry is the FK to its next hop — a branch join var, consumed by the hop
+        // resolution below. Any other var-object member declines to the generic path
+        // (never over-admit); honoring it is a follow-on (project the column + a per-
+        // column non-null drop + a cross-branch shared-var equality pass).
+        if chain.iter().any(|p| {
+            p.star_bindings
+                .iter()
+                .any(|(_, v)| !branch.join_vars.contains(v))
+        }) {
+            return Ok(None);
+        }
         // Per-hop FK resolution. hop `h` connects source `h` (index 0 = root, then
         // chain[0..m-1]) to chain[h] via join var (root_join_var, then branch.join_vars):
         // (child cols on the source, parent cols on chain[h], chain[h]'s TM). Single-
@@ -6852,6 +6871,54 @@ mod tests {
             ],
             "the folded star_constraints form of the semi-join filter must produce the \
              same filtered answer as the standalone const-object form"
+        );
+    }
+
+    /// B2 (review id=3717398030): a semi-join CHAIN pattern that carries a VAR-OBJECT
+    /// member (`star_bindings`) OTHER than its next-hop FK must DECLINE the fuse.
+    /// `build_semi_join_membership` projects only join / subject / constraint / next-FK
+    /// columns and never consults `star_bindings`, so a leaf var-object member — a BGP
+    /// existence requirement (the object column must be non-null for the triple to
+    /// match) — would be silently dropped and OVER-ADMIT the root FK (a customer with a
+    /// null region is folded in though the generic BGP excludes it). This uses the REAL
+    /// two-forms representation the rewrite emits (memory: r2rml-const-object-two-forms):
+    /// segment lives in `star_constraints` BECAUSE the customer subject now ALSO carries
+    /// the `?r` (region) var-object member — exactly the shape id=3717398038 flagged as
+    /// otherwise unemittable. `?r` (VarId 30) is a leaf object var, NOT a branch join
+    /// var and NOT a group-by var, so the branch stays a SEMI-JOIN and the join topology
+    /// is unchanged (still decomposes). Pre-fix `resolve_branching_star_at_open`
+    /// returned `Some(..)` (folded, ignoring the region existence → over-count); the
+    /// guard makes it DECLINE (`Ok(None)` → the generic path, which honors the region
+    /// BGP). The interior `order` pattern's ONLY star_binding is `(customer, ?c)`, its
+    /// next-hop FK (a branch join var) — so the guard must NOT decline the clean shape.
+    #[tokio::test]
+    async fn p3_semijoin_chain_var_object_member_declines() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+        let mut pats = crt_patterns(true); // segment in star_constraints (the two-forms arm)
+        pats[2].star_bindings = vec![("http://ex/region".into(), VarId(30))];
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let provider = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches: clean_batches(),
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+            .expect("the leaf var-object member does not change the join topology");
+        let mut op = crt_op();
+        let resolved = op
+            .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+            .await
+            .expect("resolve must not error");
+        assert!(
+            resolved.is_none(),
+            "a semi-join chain pattern with a leaf var-object member must DECLINE the \
+             fuse (the membership build cannot honor the region existence requirement); \
+             pre-fix it admitted and over-counted"
         );
     }
 
