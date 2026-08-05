@@ -126,7 +126,7 @@ fn streaming_reader_accepts_a_mid_file_redefinition() {
         let doc = format!("{block}{text}");
         let mut sink = GraphCollectorSink::new();
         parse_with_prefixes_base(&doc, &mut sink, &seeded, None).expect("chunk parses");
-        for t in sink.finish().iter() {
+        for t in sink.into_graph().iter() {
             let s = t.s.as_iri().unwrap_or("");
             let n: usize = s
                 .rsplit("/s")

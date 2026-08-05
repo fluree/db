@@ -17,7 +17,7 @@ use fluree_graph_turtle::{parse, parse_with_prefixes_base};
 fn subjects(doc: &str) -> Vec<String> {
     let mut sink = GraphCollectorSink::new();
     parse(doc, &mut sink).expect("parses");
-    sink.finish()
+    sink.into_graph()
         .iter()
         .filter_map(|t| t.s.as_iri().map(str::to_string))
         .collect()
@@ -56,7 +56,7 @@ fn a_rebinding_leaves_other_prefixes_alone() {
                e:x f:p \"2\" .\n";
     let mut sink = GraphCollectorSink::new();
     parse(doc, &mut sink).expect("parses");
-    let graph = sink.finish();
+    let graph = sink.into_graph();
 
     let subjects: Vec<&str> = graph.iter().filter_map(|t| t.s.as_iri()).collect();
     assert_eq!(subjects, vec!["http://a/x", "http://b/x"]);
@@ -134,7 +134,7 @@ fn a_pre_seeded_map_rebinds_the_same_way() {
     let mut sink = GraphCollectorSink::new();
     parse_with_prefixes_base(doc, &mut sink, &seeded, None).expect("parses");
     let subjects: Vec<String> = sink
-        .finish()
+        .into_graph()
         .iter()
         .filter_map(|t| t.s.as_iri().map(str::to_string))
         .collect();

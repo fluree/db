@@ -21,7 +21,7 @@ use fluree_graph_turtle::{parse, parse_with_prefixes_base};
 fn subjects(doc: &str) -> Vec<String> {
     let mut sink = GraphCollectorSink::new();
     parse(doc, &mut sink).expect("parses");
-    sink.finish()
+    sink.into_graph()
         .iter()
         .filter_map(|t| t.s.as_iri().map(str::to_string))
         .collect()
@@ -30,7 +30,7 @@ fn subjects(doc: &str) -> Vec<String> {
 fn objects(doc: &str) -> Vec<String> {
     let mut sink = GraphCollectorSink::new();
     parse(doc, &mut sink).expect("parses");
-    sink.finish()
+    sink.into_graph()
         .iter()
         .filter_map(|t| t.o.as_iri().map(str::to_string))
         .collect()
@@ -180,7 +180,7 @@ fn f_preseeded_relative_vs_resolved() {
     let mut sink = GraphCollectorSink::new();
     parse_with_prefixes_base(doc, &mut sink, &seeded, None).expect("parses");
     let subs: Vec<String> = sink
-        .finish()
+        .into_graph()
         .iter()
         .filter_map(|t| t.s.as_iri().map(str::to_string))
         .collect();
