@@ -312,7 +312,11 @@ pub fn build_stamp_chunk(
 ) -> Result<ParsedChunk, MaterializeError> {
     let txn_id = format!("{}-{}", ctx.ledger_id, t);
     let mut worker_cache = WorkerCache::new(Arc::clone(ctx.shared_alloc));
-    let mut sink = ImportSink::new_cached(&mut worker_cache, t, txn_id, ctx.compress)
+    // Sub-chunk 0: the sink's sub-chunk ordinal only separates ANONYMOUS blank
+    // nodes minted by two sinks that share a skolem base, and this base already
+    // carries `t`, so it is unique per chunk. (The twin never mints an anonymous
+    // node in any case — every materialized blank node is labeled.)
+    let mut sink = ImportSink::new_cached(&mut worker_cache, t, txn_id, 0, ctx.compress)
         .map_err(|e| R2rmlError::Materialization(format!("import sink create: {e}")))?;
 
     if let Some(config) = ctx.spool_config {
@@ -825,10 +829,13 @@ fn spawn_produce_workers(
                         // and the chunk is cut on the running byte estimate at batch
                         // boundaries (one batch of overshoot at most).
                         let mut worker_cache = WorkerCache::new(Arc::clone(&shared_alloc));
+                        // Sub-chunk 0 for the same reason as `build_stamp_chunk`:
+                        // the base carries `t`, so it is already unique per chunk.
                         let mut sink = ImportSink::new_cached(
                             &mut worker_cache,
                             t,
                             format!("{ledger}-{t}"),
+                            0,
                             compress,
                         )
                         .map_err(|e| format!("import sink create: {e}"))?;

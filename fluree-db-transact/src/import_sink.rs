@@ -523,7 +523,7 @@ mod inner {
     /// # Example
     ///
     /// ```ignore
-    /// let mut sink = ImportSink::new(&mut ns, t, txn_id, true)?;
+    /// let mut sink = ImportSink::new(&mut ns, t, skolem_base, 0, true)?;
     /// fluree_graph_turtle::parse(ttl, &mut sink)?;
     /// let writer = sink.into_parts();
     /// let result = writer.finish(&envelope)?;
@@ -534,7 +534,20 @@ mod inner {
         blank_counter: u32,
         ns: NsAllocator<'a>,
         t: i64,
-        txn_id: String,
+        /// Blank-node skolemization key for the RDF *document* being parsed.
+        ///
+        /// Every labeled blank node in the document resolves to
+        /// `fdb-{skolem_base}-{label}`, so this value must be identical for
+        /// every chunk cut from one source document and distinct between
+        /// documents. It is deliberately NOT the commit id: bulk import splits
+        /// one document across many commits. Built by
+        /// `fluree_db_core::skolem::skolem_base`.
+        skolem_base: String,
+        /// Index of this chunk within its source document, from 0.
+        ///
+        /// Separates *anonymous* nodes, which `skolem_base` alone cannot — see
+        /// `term_blank`.
+        sub_chunk: u32,
         writer: StreamingCommitWriter,
         /// First encoding error encountered (checked after parse).
         encode_error: Option<CommitCodecError>,
@@ -551,12 +564,14 @@ mod inner {
         /// # Arguments
         /// * `ns_registry` — namespace registry (seeded from predefined codes)
         /// * `t` — transaction time
-        /// * `txn_id` — unique ID for blank node skolemization
+        /// * `skolem_base` — document-scoped blank-node skolemization key
+        /// * `sub_chunk` — index of this chunk within its source document
         /// * `compress` — whether to zstd-compress the ops stream
         pub fn new(
             ns_registry: &'a mut NamespaceRegistry,
             t: i64,
-            txn_id: String,
+            skolem_base: String,
+            sub_chunk: u32,
             compress: bool,
         ) -> Result<Self, CommitCodecError> {
             Ok(Self {
@@ -565,7 +580,8 @@ mod inner {
                 blank_counter: 0,
                 ns: NsAllocator::Exclusive(ns_registry),
                 t,
-                txn_id,
+                skolem_base,
+                sub_chunk,
                 writer: StreamingCommitWriter::new(compress)?,
                 encode_error: None,
                 prefix_map: HashMap::new(),
@@ -577,7 +593,8 @@ mod inner {
         pub fn new_cached(
             worker_cache: &'a mut WorkerCache,
             t: i64,
-            txn_id: String,
+            skolem_base: String,
+            sub_chunk: u32,
             compress: bool,
         ) -> Result<Self, CommitCodecError> {
             Ok(Self {
@@ -586,7 +603,8 @@ mod inner {
                 blank_counter: 0,
                 ns: NsAllocator::Cached(worker_cache),
                 t,
-                txn_id,
+                skolem_base,
+                sub_chunk,
                 writer: StreamingCommitWriter::new(compress)?,
                 encode_error: None,
                 prefix_map: HashMap::new(),
@@ -645,7 +663,7 @@ mod inner {
         }
 
         fn skolemize(&mut self, local: &str) -> Sid {
-            let unique_id = format!("{}-{}", self.txn_id, local);
+            let unique_id = format!("{}-{}", self.skolem_base, local);
             self.ns.blank_node_sid(&unique_id)
         }
 
@@ -774,10 +792,27 @@ mod inner {
                     // Anonymous mint: leading '-' keeps the namespace
                     // disjoint from every lexable user label (labels cannot
                     // start with '-'), while the full skolemized
-                    // `fdb-{txn}--b{N}` stays serializable — see
-                    // `FlakeSink::term_blank` for the full rationale.
+                    // `fdb-{skolem_base}--b{sub_chunk}-{N}` stays
+                    // serializable — see `FlakeSink::term_blank` for the full
+                    // rationale.
+                    //
+                    // `sub_chunk` is in the label because the counter alone is
+                    // NOT enough: it restarts at 0 in every sink (one per
+                    // chunk) while `skolem_base` is deliberately shared by all
+                    // chunks of a document, so `-b{N}` alone would make
+                    // chunk 0's Nth anonymous node and chunk 1's Nth the same
+                    // subject. Being statement-local means nothing can
+                    // *reference* an anonymous node from elsewhere; it does
+                    // not stop two of them from colliding on an id.
+                    //
+                    // The three parts are jointly unique: `skolem_base` per
+                    // document, `sub_chunk` per chunk within a document, `N`
+                    // per anonymous node within a chunk. It is deliberately
+                    // NOT the commit ordinal — that is a property of the whole
+                    // import, so adding one file to the front of a directory
+                    // would renumber every anonymous node behind it.
                     self.blank_counter += 1;
-                    let label = format!("-b{}", self.blank_counter);
+                    let label = format!("-b{}-{}", self.sub_chunk, self.blank_counter);
                     let sid = self.skolemize(&label);
                     self.add_term(ResolvedTerm::Sid(sid))
                 }
@@ -920,7 +955,7 @@ mod inner {
             ns: &mut NamespaceRegistry,
             t: i64,
         ) -> Result<ImportSink<'_>, CommitCodecError> {
-            ImportSink::new(ns, t, "test-txn".to_string(), true)
+            ImportSink::new(ns, t, "test-txn".to_string(), 0, true)
         }
 
         fn make_envelope(t: i64) -> crate::commit_v2::CodecEnvelope {
@@ -1150,7 +1185,7 @@ mod inner {
             // wiring) so spool prefix lookups resolve mid-parse.
             let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
             let mut sink =
-                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), true).unwrap();
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), 0, true).unwrap();
 
             // Attach spool context
             let spool_path = dir.join("chunk_0.spool");
@@ -1222,7 +1257,7 @@ mod inner {
             // wiring) so spool prefix lookups resolve mid-parse.
             let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
             let mut sink =
-                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), true).unwrap();
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), 0, true).unwrap();
 
             let spool_path = dir.join("chunk_0.spool");
             let spool_ctx = SpoolContext::new(&spool_path, 0, 0, &config).unwrap();
@@ -1274,7 +1309,7 @@ mod inner {
             // wiring) so spool prefix lookups resolve mid-parse.
             let mut cache = WorkerCache::new(Arc::clone(&config.ns_alloc));
             let mut sink =
-                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), true).unwrap();
+                ImportSink::new_cached(&mut cache, 1, "test-txn".to_string(), 0, true).unwrap();
 
             let spool_path = dir.join("chunk_0.spool");
             let spool_ctx = SpoolContext::new(&spool_path, 0, 0, &config).unwrap();
