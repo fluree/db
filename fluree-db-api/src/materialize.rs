@@ -976,7 +976,7 @@ pub async fn drive_virtual_import(
     // after every table has been scanned, before the completion stamp.
     provider
         .verify_build_snapshot_integrity(graph_source_id)
-        .map_err(|e| MaterializeError::from(R2rmlError::Materialization(e)))?;
+        .map_err(MaterializeError::from)?;
     let mut parents = ParentIndexSet::new(&mapping)?;
     let materialization = plan(&mapping);
     let workers = parallelism.max(1);
@@ -1192,7 +1192,7 @@ pub async fn drive_virtual_import(
     // watermark it does not contain.
     provider
         .verify_build_snapshot_integrity(graph_source_id)
-        .map_err(|e| MaterializeError::from(R2rmlError::Materialization(e)))?;
+        .map_err(MaterializeError::from)?;
 
     // Assemble + ship the completion stamp on the FINAL chunk (highest idx →
     // committed last → the twin's head; a head-walk finds the stamp iff the build

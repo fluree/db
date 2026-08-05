@@ -217,7 +217,7 @@ pub trait R2rmlProvider: Debug + Send + Sync {
 
     /// MAJOR-2 (#1529 review): assert the snapshots read during a materialize build
     /// are trustworthy — every table stayed on ONE `metadata_location`, and pinning
-    /// is actually in effect. Returns `Err(reason)` (a human-readable string) when a
+    /// is actually in effect. Returns `Err(R2rmlError::BuildSnapshotIntegrity)` when a
     /// build must be refused. Default: `Ok` — a non-Iceberg / test provider has no
     /// moving-snapshot hazard. A real Iceberg-backed provider overrides this to
     /// refuse when the loadTable cache is disabled (pinning is then a no-op) or when
@@ -226,7 +226,7 @@ pub trait R2rmlProvider: Debug + Send + Sync {
     fn verify_build_snapshot_integrity(
         &self,
         graph_source_id: &str,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), fluree_db_r2rml::R2rmlError> {
         let _ = graph_source_id;
         Ok(())
     }

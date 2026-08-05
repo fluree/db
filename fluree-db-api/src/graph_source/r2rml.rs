@@ -868,18 +868,19 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
     fn verify_build_snapshot_integrity(
         &self,
         graph_source_id: &str,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), fluree_db_r2rml::R2rmlError> {
+        use fluree_db_r2rml::R2rmlError;
         if !super::catalog_session::cache_enabled() {
-            return Err(
+            return Err(R2rmlError::BuildSnapshotIntegrity(
                 "the loadTable metadata cache is disabled (FLUREE_ICEBERG_LOADTABLE_CACHE=0), so \
                  Iceberg snapshot pinning is a no-op and the twin's stamped watermark cannot be \
                  guaranteed to describe its contents; re-enable the cache to materialize"
                     .to_string(),
-            );
+            ));
         }
         let conflicts = self.session.observed_snapshot_conflicts(graph_source_id);
         if let Some((table, first, second)) = conflicts.first() {
-            return Err(format!(
+            return Err(R2rmlError::BuildSnapshotIntegrity(format!(
                 "table '{table}' moved snapshots during the build (read metadata_location \
                  '{first}' then '{second}'): the source committed mid-build, so the twin's stamped \
                  watermark would not describe its contents. Re-run against a quiesced source.{}",
@@ -888,7 +889,7 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
                 } else {
                     String::new()
                 }
-            ));
+            )));
         }
         Ok(())
     }
