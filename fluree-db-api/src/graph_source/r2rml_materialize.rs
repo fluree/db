@@ -437,132 +437,77 @@ impl Fluree {
         // between chunks rather than letting it accumulate toward the ceiling.
         let txn_budget = (self.index_config.reindex_max_bytes / 4).max(1 << 20);
 
+        // PER-TARGET ISOLATION.
+        //
+        // Each resolved target is an independent commit domain — its own novelty
+        // ceiling, its own index, its own ways to be broken. Aborting the whole job on
+        // the first bad one is how a SINGLE truncated dict pack in one ledger produced
+        // 208 identical failures across all 17 sources in 20 minutes, while 21 healthy
+        // targets got nothing.
+        //
+        // Note the loop already commits per target as it goes, so partial application
+        // was ALWAYS the reality. What was missing is recording which targets
+        // succeeded. This does not introduce partial writes; it stops discarding the
+        // knowledge of them.
         let mut subjects_retracted = 0usize;
+        let mut ok_targets = 0usize;
+        let mut deferred: Vec<(String, usize)> = Vec::new();
+        let mut failed: Vec<(String, ApiError)> = Vec::new();
+
         for (target, (live, deletions)) in by_target {
-            // Retraction is skipped on a brand-new target (nothing to retract);
-            // deletions only count against a pre-existing target.
-            let target_existed = self.ledger_exists(&target).await?;
-            if target_existed {
-                subjects_retracted += deletions.len();
-            }
-
-            // Whole-subject REPLACE (latest-by-key): retract every subject seen in
-            // this window (live OR tombstone) — per graph — before re-asserting, so
-            // a dropped field clears and a tombstone is removed. The retract and
-            // re-assert are both graph-scoped, so a subject in graph B never touches
-            // the same IRI in graph A. Additive mode skips this (per-predicate
-            // upsert suffices; a subject may legitimately span rows).
-            let mut retract_by_graph: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
-            if latest_by_key {
-                for (graph, subject) in live.keys().cloned().chain(deletions.iter().cloned()) {
-                    retract_by_graph.entry(graph).or_default().insert(subject);
+            match self
+                .materialize_one_target(&target, live, deletions, latest_by_key, txn_budget)
+                .await
+            {
+                Ok(retracted) => {
+                    subjects_retracted += retracted;
+                    ok_targets += 1;
+                }
+                // Deferral is not failure — it is backpressure on THIS target only.
+                Err(ApiError::NoveltyDeferred { remaining }) => {
+                    deferred.push((target, remaining));
+                }
+                Err(e) => {
+                    // Logged per target, not just aggregated, so one persistently
+                    // broken ledger is identifiable rather than hidden behind a count.
+                    warn!(
+                        target = %target,
+                        error = %e,
+                        "materialize: target FAILED; other targets continue"
+                    );
+                    failed.push((target, e));
                 }
             }
+        }
 
-            let mut ledger = if target_existed {
-                self.ledger(&target).await?
-            } else {
-                self.create_ledger(&target).await?
-            };
+        if !deferred.is_empty() || !failed.is_empty() {
+            info!(
+                targets_ok = ok_targets,
+                targets_deferred = deferred.len(),
+                targets_failed = failed.len(),
+                "materialize: partial window"
+            );
+        }
 
-            if target_existed {
-                for (graph, iris) in &retract_by_graph {
-                    if iris.is_empty() {
-                        continue;
-                    }
-                    let iri_chunks: Vec<Vec<String>> = chunk_iris_by_size(iris, txn_budget)
-                        .into_iter()
-                        .map(|c| c.into_iter().collect())
-                        .collect();
-                    let g = graph.clone();
-                    ledger = self
-                        .transact_chunks_with_backpressure(
-                            ledger,
-                            iri_chunks,
-                            move |c: &[String]| build_retract_doc(c, g.as_deref()),
-                            ChunkVerb::Update,
-                        )
-                        .await?;
-                }
-            }
-
-            if latest_by_key {
-                // The retraction cleared every seen subject (per graph), so the
-                // re-asserted nodes (carrying @type) are the sole source of truth —
-                // a single upsert per graph is correct.
-                let mut nodes_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
-                for ((graph, _subject), node) in live {
-                    nodes_by_graph
-                        .entry(graph)
-                        .or_default()
-                        .push(node.into_json());
-                }
-                // A delete-only window (tombstones, no live rows) leaves
-                // `nodes_by_graph` empty; skip the upsert rather than send an
-                // empty `[]` doc (the transactor rejects an upsert with no
-                // predicate/@type). The retracts above already applied.
-                let live_doc = nodes_by_graph_to_doc(nodes_by_graph);
-                // Chunked: one window used to be one transaction, which a wide
-                // source cannot fit under the novelty ceiling at any window size
-                // (see `transaction_json_budget`).
-                ledger = self
-                    .transact_chunks_with_backpressure(
-                        ledger,
-                        chunk_nodes_by_size(live_doc, txn_budget),
-                        |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
-                        ChunkVerb::Upsert,
-                    )
-                    .await?;
-            } else {
-                // Additive mode: assert `@type` via an idempotent `insert` so
-                // classes UNION across sources, and `upsert` only the remaining
-                // predicates (a single upsert carrying `@type` would retract-then-
-                // insert rdf:type per predicate, clobbering classes other sources
-                // added). Both grouped per graph.
-                let mut type_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
-                let mut pred_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
-                for ((graph, _subject), node) in live {
-                    let (type_node, pred_node) = node.into_type_and_predicate_nodes();
-                    if let Some(tn) = type_node {
-                        type_by_graph.entry(graph.clone()).or_default().push(tn);
-                    }
-                    if let Some(pn) = pred_node {
-                        pred_by_graph.entry(graph).or_default().push(pn);
-                    }
-                }
-                let type_doc = nodes_by_graph_to_doc(type_by_graph);
-                ledger = self
-                    .transact_chunks_with_backpressure(
-                        ledger,
-                        chunk_nodes_by_size(type_doc, txn_budget),
-                        |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
-                        ChunkVerb::Insert,
-                    )
-                    .await?;
-                // A type-only source (e.g. an r2rml `entity_type` map: subject +
-                // rdf:type, no other predicates) leaves `pred_by_graph` empty, so
-                // the doc is `[]`; skip the upsert rather than send an empty doc.
-                // An unconditional `upsert([])` is rejected ("Upsert must contain
-                // at least one predicate or @type"), which aborts the sync BEFORE
-                // its watermark advances — so the next poll full-rescans and
-                // re-fails forever (churn: a new @type-insert commit every poll).
-                let pred_doc = nodes_by_graph_to_doc(pred_by_graph);
-                ledger = self
-                    .transact_chunks_with_backpressure(
-                        ledger,
-                        chunk_nodes_by_size(pred_doc, txn_budget),
-                        |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
-                        ChunkVerb::Upsert,
-                    )
-                    .await?;
-            }
-
-            // `ledger` is a PER-TARGET handle and its final state is deliberately not
-            // carried past this point: the watermark commit below writes to the shared
-            // STATE ledger, not to this target. Dropped explicitly so the last
-            // assignment above is a use — otherwise it reads as dead code, and the
-            // next person to add a step after it would have to rediscover why.
-            drop(ledger);
+        // The watermark is still SHARED across targets (per-target watermarks are the
+        // separate C1 change), so it must not advance while any target is behind — that
+        // would skip this window for them permanently. Successful targets keep their
+        // data; the window is re-read next poll and re-applied idempotently.
+        //
+        // Failure outranks deferral: a deferral self-heals on the next poll, a failure
+        // usually needs attention, and reporting the milder of the two would bury it.
+        if !failed.is_empty() {
+            let n_failed = failed.len();
+            let n_total = ok_targets + n_failed + deferred.len();
+            let (target, e) = failed.remove(0);
+            return Err(ApiError::Internal(format!(
+                "materialize: {n_failed} of {n_total} targets failed (watermark held back \
+                 so the window is retried); first failure on {target}: {e}"
+            )));
+        }
+        if !deferred.is_empty() {
+            let remaining = deferred.iter().map(|(_, r)| *r).sum();
+            return Err(ApiError::NoveltyDeferred { remaining });
         }
 
         // 5. Advance the job watermark(s) in the shared state ledger — AFTER every
@@ -984,6 +929,135 @@ enum ChunkVerb {
 }
 
 impl Fluree {
+    /// Materialize one resolved target. Returns the number of subjects retracted.
+    ///
+    /// Extracted so the caller can collect a per-target outcome instead of aborting the
+    /// whole job on the first error — see the isolation note at the call site. Every
+    /// `?` in here now scopes to ONE target.
+    #[allow(clippy::too_many_arguments)]
+    async fn materialize_one_target(
+        &self,
+        target: &str,
+        live: BTreeMap<(Option<String>, String), SubjectNode>,
+        deletions: BTreeSet<(Option<String>, String)>,
+        latest_by_key: bool,
+        txn_budget: usize,
+    ) -> Result<usize> {
+        // Retraction is skipped on a brand-new target (nothing to retract);
+        // deletions only count against a pre-existing target.
+        let target_existed = self.ledger_exists(target).await?;
+        let subjects_retracted = if target_existed { deletions.len() } else { 0 };
+
+        // Whole-subject REPLACE (latest-by-key): retract every subject seen in this
+        // window (live OR tombstone) — per graph — before re-asserting, so a dropped
+        // field clears and a tombstone is removed. The retract and re-assert are both
+        // graph-scoped, so a subject in graph B never touches the same IRI in graph A.
+        // Additive mode skips this (per-predicate upsert suffices; a subject may
+        // legitimately span rows).
+        let mut retract_by_graph: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+        if latest_by_key {
+            for (graph, subject) in live.keys().cloned().chain(deletions.iter().cloned()) {
+                retract_by_graph.entry(graph).or_default().insert(subject);
+            }
+        }
+
+        let mut ledger = if target_existed {
+            self.ledger(target).await?
+        } else {
+            self.create_ledger(target).await?
+        };
+
+        if target_existed {
+            for (graph, iris) in &retract_by_graph {
+                if iris.is_empty() {
+                    continue;
+                }
+                let iri_chunks: Vec<Vec<String>> = chunk_iris_by_size(iris, txn_budget)
+                    .into_iter()
+                    .map(|c| c.into_iter().collect())
+                    .collect();
+                let g = graph.clone();
+                ledger = self
+                    .transact_chunks_with_backpressure(
+                        ledger,
+                        iri_chunks,
+                        move |c: &[String]| build_retract_doc(c, g.as_deref()),
+                        ChunkVerb::Update,
+                    )
+                    .await?;
+            }
+        }
+
+        if latest_by_key {
+            // The retraction cleared every seen subject (per graph), so the re-asserted
+            // nodes (carrying @type) are the sole source of truth — a single upsert per
+            // graph is correct.
+            let mut nodes_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+            for ((graph, _subject), node) in live {
+                nodes_by_graph
+                    .entry(graph)
+                    .or_default()
+                    .push(node.into_json());
+            }
+            // A delete-only window (tombstones, no live rows) leaves `nodes_by_graph`
+            // empty; skip rather than send an empty `[]` doc (the transactor rejects an
+            // upsert with no predicate/@type). The retracts above already applied.
+            let live_doc = nodes_by_graph_to_doc(nodes_by_graph);
+            ledger = self
+                .transact_chunks_with_backpressure(
+                    ledger,
+                    chunk_nodes_by_size(live_doc, txn_budget),
+                    |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+                    ChunkVerb::Upsert,
+                )
+                .await?;
+        } else {
+            // Additive mode: assert `@type` via an idempotent `insert` so classes UNION
+            // across sources, and `upsert` only the remaining predicates (a single
+            // upsert carrying `@type` would retract-then-insert rdf:type per predicate,
+            // clobbering classes other sources added). Both grouped per graph.
+            let mut type_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+            let mut pred_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+            for ((graph, _subject), node) in live {
+                let (type_node, pred_node) = node.into_type_and_predicate_nodes();
+                if let Some(tn) = type_node {
+                    type_by_graph.entry(graph.clone()).or_default().push(tn);
+                }
+                if let Some(pn) = pred_node {
+                    pred_by_graph.entry(graph).or_default().push(pn);
+                }
+            }
+            let type_doc = nodes_by_graph_to_doc(type_by_graph);
+            ledger = self
+                .transact_chunks_with_backpressure(
+                    ledger,
+                    chunk_nodes_by_size(type_doc, txn_budget),
+                    |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+                    ChunkVerb::Insert,
+                )
+                .await?;
+            // A type-only source (e.g. an r2rml `entity_type` map: subject + rdf:type,
+            // no other predicates) leaves `pred_by_graph` empty, so the doc is `[]`;
+            // skip rather than send an empty doc. An unconditional `upsert([])` is
+            // rejected ("Upsert must contain at least one predicate or @type").
+            let pred_doc = nodes_by_graph_to_doc(pred_by_graph);
+            ledger = self
+                .transact_chunks_with_backpressure(
+                    ledger,
+                    chunk_nodes_by_size(pred_doc, txn_budget),
+                    |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+                    ChunkVerb::Upsert,
+                )
+                .await?;
+        }
+
+        // `ledger` is a PER-TARGET handle; its final state is deliberately not carried
+        // further. Dropped explicitly so the last assignment is a use rather than
+        // reading as dead code.
+        drop(ledger);
+        Ok(subjects_retracted)
+    }
+
     /// Apply pre-sized chunks as transactions, **absorbing novelty backpressure**
     /// instead of failing the whole materialize on it.
     ///
