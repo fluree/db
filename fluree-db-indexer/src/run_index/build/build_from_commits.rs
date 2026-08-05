@@ -7,6 +7,7 @@
 //! Bulk import now writes V2-native sorted-commit artifacts directly, so this
 //! module consumes those artifacts without a bulk-import-only V1 → V2 pass.
 
+use crate::run_index::build::fd_plan::{plan_fd_usage, FdPlan};
 use crate::run_index::build::index_build::{
     build_all_indexes, BuildAllConfig, IndexBuildResult, PersistingLeafWriter,
 };
@@ -21,6 +22,7 @@ use crate::run_index::runs::spool::{
 use crate::stats::{stats_record_from_v2, SpotClassStats, DT_REF_ID};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::cmp_v2_spot;
+use fluree_db_core::fd_limit::FdBudget;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::o_type_registry::OTypeRegistry;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -119,6 +121,11 @@ pub struct BuildConfig {
     pub run_budget_bytes: usize,
     /// Worker count for chunk-parallel secondary-order generation.
     pub worker_count: usize,
+    /// File-descriptor budget the build plans its fan-in/fan-out within
+    /// (see [`crate::run_index::build::fd_plan`]). Use
+    /// [`FdBudget::detect`] for real builds; [`FdBudget::unlimited`]
+    /// preserves the legacy unbudgeted behavior.
+    pub fd_budget: FdBudget,
     /// Remap progress counter (optional).
     pub remap_progress: Option<Arc<AtomicU64>>,
     /// Merge/build progress counter (optional).
@@ -292,6 +299,94 @@ fn mmap_readonly(path: &Path) -> io::Result<memmap2::Mmap> {
     unsafe { memmap2::Mmap::map(&file) }
 }
 
+/// Bounded pool of append-mode class-membership bucket writers.
+///
+/// The scatter pass sprays `TypeEntry` records across
+/// [`CLASS_MEMBERSHIP_BUCKETS`] logical bucket files. Opening all of them up
+/// front held 256 descriptors for the whole pass — the entire soft limit on a
+/// stock macOS shell — so at most `max_open` writers are open at once; the
+/// least-recently-used writer is flushed and closed on eviction and its
+/// bucket transparently reopened in append mode on the next write.
+///
+/// Correctness: bucket files are created lazily, so a bucket that never
+/// receives an entry has no file (the materialization pass treats missing as
+/// empty). Records are fixed-width and every eviction flushes the `BufWriter`
+/// before closing, so no partial record can straddle a close/reopen boundary.
+/// Within-bucket record order is irrelevant — the materialization pass sorts —
+/// which is what makes append-reopen lossless.
+struct BucketWriterPool {
+    dir: PathBuf,
+    max_open: usize,
+    slots: Vec<Option<std::io::BufWriter<std::fs::File>>>,
+    /// Monotonic use stamps per bucket; eviction takes the open slot with the
+    /// lowest stamp (linear scan over 256 slots — evictions are rare relative
+    /// to entry volume and the scan is cache-resident).
+    last_used: Vec<u64>,
+    clock: u64,
+    open_count: usize,
+}
+
+impl BucketWriterPool {
+    fn new(dir: PathBuf, max_open: usize) -> Self {
+        Self {
+            dir,
+            max_open: max_open.max(1),
+            slots: (0..CLASS_MEMBERSHIP_BUCKETS).map(|_| None).collect(),
+            last_used: vec![0; CLASS_MEMBERSHIP_BUCKETS],
+            clock: 0,
+            open_count: 0,
+        }
+    }
+
+    fn bucket_path(dir: &Path, bucket: usize) -> PathBuf {
+        dir.join(format!("bucket_{bucket:03}.typ"))
+    }
+
+    fn writer(&mut self, bucket: usize) -> io::Result<&mut std::io::BufWriter<std::fs::File>> {
+        use std::io::Write;
+
+        self.clock += 1;
+        self.last_used[bucket] = self.clock;
+        if self.slots[bucket].is_none() {
+            if self.open_count >= self.max_open {
+                let victim = self
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
+                    .min_by_key(|&i| self.last_used[i])
+                    .expect("open_count >= max_open >= 1 implies an open slot");
+                let mut evicted = self.slots[victim].take().expect("victim slot is open");
+                evicted.flush()?;
+                self.open_count -= 1;
+            }
+            // `append` covers both first open and reopen-after-eviction;
+            // `File::create` would truncate previously scattered entries.
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(Self::bucket_path(&self.dir, bucket))?;
+            self.slots[bucket] = Some(std::io::BufWriter::new(file));
+            self.open_count += 1;
+        }
+        Ok(self.slots[bucket].as_mut().expect("slot ensured open above"))
+    }
+
+    /// Flush and close every open writer. Errors instead of silently dropping
+    /// buffered entries (a plain `drop` would swallow flush failures).
+    fn finish(mut self) -> io::Result<()> {
+        use std::io::Write;
+
+        for slot in &mut self.slots {
+            if let Some(writer) = slot.as_mut() {
+                writer.flush()?;
+            }
+            *slot = None;
+        }
+        Ok(())
+    }
+}
+
 impl DiskClassMembership {
     fn classes_of(&self, g_id: u16, sid: u64, out: &mut Vec<u64>) {
         out.clear();
@@ -396,7 +491,15 @@ impl ClassMembership {
 
     /// Build from per-chunk `.types` sidecars whose IDs are chunk-local and are
     /// remapped to global via each commit's `MmapSubjectRemap`. Import path.
-    fn build_from_commits(commits: &[CommitInput], scratch_dir: &Path) -> io::Result<Option<Self>> {
+    ///
+    /// `max_open_writers` bounds how many partition files the scatter pass
+    /// holds open simultaneously (see [`BucketWriterPool`]); size it from
+    /// [`FdPlan::scatter_pool`].
+    fn build_from_commits(
+        commits: &[CommitInput],
+        scratch_dir: &Path,
+        max_open_writers: usize,
+    ) -> io::Result<Option<Self>> {
         use std::io::{BufReader, BufWriter, Read, Write};
 
         let build_start = Instant::now();
@@ -420,11 +523,7 @@ impl ClassMembership {
         std::fs::create_dir_all(&index_dir)?;
         std::fs::create_dir_all(&data_dir)?;
 
-        let mut partition_writers = Vec::with_capacity(CLASS_MEMBERSHIP_BUCKETS);
-        for bucket in 0..CLASS_MEMBERSHIP_BUCKETS {
-            let path = partition_dir.join(format!("bucket_{bucket:03}.typ"));
-            partition_writers.push(BufWriter::new(std::fs::File::create(path)?));
-        }
+        let mut partition_writers = BucketWriterPool::new(partition_dir.clone(), max_open_writers);
 
         for commit in commits {
             let Some(types_map_path) = &commit.types_map_path else {
@@ -450,7 +549,7 @@ impl ClassMembership {
                 distinct_classes.insert(c_global);
                 let bucket = class_membership_bucket(g_id, s_global);
                 write_type_entry(
-                    &mut partition_writers[bucket],
+                    partition_writers.writer(bucket)?,
                     TypeEntry {
                         g_id,
                         subject: s_global,
@@ -463,10 +562,7 @@ impl ClassMembership {
         if !saw_sidecar {
             return Ok(None);
         }
-        for writer in &mut partition_writers {
-            writer.flush()?;
-        }
-        drop(partition_writers);
+        partition_writers.finish()?;
 
         let mut buckets = Vec::with_capacity(CLASS_MEMBERSHIP_BUCKETS);
         let mut subject_entries = 0usize;
@@ -474,7 +570,13 @@ impl ClassMembership {
         let bucket_build_start = Instant::now();
         for bucket in 0..CLASS_MEMBERSHIP_BUCKETS {
             let partition_path = partition_dir.join(format!("bucket_{bucket:03}.typ"));
-            let partition_bytes = std::fs::metadata(&partition_path)?.len();
+            // Bucket files are created lazily by the writer pool: a bucket
+            // that never received an entry has no file at all.
+            let partition_bytes = match std::fs::metadata(&partition_path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+                Err(e) => return Err(e),
+            };
             if partition_bytes == 0 {
                 buckets.push(None);
                 continue;
@@ -948,11 +1050,18 @@ pub fn build_indexes_from_commits(
     mut stats_hook: Option<&mut crate::stats::IdStatsHook>,
 ) -> io::Result<(BuildResult, Option<SpotClassStats>)> {
     let overall_start = Instant::now();
+    let fd_plan = plan_fd_usage(config.fd_budget, config.worker_count);
     tracing::info!(
         chunks = commits.len(),
         worker_count = config.worker_count,
         run_budget_bytes = config.run_budget_bytes,
         g_id = config.g_id,
+        fd_soft_limit = config.fd_budget.soft,
+        fd_reserve = config.fd_budget.reserve,
+        scatter_pool = fd_plan.scatter_pool,
+        spot_fan_in = fd_plan.spot_fan_in,
+        worker_cap = fd_plan.worker_cap,
+        merge_fan_in_per_order = fd_plan.merge_fan_in_per_order,
         "starting build_indexes_from_commits"
     );
     log_index_memory("build_indexes_from_commits:start");
@@ -969,7 +1078,11 @@ pub fn build_indexes_from_commits(
     // while letting that membership heap drop before the secondary phases begin.
     let spot_rdf_type_p_id = stats_hook.as_ref().and_then(|hook| hook.rdf_type_p_id());
     let spot_class_membership = if spot_rdf_type_p_id.is_some() {
-        ClassMembership::build_from_commits(commits, &config.run_dir.join("class_membership"))?
+        ClassMembership::build_from_commits(
+            commits,
+            &config.run_dir.join("class_membership"),
+            fd_plan.scatter_pool,
+        )?
     } else {
         None
     };
@@ -982,8 +1095,13 @@ pub fn build_indexes_from_commits(
             "class membership built for ref-target stats"
         );
     }
-    let (spot_result, spot_class_stats) =
-        build_spot_index_from_commits(commits, config, spot_rdf_type_p_id, spot_class_membership)?;
+    let (spot_result, spot_class_stats) = build_spot_index_from_commits(
+        commits,
+        config,
+        spot_rdf_type_p_id,
+        spot_class_membership,
+        &fd_plan,
+    )?;
     log_index_memory("spot_build:joined_before_secondary_phases");
 
     // Phase 1: Generate secondary-order runs in parallel.
@@ -991,7 +1109,11 @@ pub fn build_indexes_from_commits(
         stage.store(BUILD_STAGE_REMAP, Ordering::Relaxed);
     }
     let remap_start = Instant::now();
-    let worker_count = config.worker_count.max(1).min(commits.len().max(1));
+    let worker_count = config
+        .worker_count
+        .max(1)
+        .min(commits.len().max(1))
+        .min(fd_plan.worker_cap);
     let per_thread_budget_bytes = (config.run_budget_bytes / worker_count).max(64 * 1024 * 1024);
     log_index_memory("secondary_run_generation:start");
     tracing::info!(
@@ -1141,6 +1263,7 @@ pub fn build_indexes_from_commits(
         // concurrency no longer overlaps with the class-membership heap.
         // build_all_indexes clamps this to the number of buildable orders.
         max_concurrency: config.worker_count,
+        fan_in_cap: fd_plan.merge_fan_in_per_order,
     };
 
     let mut order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
@@ -1186,6 +1309,7 @@ fn build_spot_index_from_commits(
     config: &BuildConfig,
     rdf_type_p_id: Option<u32>,
     class_membership: Option<ClassMembership>,
+    fd_plan: &FdPlan,
 ) -> io::Result<(IndexBuildResult, Option<SpotClassStats>)> {
     let g_id = config.g_id;
     let index_dir = &config.index_dir;
@@ -1372,6 +1496,7 @@ pub fn build_indexes_from_remapped_commits(
         // Rebuild path builds all 4 orders here (no separate SPOT thread), so
         // concurrency can cover all of them, bounded by the core budget.
         max_concurrency: config.worker_count,
+        fan_in_cap: plan_fd_usage(config.fd_budget, config.worker_count).merge_fan_in_per_order,
     };
 
     let order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
@@ -1501,6 +1626,7 @@ mod tests {
             zstd_level: 1,
             run_budget_bytes: 256 * 1024,
             worker_count: 1,
+            fd_budget: FdBudget::unlimited(),
             remap_progress: None,
             build_progress: None,
             stage_marker: None,
@@ -1598,7 +1724,7 @@ mod tests {
         ];
 
         let membership =
-            ClassMembership::build_from_commits(&commits, &dir.path().join("membership"))
+            ClassMembership::build_from_commits(&commits, &dir.path().join("membership"), usize::MAX)
                 .unwrap()
                 .expect("membership");
         assert!(matches!(membership, ClassMembership::Disk(_)));
@@ -1614,6 +1740,77 @@ mod tests {
         assert_eq!(buf, vec![4000]);
         membership.collect_classes(0, 999, &mut buf);
         assert!(buf.is_empty());
+    }
+
+    /// A tiny writer pool (forcing heavy LRU eviction and append-reopen)
+    /// must produce byte-for-byte the same membership as the unbounded
+    /// scatter, including buckets that never receive an entry (lazily
+    /// uncreated files read as empty).
+    #[test]
+    fn scatter_pool_matches_unbounded() {
+        let build = |max_open: usize| {
+            let dir = tempfile::tempdir().unwrap();
+            let types0 = dir.path().join("chunk_00000.types");
+            let types1 = dir.path().join("chunk_00001.types");
+            let subj0 = dir.path().join("subjects_00000.rmp");
+            let subj1 = dir.path().join("subjects_00001.rmp");
+            let str0 = dir.path().join("strings_00000.rmp");
+            let str1 = dir.path().join("strings_00001.rmp");
+            write_identity_subject_remap(&subj0, 6000);
+            write_identity_subject_remap(&subj1, 6000);
+            write_identity_string_remap(&str0, 1);
+            write_identity_string_remap(&str1, 1);
+
+            // ~500 subjects spraying across many (but not all) buckets, with
+            // interleaved revisits so evicted buckets are reopened mid-pass.
+            let entries0: Vec<(u16, u64, u64)> = (0..500u64)
+                .map(|s| (0u16, s * 7 % 1500, 1000 + s % 70))
+                .collect();
+            let entries1: Vec<(u16, u64, u64)> = (0..500u64)
+                .map(|s| (0u16, s * 13 % 1500, 1000 + s % 90))
+                .collect();
+            write_types_sidecar(&types0, &entries0);
+            write_types_sidecar(&types1, &entries1);
+
+            let commits = vec![
+                CommitInput {
+                    commit_path: dir.path().join("unused0.fsv2"),
+                    record_count: 0,
+                    subject_remap_path: subj0,
+                    string_remap_path: str0,
+                    lang_remap: vec![],
+                    types_map_path: Some(types0),
+                },
+                CommitInput {
+                    commit_path: dir.path().join("unused1.fsv2"),
+                    record_count: 0,
+                    subject_remap_path: subj1,
+                    string_remap_path: str1,
+                    lang_remap: vec![],
+                    types_map_path: Some(types1),
+                },
+            ];
+
+            let membership =
+                ClassMembership::build_from_commits(&commits, &dir.path().join("m"), max_open)
+                    .unwrap()
+                    .expect("membership");
+            let mut buf = Vec::new();
+            let per_subject: Vec<(u64, Vec<u64>)> = (0..1500u64)
+                .map(|s| {
+                    membership.collect_classes(0, s, &mut buf);
+                    (s, buf.clone())
+                })
+                .collect();
+            // Keep the tempdir alive until reads are done (mmaps hold pages,
+            // not paths, but the reads above already completed regardless).
+            drop(dir);
+            (membership.summary().1, membership.summary().2, per_subject)
+        };
+
+        let unbounded = build(usize::MAX);
+        let pooled = build(4);
+        assert_eq!(unbounded, pooled);
     }
 
     #[test]

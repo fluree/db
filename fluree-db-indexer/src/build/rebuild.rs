@@ -739,6 +739,7 @@ where
                     zstd_level: 1,
                     run_budget_bytes: config.run_budget_bytes,
                     worker_count: 1,
+                    fd_budget: fluree_db_core::fd_limit::FdBudget::detect(),
                     remap_progress: None,
                     build_progress: None,
                     stage_marker: None,

@@ -5500,6 +5500,11 @@ where
                 let v3_runs_g0 = v3_run_dir.join("v3_runs_g0");
                 let v3_runs_g1 = v3_run_dir.join("v3_runs_g1");
 
+                // One FD budget for every graph's build in this import: the
+                // builds are sequential and plan against the same process
+                // limit (post best-effort raise at startup/preflight).
+                let fd_budget = fluree_db_core::fd_limit::FdBudget::detect();
+
                 let cfg_g0 = fluree_db_indexer::BuildConfig {
                     run_dir: v3_runs_g0,
                     index_dir: v3_index_dir.clone(),
@@ -5509,6 +5514,7 @@ where
                     zstd_level: 1,
                     run_budget_bytes: v3_run_budget,
                     worker_count: v3_worker_count,
+                    fd_budget,
                     remap_progress: Some(v3_remap_counter),
                     build_progress: Some(v3_build_counter),
                     stage_marker: Some(v3_stage_marker),
@@ -5538,6 +5544,7 @@ where
                         zstd_level: 1,
                         run_budget_bytes: v3_run_budget,
                         worker_count: 1,
+                        fd_budget,
                         remap_progress: None,
                         build_progress: None,
                         stage_marker: None,
@@ -5575,6 +5582,7 @@ where
                         zstd_level: 1,
                         run_budget_bytes: v3_run_budget,
                         worker_count: 1,
+                        fd_budget,
                         remap_progress: None,
                         build_progress: None,
                         stage_marker: None,

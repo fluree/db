@@ -90,6 +90,11 @@ pub struct IndexBuildConfig {
     pub g_id: u16,
     /// Shared progress counter.
     pub progress: Option<Arc<AtomicU64>>,
+    /// Max run files the k-way merge may hold open simultaneously. Run counts
+    /// beyond this are first reduced by a lossless cascaded merge (see
+    /// `cascade_runs_to_fan_in`). `usize::MAX` disables cascading (legacy
+    /// unbudgeted behavior).
+    pub fan_in_cap: usize,
 }
 
 // ============================================================================
@@ -514,6 +519,10 @@ pub struct BuildAllConfig {
     /// build times from additive into `max()`. `0`/`1` preserves the legacy
     /// serial build; callers size this from the effective import core budget.
     pub max_concurrency: usize,
+    /// Per-order merge fan-in cap, forwarded to [`IndexBuildConfig`]. Callers
+    /// size this from the FD budget divided by the order concurrency (see
+    /// `fd_plan::plan_fd_usage`); `usize::MAX` disables cascading.
+    pub fan_in_cap: usize,
 }
 
 /// Build V2 indexes for all four orders from a base run directory.
@@ -579,6 +588,7 @@ pub fn build_all_indexes(
             // Import progress reflects all order builds, not just one
             // representative order, so attach the shared counter to each.
             progress: config.progress.clone(),
+            fan_in_cap: config.fan_in_cap,
         };
 
         let result = build_index(&order_config)?;
@@ -746,6 +756,7 @@ mod tests {
             skip_history: true,
             g_id: 0,
             progress: None,
+            fan_in_cap: usize::MAX,
         };
 
         let result = build_index(&config).unwrap();
@@ -838,6 +849,7 @@ mod tests {
             skip_history: false,
             g_id: 0,
             progress: None,
+            fan_in_cap: usize::MAX,
         };
 
         let result = build_index(&config).unwrap();
@@ -900,6 +912,7 @@ mod tests {
             skip_history: false,
             g_id: 0,
             progress: None,
+            fan_in_cap: usize::MAX,
         };
 
         let result = build_index(&config).unwrap();
@@ -952,6 +965,7 @@ mod tests {
             skip_history: false,
             g_id: 0,
             progress: None,
+            fan_in_cap: usize::MAX,
         };
 
         let result = build_index(&config).unwrap();
@@ -1011,6 +1025,7 @@ mod tests {
             skip_history: true,
             g_id: 0,
             progress: None,
+            fan_in_cap: usize::MAX,
         };
 
         let result = build_index(&config).unwrap();
