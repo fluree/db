@@ -114,6 +114,14 @@ fn streaming_reader_accepts_a_mid_file_redefinition() {
     // expansion for the same span. Counted only inside the carrier chunk,
     // because only there has the parser actually SEEN the redefinition.
     let mut stale_objects_in_carrier = 0usize;
+    // Non-vacuity witness: post-redefinition triples in the carrier chunk
+    // REGARDLESS of how they resolved. The two `== 0` assertions below are
+    // only meaningful if the carrier actually contains such triples — at
+    // chunk sizes below 16 KB it contains none, and both assertions pass
+    // against a parser with the fix entirely removed. Counting structurally
+    // makes non-vacuity a property of the test, not of the `16 * 1024`
+    // constant above.
+    let mut post_redef_in_carrier = 0usize;
     for (idx, text) in &chunks {
         let doc = format!("{block}{text}");
         let mut sink = GraphCollectorSink::new();
@@ -126,6 +134,9 @@ fn streaming_reader_accepts_a_mid_file_redefinition() {
                 .and_then(|d| d.parse().ok())
                 .unwrap_or(usize::MAX);
             let post_redefinition = n >= 2000 && n != usize::MAX;
+            if post_redefinition && *idx == carrier[0] {
+                post_redef_in_carrier += 1;
+            }
             if post_redefinition && !s.starts_with("http://b/") {
                 if *idx == carrier[0] {
                     wrong_in_carrier += 1;
@@ -138,6 +149,12 @@ fn streaming_reader_accepts_a_mid_file_redefinition() {
             }
         }
     }
+    assert!(
+        post_redef_in_carrier > 0,
+        "VACUOUS: the carrier chunk holds no post-redefinition triples, so the \
+         assertions below cannot distinguish the fix — the chunk size no longer \
+         places statements after the redefinition inside its chunk"
+    );
     println!(
         "post-redefinition subjects still on the OLD namespace: \
          in carrier chunk = {wrong_in_carrier}, in later chunks = {wrong_after_carrier}"
@@ -161,7 +178,8 @@ fn streaming_reader_accepts_a_mid_file_redefinition() {
     );
     assert!(
         wrong_after_carrier > 0,
-        "later chunks are still mis-resolved — the separate chunker defect"
+        "if this fails, the §1.4 chunker fix has landed: later chunks now see \
+         the redefinition — flip this to `== 0` and delete the tripwire note"
     );
 
     // Claim 5: the guarded pre-scan path WOULD have rejected this file.
@@ -216,6 +234,8 @@ fn the_guard_misses_a_mid_line_directive() {
     println!("mid-line directive (data_start={ds2}) => {res:?}");
     assert!(
         res.is_ok(),
-        "mid-line directive after data is MISSED by the guard (noted, not fixed)"
+        "if this fails, PrefixCheck has learned to match mid-line directives: \
+         the guard now catches what this test documents as missed — flip to \
+         `is_err()` and retire this note"
     );
 }

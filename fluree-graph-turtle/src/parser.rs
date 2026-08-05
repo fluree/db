@@ -37,9 +37,12 @@ pub struct Parser<'a, 'input, S> {
     iri_term_cache: FxHashMap<Arc<str>, TermId>,
     /// Cache of prefixed name span text -> TermId.
     ///
-    /// Keyed by the raw span text (e.g., `"ex:name"` or `"ex:"`), which uniquely
-    /// identifies the expanded IRI for a given prefix mapping. Handles both
-    /// PrefixedName and PrefixedNameNs tokens in one cache.
+    /// Keyed by the raw span text (e.g., `"ex:name"` or `"ex:"`) — which
+    /// identifies the expanded IRI only WHILE the prefix mapping is stable.
+    /// A `@prefix` redefinition changes what a cached span means, so
+    /// [`Parser::bind_prefix`] clears this cache on any rebinding; every
+    /// prefix write must go through it. Handles both PrefixedName and
+    /// PrefixedNameNs tokens in one cache.
     prefixed_term_cache: FxHashMap<Arc<str>, TermId>,
     /// Cache hit/miss counters (recorded on `turtle_parse_events` span).
     iri_cache_hits: u64,
@@ -1546,7 +1549,15 @@ pub fn parse_with_prefixes_base_options<S: GraphSink>(
     if !prefixes.is_empty() {
         parser.prefixes.reserve(prefixes.len());
         for (prefix, namespace) in prefixes {
-            parser.prefixes.insert(prefix.clone(), namespace.clone());
+            // Through bind_prefix, not a raw insert: on an empty cache the
+            // invalidation is a no-op, but this is the entry point chunked
+            // import uses, and any future change that seeds AFTER names have
+            // been cached ("re-seed after the prelude", "top up between
+            // chunks") would reintroduce the stale-cache bug this parser
+            // guards against — with no test able to see it, because seeding
+            // normally happens before anything is cached. Routing it here
+            // makes the invariant structural instead of conventional.
+            parser.bind_prefix(prefix.clone(), namespace.clone());
         }
     }
     parser.parse()
