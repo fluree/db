@@ -425,6 +425,12 @@ impl ParentIndexSet {
             // MAJOR-4 (#1529 review): create each canonical col-set's map ONCE (one
             // column-name Vec clone per set), then probe it by borrow in the row loop
             // — the old `entry.entry(cols.clone())` cloned that Vec on EVERY row.
+            // id=3717339921: this leaves a PRESENT-but-EMPTY inner map when a col-set
+            // yields no key, where the old per-row code left the entry ABSENT. Safe by
+            // construction: no consumer distinguishes the two — `resolve` chains
+            // `.get(cols)?.get(key)` (an empty map returns `None` on `.get(key)`, same as
+            // an absent col-set short-circuiting the `?`), `merge_from` `.extend`s (a
+            // no-op on empty), and `estimated_bytes` counts 0 for an empty map.
             for cols in &col_sets {
                 entry.entry(cols.clone()).or_default();
             }
