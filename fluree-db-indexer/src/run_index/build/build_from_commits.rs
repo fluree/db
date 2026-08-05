@@ -17,11 +17,11 @@ use crate::run_index::runs::run_file::StreamingRunFileWriter;
 use crate::run_index::runs::run_writer::{
     MultiOrderConfig, MultiOrderRunWriter, MultiOrderRunWriterWithOp,
 };
-use crate::run_index::runs::streaming_reader::{MergeSource, StreamingRunReader};
 use crate::run_index::runs::spool::{
     link_chunk_run_files_to_flat, remap_commit_to_runs_with_op, remap_sorted_commit_v2_to_runs,
     MmapStringRemap, MmapSubjectRemap, SortedCommitMergeReaderV2, SubjectRemap,
 };
+use crate::run_index::runs::streaming_reader::{MergeSource, StreamingRunReader};
 use crate::stats::{stats_record_from_v2, SpotClassStats, DT_REF_ID};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{cmp_v2_spot, RunRecordV2};
@@ -372,7 +372,9 @@ impl BucketWriterPool {
             self.slots[bucket] = Some(std::io::BufWriter::new(file));
             self.open_count += 1;
         }
-        Ok(self.slots[bucket].as_mut().expect("slot ensured open above"))
+        Ok(self.slots[bucket]
+            .as_mut()
+            .expect("slot ensured open above"))
     }
 
     /// Flush and close every open writer. Errors instead of silently dropping
@@ -1944,10 +1946,13 @@ mod tests {
             },
         ];
 
-        let membership =
-            ClassMembership::build_from_commits(&commits, &dir.path().join("membership"), usize::MAX)
-                .unwrap()
-                .expect("membership");
+        let membership = ClassMembership::build_from_commits(
+            &commits,
+            &dir.path().join("membership"),
+            usize::MAX,
+        )
+        .unwrap()
+        .expect("membership");
         assert!(matches!(membership, ClassMembership::Disk(_)));
         assert_eq!(membership.summary().1, 4);
         assert_eq!(membership.summary().2, 3);

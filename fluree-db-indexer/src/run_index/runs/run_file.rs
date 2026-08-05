@@ -477,7 +477,11 @@ impl StreamingRunFileWriter {
         use std::io::Seek;
 
         self.flush_block()?;
-        let min_t = if self.record_count == 0 { 0 } else { self.min_t };
+        let min_t = if self.record_count == 0 {
+            0
+        } else {
+            self.min_t
+        };
         let header = Self::header(
             self.with_op,
             self.sort_order,
@@ -656,15 +660,7 @@ mod tests {
 
         // Multi-block volume (> 8192 records) with wrapping t values.
         let records: Vec<RunRecordV2> = (0..20_000u64)
-            .map(|i| {
-                make_rec(
-                    i,
-                    1,
-                    OType::XSD_INTEGER.as_u16(),
-                    i * 3,
-                    (i % 7) as u32 + 1,
-                )
-            })
+            .map(|i| make_rec(i, 1, OType::XSD_INTEGER.as_u16(), i * 3, (i % 7) as u32 + 1))
             .collect();
         let ops: Vec<u8> = (0..20_000u64).map(|i| (i % 2) as u8).collect();
         let min_t = 1;
@@ -675,9 +671,14 @@ mod tests {
         let slice_path = dir.path().join("slice.frn");
         write_run_file(&slice_path, &records, RunSortOrder::Spot, min_t, max_t).unwrap();
         let stream_path = dir.path().join("stream.frn");
-        let mut writer =
-            StreamingRunFileWriter::create_with_options(&stream_path, RunSortOrder::Spot, false, true, 1)
-                .unwrap();
+        let mut writer = StreamingRunFileWriter::create_with_options(
+            &stream_path,
+            RunSortOrder::Spot,
+            false,
+            true,
+            1,
+        )
+        .unwrap();
         for rec in &records {
             writer.push(*rec, 1).unwrap();
         }
@@ -692,12 +693,24 @@ mod tests {
 
         // With-op variant (version 2).
         let slice_op_path = dir.path().join("slice_op.frn");
-        write_run_file_with_op(&slice_op_path, &records, &ops, RunSortOrder::Spot, min_t, max_t)
-            .unwrap();
+        write_run_file_with_op(
+            &slice_op_path,
+            &records,
+            &ops,
+            RunSortOrder::Spot,
+            min_t,
+            max_t,
+        )
+        .unwrap();
         let stream_op_path = dir.path().join("stream_op.frn");
-        let mut writer =
-            StreamingRunFileWriter::create_with_options(&stream_op_path, RunSortOrder::Spot, true, true, 1)
-                .unwrap();
+        let mut writer = StreamingRunFileWriter::create_with_options(
+            &stream_op_path,
+            RunSortOrder::Spot,
+            true,
+            true,
+            1,
+        )
+        .unwrap();
         for (rec, &op) in records.iter().zip(ops.iter()) {
             writer.push(*rec, op).unwrap();
         }
@@ -740,9 +753,14 @@ mod tests {
 
         // Empty output: header must read back with zero records.
         let empty_path = dir.path().join("empty.frn");
-        let writer =
-            StreamingRunFileWriter::create_with_options(&empty_path, RunSortOrder::Post, false, true, 1)
-                .unwrap();
+        let writer = StreamingRunFileWriter::create_with_options(
+            &empty_path,
+            RunSortOrder::Post,
+            false,
+            true,
+            1,
+        )
+        .unwrap();
         let info = writer.finish().unwrap();
         assert_eq!(info.record_count, 0);
         let mut reader = StreamingRunReader::open(&empty_path).unwrap();

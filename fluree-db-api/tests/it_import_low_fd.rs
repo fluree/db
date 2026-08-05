@@ -202,10 +202,9 @@ async fn import_under_low_fd_limit() {
     );
 
     // Ran-marker + flake-count equality.
-    let child_result: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&result_path).expect("child result file must exist"),
-    )
-    .expect("child result json");
+    let child_result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&result_path).expect("child result file must exist"))
+            .expect("child result json");
     assert_eq!(
         child_result["flake_count"].as_u64(),
         Some(baseline_flakes),

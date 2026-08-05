@@ -5572,8 +5572,7 @@ where
                     build_progress: Some(v3_build_counter),
                     stage_marker: Some(v3_stage_marker),
                 };
-                std::fs::create_dir_all(&cfg_g0.run_dir)
-                    .map_err(|e| index_build_error(&e))?;
+                std::fs::create_dir_all(&cfg_g0.run_dir).map_err(|e| index_build_error(&e))?;
 
                 let (g0_result, mut spot_class_stats) =
                     fluree_db_indexer::build_indexes_from_commits(
@@ -5602,8 +5601,7 @@ where
                         build_progress: None,
                         stage_marker: None,
                     };
-                    std::fs::create_dir_all(&cfg_g1.run_dir)
-                        .map_err(|e| index_build_error(&e))?;
+                    std::fs::create_dir_all(&cfg_g1.run_dir).map_err(|e| index_build_error(&e))?;
 
                     Some(
                         fluree_db_indexer::build_indexes_from_commits(
@@ -5640,8 +5638,7 @@ where
                         build_progress: None,
                         stage_marker: None,
                     };
-                    std::fs::create_dir_all(&cfg_ng.run_dir)
-                        .map_err(|e| index_build_error(&e))?;
+                    std::fs::create_dir_all(&cfg_ng.run_dir).map_err(|e| index_build_error(&e))?;
 
                     // Fold this named graph's per-class SPOT stats into the
                     // default-graph accumulator. All `SpotClassStats` maps are

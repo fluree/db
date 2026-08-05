@@ -42,6 +42,9 @@ pub enum RaiseOutcome {
 /// Read the current `RLIMIT_NOFILE`. `None` on non-unix platforms or if
 /// `getrlimit` fails.
 #[cfg(unix)]
+// rlim_t is platform-dependent (u64 on 64-bit macOS/glibc, narrower
+// elsewhere), so the widening casts are not universally redundant.
+#[allow(clippy::unnecessary_cast)]
 pub fn nofile_limits() -> Option<NofileLimits> {
     let mut rl = libc::rlimit {
         rlim_cur: 0,
@@ -283,8 +286,7 @@ mod tests {
         assert!(!is_fd_exhaustion(&std::io::Error::from_raw_os_error(
             libc::ENOENT
         )));
-        assert!(!is_fd_exhaustion(&std::io::Error::new(
-            std::io::ErrorKind::Other,
+        assert!(!is_fd_exhaustion(&std::io::Error::other(
             "no raw os error"
         )));
     }
