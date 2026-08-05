@@ -3372,8 +3372,16 @@ mod tests {
             let shared_alloc = Arc::new(SharedNamespaceAllocator::from_registry(
                 &NamespaceRegistry::new(),
             ));
-            let spool_dir =
-                std::env::temp_dir().join(format!("fluree-c2-test-{}", std::process::id()));
+            // id=3717339915: a per-run atomic suffix (the VERIFY_DIR_SEQ pattern) so
+            // repeats/parallel runs in one test process never share a spool dir and
+            // delete each other's runs mid-sort.
+            static C2_TEST_DIR_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let spool_dir = std::env::temp_dir().join(format!(
+                "fluree-c2-test-{}-{}",
+                std::process::id(),
+                C2_TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             std::fs::create_dir_all(&spool_dir).unwrap();
             let (tx, rx) = std::sync::mpsc::sync_channel::<super::ChunkResult>(2);
             // Drain the result side so no worker/driver blocks on `result_tx.send`;
