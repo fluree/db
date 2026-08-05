@@ -1865,7 +1865,17 @@ impl Operator for FusedR2rmlAggregateOperator {
                         ) {
                             hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
                             hashbrown::hash_table::Entry::Vacant(v) => {
-                                let id = group_accs.len() as u32;
+                                // id=3717339911: the dense group id is a u32. Past
+                                // u32::MAX groups the cast would silently wrap and corrupt
+                                // accumulators; assert the invariant (the memory-budget
+                                // checkpoint normally trips far earlier, but is not set on
+                                // every caller/fixture path).
+                                debug_assert!(
+                                    group_accs.len() <= u32::MAX as usize,
+                                    "fused group count exceeded u32::MAX"
+                                );
+                                let id = u32::try_from(group_accs.len())
+                                    .expect("fused group count exceeds u32::MAX");
                                 let owned: Vec<GKey> =
                                     scratch.iter().map(|r| r.to_owned_key()).collect();
                                 v.insert((owned, id));
