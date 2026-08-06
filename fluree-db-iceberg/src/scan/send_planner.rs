@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::error::{IcebergError, Result};
 use crate::io::SendIcebergStorage;
-use crate::manifest::{parse_manifest, parse_manifest_list, parse_manifest_list_with_deletes};
+use crate::manifest::{parse_manifest, parse_manifest_list_with_deletes};
 use crate::metadata::{Schema, Snapshot, TableMetadata};
 use crate::scan::planner::{
     effective_sequence_number, FileScanTask, IncrementalScanPlan, ScanConfig, ScanPlan,
@@ -236,8 +236,41 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
                 "Snapshot has no manifest list (v1 format not supported)".to_string(),
             )
         })?;
+        // Fail closed on merge-on-read delete files, exactly as `plan()` does.
+        //
+        // WHY THIS MATTERS MORE HERE THAN ON A QUERY. A query that reads a MoR table
+        // without applying its delete files returns deleted rows once, to one caller,
+        // who can re-run it. Materialization writes those rows into a ledger as
+        // committed state and then advances the watermark PAST the window — so nothing
+        // ever re-reads it. A transient wrong answer becomes permanent wrong data.
+        //
+        // The `from_snapshot_id = None` case is the concrete hole: it means "since
+        // genesis", i.e. a full read of `to`'s live state — precisely the read `plan()`
+        // refuses on a delete-bearing snapshot. It is also the initial-materialization
+        // path, so the very first build of a twin was the least guarded.
+        //
+        // `window_is_append_only` is a CALLER contract (see this method's docs) and is
+        // not enforced here, so it cannot be relied on as the guard.
+        let allow_mor = crate::mor_guard::mor_deletes_allowed();
+        crate::mor_guard::ensure_no_summary_deletes(
+            to_snapshot,
+            &self.metadata.location,
+            allow_mor,
+        )?;
+
         let manifest_list_data = self.storage.read(manifest_list_path).await?;
-        let manifest_entries = parse_manifest_list(&manifest_list_data)?;
+        // Parse WITH delete manifests so the backstop can SEE them. Previously this
+        // used `parse_manifest_list`, which filters `content=1` entries out — which in
+        // turn made the `is_deletes()` skip inside the loop below DEAD CODE: it read as
+        // a delete-file safety check while being unreachable. Now the entries arrive,
+        // the guard counts them, and the skip does the job its name claims.
+        let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
+        let delete_manifests = manifest_entries.iter().filter(|e| e.is_deletes()).count();
+        crate::mor_guard::ensure_no_delete_manifests(
+            delete_manifests,
+            &self.metadata.location,
+            allow_mor,
+        )?;
 
         let mut added_tasks = Vec::new();
         let mut files_selected = 0;
@@ -432,6 +465,70 @@ mod mor_guard_tests {
         assert!(
             matches!(err, IcebergError::MergeOnReadDeletes(_)),
             "expected a merge-on-read refusal, got {err:?}"
+        );
+    }
+
+    /// B1. `plan_incremental` is the MATERIALIZE path, and it bypassed this guard
+    /// entirely: no `mor_guard` call, and it parsed with `parse_manifest_list`, which
+    /// filters `content=1` entries out — so it could not even see delete manifests.
+    ///
+    /// The stakes are higher here than on `plan_scan`. A query returns deleted rows
+    /// once, to one caller, who can re-run it. Materialization writes them into a
+    /// ledger as committed state and then advances the watermark PAST the window, so
+    /// nothing ever re-reads it: a transient wrong answer becomes permanent wrong data.
+    ///
+    /// `NoReadStorage` errors on every read, so this also pins that the refusal happens
+    /// BEFORE any manifest-list I/O — a guard that only fires after fetching the
+    /// manifest list would still be correct, but not zero-cost on the hot poll path.
+    #[tokio::test]
+    async fn send_planner_refuses_delete_bearing_snapshot_incrementally() {
+        let md = metadata_with_summary(&[("total-position-deletes", "17")]);
+        let storage = NoReadStorage;
+        let planner = SendScanPlanner::new(&storage, &md, ScanConfig::new());
+        let err = planner
+            .plan_incremental(Some(100), 100)
+            .await
+            .expect_err("the materialize path must fail closed on merge-on-read deletes");
+        assert!(
+            matches!(err, IcebergError::MergeOnReadDeletes(_)),
+            "expected a merge-on-read refusal, got {err:?}"
+        );
+    }
+
+    /// The `from = None` case specifically, because it is the worst one: it means
+    /// "since genesis", i.e. a FULL read of the snapshot's live state — exactly the
+    /// read `plan_scan` refuses — and it is the initial-materialization path, so the
+    /// very first build of a twin was the least guarded thing in the pipeline.
+    #[tokio::test]
+    async fn initial_materialization_from_genesis_also_refuses() {
+        let md = metadata_with_summary(&[("total-equality-deletes", "3")]);
+        let storage = NoReadStorage;
+        let planner = SendScanPlanner::new(&storage, &md, ScanConfig::new());
+        let err = planner
+            .plan_incremental(None, 100)
+            .await
+            .expect_err("a from-genesis incremental read is a full live-state read");
+        assert!(
+            matches!(err, IcebergError::MergeOnReadDeletes(_)),
+            "expected a merge-on-read refusal, got {err:?}"
+        );
+    }
+
+    /// The guard must not fire on a clean snapshot — otherwise it would break every
+    /// copy-on-write table, which is the common case. Reaching storage (and failing
+    /// there, on `NoReadStorage`) is the proof that the guard let it through.
+    #[tokio::test]
+    async fn a_clean_snapshot_is_not_refused_incrementally() {
+        let md = metadata_with_summary(&[("total-records", "1000"), ("added-records", "10")]);
+        let storage = NoReadStorage;
+        let planner = SendScanPlanner::new(&storage, &md, ScanConfig::new());
+        let err = planner
+            .plan_incremental(Some(100), 100)
+            .await
+            .expect_err("NoReadStorage fails the manifest-list read");
+        assert!(
+            !matches!(err, IcebergError::MergeOnReadDeletes(_)),
+            "a delete-free snapshot must NOT be refused as merge-on-read; got {err:?}"
         );
     }
 }
