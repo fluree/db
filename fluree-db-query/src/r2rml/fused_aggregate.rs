@@ -1067,7 +1067,7 @@ struct Resolved {
     /// group-key resolve/fold — the existence semi-join, byte-identical to the generic
     /// chained inner join (`build_semi_join_membership`). Empty for the single-table and
     /// pure-linear join folds; length 1 is the #1582 crt_join_reorder case; length ≥2 is
-    /// the S1 widening (multi-filter BI shape, gated by `multifact_gen_enabled`).
+    /// the S1 widening (multi-filter BI shape, gated by the `multifact_gen` field).
     semi_joins: Vec<SemiJoinSet>,
     /// W4-2: per GROUP BY position (SPARQL order), whether that key is read inline
     /// from the fact batch (`Fact`) or from the dim FK→GKey map (`Dim(slot)`). All
@@ -1238,17 +1238,27 @@ pub struct FusedR2rmlAggregateOperator {
     /// the switch is off (or the result fits one chunk) the single-batch path is taken
     /// and this stays `None`.
     pending_rows: Option<Vec<(Vec<GKey>, Vec<Acc>)>>,
-    /// N1/N2/P3 kill switches, resolved from env ONCE at CONSTRUCTION (id=3717339910).
-    /// Not a process-wide `OnceLock` and not read per-call: a per-operator field is
-    /// what lets a test flip a switch by SETTING THE FIELD instead of mutating process
-    /// env. `std::env::set_var`/`remove_var` race the env reads on parallel test threads
-    /// (libc-level UB; `set_var` is `unsafe` in edition 2024). Each defaults ON unless
-    /// its env var holds a falsy spelling (`0`/`false`/`off`/`no`), via
-    /// [`crate::r2rml::env_switch_enabled`]. (`FLUREE_FUSED_R2RML_MULTIFACT_GEN` on
-    /// #1589 must adopt this same field pattern.)
+    /// N1/N2/P3 kill switches, resolved from env ONCE at CONSTRUCTION (id=3717339910,
+    /// id=3717398054). Not a process-wide `OnceLock` and not read per-call: a per-operator
+    /// field is what lets a test flip a switch by SETTING THE FIELD instead of mutating
+    /// process env. `std::env::set_var`/`remove_var` race the env reads on parallel test
+    /// threads (libc-level UB; `set_var` is `unsafe` in edition 2024). Each defaults ON
+    /// unless its env var holds a falsy spelling (`0`/`false`/`off`/`no`), via
+    /// [`crate::r2rml::env_switch_enabled`]. `multifact_gen` (`FLUREE_FUSED_R2RML_MULTIFACT_GEN`)
+    /// now adopts this same pattern (Phase 2): it is threaded into the static
+    /// [`Self::decompose_branching_star`] as a bool argument (a static fn cannot read a
+    /// field), replacing the `cfg(test)` uncached env read + the `GEN_ENV_LOCK` band-aid.
     vector_fold: bool,
     output_bound: bool,
     multifact: bool,
+    /// Generality kill switch (`FLUREE_FUSED_R2RML_MULTIFACT_GEN`, default **on**). Gates
+    /// ONLY the multi-fact generality WIDENING beyond #1582's exactly-one-of-each cut —
+    /// the K≥2 semi-join admission (S1, in `decompose_branching_star`) and the ≥2 ref-IRI
+    /// group-key admission (S2, at the group-key resolver). OFF restores #1582's behavior
+    /// byte-for-byte: a K=1 branching star and a single ref-IRI group key still fuse; a
+    /// K≥2 or ≥2-ref shape declines to the generic pipeline. Rides ON TOP of `multifact`
+    /// and `FLUREE_FUSED_R2RML_AGG_JOIN`, which remain independently killable underneath.
+    multifact_gen: bool,
 }
 
 impl FusedR2rmlAggregateOperator {
@@ -1280,6 +1290,7 @@ impl FusedR2rmlAggregateOperator {
             vector_fold: crate::r2rml::env_switch_enabled("FLUREE_FUSED_VECTOR_FOLD"),
             output_bound: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND"),
             multifact: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"),
+            multifact_gen: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT_GEN"),
         }
     }
 
@@ -2281,7 +2292,7 @@ impl FusedR2rmlAggregateOperator {
         // P2a + S2: each RefObjectMap group key's (fact FK child cols, parent join cols,
         // parent TM IRI), captured in SPARQL order; a FK→IRI resolver is built per entry
         // after the scan projection below. #1582 admitted at most ONE (crt_highcard); S2
-        // admits ≥2 behind `multifact_gen_enabled`, so an OFF run declines the 2nd ref
+        // admits ≥2 behind the `multifact_gen` field, so an OFF run declines the 2nd ref
         // key exactly as P2a did.
         let mut ref_group_keys: Vec<(Vec<String>, Vec<String>, String)> = Vec::new();
         for gv in &self.group_by {
@@ -2303,7 +2314,7 @@ impl FusedR2rmlAggregateOperator {
                 else {
                     return Ok(None); // neither a scalar column nor a ref object
                 };
-                if !ref_group_keys.is_empty() && !Self::multifact_gen_enabled() {
+                if !ref_group_keys.is_empty() && !self.multifact_gen {
                     return Ok(None); // ≥2 ref group keys: the S2 widening, gated (OFF = P2a)
                 }
                 // The parent subject must be a pure IRI (the fold emits an IRI term);
@@ -2788,31 +2799,6 @@ impl FusedR2rmlAggregateOperator {
         Some((order, join_vars))
     }
 
-    /// Generality kill switch (`FLUREE_FUSED_R2RML_MULTIFACT_GEN`, default **on**).
-    /// Gates ONLY the multi-fact generality WIDENING beyond #1582's exactly-one-of-each
-    /// cut — the K≥2 semi-join admission (S1) and the ≥2 ref-IRI group-key admission
-    /// (S2). OFF restores #1582's behavior byte-for-byte: a K=1 (one group-key + one
-    /// semi-join) branching star and a single ref-IRI group key still fuse; a K≥2 or
-    /// ≥2-ref shape declines to the generic pipeline. It rides ON TOP of the #1582
-    /// switches (`FLUREE_FUSED_R2RML_MULTIFACT` for the branching path,
-    /// `FLUREE_FUSED_R2RML_AGG_JOIN` for the join path), which remain independently
-    /// killable underneath — turning either of those off declines the whole family
-    /// regardless of this flag. Read once per process (test reads live, as the sibling
-    /// switches do).
-    fn multifact_gen_enabled() -> bool {
-        #[cfg(not(test))]
-        {
-            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ENABLED.get_or_init(|| {
-                crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT_GEN")
-            })
-        }
-        #[cfg(test)]
-        {
-            crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT_GEN")
-        }
-    }
-
     /// P3 + S1: decompose a BRANCHING-STAR join — a fact ROOT with ≥2 FK branches, each
     /// a linear sub-chain — into its root + classified branches, or `None` when the
     /// shape is not the admitted class. The structural half of the branching path; the
@@ -2824,16 +2810,19 @@ impl FusedR2rmlAggregateOperator {
     /// pure membership/constraint branch, e.g. `order → customer[segment=Enterprise]`).
     /// Admits exactly ONE group-key branch plus K≥1 semi-join branches; K=1 is #1582's
     /// crt_join_reorder class (always admitted), K≥2 is the S1 widening (multi-filter BI
-    /// shape) gated behind `multifact_gen_enabled` so an OFF run declines it to the
-    /// generic pipeline byte-identically to #1582. Declines (`None`) on: <3 patterns, a
-    /// non-unique root (disconnected), a non-branching root (out-degree <2 — that is a
-    /// linear chain, [`Self::order_chain`]'s job), a merge (a pattern referenced by >1),
-    /// a nested branch inside a branch, a cycle, a disconnected pattern, a branch-set
-    /// without exactly one GROUP-KEY branch or with zero SEMI-JOIN branches, or (switch
-    /// off) a K≥2 SEMI-JOIN star.
+    /// shape) gated behind `gen_enabled` (the operator's `multifact_gen` field, defaulted
+    /// from `FLUREE_FUSED_R2RML_MULTIFACT_GEN`) so an OFF run declines it to the generic
+    /// pipeline byte-identically to #1582. `gen_enabled` is an argument, not a field read,
+    /// because this is a static fn; the caller passes `self.multifact_gen`. Declines
+    /// (`None`) on: <3 patterns, a non-unique root (disconnected), a non-branching root
+    /// (out-degree <2 — that is a linear chain, [`Self::order_chain`]'s job), a merge (a
+    /// pattern referenced by >1), a nested branch inside a branch, a cycle, a disconnected
+    /// pattern, a branch-set without exactly one GROUP-KEY branch or with zero SEMI-JOIN
+    /// branches, or (switch off) a K≥2 SEMI-JOIN star.
     fn decompose_branching_star<'p>(
         pats: &[&'p R2rmlPattern],
         group_by: &[VarId],
+        gen_enabled: bool,
     ) -> Option<BranchingStar<'p>> {
         let n = pats.len();
         if n < 3 {
@@ -2937,7 +2926,7 @@ impl FusedR2rmlAggregateOperator {
             return None;
         }
         // K≥2 semi-join branches is the S1 widening increment; gated so OFF = #1582.
-        if semi_joins >= 2 && !Self::multifact_gen_enabled() {
+        if semi_joins >= 2 && !gen_enabled {
             return None;
         }
         Some(BranchingStar {
@@ -3262,7 +3251,9 @@ impl FusedR2rmlAggregateOperator {
                 // pre-P3 decline (byte-identical), so a branching shape reverts to the
                 // generic pipeline wholesale.
                 if self.multifact {
-                    if let Some(star) = Self::decompose_branching_star(pats, &self.group_by) {
+                    if let Some(star) =
+                        Self::decompose_branching_star(pats, &self.group_by, self.multifact_gen)
+                    {
                         return self
                             .resolve_branching_star_at_open(ctx, mapping, star)
                             .await;
@@ -6087,10 +6078,8 @@ mod tests {
 
     /// Run the S2 two-ref-key fold, returning `(customer IRI, product IRI, SUM binding)`
     /// sorted by (customer, product). PANICS if a key is not an IRI term or the shape
-    /// declines. Holds the GEN lock across `open` (which reads the ≥2-ref gate under
-    /// cfg(test)) so the switch test's mutation window cannot flip the admission mid-run;
-    /// the runtime is current-thread, so holding across this single await is safe.
-    #[allow(clippy::await_holding_lock)]
+    /// declines. Sets `multifact_gen = true` on the operator (the ≥2-ref gate reads the
+    /// field, not process env), so no lock is needed across `open`.
     async fn run_s2_two_ref(
         mapping: Arc<CompiledR2rmlMapping>,
         batches: std::collections::HashMap<String, fluree_db_tabular::ColumnBatch>,
@@ -6142,6 +6131,7 @@ mod tests {
         let (c, p, sum) = (VarId(1), VarId(2), VarId(20));
         let mut op =
             FusedR2rmlAggregateOperator::new(s2_two_ref_plan(), Box::new(EmptyOperator::new()));
+        op.multifact_gen = true; // the ≥2-ref widening must admit
         let snapshot = LedgerSnapshot::genesis("test/main");
         let vars = VarRegistry::new();
         let provider = P {
@@ -6150,11 +6140,7 @@ mod tests {
         };
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
-        {
-            // GEN read (the ≥2-ref gate) happens inside open(); serialize it.
-            let _g = gen_lock();
-            op.open(&ctx).await.expect("open");
-        }
+        op.open(&ctx).await.expect("open");
         let mut out = Vec::new();
         while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
             let n = batch.column(c).map(<[Binding]>::len).unwrap_or(0);
@@ -6346,12 +6332,12 @@ mod tests {
         );
     }
 
-    /// (S2-switch) `FLUREE_FUSED_R2RML_MULTIFACT_GEN=0` gates ONLY the widening: a
+    /// (S2-switch) The GEN switch OFF (`multifact_gen = false`) gates ONLY the widening: a
     /// two-ref-key single-table fold DECLINES (`resolve_at_open` → None → generic path),
-    /// while a ONE-ref-key fold (P2a) STILL fuses — so OFF is byte-identical to P2a. Holds
-    /// the GEN lock (shared with the run helpers) across the reads.
+    /// while a ONE-ref-key fold (P2a) STILL fuses — so OFF is byte-identical to P2a.
+    /// id=3717398054: the switch is an operator FIELD the test sets directly, never process
+    /// env — so no `GEN_ENV_LOCK` and no lock held across the `.await`.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn s2_gen_switch_gates_only_the_widening() {
         use crate::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
         use crate::seed::EmptyOperator;
@@ -6440,33 +6426,25 @@ mod tests {
         let two_ref_op =
             || FusedR2rmlAggregateOperator::new(s2_two_ref_plan(), Box::new(EmptyOperator::new()));
 
-        let _g = gen_lock();
+        // id=3717398054: flip the GEN switch by SETTING THE FIELD, never process env.
         // OFF: two-ref declines, one-ref still fuses.
-        std::env::set_var("FLUREE_FUSED_R2RML_MULTIFACT_GEN", "0");
+        let mut two_off = two_ref_op();
+        two_off.multifact_gen = false;
         assert!(
-            two_ref_op()
-                .resolve_at_open(&ctx)
-                .await
-                .expect("resolve")
-                .is_none(),
+            two_off.resolve_at_open(&ctx).await.expect("resolve").is_none(),
             "GEN off must DECLINE the ≥2 ref-key fold"
         );
+        let mut one_off = one_ref_op();
+        one_off.multifact_gen = false;
         assert!(
-            one_ref_op()
-                .resolve_at_open(&ctx)
-                .await
-                .expect("resolve")
-                .is_some(),
+            one_off.resolve_at_open(&ctx).await.expect("resolve").is_some(),
             "GEN off must STILL fuse a single ref-key fold (byte-identical to P2a)"
         );
         // ON: two-ref fuses.
-        std::env::remove_var("FLUREE_FUSED_R2RML_MULTIFACT_GEN");
+        let mut two_on = two_ref_op();
+        two_on.multifact_gen = true;
         assert!(
-            two_ref_op()
-                .resolve_at_open(&ctx)
-                .await
-                .expect("resolve")
-                .is_some(),
+            two_on.resolve_at_open(&ctx).await.expect("resolve").is_some(),
             "GEN on must FUSE the ≥2 ref-key fold"
         );
     }
@@ -6479,7 +6457,6 @@ mod tests {
     /// in device must land in DIFFERENT groups, proving the fact-column position is part
     /// of the composite key and is not confused with a resolver slot.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn s2_fact_col_interleaved_with_two_ref_keys() {
         use crate::ir::grouping::InputSemantics;
         use crate::var_registry::VarRegistry;
@@ -6537,10 +6514,8 @@ mod tests {
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
         let mut op =
             FusedR2rmlAggregateOperator::new(plan, Box::new(crate::seed::EmptyOperator::new()));
-        {
-            let _g = gen_lock();
-            op.open(&ctx).await.expect("open");
-        }
+        op.multifact_gen = true; // the two-ref-key widening must admit
+        op.open(&ctx).await.expect("open");
         let mut out = Vec::new();
         while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
             let n = batch.column(dev).map(<[Binding]>::len).unwrap_or(0);
@@ -6809,7 +6784,7 @@ mod tests {
 
         // Pass shuffled; decomposition must recover the star regardless of order.
         let starr =
-            FusedR2rmlAggregateOperator::decompose_branching_star(&[&c, &p, &ol, &o], &group_by)
+            FusedR2rmlAggregateOperator::decompose_branching_star(&[&c, &p, &ol, &o], &group_by, true)
                 .expect("crt_join_reorder shape must decompose");
         assert_eq!(
             starr.root.subject_var,
@@ -6860,7 +6835,8 @@ mod tests {
         let lin_dim = star(1, &[("region", 12)]);
         assert!(FusedR2rmlAggregateOperator::decompose_branching_star(
             &[&lin_fact, &lin_dim],
-            &group_by
+            &group_by,
+            true
         )
         .is_none());
     }
@@ -7412,7 +7388,7 @@ mod tests {
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
-        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
             .expect("crt_join_reorder must decompose");
         let mut op = crt_op();
         let resolved = op
@@ -7582,7 +7558,7 @@ mod tests {
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
-        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
             .expect("the leaf var-object member does not change the join topology");
         let op = crt_op();
         let resolved = op
@@ -7636,7 +7612,7 @@ mod tests {
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
-        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
             .expect("crt_join_reorder must decompose");
         let op = crt_op();
         let resolved = op
@@ -7947,7 +7923,7 @@ mod tests {
         let ctx = ExecutionContext::new(&snapshot, &vars)
             .with_r2rml_providers(&provider, &provider)
             .with_cancellation(cancel);
-        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
             .expect("decompose");
         match crt_op()
             .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
@@ -8020,18 +7996,6 @@ mod tests {
     // OrderLine has just {order, product}, so a supplier branch there would
     // COLLIDE with the product group-key branch (branches must be disjoint).
     // ===================================================================
-
-    /// Serializes tests that read/write `FLUREE_FUSED_R2RML_MULTIFACT_GEN`. The K≥2
-    /// admission gate in `decompose_branching_star` reads it live under cfg(test), so the
-    /// switch test's set/remove window must not race a concurrent K≥2 decompose. Held
-    /// ONLY around the (synchronous) `decompose` call — never across an `.await`.
-    static GEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn gen_lock() -> std::sync::MutexGuard<'static, ()> {
-        GEN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     /// S1 mapping: SupportTicket(fact) `--product-->` Product (group-key branch,
     /// category + isCurrent), `--customer-->` Customer (semi-join, segment), and
@@ -8164,9 +8128,9 @@ mod tests {
 
     /// Resolve + fold an S1 fixture through the branching-star path
     /// (`decompose_branching_star` + `resolve_branching_star_at_open`, called directly),
-    /// returning `(category, SUM)` sorted by category. The GEN switch is default-on
-    /// (unset), so the K≥2 shape decomposes; the lock excludes the switch test's mutation
-    /// window from this (synchronous) decompose. Panics if the shape does not FUSE.
+    /// returning `(category, SUM)` sorted by category. Passes `gen_enabled=true` to
+    /// decompose so the K≥2 shape admits; no process env / no lock (the GEN switch is an
+    /// operator-level bool now). Panics if the shape does not FUSE.
     async fn run_s1(
         mapping: Arc<CompiledR2rmlMapping>,
         batches: std::collections::HashMap<String, Vec<ColumnBatch>>,
@@ -8177,11 +8141,8 @@ mod tests {
         use fluree_db_core::LedgerSnapshot;
         let pats = s1_patterns(seg_star, dept_star);
         let refs: Vec<&R2rmlPattern> = pats.iter().collect();
-        let star = {
-            let _g = gen_lock();
-            FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
-                .expect("S1 K=2 shape must decompose (GEN default-on)")
-        };
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
+            .expect("S1 K=2 shape must decompose (GEN on)");
         let provider = CrtProvider {
             mapping: Arc::clone(&mapping),
             batches,
@@ -8571,10 +8532,9 @@ mod tests {
     /// and two SEMI-JOIN branches (customer, agent), all rooted at the ticket fact.
     #[tokio::test]
     async fn s1_decompose_recognizes_k2_shape() {
-        let _g = gen_lock();
         let pats = s1_patterns(false, false);
         let refs: Vec<&R2rmlPattern> = pats.iter().collect();
-        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
             .expect("K=2 shape must decompose with GEN on");
         assert_eq!(
             star.branches.len(),
@@ -8598,35 +8558,36 @@ mod tests {
         );
     }
 
-    /// (S1-switch) `FLUREE_FUSED_R2RML_MULTIFACT_GEN=0` gates ONLY the widening: a K≥2
-    /// star DECLINES (decompose → None → generic pipeline), while a K=1 (#1582
-    /// crt_join_reorder) star STILL decomposes — so OFF is byte-identical to #1582. Sole
-    /// reader/writer of the GEN var; the lock excludes concurrent `run_s1` decomposes.
-    #[tokio::test]
-    async fn s1_gen_switch_gates_only_the_widening() {
-        let _g = gen_lock();
+    /// (S1-switch) The GEN switch (`gen_enabled`, the `multifact_gen` field defaulted from
+    /// `FLUREE_FUSED_R2RML_MULTIFACT_GEN`) gates ONLY the widening: a K≥2 star DECLINES
+    /// (decompose → None → generic pipeline) with the switch OFF, while a K=1 (#1582
+    /// crt_join_reorder) star STILL decomposes — so OFF is byte-identical to #1582.
+    /// id=3717398054: the switch is a bool ARGUMENT the test passes directly, never
+    /// process env, so this can no longer race a parallel thread's env read (and needs no
+    /// `GEN_ENV_LOCK`).
+    #[test]
+    fn s1_gen_switch_gates_only_the_widening() {
         let s1 = s1_patterns(false, false);
         let s1_refs: Vec<&R2rmlPattern> = s1.iter().collect();
         let k1 = crt_patterns(false);
         let k1_refs: Vec<&R2rmlPattern> = k1.iter().collect();
 
-        // OFF: K≥2 declines, K=1 still admits.
-        std::env::set_var("FLUREE_FUSED_R2RML_MULTIFACT_GEN", "0");
-        assert!(!FusedR2rmlAggregateOperator::multifact_gen_enabled());
+        // OFF (gen_enabled=false): K≥2 declines, K=1 still admits.
         assert!(
-            FusedR2rmlAggregateOperator::decompose_branching_star(&s1_refs, &[VarId(12)]).is_none(),
+            FusedR2rmlAggregateOperator::decompose_branching_star(&s1_refs, &[VarId(12)], false)
+                .is_none(),
             "GEN off must DECLINE the K≥2 star (widening gated)"
         );
         assert!(
-            FusedR2rmlAggregateOperator::decompose_branching_star(&k1_refs, &[VarId(12)]).is_some(),
+            FusedR2rmlAggregateOperator::decompose_branching_star(&k1_refs, &[VarId(12)], false)
+                .is_some(),
             "GEN off must STILL admit the #1582 K=1 star (byte-identical to #1582)"
         );
 
-        // ON (unset): K≥2 admits.
-        std::env::remove_var("FLUREE_FUSED_R2RML_MULTIFACT_GEN");
-        assert!(FusedR2rmlAggregateOperator::multifact_gen_enabled());
+        // ON (gen_enabled=true): K≥2 admits.
         assert!(
-            FusedR2rmlAggregateOperator::decompose_branching_star(&s1_refs, &[VarId(12)]).is_some(),
+            FusedR2rmlAggregateOperator::decompose_branching_star(&s1_refs, &[VarId(12)], true)
+                .is_some(),
             "GEN on must ADMIT the K≥2 star"
         );
     }
@@ -8728,11 +8689,8 @@ mod tests {
         let mapping = s1_same_table_mapping();
         let pats = s1_same_table_patterns();
         let refs: Vec<&R2rmlPattern> = pats.iter().collect();
-        let star = {
-            let _g = gen_lock();
-            FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
-                .expect("same-table K=2 shape must decompose")
-        };
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
+            .expect("same-table K=2 shape must decompose");
         let provider = CrtProvider {
             mapping: Arc::clone(&mapping),
             batches,
