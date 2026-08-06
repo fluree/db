@@ -102,23 +102,22 @@ pub(crate) async fn encode_and_write_root(
             root.prev_index = Some(prev);
         }
 
-        if !ctx.garbage_cids.is_empty() {
-            let garbage_strings: Vec<String> = ctx
-                .garbage_cids
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            let cid =
-                gc::write_garbage_record(content_store, ledger_id, root.index_t, garbage_strings)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            root.garbage = Some(BinaryGarbageRef { id: cid });
+        // Written even when empty — see the equivalent site in
+        // `encode_and_write_root_v6`.
+        let garbage_strings: Vec<String> = ctx
+            .garbage_cids
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let cid = gc::write_garbage_record(content_store, ledger_id, root.index_t, garbage_strings)
+            .await
+            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+        root.garbage = Some(BinaryGarbageRef { id: cid });
 
-            tracing::info!(
-                garbage_count = ctx.garbage_cids.len(),
-                "GC chain: garbage record written"
-            );
-        }
+        tracing::info!(
+            garbage_count = ctx.garbage_cids.len(),
+            "GC chain: garbage record written"
+        );
     }
 
     tracing::info!(
@@ -537,27 +536,29 @@ pub(crate) async fn encode_and_write_root_v6(
             root.prev_index = Some(prev);
         }
 
-        if !ctx.garbage_cids.is_empty() {
-            let garbage_strings: Vec<String> = ctx
-                .garbage_cids
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            let cid = gc::write_garbage_record(
-                content_store,
-                &inputs.ledger_id,
-                inputs.index_t,
-                garbage_strings,
-            )
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            root.garbage = Some(BinaryGarbageRef { id: cid });
+        // An empty manifest records that this root replaced nothing, which a
+        // root with no manifest cannot express. The collector stops its
+        // oldest-first walk at the first absent manifest, so omitting the
+        // write would strand every newer version.
+        let garbage_strings: Vec<String> = ctx
+            .garbage_cids
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let cid = gc::write_garbage_record(
+            content_store,
+            &inputs.ledger_id,
+            inputs.index_t,
+            garbage_strings,
+        )
+        .await
+        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+        root.garbage = Some(BinaryGarbageRef { id: cid });
 
-            tracing::info!(
-                garbage_count = ctx.garbage_cids.len(),
-                "GC chain: garbage record written"
-            );
-        }
+        tracing::info!(
+            garbage_count = ctx.garbage_cids.len(),
+            "GC chain: garbage record written"
+        );
     }
 
     // Link the prior index head when no `gc_ctx` supplied one. GC and drop

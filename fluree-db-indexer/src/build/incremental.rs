@@ -3795,139 +3795,90 @@ pub async fn incremental_index(
         "Phase 4: root builder finalized"
     );
 
-    // Write garbage manifest.
-    if !replaced_cids.is_empty() {
-        let garbage_strings: Vec<String> = replaced_cids
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect();
-        let garbage_write_started = Instant::now();
-        tracing::debug!(
-            replaced_cids = garbage_strings.len(),
-            index_t = new_root.index_t,
-            "Phase 4: writing garbage record"
-        );
-        let garbage_cid = gc::write_garbage_record(
-            content_store.as_ref(),
-            ledger_id,
-            new_root.index_t,
-            garbage_strings,
-        )
+    // Write the garbage manifest unconditionally. An empty manifest carries
+    // real information — this build replaced nothing — which a root with no
+    // manifest cannot express. The collector walks the prev-index chain
+    // oldest-first and stops at the first root whose manifest is absent, so a
+    // build that skipped the write would strand every newer version.
+    let garbage_strings: Vec<String> = replaced_cids
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    let garbage_write_started = Instant::now();
+    tracing::debug!(
+        replaced_cids = garbage_strings.len(),
+        index_t = new_root.index_t,
+        "Phase 4: writing garbage record"
+    );
+    let garbage_cid = gc::write_garbage_record(
+        content_store.as_ref(),
+        ledger_id,
+        new_root.index_t,
+        garbage_strings,
+    )
+    .await
+    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+    tracing::debug!(
+        %garbage_cid,
+        elapsed_ms = garbage_write_started.elapsed().as_millis() as u64,
+        "Phase 4: garbage record written"
+    );
+
+    // Set garbage on the root before encoding.
+    let mut final_root = new_root;
+    final_root.garbage = Some(BinaryGarbageRef { id: garbage_cid });
+    if let Some(stats) = final_root.stats.as_mut() {
+        stats.distribute_total_size_by_flakes(final_root.total_commit_size);
+    }
+
+    super::root_assembly::reconcile_ns_at_publish(
+        &final_root.namespace_codes,
+        &novelty.shared.ns_prefixes,
+        final_root.index_t,
+    )?;
+
+    let root_encode_started = Instant::now();
+    let root_bytes = final_root.encode();
+    tracing::debug!(
+        bytes = root_bytes.len(),
+        elapsed_ms = root_encode_started.elapsed().as_millis() as u64,
+        "Phase 4: encoded incremental index root"
+    );
+    let root_write_started = Instant::now();
+    tracing::debug!(
+        bytes = root_bytes.len(),
+        index_t = final_root.index_t,
+        "Phase 4: writing incremental index root"
+    );
+    let root_id = content_store
+        .put(ContentKind::IndexRoot, &root_bytes)
         .await
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        tracing::debug!(
-            %garbage_cid,
-            elapsed_ms = garbage_write_started.elapsed().as_millis() as u64,
-            "Phase 4: garbage record written"
-        );
+    cache_artifact_bytes(&cache_dir, &root_id, &root_bytes, "index_root");
 
-        // Set garbage on the root before encoding.
-        let mut final_root = new_root;
-        final_root.garbage = Some(BinaryGarbageRef { id: garbage_cid });
-        if let Some(stats) = final_root.stats.as_mut() {
-            stats.distribute_total_size_by_flakes(final_root.total_commit_size);
-        }
+    tracing::debug!(
+        %root_id,
+        index_t = final_root.index_t,
+        replaced = replaced_cids.len(),
+        new_leaves = total_new_leaves,
+        root_write_ms = root_write_started.elapsed().as_millis() as u64,
+        phase4_elapsed_ms = phase4_started.elapsed().as_millis() as u64,
+        "V6 incremental index root published"
+    );
 
-        super::root_assembly::reconcile_ns_at_publish(
-            &final_root.namespace_codes,
-            &novelty.shared.ns_prefixes,
-            final_root.index_t,
-        )?;
-
-        let root_encode_started = Instant::now();
-        let root_bytes = final_root.encode();
-        tracing::debug!(
-            bytes = root_bytes.len(),
-            elapsed_ms = root_encode_started.elapsed().as_millis() as u64,
-            "Phase 4: encoded incremental index root"
-        );
-        let root_write_started = Instant::now();
-        tracing::debug!(
-            bytes = root_bytes.len(),
-            index_t = final_root.index_t,
-            "Phase 4: writing incremental index root"
-        );
-        let root_id = content_store
-            .put(ContentKind::IndexRoot, &root_bytes)
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        cache_artifact_bytes(&cache_dir, &root_id, &root_bytes, "index_root");
-
-        tracing::debug!(
-            %root_id,
-            index_t = final_root.index_t,
-            replaced = replaced_cids.len(),
-            new_leaves = total_new_leaves,
-            root_write_ms = root_write_started.elapsed().as_millis() as u64,
-            phase4_elapsed_ms = phase4_started.elapsed().as_millis() as u64,
-            "V6 incremental index root published"
-        );
-
-        Ok(IndexResult {
-            root_id,
-            index_t: final_root.index_t,
-            ledger_id: ledger_id.to_string(),
-            stats: IndexStats {
-                flake_count: novelty.records.len(),
-                leaf_count: total_new_leaves,
-                branch_count: by_graph.len(),
-                total_bytes: root_bytes.len(),
-            },
-            // Outer entry point fills fuel from the tracker tally.
-            fuel: None,
-        })
-    } else {
-        let mut final_root = new_root;
-        if let Some(stats) = final_root.stats.as_mut() {
-            stats.distribute_total_size_by_flakes(final_root.total_commit_size);
-        }
-
-        super::root_assembly::reconcile_ns_at_publish(
-            &final_root.namespace_codes,
-            &novelty.shared.ns_prefixes,
-            final_root.index_t,
-        )?;
-        let root_encode_started = Instant::now();
-        let root_bytes = final_root.encode();
-        tracing::debug!(
-            bytes = root_bytes.len(),
-            elapsed_ms = root_encode_started.elapsed().as_millis() as u64,
-            "Phase 4: encoded incremental index root"
-        );
-        let root_write_started = Instant::now();
-        tracing::debug!(
-            bytes = root_bytes.len(),
-            index_t = final_root.index_t,
-            "Phase 4: writing incremental index root"
-        );
-        let root_id = content_store
-            .put(ContentKind::IndexRoot, &root_bytes)
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        cache_artifact_bytes(&cache_dir, &root_id, &root_bytes, "index_root");
-
-        tracing::debug!(
-            %root_id,
-            index_t = final_root.index_t,
-            new_leaves = total_new_leaves,
-            root_write_ms = root_write_started.elapsed().as_millis() as u64,
-            phase4_elapsed_ms = phase4_started.elapsed().as_millis() as u64,
-            "V6 incremental index root published (no garbage)"
-        );
-
-        Ok(IndexResult {
-            root_id,
-            index_t: final_root.index_t,
-            ledger_id: ledger_id.to_string(),
-            stats: IndexStats {
-                flake_count: novelty.records.len(),
-                leaf_count: total_new_leaves,
-                branch_count: by_graph.len(),
-                total_bytes: root_bytes.len(),
-            },
-            fuel: None,
-        })
-    }
+    Ok(IndexResult {
+        root_id,
+        index_t: final_root.index_t,
+        ledger_id: ledger_id.to_string(),
+        stats: IndexStats {
+            flake_count: novelty.records.len(),
+            leaf_count: total_new_leaves,
+            branch_count: by_graph.len(),
+            total_bytes: root_bytes.len(),
+        },
+        // Outer entry point fills fuel from the tracker tally.
+        fuel: None,
+    })
 }
 
 // ============================================================================

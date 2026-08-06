@@ -46,6 +46,98 @@ fn parse_chain_fields(
     Ok((root.index_t, prev_id, garbage_id, root))
 }
 
+/// Release every node listed in the garbage manifest at `garbage_id`.
+///
+/// Returns the number of nodes released, or `None` when the chain walk should
+/// stop: an unreadable or unparseable manifest, or one still inside the
+/// retention window. Manifests are consulted oldest-first, so one that is too
+/// recent guarantees every later one is newer still.
+async fn release_manifest_nodes(
+    store: &dyn ContentStore,
+    garbage_id: &ContentId,
+    manifest_t: i64,
+    cache_dir: Option<&Path>,
+    now_ms: i64,
+    min_age_ms: i64,
+) -> Option<usize> {
+    let bytes = match get_cached_or_remote(store, garbage_id, cache_dir).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::debug!(
+                t = manifest_t,
+                error = %e,
+                "Failed to load garbage record (may already be released), stopping GC"
+            );
+            return None;
+        }
+    };
+
+    let record = match parse_garbage_record(&bytes) {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::debug!(
+                t = manifest_t,
+                error = %e,
+                "Failed to parse garbage record, stopping GC"
+            );
+            return None;
+        }
+    };
+
+    // `created_at_ms == 0` marks a pre-timestamp record whose age cannot be
+    // established, so it is treated as too recent.
+    if record.created_at_ms == 0 || now_ms - record.created_at_ms < min_age_ms {
+        tracing::debug!(
+            t = manifest_t,
+            age_mins = (now_ms - record.created_at_ms) / 60000,
+            "Garbage record too recent, stopping GC"
+        );
+        return None;
+    }
+
+    let release_started = std::time::Instant::now();
+    tracing::debug!(
+        t = manifest_t,
+        %garbage_id,
+        items = record.garbage.len(),
+        "GC releasing garbage record items"
+    );
+
+    let mut released = 0;
+    for item in &record.garbage {
+        match item.parse::<ContentId>() {
+            Ok(cid) => {
+                if let Err(e) = store.release(&cid).await {
+                    tracing::debug!(
+                        %cid,
+                        error = %e,
+                        "Failed to release garbage node (may already be released)"
+                    );
+                } else {
+                    released += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    item,
+                    error = %e,
+                    "Skipping unrecognized garbage item (not a valid CID)"
+                );
+            }
+        }
+    }
+
+    tracing::debug!(
+        t = manifest_t,
+        %garbage_id,
+        released,
+        elapsed_ms = release_started.elapsed().as_millis() as u64,
+        "GC garbage record item release pass complete"
+    );
+
+    Some(released)
+}
+
 /// Get current timestamp in milliseconds
 fn current_timestamp_ms() -> i64 {
     std::time::SystemTime::now()
@@ -70,8 +162,16 @@ fn current_timestamp_ms() -> i64 {
 ///   With max_old_indexes=5, we keep current + 5 old = 6 total
 /// - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 30)
 ///
-/// Age is determined by the garbage record's `created_at_ms` field.
-/// If a garbage record is missing or has no timestamp, the index is skipped (conservative).
+/// Age is determined by the garbage record's `created_at_ms` field. A record
+/// with no timestamp predates the field, so its age cannot be established and
+/// the walk stops there.
+///
+/// # Roots with no garbage manifest
+///
+/// A root written before the manifest write became unconditional can carry
+/// none. The nodes it replaced cannot be named, so they are left in storage
+/// for the sweep to reclaim, and the walk continues rather than stopping — one
+/// such root would otherwise pin every version newer than it forever.
 ///
 /// # Safety
 ///
@@ -131,12 +231,14 @@ pub async fn clean_garbage(
     // from the retained set. Newest-first would truncate the chain at the
     // retention boundary, orphaning everything beyond.
     //
-    // We break (not continue) on any failure because skipping an entry and
-    // releasing a newer one would orphan the skipped entry and everything
-    // older than it.
+    // A read or retention failure breaks (not continues) because skipping an
+    // entry and releasing a newer one would orphan the skipped entry and
+    // everything older than it. A *missing* manifest is different: see the
+    // `None` arm below.
 
     let mut deleted_count = 0;
     let mut indexes_cleaned = 0;
+    let mut unnameable_indexes = 0;
 
     for i in (keep_count..index_chain.len()).rev() {
         let manifest_entry = &index_chain[i - 1];
@@ -144,92 +246,39 @@ pub async fn clean_garbage(
 
         // Manifest from the newer entry lists nodes from entry_to_delete
         // that were replaced when manifest_entry was built.
-        let garbage_id = match &manifest_entry.garbage_id {
-            Some(id) => id,
-            None => {
-                tracing::debug!(
-                    t = manifest_entry.t,
-                    "No garbage manifest in index, stopping GC"
-                );
-                break;
-            }
-        };
-
-        // Load the garbage record by CID
-        let record =
-            match get_cached_or_remote(store, garbage_id, config.artifact_cache_dir.as_deref())
+        match &manifest_entry.garbage_id {
+            Some(garbage_id) => {
+                match release_manifest_nodes(
+                    store,
+                    garbage_id,
+                    manifest_entry.t,
+                    config.artifact_cache_dir.as_deref(),
+                    now_ms,
+                    min_age_ms,
+                )
                 .await
-            {
-                Ok(bytes) => match parse_garbage_record(&bytes) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!(
-                            t = manifest_entry.t,
-                            error = %e,
-                            "Failed to parse garbage record, stopping GC"
-                        );
-                        break;
-                    }
-                },
-                Err(e) => {
-                    tracing::debug!(
-                        t = manifest_entry.t,
-                        error = %e,
-                        "Failed to load garbage record (may already be released), stopping GC"
-                    );
-                    break;
-                }
-            };
-
-        // Check age: if created_at_ms is 0 (old format) or too recent, stop.
-        // Newer manifests will be even more recent, so break is correct.
-        if record.created_at_ms == 0 || now_ms - record.created_at_ms < min_age_ms {
-            tracing::debug!(
-                t = manifest_entry.t,
-                age_mins = (now_ms - record.created_at_ms) / 60000,
-                min_age_mins = min_age_mins,
-                "Garbage record too recent, stopping GC"
-            );
-            break;
-        }
-
-        // Release the garbage nodes (CID strings parsed back to ContentId).
-        let release_started = std::time::Instant::now();
-        tracing::debug!(
-            t = manifest_entry.t,
-            garbage_id = %garbage_id,
-            items = record.garbage.len(),
-            "GC releasing garbage record items"
-        );
-        for item in &record.garbage {
-            match item.parse::<ContentId>() {
-                Ok(cid) => {
-                    if let Err(e) = store.release(&cid).await {
-                        tracing::debug!(
-                            cid = %cid,
-                            error = %e,
-                            "Failed to release garbage node (may already be released)"
-                        );
-                    } else {
-                        deleted_count += 1;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        item,
-                        error = %e,
-                        "Skipping unrecognized garbage item (not a valid CID)"
-                    );
+                {
+                    Some(released) => deleted_count += released,
+                    None => break,
                 }
             }
+            // Roots written before the manifest write became unconditional can
+            // carry none, and the nodes they replaced cannot be named from
+            // here. Those nodes are left for the storage sweep rather than
+            // stalling this walk permanently — a single such root would
+            // otherwise pin every version newer than it. Releasing the
+            // superseded root is still safe: the walk runs oldest-first, so
+            // nothing older than it remains to orphan.
+            None => {
+                tracing::warn!(
+                    t = manifest_entry.t,
+                    superseded_t = entry_to_delete.t,
+                    "index root has no garbage manifest; releasing the superseded root \
+                     and leaving its replaced nodes for the storage sweep"
+                );
+                unnameable_indexes += 1;
+            }
         }
-        tracing::debug!(
-            t = manifest_entry.t,
-            garbage_id = %garbage_id,
-            deleted_count,
-            elapsed_ms = release_started.elapsed().as_millis() as u64,
-            "GC garbage record item release pass complete"
-        );
 
         // Release entry_to_delete's own garbage manifest
         if let Some(ref old_garbage_id) = entry_to_delete.garbage_id {
@@ -258,6 +307,7 @@ pub async fn clean_garbage(
         tracing::info!(
             indexes_cleaned = indexes_cleaned,
             nodes_deleted = deleted_count,
+            unnameable_indexes = unnameable_indexes,
             retained_count = keep_count,
             "Garbage collection complete"
         );
@@ -1267,5 +1317,43 @@ mod tests {
             retained.len() <= 1 + max_old_indexes as usize,
             "retention keeps current + {max_old_indexes} old roots, but t={retained:?} survive"
         );
+    }
+
+    /// Stepping over a manifest gap strands exactly the nodes that gap would
+    /// have named — one build's worth — and nothing more. The storage sweep
+    /// reclaims them; every other superseded node is still released here.
+    #[tokio::test]
+    async fn manifest_gap_strands_only_its_own_step() {
+        let storage = MemoryStorage::new();
+        // The manifest at t=4 would have named t=3's superseded leaf.
+        let (root_cids, leaf_cids) = write_linked_chain(&storage, 6, &[4]).await;
+        let store = test_store(&storage);
+
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let result = clean_garbage(&store, &root_cids[5], config).await.unwrap();
+
+        assert_eq!(
+            result.indexes_cleaned, 4,
+            "the gap must not stop the walk: t=1..4 are all past retention"
+        );
+        assert_eq!(
+            result.nodes_deleted, 3,
+            "every superseded node except the gap step's is released"
+        );
+
+        assert!(
+            store.has(&leaf_cids[2]).await.unwrap(),
+            "t=3's superseded leaf is unnameable and waits for the sweep"
+        );
+        for (t, leaf) in [(1, &leaf_cids[0]), (2, &leaf_cids[1]), (4, &leaf_cids[3])] {
+            assert!(
+                !store.has(leaf).await.unwrap(),
+                "t={t}'s superseded leaf is named by a manifest and must be released"
+            );
+        }
     }
 }

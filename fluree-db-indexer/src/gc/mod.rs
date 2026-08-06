@@ -74,8 +74,11 @@ pub struct CleanGarbageResult {
 
 /// Write a garbage record to storage.
 ///
-/// The caller must ensure `garbage_cid_strings` is non-empty; this function
-/// does not handle the empty case (callers guard with `if !cids.is_empty()`).
+/// An empty `garbage_cid_strings` is valid and records that the root replaced
+/// nothing. Callers write the record unconditionally: the collector stops its
+/// chain walk at the first root with no manifest, so an omitted record and an
+/// empty one are not equivalent.
+///
 /// The CID strings are sorted and deduplicated before writing.
 /// Includes a wall-clock `created_at_ms` timestamp for time-based GC retention.
 ///
