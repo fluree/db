@@ -3976,8 +3976,7 @@ impl FusedR2rmlAggregateOperator {
                             // Decline to the generic path. An IDENTICAL duplicate (same
                             // subject, same constraint result, same next FK) is benign.
                             if subject == e.get().subject {
-                                if passes_own != e.get().passes_own || next_fk != e.get().next_fk
-                                {
+                                if passes_own != e.get().passes_own || next_fk != e.get().next_fk {
                                     return Ok(None);
                                 }
                             } else if subject_sort_key(&subject)
