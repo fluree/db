@@ -586,6 +586,18 @@ pub async fn iceberg_tracking_status(State(state): State<Arc<AppState>>) -> Resp
                 // presented as an outage and hid the real cause.
                 "syncs_deferred": stats.syncs_deferred,
                 "syncs_failed": stats.syncs_failed,
+                // Polls where the targets did not land uniformly. For a fan-out job this
+                // is the normal steady state, not an anomaly.
+                "syncs_partial": stats.syncs_partial,
+
+                // READ THESE for progress. The counters above are per POLL, and a poll
+                // fans out to many independent target ledgers, so they cannot express
+                // partial progress: a window with 21 of 22 targets committed scored zero
+                // commits and one deferral, and was consequently diagnosed as a stall.
+                "targets_committed": stats.targets_committed,
+                "targets_deferred": stats.targets_deferred,
+                "targets_failed": stats.targets_failed,
+
                 "tracked_jobs": stats.tracked_jobs,
             }
         })),

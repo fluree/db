@@ -4,6 +4,38 @@ use crate::format::FormatError;
 use thiserror::Error;
 
 // ============================================================================
+// Fan-out outcome tally
+// ============================================================================
+
+/// Per-target outcome counts for one fan-out materialize window.
+///
+/// The unit of materialize work is the TARGET, not the poll. A single job resolves to
+/// N target ledgers and each can independently commit, defer on novelty backpressure,
+/// or fail — so any counter measured in polls is measuring the wrong thing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TargetTally {
+    /// Targets that committed (or had nothing to do and are up to date).
+    pub ok: usize,
+    /// Targets deferred by novelty backpressure. Self-heals on the next poll.
+    pub deferred: usize,
+    /// Targets that errored.
+    pub failed: usize,
+}
+
+impl TargetTally {
+    /// Total targets attempted in the window.
+    pub fn total(&self) -> usize {
+        self.ok + self.deferred + self.failed
+    }
+
+    /// True when every target reached the same successful outcome — the only case in
+    /// which the shared watermark may advance.
+    pub fn is_complete(&self) -> bool {
+        self.deferred == 0 && self.failed == 0
+    }
+}
+
+// ============================================================================
 // Builder errors
 // ============================================================================
 
@@ -274,6 +306,35 @@ pub enum ApiError {
         remaining: usize,
     },
 
+    /// A fan-out window where the targets did not all reach the same outcome.
+    ///
+    /// One materialize job resolves to N target ledgers, each an independent commit
+    /// domain. Partial application is therefore the NORMAL case, not an exception, and
+    /// reporting it as a single scalar outcome loses the only number that matters:
+    /// how many targets actually progressed.
+    ///
+    /// This is still an `Err` because the shared watermark is held back whenever any
+    /// target is behind, so the window is NOT complete and a caller must re-poll. The
+    /// tally rides along so the caller can account for the targets that did commit.
+    ///
+    /// Concretely: a production poll with 21 of 22 targets committing surfaced as one
+    /// `NoveltyDeferred`, so the worker recorded zero commits and one deferral. Read off
+    /// the stats, a healthy window was indistinguishable from a total stall — and it was
+    /// diagnosed as one.
+    #[error(
+        "Materialization applied {} of {} targets ({} deferred, {} failed); the watermark is held \
+         back so the window is retried. Most serious outcome: {detail}",
+        tally.ok, tally.total(), tally.deferred, tally.failed
+    )]
+    MaterializePartial {
+        /// Per-target outcome counts for this window.
+        tally: TargetTally,
+        /// The most serious single outcome — a failure if any target failed, else a
+        /// deferral. Failure outranks deferral because a deferral self-heals on the
+        /// next poll and a failure usually needs attention.
+        detail: String,
+    },
+
     /// Internal errors (ledger_info, etc.)
     #[error("Internal error: {0}")]
     Internal(String),
@@ -385,6 +446,20 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Per-target tally when this error came from a fan-out materialize window.
+    ///
+    /// Exists so a caller can credit the targets that DID commit without matching on the
+    /// variant. The absence of any such accessor is what made the previous behaviour
+    /// invisible: a partial window arrived as `NoveltyDeferred { remaining }`, which has
+    /// nowhere to put "21 targets succeeded", so the information was not so much lost as
+    /// unrepresentable.
+    pub fn target_tally(&self) -> Option<TargetTally> {
+        match self {
+            ApiError::MaterializePartial { tally, .. } => Some(*tally),
+            _ => None,
+        }
+    }
+
     /// Check if this error represents a "not found" condition.
     ///
     /// Matches both `ApiError::NotFound` and `ApiError::Ledger(LedgerError::NotFound)`.
@@ -620,5 +695,84 @@ mod tests {
             ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
             400
         );
+    }
+
+    #[test]
+    fn tally_totals_and_completeness() {
+        let all_good = TargetTally {
+            ok: 22,
+            deferred: 0,
+            failed: 0,
+        };
+        assert_eq!(all_good.total(), 22);
+        assert!(all_good.is_complete());
+
+        // One target behind is enough to hold the shared watermark back.
+        for behind in [
+            TargetTally {
+                ok: 21,
+                deferred: 1,
+                failed: 0,
+            },
+            TargetTally {
+                ok: 21,
+                deferred: 0,
+                failed: 1,
+            },
+        ] {
+            assert_eq!(behind.total(), 22);
+            assert!(
+                !behind.is_complete(),
+                "a target that did not commit must block watermark advance: {behind:?}"
+            );
+        }
+    }
+
+    /// The regression this variant exists for. Reproduces the exact production window:
+    /// 21 of 22 targets committed, one did not.
+    ///
+    /// This test CANNOT be written against the previous behaviour — that path returned
+    /// `NoveltyDeferred { remaining }` / `Internal(String)`, neither of which has a field
+    /// capable of holding "21 targets succeeded". The count was unrepresentable, so the
+    /// worker scored the window as zero commits and the deployment was diagnosed as
+    /// stalled while 21 ledgers were in fact being written every poll.
+    #[test]
+    fn a_partial_window_reports_the_targets_that_succeeded() {
+        let tally = TargetTally {
+            ok: 21,
+            deferred: 1,
+            failed: 0,
+        };
+        let e = ApiError::MaterializePartial {
+            tally,
+            detail: "novelty at capacity, 3088 items pending".into(),
+        };
+
+        assert_eq!(
+            e.target_tally().map(|t| t.ok),
+            Some(21),
+            "the 21 committed targets must be recoverable from the error itself"
+        );
+
+        // The operator-facing message must lead with the ratio, because "deferred" alone
+        // is what read as a total stall.
+        let msg = e.to_string();
+        assert!(
+            msg.contains("21 of 22"),
+            "message must state the ratio, got: {msg}"
+        );
+        assert!(msg.contains("1 deferred"), "got: {msg}");
+        assert!(
+            msg.contains("watermark is held back"),
+            "message must say the window will be retried, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn target_tally_is_none_for_unrelated_errors() {
+        assert!(ApiError::NoveltyDeferred { remaining: 5 }
+            .target_tally()
+            .is_none());
+        assert!(ApiError::Internal("boom".into()).target_tally().is_none());
     }
 }

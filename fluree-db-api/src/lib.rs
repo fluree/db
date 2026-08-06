@@ -135,7 +135,7 @@ pub use dataset::{
     sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
     TimeSpec,
 };
-pub use error::{ApiError, BuilderError, BuilderErrors, Result};
+pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
 pub use fluree_db_core::storage::ledger_id_prefix_for_path;
 pub use fluree_db_core::RemoteObject;

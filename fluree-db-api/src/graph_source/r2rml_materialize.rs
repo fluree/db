@@ -62,6 +62,7 @@ use fluree_db_r2rml::materialize::{
 };
 use fluree_vocab::UnresolvedDatatypeConstraint;
 
+use crate::error::TargetTally;
 use crate::graph_source::FlureeR2rmlProvider;
 use crate::{ApiError, Fluree, Result};
 // `StreamExt::next` — the scan is consumed as a stream so the whole table is never
@@ -150,6 +151,11 @@ pub struct MaterializeResult {
     /// this pass was a delete). Always 0 when no delete convention is configured
     /// or on the first materialization of a not-yet-existing target.
     pub subjects_retracted: usize,
+    /// Per-target outcome counts. On the success path every target is in `ok`; the
+    /// mixed case arrives as `ApiError::MaterializePartial` instead. Present on both
+    /// so a caller can account for targets uniformly rather than inferring the count
+    /// from whichever branch it landed in.
+    pub tally: TargetTally,
 }
 
 impl Fluree {
@@ -384,6 +390,8 @@ impl Fluree {
                 rows_read,
                 subjects_upserted: 0,
                 subjects_retracted: 0,
+                // No targets were attempted: the window had no rows to apply.
+                tally: TargetTally::default(),
             });
         }
 
@@ -480,11 +488,16 @@ impl Fluree {
             }
         }
 
-        if !deferred.is_empty() || !failed.is_empty() {
+        let tally = TargetTally {
+            ok: ok_targets,
+            deferred: deferred.len(),
+            failed: failed.len(),
+        };
+        if !tally.is_complete() {
             info!(
-                targets_ok = ok_targets,
-                targets_deferred = deferred.len(),
-                targets_failed = failed.len(),
+                targets_ok = tally.ok,
+                targets_deferred = tally.deferred,
+                targets_failed = tally.failed,
                 "materialize: partial window"
             );
         }
@@ -496,18 +509,28 @@ impl Fluree {
         //
         // Failure outranks deferral: a deferral self-heals on the next poll, a failure
         // usually needs attention, and reporting the milder of the two would bury it.
+        //
+        // Both branches report through `MaterializePartial` so the TALLY survives. The
+        // previous code collapsed the window to a single scalar outcome, which meant a
+        // 21-of-22 poll was recorded as one deferral and zero commits: from the stats
+        // alone, a healthy window and a total stall were the same reading.
         if !failed.is_empty() {
-            let n_failed = failed.len();
-            let n_total = ok_targets + n_failed + deferred.len();
             let (target, e) = failed.remove(0);
-            return Err(ApiError::Internal(format!(
-                "materialize: {n_failed} of {n_total} targets failed (watermark held back \
-                 so the window is retried); first failure on {target}: {e}"
-            )));
+            return Err(ApiError::MaterializePartial {
+                tally,
+                detail: format!("target {target} failed: {e}"),
+            });
         }
         if !deferred.is_empty() {
-            let remaining = deferred.iter().map(|(_, r)| *r).sum();
-            return Err(ApiError::NoveltyDeferred { remaining });
+            let remaining: usize = deferred.iter().map(|(_, r)| *r).sum();
+            // Deliberately NOT special-cased to `NoveltyDeferred` when ok == 0. That
+            // looked tidier, but it discards `tally.deferred` — the same shape of loss
+            // this variant exists to prevent, just at the other end of the range. One
+            // path keeps the counts intact for every mix.
+            return Err(ApiError::MaterializePartial {
+                tally,
+                detail: format!("novelty at capacity, {remaining} items pending"),
+            });
         }
 
         // 5. Advance the job watermark(s) in the shared state ledger — AFTER every
@@ -546,6 +569,7 @@ impl Fluree {
             rows_read,
             subjects_upserted,
             subjects_retracted,
+            tally,
         })
     }
 

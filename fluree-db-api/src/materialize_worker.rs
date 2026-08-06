@@ -39,6 +39,7 @@ use std::time::Instant;
 use tokio::time::{self, Duration, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use crate::error::TargetTally;
 use crate::ApiError;
 use crate::Fluree;
 
@@ -73,8 +74,37 @@ pub struct MaterializeWorkerStats {
     pub syncs_deferred: u64,
     /// Polls that errored.
     pub syncs_failed: u64,
+    /// Polls where SOME targets progressed and others did not. Counted apart from both
+    /// success and failure because it is neither, and because it is the normal steady
+    /// state for a fan-out job: 22 independent commit domains rarely agree.
+    pub syncs_partial: u64,
+
+    // Target-level counters. These are the ones to read. A poll fans out to N targets,
+    // so poll-level counters cannot express progress: 21 of 22 targets committing scored
+    // as zero commits and one deferral, and a healthy production window was consequently
+    // diagnosed as a stall. Summed across polls, not per poll.
+    /// Targets that committed, summed across all polls.
+    pub targets_committed: u64,
+    /// Targets deferred by novelty backpressure, summed across all polls.
+    pub targets_deferred: u64,
+    /// Targets that errored, summed across all polls.
+    pub targets_failed: u64,
+
     /// Currently tracked jobs.
     pub tracked_jobs: usize,
+}
+
+impl MaterializeWorkerStats {
+    /// Assign per-target credit for one poll. The ONLY place target counters move.
+    ///
+    /// Extracted from `poll_job` so the credit rule is reachable from a test without a
+    /// live `Fluree` — the previous rule lived inline, was never exercised, and was
+    /// wrong: it attributed the whole poll to its worst target.
+    fn record_targets(&mut self, tally: TargetTally) {
+        self.targets_committed += tally.ok as u64;
+        self.targets_deferred += tally.deferred as u64;
+        self.targets_failed += tally.failed as u64;
+    }
 }
 
 /// A tracked materialization job: read `source`, materialize into `target`.
@@ -335,7 +365,11 @@ impl MaterializeTrackingWorker {
             .await
         {
             Ok(result) if result.committed => {
-                self.bump(|s| s.syncs_committed += 1);
+                let tally = result.tally;
+                self.bump(|s| {
+                    s.syncs_committed += 1;
+                    s.record_targets(tally);
+                });
                 info!(
                     source = %job.source,
                     target = %job.target,
@@ -345,6 +379,7 @@ impl MaterializeTrackingWorker {
                     rows_read = result.rows_read,
                     subjects_upserted = result.subjects_upserted,
                     subjects_retracted = result.subjects_retracted,
+                    targets_ok = result.tally.ok,
                     "materialize tracking synced"
                 );
             }
@@ -366,6 +401,33 @@ impl MaterializeTrackingWorker {
                     "materialize tracking: deferred on novelty backpressure, will retry next poll"
                 );
             }
+            // A fan-out window that did not land uniformly. Credit the targets that DID
+            // commit: attributing the whole poll to its worst target is what made a
+            // 21-of-22 window read as a stall. The poll-level counter records that the
+            // window is incomplete; the target-level counters record what moved.
+            Err(ApiError::MaterializePartial { tally, detail }) => {
+                self.bump(|s| {
+                    s.syncs_partial += 1;
+                    s.record_targets(tally);
+                });
+                // `warn` only when a target genuinely FAILED. An all-deferred remainder
+                // is backpressure and warning on it trains operators to ignore warnings.
+                if tally.failed > 0 {
+                    warn!(
+                        source = %job.source, target = %job.target,
+                        targets_ok = tally.ok, targets_deferred = tally.deferred,
+                        targets_failed = tally.failed, detail = %detail,
+                        "materialize tracking: partial window, some targets FAILED"
+                    );
+                } else {
+                    info!(
+                        source = %job.source, target = %job.target,
+                        targets_ok = tally.ok, targets_deferred = tally.deferred,
+                        detail = %detail,
+                        "materialize tracking: partial window, remainder deferred"
+                    );
+                }
+            }
             Err(e) => {
                 self.bump(|s| s.syncs_failed += 1);
                 warn!(source = %job.source, target = %job.target, error = %e, "materialize tracking sync failed");
@@ -382,6 +444,51 @@ impl MaterializeTrackingWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window that was misread in production: 21 of 22 targets committed.
+    ///
+    /// Pins the RULE, not just the arithmetic — a poll is credited by its targets, so an
+    /// incomplete window still records everything that moved. The previous accounting
+    /// attributed the poll to its worst target, so this same window produced
+    /// `targets_committed = 0` and looked identical to a deployment where nothing ran.
+    #[test]
+    fn a_partial_window_credits_the_targets_that_committed() {
+        let mut stats = MaterializeWorkerStats::default();
+        stats.record_targets(TargetTally {
+            ok: 21,
+            deferred: 1,
+            failed: 0,
+        });
+
+        assert_eq!(
+            stats.targets_committed, 21,
+            "21 ledgers were written; recording 0 is what made a healthy window read as a stall"
+        );
+        assert_eq!(stats.targets_deferred, 1);
+        assert_eq!(stats.targets_failed, 0);
+    }
+
+    /// Target counters accumulate ACROSS polls — they are totals, not a snapshot of the
+    /// last window. A rising `targets_committed` next to a flat `syncs_committed` is the
+    /// signal that fan-out work is progressing while windows stay incomplete.
+    #[test]
+    fn target_counters_accumulate_across_polls() {
+        let mut stats = MaterializeWorkerStats::default();
+        for _ in 0..3 {
+            stats.record_targets(TargetTally {
+                ok: 21,
+                deferred: 0,
+                failed: 1,
+            });
+        }
+        assert_eq!(stats.targets_committed, 63);
+        assert_eq!(stats.targets_failed, 3);
+        assert_eq!(stats.targets_deferred, 0);
+        // Poll-level counters are untouched by target credit: they answer a different
+        // question ("did the WINDOW complete?") and conflating them is the original bug.
+        assert_eq!(stats.syncs_committed, 0);
+        assert_eq!(stats.syncs_partial, 0);
+    }
 
     impl MaterializeWorkerHandle {
         /// Build a bare handle (no worker / `Fluree`) for scheduling tests.
