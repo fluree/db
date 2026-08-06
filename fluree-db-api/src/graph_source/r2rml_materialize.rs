@@ -1141,6 +1141,11 @@ impl Fluree {
         // does.
         let mut pending: Vec<Vec<T>> = chunks.into_iter().filter(|c| !c.is_empty()).rev().collect();
 
+        // Reloads allowed across this whole call, not per chunk: a target being written
+        // by many sources at once could otherwise be retried indefinitely.
+        const MAX_CONFLICT_RETRIES: usize = 10;
+        let mut conflict_retries = 0usize;
+
         while let Some(chunk) = pending.pop() {
             let doc = build(&chunk);
             let result = match verb {
@@ -1150,6 +1155,40 @@ impl Fluree {
             };
             match result {
                 Ok(r) => ledger = r.ledger,
+                // STALE BASE — reload and retry.
+                //
+                // `CommitConflict{expected_t, head_t}` reads the opposite way to how the
+                // field names suggest: `expected_t` is the NAMESERVICE's durable
+                // commit_t and `head_t` is OUR in-memory base's t (see
+                // `verify_sequencing` in fluree-db-transact). So `expected=21, head_t=5`
+                // means our base is SIXTEEN commits behind, not ahead.
+                //
+                // That is an ordinary lost-update race, and under fan-out it is
+                // constant: 17 sources resolve the same ~22 targets, so while we work
+                // through our chunks other sources commit to the same ledger. The gap
+                // size is simply how many they managed. Observed gaps: 1, 2, 4, 16.
+                //
+                // Reloading the base is the standard remedy. Bounded, because a target
+                // under permanent write pressure should surface rather than spin, and
+                // C4 isolates the failure to this target either way.
+                Err(ApiError::Transact(fluree_db_transact::TransactError::CommitConflict {
+                    expected_t,
+                    head_t,
+                })) if conflict_retries < MAX_CONFLICT_RETRIES => {
+                    conflict_retries += 1;
+                    let id = ledger.ledger_id().to_string();
+                    info!(
+                        ledger = %id,
+                        durable_t = expected_t,
+                        our_base_t = head_t,
+                        behind_by = expected_t - head_t,
+                        attempt = conflict_retries,
+                        "materialize: stale base after a concurrent write; reloading and \
+                         retrying this chunk"
+                    );
+                    ledger = self.ledger(&id).await?;
+                    pending.push(chunk);
+                }
                 Err(e) => {
                     // Classification lives in `classify_novelty` so it is testable;
                     // `None` means a real failure — fail fast.
@@ -1707,6 +1746,44 @@ mod tests {
     }
     /// Fixed target ledger for accumulator tests that don't exercise fan-out.
     const TGT: &str = "t:main";
+
+    /// `CommitConflict`'s fields read the OPPOSITE way to their names, and this pins
+    /// that so nobody re-derives it wrongly.
+    ///
+    /// From `verify_sequencing` in fluree-db-transact:
+    ///     expected_t = record.commit_t   -> the NAMESERVICE's durable head
+    ///     head_t     = base.t()          -> OUR in-memory base
+    ///
+    /// So `expected_t > head_t` means our base is BEHIND, i.e. someone else committed
+    /// while we held it — an ordinary lost update. Reading the names at face value
+    /// suggests the reverse ("we expected the head to be further along"), which points
+    /// at an exotic cause and away from the real one. That misreading is exactly what
+    /// happened: the conflicts were documented as "direction unexplained" for two days
+    /// before the field order was checked.
+    #[test]
+    fn commit_conflict_field_order_means_our_base_is_behind() {
+        use fluree_db_transact::TransactError;
+
+        // The shape actually observed in production, gap of 16.
+        let e = TransactError::CommitConflict {
+            expected_t: 21,
+            head_t: 5,
+        };
+        let TransactError::CommitConflict { expected_t, head_t } = e else {
+            panic!("variant changed");
+        };
+        assert!(
+            expected_t > head_t,
+            "expected_t is the DURABLE head and head_t is OUR base, so a lost update \
+             has expected_t > head_t"
+        );
+        assert_eq!(
+            expected_t - head_t,
+            16,
+            "the gap is how many commits landed while we held a stale base — not \
+             evidence of anything exotic"
+        );
+    }
 
     /// Losing the create race must be tolerated on the TARGET path, exactly as it
     /// already is for the state ledger.
