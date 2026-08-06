@@ -53,7 +53,7 @@ use fluree_db_r2rml::mapping::{
 };
 use fluree_db_r2rml::materialize::{
     canonical_join, get_join_key_from_batch, materialize_object_from_batch,
-    materialize_subject_from_batch, RdfTerm,
+    materialize_subject_from_batch, subject_sort_key, RdfTerm,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use futures::StreamExt;
@@ -792,34 +792,10 @@ enum GKey {
     Null,
 }
 
-/// N1 kill switch (`FLUREE_FUSED_VECTOR_FOLD`, default **on**). Off (`0`/`false`/
-/// `off`/`no`) restores the byte-identical `HashMap<Vec<GKey>, Vec<Acc>>` fold that
-/// allocates + clones a fresh owned key every row. Read once per process.
-fn vector_fold_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_VECTOR_FOLD"))
-}
-
 /// Rows per bounded output chunk when output-bounding is on (see `pending_rows`). A
 /// GROUP BY rollup with more groups than this emits multiple batches instead of one
 /// giant one, so a high-cardinality result never fully materializes at once.
 const OUTPUT_BOUND_ROWS: usize = 8192;
-
-/// Output-bounding kill switch (`FLUREE_FUSED_R2RML_OUTPUT_BOUND`, default **on**).
-/// Off restores the single-batch emission wholesale (byte-identical to pre-bounding:
-/// one batch, groups in dict/map iteration order). Read uncached under cfg(test) so
-/// the on/off differential is testable without an `OnceLock` caching the first value.
-fn output_bound_enabled() -> bool {
-    #[cfg(not(test))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND"))
-    }
-    #[cfg(test)]
-    {
-        crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND")
-    }
-}
 
 /// N1: a BORROWED view of one composite-group-key component, read straight from
 /// the scanned batch (or the resolver's owned dim GKeys) with no per-row `String`
@@ -1201,20 +1177,6 @@ struct KeptChainRow {
     next_fk: Option<Vec<String>>,
 }
 
-/// Comparable ordering key for a parent SUBJECT term — a LOCAL mirror of the
-/// materialize crate's private `subject_sort_key` (`graph.rs`). The two MUST agree:
-/// the P3 semi-join keep-min must pick the SAME parent row the generic
-/// `build_parent_lookup` (via `parent_key_insert_keep_min`) picks, so a fused probe is
-/// byte-identical to the generic chained inner join on duplicate intermediate keys.
-/// The dup-ORDER_KEY differential (kept row failing, discarded dup passing) guards any
-/// drift between the two.
-fn semijoin_subject_sort_key(term: &RdfTerm) -> &str {
-    match term {
-        RdfTerm::Iri(s) | RdfTerm::BlankNode(s) => s,
-        RdfTerm::Literal { value, .. } => value,
-    }
-}
-
 /// A native `SUM(expr)` / `AVG(expr)` plan: the arithmetic expression and the
 /// (variable, column, read-kind) of each referenced variable.
 struct ExprFold {
@@ -1276,6 +1238,17 @@ pub struct FusedR2rmlAggregateOperator {
     /// the switch is off (or the result fits one chunk) the single-batch path is taken
     /// and this stays `None`.
     pending_rows: Option<Vec<(Vec<GKey>, Vec<Acc>)>>,
+    /// N1/N2/P3 kill switches, resolved from env ONCE at CONSTRUCTION (id=3717339910).
+    /// Not a process-wide `OnceLock` and not read per-call: a per-operator field is
+    /// what lets a test flip a switch by SETTING THE FIELD instead of mutating process
+    /// env. `std::env::set_var`/`remove_var` race the env reads on parallel test threads
+    /// (libc-level UB; `set_var` is `unsafe` in edition 2024). Each defaults ON unless
+    /// its env var holds a falsy spelling (`0`/`false`/`off`/`no`), via
+    /// [`crate::r2rml::env_switch_enabled`]. (`FLUREE_FUSED_R2RML_MULTIFACT_GEN` on
+    /// #1589 must adopt this same field pattern.)
+    vector_fold: bool,
+    output_bound: bool,
+    multifact: bool,
 }
 
 impl FusedR2rmlAggregateOperator {
@@ -1304,6 +1277,9 @@ impl FusedR2rmlAggregateOperator {
             state: OperatorState::Created,
             done: false,
             pending_rows: None,
+            vector_fold: crate::r2rml::env_switch_enabled("FLUREE_FUSED_VECTOR_FOLD"),
+            output_bound: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND"),
+            multifact: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"),
         }
     }
 
@@ -1587,6 +1563,10 @@ impl FusedR2rmlAggregateOperator {
     /// group's key + accumulators are freed as it is finalized (peak output-side memory
     /// = one chunk, not the whole result). Group order is unspecified (a wrapping Sort
     /// applies any ORDER BY), so back-to-front drain is sound. Sets `done` once drained.
+    /// Corollary (id=3717339912): a bare `LIMIT` with NO `ORDER BY` may therefore return
+    /// a DIFFERENT set of rows with output-bounding on vs off (the two drains yield the
+    /// groups in opposite order, and LIMIT keeps a prefix) — permitted, since SPARQL
+    /// leaves the row order of an unsorted result unspecified.
     fn emit_pending_chunk(&mut self) -> Result<Option<Batch>> {
         let resolved = self
             .resolved
@@ -1732,7 +1712,7 @@ impl Operator for FusedR2rmlAggregateOperator {
         // a table grow cannot re-bucket a key away from its probe (the split-group
         // bug a plain `HashMap` + `insert_hashed_nocheck` hits on resize). `groups`
         // is the OFF-path (`FLUREE_FUSED_VECTOR_FOLD=0`) byte-identical owned-key map.
-        let vfold = vector_fold_enabled();
+        let vfold = self.vector_fold;
         let mut dict: hashbrown::HashTable<(Vec<GKey>, u32)> = hashbrown::HashTable::new();
         let mut group_accs: Vec<Vec<Acc>> = Vec::new();
         let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
@@ -1912,7 +1892,17 @@ impl Operator for FusedR2rmlAggregateOperator {
                         ) {
                             hashbrown::hash_table::Entry::Occupied(o) => o.get().1,
                             hashbrown::hash_table::Entry::Vacant(v) => {
-                                let id = group_accs.len() as u32;
+                                // id=3717339911: the dense group id is a u32. Past
+                                // u32::MAX groups the cast would silently wrap and corrupt
+                                // accumulators; assert the invariant (the memory-budget
+                                // checkpoint normally trips far earlier, but is not set on
+                                // every caller/fixture path).
+                                debug_assert!(
+                                    group_accs.len() <= u32::MAX as usize,
+                                    "fused group count exceeded u32::MAX"
+                                );
+                                let id = u32::try_from(group_accs.len())
+                                    .expect("fused group count exceeds u32::MAX");
                                 let owned: Vec<GKey> =
                                     scratch.iter().map(|r| r.to_owned_key()).collect();
                                 v.insert((owned, id));
@@ -2051,7 +2041,7 @@ impl Operator for FusedR2rmlAggregateOperator {
             groups.into_iter().collect()
         };
 
-        if !output_bound_enabled() || rows.len() <= OUTPUT_BOUND_ROWS {
+        if !self.output_bound || rows.len() <= OUTPUT_BOUND_ROWS {
             // Switch off, or the whole result fits one bounded chunk: emit a single
             // batch. Byte-identical to the pre-bounding path (same rows, dict/map
             // iteration order — no reordering, since nothing is popped).
@@ -2450,11 +2440,29 @@ impl FusedR2rmlAggregateOperator {
                 }
                 None => {
                     // P2a: a RefObjectMap object var (e.g. the `?c` group key) has no
-                    // scalar column. Its row-validity is "the FK child columns are
-                    // non-null" — a NULL FK yields no ref triple, exactly as
-                    // `materialize_pom_object` returns None on a null join key, so the
-                    // fact row drops. (A present-but-dangling FK is dropped later by
-                    // the resolver probe.) Any other unresolvable object declines.
+                    // scalar column. It is admitted ONLY when it is the RefObjectMap
+                    // GROUP BY key — the one var for which the `group_resolver` below is
+                    // built (a resolver exists ONLY inside `if let Some(..) =
+                    // ref_group_key`, and `ref_group_key` is set ONLY by the GROUP BY
+                    // loop above). The resolver's per-row parent probe drops a
+                    // present-but-dangling FK, matching the generic inner join. A ref
+                    // object var that is NOT the group key — any pattern object var, or
+                    // an ungrouped `COUNT`/`SUM` over `?o :ref ?c` — has NO resolver, so
+                    // admitting it on FK-non-null validity alone would COUNT a
+                    // present-but-dangling FK the generic path drops (an over-count;
+                    // every prior P2a fixture had a GROUP BY, which is why this slipped).
+                    // Decline it to the generic path (never over-count). Declining here,
+                    // before `count_shortcut_eligible` (reached only from `next_batch` on
+                    // a resolved plan), also closes the secondary manifest `record_count`
+                    // over-count for this shape.
+                    if !self.group_by.contains(&v) {
+                        return Ok(None);
+                    }
+                    // Its row-validity is "the FK child columns are non-null" — a NULL FK
+                    // yields no ref triple, exactly as `materialize_pom_object` returns
+                    // None on a null join key, so the fact row drops. (A present-but-
+                    // dangling FK is dropped by the `group_resolver` probe.) Any other
+                    // unresolvable object declines.
                     let Some((rom, _parent)) =
                         Self::ref_object_map_for_var(&pattern, tm, v, &mapping)
                     else {
@@ -2540,7 +2548,11 @@ impl FusedR2rmlAggregateOperator {
                         };
                     // Deterministic keep-min on a duplicate parent join key: keep the
                     // lexicographically smaller IRI, byte-identical to
-                    // `parent_key_insert_keep_min` on the generic path.
+                    // `parent_key_insert_keep_min` on the generic path. The subject is a
+                    // pure IRI here (blank node declined above), so this raw-string `<` is
+                    // exactly the shared `subject_sort_key` comparator applied to
+                    // `RdfTerm::Iri` — the third keep-min copy shares that ordering
+                    // (id=3717339907).
                     match map.entry(key) {
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert(vec![GKey::Str(iri)]);
@@ -2774,27 +2786,6 @@ impl FusedR2rmlAggregateOperator {
             return None; // disconnected
         }
         Some((order, join_vars))
-    }
-
-    /// P3 kill switch (`FLUREE_FUSED_R2RML_MULTIFACT`, default **on**). Off restores
-    /// the pre-P3 behavior wholesale: a branching multi-fact shape simply declines to
-    /// the generic pipeline. Read once per process.
-    fn multifact_enabled() -> bool {
-        // Production: read once (process-wide), like the sibling fused switches.
-        #[cfg(not(test))]
-        {
-            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ENABLED
-                .get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"))
-        }
-        // Test: read the env each call so the switch-off decline path is testable
-        // without a process-wide `OnceLock` caching the first observed value. Only the
-        // gate test toggles this var (under a lock); the resolver tests call
-        // `resolve_branching_star_at_open` directly and never read it.
-        #[cfg(test)]
-        {
-            crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT")
-        }
     }
 
     /// Generality kill switch (`FLUREE_FUSED_R2RML_MULTIFACT_GEN`, default **on**).
@@ -3270,7 +3261,7 @@ impl FusedR2rmlAggregateOperator {
                 // shape outside the admitted class. With the switch OFF this is the
                 // pre-P3 decline (byte-identical), so a branching shape reverts to the
                 // generic pipeline wholesale.
-                if Self::multifact_enabled() {
+                if self.multifact {
                     if let Some(star) = Self::decompose_branching_star(pats, &self.group_by) {
                         return self
                             .resolve_branching_star_at_open(ctx, mapping, star)
@@ -3885,7 +3876,10 @@ impl FusedR2rmlAggregateOperator {
     ///
     /// #1583: the membership *set* models an inner join only while each FK is
     /// single-valued (one fact row → at most one branch row per hop). A fan-out
-    /// `RefObjectMap` must revisit this (see [`SemiJoinSet`]).
+    /// `RefObjectMap` must revisit this (see [`SemiJoinSet`]). Relatedly, the keep-min
+    /// build DECLINES a same-key/same-subject SCD-2 collision whose rows disagree on the
+    /// constraint result or next-hop FK (id=3717339904) — keep-min alone would let scan
+    /// order decide the answer.
     async fn build_semi_join_membership(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -3909,6 +3903,25 @@ impl FusedR2rmlAggregateOperator {
         let m = chain.len();
         if m == 0 {
             return Ok(None); // a branch with no dim is not a semi-join (defensive)
+        }
+        // A chain pattern's VAR-OBJECT members (`star_bindings`) OTHER than its next-hop
+        // FK impose a BGP existence requirement (the object column must be non-null for
+        // the triple to match) — and, across two branches sharing the object var, a
+        // cross-branch equality — NEITHER of which this keep-min membership build honors:
+        // it projects only join / subject / constraint / next-FK columns and never
+        // consults `star_bindings`. Silently dropping such a member OVER-ADMITS the root
+        // FK (e.g. `?c :segment "Enterprise" ; :region ?r` with a null region admits a
+        // customer the generic BGP excludes). The ONLY star_binding a chain pattern may
+        // carry is the FK to its next hop — a branch join var, consumed by the hop
+        // resolution below. Any other var-object member declines to the generic path
+        // (never over-admit); honoring it is a follow-on (project the column + a per-
+        // column non-null drop + a cross-branch shared-var equality pass).
+        if chain.iter().any(|p| {
+            p.star_bindings
+                .iter()
+                .any(|(_, v)| !branch.join_vars.contains(v))
+        }) {
+            return Ok(None);
         }
         // Per-hop FK resolution. hop `h` connects source `h` (index 0 = root, then
         // chain[0..m-1]) to chain[h] via join var (root_join_var, then branch.join_vars):
@@ -4052,8 +4065,23 @@ impl FusedR2rmlAggregateOperator {
                             });
                         }
                         Entry::Occupied(mut e) => {
-                            if semijoin_subject_sort_key(&subject)
-                                < semijoin_subject_sort_key(&e.get().subject)
+                            // id=3717339904 (SCD-2 same-key/same-subject gap): two dim
+                            // rows sharing the join key that mint the SAME subject but
+                            // disagree on `passes_own` (the constraint result) or
+                            // `next_fk` (the next hop) are the normal SCD-2 case (multiple
+                            // versions per key, same subject template, differing on
+                            // IS_CURRENT / a versioned FK). keep-min discriminates only by
+                            // subject, so it would keep whichever row the scan hit first —
+                            // a scan-order-dependent ANSWER (the generic chained join
+                            // materializes every version's triples; this fold tests one).
+                            // Decline to the generic path. An IDENTICAL duplicate (same
+                            // subject, same constraint result, same next FK) is benign.
+                            if subject == e.get().subject {
+                                if passes_own != e.get().passes_own || next_fk != e.get().next_fk {
+                                    return Ok(None);
+                                }
+                            } else if subject_sort_key(&subject)
+                                < subject_sort_key(&e.get().subject)
                             {
                                 e.insert(KeptChainRow {
                                     subject,
@@ -5865,6 +5893,70 @@ mod tests {
         );
     }
 
+    /// B1 (review id=3717339897): an UNGROUPED aggregate (`group_by:[]`, COUNT(*))
+    /// over a RefObjectMap object var (`?o <custRef> ?c`) must DECLINE the fuse. A
+    /// `group_resolver` — whose per-row parent probe drops a present-but-dangling FK —
+    /// is built ONLY for a RefObjectMap GROUP BY key (inside `if let Some(..) =
+    /// ref_group_key`). Without a resolver the single-table fold admits the object var
+    /// on FK-non-null validity alone, so a present-but-dangling FK passes and is folded
+    /// in — an over-count vs the generic inner join (which drops it). Here orders carry
+    /// CFK {10,10,20,99} against customers {10,20}: pre-fix `resolve_at_open` ADMITTED
+    /// (would fold COUNT=4), the generic answer is 3. Every prior P2a fixture has a
+    /// GROUP BY, which is exactly why this slipped. The fix declines → the generic path
+    /// answers 3 (fused == generic by construction). Declining before
+    /// `count_shortcut_eligible` (reached only from `next_batch` on a RESOLVED plan)
+    /// also closes the secondary manifest `record_count` over-count for this shape.
+    #[tokio::test]
+    async fn ungrouped_ref_object_var_declines_dangling_fk_over_count() {
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let (o, c, cnt) = (VarId(0), VarId(1), VarId(20));
+        // `?o <custRef> ?c` — the SAME single-table representation the grouped P2a
+        // fixtures use (predicate_filter + object_var bound by a RefObjectMap), only
+        // UNGROUPED.
+        let mut fact = R2rmlPattern::new("gs", o, Some(c));
+        fact.triples_map_iri = Some("#Order".to_string());
+        fact.predicate_filter = Some("http://ex/custRef".to_string());
+        let plan = FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![Pattern::R2rml(fact)],
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![], // UNGROUPED — no ref_group_key, so no dangling-FK resolver
+            aggregates: vec![(cnt, AggregateFn::CountAll)],
+        };
+        let op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
+        let mapping = order_customer_mapping("http://ex/cust/{CID}");
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "order".to_string(),
+            vec![batch_of(vec![
+                i64_col("OID", 1, vec![Some(1), Some(2), Some(3), Some(4)]),
+                i64_col("CFK", 2, vec![Some(10), Some(10), Some(20), Some(99)]),
+            ])],
+        );
+        batches.insert(
+            "customer".to_string(),
+            vec![batch_of(vec![i64_col("CID", 1, vec![Some(10), Some(20)])])],
+        );
+        let provider = CrtProvider { mapping, batches };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let resolved = op
+            .resolve_at_open(&ctx)
+            .await
+            .expect("resolve must not error");
+        assert!(
+            resolved.is_none(),
+            "an ungrouped aggregate over a RefObjectMap object var must DECLINE (no \
+             resolver drops the present-but-dangling FK); pre-fix it admitted and \
+             over-counted 4 vs the generic 3"
+        );
+    }
+
     #[tokio::test]
     async fn ref_iri_group_key_keep_min_on_duplicate_parent_key() {
         // Rider (b): a DUPLICATE parent join key with DISTINCT subjects. The customer
@@ -7457,6 +7549,107 @@ mod tests {
         );
     }
 
+    /// B2 (review id=3717398030): a semi-join CHAIN pattern that carries a VAR-OBJECT
+    /// member (`star_bindings`) OTHER than its next-hop FK must DECLINE the fuse.
+    /// `build_semi_join_membership` projects only join / subject / constraint / next-FK
+    /// columns and never consults `star_bindings`, so a leaf var-object member — a BGP
+    /// existence requirement (the object column must be non-null for the triple to
+    /// match) — would be silently dropped and OVER-ADMIT the root FK (a customer with a
+    /// null region is folded in though the generic BGP excludes it). This uses the REAL
+    /// two-forms representation the rewrite emits (memory: r2rml-const-object-two-forms):
+    /// segment lives in `star_constraints` BECAUSE the customer subject now ALSO carries
+    /// the `?r` (region) var-object member — exactly the shape id=3717398038 flagged as
+    /// otherwise unemittable. `?r` (VarId 30) is a leaf object var, NOT a branch join
+    /// var and NOT a group-by var, so the branch stays a SEMI-JOIN and the join topology
+    /// is unchanged (still decomposes). Pre-fix `resolve_branching_star_at_open`
+    /// returned `Some(..)` (folded, ignoring the region existence → over-count); the
+    /// guard makes it DECLINE (`Ok(None)` → the generic path, which honors the region
+    /// BGP). The interior `order` pattern's ONLY star_binding is `(customer, ?c)`, its
+    /// next-hop FK (a branch join var) — so the guard must NOT decline the clean shape.
+    #[tokio::test]
+    async fn p3_semijoin_chain_var_object_member_declines() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+        let mut pats = crt_patterns(true); // segment in star_constraints (the two-forms arm)
+        pats[2].star_bindings = vec![("http://ex/region".into(), VarId(30))];
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let provider = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches: clean_batches(),
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+            .expect("the leaf var-object member does not change the join topology");
+        let op = crt_op();
+        let resolved = op
+            .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+            .await
+            .expect("resolve must not error");
+        assert!(
+            resolved.is_none(),
+            "a semi-join chain pattern with a leaf var-object member must DECLINE the \
+             fuse (the membership build cannot honor the region existence requirement); \
+             pre-fix it admitted and over-counted"
+        );
+    }
+
+    /// id=3717339904 (SCD-2 same-key/same-subject semi-join gap): when two semi-join
+    /// dim rows share the join key AND mint the SAME subject but disagree on the
+    /// constraint result (`passes_own`) or the next-hop FK, keep-min — which
+    /// discriminates only by subject — would let SCAN ORDER decide membership, a
+    /// non-deterministic ANSWER (the generic chained join materializes every version's
+    /// triples; the fused keep-min tests ONE). This is exactly the SCD-2 shape P3
+    /// targets. Two customers keyed 1000 both minting cust/1000, one Enterprise (passes)
+    /// and one SMB (fails segment) → the fuse must DECLINE to the generic path. Pre-fix
+    /// it kept whichever row the scan hit first and admitted (or excluded) key 1000
+    /// accordingly.
+    #[tokio::test]
+    async fn p3_semijoin_same_key_same_subject_conflicting_constraint_declines() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+        let mut batches = clean_batches();
+        // Customer: TWO rows keyed 1000 (same join key → same subject cust/1000) with
+        // DIFFERING segment — the SCD-2 collision. 1001/1002 unchanged.
+        batches.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![
+                icol(
+                    "CUSTOMER_KEY",
+                    1,
+                    vec![Some(1000), Some(1000), Some(1001), Some(1002)],
+                ),
+                scol("SEGMENT", 2, vec!["Enterprise", "SMB", "Enterprise", "SMB"]),
+            ])],
+        );
+        let pats = crt_patterns(false); // standalone const-object segment form
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let provider = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches,
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+            .expect("crt_join_reorder must decompose");
+        let op = crt_op();
+        let resolved = op
+            .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+            .await
+            .expect("resolve must not error");
+        assert!(
+            resolved.is_none(),
+            "a same-key/same-subject SCD-2 collision with differing constraint results \
+             must DECLINE (keep-min would let scan order decide the answer)"
+        );
+    }
+
     /// (a′) VALUE-IDENTITY, Dec i128 path: the same shape with an xsd:decimal measure
     /// folds through the exact i128 → BigDecimal accumulator. Quantities 5.25, 7.25,
     /// 3.50 (scale 2). Widgets = 5.25 + 7.25 = 12.50; Gadgets = 3.50. The reference is
@@ -7564,8 +7757,7 @@ mod tests {
         let vars = VarRegistry::new();
 
         // ON: multiple bounded chunks, each ≤ the bound, union == full result.
-        std::env::set_var("FLUREE_FUSED_R2RML_OUTPUT_BOUND", "1");
-        assert!(output_bound_enabled());
+        // id=3717339910: flip the switch by SETTING THE FIELD, never process env.
         let prov_on = CrtProvider {
             mapping: Arc::clone(&mapping),
             batches: b.clone(),
@@ -7573,6 +7765,7 @@ mod tests {
         let ctx_on =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&prov_on, &prov_on);
         let mut op_on = build_op();
+        op_on.output_bound = true;
         op_on.open(&ctx_on).await.expect("open");
         let (mut nbatch_on, mut total_on, mut max_chunk) = (0usize, 0usize, 0usize);
         while let Some(batch) = op_on.next_batch(&ctx_on).await.expect("next_batch") {
@@ -7595,8 +7788,6 @@ mod tests {
         );
 
         // OFF: exactly one batch (byte-identical pre-bounding emission), same total.
-        std::env::set_var("FLUREE_FUSED_R2RML_OUTPUT_BOUND", "0");
-        assert!(!output_bound_enabled());
         let prov_off = CrtProvider {
             mapping: Arc::clone(&mapping),
             batches: b,
@@ -7604,13 +7795,13 @@ mod tests {
         let ctx_off =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&prov_off, &prov_off);
         let mut op_off = build_op();
+        op_off.output_bound = false;
         op_off.open(&ctx_off).await.expect("open");
         let (mut nbatch_off, mut total_off) = (0usize, 0usize);
         while let Some(batch) = op_off.next_batch(&ctx_off).await.expect("next_batch") {
             nbatch_off += 1;
             total_off += batch.column(c).map(<[Binding]>::len).unwrap_or(0);
         }
-        std::env::remove_var("FLUREE_FUSED_R2RML_OUTPUT_BOUND");
         assert_eq!(nbatch_off, 1, "OFF emits a single batch");
         assert_eq!(
             total_off, n as usize,
@@ -7768,11 +7959,12 @@ mod tests {
         }
     }
 
-    /// (d) SWITCH: `FLUREE_FUSED_R2RML_MULTIFACT=0` disables the whole branching path,
-    /// so `resolve_join_at_open` DECLINES the star (Ok(None) → the pre-P3 fallback,
-    /// byte-identical); unset/on FUSES it. This is the sole reader/writer of the env
-    /// var (the resolver tests call `resolve_branching_star_at_open` directly), so no
-    /// lock is needed. `multifact_enabled` is read uncached under cfg(test).
+    /// (d) SWITCH: the `multifact` operator field (defaulted from
+    /// `FLUREE_FUSED_R2RML_MULTIFACT`) disables the whole branching path, so
+    /// `resolve_join_at_open` DECLINES the star (Ok(None) → the pre-P3 fallback,
+    /// byte-identical); on FUSES it. id=3717339910: the switch is now an operator FIELD
+    /// the test sets directly, never process env — so this can no longer race a parallel
+    /// test thread's env read (the UB the cfg(test) uncached read + set_var carried).
     #[tokio::test]
     async fn p3_multifact_switch_gates_the_branching_path() {
         use crate::var_registry::VarRegistry;
@@ -7784,15 +7976,15 @@ mod tests {
         let vars = VarRegistry::new();
 
         // OFF → decline (Ok(None)).
-        std::env::set_var("FLUREE_FUSED_R2RML_MULTIFACT", "0");
-        assert!(!FusedR2rmlAggregateOperator::multifact_enabled());
         let provider_off = CrtProvider {
             mapping: Arc::clone(&mapping),
             batches: std::collections::HashMap::new(),
         };
         let ctx_off = ExecutionContext::new(&snapshot, &vars)
             .with_r2rml_providers(&provider_off, &provider_off);
-        let off = crt_op()
+        let mut op_off = crt_op();
+        op_off.multifact = false;
+        let off = op_off
             .resolve_join_at_open(&ctx_off, &refs, mapping.as_ref())
             .await
             .expect("resolve must not error");
@@ -7802,19 +7994,18 @@ mod tests {
         );
 
         // ON (the same shape + a valid fixture) → fuse (Ok(Some)).
-        std::env::set_var("FLUREE_FUSED_R2RML_MULTIFACT", "1");
-        assert!(FusedR2rmlAggregateOperator::multifact_enabled());
         let provider_on = CrtProvider {
             mapping: Arc::clone(&mapping),
             batches: clean_batches(),
         };
         let ctx_on = ExecutionContext::new(&snapshot, &vars)
             .with_r2rml_providers(&provider_on, &provider_on);
-        let on = crt_op()
+        let mut op_on = crt_op();
+        op_on.multifact = true;
+        let on = op_on
             .resolve_join_at_open(&ctx_on, &refs, mapping.as_ref())
             .await
             .expect("resolve must not error");
-        std::env::remove_var("FLUREE_FUSED_R2RML_MULTIFACT");
         assert!(
             on.is_some(),
             "switch ON must FUSE the branching star (contrast proving the gate controls it)"

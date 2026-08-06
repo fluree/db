@@ -976,7 +976,7 @@ pub async fn drive_virtual_import(
     // after every table has been scanned, before the completion stamp.
     provider
         .verify_build_snapshot_integrity(graph_source_id)
-        .map_err(|e| MaterializeError::from(R2rmlError::Materialization(e)))?;
+        .map_err(MaterializeError::from)?;
     let mut parents = ParentIndexSet::new(&mapping)?;
     let materialization = plan(&mapping);
     let workers = parallelism.max(1);
@@ -1192,7 +1192,7 @@ pub async fn drive_virtual_import(
     // watermark it does not contain.
     provider
         .verify_build_snapshot_integrity(graph_source_id)
-        .map_err(|e| MaterializeError::from(R2rmlError::Materialization(e)))?;
+        .map_err(MaterializeError::from)?;
 
     // Assemble + ship the completion stamp on the FINAL chunk (highest idx →
     // committed last → the twin's head; a head-walk finds the stamp iff the build
@@ -1245,7 +1245,7 @@ pub enum VerifyMode {
 /// the mismatch so an operator does not read a spurious count delta as corruption.
 /// The durable fix (count DISTINCT subjects per class source-side) is tracked, not
 /// in this phase.
-const COUNT_MULTISET_NOTE: &str =
+pub const COUNT_MULTISET_NOTE: &str =
     "count compares a source multiset (one per rdf:type row) against a twin set \
      (distinct subjects); a non-unique subject template can mismatch here even on a \
      faithful twin — the full-triple diff is authoritative";
@@ -1255,14 +1255,12 @@ const COUNT_MULTISET_NOTE: &str =
 pub enum CheckOutcome {
     /// Source and twin agree.
     Match,
-    /// A count differs between the source and the twin. `note` carries a caveat
-    /// (rendered with the failure) about why a count difference can be spurious even
-    /// on a faithful twin — see [`COUNT_MULTISET_NOTE`].
-    Mismatch {
-        source: u64,
-        twin: u64,
-        note: Option<&'static str>,
-    },
+    /// A count differs between the source and the twin. A count difference can be
+    /// spurious even on a faithful twin (a non-unique subject template makes the
+    /// source multiset larger than the twin's distinct-subject set); the reporting
+    /// layer renders that caveat for `count:*` checks — see [`COUNT_MULTISET_NOTE`].
+    /// (id=3717339914: the note is no longer a vacuous enum field.)
+    Mismatch { source: u64, twin: u64 },
     /// Triple sets differ (full or per-subject sample).
     TripleDiff {
         missing_in_twin: usize,
@@ -1448,11 +1446,7 @@ where
             outcome: if source == twin {
                 CheckOutcome::Match
             } else {
-                CheckOutcome::Mismatch {
-                    source,
-                    twin,
-                    note: Some(COUNT_MULTISET_NOTE),
-                }
+                CheckOutcome::Mismatch { source, twin }
             },
         });
     }
@@ -1569,11 +1563,7 @@ where
             outcome: if source == twin {
                 CheckOutcome::Match
             } else {
-                CheckOutcome::Mismatch {
-                    source,
-                    twin,
-                    note: Some(COUNT_MULTISET_NOTE),
-                }
+                CheckOutcome::Mismatch { source, twin }
             },
         });
     }
@@ -3382,8 +3372,16 @@ mod tests {
             let shared_alloc = Arc::new(SharedNamespaceAllocator::from_registry(
                 &NamespaceRegistry::new(),
             ));
-            let spool_dir =
-                std::env::temp_dir().join(format!("fluree-c2-test-{}", std::process::id()));
+            // id=3717339915: a per-run atomic suffix (the VERIFY_DIR_SEQ pattern) so
+            // repeats/parallel runs in one test process never share a spool dir and
+            // delete each other's runs mid-sort.
+            static C2_TEST_DIR_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let spool_dir = std::env::temp_dir().join(format!(
+                "fluree-c2-test-{}-{}",
+                std::process::id(),
+                C2_TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             std::fs::create_dir_all(&spool_dir).unwrap();
             let (tx, rx) = std::sync::mpsc::sync_channel::<super::ChunkResult>(2);
             // Drain the result side so no worker/driver blocks on `result_tx.send`;

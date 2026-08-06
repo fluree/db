@@ -14,7 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use fluree_db_api::materialize::{verify_twin, ParityReport, VerifyMode};
+use fluree_db_api::materialize::{
+    verify_twin, CheckOutcome, ParityReport, VerifyMode, COUNT_MULTISET_NOTE,
+};
 // The MoR-guard env var comes from ONE definition — fluree-db-iceberg's
 // `mor_guard::ALLOW_MOR_DELETES_ENV`, re-exported by fluree-db-api (which the CLI
 // already depends on) — instead of a hard-copied literal that could silently drift
@@ -206,7 +208,13 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
     if !report.passed {
         // drop_ledger drops the WHOLE ledger and rejects a `:branch` suffix, so
         // strip it — otherwise the drop 400s and the unverified twin stays
-        // announced (the exact hazard this path guards against).
+        // announced (the exact hazard this path guards against). This is name-scoped
+        // (every branch); the `blocking_existing_branch` up-front refusal makes it safe
+        // for the CLI (the name is fresh apart from the target branch). A branch-scoped
+        // HARD purge, to make this belt-and-braces for API drivers too, is tracked in
+        // https://github.com/fluree/db/issues/1592 (review id=3717339919) — no such
+        // capability exists today (drop_ledger is name-only, drop_branch is
+        // record-only).
         let drop_result = fluree
             .drop_ledger(ledger_name_no_branch(&twin_ledger), DropMode::Hard)
             .await;
@@ -333,7 +341,20 @@ fn format_failures(report: &ParityReport) -> String {
     report
         .failures()
         .iter()
-        .map(|c| format!("  - {}: {:?}", c.name, c.outcome))
+        .map(|c| {
+            // id=3717339914: the multiset-vs-set caveat is rendered HERE (the reporting
+            // layer), for count checks only, rather than carried as a vacuous enum
+            // field. A `count:*` mismatch can be spurious on a faithful twin; the
+            // full-triple diff is authoritative.
+            let note = if c.name.starts_with("count:")
+                && matches!(c.outcome, CheckOutcome::Mismatch { .. })
+            {
+                format!("\n      ({COUNT_MULTISET_NOTE})")
+            } else {
+                String::new()
+            };
+            format!("  - {}: {:?}{note}", c.name, c.outcome)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

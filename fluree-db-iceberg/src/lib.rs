@@ -65,6 +65,23 @@ pub mod net;
 pub mod scan;
 pub mod stats;
 
+/// Read an on/off environment switch that defaults to **on** — only `0`, `false`,
+/// `off`, or `no` (trimmed, case-insensitive) disable it. This is the crate-local
+/// twin of `fluree-db-query`'s `r2rml::env_switch_enabled` (id=3717339924): the two
+/// crates can't share the symbol (fluree-db-query depends on fluree-db-iceberg, not
+/// the reverse), so the falsy-spelling set is duplicated here ONCE, and the crate's
+/// kill switches call this instead of each hand-rolling the same match. Call sites
+/// cache the result in a per-switch `OnceLock` — set switches at process startup.
+pub(crate) fn env_switch_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
 // Re-export commonly used types
 pub use config::{CatalogConfig, IcebergGsConfig, IoConfig, MappingSource, TableConfig};
 pub use config_value::{ConfigValue, SecretResolveError, SecretResolver};

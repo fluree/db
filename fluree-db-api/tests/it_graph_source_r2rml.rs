@@ -5734,15 +5734,9 @@ async fn verify_twin_fails_on_corrupted_twin() {
         .iter()
         .find(|c| c.name == "count:http://ex.org/Order")
         .expect("Order count check present");
-    assert!(
-        matches!(
-            order_count.outcome,
-            CheckOutcome::Mismatch {
-                source: 2,
-                twin: 3,
-                ..
-            }
-        ),
+    assert_eq!(
+        order_count.outcome,
+        CheckOutcome::Mismatch { source: 2, twin: 3 },
         "the injected Order must show as a count mismatch, got {:?}",
         order_count.outcome
     );

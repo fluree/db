@@ -223,7 +223,14 @@ type KeyToSubject = HashMap<Vec<String>, RdfTerm>;
 
 /// A comparable ordering key for a parent SUBJECT term. Parent subjects are IRIs
 /// (occasionally blank nodes); the inner string gives a total lexicographic order.
-fn subject_sort_key(term: &RdfTerm) -> &str {
+///
+/// Exported (id=3717339907) so the VIRTUAL query path's fused keep-min uses the SAME
+/// comparator this crate's `parent_key_insert_keep_min` uses — otherwise the fused
+/// semi-join could pick a different parent row than the generic chained inner join on a
+/// duplicate intermediate key. Reused directly at the RdfTerm keep-min sites; the P2a
+/// IRI-string site compares the pure-IRI subjects it already extracted, which for
+/// `RdfTerm::Iri` is exactly this function's inner-string ordering.
+pub fn subject_sort_key(term: &RdfTerm) -> &str {
     match term {
         RdfTerm::Iri(s) | RdfTerm::BlankNode(s) => s,
         RdfTerm::Literal { value, .. } => value,
@@ -418,6 +425,12 @@ impl ParentIndexSet {
             // MAJOR-4 (#1529 review): create each canonical col-set's map ONCE (one
             // column-name Vec clone per set), then probe it by borrow in the row loop
             // — the old `entry.entry(cols.clone())` cloned that Vec on EVERY row.
+            // id=3717339921: this leaves a PRESENT-but-EMPTY inner map when a col-set
+            // yields no key, where the old per-row code left the entry ABSENT. Safe by
+            // construction: no consumer distinguishes the two — `resolve` chains
+            // `.get(cols)?.get(key)` (an empty map returns `None` on `.get(key)`, same as
+            // an absent col-set short-circuiting the `?`), `merge_from` `.extend`s (a
+            // no-op on empty), and `estimated_bytes` counts 0 for an empty map.
             for cols in &col_sets {
                 entry.entry(cols.clone()).or_default();
             }
