@@ -52,8 +52,8 @@ use fluree_db_r2rml::mapping::{
     TermType, TriplesMap,
 };
 use fluree_db_r2rml::materialize::{
-    canonical_join, get_join_key_from_batch, materialize_object_from_batch,
-    materialize_subject_from_batch, subject_sort_key, RdfTerm,
+    canonical_join, fill_join_key_from_batch, get_join_key_from_batch,
+    materialize_object_from_batch, materialize_subject_from_batch, subject_sort_key, RdfTerm,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use futures::StreamExt;
@@ -1379,14 +1379,21 @@ impl FusedR2rmlAggregateOperator {
     /// join drops the row) or whose stringified FK value is not in that branch's
     /// keep-min-then-filter membership. Empty `sets` ⇒ `true` (the single-table /
     /// pure-linear path, a no-op byte-identical to pre-P3). Each set is probed with the
-    /// same `get_join_key_from_batch` stringification the membership build used, so both
-    /// sides encode the join value identically.
-    fn row_passes_semi_joins(sets: &[SemiJoinSet], batch: &ColumnBatch, row: usize) -> bool {
+    /// same stringification the membership build used, so both sides encode the join
+    /// value identically. `fk_scratch` is the caller's reused per-batch buffer — filled
+    /// per set via [`fill_join_key_from_batch`] and probed as a borrowed slice, so no
+    /// owned key `Vec` is allocated per fact row per set (id=3717398040).
+    fn row_passes_semi_joins(
+        sets: &[SemiJoinSet],
+        batch: &ColumnBatch,
+        row: usize,
+        fk_scratch: &mut Vec<String>,
+    ) -> bool {
         for sj in sets {
-            let Some(fk) = get_join_key_from_batch(&sj.fact_fk_cols, batch, row) else {
-                return false;
-            };
-            if !sj.membership.contains(&fk) {
+            if !fill_join_key_from_batch(&sj.fact_fk_cols, batch, row, fk_scratch) {
+                return false; // null FK ⇒ no branch triple ⇒ inner-join drop
+            }
+            if !sj.membership.contains(fk_scratch.as_slice()) {
                 return false;
             }
         }
@@ -1780,6 +1787,12 @@ impl Operator for FusedR2rmlAggregateOperator {
             // per group resolver, borrowing that resolver's map — not `batch`); cleared
             // each row, so multi-resolver folds pay the alloc once per batch, not per row.
             let mut dim_probes: Vec<&[GKey]> = Vec::with_capacity(resolved.group_resolvers.len());
+            // id=3717398040: reused per-batch scratch for the FK PROBE keys (semi-join
+            // membership + group-resolver lookups). Filled per row/set/resolver and
+            // probed as a borrowed slice, so the K+R per-row probes this PR introduced
+            // pay no owned-`Vec` allocation — the alloc is paid once per batch. (The
+            // component `String`s still allocate per fill; interning them is deferred.)
+            let mut fk_scratch: Vec<String> = Vec::new();
             for row in 0..batch.num_rows {
                 // Row-validity (R2RML star row-drop): the subject and every
                 // predicate's object column must be non-null.
@@ -1828,7 +1841,7 @@ impl Operator for FusedR2rmlAggregateOperator {
                 // drop; each set's FK child columns are also null-dropped by
                 // `validity_cols`, so this probe never sees a null-FK row on the reachable
                 // path. #1583: rests on each FK being single-valued (see `SemiJoinSet`).
-                if !Self::row_passes_semi_joins(&resolved.semi_joins, &batch, row) {
+                if !Self::row_passes_semi_joins(&resolved.semi_joins, &batch, row, &mut fk_scratch) {
                     continue;
                 }
                 let accs: &mut Vec<Acc> = if gcols.is_empty() {
@@ -1849,12 +1862,18 @@ impl Operator for FusedR2rmlAggregateOperator {
                     dim_probes.clear();
                     let mut resolver_miss = false;
                     for resolver in &resolved.group_resolvers {
-                        let Some(fk) = get_join_key_from_batch(&resolver.fact_fk_cols, &batch, row)
-                        else {
+                        // id=3717398040: fill the reused scratch and probe the map by a
+                        // borrowed slice — no owned key `Vec` per fact row per resolver.
+                        if !fill_join_key_from_batch(
+                            &resolver.fact_fk_cols,
+                            &batch,
+                            row,
+                            &mut fk_scratch,
+                        ) {
                             resolver_miss = true;
                             break;
-                        };
-                        match resolver.map.get(&fk) {
+                        }
+                        match resolver.map.get(fk_scratch.as_slice()) {
                             Some(gk) => dim_probes.push(gk.as_slice()),
                             None => {
                                 resolver_miss = true;
