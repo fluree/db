@@ -356,16 +356,11 @@ fn arrow_column_to_values(
 /// (`0`/`false`/`off`/`no`, trimmed + case-insensitive per the switch family)
 /// restores the byte-identical two-hop `arrow_column_to_values` +
 /// `build_columns_from_values` path. Read once per process (`OnceLock`, the family
-/// idiom): set it at startup, not per query.
+/// idiom): set it at startup, not per query. id=3717339924: the falsy-spelling parse
+/// is the shared crate-local `env_switch_enabled` helper, not a hand-rolled match.
 fn direct_decode_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_ARROW_DIRECT_DECODE") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| crate::env_switch_enabled("FLUREE_ARROW_DIRECT_DECODE"))
 }
 
 /// N2 (Gap-4 P1): build a [`Column`] DIRECTLY from an Arrow array, skipping the
