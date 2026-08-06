@@ -2360,6 +2360,21 @@ mem:constraint-01kyke812e1np5c9ag45ac7580 a mem:Constraint ;
     mem:createdAt "2026-07-28T04:03:09.006298+00:00"^^xsd:dateTime ;
     mem:rationale "Using required_aggregate_vars (rather than checking the projection directly) folds in projection, HAVING, post-binds and ORDER BY in one check — a post-bind whose EXPRESSION reads a non-key var still reads a grouped list, which a bind-output whitelist would miss. Regression tests need a fan-in fixture; the pinned grouped-list test has none and cannot catch dedup." .
 
+mem:fact-01kz9zn33sjc3rh7r9s2zr825w a mem:Fact ;
+    mem:content "Wildcard (?p) scan visibility narrowed to f:reifies* only (branch fix/wildcard-fluree-ns-visibility): removed the legacy default-graph hide of the whole FLUREE_DB namespace in binary_scan::is_internal_predicate and its two fast_whole_graph_agg mirrors (overlay flake walk + graph_has_scan_hidden_predicates). That hide was a fossil from before named graphs, when commit metadata lived in the main graph; today all commit meta routes to txn-meta g_id=1 (stamp_graph_on_commit_flakes on novelty side, emit_txn_meta g_id=1 in indexer), db:flakes has no writers, so the only thing it hid was user-authored f: data (policies) — and only post-index, since the novelty path never applied it. opts.includeSystemFacts still reveals f:reifies*." ;
+    mem:tag "binary-scan" ;
+    mem:tag "fluree-namespace" ;
+    mem:tag "system-facts" ;
+    mem:tag "visibility" ;
+    mem:tag "wildcard" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_query_wildcard_system_facts.rs" ;
+    mem:artifactRef "fluree-db-novelty/src/commit_flakes.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_whole_graph_agg.rs" ;
+    mem:branch "fix/wildcard-fluree-ns-visibility" ;
+    mem:createdAt "2026-08-05T22:10:40.377307+00:00"^^xsd:dateTime .
+
 mem:constraint-01kjte29y3cp8mae56xy6yfv2n a mem:Constraint ;
     mem:content "SPARQL↔JSON-LD Parity: both compile to the same IR (fluree-db-query/src/ir.rs) and share the entire execution engine. When adding SPARQL features: (1) shared IR changes already affect JSON-LD — verify JSON-LD tests pass, (2) if expressible in JSON-LD, add parallel tests, (3) execution path missing in JSON-LD lower → track follow-up.\n\nSPARQL tests: it_query_sparql.rs | JSON-LD tests: it_query.rs, it_query_analytical.rs, it_query_grouping.rs\nValidate: `cd testsuite-sparql && make test-eval-cat CAT=<cat>` then `cargo test -p fluree-db-api --test it_query`" ;
     mem:tag "compliance" ;
