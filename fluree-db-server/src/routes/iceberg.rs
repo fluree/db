@@ -356,8 +356,8 @@ pub struct IcebergTrackResponse {
     pub poll_interval_secs: u64,
     /// Number of jobs the worker is tracking.
     pub tracked_jobs: usize,
-    /// What happened to the opportunistic first sync: `started` (running in the
-    /// background), `completed`, or `failed`.
+    /// What happened to the opportunistic first sync: `scheduled` (left to the
+    /// tracking worker's next tick), `completed`, or `failed`.
     ///
     /// Separate from `tracked` because the two are genuinely independent, and
     /// conflating them was a real defect: a first sync that lost a commit race made
@@ -471,25 +471,24 @@ async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<i
             }
         }
     } else {
-        let fluree = Arc::clone(&state.fluree);
-        let (source, target) = (req.source.clone(), req.target.clone());
-        tokio::spawn(async move {
-            match fluree
-                .materialize_r2rml_graph_source(&source, &target, false)
-                .await
-            {
-                Ok(r) => tracing::info!(
-                    source = %source, target = %target,
-                    rows_read = r.rows_read, committed = r.committed,
-                    "iceberg/track: background first sync finished"
-                ),
-                Err(e) => tracing::warn!(
-                    source = %source, target = %target, error = %e,
-                    "iceberg/track: background first sync failed; the worker will retry"
-                ),
-            }
-        });
-        ("started", None, None)
+        // DELIBERATELY NOT SPAWNED. Leave it to the tracking worker's next tick.
+        //
+        // Spawning looked like the obvious way to keep the latency benefit without
+        // blocking, and it is a trap: the worker polls jobs through a SERIAL outer loop,
+        // but spawned tasks bypass that entirely. Registering 17 sources therefore
+        // launched 17 unbounded concurrent materializes — and the per-window accumulator
+        // is the one memory term nothing currently bounds (~10 GiB for a single
+        // ~800k-row window). Measured locally: 873 % CPU, i.e. ~9 cores, on what should
+        // be background work.
+        //
+        // The synchronous version was accidentally providing the serialisation. Removing
+        // the await must not also remove the brake.
+        //
+        // Cost of leaving it to the worker: up to one poll interval before data appears
+        // (30 s default, and the caller can pass poll_interval_secs to shorten it). That
+        // is a small price for keeping first-sync concurrency equal to the worker's,
+        // which is the only place it is bounded.
+        ("scheduled", None, None)
     };
 
     let response = IcebergTrackResponse {

@@ -1171,17 +1171,15 @@ impl Fluree {
                 // Reloading the base is the standard remedy. Bounded, because a target
                 // under permanent write pressure should surface rather than spin, and
                 // C4 isolates the failure to this target either way.
-                Err(ApiError::Transact(fluree_db_transact::TransactError::CommitConflict {
-                    expected_t,
-                    head_t,
-                })) if conflict_retries < MAX_CONFLICT_RETRIES => {
+                Err(ref e)
+                    if is_stale_base(e).is_some() && conflict_retries < MAX_CONFLICT_RETRIES =>
+                {
                     conflict_retries += 1;
+                    let detail = is_stale_base(e).unwrap_or_default();
                     let id = ledger.ledger_id().to_string();
                     info!(
                         ledger = %id,
-                        durable_t = expected_t,
-                        our_base_t = head_t,
-                        behind_by = expected_t - head_t,
+                        detail = %detail,
                         attempt = conflict_retries,
                         "materialize: stale base after a concurrent write; reloading and \
                          retrying this chunk"
@@ -1275,6 +1273,52 @@ fn watermark_refresh_bound_ms() -> i64 {
             .unwrap_or(30);
         mins.saturating_mul(60_000)
     })
+}
+
+/// Is this error a lost optimistic-concurrency race, i.e. "your base is stale, reload"?
+///
+/// Returns a short description for the log, or `None` if the error is a real failure.
+///
+/// FOUR VARIANTS, one condition. They differ only in WHERE the staleness is detected,
+/// which is an implementation detail of the commit path, not something a caller should
+/// have to branch on:
+///
+///   CommitConflict     base.t() != nameservice commit_t, caught before publishing.
+///                      NOTE the field order reads backwards from the names:
+///                      `expected_t` is the DURABLE head, `head_t` is OUR base — so
+///                      `expected > head` means we are BEHIND (see verify_sequencing).
+///   PublishLostRace    someone published while we were building; caught AT publish.
+///   CommitIdMismatch   our base's head CID is not the nameservice's head CID.
+///   NamespaceConflict  namespace allocation raced a concurrent staging registry.
+///
+/// Handling only `CommitConflict` left the other three fatal. Under fan-out — 17
+/// sources resolving the same ~22 targets — that showed up immediately: after fixing
+/// `CommitConflict`, the residual target failures were **all** `PublishLostRace`, one
+/// per target, during the initial backfill burst when every source writes every target.
+/// Same race, different detection point, so the same remedy applies.
+fn is_stale_base(e: &ApiError) -> Option<String> {
+    use fluree_db_transact::TransactError as TE;
+    let ApiError::Transact(te) = e else {
+        return None;
+    };
+    match te {
+        TE::CommitConflict { expected_t, head_t } => Some(format!(
+            "stale base: durable_t={expected_t} our_base_t={head_t} behind_by={}",
+            expected_t - head_t
+        )),
+        TE::PublishLostRace {
+            attempted_t,
+            published_t,
+            ..
+        } => Some(format!(
+            "publish race lost: attempted_t={attempted_t} published_t={published_t}"
+        )),
+        TE::CommitIdMismatch { expected, found } => Some(format!(
+            "head CID mismatch: expected={expected} found={found}"
+        )),
+        TE::NamespaceConflict(msg) => Some(format!("namespace allocation raced: {msg}")),
+        _ => None,
+    }
 }
 
 /// Novelty backpressure, classified by what can actually resolve it.
