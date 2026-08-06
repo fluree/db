@@ -943,9 +943,48 @@ impl Fluree {
         latest_by_key: bool,
         txn_budget: usize,
     ) -> Result<usize> {
-        // Retraction is skipped on a brand-new target (nothing to retract);
-        // deletions only count against a pre-existing target.
-        let target_existed = self.ledger_exists(target).await?;
+        // TOLERATE LOSING THE CREATE RACE.
+        //
+        // `ledger_exists` then `create_ledger` is check-then-create, and it is not
+        // atomic. Under fan-out this races constantly: 17 sources resolve the SAME ~22
+        // targets, so when a target is new several sources see it missing in the same
+        // instant and all try to create it. One wins; the losers previously failed the
+        // whole target.
+        //
+        // This is not a new discovery — `materialize_state_ledger` in this very file
+        // already documents and handles it ("Tolerates losing the create race ... Before
+        // this existed the same check-then-create sat inline in the watermark write and
+        // could fail a whole materialization pass on that race"). The fix was applied to
+        // the state ledger and never to the target path, which is where fan-out makes it
+        // far MORE likely. Observed as `Commit conflict: expected t=2, head_t=1` — t=1
+        // being the signature of a just-created ledger.
+        let existed_before = self.ledger_exists(target).await?;
+        let (mut ledger, target_existed) = if existed_before {
+            (self.ledger(target).await?, true)
+        } else {
+            match self.create_ledger(target).await {
+                Ok(l) => (l, false),
+                // Another source created it first. Open theirs and carry on.
+                //
+                // Reported as EXISTING rather than as created-by-us, deliberately: it
+                // does exist now, and for latest-by-key that routes us through the
+                // whole-subject retract before re-asserting. On a ledger the winner has
+                // only just created that retract is very likely a no-op, so the cost is
+                // at most one redundant transaction — whereas skipping a retract that
+                // WAS needed would leave stale fields behind. Err toward the harmless
+                // side.
+                Err(ApiError::LedgerExists(_)) => {
+                    info!(
+                        target = %target,
+                        "materialize: lost the create race for a new target; opening the \
+                         existing ledger"
+                    );
+                    (self.ledger(target).await?, true)
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        // Deletions only count against a target that already held data.
         let subjects_retracted = if target_existed { deletions.len() } else { 0 };
 
         // Whole-subject REPLACE (latest-by-key): retract every subject seen in this
@@ -960,12 +999,6 @@ impl Fluree {
                 retract_by_graph.entry(graph).or_default().insert(subject);
             }
         }
-
-        let mut ledger = if target_existed {
-            self.ledger(target).await?
-        } else {
-            self.create_ledger(target).await?
-        };
 
         if target_existed {
             for (graph, iris) in &retract_by_graph {
@@ -1674,6 +1707,37 @@ mod tests {
     }
     /// Fixed target ledger for accumulator tests that don't exercise fan-out.
     const TGT: &str = "t:main";
+
+    /// Losing the create race must be tolerated on the TARGET path, exactly as it
+    /// already is for the state ledger.
+    ///
+    /// A canary over the source text rather than a behavioural test, because forcing a
+    /// genuine two-writer create race needs a concurrent harness this module does not
+    /// have. It is still worth having: the failure mode is silent until fan-out hits a
+    /// NEW target, at which point it fails a whole target with
+    /// `Commit conflict: expected t=2, head_t=1`. Deleting the `LedgerExists` arm would
+    /// reintroduce that and no other test would notice.
+    #[test]
+    fn target_create_race_is_tolerated_like_the_state_ledger() {
+        let src = include_str!("r2rml_materialize.rs");
+
+        // The state ledger's tolerance — the precedent this mirrors.
+        assert!(
+            src.contains("Err(ApiError::LedgerExists(_)) => self.ledger(MATERIALIZE_STATE_LEDGER)"),
+            "the state ledger's create-race tolerance has moved or gone; if it was \
+             deliberately removed, this test and the target path both need revisiting"
+        );
+
+        // The target path must have its own. Two arms total, one per path.
+        let arms = src.matches("Err(ApiError::LedgerExists(_))").count();
+        assert!(
+            arms >= 2,
+            "expected create-race tolerance on BOTH the state-ledger and target paths, \
+             found {arms} LedgerExists arm(s). Under fan-out, 17 sources resolve the same \
+             targets, so several race to create a new one; without this the losers fail \
+             the whole target."
+        );
+    }
 
     /// The refresh bound must sit well under the source's snapshot retention, or
     /// watermarks expire and every poll degrades to a full table read.

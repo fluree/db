@@ -80,6 +80,7 @@ impl ServerError {
             }
 
             // Ledger management
+            ServerError::Api(ApiError::NoveltyDeferred { .. }) => errors::NOVELTY_DEFERRED,
             ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
 
             // Index operations
@@ -189,6 +190,12 @@ impl ServerError {
             }
 
             // 404 - Not Found
+            // Retryable backpressure, NOT a fault. The 503 belonged here, in
+            // ServerError's mapping, which is what the HTTP layer consults — putting it
+            // only on `ApiError::status_code()` left it dead and a deferral surfaced as
+            // a 500 `err:system/InternalError`, telling operators a normal capacity
+            // condition was an internal error.
+            ServerError::Api(ApiError::NoveltyDeferred { .. }) => StatusCode::SERVICE_UNAVAILABLE,
             ServerError::Api(ApiError::NotFound(_)) => StatusCode::NOT_FOUND,
 
             // 409 - Conflict

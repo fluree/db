@@ -260,8 +260,14 @@ pub enum ApiError {
     /// Waiting in-process instead of deferring caused a production deadlock — the
     /// worker holds what the indexer needs to publish, so the wait guaranteed the
     /// condition could not clear. See `transact_chunks_with_backpressure`.
+    // NOT "(will retry)". Whether anything retries depends on the CALLER: the
+    // materialize worker re-polls every 30-57 s, but a one-shot HTTP
+    // /iceberg/materialize does not — so promising a retry misinformed an operator who
+    // invoked it by hand and reasonably read it as "in progress".
     #[error(
-        "Materialization deferred: novelty at capacity, {remaining} items pending (will retry)"
+        "Materialization deferred: novelty at capacity, {remaining} items pending. Nothing was \
+         applied for the deferred target. The tracking worker retries automatically; a one-shot \
+         /iceberg/materialize call must be re-issued."
     )]
     NoveltyDeferred {
         /// Items not applied in this window; they are re-derived on the next poll.

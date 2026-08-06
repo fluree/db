@@ -193,6 +193,11 @@ pub const POLICY_VIOLATION: &str = "err:policy/PolicyViolation";
 // =============================================================================
 
 /// Internal server error (catch-all)
+/// Materialization deferred by novelty backpressure — retryable, not a fault.
+/// Distinct from INTERNAL so a client can branch on "try again shortly" rather than
+/// treating normal capacity pressure as a server defect.
+pub const NOVELTY_DEFERRED: &str = "err:db/NoveltyDeferred";
+
 pub const INTERNAL: &str = "err:system/InternalError";
 
 /// Nameservice error
