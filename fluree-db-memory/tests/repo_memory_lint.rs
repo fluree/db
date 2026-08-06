@@ -256,6 +256,7 @@ fn repo_memory_refs_are_repo_relative_and_resolve() {
     let src = repo_ttl();
     let root = repo_root();
     let mut failures = Vec::new();
+    let mut unresolved = Vec::new();
     for (id, block) in blocks(&src) {
         for r in prop_values(&block, "artifactRef") {
             if r.starts_with('/') || r.starts_with('~') || r.contains(":\\") {
@@ -267,13 +268,26 @@ fn repo_memory_refs_are_repo_relative_and_resolve() {
                 continue;
             }
             if !root.join(r).exists() {
-                failures.push(format!("{id}: ref {r:?} does not exist at HEAD"));
+                unresolved.push(format!("{id}: ref {r:?} does not exist at HEAD"));
             }
         }
     }
     assert!(
         failures.is_empty(),
-        "stale or invalid artifactRefs — update or drop them with `fluree memory update`:\n  {}",
+        "invalid artifactRefs — update or drop them with `fluree memory update`:\n  {}",
         failures.join("\n  ")
     );
+    // Advisory by design: whether a ref still resolves is coupled to every
+    // rename in the workspace, so failing here would make the memory store a
+    // merge gate on unrelated refactors (and create a two-green-PRs-red-main
+    // hazard). `memory_audit` and the recall stale-ref markers own this signal;
+    // the audit at a PR-ready checkpoint is where it gets acted on.
+    if !unresolved.is_empty() {
+        println!(
+            "advisory: {} artifactRef(s) no longer resolve at HEAD — run `fluree memory audit` \
+             and re-verify or update:\n  {}",
+            unresolved.len(),
+            unresolved.join("\n  ")
+        );
+    }
 }

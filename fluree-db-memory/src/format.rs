@@ -247,9 +247,16 @@ pub fn format_audit_markdown(report: &crate::audit::AuditReport) -> String {
          first.\n",
     );
 
+    if report.ref_checks_skipped {
+        out.push_str(
+            "\nNote: no project root (global-mode store) — refs are repo-relative, so \
+             missing/churned ref checks and coverage were skipped.\n",
+        );
+    }
+
     // A branch audit with no diff saw only the memories tagged with this branch
     // — say so, or "0 in scope" reads as a clean bill of health.
-    if report.scope != "all" && report.coverage.is_none() {
+    if report.scope != "all" && !report.ref_checks_skipped && report.coverage.is_none() {
         out.push_str(&format!(
             "\nNote: `git merge-base {} HEAD` did not resolve here, so scope is limited to \
              memories captured on this branch and there is no coverage section.\n",

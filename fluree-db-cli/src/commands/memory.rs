@@ -431,13 +431,10 @@ async fn run_status(dirs: &FlureeDir) -> CliResult<()> {
 async fn run_audit(all: bool, base: &str, format: &str, dirs: &FlureeDir) -> CliResult<()> {
     let store = build_synced_store(dirs).await?;
 
-    // Refs are repo-relative, so they need the project root. A global-mode store
-    // has no `.fluree-memory/` to sit under; fall back to where the user ran us.
-    let repo_root = match store.repo_root() {
-        Some(root) => root.to_path_buf(),
-        None => std::env::current_dir()
-            .map_err(|e| CliError::Input(format!("cannot determine the current directory: {e}")))?,
-    };
+    // Refs are repo-relative, so they need the project root. A global-mode
+    // store has none — the audit skips ref checks rather than resolving them
+    // against wherever the user happens to be standing.
+    let repo_root = store.repo_root().map(std::path::Path::to_path_buf);
 
     let scope = match (all, fluree_db_memory::detect_git_branch()) {
         (false, Some(branch)) => AuditScope::Branch(branch),
@@ -450,7 +447,7 @@ async fn run_audit(all: bool, base: &str, format: &str, dirs: &FlureeDir) -> Cli
         .map_err(memory_err)?;
     let report = audit_memories(
         &memories,
-        &repo_root,
+        repo_root.as_deref(),
         &AuditOptions {
             scope,
             base_ref: Some(base.to_string()),

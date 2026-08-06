@@ -611,7 +611,7 @@ impl FlureeMcpService {
             Ok(all) => {
                 let report = audit_memories(
                     &all,
-                    &repo_root,
+                    Some(&repo_root),
                     &AuditOptions {
                         scope,
                         base_ref: req.base,

@@ -70,6 +70,10 @@ pub struct AuditReport {
     /// `None` when git could not resolve the merge base — a non-git root, an
     /// unknown base ref, or an `All`-scope audit. Coverage is a branch question.
     pub coverage: Option<CoverageReport>,
+    /// True when no project root was available (global-mode store): refs are
+    /// repo-relative, so missing/churned checks and coverage were skipped
+    /// rather than resolved against an unrelated working directory.
+    pub ref_checks_skipped: bool,
 }
 
 /// Signals for one memory.
@@ -182,7 +186,11 @@ impl MemoryAuditEntry {
 /// Audit `memories` against the working tree at `repo_root`.
 ///
 /// Read-only: the store is never mutated and git is only ever queried.
-pub fn audit_memories(memories: &[Memory], repo_root: &Path, opts: &AuditOptions) -> AuditReport {
+pub fn audit_memories(
+    memories: &[Memory],
+    repo_root: Option<&Path>,
+    opts: &AuditOptions,
+) -> AuditReport {
     let base_ref = opts
         .base_ref
         .as_deref()
@@ -191,9 +199,9 @@ pub fn audit_memories(memories: &[Memory], repo_root: &Path, opts: &AuditOptions
 
     // A branch audit needs the diff twice: to widen the scope to memories that
     // reference changed files, and to compute coverage. Resolve it once.
-    let diff = match &opts.scope {
-        AuditScope::Branch(_) => branch_diff(repo_root, &base_ref),
-        AuditScope::All => None,
+    let diff = match (&opts.scope, repo_root) {
+        (AuditScope::Branch(_), Some(root)) => branch_diff(root, &base_ref),
+        _ => None,
     };
 
     let in_scope: Vec<&Memory> = match &opts.scope {
@@ -213,8 +221,10 @@ pub fn audit_memories(memories: &[Memory], repo_root: &Path, opts: &AuditOptions
         }
     };
 
-    // One `git log` per distinct ref, not per (memory, ref) pair.
-    let churn = last_commit_dates(repo_root, &in_scope);
+    let churn = match repo_root {
+        Some(root) => last_commit_dates(root, &in_scope),
+        None => BTreeMap::new(),
+    };
 
     let mut entries: Vec<MemoryAuditEntry> = in_scope
         .iter()
@@ -235,10 +245,15 @@ pub fn audit_memories(memories: &[Memory], repo_root: &Path, opts: &AuditOptions
         total_memories: memories.len(),
         entries,
         coverage,
+        ref_checks_skipped: repo_root.is_none(),
     }
 }
 
-fn audit_one(mem: &Memory, repo_root: &Path, churn: &BTreeMap<String, String>) -> MemoryAuditEntry {
+fn audit_one(
+    mem: &Memory,
+    repo_root: Option<&Path>,
+    churn: &BTreeMap<String, String>,
+) -> MemoryAuditEntry {
     let mut text = mem.content.clone();
     if let Some(rationale) = &mem.rationale {
         text.push(' ');
@@ -248,8 +263,11 @@ fn audit_one(mem: &Memory, repo_root: &Path, churn: &BTreeMap<String, String>) -
     let mut missing_refs = Vec::new();
     let mut churned_refs = Vec::new();
     let effective = effective_timestamp(mem);
-    for r in &mem.artifact_refs {
-        if !repo_root.join(r).exists() {
+    // No root means repo-relative refs can't be resolved at all; reporting
+    // them MISSING against an unrelated cwd would be a confident wrong answer.
+    for r in repo_root.map(|_| &mem.artifact_refs).into_iter().flatten() {
+        let root = repo_root.expect("guarded by the map above");
+        if !root.join(r).exists() {
             missing_refs.push(r.clone());
             continue;
         }
@@ -298,8 +316,9 @@ struct Markers {
 
 /// `@`-prefixed words that are JSON-LD/RDF keywords rather than people. Without
 /// this list every memory about `@context` or `@fulltext` reads as personal.
-const NON_HANDLE_ATS: [&str; 20] = [
+const NON_HANDLE_ATS: [&str; 21] = [
     "context",
+    "prefix",
     "id",
     "type",
     "value",
@@ -349,12 +368,24 @@ fn markers() -> &'static Markers {
 
 /// Progress/status language over content + rationale.
 pub fn narration_markers(text: &str) -> Vec<String> {
-    markers()
+    let mut found: Vec<String> = markers()
         .narration
         .iter()
+        .filter(|(label, _)| *label != "iso-date")
         .filter(|(_, re)| re.is_match(text))
         .map(|(label, _)| (*label).to_string())
-        .collect()
+        .collect();
+    // A bare date is often legitimate provenance ("the spec froze 2025-03-01");
+    // it only reads as a status board next to other narration language.
+    if !found.is_empty()
+        && markers()
+            .narration
+            .iter()
+            .any(|(l, re)| *l == "iso-date" && re.is_match(text))
+    {
+        found.push("iso-date".to_string());
+    }
+    found
 }
 
 /// Markers that a memory won't travel to another contributor's checkout.
@@ -419,11 +450,15 @@ fn git(repo_root: &Path, args: &[&str]) -> Option<String> {
 /// `None` on any git failure — a missing repo or an unknown base must degrade
 /// the audit to "no coverage section", never fail it.
 fn branch_diff(repo_root: &Path, base_ref: &str) -> Option<BranchDiff> {
+    // User-supplied; a leading '-' would parse as a git option, not a ref.
+    if base_ref.starts_with('-') {
+        return None;
+    }
     let merge_base = git(repo_root, &["merge-base", base_ref, "HEAD"])?;
     if merge_base.is_empty() {
         return None;
     }
-    let range = format!("{merge_base}...HEAD");
+    let range = format!("{merge_base}..HEAD");
     let out = git(repo_root, &["diff", "--name-only", &range])?;
     Some(BranchDiff {
         merge_base,
@@ -432,22 +467,46 @@ fn branch_diff(repo_root: &Path, base_ref: &str) -> Option<BranchDiff> {
 }
 
 /// Commit date of the most recent commit touching each distinct existing ref.
+///
+/// One `git log` walk for the whole set, bounded to commits newer than the
+/// oldest effective timestamp in scope — churn older than every memory can't
+/// flag anything, and per-ref subprocesses made `--scope all` fork O(refs)
+/// processes.
 fn last_commit_dates(repo_root: &Path, memories: &[&Memory]) -> BTreeMap<String, String> {
     let distinct: BTreeSet<&str> = memories
         .iter()
         .flat_map(|m| m.artifact_refs.iter().map(String::as_str))
         // A missing ref is already reported as missing; asking git about it
-        // would spend a process to say the same thing twice.
+        // would spend effort to say the same thing twice.
         .filter(|r| repo_root.join(r).exists())
         .collect();
-
-    distinct
-        .into_iter()
-        .filter_map(|r| {
-            let date = git(repo_root, &["log", "-1", "--format=%cI", "--", r])?;
-            (!date.is_empty()).then(|| (r.to_string(), date))
-        })
-        .collect()
+    if distinct.is_empty() {
+        return BTreeMap::new();
+    }
+    let Some(oldest) = memories.iter().filter_map(|m| effective_timestamp(m)).min() else {
+        return BTreeMap::new();
+    };
+    let since = format!("--since={}", oldest.to_rfc3339());
+    let out = git(
+        repo_root,
+        &["log", &since, "--format=%x01%cI", "--name-only"],
+    );
+    let mut dates = BTreeMap::new();
+    let mut current: Option<&str> = None;
+    for line in out.as_deref().unwrap_or_default().lines() {
+        if let Some(date) = line.strip_prefix('\x01') {
+            current = Some(date);
+        } else if !line.is_empty() {
+            if let Some(date) = current {
+                if distinct.contains(line) && !dates.contains_key(line) {
+                    // Newest-first walk: the first commit naming a path is its
+                    // most recent touch.
+                    dates.insert(line.to_string(), date.to_string());
+                }
+            }
+        }
+    }
+    dates
 }
 
 fn coverage_report(diff: BranchDiff, in_scope: &[&Memory]) -> CoverageReport {
@@ -515,7 +574,13 @@ mod tests {
             narration_markers("resume from the handoff"),
             ["hand-off", "resume"]
         );
-        assert_eq!(narration_markers("verified on 2026-07-12"), ["iso-date"]);
+        // A bare date is provenance, not narration (review R5): it only flags
+        // alongside another narration marker.
+        assert!(narration_markers("verified on 2026-07-12").is_empty());
+        assert_eq!(
+            narration_markers("SHIPPED 2026-07-18"),
+            ["SHIPPED", "iso-date"]
+        );
         assert_eq!(
             narration_markers("landed on main; next steps are in the tracker"),
             ["landed", "next-step"]
@@ -576,7 +641,7 @@ mod tests {
         let mut m = mem("mem:fact-a", &"x".repeat(MAX_CONTENT_LENGTH + 1));
         m.artifact_refs = vec!["Cargo.toml".to_string(), "src/gone.rs".to_string()];
 
-        let report = audit_memories(&[m], root.path(), &AuditOptions::default());
+        let report = audit_memories(&[m], Some(root.path()), &AuditOptions::default());
         let entry = &report.entries[0];
         assert!(entry.over_cap);
         assert_eq!(entry.content_len, MAX_CONTENT_LENGTH + 1);
@@ -596,7 +661,7 @@ mod tests {
         );
         m.artifact_refs = vec!["Cargo.toml".to_string()];
 
-        let report = audit_memories(&[m], root.path(), &AuditOptions::default());
+        let report = audit_memories(&[m], Some(root.path()), &AuditOptions::default());
         assert!(report.entries[0].is_clean());
         assert!(report.entries[0].flags().is_empty());
         assert_eq!(report.entries[0].refs_status(), "1 ok");
@@ -613,7 +678,7 @@ mod tests {
 
         let report = audit_memories(
             &[on_branch, elsewhere],
-            root.path(),
+            Some(root.path()),
             &AuditOptions {
                 scope: AuditScope::Branch("feat/x".to_string()),
                 base_ref: None,
@@ -631,7 +696,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let report = audit_memories(
             &[mem("mem:fact-a", "anything")],
-            root.path(),
+            Some(root.path()),
             &AuditOptions {
                 scope: AuditScope::Branch("feat/x".to_string()),
                 base_ref: None,
@@ -642,10 +707,20 @@ mod tests {
     }
 
     #[test]
+    fn no_root_skips_ref_checks_instead_of_reporting_missing() {
+        let mut m = mem("mem:fact-a", "cites a real path");
+        m.artifact_refs = vec!["src/definitely/not/here.rs".to_string()];
+        let report = audit_memories(&[m], None, &AuditOptions::default());
+        assert!(report.ref_checks_skipped);
+        assert!(report.entries[0].missing_refs.is_empty());
+        assert!(report.entries[0].churned_refs.is_empty());
+    }
+
+    #[test]
     fn all_scope_never_reports_coverage() {
         let report = audit_memories(
             &[mem("mem:fact-a", "anything")],
-            Path::new("."),
+            Some(Path::new(".")),
             &AuditOptions::default(),
         );
         assert!(report.coverage.is_none());
