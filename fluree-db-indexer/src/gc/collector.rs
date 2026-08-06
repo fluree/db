@@ -1038,8 +1038,8 @@ mod tests {
     }
 
     /// The minimal `Fir6Inputs` a rebuild publishes: no dict packs, no graph
-    /// data, and `prev_root_id` as the index chain's prior head.
-    fn minimal_fir6_inputs(t: i64, prev_root_id: Option<ContentId>) -> Fir6Inputs {
+    /// data, and `prev_index` as the version this root supersedes.
+    fn minimal_fir6_inputs(t: i64, prev_index: Option<BinaryPrevIndexRef>) -> Fir6Inputs {
         let dummy_cid = ContentId::new(ContentKind::IndexLeaf, b"dummy");
         let dummy_tree = DictTreeRefs {
             branch: dummy_cid,
@@ -1084,7 +1084,7 @@ mod tests {
             db_schema: None,
             sketch_ref: None,
             attachment_events: None,
-            prev_index_root_id: prev_root_id,
+            prev_index,
         }
     }
 
@@ -1148,9 +1148,9 @@ mod tests {
 
     /// A rebuild publishes through `encode_and_write_root_v6` with no
     /// `GarbageContext`, so the prior index head reaches the new root only via
-    /// `Fir6Inputs::prev_index_root_id`. Dropping it severs the prev-index
-    /// chain: a later chain walk stops at this root and every earlier version
-    /// is orphaned beyond GC's reach (#1548).
+    /// `Fir6Inputs::prev_index`. Dropping it severs the prev-index chain: a
+    /// later chain walk stops at this root and every earlier version is
+    /// orphaned beyond GC's reach (#1548).
     #[tokio::test]
     async fn rebuild_root_links_prior_index_chain() {
         let storage = MemoryStorage::new();
@@ -1159,7 +1159,13 @@ mod tests {
 
         let result = encode_and_write_root_v6(
             &store,
-            minimal_fir6_inputs(9, Some(prior_head.clone())),
+            minimal_fir6_inputs(
+                9,
+                Some(BinaryPrevIndexRef {
+                    t: 8,
+                    id: prior_head.clone(),
+                }),
+            ),
             None,
             IndexStats::default(),
         )
@@ -1186,7 +1192,13 @@ mod tests {
 
         let reindexed = encode_and_write_root_v6(
             &store,
-            minimal_fir6_inputs(4, Some(root_cids[2].clone())),
+            minimal_fir6_inputs(
+                4,
+                Some(BinaryPrevIndexRef {
+                    t: 3,
+                    id: root_cids[2].clone(),
+                }),
+            ),
             None,
             IndexStats::default(),
         )

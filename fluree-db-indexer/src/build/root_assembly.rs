@@ -261,11 +261,16 @@ pub(crate) struct Fir6Inputs {
     ///   from this state because the indexer has no way to
     ///   recover the missing history.
     pub attachment_events: Option<crate::config::AttachmentEventCoverage>,
-    /// The previous index root's CID (`NsRecord.index_head_id`), when one
-    /// exists. Lets the `Augment` arena arm recover the base arena's event
-    /// history from the prior root — without it a full rebuild under
-    /// `Augment` coverage silently drops a previously-sealed arena.
-    pub prev_index_root_id: Option<ContentId>,
+    /// The index version this root supersedes — the prior head root's CID and
+    /// `index_t` (`NsRecord`'s `index_head_id` and `index_t`) — when one
+    /// exists.
+    ///
+    /// Serves two purposes. It becomes the published root's `prev_index` link,
+    /// which GC and drop walk to enumerate superseded artifacts. It also lets
+    /// the `Augment` arena arm recover the base arena's event history from the
+    /// prior root — without it a full rebuild under `Augment` coverage
+    /// silently drops a previously-sealed arena.
+    pub prev_index: Option<BinaryPrevIndexRef>,
 }
 
 /// Encode an `IndexRoot` (FIR6), write to CAS, and return an `IndexResult`.
@@ -274,7 +279,10 @@ pub(crate) struct Fir6Inputs {
 /// `IndexRoot`, encodes it, writes to CAS with `ContentKind::IndexRoot`,
 /// and derives the CID.
 ///
-/// `gc_ctx` is `None` for this milestone (V3 GC chain is deferred).
+/// `gc_ctx` carries a caller-computed garbage manifest and prev-index link.
+/// When it is `None`, the prev-index link is still derived from
+/// [`Fir6Inputs::prev_index`] so the chain stays walkable; only the
+/// garbage manifest is omitted.
 pub(crate) async fn encode_and_write_root_v6(
     content_store: &dyn ContentStore,
     inputs: Fir6Inputs,
@@ -432,8 +440,8 @@ pub(crate) async fn encode_and_write_root_v6(
             // full reindex under `Augment` coverage silently drops a
             // previously-sealed arena (and the sticky bit then blocks the
             // bootstrap scan from ever resealing).
-            let prev_arena = match inputs.prev_index_root_id.as_ref() {
-                Some(prev_id) => load_prev_annotation_index(content_store, prev_id).await,
+            let prev_arena = match inputs.prev_index.as_ref() {
+                Some(prev) => load_prev_annotation_index(content_store, &prev.id).await,
                 None => None,
             };
             match prev_arena {
@@ -550,6 +558,14 @@ pub(crate) async fn encode_and_write_root_v6(
                 "GC chain: garbage record written"
             );
         }
+    }
+
+    // Link the prior index head when no `gc_ctx` supplied one. GC and drop
+    // both enumerate superseded artifacts by walking the prev-index chain, so
+    // a root published without the link orphans every earlier version and the
+    // blobs only those versions reference.
+    if root.prev_index.is_none() {
+        root.prev_index = inputs.prev_index.clone();
     }
 
     tracing::info!(

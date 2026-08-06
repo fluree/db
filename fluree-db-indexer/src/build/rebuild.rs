@@ -4,7 +4,7 @@
 //! sorted run files, builds per-graph leaf/branch indexes for all sort
 //! orders, and writes an `IndexRoot` (FIR6) descriptor to storage.
 
-use fluree_db_binary_index::{GraphArenaRefs, RunRecord, VectorDictRef};
+use fluree_db_binary_index::{BinaryPrevIndexRef, GraphArenaRefs, RunRecord, VectorDictRef};
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
 
 use crate::error::{IndexerError, Result};
@@ -119,7 +119,10 @@ where
 
     // Capture values for the blocking task
     let ledger_id = ledger_id.to_string();
-    let prev_root_id = record.index_head_id.clone();
+    let prev_index = record.index_head_id.clone().map(|id| BinaryPrevIndexRef {
+        t: record.index_t,
+        id,
+    });
     let commit_t = record.commit_t;
     // Drive the rebuild's `block_on` on a dedicated runtime so the future, its
     // timers, and any tasks it spawns are advanced by dedicated workers rather
@@ -1120,13 +1123,15 @@ where
                 db_schema,
                 sketch_ref,
                 attachment_events: config.attachment_events.clone(),
-                prev_index_root_id: prev_root_id.clone(),
+                prev_index: prev_index.clone(),
             };
 
             let result = super::root_assembly::encode_and_write_root_v6(
                 &content_store,
                 fir6_inputs,
-                None, // GC chain deferred for V3 milestone.
+                // No caller-computed garbage manifest yet; the prev-index link
+                // is carried by `Fir6Inputs::prev_index`.
+                None,
                 IndexStats {
                     flake_count: total_rows as usize,
                     leaf_count: v3_result
