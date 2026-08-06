@@ -84,9 +84,11 @@ async fn release_manifest_nodes(
         }
     };
 
-    // `created_at_ms == 0` marks a pre-timestamp record whose age cannot be
-    // established, so it is treated as too recent.
-    if record.created_at_ms == 0 || now_ms - record.created_at_ms < min_age_ms {
+    // A record with no timestamp predates the `created_at_ms` field, so it was
+    // written at least a release ago — past any retention window. Treating the
+    // absent timestamp as "too recent" would stop the walk at that record on
+    // every pass, pinning every version newer than it.
+    if record.created_at_ms != 0 && now_ms - record.created_at_ms < min_age_ms {
         tracing::debug!(
             t = manifest_t,
             age_mins = (now_ms - record.created_at_ms) / 60000,
@@ -163,8 +165,7 @@ fn current_timestamp_ms() -> i64 {
 /// - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 30)
 ///
 /// Age is determined by the garbage record's `created_at_ms` field. A record
-/// with no timestamp predates the field, so its age cannot be established and
-/// the walk stops there.
+/// with no timestamp predates the field and is treated as past the window.
 ///
 /// # Roots with no garbage manifest
 ///
@@ -1138,18 +1139,27 @@ mod tests {
         }
     }
 
+    /// Roots in a synthetic chain that deviate from what the current write
+    /// path produces, identified by `t`.
+    #[derive(Default)]
+    struct LegacyRoots {
+        /// Published with no garbage manifest at all.
+        no_manifest: &'static [i64],
+        /// Manifest written before the `created_at_ms` field existed.
+        no_timestamp: &'static [i64],
+    }
+
     /// Write a linked chain of index roots `t=1..=len`. Each root at `t > 1`
     /// carries a garbage manifest listing the leaf blob its predecessor
-    /// referenced, aged past any retention threshold. Roots whose `t` appears
-    /// in `manifest_gaps` are published without a manifest — the shape a build
-    /// with an empty garbage set produces.
+    /// referenced, aged past any retention threshold, except where `legacy`
+    /// says otherwise.
     ///
     /// Returns the root CIDs and the superseded leaf CIDs, each indexed by
     /// `t - 1`.
     async fn write_linked_chain(
         storage: &MemoryStorage,
         len: i64,
-        manifest_gaps: &[i64],
+        legacy: LegacyRoots,
     ) -> (Vec<ContentId>, Vec<ContentId>) {
         let aged_ts = current_timestamp_ms() - (60 * 60 * 1000);
         let mut root_cids: Vec<ContentId> = Vec::new();
@@ -1164,12 +1174,17 @@ mod tests {
                 .unwrap();
             leaf_cids.push(leaf_cid);
 
-            let garbage = if t > 1 && !manifest_gaps.contains(&t) {
+            let garbage = if t > 1 && !legacy.no_manifest.contains(&t) {
                 let (garb_cid, garb_addr) =
                     cid_and_addr(ContentKind::GarbageRecord, format!("garb-{t}").as_bytes());
                 let superseded = &leaf_cids[(t - 2) as usize];
+                let created_at_ms = if legacy.no_timestamp.contains(&t) {
+                    0
+                } else {
+                    aged_ts
+                };
                 let json = format!(
-                    r#"{{"ledger_id": "{LEDGER}", "t": {t}, "garbage": ["{superseded}"], "created_at_ms": {aged_ts}}}"#
+                    r#"{{"ledger_id": "{LEDGER}", "t": {t}, "garbage": ["{superseded}"], "created_at_ms": {created_at_ms}}}"#
                 );
                 storage
                     .write_bytes(&garb_addr, json.as_bytes())
@@ -1237,7 +1252,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_root_carries_garbage_manifest() {
         let storage = MemoryStorage::new();
-        let (root_cids, _) = write_linked_chain(&storage, 2, &[]).await;
+        let (root_cids, _) = write_linked_chain(&storage, 2, LegacyRoots::default()).await;
         let store = test_store(&storage);
 
         let result = encode_and_write_root_v6(
@@ -1309,7 +1324,7 @@ mod tests {
     #[tokio::test]
     async fn reindex_publish_leaves_superseded_roots_collectable() {
         let storage = MemoryStorage::new();
-        let (root_cids, leaf_cids) = write_linked_chain(&storage, 3, &[]).await;
+        let (root_cids, leaf_cids) = write_linked_chain(&storage, 3, LegacyRoots::default()).await;
         let store = test_store(&storage);
 
         let reindexed = encode_and_write_root_v6(
@@ -1367,7 +1382,15 @@ mod tests {
     #[tokio::test]
     async fn gc_bounds_retained_chain_despite_manifest_gap() {
         let storage = MemoryStorage::new();
-        let (root_cids, _) = write_linked_chain(&storage, 6, &[4]).await;
+        let (root_cids, _) = write_linked_chain(
+            &storage,
+            6,
+            LegacyRoots {
+                no_manifest: &[4],
+                ..Default::default()
+            },
+        )
+        .await;
         let store = test_store(&storage);
 
         let max_old_indexes = 1;
@@ -1391,6 +1414,46 @@ mod tests {
         );
     }
 
+    /// A manifest with no `created_at_ms` predates the field, so its nodes are
+    /// long past any retention window. Reading the absent timestamp as "too
+    /// recent" stopped the walk at that record on every pass, pinning every
+    /// version newer than it (#1548).
+    #[tokio::test]
+    async fn manifest_without_timestamp_does_not_stop_gc() {
+        let storage = MemoryStorage::new();
+        // t=2's manifest predates the field; t=3's and t=4's are current.
+        let (root_cids, leaf_cids) = write_linked_chain(
+            &storage,
+            4,
+            LegacyRoots {
+                no_timestamp: &[2],
+                ..Default::default()
+            },
+        )
+        .await;
+        let store = test_store(&storage);
+
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let result = clean_garbage(&store, &root_cids[3], config).await.unwrap();
+
+        assert_eq!(
+            result.indexes_cleaned, 2,
+            "t=1 and t=2 are past retention and must be released"
+        );
+        assert!(
+            !store.has(&leaf_cids[0]).await.unwrap(),
+            "the pre-timestamp manifest still names t=1's superseded leaf"
+        );
+        assert!(
+            !store.has(&leaf_cids[1]).await.unwrap(),
+            "the walk continues past it to t=2's manifest"
+        );
+    }
+
     /// Stepping over a manifest gap strands exactly the nodes that gap would
     /// have named — one build's worth — and nothing more. The storage sweep
     /// reclaims them; every other superseded node is still released here.
@@ -1398,7 +1461,15 @@ mod tests {
     async fn manifest_gap_strands_only_its_own_step() {
         let storage = MemoryStorage::new();
         // The manifest at t=4 would have named t=3's superseded leaf.
-        let (root_cids, leaf_cids) = write_linked_chain(&storage, 6, &[4]).await;
+        let (root_cids, leaf_cids) = write_linked_chain(
+            &storage,
+            6,
+            LegacyRoots {
+                no_manifest: &[4],
+                ..Default::default()
+            },
+        )
+        .await;
         let store = test_store(&storage);
 
         let config = CleanGarbageConfig {
