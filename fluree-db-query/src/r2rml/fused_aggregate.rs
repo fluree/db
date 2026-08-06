@@ -6900,7 +6900,7 @@ mod tests {
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
         let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
             .expect("the leaf var-object member does not change the join topology");
-        let mut op = crt_op();
+        let op = crt_op();
         let resolved = op
             .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
             .await
@@ -6954,7 +6954,7 @@ mod tests {
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
         let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
             .expect("crt_join_reorder must decompose");
-        let mut op = crt_op();
+        let op = crt_op();
         let resolved = op
             .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
             .await
