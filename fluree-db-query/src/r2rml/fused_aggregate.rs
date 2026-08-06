@@ -792,34 +792,10 @@ enum GKey {
     Null,
 }
 
-/// N1 kill switch (`FLUREE_FUSED_VECTOR_FOLD`, default **on**). Off (`0`/`false`/
-/// `off`/`no`) restores the byte-identical `HashMap<Vec<GKey>, Vec<Acc>>` fold that
-/// allocates + clones a fresh owned key every row. Read once per process.
-fn vector_fold_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_VECTOR_FOLD"))
-}
-
 /// Rows per bounded output chunk when output-bounding is on (see `pending_rows`). A
 /// GROUP BY rollup with more groups than this emits multiple batches instead of one
 /// giant one, so a high-cardinality result never fully materializes at once.
 const OUTPUT_BOUND_ROWS: usize = 8192;
-
-/// Output-bounding kill switch (`FLUREE_FUSED_R2RML_OUTPUT_BOUND`, default **on**).
-/// Off restores the single-batch emission wholesale (byte-identical to pre-bounding:
-/// one batch, groups in dict/map iteration order). Read uncached under cfg(test) so
-/// the on/off differential is testable without an `OnceLock` caching the first value.
-fn output_bound_enabled() -> bool {
-    #[cfg(not(test))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND"))
-    }
-    #[cfg(test)]
-    {
-        crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND")
-    }
-}
 
 /// N1: a BORROWED view of one composite-group-key component, read straight from
 /// the scanned batch (or the resolver's owned dim GKeys) with no per-row `String`
@@ -1253,6 +1229,17 @@ pub struct FusedR2rmlAggregateOperator {
     /// the switch is off (or the result fits one chunk) the single-batch path is taken
     /// and this stays `None`.
     pending_rows: Option<Vec<(Vec<GKey>, Vec<Acc>)>>,
+    /// N1/N2/P3 kill switches, resolved from env ONCE at CONSTRUCTION (id=3717339910).
+    /// Not a process-wide `OnceLock` and not read per-call: a per-operator field is
+    /// what lets a test flip a switch by SETTING THE FIELD instead of mutating process
+    /// env. `std::env::set_var`/`remove_var` race the env reads on parallel test threads
+    /// (libc-level UB; `set_var` is `unsafe` in edition 2024). Each defaults ON unless
+    /// its env var holds a falsy spelling (`0`/`false`/`off`/`no`), via
+    /// [`crate::r2rml::env_switch_enabled`]. (`FLUREE_FUSED_R2RML_MULTIFACT_GEN` on
+    /// #1589 must adopt this same field pattern.)
+    vector_fold: bool,
+    output_bound: bool,
+    multifact: bool,
 }
 
 impl FusedR2rmlAggregateOperator {
@@ -1281,6 +1268,9 @@ impl FusedR2rmlAggregateOperator {
             state: OperatorState::Created,
             done: false,
             pending_rows: None,
+            vector_fold: crate::r2rml::env_switch_enabled("FLUREE_FUSED_VECTOR_FOLD"),
+            output_bound: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND"),
+            multifact: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"),
         }
     }
 
@@ -1693,7 +1683,7 @@ impl Operator for FusedR2rmlAggregateOperator {
         // a table grow cannot re-bucket a key away from its probe (the split-group
         // bug a plain `HashMap` + `insert_hashed_nocheck` hits on resize). `groups`
         // is the OFF-path (`FLUREE_FUSED_VECTOR_FOLD=0`) byte-identical owned-key map.
-        let vfold = vector_fold_enabled();
+        let vfold = self.vector_fold;
         let mut dict: hashbrown::HashTable<(Vec<GKey>, u32)> = hashbrown::HashTable::new();
         let mut group_accs: Vec<Vec<Acc>> = Vec::new();
         let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
@@ -2014,7 +2004,7 @@ impl Operator for FusedR2rmlAggregateOperator {
             groups.into_iter().collect()
         };
 
-        if !output_bound_enabled() || rows.len() <= OUTPUT_BOUND_ROWS {
+        if !self.output_bound || rows.len() <= OUTPUT_BOUND_ROWS {
             // Switch off, or the whole result fits one bounded chunk: emit a single
             // batch. Byte-identical to the pre-bounding path (same rows, dict/map
             // iteration order — no reordering, since nothing is popped).
@@ -2756,27 +2746,6 @@ impl FusedR2rmlAggregateOperator {
         Some((order, join_vars))
     }
 
-    /// P3 kill switch (`FLUREE_FUSED_R2RML_MULTIFACT`, default **on**). Off restores
-    /// the pre-P3 behavior wholesale: a branching multi-fact shape simply declines to
-    /// the generic pipeline. Read once per process.
-    fn multifact_enabled() -> bool {
-        // Production: read once (process-wide), like the sibling fused switches.
-        #[cfg(not(test))]
-        {
-            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ENABLED
-                .get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"))
-        }
-        // Test: read the env each call so the switch-off decline path is testable
-        // without a process-wide `OnceLock` caching the first observed value. Only the
-        // gate test toggles this var (under a lock); the resolver tests call
-        // `resolve_branching_star_at_open` directly and never read it.
-        #[cfg(test)]
-        {
-            crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT")
-        }
-    }
-
     /// P3 (scaffolding): decompose a BRANCHING-STAR join — a fact ROOT with ≥2 FK
     /// branches, each a linear sub-chain — into its root + classified branches, or
     /// `None` when the shape is not the admitted class. This is the structural half
@@ -3213,7 +3182,7 @@ impl FusedR2rmlAggregateOperator {
                 // shape outside the admitted class. With the switch OFF this is the
                 // pre-P3 decline (byte-identical), so a branching shape reverts to the
                 // generic pipeline wholesale.
-                if Self::multifact_enabled() {
+                if self.multifact {
                     if let Some(star) = Self::decompose_branching_star(pats, &self.group_by) {
                         return self
                             .resolve_branching_star_at_open(ctx, mapping, star)
@@ -7105,8 +7074,7 @@ mod tests {
         let vars = VarRegistry::new();
 
         // ON: multiple bounded chunks, each ≤ the bound, union == full result.
-        std::env::set_var("FLUREE_FUSED_R2RML_OUTPUT_BOUND", "1");
-        assert!(output_bound_enabled());
+        // id=3717339910: flip the switch by SETTING THE FIELD, never process env.
         let prov_on = CrtProvider {
             mapping: Arc::clone(&mapping),
             batches: b.clone(),
@@ -7114,6 +7082,7 @@ mod tests {
         let ctx_on =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&prov_on, &prov_on);
         let mut op_on = build_op();
+        op_on.output_bound = true;
         op_on.open(&ctx_on).await.expect("open");
         let (mut nbatch_on, mut total_on, mut max_chunk) = (0usize, 0usize, 0usize);
         while let Some(batch) = op_on.next_batch(&ctx_on).await.expect("next_batch") {
@@ -7136,8 +7105,6 @@ mod tests {
         );
 
         // OFF: exactly one batch (byte-identical pre-bounding emission), same total.
-        std::env::set_var("FLUREE_FUSED_R2RML_OUTPUT_BOUND", "0");
-        assert!(!output_bound_enabled());
         let prov_off = CrtProvider {
             mapping: Arc::clone(&mapping),
             batches: b,
@@ -7145,13 +7112,13 @@ mod tests {
         let ctx_off =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&prov_off, &prov_off);
         let mut op_off = build_op();
+        op_off.output_bound = false;
         op_off.open(&ctx_off).await.expect("open");
         let (mut nbatch_off, mut total_off) = (0usize, 0usize);
         while let Some(batch) = op_off.next_batch(&ctx_off).await.expect("next_batch") {
             nbatch_off += 1;
             total_off += batch.column(c).map(<[Binding]>::len).unwrap_or(0);
         }
-        std::env::remove_var("FLUREE_FUSED_R2RML_OUTPUT_BOUND");
         assert_eq!(nbatch_off, 1, "OFF emits a single batch");
         assert_eq!(
             total_off, n as usize,
@@ -7309,11 +7276,12 @@ mod tests {
         }
     }
 
-    /// (d) SWITCH: `FLUREE_FUSED_R2RML_MULTIFACT=0` disables the whole branching path,
-    /// so `resolve_join_at_open` DECLINES the star (Ok(None) → the pre-P3 fallback,
-    /// byte-identical); unset/on FUSES it. This is the sole reader/writer of the env
-    /// var (the resolver tests call `resolve_branching_star_at_open` directly), so no
-    /// lock is needed. `multifact_enabled` is read uncached under cfg(test).
+    /// (d) SWITCH: the `multifact` operator field (defaulted from
+    /// `FLUREE_FUSED_R2RML_MULTIFACT`) disables the whole branching path, so
+    /// `resolve_join_at_open` DECLINES the star (Ok(None) → the pre-P3 fallback,
+    /// byte-identical); on FUSES it. id=3717339910: the switch is now an operator FIELD
+    /// the test sets directly, never process env — so this can no longer race a parallel
+    /// test thread's env read (the UB the cfg(test) uncached read + set_var carried).
     #[tokio::test]
     async fn p3_multifact_switch_gates_the_branching_path() {
         use crate::var_registry::VarRegistry;
@@ -7325,15 +7293,15 @@ mod tests {
         let vars = VarRegistry::new();
 
         // OFF → decline (Ok(None)).
-        std::env::set_var("FLUREE_FUSED_R2RML_MULTIFACT", "0");
-        assert!(!FusedR2rmlAggregateOperator::multifact_enabled());
         let provider_off = CrtProvider {
             mapping: Arc::clone(&mapping),
             batches: std::collections::HashMap::new(),
         };
         let ctx_off = ExecutionContext::new(&snapshot, &vars)
             .with_r2rml_providers(&provider_off, &provider_off);
-        let off = crt_op()
+        let mut op_off = crt_op();
+        op_off.multifact = false;
+        let off = op_off
             .resolve_join_at_open(&ctx_off, &refs, mapping.as_ref())
             .await
             .expect("resolve must not error");
@@ -7343,19 +7311,18 @@ mod tests {
         );
 
         // ON (the same shape + a valid fixture) → fuse (Ok(Some)).
-        std::env::set_var("FLUREE_FUSED_R2RML_MULTIFACT", "1");
-        assert!(FusedR2rmlAggregateOperator::multifact_enabled());
         let provider_on = CrtProvider {
             mapping: Arc::clone(&mapping),
             batches: clean_batches(),
         };
         let ctx_on = ExecutionContext::new(&snapshot, &vars)
             .with_r2rml_providers(&provider_on, &provider_on);
-        let on = crt_op()
+        let mut op_on = crt_op();
+        op_on.multifact = true;
+        let on = op_on
             .resolve_join_at_open(&ctx_on, &refs, mapping.as_ref())
             .await
             .expect("resolve must not error");
-        std::env::remove_var("FLUREE_FUSED_R2RML_MULTIFACT");
         assert!(
             on.is_some(),
             "switch ON must FUSE the branching star (contrast proving the gate controls it)"
