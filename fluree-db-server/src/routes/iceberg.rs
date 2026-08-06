@@ -330,6 +330,19 @@ pub struct IcebergTrackRequest {
     /// worker's default (30s). Ignored by `/untrack`. Must be > 0.
     #[serde(default)]
     pub poll_interval_secs: Option<u64>,
+    /// Block the response until the opportunistic first sync finishes.
+    ///
+    /// Defaults to FALSE: registration is durable the moment it is persisted, and
+    /// the worker polls regardless, so the first sync is a latency optimisation
+    /// rather than part of the operation. Waiting for it made `track` take as long
+    /// as a full materialize — on a fresh volume, bootstrap registers 17 sources
+    /// and each one blocked on a FULL read, serialising 17 backfills inside pod
+    /// startup.
+    ///
+    /// Set true when a caller genuinely wants the first sync's numbers in the
+    /// response (tests, one-off manual runs on a small source).
+    #[serde(default)]
+    pub wait_for_first_sync: bool,
 }
 
 /// Response for `POST /v1/fluree/iceberg/track`.
@@ -343,8 +356,22 @@ pub struct IcebergTrackResponse {
     pub poll_interval_secs: u64,
     /// Number of jobs the worker is tracking.
     pub tracked_jobs: usize,
-    /// Result of the immediate first materialize run on registration.
-    pub initial: IcebergMaterializeResponse,
+    /// What happened to the opportunistic first sync: `started` (running in the
+    /// background), `completed`, or `failed`.
+    ///
+    /// Separate from `tracked` because the two are genuinely independent, and
+    /// conflating them was a real defect: a first sync that lost a commit race made
+    /// the whole call return an error even though the job was registered AND
+    /// persisted beforehand. Operators reasonably read `track ERROR` as "tracking
+    /// did not happen" when it had.
+    pub first_sync: &'static str,
+    /// Numbers from the first sync — only present when `wait_for_first_sync` was set
+    /// and it succeeded. `null` otherwise, which existing consumers already tolerate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial: Option<IcebergMaterializeResponse>,
+    /// Why the first sync failed, when it did. Never fails the call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_sync_error: Option<String>,
 }
 
 /// Register a `source → target` materialization tracking job and run an
@@ -397,30 +424,83 @@ async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<i
         .await
         .map_err(ServerError::Api)?;
 
-    // Immediate first sync so the target is populated without waiting a cycle.
-    let result = state
-        .fluree
-        .materialize_r2rml_graph_source(&req.source, &req.target, false)
-        .await
-        .map_err(ServerError::Api)?;
+    // The opportunistic first sync — populate the target without waiting a poll cycle.
+    //
+    // It is NOT part of registration, and the code above is what makes that true: the
+    // job is in the worker AND persisted before we get here. So this must neither
+    // block the response nor be able to fail it. Previously it did both:
+    //
+    //   * `?` on its error made `track` report failure for a job that was already
+    //     registered and durable. A first sync losing a commit race produced
+    //     `track ERROR: Commit conflict ...`, which reads as "tracking did not happen".
+    //   * awaiting it made `track` cost a full materialize. On a fresh volume nothing
+    //     is tracked, so bootstrap registers all 17 sources and each blocked on a FULL
+    //     read — 17 backfills serialised inside pod startup.
+    let tracked_jobs = worker.tracked_jobs().len();
+    let (first_sync, initial, first_sync_error) = if req.wait_for_first_sync {
+        match state
+            .fluree
+            .materialize_r2rml_graph_source(&req.source, &req.target, false)
+            .await
+        {
+            Ok(result) => (
+                "completed",
+                Some(IcebergMaterializeResponse {
+                    source: req.source.clone(),
+                    target: req.target.clone(),
+                    from_snapshot_id: result.from_snapshot_id,
+                    to_snapshot_id: result.to_snapshot_id,
+                    incremental: result.incremental,
+                    committed: result.committed,
+                    rows_read: result.rows_read,
+                    subjects_upserted: result.subjects_upserted,
+                    subjects_retracted: result.subjects_retracted,
+                }),
+                None,
+            ),
+            // Reported, never fatal: the job is tracked and the worker will retry.
+            Err(e) => {
+                tracing::warn!(
+                    source = %req.source,
+                    target = %req.target,
+                    error = %e,
+                    "iceberg/track: first sync failed; the job IS tracked and the worker \
+                     will retry on its next poll"
+                );
+                ("failed", None, Some(e.to_string()))
+            }
+        }
+    } else {
+        let fluree = Arc::clone(&state.fluree);
+        let (source, target) = (req.source.clone(), req.target.clone());
+        tokio::spawn(async move {
+            match fluree
+                .materialize_r2rml_graph_source(&source, &target, false)
+                .await
+            {
+                Ok(r) => tracing::info!(
+                    source = %source, target = %target,
+                    rows_read = r.rows_read, committed = r.committed,
+                    "iceberg/track: background first sync finished"
+                ),
+                Err(e) => tracing::warn!(
+                    source = %source, target = %target, error = %e,
+                    "iceberg/track: background first sync failed; the worker will retry"
+                ),
+            }
+        });
+        ("started", None, None)
+    };
 
     let response = IcebergTrackResponse {
-        source: req.source.clone(),
-        target: req.target.clone(),
+        source: req.source,
+        target: req.target,
         tracked: true,
         poll_interval_secs: interval.as_secs(),
-        tracked_jobs: worker.tracked_jobs().len(),
-        initial: IcebergMaterializeResponse {
-            source: req.source,
-            target: req.target,
-            from_snapshot_id: result.from_snapshot_id,
-            to_snapshot_id: result.to_snapshot_id,
-            incremental: result.incremental,
-            committed: result.committed,
-            rows_read: result.rows_read,
-            subjects_upserted: result.subjects_upserted,
-            subjects_retracted: result.subjects_retracted,
-        },
+        tracked_jobs,
+        first_sync,
+        initial,
+        first_sync_error,
     };
     Ok((StatusCode::OK, Json(response)))
 }
