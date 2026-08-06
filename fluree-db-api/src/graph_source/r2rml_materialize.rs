@@ -62,7 +62,12 @@ use fluree_db_r2rml::materialize::{
 };
 use fluree_vocab::UnresolvedDatatypeConstraint;
 
+use std::sync::Arc;
+
+use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+
 use crate::error::TargetTally;
+use crate::graph_source::r2rml::MaterializeScan;
 use crate::graph_source::FlureeR2rmlProvider;
 use crate::{ApiError, Fluree, Result};
 // `StreamExt::next` — the scan is consumed as a stream so the whole table is never
@@ -158,6 +163,85 @@ pub struct MaterializeResult {
     pub tally: TargetTally,
 }
 
+/// The source side of a materialize pass: what the mapping is, how to interpret it, and
+/// one window of rows.
+///
+/// Exists so the engine can be driven without an Iceberg catalog. Before this, the engine
+/// opened with `let provider = FlureeR2rmlProvider::new(self)` — no injection point — and
+/// every graph-source integration test in the repo needs live infrastructure (a Polaris
+/// REST catalog, LocalStack or MinIO). The combination made
+/// [`Fluree::materialize_r2rml_graph_source`] **structurally untestable**, which is why a
+/// reviewer could replace the streaming core with "yield nothing" and leave 954/954 green.
+/// The engine was not left uncovered by carelessness; there was no seam to cover it
+/// through.
+///
+/// Deliberately THREE methods — the entire provider surface the engine actually touches.
+/// A wider trait would be easier to write and harder to fake honestly.
+///
+/// `&dyn` rather than a generic parameter: the pass is ~400 lines and I/O-bound, so
+/// monomorphizing it per provider buys nothing measurable and would leak a type parameter
+/// into the per-target helpers. Dynamic dispatch costs three calls per table per poll.
+///
+/// # What faking this does and does not cover
+///
+/// It covers everything the ENGINE decides — latest-by-key collapsing, tombstone
+/// retraction, the additive `@type` union, per-target fan-out and [`TargetTally`],
+/// watermark hold-back, transaction chunking, stale-base retry, novelty deferral.
+///
+/// It does **NOT** cover the real provider's scan (`stream_scan_tasks`, `ScanChoice`, the
+/// incremental snapshot window), because a fake bypasses that code by construction. Making
+/// that path testable offline needs a storage seam
+/// (`prepare_iceberg_scan` returns a concrete `Arc<S3IcebergStorage>`) plus a minimal
+/// Iceberg table fixture — a separate, larger change.
+#[async_trait::async_trait]
+pub trait MaterializeSource: Send + Sync {
+    /// The compiled R2RML mapping for `graph_source_id`.
+    async fn compiled_mapping(&self, graph_source_id: &str) -> Result<Arc<CompiledR2rmlMapping>>;
+
+    /// Materialization options: `(delete convention, order_by column)`. Either one being
+    /// present switches the pass from additive merge to latest-by-key.
+    async fn materialize_options(
+        &self,
+        graph_source_id: &str,
+    ) -> Result<(Option<DeleteConvention>, Option<String>)>;
+
+    /// One window of rows for `table_name`, starting after `from_snapshot_id`, as a
+    /// stream — the whole table is never resident.
+    async fn scan_window(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        from_snapshot_id: Option<i64>,
+    ) -> Result<MaterializeScan>;
+}
+
+/// The production implementation: straight delegation to [`FlureeR2rmlProvider`], so the
+/// seam adds no behaviour of its own and cannot drift from what the server does.
+#[async_trait::async_trait]
+impl MaterializeSource for FlureeR2rmlProvider<'_> {
+    async fn compiled_mapping(&self, graph_source_id: &str) -> Result<Arc<CompiledR2rmlMapping>> {
+        Ok(R2rmlProvider::compiled_mapping(self, graph_source_id, None).await?)
+    }
+
+    async fn materialize_options(
+        &self,
+        graph_source_id: &str,
+    ) -> Result<(Option<DeleteConvention>, Option<String>)> {
+        Ok(FlureeR2rmlProvider::materialize_options(self, graph_source_id).await?)
+    }
+
+    async fn scan_window(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        from_snapshot_id: Option<i64>,
+    ) -> Result<MaterializeScan> {
+        Ok(self
+            .scan_for_materialize_stream(graph_source_id, table_name, &[], from_snapshot_id)
+            .await?)
+    }
+}
+
 impl Fluree {
     /// Materialize an R2RML / Iceberg graph source into a native ledger.
     ///
@@ -195,12 +279,42 @@ impl Fluree {
         force_full: bool,
     ) -> Result<MaterializeResult> {
         let provider = FlureeR2rmlProvider::new(self);
+        self.materialize_from_source(
+            &provider,
+            source_graph_source_id,
+            target_ledger_id,
+            force_full,
+            // Production always derives its own transaction budget.
+            None,
+        )
+        .await
+    }
 
+    /// The materialize pass itself, against any [`MaterializeSource`].
+    ///
+    /// Split out from [`Self::materialize_r2rml_graph_source`] so a test can drive the
+    /// engine without an Iceberg catalog. The public method's signature is unchanged and
+    /// simply supplies the production source, so nothing about the server's behaviour
+    /// moves — see `MaterializeSource` for what a fake does and does not cover.
+    ///
+    /// `txn_budget_override` overrides the per-transaction byte budget. Production passes
+    /// `None` and gets the derived value; only a test passes `Some`. It exists because the
+    /// derived budget has a **1 MiB floor** (`.max(1 << 20)`), so proving that a window is
+    /// split across transactions would otherwise need >1 MiB of JSON-LD — ~24,000 rows,
+    /// which took minutes through the transact path. A parameter only tests supply is a
+    /// smell; a multi-minute unit test nobody runs is a worse one, and an env var would be
+    /// process-global and flaky under parallel tests.
+    pub(crate) async fn materialize_from_source(
+        &self,
+        provider: &dyn MaterializeSource,
+        source_graph_source_id: &str,
+        target_ledger_id: &str,
+        force_full: bool,
+        txn_budget_override: Option<usize>,
+    ) -> Result<MaterializeResult> {
         // 1. Compiled R2RML mapping (subject / predicate / object maps) and the
         //    materialization options (delete convention + latest-by-key ordering).
-        let mapping = provider
-            .compiled_mapping(source_graph_source_id, None)
-            .await?;
+        let mapping = provider.compiled_mapping(source_graph_source_id).await?;
         if mapping.triples_maps.is_empty() {
             return Err(ApiError::Config(format!(
                 "Graph source '{source_graph_source_id}' has no R2RML triples maps"
@@ -277,7 +391,7 @@ impl Fluree {
             // and more predictable term than the raw columnar data, but it is not
             // O(1) — a window with millions of distinct subjects is still large.
             let scan = provider
-                .scan_for_materialize_stream(source_graph_source_id, table_name, &[], from_t)
+                .scan_window(source_graph_source_id, table_name, from_t)
                 .await?;
             let (to_id, incremental) = (scan.to_snapshot_id, scan.incremental);
             // A window older than the refresh bound must persist its watermark even
@@ -443,7 +557,8 @@ impl Fluree {
         // a QUARTER of the flake ceiling errs in the safe direction. Over-chunking is
         // nearly free: `reindex_min_bytes` is 1 MiB, so the indexer drains novelty
         // between chunks rather than letting it accumulate toward the ceiling.
-        let txn_budget = (self.index_config.reindex_max_bytes / 4).max(1 << 20);
+        let txn_budget =
+            txn_budget_override.unwrap_or((self.index_config.reindex_max_bytes / 4).max(1 << 20));
 
         // PER-TARGET ISOLATION.
         //
@@ -2506,5 +2621,361 @@ mod tests {
         }
         assert_eq!(union, iris, "retraction chunks must cover every subject");
         assert_eq!(total, iris.len(), "chunks must not duplicate a subject");
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    //! B3 — the first tests that drive the materialize engine itself.
+    //!
+    //! Before these, `materialize_r2rml_graph_source` had three callers in the whole repo
+    //! and none was a test, so a reviewer could replace the streaming core with "yield
+    //! nothing" and leave 954/954 green. It was not carelessness: every graph-source
+    //! integration test needs live infrastructure (Polaris / LocalStack / MinIO), there is
+    //! no offline Iceberg fixture anywhere in the tree, and the engine hardcoded its
+    //! provider. [`MaterializeSource`] is the seam that makes this reachable.
+    //!
+    //! SCOPE, stated up front so no one mistakes these for more than they are: a fake
+    //! source bypasses the real provider's scan by construction, so these do NOT cover
+    //! `stream_scan_tasks` / `ScanChoice` / the incremental snapshot window. They cover
+    //! what the ENGINE decides.
+
+    use super::*;
+    use crate::FlureeBuilder;
+    use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+    use fluree_db_tabular::batch::{BatchSchema, Column, FieldInfo, FieldType};
+
+    /// One string column per name, one row per tuple element.
+    fn batch(columns: &[(&str, &[&str])]) -> ColumnBatch {
+        let fields = columns
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| FieldInfo {
+                name: (*name).to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: i as i32 + 1,
+            })
+            .collect();
+        let cols = columns
+            .iter()
+            .map(|(_, vals)| Column::String(vals.iter().map(|v| Some((*v).to_string())).collect()))
+            .collect();
+        ColumnBatch::new(Arc::new(BatchSchema::new(fields)), cols).expect("batch")
+    }
+
+    /// `people` table → one subject per `id`, with a `name` predicate.
+    fn people_mapping() -> Arc<CompiledR2rmlMapping> {
+        let tm = TriplesMap::new("http://tm/people", "people")
+            .with_subject_template("http://ex/person/{id}")
+            .with_class("http://ex/Person")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/name"),
+                object_map: ObjectMap::column("name"),
+            });
+        Arc::new(CompiledR2rmlMapping::new(vec![tm]))
+    }
+
+    /// A [`MaterializeSource`] backed by in-memory batches. Records how many scan windows
+    /// were requested, so a test can prove the engine actually pulled from it — the guard
+    /// against a fixture that silently reaches nothing.
+    struct FakeSource {
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: std::sync::Mutex<Vec<ColumnBatch>>,
+        delete: Option<DeleteConvention>,
+        order_by: Option<String>,
+        to_snapshot_id: Option<i64>,
+        /// `None` means "first run / watermark unresolvable", which C3 treats as
+        /// persist-regardless. Default to a FRESH window so tests opt in to staleness.
+        window_age_ms: Option<i64>,
+        scans: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeSource {
+        fn new(mapping: Arc<CompiledR2rmlMapping>, batches: Vec<ColumnBatch>) -> Self {
+            Self {
+                mapping,
+                batches: std::sync::Mutex::new(batches),
+                delete: None,
+                order_by: None,
+                to_snapshot_id: Some(7),
+                window_age_ms: Some(0),
+                scans: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn scans(&self) -> usize {
+            self.scans.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MaterializeSource for FakeSource {
+        async fn compiled_mapping(&self, _gs: &str) -> Result<Arc<CompiledR2rmlMapping>> {
+            Ok(self.mapping.clone())
+        }
+        async fn materialize_options(
+            &self,
+            _gs: &str,
+        ) -> Result<(Option<DeleteConvention>, Option<String>)> {
+            Ok((self.delete.clone(), self.order_by.clone()))
+        }
+        async fn scan_window(
+            &self,
+            _gs: &str,
+            _table: &str,
+            _from: Option<i64>,
+        ) -> Result<MaterializeScan> {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let taken: Vec<ColumnBatch> = std::mem::take(&mut *self.batches.lock().unwrap());
+            Ok(MaterializeScan {
+                to_snapshot_id: self.to_snapshot_id,
+                incremental: false,
+                window_age_ms: self.window_age_ms,
+                stream: Box::pin(futures::stream::iter(taken.into_iter().map(Ok))),
+            })
+        }
+    }
+
+    /// THE test the review asked for: the engine runs end to end, reads from the source,
+    /// and writes subjects into a real target ledger.
+    ///
+    /// The `scans()` assertion is the anti-theatre guard. Without it, a fixture that wires
+    /// up but never gets pulled would still "pass" — which is exactly how gutting
+    /// `stream_scan_tasks` left 954 tests green.
+    #[tokio::test]
+    async fn engine_materializes_rows_into_the_target_ledger() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[("id", &["1", "2"]), ("name", &["alice", "bob"])])],
+        );
+
+        let result = fluree
+            .materialize_from_source(&src, "people:main", "people_native:main", false, None)
+            .await
+            .expect("materialize");
+
+        assert_eq!(
+            src.scans(),
+            1,
+            "the engine must actually pull a scan window"
+        );
+        assert!(result.committed, "two rows must produce a commit");
+        assert_eq!(result.rows_read, 2, "both source rows must be read");
+        assert_eq!(result.subjects_upserted, 2, "one subject per id");
+        assert_eq!(
+            result.to_snapshot_id,
+            Some(7),
+            "watermark advances to the window end"
+        );
+        assert_eq!(
+            result.tally,
+            TargetTally {
+                ok: 1,
+                deferred: 0,
+                failed: 0
+            },
+            "one concrete target, fully applied"
+        );
+    }
+
+    /// A window with no rows must NOT commit. This is C3: snapshot-id movement is not
+    /// work, and treating it as work is what drove ~1,200 empty commits/hour into the
+    /// shared state ledger until it saturated and halted every sync in the deployment.
+    #[tokio::test]
+    async fn an_empty_window_commits_nothing() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(people_mapping(), vec![]);
+        assert_eq!(
+            src.window_age_ms,
+            Some(0),
+            "a FRESH window — staleness is the other test"
+        );
+
+        let result = fluree
+            .materialize_from_source(&src, "people:main", "people_native:main", false, None)
+            .await
+            .expect("materialize");
+
+        assert_eq!(src.scans(), 1, "the window is still examined");
+        assert!(!result.committed, "no rows means no commit churn");
+        assert_eq!(result.rows_read, 0);
+        assert_eq!(result.tally.total(), 0, "no target was attempted");
+    }
+
+    /// The other half of C3, and the reason it is a bound rather than a flat "skip empty
+    /// windows": a window whose watermark has gone STALE must persist even with zero rows,
+    /// or a quiet table's watermark ages out of Iceberg's snapshot retention and the next
+    /// poll can only recover with a full table re-read.
+    ///
+    /// `window_age_ms: None` is the same signal — "first run, or the stored snapshot no
+    /// longer resolves" — and it must also persist. Writing this test is what taught me
+    /// that; my first version set `None` and then asserted no commit, which had the C3
+    /// semantics exactly backwards.
+    #[tokio::test]
+    async fn a_stale_empty_window_still_persists_its_watermark() {
+        for age in [None, Some(i64::MAX)] {
+            let fluree = FlureeBuilder::memory().build_memory();
+            let mut src = FakeSource::new(people_mapping(), vec![]);
+            src.window_age_ms = age;
+
+            let result = fluree
+                .materialize_from_source(&src, "people:main", "people_native:main", false, None)
+                .await
+                .expect("materialize");
+
+            assert!(
+                result.committed,
+                "a stale/unresolvable window (age={age:?}) must persist its watermark                  even with no rows, or it ages out of snapshot retention"
+            );
+            assert_eq!(
+                result.rows_read, 0,
+                "still no rows — only the watermark moved"
+            );
+        }
+    }
+
+    /// A templated target fans out: one scan, N target ledgers, each its own commit
+    /// domain. Pins that the tally counts TARGETS rather than polls — the accounting whose
+    /// absence made a 21-of-22 production window read as a total stall.
+    #[tokio::test]
+    async fn a_templated_target_fans_out_per_row() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[
+                ("id", &["1", "2", "3"]),
+                ("name", &["alice", "bob", "carol"]),
+                ("tenant", &["acme", "acme", "globex"]),
+            ])],
+        );
+
+        let result = fluree
+            .materialize_from_source(&src, "people:main", "people_{tenant}:main", false, None)
+            .await
+            .expect("materialize");
+
+        assert_eq!(src.scans(), 1, "ONE scan feeds every target");
+        assert!(result.committed);
+        assert_eq!(
+            result.tally,
+            TargetTally {
+                ok: 2,
+                deferred: 0,
+                failed: 0
+            },
+            "two distinct tenants => two target ledgers, both applied"
+        );
+        assert_eq!(
+            result.subjects_upserted, 3,
+            "all three subjects land somewhere"
+        );
+    }
+
+    /// The reviewer's round-2 mutation, finally covered.
+    ///
+    /// Their mutation was NOT to break `chunk_nodes_by_size` — its own unit tests catch
+    /// that. It neutralised chunking **at the call site**, leaving the function intact and
+    /// the budget unbounded. I reproduced it (`txn_budget = usize::MAX`) and got **1019
+    /// passed**, including the other engine tests here. So the seam alone did not meet the
+    /// acceptance bar; this test is what does.
+    ///
+    /// The observable is the TARGET LEDGER'S `t`. A window that exceeds the transaction
+    /// budget must be applied as several transactions, so `t` advances further than a
+    /// single-chunk window would. `MaterializeResult` reports no chunk count, and the
+    /// ledger's commit count is the honest proxy — it is what the novelty ceiling actually
+    /// reacts to.
+    #[tokio::test]
+    async fn a_window_larger_than_the_txn_budget_is_applied_in_several_transactions() {
+        let ids: Vec<String> = (0..40).map(|i| i.to_string()).collect();
+        let names: Vec<String> = (0..40).map(|i| format!("person-{i:04}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let rows = vec![("id", id_refs.as_slice()), ("name", name_refs.as_slice())];
+
+        // Same window twice: once unbounded (one chunk), once with a budget small enough
+        // to force several. Comparing the two is what makes this mutation-sensitive —
+        // asserting only "t > 2" could pass for unrelated reasons.
+        let mut t_by_budget = Vec::new();
+        for budget in [None, Some(200usize)] {
+            let fluree = FlureeBuilder::memory().build_memory();
+            let src = FakeSource::new(people_mapping(), vec![batch(&rows)]);
+            let result = fluree
+                .materialize_from_source(&src, "people:main", "people_native:main", false, budget)
+                .await
+                .expect("materialize");
+            assert_eq!(
+                result.subjects_upserted, 40,
+                "every row lands regardless of chunking"
+            );
+            let t = fluree
+                .ledger("people_native:main")
+                .await
+                .expect("target ledger")
+                .t();
+            t_by_budget.push(t);
+        }
+
+        let (unbounded, chunked) = (t_by_budget[0], t_by_budget[1]);
+        assert!(
+            chunked > unbounded,
+            "a small transaction budget must split the window into more transactions: \
+             unbounded reached t={unbounded}, budget=200B reached t={chunked} — chunking \
+             is not happening at the call site"
+        );
+    }
+
+    /// A row whose template column is NULL cannot be routed anywhere, so it is skipped
+    /// rather than defaulting into some other tenant's ledger. Silent misrouting across a
+    /// tenant boundary is the worst available failure here.
+    #[tokio::test]
+    async fn an_unroutable_row_is_skipped_not_misfiled() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let fields = vec![
+            FieldInfo {
+                name: "id".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "tenant".into(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+        ];
+        let cols = vec![
+            Column::String(vec![Some("1".into()), Some("2".into())]),
+            Column::String(vec![Some("alice".into()), Some("bob".into())]),
+            Column::String(vec![Some("acme".into()), None]), // row 2 has no tenant
+        ];
+        let b = ColumnBatch::new(Arc::new(BatchSchema::new(fields)), cols).expect("batch");
+        let src = FakeSource::new(people_mapping(), vec![b]);
+
+        let result = fluree
+            .materialize_from_source(&src, "people:main", "people_{tenant}:main", false, None)
+            .await
+            .expect("materialize");
+
+        assert_eq!(
+            result.tally,
+            TargetTally {
+                ok: 1,
+                deferred: 0,
+                failed: 0
+            },
+            "only the routable tenant gets a ledger"
+        );
+        assert_eq!(
+            result.subjects_upserted, 1,
+            "the unroutable row is dropped, not misfiled"
+        );
     }
 }
