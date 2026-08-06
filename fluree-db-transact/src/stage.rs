@@ -1153,7 +1153,9 @@ async fn stage_graph_mgmt(
                 // is an unconditional whole-graph retraction — but a one-line
                 // `CLEAR ALL` strips the ontology, and because `is_schema_flake`
                 // exempts schema flakes from modify policy, that retraction is
-                // not policy-blockable.
+                // not policy-blockable. `COPY/MOVE <g> TO DEFAULT` reach the
+                // same wholesale default-graph retraction through their
+                // `clear_dest` pass, so the footgun applies to them equally.
                 let mut targets: Vec<(GraphId, Option<Sid>)> = Vec::new();
                 match target {
                     GraphTarget::Default => targets.push((0, None)),
@@ -1312,55 +1314,158 @@ async fn stage_graph_mgmt(
                         None => Vec::new(),
                     };
 
-                    // O5: re-homing (below) rewrites only each flake's `g`, but an
-                    // edge annotation encodes its edge's graph in the
-                    // `f:reifiesGraph` OBJECT and anchors the bundle by flake-level
-                    // `g`. Moving the bundle to another graph without rewriting
-                    // that object desyncs the two, so `EdgeKey::from_reifies_facts`
-                    // returns `GraphMismatch` and both readers (JSON-LD hydration
-                    // and the attachment indexer) silently drop the annotation.
-                    // Fail loud rather than silently lose data; the full
-                    // reification-aware re-home (rewrite/add/drop `f:reifiesGraph`
-                    // per src/dest graph) is a deferred follow-up. `is_reserved_
-                    // reifies_predicate` matches ANY `f:reifies*` predicate, so
-                    // this also catches a default-graph annotation (which has no
-                    // `f:reifiesGraph` flake) being moved into a named graph.
-                    if src_flakes
-                        .iter()
-                        .any(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
-                    {
-                        return Err(TransactError::UnsupportedFeature(
-                            "COPY/MOVE/ADD of a graph containing edge annotations \
-                             (f:reifies*) is not yet supported: re-homing would \
-                             orphan the annotation's reified-graph anchor. Retract \
-                             the annotations first."
-                                .to_string(),
-                        ));
-                    }
-
                     let dest_flakes =
                         scan_graph_flakes(&ledger, dest_g_id, options.tracker).await?;
 
-                    let src_contents: HashSet<FlakeContent> =
-                        src_flakes.iter().map(flake_content).collect();
                     let dest_contents: HashSet<FlakeContent> =
                         dest_flakes.iter().map(flake_content).collect();
 
-                    // COPY/MOVE: retract destination facts the source lacks.
-                    // (ADD keeps the destination intact.) Facts common to both
-                    // are left in place, so no assert+retract of the same fact.
+                    // O5: re-homing rewrites the `f:reifiesGraph` anchor per src/
+                    // dest graph (see the assert loop below), so an
+                    // annotation-bearing graph now transfers cleanly instead of
+                    // orphaning the anchor. One case is not repairable by
+                    // rewriting, though: ADD (`clear_dest == false`) merges the
+                    // source bundle into the destination without retracting dest's
+                    // existing bundles. If the SAME explicit reifier `@id` reifies
+                    // a DIFFERENT edge in the source and the destination, the merged
+                    // bundle carries two `f:reifiesSubject` flakes on one subject;
+                    // `EdgeKey::from_reifies_facts` rejects that as `Duplicate`, so
+                    // both readers (JSON-LD hydration + attachment indexer) silently
+                    // drop BOTH annotations — including dest's previously-valid one.
+                    // COPY/MOVE are immune (`clear_dest` retracts the colliding dest
+                    // bundle before the source bundle is asserted). Blank-minted
+                    // reifiers never collide, so this only trips when a user reuses
+                    // an explicit reifier `@id` across the two graphs. Fail loud.
+                    if !*clear_dest {
+                        // The edge a reifier subject denotes, keyed by subject Sid:
+                        // the set of its `f:reifies*` flake contents EXCLUDING
+                        // `f:reifiesGraph` (the only graph-dependent flake). Same
+                        // subject + different signature == a merge that would
+                        // produce a `Duplicate`; same signature (same edge) dedups
+                        // cleanly against `dest_contents` and is fine.
+                        let edge_signatures =
+                            |bundle: &[Flake]| -> HashMap<Sid, HashSet<FlakeContent>> {
+                                let mut sigs: HashMap<Sid, HashSet<FlakeContent>> = HashMap::new();
+                                for f in bundle {
+                                    if fluree_db_core::is_reserved_reifies_predicate(&f.p)
+                                        && !fluree_db_core::is_reifies_graph(&f.p)
+                                    {
+                                        sigs.entry(f.s.clone())
+                                            .or_default()
+                                            .insert(flake_content(f));
+                                    }
+                                }
+                                sigs
+                            };
+                        let dest_sigs = edge_signatures(&dest_flakes);
+                        if !dest_sigs.is_empty() {
+                            let src_sigs = edge_signatures(&src_flakes);
+                            for (subject, src_sig) in &src_sigs {
+                                if let Some(dest_sig) = dest_sigs.get(subject) {
+                                    if src_sig != dest_sig {
+                                        let iri = ns_registry
+                                            .get_prefix(subject.namespace_code)
+                                            .map(|prefix| format!("{}{}", prefix, subject.name))
+                                            .unwrap_or_else(|| subject.to_string());
+                                        return Err(TransactError::UnsupportedFeature(format!(
+                                            "ADD would merge edge annotations that share \
+                                             reifier <{iri}> but reify different edges in the \
+                                             source and destination graphs, which silently \
+                                             drops both annotations. Use COPY/MOVE, or give the \
+                                             annotations distinct reifier @ids."
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Build the source assertions, re-homed into the destination
+                    // graph. Every flake's `g` becomes `dest_sid`; the
+                    // `f:reifiesGraph` anchor additionally encodes the edge's graph
+                    // in its OBJECT, so it needs a reification-aware rewrite rather
+                    // than the generic `g`-only one:
+                    //   - named→named  : rewrite the anchor OBJECT to the dest graph
+                    //     too, so the decoded `g` == flake-level `g` == dest.
+                    //   - named→default: DROP the anchor (the default graph carries
+                    //     none; the decoder wants `g == None`).
+                    //   - default→named: the source carried no anchor, so SYNTHESIZE
+                    //     one per reifier subject (keyed off the exactly-one
+                    //     `f:reifiesSubject` flake per bundle).
+                    let src_is_default = matches!(from, GraphSel::Default);
+                    // default→named synthesizes ONE anchor per reifier subject
+                    // (below), so size for them exactly; other directions add
+                    // nothing beyond the re-homed source flakes.
+                    let synthesized = if src_is_default {
+                        src_flakes
+                            .iter()
+                            .filter(|f| fluree_db_core::is_reifies_subject(&f.p))
+                            .count()
+                    } else {
+                        0
+                    };
+                    let mut rehomed: Vec<Flake> =
+                        Vec::with_capacity(src_flakes.len() + synthesized);
+                    for f in &src_flakes {
+                        if fluree_db_core::is_reifies_graph(&f.p) {
+                            if let Some(dest) = &dest_sid {
+                                let mut a = f.clone();
+                                a.op = true;
+                                a.t = new_t;
+                                a.g = Some(dest.clone());
+                                a.o = FlakeValue::Ref(dest.clone());
+                                rehomed.push(a);
+                            }
+                            // dest default: drop the anchor (emit nothing).
+                            continue;
+                        }
+                        let mut a = f.clone();
+                        a.op = true;
+                        a.t = new_t;
+                        a.g = dest_sid.clone();
+                        rehomed.push(a);
+                    }
+                    if src_is_default {
+                        if let Some(dest) = &dest_sid {
+                            for f in &src_flakes {
+                                if fluree_db_core::is_reifies_subject(&f.p) {
+                                    rehomed.push(Flake::new_in_graph(
+                                        dest.clone(),
+                                        f.s.clone(),
+                                        fluree_db_core::namespaces::reifies_graph_sid().clone(),
+                                        FlakeValue::Ref(dest.clone()),
+                                        fluree_db_core::id_datatype_sid(),
+                                        new_t,
+                                        true,
+                                        None,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    // The content set the transfer will land in the destination —
+                    // keyed on the RE-HOMED flakes so COPY/MOVE stay symmetric: a
+                    // fact common to source and destination (including an anchor
+                    // that already names the dest graph) is left in place rather
+                    // than retracted-and-re-asserted at the same `new_t`.
+                    let rehomed_contents: HashSet<FlakeContent> =
+                        rehomed.iter().map(flake_content).collect();
+
+                    // COPY/MOVE: retract destination facts the re-homed source lacks.
+                    // (ADD keeps the destination intact.)
                     //
-                    // O3: a never-registered (typo'd) source without SILENT
-                    // already errored at source resolution above, so reaching
-                    // here means the source is either the default graph, a
-                    // registered graph (possibly emptied — a legitimate empty
-                    // source), or a missing source the user marked SILENT. In
-                    // every case clearing the destination against an empty
-                    // source (retracting it wholesale) is the intended
-                    // behavior, so this no longer silently loses data on a typo.
+                    // O3: a never-registered (typo'd) source without SILENT already
+                    // errored at source resolution above, so reaching here means the
+                    // source is either the default graph, a registered graph
+                    // (possibly emptied — a legitimate empty source), or a missing
+                    // source the user marked SILENT. In every case clearing the
+                    // destination against an empty source (retracting it wholesale)
+                    // is the intended behavior, so this no longer silently loses data
+                    // on a typo.
                     if *clear_dest {
                         for f in &dest_flakes {
-                            if !src_contents.contains(&flake_content(f)) {
+                            if !rehomed_contents.contains(&flake_content(f)) {
                                 let mut r = f.clone();
                                 r.op = false;
                                 r.t = new_t;
@@ -1369,14 +1474,10 @@ async fn stage_graph_mgmt(
                         }
                     }
 
-                    // Assert source facts not already present in the destination,
-                    // re-homed by rewriting only `g`.
-                    for f in &src_flakes {
-                        if !dest_contents.contains(&flake_content(f)) {
-                            let mut a = f.clone();
-                            a.op = true;
-                            a.t = new_t;
-                            a.g = dest_sid.clone();
+                    // Assert re-homed source facts not already present in the
+                    // destination.
+                    for a in rehomed {
+                        if !dest_contents.contains(&flake_content(&a)) {
                             flakes.push(a);
                         }
                     }

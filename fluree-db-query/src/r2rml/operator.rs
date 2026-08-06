@@ -47,8 +47,8 @@ use fluree_db_r2rml::mapping::{
 };
 use fluree_db_r2rml::materialize::{
     expand_template, get_join_key_from_batch, materialize_object_from_batch,
-    materialize_predicate_from_batch, materialize_subject_from_batch, reverse_subject_template,
-    RdfTerm,
+    materialize_predicate_from_batch, materialize_subject_from_batch, parent_key_insert_keep_min,
+    reverse_subject_template, RdfTerm,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use fluree_vocab::xsd;
@@ -236,6 +236,35 @@ fn topk_pushdown_enabled() -> bool {
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_TOPK_PUSHDOWN"))
 }
 
+/// F-AUD-3 kill switch: whether the non-aggregate scan/crawl path records its
+/// materialized windows and fact-parent lookup builds against the query memory
+/// budget. Default ON (`FLUREE_SCAN_MEM_ACCOUNTING`, family falsy spellings via
+/// [`super::env_switch_enabled`]). ON makes a wide crawl trip a typed
+/// `MemoryBudgetExceeded` (507) instead of OOMing — closing the blind spot the
+/// audit's specimen 071cd59f (a point-lookup crawl that hard-OOM'd at 10 GB) fell
+/// into, which the hash-join / group-aggregate `record_alloc`s never covered.
+/// OFF is a clean revert to the prior behavior (scan path invisible to the budget;
+/// the `checkpoint()` polls degrade to pure cancellation checks because the scan
+/// records nothing). Each materialized window is charged then RELEASED once emitted
+/// (it has a provable drop point), so a long streaming scan accounts only its
+/// resident window rather than the all-time sum of every freed window — that sum
+/// otherwise false-aborts a bounded-memory long scan (q038). The retained parent-map
+/// build (A2) and the per-file buffers (V2 site B, still excluded) are the remaining
+/// non-released allocations; A2 genuinely persists so its cumulative charge is
+/// correct, and site B needs its own release pairing.
+fn scan_mem_accounting_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_SCAN_MEM_ACCOUNTING"))
+}
+
+/// F-AUD-3: conservative per-entry byte estimate for a `build_parent_lookup`
+/// entry (a join key vec + a materialized subject `RdfTerm`, typically an IRI
+/// string) used to account the fact-as-parent build against the budget. ~200 B is
+/// the V2 estimate; like [`crate::context::BINDING_EST_BYTES`] it is a floor
+/// (ignores per-entry heap beyond the term), safe because over-counting only trips
+/// a build already near OOM.
+const PARENT_ENTRY_EST_BYTES: usize = 200;
+
 /// How a window of produced rows is combined with the buffered child rows.
 ///
 /// The join is *flipped* relative to a naive per-child probe: the (small,
@@ -395,13 +424,13 @@ pub struct R2rmlScanOperator {
     row_budget: Option<usize>,
     /// Output rows emitted so far, counted against `row_budget`.
     emitted: usize,
-    /// Scan-side top-k directive (PR-5): `(primary DESC sort var, LIMIT+OFFSET)`,
-    /// set by a `SortOperator` for a `ORDER BY DESC(<scan col>) LIMIT k` directly
-    /// above this scan. Resolved to the sort column against the mapping at scan
-    /// time ([`Self::resolve_topk_directive`]); `None` = no pushdown (full scan +
-    /// the authoritative sort above). Only ever consulted for the main table scan,
-    /// never a parent/dimension lookup.
-    topk: Option<(VarId, usize)>,
+    /// Scan-side top-k directive (PR-5; ASC added in item 8): `(primary sort var,
+    /// LIMIT+OFFSET, ascending)`, set by a `SortOperator` for an `ORDER BY
+    /// <scan col> LIMIT k` directly above this scan. Resolved to the sort column
+    /// against the mapping at scan time ([`Self::resolve_topk_directive`]); `None`
+    /// = no pushdown (full scan + the authoritative sort above). Only ever
+    /// consulted for the main table scan, never a parent/dimension lookup.
+    topk: Option<(VarId, usize, bool)>,
     /// A scan-local FILTER the planner folded into this scan (see
     /// [`R2rmlPattern::consumed_filter`]). Applied to each output batch with the
     /// same evaluator the dropped `FilterOperator` would use, so results are
@@ -593,7 +622,7 @@ impl R2rmlScanOperator {
     /// column; the `SortOperator` above still applies the exact compound order +
     /// LIMIT, so a `None` here is only a missed optimization, never wrong.
     fn resolve_topk_directive(&self, triples_map: &TriplesMap) -> Option<crate::r2rml::ScanTopK> {
-        let (sort_var, k) = self.topk?;
+        let (sort_var, k, ascending) = self.topk?;
         // SOUNDNESS (heap feed): decline when a residual filter the operator
         // enforces after the scan is present — the heap would see pre-filter rows.
         if topk_residual_filter_present(&self.pattern) {
@@ -626,6 +655,7 @@ impl R2rmlScanOperator {
         Some(crate::r2rml::ScanTopK {
             sort_column: col.to_string(),
             k,
+            ascending,
         })
     }
 
@@ -1283,6 +1313,7 @@ impl R2rmlScanOperator {
                     let parent_batches = collect_stream(parent_stream, ctx).await?;
 
                     let lookup = Arc::new(build_parent_lookup(
+                        ctx,
                         parent_tm,
                         &parent_join_cols,
                         parent_batches,
@@ -1428,6 +1459,29 @@ impl R2rmlScanOperator {
                 ctx,
             )?;
 
+            // F-AUD-3 site A1: account the materialized window against the query
+            // memory budget so a wide non-aggregate crawl (the previously-blind scan
+            // path) trips a typed `MemoryBudgetExceeded` instead of OOMing. Charge the
+            // resident window and `checkpoint()` BEFORE doing more work, so an oversized
+            // window (or this window on top of a retained A2 fact-parent build / an
+            // upstream fold) aborts typed. The window is then RELEASED once emitted
+            // (below) — it has a provable drop point, so a streaming scan of N
+            // sequentially-freed windows accounts only the resident one instead of
+            // their all-time sum. Without the release, ~70 freed 512K-row windows of a
+            // long un-fused-COUNT scan (q038) SUM past the budget and false-abort a
+            // query whose per-window resident memory is bounded and fine.
+            let window_est = if scan_mem_accounting_enabled() {
+                let est = produced
+                    .len()
+                    .saturating_mul(num_cols)
+                    .saturating_mul(crate::context::BINDING_EST_BYTES);
+                ctx.record_alloc(est);
+                ctx.checkpoint()?;
+                est
+            } else {
+                0
+            };
+
             if !produced.is_empty() {
                 emit_produced_window(
                     &self.out_pos,
@@ -1441,6 +1495,16 @@ impl R2rmlScanOperator {
                     &mut self.pending,
                     ctx,
                 )?;
+            }
+
+            // The window has been handed off (its rows copied into `columns` / the
+            // bounded `self.pending` overflow) and `produced` drops at the end of this
+            // iteration — release its charge so only the in-flight window is counted.
+            // The retained overflow is bounded (≤ one window, drained before the next
+            // pull) and intentionally left untracked (minimal per V2 site B). The A2
+            // fact-parent build charge is NOT released — that map genuinely persists.
+            if window_est != 0 {
+                ctx.release(window_est);
             }
             // Geometric window growth. A budgeted (LIMIT) scan starts with a small
             // window (~the remaining budget) so a selective query does not explode
@@ -1858,12 +1922,16 @@ fn coerce_scalar_for_pushdown(
         // Already a pushable, type-matched value; the residual uses the same
         // semantics for these variants.
         ScanValue::Int(_) | ScanValue::Bool(_) | ScanValue::Date(_) => Some(value.clone()),
-        // Double/Decimal/TemplateKey never wrap a Scalar object constant (a numeric
-        // object routes to ObjectConstant::Double/Decimal, operator-enforced only),
-        // so these are unreachable here; push as-is defensively — never wrong.
-        ScanValue::Double(_) | ScanValue::Decimal { .. } | ScanValue::TemplateKey(_) => {
-            Some(value.clone())
-        }
+        // Double/Decimal/TemplateKey/Timestamp never wrap a Scalar object constant
+        // (a numeric/temporal object routes elsewhere, operator-enforced only), so
+        // these are unreachable here; push as-is defensively — never wrong.
+        ScanValue::Double(_)
+        | ScanValue::Decimal { .. }
+        | ScanValue::TemplateKey(_)
+        | ScanValue::Timestamp { .. } => Some(value.clone()),
+        // A `Set` only ever arrives via the FILTER-IN / VALUES set-pushdown path,
+        // never wrapped in a `Scalar` object constant — decline to coerce it.
+        ScanValue::Set(_) => None,
     }
 }
 
@@ -2048,6 +2116,12 @@ pub(crate) fn rdf_term_eq_object_constant_cached(
                 // A TemplateKey is only ever a reversed subject-key filter, never
                 // an object constant, so it never matches an object term.
                 ScanValue::TemplateKey(_) => false,
+                // A Set is only ever a FILTER-IN / VALUES scan filter, never an
+                // object constant, so it never matches an object term.
+                ScanValue::Set(_) => false,
+                // A Timestamp is only ever a FILTER pushdown value (dateTime object
+                // constants are not lowered), never an object constant here.
+                ScanValue::Timestamp { .. } => false,
             }
         }
     }
@@ -2493,13 +2567,30 @@ fn materialize_batch(
 ///
 /// HashMap mapping join key (as `Vec<String>`) to parent subject `RdfTerm`.
 fn build_parent_lookup(
+    ctx: &ExecutionContext<'_>,
     parent_tm: &TriplesMap,
     parent_columns: &[String],
     batches: Vec<ColumnBatch>,
 ) -> Result<ParentLookup> {
     let mut lookup = ParentLookup::new();
+    let mut dup_key_collisions = 0u64;
 
     for batch in batches {
+        // F-AUD-3 site A2: the fact-as-parent hazard (V2) — a RefObjectMap whose
+        // parent is a FACT table transiently builds a full parent-sized map (tens of
+        // millions of entries) here, unbounded by the memo cap, which only refuses to
+        // RETAIN an over-window lookup AFTER it is fully built. Account each batch's
+        // worst-case contribution and checkpoint inside the build loop so a
+        // budget-exceeding build aborts typed (`MemoryBudgetExceeded`) BEFORE the
+        // whole map is resident, instead of OOMing. `num_rows` over-counts skipped
+        // (null-subject / null-key) rows — deliberately conservative. Unlike the A1
+        // scan window (released on hand-off), this charge is NOT released: the lookup
+        // is genuinely retained for the whole join, so the cumulative charge correctly
+        // equals its resident footprint.
+        if scan_mem_accounting_enabled() {
+            ctx.record_alloc(batch.num_rows.saturating_mul(PARENT_ENTRY_EST_BYTES));
+            ctx.checkpoint()?;
+        }
         for row_idx in 0..batch.num_rows {
             // Materialize parent subject
             let subject_term =
@@ -2523,14 +2614,22 @@ fn build_parent_lookup(
                 None => continue, // Null in join key - skip
             };
 
-            // Insert into lookup (last wins for duplicate keys)
-            lookup.insert(key, subject_term);
+            // Deterministic keep-min on a duplicate join key (shared with the
+            // materialize twin builder via `parent_key_insert_keep_min`), so the
+            // virtual path and the twin resolve the SAME parent and both are
+            // reproducible regardless of scan / IO-completion order — NOT the old
+            // scan-order-dependent last-wins. The true R2RML fan-out (one edge per
+            // matching parent) is a tracked shared-path follow-up.
+            if parent_key_insert_keep_min(&mut lookup, key, subject_term) {
+                dup_key_collisions += 1;
+            }
         }
     }
 
     tracing::debug!(
         parent_tm = %parent_tm.iri,
         lookup_size = lookup.len(),
+        dup_key_collisions,
         "Built parent lookup table for RefObjectMap join"
     );
 
@@ -2555,13 +2654,15 @@ impl Operator for R2rmlScanOperator {
         }
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize) {
-        // Record the DESC top-k directive; it is resolved to a scan column against
-        // the mapping at scan time and honored only for the main table scan. Like
+    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+        // Record the top-k directive; it is resolved to a scan column against the
+        // mapping at scan time and honored only for the main table scan. Like
         // `row_budget`, do NOT forward to the child — an inner correlated scan must
         // still produce every row the join needs; only a topmost scan is eligible.
+        // An ASC directive is admitted only when the sort column is REQUIRED (the
+        // provider re-checks nullability at scan time).
         if topk_pushdown_enabled() {
-            self.topk = Some((sort_var, k));
+            self.topk = Some((sort_var, k, ascending));
         }
     }
 
@@ -2604,13 +2705,16 @@ impl Operator for R2rmlScanOperator {
             .collect();
 
         loop {
-            // Cancellation checkpoint at the top of the internal loop: this loop
-            // can pull many windows / files / child batches before returning a
+            // Cancellation + memory checkpoint at the top of the internal loop: this
+            // loop can pull many windows / files / child batches before returning a
             // full output batch, so the runner's between-`next_batch` check would
             // otherwise never run for a whole-table scan. Covers the loop's
-            // non-advancing branches (overflow drain, child pull) that site 2
-            // does not.
-            ctx.check_cancelled()?;
+            // non-advancing branches (overflow drain, child pull) that site 2 does
+            // not. Upgraded from `check_cancelled()` to `checkpoint()` (F-AUD-3): it
+            // also enforces the query memory budget against the window bytes recorded
+            // by site A1 (a no-op for the budget when scan accounting is off, since
+            // nothing on this path records then).
+            ctx.checkpoint()?;
             // 1. Drain overflow from a prior window before doing more work.
             while !self.pending.is_empty() && columns[0].len() < ctx.batch_size {
                 let row = self.pending.pop_front().unwrap();
@@ -2758,6 +2862,296 @@ mod tests {
             collect_scan_capped(stream, 1000, &ctx).await,
             Err(QueryError::Cancelled { .. })
         ));
+    }
+
+    /// C3 (F-AUD-20): the drain loop must actually STOP MID-SWEEP — not merely bail
+    /// up front on an already-cancelled empty stream (the two tests above). Here a
+    /// 5-batch stream cancels the query *while producing its first batch*; the loop
+    /// must consume exactly that one batch and then return `Cancelled` at the next
+    /// checkpoint, leaving the remaining four unread. Without the per-iteration
+    /// `check_cancelled()` the loop would drain all five (poll count 5).
+    #[tokio::test]
+    async fn collect_stream_stops_a_drain_loop_mid_sweep() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancellation = QueryCancellation::new();
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        let cancel_from_stream = cancellation.clone();
+        let polls_in = Arc::clone(&polls);
+        let stream: ColumnBatchStream = Box::pin(futures::stream::unfold(0usize, move |i| {
+            let cancel_from_stream = cancel_from_stream.clone();
+            let polls_in = Arc::clone(&polls_in);
+            async move {
+                if i >= 5 {
+                    return None;
+                }
+                polls_in.fetch_add(1, Ordering::SeqCst);
+                // Cancel as the FIRST batch is produced; the loop's next-iteration
+                // checkpoint must catch it before pulling batch 2.
+                if i == 0 {
+                    cancel_from_stream.cancel();
+                }
+                let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                    name: "K".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id: 1,
+                }]));
+                let batch = ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1)])]).unwrap();
+                Some((Ok(batch), i + 1))
+            }
+        }));
+
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+        let result = collect_stream(stream, &ctx).await;
+        assert!(
+            matches!(result, Err(QueryError::Cancelled { .. })),
+            "a mid-sweep cancel must stop the drain, got {result:?}"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the loop consumed only the first batch, not the whole 5-batch stream"
+        );
+    }
+
+    /// F-AUD-3 site A1 — specimen 071cd59f regression. A wide non-aggregate crawl
+    /// (`?s ?p ?o`) materializes a window of bindings that the pre-fix scan path
+    /// never recorded against the memory budget, so a runaway crawl OOM'd instead of
+    /// aborting typed. With scan accounting on (the default), the materialized
+    /// window is recorded and a tiny 1-byte ceiling makes the window checkpoint
+    /// abort TYPED (`MemoryBudgetExceeded`, a 507) rather than completing/OOMing.
+    #[tokio::test]
+    async fn r3b_scan_window_budget_aborts_typed() {
+        use crate::r2rml::R2rmlTableProvider;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::QueryCancellation;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+        #[derive(Debug)]
+        struct StoreProvider;
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for StoreProvider {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                    name: "STORE_KEY".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id: 1,
+                }]));
+                let batch =
+                    ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1), Some(2), Some(3)])])
+                        .unwrap();
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/storeKey"),
+                object_map: ObjectMap::column("STORE_KEY"),
+            });
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let provider = StoreProvider;
+
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(1); // 1-byte ceiling → the first window's record crosses it.
+        let mut ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+        ctx.r2rml_table_provider = Some(&provider);
+
+        // `?s ?p ?o` — the true-wildcard crawl the blind spot lived on.
+        let pattern =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+        op.mapping = Some(Arc::clone(&mapping));
+
+        let mut progress = op
+            .build_progress(&ctx, Batch::single_empty())
+            .await
+            .expect("build_progress")
+            .expect("wildcard crawl resolves the one TriplesMap");
+        let num_cols = op.schema().len();
+        let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+        let err = op
+            .advance_one_window(&ctx, &mut progress, num_cols, &mut columns)
+            .await
+            .expect_err("the materialized window must trip the 1-byte budget");
+        assert!(
+            matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+            "wide crawl window must abort typed, got {err:?}"
+        );
+    }
+
+    /// F-AUD-3 site A1 — q038 regression (the false-abort the live re-bless caught).
+    /// A long non-aggregate scan streams many windows that are each materialized then
+    /// FREED; the per-window budget charge is released on hand-off, so the windows do
+    /// not SUM to a false over-budget. Here 64 one-row windows (charge ~528 B each)
+    /// run under an 8000 B ceiling: each resident window fits and the scan COMPLETES —
+    /// whereas the pre-fix cumulative counter crossed the ceiling within ~16 windows
+    /// and false-aborted a bounded-memory scan. The single-window abort test above
+    /// (an oversized window on a 1-byte ceiling) still passes: the checkpoint fires
+    /// while the window is charged, before it is released.
+    #[tokio::test]
+    async fn r3b_scan_windows_release_no_false_abort() {
+        use crate::r2rml::R2rmlTableProvider;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::QueryCancellation;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+        const N_WINDOWS: usize = 64;
+
+        #[derive(Debug)]
+        struct ManyRowsProvider;
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for ManyRowsProvider {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                    name: "STORE_KEY".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id: 1,
+                }]));
+                // N single-row batches → with window_rows pinned to 1, one window each.
+                let batches: Vec<Result<ColumnBatch>> = (0..N_WINDOWS as i64)
+                    .map(|k| {
+                        Ok(ColumnBatch::new(
+                            Arc::clone(&schema),
+                            vec![Column::Int64(vec![Some(k + 1)])],
+                        )
+                        .unwrap())
+                    })
+                    .collect();
+                Ok(Box::pin(futures::stream::iter(batches)))
+            }
+        }
+
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/storeKey"),
+                object_map: ObjectMap::column("STORE_KEY"),
+            });
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let provider = ManyRowsProvider;
+
+        let cancel = QueryCancellation::new();
+        // Between one window (~528 B) and the naive cumulative (64×528 ≈ 34 KB): the
+        // pre-fix counter crosses this within ~16 windows; released windows never do.
+        cancel.set_memory_limit(8000);
+        let mut ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+        ctx.r2rml_table_provider = Some(&provider);
+
+        let pattern =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+        op.mapping = Some(Arc::clone(&mapping));
+
+        let mut progress = op
+            .build_progress(&ctx, Batch::single_empty())
+            .await
+            .expect("build_progress")
+            .expect("wildcard crawl resolves the one TriplesMap");
+        let num_cols = op.schema().len();
+        let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+
+        let mut windows = 0usize;
+        loop {
+            progress.window_rows = 1; // pin one row per window (bypass geometric growth) — env-free.
+            let more = op
+                .advance_one_window(&ctx, &mut progress, num_cols, &mut columns)
+                .await
+                .expect("a bounded-resident streaming scan must NOT false-abort on the budget");
+            // Simulate the consumer draining the emitted batch so nothing accumulates
+            // outside the released window charge.
+            for c in &mut columns {
+                c.clear();
+            }
+            op.pending.clear();
+            // The window charge is released on hand-off, so live accounted memory
+            // never approaches the naive cumulative — it stays within one window.
+            assert!(
+                ctx.mem_used() < 8000,
+                "released window charge must keep live memory under budget, got {}",
+                ctx.mem_used()
+            );
+            if !more {
+                break;
+            }
+            windows += 1;
+            assert!(windows < 1000, "safety bound");
+        }
+        assert!(
+            windows >= N_WINDOWS,
+            "the whole streaming scan must complete; got {windows} windows"
+        );
+    }
+
+    /// F-AUD-3 site A2 — the fact-as-parent build. `build_parent_lookup` transiently
+    /// materializes a full parent-sized map; with a RefObjectMap whose parent is a
+    /// FACT table this is tens of millions of entries, unbounded by the memo cap.
+    /// The per-batch accounting + checkpoint makes a budget-exceeding build abort
+    /// TYPED before the whole map is resident (a 1-byte ceiling trips on the first
+    /// batch here) instead of OOMing.
+    #[test]
+    fn r3b_parent_build_budget_aborts_typed() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        use fluree_db_r2rml::mapping::TriplesMap;
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(1); // 1-byte ceiling.
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+
+        let parent_tm = TriplesMap::new("#Customer", "customers")
+            .with_subject_template("http://ex/customer/{ID}");
+        // One batch of rows is enough — the per-batch record_alloc crosses the ceiling
+        // before any row is inserted, so the build aborts on the first batch.
+        let batch = single_col_batch("ID", vec![Some(1), Some(2), Some(3)]);
+        let err = build_parent_lookup(&ctx, &parent_tm, &["ID".to_string()], vec![batch])
+            .expect_err("the fact-parent build must trip the 1-byte budget");
+        assert!(
+            matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+            "fact-parent build must abort typed, got {err:?}"
+        );
     }
 
     /// PR-5 soundness: the top-k pushdown must be declined whenever the scan
@@ -4119,7 +4513,7 @@ mod tests {
                     let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
                     op.mapping = Some(Arc::clone(mapping));
                     if topk {
-                        op.topk = Some((VarId(1), 10));
+                        op.topk = Some((VarId(1), 10, false));
                     }
                     for _ in 0..3 {
                         futures::executor::block_on(op.build_progress(&ctx, Batch::single_empty()))

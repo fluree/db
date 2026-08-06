@@ -102,12 +102,6 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         self
     }
 
-    /// Enable BM25/Vector index providers for graph source queries.
-    pub fn with_index_providers(mut self) -> Self {
-        self.core.set_index_providers();
-        self
-    }
-
     /// Enable R2RML/Iceberg support (feature-gated).
     ///
     /// Attaches actual R2RML provider objects so that GRAPH patterns
@@ -427,12 +421,6 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
     /// Set query execution controls.
     pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
         self.core.set_execution_options(options);
-        self
-    }
-
-    /// Enable BM25/Vector index providers for graph source queries.
-    pub fn with_index_providers(mut self) -> Self {
-        self.core.set_index_providers();
         self
     }
 

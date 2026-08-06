@@ -24,6 +24,7 @@
 //! - Subject-bound patterns (`ex:subject ex:name ?o`) are not optimized
 //! - Filter patterns are preserved and applied post-R2RML scan
 
+use crate::binding::Binding;
 use crate::ir::adapters::ScanPushdown;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
@@ -76,6 +77,26 @@ pub fn unsupported_subscope_error(graph_iri: &str, kinds: &[&str]) -> crate::err
          the GRAPH block.",
         graph_iri,
         unique.join(", ")
+    ))
+}
+
+/// The typed refusal for an R2RML graph-source query carrying `unconverted`
+/// patterns — a VARIABLE predicate paired with a BOUND term (`?s ?p <iri>` /
+/// `?s ?p "value"`). The single source of the (corrected, actionable) prose for
+/// both the seeded and batched rewrite sites in `graph.rs`, so the message
+/// cannot drift between them, surfaced with the stable
+/// `err:r2rml/UnsupportedPattern` machine code (HTTP 400).
+///
+/// Corrects the historical message, which falsely blamed "bound subjects … or
+/// bound objects": a bound subject (`<iri> ?p ?o`) and a constant-predicate
+/// bound object (`?s <ex:name> "value"`) both convert and run today; only a
+/// VARIABLE predicate with a bound term is refused.
+pub fn r2rml_unsupported_pattern_error(graph_iri: &str, count: usize) -> crate::error::QueryError {
+    crate::error::QueryError::r2rml_unsupported_pattern(format!(
+        "graph source '{graph_iri}' has {count} pattern(s) with a variable predicate and a \
+         bound term (e.g. `?s ?p <iri>` or `?s ?p \"value\"`); use a concrete predicate \
+         (e.g. `?s <ex:name> ?o`) instead. Bound subjects (`<iri> ?p ?o`) and \
+         constant-predicate bound objects (`?s <ex:name> \"value\"`) already work."
     ))
 }
 
@@ -431,13 +452,16 @@ pub fn rewrite_patterns_for_r2rml(
         }
     }
 
-    // Attach pushable FILTER comparisons to the R2RML pattern that produces
-    // each compared variable, for Iceberg file pruning. The FILTER pattern is
-    // left in place (residual), so this only ever skips data files.
+    // Attach pushable FILTER comparisons — and bounded FILTER-IN / single-var
+    // VALUES sets (item 7, F-AUD-5) — to the R2RML pattern that produces each
+    // compared variable, for Iceberg file pruning. The FILTER / VALUES pattern is
+    // left in place (residual / join), so this only ever skips data files.
     let mut pushdowns: Vec<(VarId, ScanCmpOp, ScanValue)> = Vec::new();
     for p in &result_patterns {
-        if let Pattern::Filter(expr) = p {
-            collect_pushdowns(expr, &mut pushdowns);
+        match p {
+            Pattern::Filter(expr) => collect_pushdowns(expr, &mut pushdowns),
+            Pattern::Values { vars, rows } => collect_values_pushdown(vars, rows, &mut pushdowns),
+            _ => {}
         }
     }
     if !pushdowns.is_empty() {
@@ -585,6 +609,13 @@ fn collect_pushdowns(expr: &Expression, out: &mut Vec<(VarId, ScanCmpOp, ScanVal
         }
         return;
     }
+    // Item 7 (F-AUD-5): a bounded `FILTER ?var IN (c1..cN)` lowers to a set
+    // membership pushdown. (`NOT IN` lowers to `Function::NotIn`, which is not
+    // collected — `Expression::NotIn` cannot prune via min/max bounds.)
+    if matches!(func, Function::In) {
+        collect_in_pushdown(args, out);
+        return;
+    }
     if args.len() != 2 {
         return;
     }
@@ -601,6 +632,76 @@ fn collect_pushdowns(expr: &Expression, out: &mut Vec<(VarId, ScanCmpOp, ScanVal
     if let Some(sv) = to_scan_value(value) {
         out.push((var, op, sv));
     }
+}
+
+/// Collect a bounded `?var IN (c1..cN)` (the [`Function::In`] shape from
+/// [`eval_in`](crate::eval): `args[0]` is the tested var, `args[1..]` are the
+/// list members) as a [`ScanCmpOp::In`] set pushdown, when In-pushdown is enabled,
+/// the tested position is a bare variable, and EVERY member is a constant that
+/// converts to a prunable [`ScanValue`]. A single non-constant or non-convertible
+/// member declines the WHOLE set: a partial `IN` would be unsound — the scan could
+/// prune a file that a dropped member's rows live in, and those rows never reach
+/// the residual FILTER. Sets larger than the cap decline (kept cheap). The value
+/// types are the same `to_scan_value` types the scalar pushdown emits, so the
+/// per-member soundness (loose value match, numeric gating) is identical.
+fn collect_in_pushdown(args: &[Expression], out: &mut Vec<(VarId, ScanCmpOp, ScanValue)>) {
+    if !super::in_pushdown_enabled() {
+        return;
+    }
+    let Some(Expression::Var(var)) = args.first() else {
+        return;
+    };
+    let members = &args[1..];
+    if members.is_empty() || members.len() > super::in_pushdown_max() {
+        return;
+    }
+    let mut values = Vec::with_capacity(members.len());
+    for m in members {
+        let Expression::Const(c) = m else {
+            return;
+        };
+        let Some(sv) = to_scan_value(c) else {
+            return;
+        };
+        values.push(sv);
+    }
+    out.push((*var, ScanCmpOp::In, ScanValue::Set(values)));
+}
+
+/// Item 7 (F-AUD-5): collect a single-var `VALUES ?v { c1 c2 … }` as a
+/// [`ScanCmpOp::In`] set pushdown. Only single-var VALUES lower here — a
+/// multi-column VALUES binds correlated tuples, and independent per-column INs
+/// would lose the correlation (still sound for pruning, but out of scope). Every
+/// row must bind exactly ONE scalar literal that converts to a prunable
+/// [`ScanValue`]; an `UNDEF` (`Binding::Unbound`), an IRI/ref binding, or a
+/// non-convertible literal declines the WHOLE set — an `UNDEF` means "any value",
+/// so an `IN` prune would wrongly drop rows. The VALUES pattern stays in the plan
+/// (the join enforces exact membership), so this only skips data files.
+fn collect_values_pushdown(
+    vars: &[VarId],
+    rows: &[Vec<Binding>],
+    out: &mut Vec<(VarId, ScanCmpOp, ScanValue)>,
+) {
+    if !super::in_pushdown_enabled() {
+        return;
+    }
+    let [var] = vars else {
+        return;
+    };
+    if rows.is_empty() || rows.len() > super::in_pushdown_max() {
+        return;
+    }
+    let mut values = Vec::with_capacity(rows.len());
+    for row in rows {
+        let [Binding::Lit { val, .. }] = row.as_slice() else {
+            return;
+        };
+        let Some(sv) = to_scan_value(val) else {
+            return;
+        };
+        values.push(sv);
+    }
+    out.push((*var, ScanCmpOp::In, ScanValue::Set(values)));
 }
 
 /// Map a comparison `Function` to a pushable `ScanCmpOp`, reversing operand
@@ -689,6 +790,16 @@ fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
         }
         FlakeValue::Decimal(d) if crate::r2rml::iceberg_numeric_stats_enabled() => {
             scan_value_from_bigdecimal(d)
+        }
+        // Item 10 (F-AUD-11): an xsd:dateTime pushes as micros-since-epoch, carrying
+        // whether the source was tz-AWARE (an explicit offset ⇒ UTC frame) so the
+        // provider can frame-match it to a `timestamp` vs `timestamptz` column.
+        // Gated by FLUREE_ICEBERG_TIMESTAMP_STATS.
+        FlakeValue::DateTime(dt) if crate::r2rml::iceberg_timestamp_stats_enabled() => {
+            Some(ScanValue::Timestamp {
+                micros: dt.epoch_micros(),
+                tz: dt.tz_offset().is_some(),
+            })
         }
         _ => None,
     }
@@ -807,7 +918,8 @@ fn fuse_class_if_safe(
             // single-pattern gate → decline → materialize the fact. Distinct from
             // strong fusion, which needs no disjointness because it already proved
             // every base-predicate map is a class map (nothing to drop).
-            if class_declares_predicate(m, &class, base_pred)
+            if shared_predicate_fusion_enabled()
+                && class_declares_predicate(m, &class, base_pred)
                 && wildcard_class_fusion_is_safe(m, &class)
             {
                 class_groups.remove(idx);
@@ -1021,6 +1133,19 @@ fn wildcard_class_fusion_enabled() -> bool {
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_CRAWL_CLASS_FUSION"))
 }
 
+/// Whether the **E1 shared-predicate class collapse** is enabled (default on).
+/// E1 (`fuse_class_if_safe`) collapses a separate class scan back into the star
+/// for a base predicate SHARED across disjoint-subject classes (the `ex:category`
+/// round-2 fix). It shipped unswitched on the audited line (F-AUD-19 / A2 D2); this
+/// is its dedicated kill switch. OFF does NOT re-materialize — control falls through
+/// to the weaker pre-E1 `class_prune_hint` (star + separate class scan, still safe),
+/// exactly the behavior before E1. Distinct from `FLUREE_R2RML_CRAWL_CLASS_FUSION`
+/// (the browse-crawl wildcard path) — do not conflate.
+fn shared_predicate_fusion_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_SHARED_PREDICATE_FUSION"))
+}
+
 /// A standalone variable-predicate wildcard scan (`?s ?p ?o`) on `subject`:
 /// binds both predicate and object, carries no predicate/class filter, and is
 /// not a fused star. This is the shape a subgraph crawl injects; class-
@@ -1107,7 +1232,16 @@ fn try_fuse_wildcard_class(
     if !has_wildcard {
         return false;
     }
-    if !wildcard_class_fusion_is_safe(mapping, class) {
+    // E2 / D9 (unknown-class short-circuit): a class that matches ZERO
+    // TriplesMaps can never bind a subject, so the crawl's answer is empty. Fuse
+    // the (unsatisfiable) `class_filter` onto the wildcard anyway — the operator
+    // then resolves it to zero TriplesMaps and returns an EMPTY result, instead
+    // of the full TriplesMap fan-out (16-table scan DNF) an UNconstrained
+    // wildcard would trigger. The vertical-partition safety check
+    // (`wildcard_class_fusion_is_safe`) is moot for an unmapped class — there is
+    // no class-declaring map whose sibling could be dropped — so skip it here.
+    let class_unmapped = mapping.find_maps_for_class(class).is_empty();
+    if !class_unmapped && !wildcard_class_fusion_is_safe(mapping, class) {
         return false;
     }
 
@@ -2563,5 +2697,134 @@ mod tests {
                 scale: 2,
             })
         );
+    }
+
+    // ---- Item 7 (F-AUD-5): FILTER-IN / VALUES set lowering ----
+
+    fn str_const(s: &str) -> Expression {
+        Expression::Const(FlakeValue::String(s.to_string()))
+    }
+
+    fn set_len(out: &[(VarId, ScanCmpOp, ScanValue)]) -> usize {
+        assert_eq!(out.len(), 1, "expected exactly one set pushdown");
+        let (_, op, val) = &out[0];
+        assert_eq!(*op, ScanCmpOp::In);
+        match val {
+            ScanValue::Set(vs) => vs.len(),
+            other => panic!("expected ScanValue::Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_in_collects_bounded_scalar_set() {
+        let args = vec![Expression::Var(VarId(0)), str_const("a"), str_const("b")];
+        let mut out = Vec::new();
+        collect_in_pushdown(&args, &mut out);
+        assert_eq!(out[0].0, VarId(0));
+        assert_eq!(set_len(&out), 2);
+    }
+
+    #[test]
+    fn filter_in_declines_when_a_member_is_not_a_pushable_const() {
+        // A non-constant member (a bound var) declines the WHOLE set — a partial
+        // IN could prune a file the dropped member's rows live in.
+        let args = vec![
+            Expression::Var(VarId(0)),
+            str_const("a"),
+            Expression::Var(VarId(1)),
+        ];
+        let mut out = Vec::new();
+        collect_in_pushdown(&args, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filter_in_declines_over_cap() {
+        // Default cap is 64; 65 members decline (kept cheap — O(files × members)).
+        let mut args = vec![Expression::Var(VarId(0))];
+        for i in 0..65 {
+            args.push(Expression::Const(FlakeValue::Long(i)));
+        }
+        let mut out = Vec::new();
+        collect_in_pushdown(&args, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filter_in_declines_empty_set() {
+        let args = vec![Expression::Var(VarId(0))];
+        let mut out = Vec::new();
+        collect_in_pushdown(&args, &mut out);
+        assert!(out.is_empty());
+    }
+
+    fn lit(s: &str) -> Binding {
+        Binding::lit(FlakeValue::String(s.to_string()), Sid::new(XSD, "string"))
+    }
+
+    #[test]
+    fn values_single_var_collects_scalar_set() {
+        let rows = vec![vec![lit("x")], vec![lit("y")], vec![lit("z")]];
+        let mut out = Vec::new();
+        collect_values_pushdown(&[VarId(0)], &rows, &mut out);
+        assert_eq!(out[0].0, VarId(0));
+        assert_eq!(set_len(&out), 3);
+    }
+
+    #[test]
+    fn values_declines_on_undef_row() {
+        // UNDEF means "any value"; an IN prune would wrongly drop rows → decline.
+        let rows = vec![vec![lit("x")], vec![Binding::Unbound]];
+        let mut out = Vec::new();
+        collect_values_pushdown(&[VarId(0)], &rows, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn values_declines_multi_var() {
+        // A multi-column VALUES binds correlated tuples; out of scope (single-var
+        // only). An independent per-column IN would lose the correlation.
+        let rows = vec![vec![lit("x"), lit("y")]];
+        let mut out = Vec::new();
+        collect_values_pushdown(&[VarId(0), VarId(1)], &rows, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn values_declines_on_iri_binding() {
+        // An IRI/ref member is not a scalar-column value (the FK-IRI reversal is a
+        // separate, deeper mechanism) → decline.
+        let rows = vec![vec![Binding::Iri("http://x/1".into())]];
+        let mut out = Vec::new();
+        collect_values_pushdown(&[VarId(0)], &rows, &mut out);
+        assert!(out.is_empty());
+    }
+
+    // ---- Item 10 (F-AUD-11): xsd:dateTime → frame-aware Timestamp ----
+
+    #[test]
+    fn datetime_emits_frame_aware_timestamp() {
+        use fluree_db_core::DateTime;
+        let mk =
+            |s: &str| to_scan_value(&FlakeValue::DateTime(Box::new(DateTime::parse(s).unwrap())));
+        match (mk("2024-06-01T00:00:00Z"), mk("2024-06-01T00:00:00")) {
+            (
+                Some(ScanValue::Timestamp {
+                    tz: tz_a,
+                    micros: m_a,
+                }),
+                Some(ScanValue::Timestamp {
+                    tz: tz_n,
+                    micros: m_n,
+                }),
+            ) => {
+                assert!(tz_a, "explicit Z ⇒ tz-aware (UTC frame)");
+                assert!(!tz_n, "no offset ⇒ naive (wall-clock frame)");
+                // A naive dateTime is treated as UTC, so the same wall-clock yields
+                // the same micros — only the frame flag differs.
+                assert_eq!(m_a, m_n);
+            }
+            other => panic!("expected two Timestamps, got {other:?}"),
+        }
     }
 }

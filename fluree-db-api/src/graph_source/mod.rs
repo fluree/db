@@ -31,9 +31,6 @@
 //! .with_k1(1.2)   // Optional: term frequency saturation
 //! .with_b(0.75);  // Optional: document length normalization
 //!
-//! // Validate before creating
-//! config.validate()?;
-//!
 //! let result = fluree.create_full_text_index(config).await?;
 //! println!("Created index with {} documents at t={}", result.doc_count, result.index_t);
 //! ```

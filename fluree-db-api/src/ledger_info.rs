@@ -311,9 +311,24 @@ pub struct Source {
     /// Catalog descriptor (REST or Direct-mode). Omitted when neither is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<Catalog>,
-    /// Authoritative per-table row counts (Iceberg manifest metadata).
+    /// Per-table row counts (Iceberg snapshot-summary `total-records`). Authoritative
+    /// for append-only / copy-on-write tables; for any table listed in
+    /// [`Self::mor_approximate_tables`] the count is an **upper bound** (it sums live
+    /// data-file records without subtracting merge-on-read position/equality deletes,
+    /// which Fluree recognizes but does not yet apply — F-AUD-1).
     #[serde(rename = "table-row-counts", default)]
     pub table_row_counts: BTreeMap<String, i64>,
+    /// Tables whose [`Self::table_row_counts`] entry is an **approximate upper bound**
+    /// because the current Iceberg snapshot carries merge-on-read delete files
+    /// (`total-delete-files`/`-position-deletes`/`-equality-deletes` > 0). Empty (and
+    /// omitted) for the common append-only case. Consumers that ignore unknown keys
+    /// (the `/data-model` + MCP readers, all null-safe) are unaffected.
+    #[serde(
+        rename = "mor-approximate-tables",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub mor_approximate_tables: Vec<String>,
 }
 
 /// Source catalog descriptor. `type`/`warehouse` emit explicit `null` (not
@@ -1182,6 +1197,9 @@ pub struct VirtualSourceMeta {
     pub tables: Vec<String>,
     /// Current Iceberg snapshot id (used as the virtual dataset "version").
     pub snapshot_id: Option<i64>,
+    /// Tables whose snapshot carries merge-on-read delete files, so their row count
+    /// is an upper bound (see [`Source::mor_approximate_tables`]).
+    pub mor_approximate_tables: Vec<String>,
 }
 
 /// Sum two optional row counts, treating `None` as "unknown" rather than zero:
@@ -1450,6 +1468,7 @@ pub fn build_virtual_ledger_info(
             .iter()
             .map(|(t, c)| (t.clone(), *c))
             .collect(),
+        mor_approximate_tables: meta.mor_approximate_tables.clone(),
     };
 
     LedgerInfo {
@@ -1597,13 +1616,18 @@ fn info_count_budget_ms() -> u64 {
 /// best-effort — a parse / auth / load / metadata failure drops only that table's
 /// count (logged at debug), never the whole response. A Direct-catalog source (no
 /// REST client) returns no counts.
+/// One table's `loadTable` outcome for the virtual-info fan-out:
+/// `(table name, summary row count if present, snapshot id, MoR-approximate?)`.
+#[cfg(feature = "iceberg")]
+type VirtualTableCount = (String, Option<i64>, i64, bool);
+
 #[cfg(feature = "iceberg")]
 async fn fetch_virtual_table_row_counts(
     fluree: &crate::Fluree,
     record: &GraphSourceRecord,
     cfg: &fluree_db_iceberg::IcebergGsConfig,
     tables: &[String],
-) -> (HashMap<String, i64>, Option<i64>) {
+) -> (HashMap<String, i64>, Option<i64>, Vec<String>) {
     use fluree_db_iceberg::catalog::{
         parse_table_identifier, RestCatalogClient, RestCatalogConfig, SendCatalogClient,
     };
@@ -1620,7 +1644,7 @@ async fn fetch_virtual_table_row_counts(
         ..
     } = &cfg.catalog
     else {
-        return (HashMap::new(), None);
+        return (HashMap::new(), None, Vec::new());
     };
 
     // Reuse (or warm) the process-wide REST client under the SAME cache key the
@@ -1640,14 +1664,14 @@ async fn fetch_virtual_table_row_counts(
                 Ok(a) => a,
                 Err(e) => {
                     tracing::debug!(error = %e, "virtual ledger-info: auth secret resolution failed; counts omitted");
-                    return (HashMap::new(), None);
+                    return (HashMap::new(), None, Vec::new());
                 }
             };
             let auth_provider = match hydrated_auth.create_provider_arc() {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::debug!(error = %e, "virtual ledger-info: auth provider build failed; counts omitted");
-                    return (HashMap::new(), None);
+                    return (HashMap::new(), None, Vec::new());
                 }
             };
             let catalog_config = RestCatalogConfig {
@@ -1663,7 +1687,7 @@ async fn fetch_virtual_table_row_counts(
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "virtual ledger-info: catalog client build failed; counts omitted");
-                    return (HashMap::new(), None);
+                    return (HashMap::new(), None, Vec::new());
                 }
             }
         }
@@ -1675,7 +1699,7 @@ async fn fetch_virtual_table_row_counts(
     // client. `.buffered` (not `buffer_unordered`) preserves request order, so the
     // snapshot pin (first successful table) is deterministic for the sorted
     // `tables`.
-    let per_table: Vec<Option<(String, Option<i64>, i64)>> =
+    let per_table: Vec<Option<VirtualTableCount>> =
         futures::stream::iter(tables.iter().cloned())
             .map(|table| {
                 let catalog = Arc::clone(&catalog);
@@ -1697,9 +1721,15 @@ async fn fetch_virtual_table_row_counts(
                         }
                     };
                     let metadata = load.metadata.as_ref()?;
+                    // MoR rider (F-AUD-1): the snapshot-summary `total-records` this
+                    // count derives from OVER-COUNTS a merge-on-read table (it does not
+                    // subtract position/equality deletes, which Fluree recognizes but
+                    // does not yet apply). Flag such a table so its count is reported
+                    // as an upper bound. Zero-I/O — reads only the in-memory summary.
+                    let has_deletes = metadata_indicates_mor_approximate_count(metadata);
                     let schema =
                         crate::graph_source::table_schema_from_metadata(&api_id, metadata).ok()?;
-                    Some((table, schema.row_count, schema.snapshot.id))
+                    Some((table, schema.row_count, schema.snapshot.id, has_deletes))
                 }
             })
             .buffered(INFO_COUNT_FETCH_CONCURRENCY)
@@ -1708,7 +1738,11 @@ async fn fetch_virtual_table_row_counts(
 
     let mut counts = HashMap::new();
     let mut snapshot_id = None;
-    for (table, row_count, snap) in per_table.into_iter().flatten() {
+    let mut mor_approximate_tables = Vec::new();
+    for (table, row_count, snap, has_deletes) in per_table.into_iter().flatten() {
+        if has_deletes {
+            mor_approximate_tables.push(table.clone());
+        }
         if let Some(rc) = row_count {
             counts.insert(table, rc);
         }
@@ -1716,7 +1750,24 @@ async fn fetch_virtual_table_row_counts(
             snapshot_id = Some(snap);
         }
     }
-    (counts, snapshot_id)
+    mor_approximate_tables.sort();
+    (counts, snapshot_id, mor_approximate_tables)
+}
+
+/// Whether a virtual (Iceberg) table's snapshot-summary row count must be treated
+/// as a merge-on-read UPPER BOUND rather than exact — i.e. the table belongs in
+/// [`Source::mor_approximate_tables`]. Fail-closed via
+/// [`fluree_db_iceberg::mor_guard::summary_indicates_deletes`]: a present delete
+/// counter that is non-zero, negative, or unparseable flags the table, so a
+/// malformed counter can never let an over-counted total masquerade as exact
+/// (audit 1528-W1). Zero-I/O — reads only the current snapshot's in-memory summary.
+#[cfg(feature = "iceberg")]
+fn metadata_indicates_mor_approximate_count(
+    metadata: &fluree_db_iceberg::metadata::TableMetadata,
+) -> bool {
+    metadata
+        .current_snapshot()
+        .is_some_and(fluree_db_iceberg::mor_guard::summary_indicates_deletes)
 }
 
 /// Async orchestration for the Iceberg/R2RML virtual-info path: resolve the
@@ -1784,7 +1835,11 @@ async fn build_iceberg_virtual_info(
     // catalog degrades counts to empty (and snapshot to `None`) while the schema
     // (classes/properties, derived from the mapping) still renders on time.
     let budget_ms = info_count_budget_ms();
-    let (counts, fetched_snapshot): (HashMap<String, i64>, Option<i64>) = match cfg.as_ref() {
+    let (counts, fetched_snapshot, mor_approximate_tables): (
+        HashMap<String, i64>,
+        Option<i64>,
+        Vec<String>,
+    ) = match cfg.as_ref() {
         Some(cfg) if budget_ms > 0 => {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(budget_ms),
@@ -1799,15 +1854,16 @@ async fn build_iceberg_virtual_info(
                         budget_ms,
                         "virtual ledger-info: row-count fetch exceeded budget; counts omitted"
                     );
-                    (HashMap::new(), None)
+                    (HashMap::new(), None, Vec::new())
                 }
             }
         }
-        _ => (HashMap::new(), None),
+        _ => (HashMap::new(), None, Vec::new()),
     };
     if meta.snapshot_id.is_none() {
         meta.snapshot_id = fetched_snapshot;
     }
+    meta.mor_approximate_tables = mor_approximate_tables;
 
     Ok(build_virtual_ledger_info(record, mapping.as_deref(), &meta, &counts).into_json())
 }
@@ -2180,6 +2236,53 @@ const fn serve_virtual_stats_from_metadata(ledger_t: i64, graph_source_registere
     ledger_t == 0 && graph_source_registered
 }
 
+/// Env switch for per-member `/info` routing (item 14, C1 residual). Default ON.
+/// With it on, a graph-source-registered ledger serves its virtual (manifest-
+/// backed) stats regardless of the native ledger's `t`: an empty shell (`t == 0`)
+/// serves virtual-only (`serve_virtual_stats_from_metadata`, unchanged), and a
+/// **hybrid** (`t > 0` with a registered graph source) MERGES the native members
+/// with the graph-source member instead of taking the native-only path — so
+/// `get_data_model` no longer loses the virtual model the moment the shell crosses
+/// `t > 0`. Set to a falsy value (`0`/`false`/`off`/`no`) to restore the strict
+/// `t == 0`-only reroute (a hybrid then takes the native path, the prior behavior).
+const INFO_MEMBER_ROUTING_ENV: &str = "FLUREE_R2RML_INFO_MEMBER_ROUTING";
+
+fn info_member_routing_enabled() -> bool {
+    info_member_routing_from_env(std::env::var(INFO_MEMBER_ROUTING_ENV).ok().as_deref())
+}
+
+/// Pure default-ON parse (split out from [`info_member_routing_enabled`] so it is
+/// unit-testable without mutating the shared process environment): absent or any
+/// non-falsy value is ON; `0`/`false`/`off`/`no` (case-insensitive, trimmed) is OFF.
+fn info_member_routing_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
+/// Merge a graph-source (virtual) `LedgerInfo` into the native one for a **hybrid**
+/// ledger — committed native data (`t > 0`) that ALSO has a registered graph
+/// source. The native ledger/commit/index/`t` metadata is authoritative and kept;
+/// the graph-source member's `classes`/`properties` are overlaid by (compacted)
+/// IRI — the graph source is authoritative for the classes it maps, so it wins a
+/// key collision — while native-only classes/properties are preserved (a union,
+/// never a sum, so a shared IRI is never double-counted). The virtual `source`
+/// block (snapshot id + per-table counts) is attached so the hybrid is marked
+/// virtual-backed while still reporting its native members. Top-level
+/// `stats.flakes`/`size` stay native (the native ledger's own totals; per-class
+/// virtual counts carry the graph-source detail).
+fn merge_virtual_into_native(mut native: LedgerInfo, virt: LedgerInfo) -> LedgerInfo {
+    for (iri, class) in virt.stats.classes {
+        native.stats.classes.insert(iri, class);
+    }
+    for (iri, prop) in virt.stats.properties {
+        native.stats.properties.insert(iri, prop);
+    }
+    native.source = virt.source;
+    native
+}
+
 impl<'a> LedgerInfoBuilder<'a> {
     /// Create a new builder (called by `Fluree::ledger_info()`).
     pub(crate) fn new(fluree: &'a Fluree, ledger_id: String) -> Self {
@@ -2276,14 +2379,19 @@ impl<'a> LedgerInfoBuilder<'a> {
             Err(e) => return Err(e),
         };
 
-        // T1.2: reroute an empty-shell virtual dataset's stats to the metadata-only
-        // graph-source path, so `/info` (e.g. MCP `get_data_model`) reads counts
-        // from Iceberg manifests + the mapping instead of scanning every backing
-        // table (the 900s runaway). The graph-source lookup runs ONLY for an empty
-        // shell (`t == 0`) — no extra work on the native hot path — and a lookup
-        // failure falls through to native (fail-safe). See
-        // `serve_virtual_stats_from_metadata` for the precise predicate.
-        let graph_source = if ledger.t() == 0 {
+        // Per-member routing (item 14, C1 residual). A graph-source-registered
+        // ledger serves its virtual (manifest-backed) stats regardless of the native
+        // `t`, so `/info` (e.g. MCP `get_data_model`) reads counts from Iceberg
+        // manifests + the mapping instead of scanning every backing table (the 900s
+        // runaway) — and no longer loses that model the moment an empty shell crosses
+        // `t > 0`. T1.2 (`t == 0`) serves virtual-only; a HYBRID (`t > 0` + a graph
+        // source) MERGES the native members with the graph-source member. The lookup
+        // runs only when it can change the result — `t == 0`, OR member routing is on
+        // — so the pure native hot path is untouched; any lookup/build failure falls
+        // through to native (fail-safe). Gated by `FLUREE_R2RML_INFO_MEMBER_ROUTING`
+        // (default on): with it off, only the `t == 0` reroute fires (prior behavior).
+        let member_routing = info_member_routing_enabled();
+        let graph_source = if ledger.t() == 0 || member_routing {
             self.fluree
                 .nameservice()
                 .lookup_graph_source(&self.ledger_id)
@@ -2293,9 +2401,47 @@ impl<'a> LedgerInfoBuilder<'a> {
         } else {
             None
         };
-        if serve_virtual_stats_from_metadata(ledger.t(), graph_source.is_some()) {
-            if let Some(gs) = graph_source {
+        if let Some(gs) = graph_source {
+            if serve_virtual_stats_from_metadata(ledger.t(), true) {
+                // Empty shell: the graph source IS the dataset (no native members).
                 return build_graph_source_info(self.fluree, &gs).await;
+            }
+            if member_routing {
+                // Hybrid (t > 0 + a graph source): build both members and merge, so
+                // the native members keep the native path and the graph-source member
+                // is served from manifest-backed counts. Bypasses the response cache
+                // (hybrids are rare); reuses the same native builder the cache path
+                // uses below.
+                let storage = self
+                    .fluree
+                    .backend()
+                    .admin_storage_cloned()
+                    .ok_or_else(|| {
+                        ApiError::config("ledger_info requires a managed storage backend")
+                    })?;
+                let native_json = build_ledger_info_with_options(
+                    &ledger,
+                    &storage,
+                    self.context,
+                    self.options.clone(),
+                )
+                .await
+                .map_err(|e| ApiError::internal(format!("ledger_info failed: {e}")))?;
+                let virtual_json = build_graph_source_info(self.fluree, &gs).await?;
+                // Best-effort typed merge; on any deserialize failure prefer the
+                // virtual model (it carries the authoritative graph-source classes
+                // item 14 needs — the native-only response was the bug being fixed).
+                return Ok(
+                    match (
+                        serde_json::from_value::<LedgerInfo>(native_json),
+                        serde_json::from_value::<LedgerInfo>(virtual_json.clone()),
+                    ) {
+                        (Ok(native), Ok(virt)) => {
+                            merge_virtual_into_native(native, virt).into_json()
+                        }
+                        _ => virtual_json,
+                    },
+                );
             }
         }
 
@@ -2460,9 +2606,164 @@ mod tests {
         assert!(!serve_virtual_stats_from_metadata(0, false));
         assert!(!serve_virtual_stats_from_metadata(42, false));
         // (e) hybrid: a ledger with committed native data (t>0) that ALSO has a
-        // graph source registered → native path, so its real flakes are never
-        // under-reported by the manifest-only path.
+        // graph source registered. This predicate stays `false` (it gates the
+        // virtual-ONLY reroute); item 14's `execute` routing now handles the hybrid
+        // separately when `info_member_routing_enabled()` — see
+        // `merge_virtual_into_native_unions_classes_graph_source_wins`.
         assert!(!serve_virtual_stats_from_metadata(42, true));
+    }
+
+    /// Item 14 switch: default ON, only explicit falsy values turn it off (so a
+    /// hybrid keeps serving its virtual model by default; an operator can revert to
+    /// the strict `t == 0` reroute with `FLUREE_R2RML_INFO_MEMBER_ROUTING=0`).
+    #[test]
+    fn info_member_routing_default_on_and_falsy_off() {
+        assert!(info_member_routing_from_env(None), "absent → default on");
+        for on in ["1", "true", "on", "yes", "whatever"] {
+            assert!(info_member_routing_from_env(Some(on)), "{on:?} → on");
+        }
+        for off in ["0", "false", "OFF", " no ", "No"] {
+            assert!(!info_member_routing_from_env(Some(off)), "{off:?} → off");
+        }
+    }
+
+    /// Item 14 hybrid merge: native members keep the native path (native-only
+    /// classes/properties + native ledger/commit metadata preserved) while the
+    /// graph-source member's classes are overlaid by IRI — the graph source wins a
+    /// shared IRI (a UNION, never a SUM, so no double-count) and its `source` block
+    /// (snapshot + counts) is attached.
+    #[test]
+    fn merge_virtual_into_native_unions_classes_graph_source_wins() {
+        use serde_json::json;
+        let native: LedgerInfo = serde_json::from_value(json!({
+            "ledger": {"alias":"ds","t":7,"commit-t":7,"index-t":7,"flakes":10,"size":0,
+                       "named-graphs":[{"iri":"urn:default","g-id":0,"flakes":10,"size":0}]},
+            "graph": "default",
+            "stats": {"flakes":10,"size":0,
+                      "classes":{"A":{"count":5},"C":{"count":5}},
+                      "properties":{"p1":{"count":5}}},
+            "commit": null,
+            "commitId": "nativecommit"
+        }))
+        .unwrap();
+        let virt: LedgerInfo = serde_json::from_value(json!({
+            "ledger_id":"ds","t":42,
+            "ledger": {"alias":"ds","t":42,"commit-t":null,"index-t":null,"flakes":300,"size":0,
+                       "named-graphs":[{"iri":"urn:default","g-id":0,"flakes":300,"size":0}]},
+            "graph": "default",
+            "stats": {"flakes":300,"size":0,
+                      "classes":{"B":{"count":200},"C":{"count":100}},
+                      "properties":{"p2":{"count":200}}},
+            "commit": null,
+            "source": {"virtual":true,"type":"Iceberg","tables":["t"],"snapshot":42,
+                       "table-row-counts":{"t":300}}
+        }))
+        .unwrap();
+
+        let merged = merge_virtual_into_native(native, virt);
+        assert_eq!(
+            merged.stats.classes.get("A").and_then(|c| c.count),
+            Some(5),
+            "native-only class preserved"
+        );
+        assert_eq!(
+            merged.stats.classes.get("B").and_then(|c| c.count),
+            Some(200),
+            "virtual-only class added"
+        );
+        assert_eq!(
+            merged.stats.classes.get("C").and_then(|c| c.count),
+            Some(100),
+            "graph source wins the shared IRI (union, not sum — no double-count)"
+        );
+        assert!(merged.stats.properties.contains_key("p1"));
+        assert!(merged.stats.properties.contains_key("p2"));
+        assert_eq!(
+            merged.commit_id.as_deref(),
+            Some("nativecommit"),
+            "native ledger metadata authoritative"
+        );
+        assert_eq!(merged.ledger.t, Some(7), "native ledger t kept");
+        assert_eq!(
+            merged.source.as_ref().and_then(|s| s.snapshot),
+            Some(42),
+            "virtual source block attached"
+        );
+    }
+
+    /// Item 14 MoR rider: a table whose snapshot carries merge-on-read deletes keeps
+    /// its (upper-bound) row count but is flagged in `mor-approximate-tables`, so the
+    /// `/info` payload is honest rather than silently over-reporting. Consumers that
+    /// ignore the new key (all null-safe) are unaffected.
+    #[test]
+    fn mor_approximate_tables_flag_surfaces_in_source() {
+        use serde_json::json;
+        let record = virtual_record(&secret_bearing_config());
+        let mapping = two_table_mapping();
+        let mut counts = HashMap::new();
+        counts.insert("openflights.airlines".to_string(), 100);
+        let mut meta = iceberg_meta();
+        meta.mor_approximate_tables = vec!["openflights.airlines".to_string()];
+        let info = serde_json::to_value(build_virtual_ledger_info(
+            &record,
+            Some(&mapping),
+            &meta,
+            &counts,
+        ))
+        .unwrap();
+        let source = &info["source"];
+        assert_eq!(
+            source["table-row-counts"]["openflights.airlines"], 100,
+            "the upper-bound count is still reported (flagged, not dropped)"
+        );
+        assert_eq!(
+            source["mor-approximate-tables"],
+            json!(["openflights.airlines"]),
+            "the MoR table is flagged approximate"
+        );
+    }
+
+    /// 1528-W1 (/info side): the fail-closed summary classifier must make a table
+    /// whose current-snapshot summary carries a garbled or negative delete counter
+    /// land in `mor-approximate-tables` (its row count reported as an upper bound),
+    /// never silently counted as exact. A clean append snapshot is not flagged.
+    /// Exercises the exact predicate `fetch_virtual_table_row_counts` uses.
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn mor_approximate_count_flags_malformed_summary_counter() {
+        fn metadata_with_summary(summary_json: &str) -> fluree_db_iceberg::metadata::TableMetadata {
+            let json = format!(
+                r#"{{
+                  "format-version": 2,
+                  "location": "s3://b/t",
+                  "last-updated-ms": 0,
+                  "last-column-id": 1,
+                  "current-snapshot-id": 1,
+                  "snapshots": [
+                    {{
+                      "snapshot-id": 1,
+                      "timestamp-ms": 0,
+                      "summary": {summary_json}
+                    }}
+                  ]
+                }}"#
+            );
+            fluree_db_iceberg::metadata::TableMetadata::from_json_str(&json)
+                .expect("valid test metadata")
+        }
+
+        // Present-but-unparseable counter → flagged (upper bound), not exact.
+        let garbled = metadata_with_summary(r#"{"total-delete-files": "garbage"}"#);
+        assert!(
+            metadata_indicates_mor_approximate_count(&garbled),
+            "a malformed delete counter must flag the table as mor-approximate"
+        );
+        // A negative counter is likewise flagged (fail-closed, not clamp-to-zero).
+        let negative = metadata_with_summary(r#"{"total-position-deletes": "-1"}"#);
+        assert!(metadata_indicates_mor_approximate_count(&negative));
+        // A clean append snapshot (no delete counters) is NOT flagged → exact count.
+        let clean = metadata_with_summary(r#"{"total-records": "1000", "operation": "append"}"#);
+        assert!(!metadata_indicates_mor_approximate_count(&clean));
     }
 
     #[test]
@@ -2688,6 +2989,7 @@ mod tests {
                 "openflights.routes".to_string(),
             ],
             snapshot_id: Some(42),
+            mor_approximate_tables: Vec::new(),
         }
     }
 

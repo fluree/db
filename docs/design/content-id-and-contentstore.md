@@ -128,7 +128,7 @@ pub trait ContentStore: Debug + Send + Sync {
 ### Implementations
 
 - **`MemoryContentStore`**: In-memory `HashMap<ContentId, Vec<u8>>` for testing.
-- **`BridgeContentStore`**: Adapter that wraps a `Storage` implementation, mapping ContentIds to physical storage addresses.
+- **`StorageContentStore<S: Storage>`**: Adapter that wraps a `Storage` implementation, mapping ContentIds to physical storage addresses. (`fluree-db-core/src/storage.rs`)
 - **Filesystem / S3 / IPFS**: Direct implementations that store objects keyed by CID.
 
 ### Layered composition

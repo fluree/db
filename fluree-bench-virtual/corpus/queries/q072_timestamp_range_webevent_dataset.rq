@@ -1,0 +1,16 @@
+# q072 timestamp_range_webevent_dataset — promoted from A3 probe-07 (audit item 10, F-AUD-11)
+# Coverage: an xsd:dateTime range FILTER over the sole dateTime column
+#   (edw:eventTs → FACT_WEB_EVENT.EVENT_TS). Item 10 adds a Timestamp ScanValue arm
+#   that pushes to MANIFEST-level pruning when the literal's tz frame matches the
+#   column (a UTC "…Z" literal against a `timestamptz` column; naive against
+#   `timestamp`). If EVENT_TS is `timestamptz`, files_pruned>0; otherwise the frame
+#   gate declines and the in-engine FILTER enforces (still correct). rows_only:
+#   the LIMIT truncates an unordered matching set.
+# Exec path: query_from() FROM <enterprise-sf01-v:main> (the deployed solo/chat shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?e ?et
+FROM <enterprise-sf01-v:main>
+WHERE { ?e a edw:WebEvent ; edw:eventType ?et ; edw:eventTs ?ts .
+        FILTER(?ts > "2024-06-01T00:00:00Z"^^xsd:dateTime) }
+LIMIT 5000

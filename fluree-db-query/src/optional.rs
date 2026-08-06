@@ -2276,6 +2276,23 @@ impl Operator for OptionalOperator {
         effective_schema(&self.out_schema, &self.combined_schema)
     }
 
+    /// Item 11 (F-AUD-7): forward a top-of-tree `LIMIT` budget to the REQUIRED
+    /// (outer) side only. A left-outer-join emits ≥1 output row per required row
+    /// (a padded null row when the optional side has no match) and preserves
+    /// required-row order, so the first `k` output rows come from the first ≤`k`
+    /// required rows — bounding the required side to `k` is sound (the `LIMIT`
+    /// above truncates any surplus). The optional (inner) side is deliberately NOT
+    /// budgeted: it must still produce every match for a given required row.
+    /// Gated by `FLUREE_R2RML_BUDGET_OPTIONAL`; OFF swallows the budget (the
+    /// pre-item-11 full outer scan — byte-identical results).
+    fn set_row_budget(&mut self, budget: usize) {
+        if crate::r2rml::optional_budget_enabled() {
+            self.required.set_row_budget(budget);
+        } else {
+            tracing::debug!(budget, "OPTIONAL row-budget forwarding disabled by switch");
+        }
+    }
+
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         if !self.state.can_open() {
             if self.state.is_closed() {
@@ -2714,6 +2731,51 @@ mod tests {
         assert_eq!(op.schema()[0], VarId(0)); // ?s (from required)
         assert_eq!(op.schema()[1], VarId(1)); // ?name (from required)
         assert_eq!(op.schema()[2], VarId(2)); // ?email (optional-only)
+    }
+
+    /// Item 11 (F-AUD-7): a top-of-tree `LIMIT` budget is forwarded to the REQUIRED
+    /// (outer) side of an OPTIONAL — the sound direction (each required row emits
+    /// ≥1 output), so the outer scan stops early instead of full-scanning (probe-04).
+    #[test]
+    fn optional_forwards_row_budget_to_required_side() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let recorded = Arc::new(AtomicUsize::new(0));
+        struct RecordingOp {
+            recorded: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Operator for RecordingOp {
+            fn schema(&self) -> &[VarId] {
+                &[]
+            }
+            async fn open(&mut self, _: &ExecutionContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+                Ok(None)
+            }
+            fn close(&mut self) {}
+            fn set_row_budget(&mut self, budget: usize) {
+                self.recorded.store(budget, Ordering::SeqCst);
+            }
+        }
+
+        let required_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        let mut op = OptionalOperator::new(
+            Box::new(RecordingOp {
+                recorded: Arc::clone(&recorded),
+            }),
+            required_schema,
+            make_optional_pattern(),
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        op.set_row_budget(50);
+        assert_eq!(
+            recorded.load(Ordering::SeqCst),
+            50,
+            "the budget must reach the required (outer) side (switch default-on)"
+        );
     }
 
     #[test]

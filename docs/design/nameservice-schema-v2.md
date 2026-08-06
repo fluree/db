@@ -962,7 +962,7 @@ Each file contains JSON matching the concern's payload plus metadata:
 
 - Only `meta` items carry the `kind` attribute and project into the GSI
 - Projection: `INCLUDE` with `name`, `branch`, `source_type`, `dependencies`, `retracted`
-- Used by `all_records()` (kind=`ledger`) and `all_vg_records()` (kind=`graph_source`)
+- Used by `all_records()` (kind=`ledger`) and `all_graph_source_records()` (kind=`graph_source`)
 - After GSI query returns meta items, `BatchGetItem` fetches remaining concern items (`config`, `index`) to assemble full records
 
 ## Appendix: Attribute Reference

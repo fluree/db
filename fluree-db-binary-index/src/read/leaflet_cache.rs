@@ -5,8 +5,16 @@
 //! dictionary tree leaves — share one pool so TinyLFU decides what stays
 //! based on actual access patterns rather than fixed budget splits.
 //!
-//! Region 3 (history journal) is **never cached** — it's cold-path data
-//! decoded on demand for time-travel replay and discarded afterwards.
+//! History is **never cached** — it lives outside the leaflet entirely, in the
+//! per-leaf history sidecar (`FHS1`, located via `LeafEntry.sidecar_cid`). It's
+//! cold-path data decoded on demand for time-travel replay and discarded
+//! afterwards, so a HEAD-only query never pays for it.
+//!
+//! Note: "Region 1" / "Region 2" here are *decode groupings* used by this cache
+//! (R1 = the key columns used for filtering and joins; R2 = the remaining
+//! per-row columns needed to reconstruct a full flake). The V3 on-disk leaflet
+//! is per-column blocks, not numbered regions — see
+//! `crate::format::leaflet` and `docs/design/index-format.md`.
 //!
 //! ## Cache Key
 //!

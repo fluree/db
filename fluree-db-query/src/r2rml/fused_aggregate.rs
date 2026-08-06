@@ -79,6 +79,73 @@ fn numeric_kind(datatype: Option<&str>) -> Option<NumKind> {
     }
 }
 
+/// Whether a declared object-map datatype is admissible for a fused MIN/MAX fold:
+/// a numeric (`xsd:integer`/`long`/`int`/`decimal`/`double`/`float`) or temporal
+/// (`xsd:date`/`dateTime`) type. Everything else — string, boolean, IRI-/langtag-
+/// typed, or an **un-annotated** column (which the R2RML natural mapping treats as
+/// `xsd:string`, so its MIN/MAX would be lexical) — declines, keeping the generic
+/// pipeline's collation/term-type semantics. Fold parity itself comes from
+/// materializing the same term + `compare_bindings`; this gate only scopes the
+/// mechanism to the types the audit item covers (F-AUD-8).
+fn minmax_admissible_datatype(datatype: Option<&str>) -> bool {
+    use fluree_vocab::xsd;
+    matches!(
+        datatype,
+        Some(dt) if dt == xsd::INTEGER
+            || dt == xsd::LONG
+            || dt == xsd::INT
+            || dt == xsd::DECIMAL
+            || dt == xsd::DOUBLE
+            || dt == xsd::FLOAT
+            || dt == xsd::DATE
+            || dt == xsd::DATE_TIME
+    )
+}
+
+/// Whether a MIN/MAX fold should replace its running extreme with a candidate
+/// whose `compare_bindings(candidate, current)` is `ord`. This mirrors the
+/// generic `agg_min`/`agg_max` (`min_by`/`max_by`) tie-breaking EXACTLY:
+/// - MIN keeps the FIRST minimum (`min_by` returns the first of equal-minimums),
+///   so it replaces only on a strictly-less candidate;
+/// - MAX keeps the LAST maximum (`max_by` returns the last of equal-maximums),
+///   so it replaces on greater-OR-EQUAL — the later of two equal elements wins.
+///
+/// The `Equal` case is load-bearing: two values that compare equal can still
+/// RENDER differently (double `+0.0` vs `-0.0` → "0" vs "-0"; or a decimal at two
+/// scales — `1.50` vs `1.5`), so picking the wrong one breaks byte-parity with the
+/// materialized aggregate even though the values are "equal". Candidates are
+/// materialized before the compare, so replacing on `Equal` costs no extra work.
+fn minmax_should_replace(is_max: bool, ord: std::cmp::Ordering) -> bool {
+    if is_max {
+        ord != std::cmp::Ordering::Less
+    } else {
+        ord == std::cmp::Ordering::Less
+    }
+}
+
+/// Whether the bare-COUNT manifest shortcut is eligible for a resolved fused plan:
+/// exactly one `CountRows` fold, no GROUP BY, no FILTER, and no folded
+/// constant-object constraints. The Iceberg manifest `record_count` sum cannot see
+/// per-row FILTER/constraint matches or per-group partitions, so anything else must
+/// fall through to the scan-fold (which applies them). This is the D-c5 soundness
+/// line for item 9b in particular: a constraint-bearing COUNT (e.g. `isCurrent
+/// true`) MUST decline the delete-blind shortcut and count matching rows in the
+/// fold instead. Extracted as a pure predicate so the decline invariant is
+/// DIRECTLY unit-tested, not only verified by inspection (R-1522 verified it that
+/// way). `filter_present` is passed as a bool because a `FilterPlan` needs a live
+/// `LedgerSnapshot` to build — the shortcut only ever cares about its presence.
+fn count_shortcut_eligible(
+    filter_present: bool,
+    group_cols: &[GroupCol],
+    fact_constraints: &[ResolvedConstraint],
+    folds: &[Fold],
+) -> bool {
+    !filter_present
+        && group_cols.is_empty()
+        && fact_constraints.is_empty()
+        && matches!(folds, [Fold::CountRows])
+}
+
 /// How to read a numeric column value as an exact decimal during native
 /// expression evaluation.
 #[derive(Clone, Copy)]
@@ -368,10 +435,21 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
         }
     }
 
-    // Cost guard: a FILTER is only fused alongside a GROUP BY. There the fused
-    // path's win (skipping the subject + the many grouped/aggregated columns)
-    // dwarfs the per-row filter eval. For a filtered single aggregate the normal
-    // pipeline's file pruning + vectorized filter is faster, so decline.
+    // Cost guard: an explicit SPARQL `FILTER` is only fused alongside a GROUP BY.
+    // There the fused path's win (skipping the subject + the many grouped/aggregated
+    // columns) dwarfs the per-row filter eval. For a filtered single aggregate the
+    // normal pipeline's file pruning + vectorized filter is faster, so decline.
+    //
+    // F1 NOTE (the q038 class): this guard is NOT what declines the ungrouped
+    // filtered COUNT `SELECT (COUNT(*)) WHERE { ?s a edw:Customer ; edw:isCurrent
+    // true }`. A constant-object triple stays a `Pattern::Triple` (SPARQL lowering
+    // never desugars `edw:isCurrent true` to `?v` + `FILTER(?v = true)`), so `filter`
+    // is `None` here and this guard does not fire — q038 is ADMITTED. Its decline is
+    // downstream, at the single-`[R2rml]` shape gate in `resolve_at_open`, because
+    // the rewrite splits its class + const-object members into separate scans;
+    // `combine_constrained_class_scan` recombines them. This guard remains for a
+    // genuine residual FILTER (`?s edw:score ?v . FILTER(?v > 100)`), where the
+    // cost argument above still holds.
     if filter.is_some() && group_by.is_empty() {
         return None;
     }
@@ -379,14 +457,19 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     // Every aggregate must be a column fold this operator supports.
     let mut aggregates = Vec::with_capacity(aggregation.aggregates.len());
     for spec in aggregation.aggregates.iter() {
-        // Only multiset (non-DISTINCT) COUNT/SUM/AVG fold from columns; the fused
-        // path has no dedup, so DISTINCT (Set) must fall back to the normal
-        // pipeline. `CountDistinct` is already a separate, unmatched variant.
+        // Only multiset (non-DISTINCT) COUNT/SUM/AVG and MIN/MAX fold from columns;
+        // the fused path has no dedup, so DISTINCT (Set) must fall back to the
+        // normal pipeline. `CountDistinct` is already a separate, unmatched variant.
+        // MIN/MAX carry no DISTINCT flag (dedup is a no-op for them). Whether a
+        // MIN/MAX aggregate variable actually resolves to a foldable numeric/temporal
+        // column is decided at `open` (`resolve_agg_folds`), which declines string /
+        // language- / IRI-typed / un-annotated columns.
         let foldable = match &spec.function {
             AggregateFn::CountAll | AggregateFn::Count(_) => true,
             AggregateFn::Sum(_, sem) | AggregateFn::Avg(_, sem) => {
                 matches!(sem, InputSemantics::List)
             }
+            AggregateFn::Min(_) | AggregateFn::Max(_) => true,
             _ => false,
         };
         if !foldable {
@@ -437,6 +520,14 @@ enum Fold {
     /// `SUM(expr)` / `AVG(expr)` over a native decimal arithmetic expression;
     /// `index` points into `Resolved::expr_folds`.
     NumericExpr { index: usize, is_avg: bool },
+    /// `MIN(?col)` / `MAX(?col)` over a numeric or date/timestamp scalar column;
+    /// `index` points into `Resolved::minmax_folds`. Unlike the COUNT/SUM/AVG
+    /// folds this one materializes the candidate object term (via the same
+    /// `materialize_object_from_batch` + `LiteralEncoder` path the FILTER fold
+    /// uses) and keeps the running extreme by `compare_bindings` — byte-parity
+    /// with the generic `agg_min`/`agg_max`, but streaming (O(1) memory) instead
+    /// of buffering every value and skipping the subject/BindingRow build.
+    MinMax { index: usize },
 }
 
 /// Running accumulator for one [`Fold`], mutated per batch in `next_batch`.
@@ -465,12 +556,22 @@ enum Acc {
         count: u64,
         is_avg: bool,
     },
+    /// Running MIN/MAX extreme, held as the materialized winning `Binding`
+    /// (`Unbound` until the first non-null row). The extreme is updated by
+    /// `compare_bindings` in the fold loop (the `Fold::MinMax` arm), so this is the
+    /// exact `Binding` the generic `agg_min`/`agg_max` would return.
+    MinMax {
+        best: Binding,
+    },
 }
 
 impl Acc {
     fn for_fold(fold: &Fold) -> Self {
         match fold {
             Fold::CountRows | Fold::CountColumn(_) => Acc::Count(0),
+            Fold::MinMax { .. } => Acc::MinMax {
+                best: Binding::Unbound,
+            },
             Fold::NumericExpr { is_avg, .. } => Acc::Expr {
                 sum: 0,
                 scale: 0,
@@ -533,6 +634,9 @@ impl Acc {
     /// Materialize the final result binding for this accumulator.
     fn finalize(self) -> Binding {
         match self {
+            // The extreme is already the materialized winning term (or `Unbound`
+            // for an empty group), byte-identical to `agg_min`/`agg_max`.
+            Acc::MinMax { best } => best,
             Acc::Count(n) => Binding::lit(FlakeValue::Long(n as i64), Sid::xsd_integer()),
             Acc::Exact {
                 sum,
@@ -815,6 +919,14 @@ struct Resolved {
     /// for a join with no fact-side flag. Dim-side constraints are applied earlier,
     /// during the FK→GKey map build, so they are not carried here.
     fact_constraints: Vec<ResolvedConstraint>,
+    /// MIN/MAX fold plans, indexed by `Fold::MinMax.index`. Empty unless the query
+    /// carries a MIN/MAX aggregate. The aggregates always fold from the FACT scan
+    /// (single-table or join), so these read the fact batch.
+    minmax_folds: Vec<MinMaxFold>,
+    /// Shared literal encoder for materializing MIN/MAX candidate terms into
+    /// `Binding`s (datatype Sids pre-resolved from the fact TriplesMap). `None`
+    /// when there are no MIN/MAX folds.
+    minmax_encoder: Option<LiteralEncoder>,
 }
 
 /// PR-6 fact⋈dim group-key resolver, built once at `open` by scanning the small
@@ -836,6 +948,19 @@ struct GroupKeyResolver {
 struct ExprFold {
     expr: Expression,
     var_cols: Vec<(VarId, String, DecKind)>,
+}
+
+/// A `MIN(?col)` / `MAX(?col)` fold plan. The object map materializes the
+/// candidate term per non-null row via the same `materialize_object_from_batch`
+/// path the FILTER fold uses (so the term — value + datatype/lang/term-type — is
+/// byte-identical to the generic scan's), and the running extreme is kept by
+/// `compare_bindings`. The scan column is projected at resolve time; the fold
+/// materializes through `object_map`, which carries the column reference
+/// internally. Admitted only for numeric/temporal plain-literal columns
+/// (`minmax_admissible_datatype` + a `TermType::Literal`, no-lang gate).
+struct MinMaxFold {
+    object_map: ObjectMap,
+    is_max: bool,
 }
 
 /// Per-row FILTER evaluation plan. The filter expression is evaluated through the
@@ -1051,6 +1176,48 @@ impl FusedR2rmlAggregateOperator {
         }
     }
 
+    /// Build the per-row FILTER evaluation plan for `expr` over ONE pattern /
+    /// TriplesMap: resolve every referenced variable to its scalar-column object
+    /// map (projecting the column so the scan carries it), prepare the boolean
+    /// expression, and build the term encoder from this TriplesMap's datatype
+    /// annotations. Returns `None` — i.e. DECLINE the fuse — when any referenced
+    /// variable does not resolve to a scalar column on this pattern: a
+    /// `RefObjectMap` FK object, a template/constant object, a multi-valued
+    /// predicate, or a var bound on a different pattern (`object_map_for_var`
+    /// already encodes each of these declines).
+    ///
+    /// This is the exact construction the single-table `resolve_at_open` used
+    /// inline, extracted so the fused JOIN path (FAMILY-C) reuses it VERBATIM. A
+    /// fused filter is therefore byte-parity with the materialized `FilterOperator`
+    /// by construction: both evaluate the SAME `PreparedBoolExpression` through
+    /// `eval_to_bool_non_strict` (`next_batch` for the fact fold,
+    /// `row_passes_filter_plan` for a dim fold, `filter.rs` for the materialized
+    /// operator), and a demotable expression error yields `false` (row excluded)
+    /// in all three.
+    fn build_filter_plan(
+        pattern: &R2rmlPattern,
+        tm: &TriplesMap,
+        expr: &Expression,
+        ctx: &ExecutionContext<'_>,
+        projection: &mut Vec<String>,
+    ) -> Option<FilterPlan> {
+        let eval_vars = expr.referenced_vars();
+        let mut eval_objmaps = Vec::with_capacity(eval_vars.len());
+        for v in &eval_vars {
+            let om = Self::object_map_for_var(pattern, tm, *v)?;
+            for col in om.referenced_columns() {
+                projection.push(col.to_string());
+            }
+            eval_objmaps.push(om);
+        }
+        Some(FilterPlan {
+            prepared: PreparedBoolExpression::new(expr.clone()),
+            eval_objmaps,
+            eval_vars: Arc::from(eval_vars),
+            encoder: LiteralEncoder::build(tm, ctx.active_snapshot),
+        })
+    }
+
     /// Resolve the single TriplesMap for the rewritten pattern, requiring exactly
     /// one (explicit IRI, or an unambiguous class/predicate match).
     fn resolve_triples_map<'m>(
@@ -1141,11 +1308,12 @@ impl Operator for FusedR2rmlAggregateOperator {
         // whole fused path (a disabled switch fails detection, so this is never
         // reached). The emitted binding is byte-identical to the scan+fold result
         // (`Acc::Count(n).finalize()`).
-        if resolved.filter.is_none()
-            && resolved.group_cols.is_empty()
-            && resolved.fact_constraints.is_empty()
-            && matches!(resolved.folds.as_slice(), [Fold::CountRows])
-        {
+        if count_shortcut_eligible(
+            resolved.filter.is_some(),
+            &resolved.group_cols,
+            &resolved.fact_constraints,
+            &resolved.folds,
+        ) {
             let gs = resolved.pattern.graph_source_id.clone();
             let table = resolved.table_name.clone();
             let non_null_cols = resolved.count_non_null_cols.clone();
@@ -1197,7 +1365,9 @@ impl Operator for FusedR2rmlAggregateOperator {
             let fold_cols: Vec<Option<&Column>> = folds
                 .iter()
                 .map(|f| match f {
-                    Fold::CountRows | Fold::NumericExpr { .. } => None,
+                    // MinMax materializes via its object map (handled inline below),
+                    // not a bare column read.
+                    Fold::CountRows | Fold::NumericExpr { .. } | Fold::MinMax { .. } => None,
                     Fold::CountColumn(c) | Fold::Numeric { column: c, .. } => {
                         batch.column_by_name(c)
                     }
@@ -1242,18 +1412,21 @@ impl Operator for FusedR2rmlAggregateOperator {
                     continue;
                 }
                 if let Some(fp) = &resolved.filter {
-                    // Materialize only the referenced object columns into a
-                    // binding row and evaluate through the engine evaluator.
-                    let binds: Vec<Binding> = fp
-                        .eval_objmaps
-                        .iter()
-                        .map(|om| match materialize_object_from_batch(om, &batch, row) {
-                            Ok(Some(term)) => fp.encoder.encode(&term),
-                            _ => Binding::Unbound,
-                        })
-                        .collect();
-                    let rv = BindingRow::new(&fp.eval_vars, &binds);
-                    if !fp.prepared.eval_to_bool_non_strict(&rv, Some(ctx))? {
+                    // The single-table and FACT-side-join filter, evaluated through the
+                    // SAME `row_passes_filter_plan` the dim side uses — one filter-eval
+                    // path for all three, so a fact filter is byte-parity with the dim
+                    // filter and the materialized operator. A NULL/absent filter-member
+                    // column EXCLUDES the row (BGP row-drop). Today `validity_cols`
+                    // already null-drops these member columns before the filter runs, so
+                    // this null-exclusion is unreachable here; routing through the helper
+                    // makes that INVARIANT fail-safe — if a future refactor ever eroded
+                    // the validity coverage, a null filter member would still exclude the
+                    // row (never counted as, e.g., "not Closed") rather than leak via an
+                    // Unbound. (`materialize_object_from_batch` over a scalar-column
+                    // ObjectMap — all `build_filter_plan` produces — never returns Err, so
+                    // this is behavior-identical to the prior inline block on every
+                    // reachable input.)
+                    if !Self::row_passes_filter_plan(fp, &batch, row, ctx)? {
                         continue;
                     }
                 }
@@ -1333,6 +1506,34 @@ impl Operator for FusedR2rmlAggregateOperator {
                                 _ => true,
                             }
                         }
+                        Fold::MinMax { index } => {
+                            let mmf = &resolved.minmax_folds[*index];
+                            // Materialize just the candidate object term (no subject,
+                            // no BindingRow) exactly as the generic scan would, then
+                            // keep the running extreme by `compare_bindings` — so the
+                            // final `Binding` is byte-identical to `agg_min`/`agg_max`.
+                            // A null/absent value materializes `None` and contributes
+                            // nothing, matching those aggregates dropping `Unbound`.
+                            if let (Some(encoder), Ok(Some(term))) = (
+                                resolved.minmax_encoder.as_ref(),
+                                materialize_object_from_batch(&mmf.object_map, &batch, row),
+                            ) {
+                                let cand = encoder.encode(&term);
+                                if let Acc::MinMax { best } = &mut accs[i] {
+                                    let replace = match &*best {
+                                        Binding::Unbound => true,
+                                        cur => minmax_should_replace(
+                                            mmf.is_max,
+                                            crate::sort::compare_bindings(&cand, cur),
+                                        ),
+                                    };
+                                    if replace {
+                                        *best = cand;
+                                    }
+                                }
+                            }
+                            true
+                        }
                         _ => accs[i].update_row(fold, fold_cols[i], row),
                     };
                     if !ok {
@@ -1386,22 +1587,6 @@ impl Operator for FusedR2rmlAggregateOperator {
         self.resolved = None;
         self.state = OperatorState::Closed;
     }
-}
-
-/// C5 slice-1 MANDATORY soundness guard: whether ANY participating R2RML pattern
-/// (the aggregated fact AND every joined dim) carries a `star_constraints` entry —
-/// a constant-object member the rewrite folded into the pattern (e.g.
-/// `?c ex:isCurrent true` → `star_constraints=[(IS_CURRENT, true)]`, `rewrite.rs:344`).
-/// The fused fold reads only the GROUP-BY/aggregate/validity columns + the SPARQL
-/// FILTER; it has NO star_constraints handling (`grep star_constraints
-/// fused_aggregate.rs` = 0), while the normal scan DOES apply them
-/// (`operator.rs:524/1719/…`). So a fused plan over a constrained pattern would
-/// silently IGNORE the constraint and OVER-COUNT. Declining here keeps the fold
-/// sound; slice 1.5 teaches the fold to apply the constraint and lifts this for
-/// that shape. This is also a *current* correctness fix: any COUNT-over-a-flagged-
-/// star that reaches the fused path today over-counts.
-fn fold_over_star_constraints(pats: &[&R2rmlPattern]) -> bool {
-    pats.iter().any(|p| !p.star_constraints.is_empty())
 }
 
 /// E2: a folded constant-object constraint (`star_constraints`) resolved to a
@@ -1526,8 +1711,20 @@ impl FusedR2rmlAggregateOperator {
         // against non-lowered sub-scopes (`rr.unsupported`): a surviving
         // PropertyPath/Subquery breaks the shape, so we fall back to the normal
         // GRAPH path, which raises the loud `unsupported_subscope_error`.
+        // F1 (F-AUD-8, the q038 ungrouped/direct-path filtered-COUNT class): the
+        // rewrite splits a subject-star with no variable-object member into a
+        // standalone class scan + standalone const-object constraint scans.
+        // Recombine them into one class-scan-with-`star_constraints` pattern so the
+        // single-table fold below applies each constraint per row (see
+        // `combine_constrained_class_scan`). Computed before the match so its arm
+        // can claim this multi-pattern shape BEFORE the join arm — that arm would
+        // otherwise take it and decline (a subject-star is not an FK chain).
+        let combined_constrained_class = Self::combine_constrained_class_scan(&rr.patterns);
         let pattern = match rr.patterns.as_slice() {
             [Pattern::R2rml(p)] => p.clone(),
+            _ if combined_constrained_class.is_some() => {
+                combined_constrained_class.expect("is_some checked in the guard")
+            }
             // PR-6: a fact→dim chain rewrites to multiple R2rml leaf patterns.
             // Admit it as a fused aggregate over one join (gated by the join
             // sub-switch); anything else (non-R2rml pattern present) falls back.
@@ -1547,12 +1744,19 @@ impl FusedR2rmlAggregateOperator {
             _ => return Ok(None), // join sub-switch off, or non-R2rml pattern
         };
 
-        // C5 slice-1 MANDATORY guard: a folded constant-object constraint
-        // (star_constraints, e.g. `?c ex:isCurrent true`) on the single-table
-        // pattern is NOT applied by the fold and would OVER-COUNT. Decline.
-        if fold_over_star_constraints(&[&pattern]) {
-            return Ok(None);
-        }
+        // C5 slice-1.5 (item 9b, the q038 filtered-COUNT class): a folded
+        // constant-object constraint (`star_constraints`, e.g. `?s edw:isCurrent
+        // true`) on the single-table pattern is NO LONGER a blanket decline — the
+        // fold now APPLIES it (resolved below, once the TriplesMap is known). Slice-1
+        // declined here because the fold ignored the constraint and would OVER-COUNT;
+        // that hazard is retired by resolving the constraint to a per-row scalar-column
+        // check via the SAME `resolve_star_constraint_checks` / `row_satisfies_constraints`
+        // machinery the join path (E2) already uses, so a constrained COUNT excludes
+        // the non-matching rows exactly as the materialized answer does. A constraint
+        // that does not resolve to a scalar column still declines (below), and the
+        // COUNT(*) manifest shortcut stays declined for a constraint-bearing plan (it
+        // checks `fact_constraints.is_empty()`), because `record_count` cannot see
+        // per-row constraint matches.
 
         // The graph is genuinely R2RML-backed here; without the mapping fall back
         // to the normal path (which surfaces any real load error).
@@ -1567,7 +1771,19 @@ impl FusedR2rmlAggregateOperator {
             return Ok(None);
         };
 
+        // Resolve the fact-side folded constant-object constraints to per-row
+        // scalar-column checks. Declines (`None`) if any constraint's predicate is a
+        // RefObjectMap object or is absent — those keep the materialize path (no
+        // silent over-count). Empty for an unconstrained COUNT/SUM/AVG/MIN/MAX plan.
+        let Some(fact_constraints) = Self::resolve_star_constraint_checks(&pattern, tm) else {
+            return Ok(None);
+        };
+
         let mut projection: Vec<String> = Vec::new();
+        // Scan the constraint columns so the fold can enforce them per row.
+        for c in &fact_constraints {
+            projection.push(c.column().to_string());
+        }
 
         // Resolve GROUP BY key columns (string / integer in slice 3). The output
         // key binding's datatype Sid is encoded from the snapshot so it matches
@@ -1590,9 +1806,12 @@ impl FusedR2rmlAggregateOperator {
             // The old byte-for-byte decline this default lifts guarded TWO things,
             // both now retired by mechanisms that make widening sound:
             //   1. OVER-COUNT of a flagged shape (the `q022` isCurrent sentinel):
-            //      retired by the `star_constraints` guard above (`:1304`) — any
-            //      constant-object flag declines BEFORE this loop, so the default
-            //      here only ever widens admission for un-flagged shapes.
+            //      post-E2/F1 a constant-object flag is NO LONGER declined —
+            //      `combine_constrained_class_scan` FUSES it onto the class scan as
+            //      a `star_constraints` entry that is APPLIED per row
+            //      (`resolve_star_constraint_checks` / `row_satisfies_constraints`),
+            //      so the fold counts only satisfying rows; the default here widens
+            //      admission soundly for flagged shapes too, not just un-flagged ones.
             //   2. WRONG group-key TERM vs the materialized answer: retired by
             //      parity-by-construction — the generic materialize path's
             //      `LiteralEncoder` registers a datatype Sid only for annotated
@@ -1628,10 +1847,17 @@ impl FusedR2rmlAggregateOperator {
         }
 
         // Resolve the aggregate output folds against the (single) scanned TM.
-        let (folds, expr_folds) = match self.resolve_agg_folds(&pattern, tm, &mut projection) {
-            Some(x) => x,
-            None => return Ok(None),
-        };
+        let mut minmax_folds: Vec<MinMaxFold> = Vec::new();
+        let (folds, expr_folds) =
+            match self.resolve_agg_folds(&pattern, tm, &mut projection, &mut minmax_folds) {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+        // MIN/MAX materializes candidate terms via this encoder (built once, from
+        // the scanned TriplesMap's datatype annotations — the same datatype Sids the
+        // generic scan uses).
+        let minmax_encoder =
+            (!minmax_folds.is_empty()).then(|| LiteralEncoder::build(tm, ctx.active_snapshot));
 
         // Row-validity columns. A row participates only if the subject template
         // columns and every predicate's object column are non-null — mirroring
@@ -1677,26 +1903,14 @@ impl FusedR2rmlAggregateOperator {
 
         // FILTER: resolve each referenced variable to its object map (for per-row
         // materialization) and prepare the expression for the engine evaluator.
-        let filter = if let Some(expr) = &self.filter {
-            let eval_vars = expr.referenced_vars();
-            let mut eval_objmaps = Vec::with_capacity(eval_vars.len());
-            for v in &eval_vars {
-                let Some(om) = Self::object_map_for_var(&pattern, tm, *v) else {
-                    return Ok(None); // filter references a non-column var → fall back
-                };
-                for col in om.referenced_columns() {
-                    projection.push(col.to_string());
-                }
-                eval_objmaps.push(om);
-            }
-            Some(FilterPlan {
-                prepared: PreparedBoolExpression::new(expr.clone()),
-                eval_objmaps,
-                eval_vars: Arc::from(eval_vars),
-                encoder: LiteralEncoder::build(tm, ctx.active_snapshot),
-            })
-        } else {
-            None
+        // `build_filter_plan` is shared with the fused JOIN path (FAMILY-C), so a
+        // filtered join is byte-parity with this single-table fold.
+        let filter = match &self.filter {
+            Some(expr) => match Self::build_filter_plan(&pattern, tm, expr, ctx, &mut projection) {
+                Some(fp) => Some(fp),
+                None => return Ok(None), // a non-column filter var → fall back
+            },
+            None => None,
         };
 
         projection.sort();
@@ -1714,7 +1928,9 @@ impl FusedR2rmlAggregateOperator {
             group_resolver: None,
             // Single-table fold: every key reads inline from the fact batch.
             group_key_plan: (0..self.group_by.len()).map(|_| KeySource::Fact).collect(),
-            fact_constraints: Vec::new(),
+            fact_constraints,
+            minmax_folds,
+            minmax_encoder,
         }))
     }
 
@@ -1729,6 +1945,7 @@ impl FusedR2rmlAggregateOperator {
         pattern: &R2rmlPattern,
         tm: &TriplesMap,
         projection: &mut Vec<String>,
+        minmax_folds: &mut Vec<MinMaxFold>,
     ) -> Option<(Vec<Fold>, Vec<ExprFold>)> {
         let bind_lookup: std::collections::HashMap<VarId, &Expression> =
             self.agg_binds.iter().map(|(v, e)| (*v, e)).collect();
@@ -1793,6 +2010,40 @@ impl FusedR2rmlAggregateOperator {
                             is_avg,
                         });
                     }
+                }
+                AggregateFn::Min(v) | AggregateFn::Max(v) => {
+                    // MIN/MAX over a bare scalar column only. A desugared expression
+                    // MIN/MAX (an agg_bind) is not folded — decline to the generic
+                    // path (the exact term of an arithmetic result is out of scope).
+                    if bind_lookup.contains_key(v) {
+                        return None;
+                    }
+                    let is_max = matches!(func, AggregateFn::Max(_));
+                    let (col, datatype) = Self::scalar_column_for_var(pattern, tm, *v)?;
+                    // Scope gate: numeric / date / timestamp only. String (collation),
+                    // boolean, and un-annotated (→ xsd:string) columns decline.
+                    if !minmax_admissible_datatype(datatype.as_deref()) {
+                        return None;
+                    }
+                    // Plain-literal term only: a language-tagged or IRI-/blank-typed
+                    // object map materializes a term whose lang/term-type the fold's
+                    // compare would order differently than the generic path intends —
+                    // decline (decline-only, never wrong).
+                    let object_map = Self::object_map_for_var(pattern, tm, *v)?;
+                    if !matches!(
+                        &object_map,
+                        ObjectMap::Column {
+                            language: None,
+                            term_type: TermType::Literal,
+                            ..
+                        }
+                    ) {
+                        return None;
+                    }
+                    projection.push(col);
+                    let index = minmax_folds.len();
+                    minmax_folds.push(MinMaxFold { object_map, is_max });
+                    folds.push(Fold::MinMax { index });
                 }
                 _ => return None,
             }
@@ -1915,6 +2166,109 @@ impl FusedR2rmlAggregateOperator {
         Some(checks)
     }
 
+    /// F1 (audit F-AUD-8, the q038 ungrouped/direct-path filtered-COUNT class — the
+    /// 886×-PARTIAL residual): when a subject-star carries NO variable-object
+    /// member, the R2RML rewrite does NOT fold its class + constant-object members
+    /// into one scan — it emits a standalone `?s a Class` class scan plus one
+    /// standalone `?s pred const` scan per constraint (`rewrite.rs`, the
+    /// `var_members.is_empty()` branch, whose only non-standalone route is a
+    /// co-located crawl wildcard). That multi-pattern result misses the
+    /// single-`[R2rml]` fused gate in `resolve_at_open`, so a bare-but-CONSTRAINED
+    /// ungrouped COUNT (`SELECT (COUNT(*)) WHERE { ?s a edw:Customer ; edw:isCurrent
+    /// true }`, q038) materializes at ~7k rows/s, while its GROUPED sibling (q022,
+    /// which has a var-object `?seg` the rewrite folds the class + `isCurrent`
+    /// constraint onto) fuses. This recombines that exact split back into ONE
+    /// class-scan-carrying-`star_constraints` pattern — byte-identical to what the
+    /// rewrite already produces for the var-object case — so the single-table fold
+    /// applies each constraint per row via the SAME 9b machinery
+    /// (`resolve_star_constraint_checks` + `row_satisfies_constraints`).
+    ///
+    /// Soundness (the D-c5 over-count line — the one unacceptable outcome): the
+    /// recombination only re-associates patterns the rewrite split; it introduces
+    /// no new semantics. It admits ONLY the exact shape — one shared subject VAR,
+    /// exactly one pure class scan, every other pattern a scalar const-object
+    /// equality with nothing else attached — and returns `None` for anything else
+    /// (a bound subject, a var-object member, a second class, a cross-subject FK
+    /// join, a RefObjectMap/template object carried on a member, a non-R2RML
+    /// pattern), leaving the existing join/decline arms to handle it. Downstream,
+    /// `resolve_star_constraint_checks` still DECLINES (→ materialize) any folded
+    /// constraint it cannot enforce as a scalar-column check, and the manifest
+    /// COUNT shortcut stays declined for the resulting non-empty `fact_constraints`
+    /// (`count_shortcut_eligible`), so no constraint is ever silently dropped or
+    /// over-counted. This adds NO new constraint source — the const-object members
+    /// route through the same `star_constraints` field the var-object star already
+    /// fills. Rides `FLUREE_FUSED_R2RML_AGG`: with the fold off,
+    /// `detect_fused_r2rml_aggregate` returns `None`, the fused operator is never
+    /// built, and q038 reverts to the materialized path (this widening is off).
+    fn combine_constrained_class_scan(patterns: &[Pattern]) -> Option<R2rmlPattern> {
+        // A lone class scan is already the single-`[R2rml]` arm; a single const
+        // scan has no class to resolve its TriplesMap against. The shape is a class
+        // + at least one constraint, i.e. ≥ 2 patterns.
+        if patterns.len() < 2 {
+            return None;
+        }
+        let mut r2rml: Vec<&R2rmlPattern> = Vec::with_capacity(patterns.len());
+        for p in patterns {
+            match p {
+                Pattern::R2rml(rp) => r2rml.push(rp),
+                _ => return None, // a non-R2RML pattern present → not this shape
+            }
+        }
+        // One shared subject VARIABLE (an absent/bound subject → decline: this is a
+        // subject-star, not a bound-subject crawl or a cross-subject FK join).
+        let subject = r2rml[0].subject_var?;
+        if r2rml
+            .iter()
+            .any(|rp| rp.subject_var != Some(subject) || rp.subject_constant.is_some())
+        {
+            return None;
+        }
+        let mut class_base: Option<R2rmlPattern> = None;
+        let mut constraints: Vec<(String, ObjectConstant)> = Vec::new();
+        for rp in &r2rml {
+            // A pure class scan: a class filter and NOTHING else attached.
+            let is_pure_class = rp.class_filter.is_some()
+                && rp.predicate_filter.is_none()
+                && rp.object_var.is_none()
+                && rp.object_constant.is_none()
+                && rp.predicate_var.is_none()
+                && rp.type_var.is_none()
+                && rp.triples_map_iri.is_none()
+                && rp.class_prune_hint.is_none()
+                && rp.star_bindings.is_empty()
+                && rp.star_constraints.is_empty();
+            // A scalar const-object equality: predicate + object constant only (the
+            // standalone shape the rewrite emits for a const member with no
+            // var-object base to fold onto).
+            let is_const_object = rp.predicate_filter.is_some()
+                && rp.object_constant.is_some()
+                && rp.class_filter.is_none()
+                && rp.object_var.is_none()
+                && rp.predicate_var.is_none()
+                && rp.type_var.is_none()
+                && rp.triples_map_iri.is_none()
+                && rp.class_prune_hint.is_none()
+                && rp.star_bindings.is_empty()
+                && rp.star_constraints.is_empty();
+            if is_pure_class {
+                if class_base.is_some() {
+                    return None; // two class scans → ambiguous base → decline
+                }
+                class_base = Some((*rp).clone());
+            } else if is_const_object {
+                constraints.push((rp.predicate_filter.clone()?, rp.object_constant.clone()?));
+            } else {
+                return None; // a var-object / mixed / RefObjectMap member → not this shape
+            }
+        }
+        let mut base = class_base?; // must be exactly one pure class scan
+        if constraints.is_empty() {
+            return None; // no constraint to fold (a lone class is the single arm)
+        }
+        base.star_constraints = constraints;
+        Some(base)
+    }
+
     /// E2: whether a row satisfies EVERY resolved constraint — the existence-filter
     /// semantics of the normal scan (`operator.rs:2019`): each constraint predicate
     /// must materialize an object equal to its constant; a null/missing object
@@ -1944,17 +2298,96 @@ impl FusedR2rmlAggregateOperator {
         Ok(true)
     }
 
+    /// FAMILY-C: the single chain pattern that owns EVERY variable a FILTER
+    /// references — the pattern whose scan phase can evaluate the residual — or
+    /// `None` to DECLINE the fuse. Mirrors [`Self::route_group_key_sources`]: for
+    /// each filter var, exactly one chain pattern must bind it as a scalar object.
+    /// - 0 matches → the var is not a scalar object on the chain (e.g. it is a
+    ///   subject, or bound only outside the join) → decline;
+    /// - ≥2 matches → the var is an object in two patterns, a cross-source
+    ///   value-equality the single-scan fold cannot enforce → decline;
+    /// - the filter references vars owned by ≥2 DIFFERENT patterns → the residual
+    ///   spans more than one scan phase (fact fold vs a dim map-build) and cannot
+    ///   be applied in one pass without materializing the join → decline.
+    ///
+    /// The caller further restricts the owner to the FACT (index 0) or the
+    /// TERMINAL dim (last index); an interior-dim owner declines (symmetric with
+    /// the interior-dim group-key decline in `route_group_key_sources`). A var
+    /// that routes here but is a `RefObjectMap`/template object still declines
+    /// downstream in `build_filter_plan` (`object_map_for_var`).
+    fn route_filter_source(chain: &[&R2rmlPattern], filter_vars: &[VarId]) -> Option<usize> {
+        let mut owner: Option<usize> = None;
+        for v in filter_vars {
+            let mut src: Option<usize> = None;
+            for (i, p) in chain.iter().enumerate() {
+                if Self::predicate_for_var(p, *v).is_some() {
+                    if src.is_some() {
+                        return None; // var bound as an object on ≥2 patterns
+                    }
+                    src = Some(i);
+                }
+            }
+            let src = src?; // var bound nowhere on the chain
+            match owner {
+                None => owner = Some(src),
+                Some(o) if o == src => {}
+                Some(_) => return None, // filter spans ≥2 patterns
+            }
+        }
+        owner
+    }
+
+    /// FAMILY-C: evaluate a resolved [`FilterPlan`] against one row of a scanned
+    /// batch, exactly as `next_batch` evaluates `Resolved.filter` over the fact
+    /// batch — so a DIM-side filter (applied during the FK→GKey map build) is
+    /// byte-parity with the fact-side filter, the single-table filter, and the
+    /// materialized `FilterOperator`.
+    ///
+    /// A referenced column that is NULL/absent materializes no term: the R2RML
+    /// star emits no triple for it, so the BGP member is unbound and the row
+    /// DROPS (`Ok(false)`) — the same row-drop the single-table path enforces via
+    /// `validity_cols` before its filter runs, applied here inline BECAUSE the dim
+    /// scan does not otherwise null-check a non-group-key filter column. This
+    /// preserves error semantics for `!BOUND`/`COALESCE`-style filters (a naive
+    /// "null → Unbound → let the boolean demote" would wrongly KEEP a
+    /// `FILTER(!BOUND(?x))` row the materialized BGP drops). Non-null rows evaluate
+    /// the prepared expression non-strict: a demotable error ⇒ `false` ⇒ excluded,
+    /// identical to the materialized operator and `passes_filters`.
+    fn row_passes_filter_plan(
+        fp: &FilterPlan,
+        batch: &ColumnBatch,
+        row: usize,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<bool> {
+        let mut binds: Vec<Binding> = Vec::with_capacity(fp.eval_objmaps.len());
+        for om in &fp.eval_objmaps {
+            match materialize_object_from_batch(om, batch, row)? {
+                Some(term) => binds.push(fp.encoder.encode(&term)),
+                None => return Ok(false), // null filter-member column ⇒ BGP row-drop
+            }
+        }
+        let rv = BindingRow::new(&fp.eval_vars, &binds);
+        fp.prepared.eval_to_bool_non_strict(&rv, Some(ctx))
+    }
+
     async fn resolve_join_at_open(
         &self,
         ctx: &ExecutionContext<'_>,
         pats: &[&R2rmlPattern],
         mapping: &CompiledR2rmlMapping,
     ) -> Result<Option<Resolved>> {
-        // A FILTER over the join is out of scope (none of the target rollups carry
-        // one; HAVING is applied by a wrapping operator, not here).
-        if self.filter.is_some() {
-            return Ok(None);
-        }
+        // FAMILY-C: a row-level FILTER over the join is NO LONGER a blanket decline.
+        // It is routed (below, once the chain + TriplesMaps are known) to the single
+        // pattern that owns every filter var and applied in that pattern's scan
+        // phase — a FACT-side filter in the fact fold (`next_batch`, via
+        // `Resolved.filter`), a TERMINAL-dim filter during the FK→GKey map build.
+        // Anything the port cannot resolve soundly still declines (`Ok(None)` →
+        // materialize); see `route_filter_source` + `build_filter_plan` and the
+        // decline enumeration at the routing site. (HAVING is still applied by a
+        // wrapping operator, not here.) This widening rides
+        // `FLUREE_FUSED_R2RML_AGG_JOIN` — with the join sub-switch off, this method
+        // is never reached and a filtered join reverts to materialize.
+        //
         // E2 (slice-1.5): a folded constant-object constraint (star_constraints,
         // e.g. a dim `?prod ex:isCurrent true` or a fact-side flag) is no longer a
         // blanket decline — the fold APPLIES it (dim-side while building the FK→GKey
@@ -2105,12 +2538,79 @@ impl FusedR2rmlAggregateOperator {
             return Ok(None);
         }
 
+        // FAMILY-C: route the row-level FILTER (if any) to the single participating
+        // pattern that owns EVERY referenced variable, and build its FilterPlan
+        // there. Two sound placements, one owner:
+        //   - the FACT (chain index 0) → applied per fact row in `next_batch` via
+        //     the returned `Resolved.filter` (the exact machinery the single-table
+        //     path uses; the fact row-validity already null-drops the filter's
+        //     member columns before the filter, BGP parity), OR
+        //   - the TERMINAL dim (last index) → applied per dim row during the
+        //     FK→GKey map build below (`row_passes_filter_plan`), so a fact row
+        //     probing a filtered-out dim key drops.
+        // DECLINES (Ok(None) → materialize) — each a soundness line, enumerated:
+        //   (a) a var-free/constant filter (no per-row residual we model);
+        //   (b) a filter var bound as an object on ≥2 chain patterns, or spanning
+        //       ≥2 patterns (fact AND dim, or two dims) — `route_filter_source`;
+        //   (c) an INTERIOR-dim owner (v1, symmetric with the interior-dim
+        //       group-key decline);
+        //   (d) a filter var that is a `RefObjectMap` FK / template / constant /
+        //       multi-valued object — `build_filter_plan` → `object_map_for_var`;
+        //   (e) EXISTS/NOT-EXISTS/subquery filters and any expression the
+        //       single-table `PreparedBoolExpression` cannot evaluate never reach
+        //       here soundly: `detect_fused_r2rml_aggregate` only captures a single
+        //       `Pattern::Filter(expr)` (a bare FILTER expression; a
+        //       FILTER EXISTS lowers to a sub-pattern, not a `Pattern::Filter`, so
+        //       the GRAPH body carries a non-Triple/Filter pattern and detection
+        //       returns None), and language-/IRI-typed comparisons demote exactly
+        //       as they do on the single-table path (same evaluator, same encoder).
+        let mut fact_filter: Option<FilterPlan> = None;
+        let mut fact_filter_cols: Vec<String> = Vec::new();
+        let mut terminal_dim_filter: Option<FilterPlan> = None;
+        let mut terminal_filter_cols: Vec<String> = Vec::new();
+        if let Some(expr) = &self.filter {
+            let fvars = expr.referenced_vars();
+            if fvars.is_empty() {
+                return Ok(None); // (a)
+            }
+            let Some(src) = Self::route_filter_source(&chain, &fvars) else {
+                return Ok(None); // (b)
+            };
+            if src == 0 {
+                let Some(fp) =
+                    Self::build_filter_plan(fact_p, fact_tm, expr, ctx, &mut fact_filter_cols)
+                else {
+                    return Ok(None); // (d) on the fact
+                };
+                fact_filter = Some(fp);
+            } else if src == last_idx {
+                let Some(fp) = Self::build_filter_plan(
+                    terminal_p,
+                    terminal_tm,
+                    expr,
+                    ctx,
+                    &mut terminal_filter_cols,
+                ) else {
+                    return Ok(None); // (d) on the terminal dim
+                };
+                terminal_dim_filter = Some(fp);
+            } else {
+                return Ok(None); // (c) interior-dim filter
+            }
+        }
+
         // Aggregates fold from the FACT scan.
         let mut projection: Vec<String> = Vec::new();
-        let Some((folds, expr_folds)) = self.resolve_agg_folds(fact_p, fact_tm, &mut projection)
+        let mut minmax_folds: Vec<MinMaxFold> = Vec::new();
+        let Some((folds, expr_folds)) =
+            self.resolve_agg_folds(fact_p, fact_tm, &mut projection, &mut minmax_folds)
         else {
             return Ok(None);
         };
+        // MIN/MAX candidate terms materialize from the FACT scan, so the encoder is
+        // built from the fact TriplesMap (same datatype Sids the generic path uses).
+        let minmax_encoder =
+            (!minmax_folds.is_empty()).then(|| LiteralEncoder::build(fact_tm, ctx.active_snapshot));
 
         // Fact-side row-validity: the subject template columns, the first hop's FK
         // child columns (a null FK ⇒ no ref triple ⇒ row drops), and every scalar
@@ -2148,6 +2648,14 @@ impl FusedR2rmlAggregateOperator {
         // projection above; pushed explicitly so the fold's key read never relies on
         // that coincidence, and a null fact key still drops via validity_cols.)
         for c in &fact_key_cols {
+            projection.push(c.clone());
+        }
+        // FAMILY-C: scan the fact-side FILTER columns so `next_batch` can evaluate
+        // the residual per fact row. (A fact filter var is a fact object var, hence
+        // already in validity_cols + projection; pushed explicitly for the same
+        // reason as the group-key columns above. Empty unless the filter is
+        // fact-owned.)
+        for c in &fact_filter_cols {
             projection.push(c.clone());
         }
         projection.sort();
@@ -2202,6 +2710,12 @@ impl FusedR2rmlAggregateOperator {
         for c in dim_checks.last().expect("≥1 hop") {
             terminal_proj.push(c.column().to_string());
         }
+        // FAMILY-C: scan the terminal dim's FILTER columns so `row_passes_filter_plan`
+        // can evaluate the residual per dim row below. Empty unless the filter is
+        // terminal-dim-owned.
+        for c in &terminal_filter_cols {
+            terminal_proj.push(c.clone());
+        }
         terminal_proj.sort();
         terminal_proj.dedup();
         let mut map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
@@ -2240,6 +2754,17 @@ impl FusedR2rmlAggregateOperator {
                         row,
                     )? {
                         continue;
+                    }
+                    // FAMILY-C: skip a terminal dim row that fails the routed
+                    // dim-side FILTER (its attributes are functionally determined by
+                    // the dim PK, so applying the residual here — before the join key
+                    // enters the map — equals applying it post-join; a null filter
+                    // member drops the row, BGP parity). No-op unless the filter is
+                    // terminal-dim-owned.
+                    if let Some(fp) = &terminal_dim_filter {
+                        if !Self::row_passes_filter_plan(fp, &batch, row, ctx)? {
+                            continue;
+                        }
                     }
                     let mut gkeys = Vec::with_capacity(dim_group_cols.len());
                     let mut any_null = false;
@@ -2324,7 +2849,10 @@ impl FusedR2rmlAggregateOperator {
             projection,
             group_cols,
             folds,
-            filter: None,
+            // FAMILY-C: a FACT-side filter is applied per fact row in `next_batch`;
+            // `None` when the filter was terminal-dim-owned (already applied during
+            // the map build) or absent.
+            filter: fact_filter,
             expr_folds,
             validity_cols,
             // The COUNT(*) manifest shortcut is single-table only.
@@ -2332,6 +2860,8 @@ impl FusedR2rmlAggregateOperator {
             group_resolver: Some(GroupKeyResolver { fact_fk_cols, map }),
             group_key_plan,
             fact_constraints: fact_checks,
+            minmax_folds,
+            minmax_encoder,
         }))
     }
 }
@@ -2341,35 +2871,51 @@ mod tests {
     use super::*;
     use crate::ir::grouping::AggregateSpec;
 
-    /// C5 slice-1 over-count TRIPWIRE: a participating R2RML pattern carrying a
+    /// C5 slice-1.5 (item 9b, the q038 class): a single-table COUNT carrying a
     /// folded constant-object constraint (`star_constraints`, e.g.
-    /// `?c ex:isCurrent true`) must DECLINE the fuse — the fused fold has no
-    /// star_constraints handling and would over-count. Red under a hypothetical
-    /// unguarded fuse, green with `fold_over_star_constraints`; also the guard
-    /// against slice 1.5 silently lifting it.
+    /// `?s edw:isCurrent true`) is NO LONGER a blanket decline — the fold resolves
+    /// the constraint to a scalar-column check and APPLIES it per row (the same
+    /// `resolve_star_constraint_checks` / `row_satisfies_constraints` machinery the
+    /// join path uses), so the constrained count excludes the non-matching rows
+    /// exactly as the materialized answer does. The over-count hazard the slice-1
+    /// decline guarded is now closed by APPLICATION (this test) + the fused-vs-native
+    /// corpus parity (q022/q038/q061 + a multi-constraint member) rather than by
+    /// declining. A constraint the fold cannot enforce (a RefObjectMap object) still
+    /// declines — see `e2_resolve_star_constraint_checks_scalar_vs_ref`.
     #[test]
-    fn fold_over_star_constraints_declines_a_constrained_pattern() {
+    fn slice_1_5_admits_and_applies_a_single_table_flag_constraint() {
         use crate::r2rml::{ObjectConstant, ScanValue};
-        let plain = R2rmlPattern::new("gs:main", VarId(1), Some(VarId(2)))
-            .with_predicate("http://ex/gender");
-        assert!(
-            !fold_over_star_constraints(&[&plain]),
-            "no constraint → foldable"
-        );
-
-        let mut constrained = plain.clone();
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        let flag = "http://ex/isCurrent";
+        let tm =
+            TriplesMap::new("#Cust", "DIM_CUSTOMER").with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(flag),
+                object_map: ObjectMap::column("IS_CURRENT"),
+            });
+        // The q038 shape: a scalar-column `isCurrent true` flag folded onto the star.
+        let mut constrained = R2rmlPattern::new("gs:main", VarId(1), None);
         constrained.star_constraints = vec![(
-            "IS_CURRENT".to_string(),
+            flag.to_string(),
             ObjectConstant::Scalar(ScanValue::Bool(true)),
         )];
-        assert!(
-            fold_over_star_constraints(&[&constrained]),
-            "a folded `isCurrent true` constraint must decline the fuse (else over-count)"
+        // Slice-1.5: it now RESOLVES (admits) with exactly one per-row check applied
+        // in the fold — no longer a decline, no longer a silent over-count.
+        let checks = FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&constrained, &tm);
+        assert_eq!(
+            checks.map(|v| v.len()),
+            Some(1),
+            "the q038 `isCurrent true` flag resolves to one applied scalar check"
         );
-        // Fires if ANY participating map is constrained (the aggregated fact OR a
-        // joined dim) — the broadened guard.
-        assert!(fold_over_star_constraints(&[&plain, &constrained]));
-        assert!(!fold_over_star_constraints(&[&plain, &plain]));
+        // A non-empty `fact_constraints` set keeps the COUNT(*) manifest shortcut
+        // declined in `next_batch` (it requires `fact_constraints.is_empty()`), so a
+        // constrained count is never answered from the delete-blind `record_count`.
+        let plain = R2rmlPattern::new("gs:main", VarId(1), None);
+        assert_eq!(
+            FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&plain, &tm)
+                .map(|v| v.len()),
+            Some(0),
+            "an unconstrained star resolves to zero checks (shortcut stays eligible)"
+        );
     }
 
     /// C5 O2 mixed-dataset guard (the `dataset_is_single_source` core): the fused
@@ -2549,6 +3095,857 @@ mod tests {
         assert!(!ok(2), "isCurrent=null row is dropped (existence filter)");
         // No constraints → every row satisfied (a no-op).
         assert!(FusedR2rmlAggregateOperator::row_satisfies_constraints(&[], &batch, 1).unwrap());
+    }
+
+    /// Item 9b MULTI-constraint boundary (the D-c5 lesson): with TWO folded
+    /// constant-object constraints a row is kept iff it satisfies BOTH (AND
+    /// semantics), so a constrained COUNT excludes any row failing EITHER — no
+    /// over-count. This is the shape of corpus member q077 (isCurrent true AND
+    /// segment=Enterprise); the fused single-table path routes through this same
+    /// `row_satisfies_constraints`, so the member's native oracle and this test pin
+    /// the same guarantee at two levels.
+    #[test]
+    fn multi_constraint_requires_all_to_match() {
+        use crate::r2rml::ScanValue;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        let flag = ObjectConstant::Scalar(ScanValue::Bool(true));
+        let seg = ObjectConstant::Scalar(ScanValue::Str("Enterprise".to_string()));
+        let checks = [
+            ResolvedConstraint {
+                canon: decimal_canonical_of(&flag),
+                pom: PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/isCurrent"),
+                    object_map: ObjectMap::column("IS_CURRENT"),
+                },
+                constant: flag,
+            },
+            ResolvedConstraint {
+                canon: decimal_canonical_of(&seg),
+                pom: PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/segment"),
+                    object_map: ObjectMap::column("SEGMENT"),
+                },
+                constant: seg,
+            },
+        ];
+        let schema = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "IS_CURRENT".to_string(),
+                field_type: FieldType::Boolean,
+                nullable: true,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "SEGMENT".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+        ]));
+        // rows: (both match), (flag matches, segment wrong), (flag wrong, segment
+        // matches), (segment null).
+        let batch = ColumnBatch::new(
+            schema,
+            vec![
+                Column::Boolean(vec![Some(true), Some(true), Some(false), Some(true)]),
+                Column::String(vec![
+                    Some("Enterprise".to_string()),
+                    Some("Consumer".to_string()),
+                    Some("Enterprise".to_string()),
+                    None,
+                ]),
+            ],
+        )
+        .unwrap();
+        let ok = |row| {
+            FusedR2rmlAggregateOperator::row_satisfies_constraints(&checks, &batch, row).unwrap()
+        };
+        assert!(ok(0), "both constraints satisfied → kept");
+        assert!(!ok(1), "segment mismatch → dropped (no over-count)");
+        assert!(!ok(2), "flag mismatch → dropped (no over-count)");
+        assert!(!ok(3), "null segment → dropped (existence filter)");
+    }
+
+    /// FAMILY-C admission matrix: `route_filter_source` routes a FILTER to the
+    /// single chain pattern that owns EVERY referenced variable, and declines
+    /// (`None`) the shapes the port cannot resolve in one scan phase. Both P4
+    /// production shapes route to the FACT (Q1 `?status`; Q2 `?onHand`/`?reorder`);
+    /// a dim-attribute filter routes to the dim; a filter spanning fact AND dim,
+    /// a variable bound as an object on two patterns, and an unbound variable all
+    /// decline. (The FACT/TERMINAL-vs-interior restriction and the
+    /// RefObjectMap/non-scalar decline are asserted separately, below.)
+    #[test]
+    fn family_c_route_filter_source_admits_and_declines() {
+        let status = VarId(1);
+        let cust = VarId(2);
+        let segment = VarId(3);
+        let onhand = VarId(4);
+        let reorder = VarId(5);
+        // fact(SupportTicket/InventorySnapshot merged for the fixture): fact-side
+        // scalar members + the FK object var `?cust`.
+        let mut fact = R2rmlPattern::new("gs", VarId(0), None);
+        fact.star_bindings = vec![
+            ("http://ex/status".to_string(), status),
+            ("http://ex/onHandQty".to_string(), onhand),
+            ("http://ex/reorderPoint".to_string(), reorder),
+            ("http://ex/customer".to_string(), cust), // the RefObjectMap FK object
+        ];
+        // dim(Customer): `?cust` is its SUBJECT (not an object → not routed here);
+        // `?segment` is its attribute.
+        let mut dim = R2rmlPattern::new("gs", cust, None);
+        dim.star_bindings = vec![("http://ex/segment".to_string(), segment)];
+        let chain = vec![&fact, &dim];
+
+        // Q1: a fact-side inequality var → the fact (index 0).
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_filter_source(&chain, &[status]),
+            Some(0)
+        );
+        // Q2: a fact-side var-to-var pair → the fact (both owned there).
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_filter_source(&chain, &[onhand, reorder]),
+            Some(0)
+        );
+        // A dim-attribute filter → the terminal dim (index 1).
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_filter_source(&chain, &[segment]),
+            Some(1)
+        );
+        // Spans fact AND dim → declines (two scan phases, cannot apply in one pass).
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_filter_source(&chain, &[status, segment]),
+            None
+        );
+        // An unbound variable → declines.
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_filter_source(&chain, &[VarId(99)]),
+            None
+        );
+
+        // A variable bound as an OBJECT on two patterns (cross-source equality) →
+        // declines (fresh fixture so the shared member is on both).
+        let shared = VarId(7);
+        let mut fact2 = R2rmlPattern::new("gs", VarId(0), None);
+        fact2.star_bindings = vec![("http://ex/shared".to_string(), shared)];
+        let mut dim2 = R2rmlPattern::new("gs", VarId(0), None);
+        dim2.star_bindings = vec![("http://ex/shared".to_string(), shared)];
+        let chain2 = vec![&fact2, &dim2];
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_filter_source(&chain2, &[shared]),
+            None
+        );
+    }
+
+    /// FAMILY-C: `build_filter_plan` (the shared single-table/join construction)
+    /// ADMITS a filter over a scalar column — resolving its object map and
+    /// projecting the column — and DECLINES (`None`) a filter over a `RefObjectMap`
+    /// FK object var (the fold materializes no parent join), exactly as the
+    /// single-table path did inline. The decline is the D-c5 line: an un-resolvable
+    /// filter var must fall back to materialize, never be silently ignored.
+    #[test]
+    fn family_c_build_filter_plan_projects_scalar_declines_ref() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let tm = TriplesMap::new("#Ticket", "FACT_SUPPORT_TICKET")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/status"),
+                object_map: ObjectMap::column("STATUS"),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/customer"),
+                object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                    "#Cust", "CUST_KEY", "CUST_KEY",
+                )),
+            });
+        let status = VarId(1);
+        let cust = VarId(2);
+        let mut pat = R2rmlPattern::new("gs", VarId(0), None);
+        pat.star_bindings = vec![
+            ("http://ex/status".to_string(), status),
+            ("http://ex/customer".to_string(), cust),
+        ];
+
+        // Scalar-column filter var → admits, and its column is projected.
+        let mut proj = Vec::new();
+        let scalar_filter = Expression::ne(
+            Expression::Var(status),
+            Expression::Const(FlakeValue::String("Closed".to_string())),
+        );
+        let fp = FusedR2rmlAggregateOperator::build_filter_plan(
+            &pat,
+            &tm,
+            &scalar_filter,
+            &ctx,
+            &mut proj,
+        );
+        assert!(fp.is_some(), "a scalar-column filter var admits");
+        assert!(
+            proj.contains(&"STATUS".to_string()),
+            "the filter's column is projected into the scan"
+        );
+
+        // A filter over the RefObjectMap FK object var → declines.
+        let mut proj_ref = Vec::new();
+        let ref_filter = Expression::ne(
+            Expression::Var(cust),
+            Expression::Const(FlakeValue::String("x".to_string())),
+        );
+        assert!(
+            FusedR2rmlAggregateOperator::build_filter_plan(
+                &pat,
+                &tm,
+                &ref_filter,
+                &ctx,
+                &mut proj_ref
+            )
+            .is_none(),
+            "a filter over a RefObjectMap FK object var declines (fold has no parent join)"
+        );
+    }
+
+    /// FAMILY-C fact-side NULL defense (R-1528 hardening item 1): the FACT filter in
+    /// `next_batch` routes through the SAME `row_passes_filter_plan` as the dim side,
+    /// so a NULL fact filter-member column EXCLUDES the row (Q1's `?status != "Closed"`
+    /// with a NULL status is NOT counted as "not Closed"). In production `validity_cols`
+    /// already null-drops the member before the filter runs, making this unreachable —
+    /// this test bypasses that path (calls the helper directly) to prove the defense is
+    /// fail-safe should a future refactor ever erode the validity coverage. Exercises the
+    /// exact fact filter arm with Q1's production STATUS shape.
+    #[test]
+    fn family_c_fact_filter_null_member_excludes_failsafe() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let status = VarId(1);
+        let tm = TriplesMap::new("#Ticket", "FACT_SUPPORT_TICKET").with_predicate_object(
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/status"),
+                object_map: ObjectMap::column("STATUS"),
+            },
+        );
+        let mut pat = R2rmlPattern::new("gs", VarId(0), None);
+        pat.star_bindings = vec![("http://ex/status".to_string(), status)];
+        let mut proj = Vec::new();
+        let ne_filter = Expression::ne(
+            Expression::Var(status),
+            Expression::Const(FlakeValue::String("Closed".to_string())),
+        );
+        let fp =
+            FusedR2rmlAggregateOperator::build_filter_plan(&pat, &tm, &ne_filter, &ctx, &mut proj)
+                .expect("scalar filter admits");
+        let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "STATUS".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 1,
+        }]));
+        // rows: Open (!= Closed → kept), Closed (== Closed → dropped), NULL (excluded).
+        let batch = ColumnBatch::new(
+            schema,
+            vec![Column::String(vec![
+                Some("Open".to_string()),
+                Some("Closed".to_string()),
+                None,
+            ])],
+        )
+        .unwrap();
+        let pass = |row| {
+            FusedR2rmlAggregateOperator::row_passes_filter_plan(&fp, &batch, row, &ctx).unwrap()
+        };
+        assert!(pass(0), "status=Open → `!=` true → kept");
+        assert!(!pass(1), "status=Closed → `!=` false → dropped");
+        assert!(
+            !pass(2),
+            "status=NULL → unbound BGP member → EXCLUDED fail-safe (NOT counted as 'not Closed')"
+        );
+    }
+
+    /// FAMILY-C null/comparison semantics — THE D-c5 correctness crux. Evaluated
+    /// through `row_passes_filter_plan`, the exact per-row eval the fused fold
+    /// runs (dim-side directly; fact-side via the same `FilterPlan` in
+    /// `next_batch`). Covers all three required shapes with NULL-bearing rows:
+    ///
+    /// - Q1 `?status != "Closed"` (a dim-side variant here, `?category`): a NULL
+    ///   value is an unbound BGP member ⇒ the row is EXCLUDED — it does NOT count
+    ///   as "not Closed"/"not Electronics". This is the one wrong-count outcome the
+    ///   task calls unacceptable.
+    /// - Q2 `?onHand < ?reorder`: var-to-var with a NULL on EACH side excludes the
+    ///   row (either operand unbound ⇒ excluded); a genuine `<` decides the rest.
+    ///
+    /// The exclusion matches the materialized `FilterOperator` two ways at once:
+    /// the null-member row-drop (BGP `validity` parity — here the `None`
+    /// short-circuit) AND `eval_to_bool_non_strict` demoting a comparison error to
+    /// `false`. Both agree; the row is excluded either way.
+    #[test]
+    fn family_c_row_passes_filter_plan_null_excludes_and_compares() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // Q1 shape (dim-side variant): `?category != "Electronics"` over DIM_PRODUCT.
+        let category = VarId(1);
+        let tm_cat =
+            TriplesMap::new("#Prod", "DIM_PRODUCT").with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/category"),
+                object_map: ObjectMap::column("CATEGORY"),
+            });
+        let mut pat_cat = R2rmlPattern::new("gs", VarId(0), None);
+        pat_cat.star_bindings = vec![("http://ex/category".to_string(), category)];
+        let mut proj = Vec::new();
+        let ne_filter = Expression::ne(
+            Expression::Var(category),
+            Expression::Const(FlakeValue::String("Electronics".to_string())),
+        );
+        let fp_cat = FusedR2rmlAggregateOperator::build_filter_plan(
+            &pat_cat, &tm_cat, &ne_filter, &ctx, &mut proj,
+        )
+        .expect("scalar filter admits");
+        let schema_cat = Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "CATEGORY".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 1,
+        }]));
+        let batch_cat = ColumnBatch::new(
+            schema_cat,
+            vec![Column::String(vec![
+                Some("Electronics".to_string()),
+                Some("Toys".to_string()),
+                None,
+            ])],
+        )
+        .unwrap();
+        let pass_cat = |row| {
+            FusedR2rmlAggregateOperator::row_passes_filter_plan(&fp_cat, &batch_cat, row, &ctx)
+                .unwrap()
+        };
+        assert!(!pass_cat(0), "category=Electronics → `!=` false → excluded");
+        assert!(pass_cat(1), "category=Toys → `!=` true → kept");
+        assert!(
+            !pass_cat(2),
+            "category=NULL → unbound BGP member → EXCLUDED (must NOT count as 'not Electronics')"
+        );
+
+        // Q2 shape: `?onHand < ?reorder`, both fact-side xsd:integer columns.
+        let onhand = VarId(1);
+        let reorder = VarId(2);
+        let tm_inv = TriplesMap::new("#Snap", "FACT_INVENTORY_SNAPSHOT")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/onHandQty"),
+                object_map: ObjectMap::column_typed("ON_HAND", fluree_vocab::xsd::INTEGER),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/reorderPoint"),
+                object_map: ObjectMap::column_typed("REORDER", fluree_vocab::xsd::INTEGER),
+            });
+        let mut pat_inv = R2rmlPattern::new("gs", VarId(0), None);
+        pat_inv.star_bindings = vec![
+            ("http://ex/onHandQty".to_string(), onhand),
+            ("http://ex/reorderPoint".to_string(), reorder),
+        ];
+        let mut proj_inv = Vec::new();
+        let lt_filter = Expression::lt(Expression::Var(onhand), Expression::Var(reorder));
+        let fp_inv = FusedR2rmlAggregateOperator::build_filter_plan(
+            &pat_inv,
+            &tm_inv,
+            &lt_filter,
+            &ctx,
+            &mut proj_inv,
+        )
+        .expect("var-to-var filter admits");
+        let schema_inv = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "ON_HAND".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "REORDER".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 2,
+            },
+        ]));
+        // rows: (5<10 keep), (10<5 drop), (NULL on-hand → drop), (NULL reorder → drop).
+        let batch_inv = ColumnBatch::new(
+            schema_inv,
+            vec![
+                Column::Int64(vec![Some(5), Some(10), None, Some(10)]),
+                Column::Int64(vec![Some(10), Some(5), Some(10), None]),
+            ],
+        )
+        .unwrap();
+        let pass_inv = |row| {
+            FusedR2rmlAggregateOperator::row_passes_filter_plan(&fp_inv, &batch_inv, row, &ctx)
+                .unwrap()
+        };
+        assert!(pass_inv(0), "5 < 10 → kept");
+        assert!(!pass_inv(1), "10 < 5 → excluded");
+        assert!(
+            !pass_inv(2),
+            "NULL onHand → unbound operand → EXCLUDED (not 'less than')"
+        );
+        assert!(
+            !pass_inv(3),
+            "NULL reorder → unbound operand → EXCLUDED (not 'less than')"
+        );
+    }
+
+    /// FAMILY-C multi-constraint + filter combined (the p3+filter shape): a
+    /// terminal dim row must pass BOTH its folded constant-object constraint (a
+    /// flag, `row_satisfies_constraints`) AND the routed dim-side FILTER
+    /// (`row_passes_filter_plan`) to enter the FK→GKey map — the conjunction the
+    /// terminal-dim scan loop applies. A row failing EITHER is dropped (no
+    /// over-count); this pins the combined gate the loop enforces in sequence.
+    #[test]
+    fn family_c_constraint_and_filter_are_conjunctive() {
+        use crate::context::ExecutionContext;
+        use crate::r2rml::ScanValue;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // Dim carrying BOTH an `isCurrent true` flag (constraint) and a `?segment`
+        // attribute the filter constrains.
+        let flag = "http://ex/isCurrent";
+        let seg_pred = "http://ex/segment";
+        let tm = TriplesMap::new("#Cust", "DIM_CUSTOMER")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(flag),
+                object_map: ObjectMap::column("IS_CURRENT"),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(seg_pred),
+                object_map: ObjectMap::column("SEGMENT"),
+            });
+        let segment = VarId(1);
+        let mut pat = R2rmlPattern::new("gs", VarId(0), None);
+        pat.star_bindings = vec![(seg_pred.to_string(), segment)];
+
+        let flag_const = ObjectConstant::Scalar(ScanValue::Bool(true));
+        let checks = [ResolvedConstraint {
+            canon: decimal_canonical_of(&flag_const),
+            pom: PredicateObjectMap {
+                predicate_map: PredicateMap::constant(flag),
+                object_map: ObjectMap::column("IS_CURRENT"),
+            },
+            constant: flag_const,
+        }];
+        let mut proj = Vec::new();
+        let seg_filter = Expression::ne(
+            Expression::Var(segment),
+            Expression::Const(FlakeValue::String("SMB".to_string())),
+        );
+        let fp =
+            FusedR2rmlAggregateOperator::build_filter_plan(&pat, &tm, &seg_filter, &ctx, &mut proj)
+                .expect("scalar filter admits");
+
+        let schema = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "IS_CURRENT".to_string(),
+                field_type: FieldType::Boolean,
+                nullable: true,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "SEGMENT".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+        ]));
+        // rows: (current + Enterprise → keep), (current + SMB → filter drops),
+        // (not current + Enterprise → constraint drops).
+        let batch = ColumnBatch::new(
+            schema,
+            vec![
+                Column::Boolean(vec![Some(true), Some(true), Some(false)]),
+                Column::String(vec![
+                    Some("Enterprise".to_string()),
+                    Some("SMB".to_string()),
+                    Some("Enterprise".to_string()),
+                ]),
+            ],
+        )
+        .unwrap();
+        // The loop keeps a row iff it satisfies the constraint AND the filter.
+        let kept = |row| {
+            FusedR2rmlAggregateOperator::row_satisfies_constraints(&checks, &batch, row).unwrap()
+                && FusedR2rmlAggregateOperator::row_passes_filter_plan(&fp, &batch, row, &ctx)
+                    .unwrap()
+        };
+        assert!(kept(0), "current AND segment≠SMB → kept");
+        assert!(!kept(1), "current but segment=SMB → filter drops");
+        assert!(!kept(2), "segment≠SMB but not current → constraint drops");
+    }
+
+    /// Item 9b decline invariant (D-c5): the bare-COUNT manifest shortcut fires ONLY
+    /// for a plain COUNT — it DECLINES for a filtered, grouped, constant-object-
+    /// constrained, or non-`CountRows` plan, because the manifest `record_count` sum
+    /// cannot see per-row matches or per-group partitions. A false positive here is
+    /// exactly the over-count R-1522 named as the unacceptable outcome; this pins the
+    /// predicate directly (it was previously only inspection-verified).
+    #[test]
+    fn count_shortcut_declines_constraints_filter_group_and_non_count() {
+        use crate::r2rml::ScanValue;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        // Eligible: a single CountRows fold, no filter / group / constraints.
+        assert!(count_shortcut_eligible(false, &[], &[], &[Fold::CountRows]));
+        // Declines: a FILTER is present.
+        assert!(!count_shortcut_eligible(true, &[], &[], &[Fold::CountRows]));
+        // Declines: a GROUP BY key is present.
+        let gcol = GroupCol {
+            column: "SEG".into(),
+            kind: GKind::String,
+            dt_sid: Sid::new(2, "string"),
+        };
+        assert!(!count_shortcut_eligible(
+            false,
+            &[gcol],
+            &[],
+            &[Fold::CountRows]
+        ));
+        // Declines: a folded constant-object constraint is present (the q038/9b line).
+        let constant = ObjectConstant::Scalar(ScanValue::Bool(true));
+        let constraint = ResolvedConstraint {
+            canon: decimal_canonical_of(&constant),
+            pom: PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/isCurrent"),
+                object_map: ObjectMap::column("IS_CURRENT"),
+            },
+            constant,
+        };
+        assert!(
+            !count_shortcut_eligible(false, &[], &[constraint], &[Fold::CountRows]),
+            "a constraint-bearing COUNT must decline the delete-blind shortcut"
+        );
+        // Declines: not a bare CountRows fold (COUNT(col) / SUM / MIN / two folds / none).
+        assert!(!count_shortcut_eligible(
+            false,
+            &[],
+            &[],
+            &[Fold::CountColumn("C".into())]
+        ));
+        assert!(!count_shortcut_eligible(
+            false,
+            &[],
+            &[],
+            &[Fold::CountRows, Fold::CountRows]
+        ));
+        assert!(!count_shortcut_eligible(false, &[], &[], &[]));
+    }
+
+    /// F1 (F-AUD-8, the q038 ungrouped/direct-path filtered-COUNT class): the
+    /// recombination admits ONLY a same-subject `class scan + scalar const-object
+    /// constraint scans` split (what the rewrite emits for a subject-star with no
+    /// var-object member) and folds the constraints onto the class scan as
+    /// `star_constraints`. Every other multi-pattern shape declines (`None`), so the
+    /// existing join/decline arms still own it and no over-count is possible.
+    #[test]
+    fn f1_combine_constrained_class_scan_admission() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        const CUST: &str = "http://ns.fluree.dev/edw#Customer";
+        const OTHER: &str = "http://ns.fluree.dev/edw#Order";
+        const IS_CURRENT: &str = "http://ns.fluree.dev/edw#isCurrent";
+        const SEGMENT: &str = "http://ns.fluree.dev/edw#segment";
+        let s = VarId(0);
+        let other_s = VarId(9);
+        let bool_true = || ObjectConstant::Scalar(ScanValue::Bool(true));
+        let seg_ent = || ObjectConstant::Scalar(ScanValue::Str("Enterprise".to_string()));
+        let class_scan = |subj: VarId, class: &str| {
+            let mut p = R2rmlPattern::new("gs:main", subj, None);
+            p.class_filter = Some(class.to_string());
+            Pattern::R2rml(p)
+        };
+        let const_scan = |subj: VarId, pred: &str, c: ObjectConstant| {
+            let mut p = R2rmlPattern::new("gs:main", subj, None);
+            p.predicate_filter = Some(pred.to_string());
+            p.object_constant = Some(c);
+            Pattern::R2rml(p)
+        };
+        let var_member = |subj: VarId, pred: &str, obj: VarId| {
+            let mut p = R2rmlPattern::new("gs:main", subj, Some(obj));
+            p.predicate_filter = Some(pred.to_string());
+            Pattern::R2rml(p)
+        };
+        let combine = FusedR2rmlAggregateOperator::combine_constrained_class_scan;
+
+        // q038 shape: class + one const-object constraint → folds (either order).
+        let folded = combine(&[class_scan(s, CUST), const_scan(s, IS_CURRENT, bool_true())])
+            .expect("class + 1 const folds");
+        assert_eq!(folded.class_filter.as_deref(), Some(CUST));
+        assert_eq!(folded.star_constraints.len(), 1);
+        assert_eq!(folded.star_constraints[0].0, IS_CURRENT);
+        assert!(combine(&[const_scan(s, IS_CURRENT, bool_true()), class_scan(s, CUST)]).is_some());
+
+        // q078/q077 shape: class + TWO const-object constraints (multi-constraint AND).
+        let multi = combine(&[
+            class_scan(s, CUST),
+            const_scan(s, IS_CURRENT, bool_true()),
+            const_scan(s, SEGMENT, seg_ent()),
+        ])
+        .expect("class + 2 const folds");
+        assert_eq!(multi.star_constraints.len(), 2);
+
+        // Declines: a lone class (the single-`[R2rml]` arm owns it).
+        assert!(combine(&[class_scan(s, CUST)]).is_none());
+        // Declines: a single const scan (no class to resolve a TriplesMap against).
+        assert!(combine(&[const_scan(s, IS_CURRENT, bool_true())]).is_none());
+        // Declines: two const scans, no class base.
+        assert!(combine(&[
+            const_scan(s, IS_CURRENT, bool_true()),
+            const_scan(s, SEGMENT, seg_ent()),
+        ])
+        .is_none());
+        // Declines: a var-object member present (a real star, not this shape).
+        assert!(combine(&[class_scan(s, CUST), var_member(s, SEGMENT, VarId(2))]).is_none());
+        // Declines: a cross-subject FK-join shape (the join arm owns it).
+        assert!(combine(&[
+            class_scan(s, CUST),
+            const_scan(other_s, IS_CURRENT, bool_true())
+        ])
+        .is_none());
+        // Declines: two class scans → ambiguous base.
+        assert!(combine(&[
+            class_scan(s, CUST),
+            class_scan(s, OTHER),
+            const_scan(s, IS_CURRENT, bool_true()),
+        ])
+        .is_none());
+        // Declines: a bound-subject member (subject_constant set, no subject var).
+        let mut bound_class = R2rmlPattern::new("gs:main", s, None);
+        bound_class.subject_var = None;
+        bound_class.subject_constant = Some("http://ex/cust/1".to_string());
+        bound_class.class_filter = Some(CUST.to_string());
+        assert!(combine(&[
+            Pattern::R2rml(bound_class),
+            const_scan(s, IS_CURRENT, bool_true()),
+        ])
+        .is_none());
+        // Declines: a non-R2RML pattern present.
+        assert!(combine(&[class_scan(s, CUST), Pattern::Filter(Expression::Var(s))]).is_none());
+    }
+
+    /// F1 diagnosis + fix, end to end through the REAL rewrite: the direct-path
+    /// ungrouped constrained COUNT `?s a Customer ; isCurrent true` (q038) rewrites
+    /// to TWO separate R2rml patterns (a class scan + a standalone `isCurrent=true`
+    /// scan) — the split that misses the single-`[R2rml]` fused gate and forces a
+    /// materialize. Its GROUPED sibling q022 (which adds a var-object `?seg`)
+    /// already rewrites to ONE fused pattern. `combine_constrained_class_scan`
+    /// re-folds the q038 split into one class-scan-with-`star_constraints` pattern
+    /// whose constraint the single-table 9b fold resolves — and the resulting
+    /// non-empty `fact_constraints` keeps the delete-blind manifest COUNT shortcut
+    /// declined. The multi-constraint direct-path variant (the new q078 member)
+    /// folds two.
+    #[test]
+    fn f1_rewrite_splits_then_combine_refolds() {
+        use crate::ir::triple::{Ref, Term, TriplePattern};
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{PredicateMap, PredicateObjectMap};
+        const TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        const CUST: &str = "http://ns.fluree.dev/edw#Customer";
+        const IS_CURRENT: &str = "http://ns.fluree.dev/edw#isCurrent";
+        const SEGMENT: &str = "http://ns.fluree.dev/edw#segment";
+
+        let customer = TriplesMap::new("#Customer", "DIM_CUSTOMER")
+            .with_subject_template("http://ns.fluree.dev/edw/customer/{CUSTOMER_KEY}")
+            .with_class(CUST)
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(IS_CURRENT),
+                object_map: ObjectMap::column("IS_CURRENT"),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(SEGMENT),
+                object_map: ObjectMap::column("SEGMENT"),
+            });
+        let mapping = CompiledR2rmlMapping::new(vec![customer]);
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let tm = mapping.triples_maps.values().next().unwrap();
+
+        let s = VarId(0);
+        let seg = VarId(1);
+        let triple = |p: Ref, o: Term| Pattern::Triple(TriplePattern::new(Ref::Var(s), p, o));
+        let type_tp = triple(Ref::Iri(Arc::from(TYPE)), Term::Iri(Arc::from(CUST)));
+        let flag_tp = triple(
+            Ref::Iri(Arc::from(IS_CURRENT)),
+            Term::Value(FlakeValue::Boolean(true)),
+        );
+        let seg_var_tp = triple(Ref::Iri(Arc::from(SEGMENT)), Term::Var(seg));
+        let seg_const_tp = triple(
+            Ref::Iri(Arc::from(SEGMENT)),
+            Term::Value(FlakeValue::String("Enterprise".to_string())),
+        );
+        let rewrite = |pats: &[Pattern]| {
+            rewrite_patterns_for_r2rml(pats, "gs:main", &snapshot, Some(&mapping), false, false)
+                .patterns
+        };
+
+        // q038: the direct-path ungrouped constrained COUNT splits into 2 patterns.
+        let q038 = rewrite(&[type_tp.clone(), flag_tp.clone()]);
+        assert_eq!(
+            q038.len(),
+            2,
+            "q038 (no var-object member) rewrites to a split class + const scan — the fusion gap"
+        );
+        let folded = FusedR2rmlAggregateOperator::combine_constrained_class_scan(&q038)
+            .expect("F1 recombines the q038 split");
+        assert_eq!(folded.class_filter.as_deref(), Some(CUST));
+        assert_eq!(folded.star_constraints.len(), 1);
+        // The 9b fold resolves the folded constraint to one scalar-column check ...
+        let checks = FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&folded, tm)
+            .expect("scalar column constraint resolves");
+        assert_eq!(checks.len(), 1);
+        // ... and a non-empty constraint set keeps the manifest COUNT shortcut declined.
+        assert!(
+            !count_shortcut_eligible(false, &[], &checks, &[Fold::CountRows]),
+            "the constrained COUNT must not take the delete-blind manifest shortcut"
+        );
+
+        // q022 (grouped, adds var-object ?seg) already fuses in the rewrite: ONE
+        // pattern carrying the class + the isCurrent star_constraint. combine is a
+        // no-op for it (the single-`[R2rml]` arm owns it).
+        let q022 = rewrite(&[type_tp.clone(), flag_tp.clone(), seg_var_tp.clone()]);
+        assert_eq!(q022.len(), 1, "q022 fuses in the rewrite (var-object base)");
+        assert!(FusedR2rmlAggregateOperator::combine_constrained_class_scan(&q022).is_none());
+
+        // Multi-constraint direct path (the new q078 member): class + 2 const → 3
+        // split patterns → combine refolds to one pattern with 2 constraints.
+        let q078 = rewrite(&[type_tp.clone(), flag_tp.clone(), seg_const_tp.clone()]);
+        assert_eq!(q078.len(), 3, "multi-constraint direct path splits into 3");
+        let folded_multi = FusedR2rmlAggregateOperator::combine_constrained_class_scan(&q078)
+            .expect("F1 recombines the multi-constraint split");
+        assert_eq!(folded_multi.star_constraints.len(), 2);
+        let checks_multi =
+            FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&folded_multi, tm)
+                .expect("both scalar constraints resolve");
+        assert_eq!(checks_multi.len(), 2);
+    }
+
+    /// Item 9 MIN/MAX admission scope: only numeric and date/timestamp datatypes
+    /// fold; string (collation), boolean, custom, and un-annotated (→ xsd:string)
+    /// columns decline to the generic pipeline. Parity of the fold itself comes from
+    /// materializing the same term + `compare_bindings`; this gate only scopes the
+    /// mechanism to the audit item's covered types (F-AUD-8).
+    #[test]
+    fn minmax_admissible_datatype_scope() {
+        use fluree_vocab::xsd;
+        for dt in [
+            xsd::INTEGER,
+            xsd::LONG,
+            xsd::INT,
+            xsd::DECIMAL,
+            xsd::DOUBLE,
+            xsd::FLOAT,
+            xsd::DATE,
+            xsd::DATE_TIME,
+        ] {
+            assert!(minmax_admissible_datatype(Some(dt)), "{dt} should fold");
+        }
+        for dt in [xsd::STRING, xsd::BOOLEAN, "http://ex/custom"] {
+            assert!(
+                !minmax_admissible_datatype(Some(dt)),
+                "{dt} should decline (collation / non-orderable / out of scope)"
+            );
+        }
+        assert!(
+            !minmax_admissible_datatype(None),
+            "an un-annotated column (→ xsd:string) declines"
+        );
+    }
+
+    /// Item 9 MIN/MAX tie-break parity (R-1522): the fold must resolve an
+    /// equal-BUT-differently-rendered extreme the SAME way the generic
+    /// `agg_min`/`agg_max` do — MIN keeps the FIRST of the ties, MAX keeps the LAST
+    /// (`min_by`/`max_by` semantics). The reachable concrete case is a double column
+    /// carrying both `+0.0` and `-0.0`: they compare Equal but render "0" vs "-0",
+    /// so picking the wrong one on a tie breaks byte-parity. (A single decimal column
+    /// has a fixed scale, so it can't hold two renderings of one value — but the same
+    /// `Equal`-by-value rule covers `1.50` vs `1.5` if such a pair ever reached the
+    /// fold; the pure-logic assertions below pin that rule directly.)
+    #[test]
+    fn minmax_tie_break_matches_generic_agg() {
+        use crate::sort::compare_bindings;
+        use std::cmp::Ordering;
+        // The replace predicate == min_by (first) / max_by (last) tie-breaking.
+        assert!(
+            !minmax_should_replace(false, Ordering::Equal),
+            "MIN keeps the FIRST on a tie"
+        );
+        assert!(
+            minmax_should_replace(true, Ordering::Equal),
+            "MAX keeps the LAST on a tie"
+        );
+        assert!(minmax_should_replace(false, Ordering::Less));
+        assert!(!minmax_should_replace(false, Ordering::Greater));
+        assert!(minmax_should_replace(true, Ordering::Greater));
+        assert!(!minmax_should_replace(true, Ordering::Less));
+
+        // Concrete reachable case: ±0.0 compare Equal but render differently.
+        let pos = Binding::lit(FlakeValue::Double(0.0), Sid::xsd_double());
+        let neg = Binding::lit(FlakeValue::Double(-0.0), Sid::xsd_double());
+        assert_eq!(
+            compare_bindings(&pos, &neg),
+            Ordering::Equal,
+            "+0.0 and -0.0 compare Equal"
+        );
+        let bits = |b: &Binding| match b {
+            Binding::Lit {
+                val: FlakeValue::Double(d),
+                ..
+            } => d.to_bits(),
+            _ => panic!("expected a double lit"),
+        };
+        // Fold over [+0.0, -0.0] in scan order: MAX must end on -0.0 (the LAST,
+        // matching agg_max); MIN must end on +0.0 (the FIRST, matching agg_min).
+        // Under the old first-on-ties MAX this would keep +0.0 and diverge.
+        for (is_max, generic) in [
+            (
+                true,
+                AggregateFn::Max(VarId(0)).apply(&Binding::Grouped(vec![pos.clone(), neg.clone()])),
+            ),
+            (
+                false,
+                AggregateFn::Min(VarId(0)).apply(&Binding::Grouped(vec![pos.clone(), neg.clone()])),
+            ),
+        ] {
+            let mut best = pos.clone();
+            if minmax_should_replace(is_max, compare_bindings(&neg, &best)) {
+                best = neg.clone();
+            }
+            assert_eq!(
+                bits(&best),
+                bits(&generic),
+                "fused {} tie-break must match the generic aggregate",
+                if is_max { "MAX" } else { "MIN" }
+            );
+        }
     }
 
     /// Q2 lang/IRI admission gate: a fused group key — the single-table key OR the

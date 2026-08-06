@@ -18,7 +18,7 @@ use fluree_db_core::{
 use fluree_db_indexer::{
     clean_garbage, rebuild_index_from_commits_with_tracker, CleanGarbageConfig,
 };
-use fluree_db_nameservice::NsRecord;
+use fluree_db_nameservice::{GraphSourceType, NsRecord};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -280,7 +280,7 @@ fn validate_absolute_iri(value: &str) -> std::result::Result<(), String> {
     }
     // RFC 3987 excludes whitespace, C0 controls (`U+0000..=U+001F`), DEL
     // (`U+007F`), and the bracket/quote characters below. The C0 check is
-    // important because callers can otherwise sneak a ` ` past
+    // important because callers can otherwise sneak a `U+0000` past
     // `is_whitespace` and have it surface as a SPARQL parse 500 instead
     // of the documented 400.
     if value.chars().any(|c| {
@@ -1311,6 +1311,43 @@ impl crate::Fluree {
                                     report.files_deleted += 1;
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2b. Delete BM25 snapshot blobs (Hard mode). Runs before the retract
+        // below so the manifest is still resolvable. Without this a BM25 index
+        // dropped through this path — the `POST /drop` route, and `fluree drop`
+        // — leaves every snapshot behind; `drop_full_text_index` is the only
+        // other entrypoint that sweeps them.
+        if matches!(mode, DropMode::Hard) {
+            if let Some(ref record) = record {
+                if matches!(record.source_type, GraphSourceType::Bm25) {
+                    match self.load_or_create_bm25_manifest(&graph_source_id).await {
+                        Ok(manifest) => {
+                            let (deleted, warnings) = self
+                                .delete_bm25_snapshots(&graph_source_id, &manifest)
+                                .await;
+                            report.files_deleted += deleted;
+                            report.warnings.extend(warnings);
+                        }
+                        // An unreadable manifest costs the sweep, not the drop.
+                        // The snapshots leak, which `delete_bm25_snapshots`
+                        // already treats as no reason to leave the record
+                        // published — and drop is the recovery action for a
+                        // graph source wedged in exactly this way, so failing it
+                        // closed would strand the caller with no way out.
+                        Err(e) => {
+                            warn!(
+                                graph_source = %graph_source_id,
+                                error = %e,
+                                "BM25 snapshot sweep skipped; manifest unreadable"
+                            );
+                            report.warnings.push(format!(
+                                "BM25 snapshot sweep skipped, manifest unreadable: {e}"
+                            ));
                         }
                     }
                 }
