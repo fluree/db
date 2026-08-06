@@ -92,9 +92,25 @@ fn macos_max_files_per_proc() -> u64 {
     }
 }
 
+/// Linux rejects `setrlimit(RLIMIT_NOFILE)` soft values above
+/// `/proc/sys/fs/nr_open` — notably `RLIM_INFINITY` when the hard limit is
+/// unlimited — so the raise target must be clamped to it, symmetrically with
+/// macOS's `kern.maxfilesperproc`. Falls back to the kernel default
+/// (1 048 576) if the file is unreadable.
+#[cfg(target_os = "linux")]
+fn linux_nr_open() -> u64 {
+    const NR_OPEN_DEFAULT: u64 = 1_048_576;
+    std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(NR_OPEN_DEFAULT)
+}
+
 /// Best-effort raise of the `RLIMIT_NOFILE` soft limit to the hard limit
-/// (clamped to `kern.maxfilesperproc` on macOS). Never errors — callers log
-/// the outcome via [`log_raise_outcome`] once tracing is initialized.
+/// (clamped to `kern.maxfilesperproc` on macOS and `/proc/sys/fs/nr_open`
+/// on Linux — both kernels refuse soft values above those ceilings even
+/// when the hard limit is `RLIM_INFINITY`). Never errors — callers log the
+/// outcome via [`log_raise_outcome`] once tracing is initialized.
 #[cfg(unix)]
 pub fn raise_nofile_soft_to_hard() -> RaiseOutcome {
     let Some(NofileLimits { soft, hard }) = nofile_limits() else {
@@ -106,7 +122,9 @@ pub fn raise_nofile_soft_to_hard() -> RaiseOutcome {
 
     #[cfg(target_os = "macos")]
     let target = hard.min(macos_max_files_per_proc());
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    let target = hard.min(linux_nr_open());
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let target = hard;
 
     if soft >= target {
@@ -234,14 +252,19 @@ impl FdBudget {
         }
     }
 
-    /// Descriptors available for planning: `max(soft - reserve, 32)`, so even
-    /// absurdly low limits yield a plan that can make progress (the kernel
-    /// will still enforce the real limit; 32 merely keeps the plan sane).
+    /// Descriptors available for planning: `soft - reserve`, floored at
+    /// `min(32, soft)` so a reserve-dominated budget still yields a plan
+    /// that can make progress — but never a number larger than the stated
+    /// limit itself, which would mislead an operator debugging an EMFILE
+    /// with a deliberately tiny `FLUREE_FD_BUDGET`. (The per-phase plan
+    /// floors in `fd_plan` may still exceed a degenerate budget by design;
+    /// the kernel, not the plan, enforces reality.)
     pub fn available(&self) -> usize {
         if self.soft == u64::MAX {
             return usize::MAX;
         }
-        usize::try_from(self.soft.saturating_sub(self.reserve).max(32)).unwrap_or(usize::MAX)
+        let floor = self.soft.min(32);
+        usize::try_from(self.soft.saturating_sub(self.reserve).max(floor)).unwrap_or(usize::MAX)
     }
 }
 
@@ -264,8 +287,10 @@ mod tests {
         assert_eq!(FdBudget::from_soft(96).available(), 64);
         assert_eq!(FdBudget::from_soft(256).available(), 192);
         assert_eq!(FdBudget::from_soft(1024).available(), 960);
-        // Degenerate limits floor at 32 rather than planning zero fan-in.
-        assert_eq!(FdBudget::from_soft(8).available(), 32);
+        // Reserve-dominated budgets floor at 32 rather than planning zero
+        // fan-in — but never above the stated limit itself.
+        assert_eq!(FdBudget::from_soft(40).available(), 32);
+        assert_eq!(FdBudget::from_soft(8).available(), 8);
         assert_eq!(FdBudget::unlimited().available(), usize::MAX);
     }
 

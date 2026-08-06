@@ -620,9 +620,9 @@ pub enum ImportError {
     /// tokio runtime. Its producer drives an async scan via `Handle::block_on`
     /// off a dedicated thread, which deadlocks on a current-thread runtime.
     UnsupportedRuntime(String),
-    /// The process open-file limit is too low for a bulk import even with
-    /// descriptor-conserving strategies. Raised by preflight so the import
-    /// fails in milliseconds instead of mid-build.
+    /// The process open-file limit was exhausted (or is demonstrably too low)
+    /// during an import phase with a per-chunk descriptor cost, such as the
+    /// dictionary merge. Carries the observed limit and the remedy.
     FdLimit(String),
 }
 
@@ -2957,26 +2957,26 @@ where
     async {
         // ---- FD preflight ----
         // Best-effort raise (idempotent — covers library embedders that never
-        // ran a CLI/server entry point), then fail fast on limits so low that
-        // even the descriptor-conserving build strategies cannot run, instead
-        // of dying twenty minutes into the index build. The gate reads the
-        // OBSERVED kernel limit, deliberately not `effective_fd_budget()`:
-        // the FLUREE_FD_BUDGET override shapes how the build *plans*, but
-        // only the real limit decides whether an import can run at all. The
-        // floor of 96 covers the budgeted build's worst phase plus the
-        // ~20–25 descriptors the rest of the process holds concurrently
-        // (stdio, tokio, the dictionary upload).
+        // ran a CLI/server entry point), then warn early on low limits. The
+        // warnings read the OBSERVED kernel limit, deliberately not
+        // `effective_fd_budget()`: the FLUREE_FD_BUDGET override shapes how
+        // the build *plans*, but only the real limit describes the
+        // environment. No hard refusal here — a small single-chunk import
+        // can succeed at limits the worst multi-chunk phase could not, so
+        // refusing on a fixed floor would regress imports that used to work;
+        // if exhaustion does happen, the EMFILE errors now carry the
+        // observed limit and the remedy.
         let fd_raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
         fluree_db_core::fd_limit::log_raise_outcome(&fd_raise);
         if let Some(limits) = fluree_db_core::fd_limit::nofile_limits() {
             if limits.soft < 96 {
-                return Err(ImportError::FdLimit(format!(
-                    "process open-file limit is {}; bulk import needs at least 96 \
-                     (raise it with `ulimit -n <n>` or launchd/systemd LimitNOFILE)",
-                    limits.soft
-                )));
-            }
-            if limits.soft < 256 {
+                tracing::warn!(
+                    soft = limits.soft,
+                    "open-file limit is very low; small imports may succeed but \
+                     multi-chunk imports are likely to exhaust it — raise it with \
+                     `ulimit -n <n>` or launchd/systemd LimitNOFILE"
+                );
+            } else if limits.soft < 256 {
                 tracing::warn!(
                     soft = limits.soft,
                     "open-file limit is low; import will conserve descriptors \

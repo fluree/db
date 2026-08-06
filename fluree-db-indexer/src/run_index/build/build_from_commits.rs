@@ -1283,11 +1283,13 @@ pub fn build_indexes_from_commits(
         skip_history: true, // Append-only: no time-travel data.
         g_id: config.g_id,
         progress: config.build_progress.clone(),
-        // Build the secondary orders (PSOT/POST/OPST) concurrently, bounded by
-        // the import core budget. SPOT has already completed, so this
-        // concurrency no longer overlaps with the class-membership heap.
-        // build_all_indexes clamps this to the number of buildable orders.
-        max_concurrency: config.worker_count,
+        // Build the secondary orders (PSOT/POST/OPST) concurrently. SPOT has
+        // already completed, so this concurrency no longer overlaps with the
+        // class-membership heap. Taken from the SAME plan field the fan-in
+        // share was divided by — never independently from worker_count — so
+        // the merge budget cannot drift from the actual concurrency.
+        // build_all_indexes still clamps to the number of buildable orders.
+        max_concurrency: fd_plan.order_concurrency,
         fan_in_cap: fd_plan.merge_fan_in_per_order,
     };
 
@@ -1418,11 +1420,16 @@ fn build_spot_index_from_commits(
             let streams = open_spot_commit_readers(group, g_id)?;
             let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
             let out_path = pass_dir.join(format!("merged_{i:06}.frn"));
-            // Spool sources carry no op sideband (`peek_op` is uniformly 1
-            // on the import path), so version-1 intermediates lose nothing.
-            let mut inter = StreamingRunFileWriter::create(&out_path, order, false)?;
-            while let Some((record, _op)) = merge.next_record()? {
-                inter.push(record, 1)?;
+            // Carry op bytes through verbatim (with-op intermediates), so
+            // this arm agrees with the flat arm by construction: the shared
+            // pump's `op == 0` skip sees the same ops either way. Today the
+            // V2 spool reader reports a uniform op = 1 (no `peek_op`
+            // override), but the spool wire format round-trips retractions
+            // and the pump guards for them — preserve, don't assume, exactly
+            // as `cascade_runs_to_fan_in` does.
+            let mut inter = StreamingRunFileWriter::create(&out_path, order, true)?;
+            while let Some((record, op)) = merge.next_record()? {
+                inter.push(record, op)?;
             }
             inter.finish()?;
             intermediates.push(out_path);
@@ -1628,6 +1635,11 @@ pub fn build_indexes_from_remapped_commits(
     }
     let build_start = Instant::now();
 
+    let rebuild_fd_plan = plan_fd_usage(
+        config.fd_budget,
+        config.worker_count,
+        REBUILD_CONCURRENT_ORDERS,
+    );
     let build_config = BuildAllConfig {
         base_run_dir: config.run_dir.clone(),
         index_dir: config.index_dir.clone(),
@@ -1639,15 +1651,11 @@ pub fn build_indexes_from_remapped_commits(
         g_id: config.g_id,
         progress: config.build_progress.clone(),
         // Rebuild path builds all 4 orders here (no separate SPOT thread), so
-        // concurrency can cover all of them, bounded by the core budget —
-        // which is why the fan-in share divides by 4, not the import path's 3.
-        max_concurrency: config.worker_count,
-        fan_in_cap: plan_fd_usage(
-            config.fd_budget,
-            config.worker_count,
-            REBUILD_CONCURRENT_ORDERS,
-        )
-        .merge_fan_in_per_order,
+        // concurrency can cover all of them — which is why the fan-in share
+        // divides by 4, not the import path's 3. Concurrency and share both
+        // come from the same plan so they cannot drift apart.
+        max_concurrency: rebuild_fd_plan.order_concurrency,
+        fan_in_cap: rebuild_fd_plan.merge_fan_in_per_order,
     };
 
     let order_results = build_all_indexes(&build_config).map_err(index_build_err_to_io)?;

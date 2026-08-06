@@ -545,6 +545,9 @@ pub(crate) fn cascade_runs_to_fan_in(
     scratch_dir: &Path,
 ) -> io::Result<Vec<PathBuf>> {
     // fan_in == 1 would make chunks(1) a no-op loop; 2 always terminates.
+    // Defense-in-depth only: `plan_fd_usage` already floors
+    // `merge_fan_in_per_order` at 8, so this can bite only a caller passing
+    // a hand-built cap — the plan's floor is the authoritative one.
     let fan_in = fan_in.max(2);
     if scratch_dir.exists() {
         std::fs::remove_dir_all(scratch_dir)?;

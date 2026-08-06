@@ -44,9 +44,15 @@ pub struct FdPlan {
     pub worker_cap: usize,
     /// Max run files one order's k-way merge may hold open at once; run
     /// counts beyond this trigger the cascaded multi-pass merge. Sized as
-    /// `A / concurrent_orders − 4`, where the −4 covers each in-flight
+    /// `A / order_concurrency − 4`, where the −4 covers each in-flight
     /// cascade pass's single output writer (plus slack).
     pub merge_fan_in_per_order: usize,
+    /// The order-merge concurrency `merge_fan_in_per_order` was divided by.
+    /// Callers MUST size `BuildAllConfig::max_concurrency` from this field —
+    /// never independently from `worker_count` — so the share arithmetic and
+    /// the actual concurrency cannot drift apart (running more simultaneous
+    /// order merges than this would overrun the budget by the excess ratio).
+    pub order_concurrency: usize,
 }
 
 /// Compute the per-phase FD plan for a build with `worker_count` workers.
@@ -69,6 +75,7 @@ pub fn plan_fd_usage(budget: FdBudget, worker_count: usize, concurrent_orders: u
         spot_fan_in: (a / 2).max(16),
         worker_cap: (a / 8).max(1),
         merge_fan_in_per_order: (a / order_concurrency).saturating_sub(4).max(8),
+        order_concurrency,
     }
 }
 
@@ -113,6 +120,18 @@ mod tests {
         assert_eq!(p.spot_fan_in, 5088);
         assert_eq!(p.worker_cap, 1272);
         assert_eq!(p.merge_fan_in_per_order, 3388);
+    }
+
+    #[test]
+    fn order_concurrency_field_matches_divisor() {
+        // The plan must expose the exact divisor it used, so callers can set
+        // BuildAllConfig::max_concurrency from it and stay structurally in
+        // sync with the share arithmetic.
+        for (workers, orders, expect) in [(1, 3, 1), (2, 3, 2), (8, 3, 3), (8, 4, 4), (2, 4, 2)] {
+            let p = plan_fd_usage(FdBudget::from_soft(256), workers, orders);
+            assert_eq!(p.order_concurrency, expect);
+            assert_eq!(p.merge_fan_in_per_order, (192 / expect - 4).max(8));
+        }
     }
 
     #[test]
