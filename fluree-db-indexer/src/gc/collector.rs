@@ -1231,6 +1231,78 @@ mod tests {
         );
     }
 
+    /// A rebuild supersedes the entire prior index, so its published root must
+    /// carry a garbage manifest naming what it replaced. Without one the root
+    /// becomes an absorbing barrier as soon as the chain grows past it (#1548).
+    #[tokio::test]
+    async fn rebuild_root_carries_garbage_manifest() {
+        let storage = MemoryStorage::new();
+        let (root_cids, _) = write_linked_chain(&storage, 2, &[]).await;
+        let store = test_store(&storage);
+
+        let result = encode_and_write_root_v6(
+            &store,
+            minimal_fir6_inputs(
+                3,
+                Some(BinaryPrevIndexRef {
+                    t: 2,
+                    id: root_cids[1].clone(),
+                }),
+            ),
+            None,
+            IndexStats::default(),
+        )
+        .await
+        .unwrap();
+
+        let published = IndexRoot::decode(&store.get(&result.root_id).await.unwrap()).unwrap();
+        let garbage_id = published
+            .garbage
+            .expect("rebuild root must carry a garbage manifest")
+            .id;
+        let record = parse_garbage_record(&store.get(&garbage_id).await.unwrap())
+            .expect("manifest must be readable");
+        assert_eq!(record.t, 3, "manifest belongs to the root that wrote it");
+    }
+
+    /// When the prior root cannot be expanded, what it superseded is unknown.
+    /// The manifest must then be absent rather than empty: an empty one claims
+    /// the rebuild replaced nothing, which would let GC release the prior root
+    /// while leaving behind every blob it referenced (#1548).
+    #[tokio::test]
+    async fn rebuild_omits_manifest_when_prior_root_unreadable() {
+        let storage = MemoryStorage::new();
+        let store = test_store(&storage);
+        // Never written to storage, so its reachable set cannot be computed.
+        let (unreadable, _) = cid_and_addr(ContentKind::IndexRoot, b"absent-prior-root");
+
+        let result = encode_and_write_root_v6(
+            &store,
+            minimal_fir6_inputs(
+                3,
+                Some(BinaryPrevIndexRef {
+                    t: 2,
+                    id: unreadable.clone(),
+                }),
+            ),
+            None,
+            IndexStats::default(),
+        )
+        .await
+        .unwrap();
+
+        let published = IndexRoot::decode(&store.get(&result.root_id).await.unwrap()).unwrap();
+        assert!(
+            published.garbage.is_none(),
+            "an undeterminable garbage set must not be recorded as an empty one"
+        );
+        assert_eq!(
+            published.prev_index.map(|p| p.id),
+            Some(unreadable),
+            "the chain link is still published so the walk stays connected"
+        );
+    }
+
     /// Reindex over an existing chain, then GC. The consolidated root
     /// supersedes the whole prior chain, so everything past the retention
     /// window must become collectable (#1548).

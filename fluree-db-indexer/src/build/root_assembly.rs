@@ -173,9 +173,9 @@ async fn load_prev_annotation_index(
 /// manifests via `collect_root_cas_ids_expanded`. Diffing only the direct
 /// CAS refs (`all_cas_ids()`) would silently leak those leaves on every
 /// reindex.
-// Kept for: shared GC chain computation for both rebuild and incremental pipelines.
-// Use when: rebuild.rs Phase F.7 is refactored to use this shared helper.
-#[expect(dead_code)]
+///
+/// Returns `None` when either root cannot be read or expanded, which the
+/// caller must distinguish from an empty garbage set.
 pub(crate) async fn compute_garbage_from_prev_root(
     content_store: &dyn fluree_db_core::storage::ContentStore,
     new_root: &IndexRoot,
@@ -530,18 +530,59 @@ pub(crate) async fn encode_and_write_root_v6(
         root.had_annotation_arena = true;
     }
 
-    // Attach garbage manifest and prev_index if provided.
-    if let Some(ctx) = gc_ctx {
+    // Take the caller's prev-index link and garbage set, when supplied.
+    let mut garbage_cids = gc_ctx.map(|ctx| {
         if let Some(prev) = ctx.prev_index {
             root.prev_index = Some(prev);
         }
+        ctx.garbage_cids
+    });
 
-        // An empty manifest records that this root replaced nothing, which a
-        // root with no manifest cannot express. The collector stops its
-        // oldest-first walk at the first absent manifest, so omitting the
-        // write would strand every newer version.
-        let garbage_strings: Vec<String> = ctx
-            .garbage_cids
+    // Link the prior index head when no `gc_ctx` supplied one. GC and drop
+    // both enumerate superseded artifacts by walking the prev-index chain, so
+    // a root published without the link orphans every earlier version and the
+    // blobs only those versions reference.
+    if root.prev_index.is_none() {
+        root.prev_index = inputs.prev_index.clone();
+    }
+
+    // A rebuild replaces the whole prior index, so no upstream stage can name
+    // what it superseded. Diff the prior root's reachable set against this one
+    // here, where the assembled root is available.
+    if garbage_cids.is_none() {
+        garbage_cids = match root.prev_index.clone() {
+            Some(prev) => {
+                match compute_garbage_from_prev_root(content_store, &root, &prev.id).await {
+                    Some(ctx) => Some(ctx.garbage_cids),
+                    // Leave the manifest absent rather than writing an empty
+                    // one. "Superseded nothing" and "could not determine" are
+                    // different claims, and recording the first after a full
+                    // rebuild would let GC release the prior root while leaving
+                    // behind every blob it referenced. The collector treats an
+                    // absent manifest as unnameable garbage and defers it to
+                    // the storage sweep.
+                    None => {
+                        tracing::warn!(
+                            prev_root_id = %prev.id,
+                            index_t = root.index_t,
+                            "could not determine which artifacts the prior root \
+                             superseded; publishing without a garbage manifest"
+                        );
+                        None
+                    }
+                }
+            }
+            // No prior index — this root supersedes nothing.
+            None => Some(Vec::new()),
+        };
+    }
+
+    // An empty manifest records that this root replaced nothing, which a root
+    // with no manifest cannot express. The collector stops its oldest-first
+    // walk at the first absent manifest, so omitting the write would strand
+    // every newer version.
+    if let Some(garbage_cids) = garbage_cids {
+        let garbage_strings: Vec<String> = garbage_cids
             .iter()
             .map(std::string::ToString::to_string)
             .collect();
@@ -556,17 +597,9 @@ pub(crate) async fn encode_and_write_root_v6(
         root.garbage = Some(BinaryGarbageRef { id: cid });
 
         tracing::info!(
-            garbage_count = ctx.garbage_cids.len(),
+            garbage_count = garbage_cids.len(),
             "GC chain: garbage record written"
         );
-    }
-
-    // Link the prior index head when no `gc_ctx` supplied one. GC and drop
-    // both enumerate superseded artifacts by walking the prev-index chain, so
-    // a root published without the link orphans every earlier version and the
-    // blobs only those versions reference.
-    if root.prev_index.is_none() {
-        root.prev_index = inputs.prev_index.clone();
     }
 
     tracing::info!(
