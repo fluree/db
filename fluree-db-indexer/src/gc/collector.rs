@@ -353,12 +353,15 @@ pub(crate) async fn walk_prev_index_chain_cs_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::root_assembly::{encode_and_write_root_v6, Fir6Inputs};
+    use crate::build::types::{UploadedDicts, UploadedIndexes};
+    use crate::IndexStats;
     use fluree_db_binary_index::{
         BinaryGarbageRef, BinaryPrevIndexRef, DictPackRefs, DictRefs, DictTreeRefs, IndexRoot,
     };
     use fluree_db_core::prelude::*;
     use fluree_db_core::storage::content_store_for;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     const LEDGER: &str = "test:main";
 
@@ -1032,5 +1035,225 @@ mod tests {
         // --- Current root + its garbage manifest retained ---
         assert!(store.has(&new_root_cid).await.unwrap());
         assert!(store.has(&garb_cid).await.unwrap());
+    }
+
+    /// The minimal `Fir6Inputs` a rebuild publishes: no dict packs, no graph
+    /// data, and `prev_root_id` as the index chain's prior head.
+    fn minimal_fir6_inputs(t: i64, prev_root_id: Option<ContentId>) -> Fir6Inputs {
+        let dummy_cid = ContentId::new(ContentKind::IndexLeaf, b"dummy");
+        let dummy_tree = DictTreeRefs {
+            branch: dummy_cid,
+            leaves: Vec::new(),
+        };
+        Fir6Inputs {
+            ledger_id: LEDGER.to_string(),
+            index_t: t,
+            namespace_codes: BTreeMap::new(),
+            commit_derived_ns: HashMap::new(),
+            ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
+            predicate_sids: Vec::new(),
+            uploaded_dicts: UploadedDicts {
+                dict_refs: DictRefs {
+                    forward_packs: DictPackRefs {
+                        string_fwd_packs: Vec::new(),
+                        subject_fwd_ns_packs: Vec::new(),
+                    },
+                    subject_reverse: dummy_tree.clone(),
+                    string_reverse: dummy_tree,
+                },
+                subject_id_encoding: fluree_db_core::SubjectIdEncoding::Narrow,
+                subject_watermarks: Vec::new(),
+                string_watermark: 0,
+                graph_iris: Vec::new(),
+                datatype_iris: Vec::new(),
+                language_tags: Vec::new(),
+                numbig: BTreeMap::new(),
+                vectors: BTreeMap::new(),
+            },
+            v3_uploaded: UploadedIndexes {
+                default_graph_orders: Vec::new(),
+                named_graphs: Vec::new(),
+            },
+            graph_arenas: Vec::new(),
+            datatype_iris: Vec::new(),
+            language_tags: Vec::new(),
+            total_commit_size: 0,
+            total_asserts: 0,
+            total_retracts: 0,
+            db_stats: None,
+            db_schema: None,
+            sketch_ref: None,
+            attachment_events: None,
+            prev_index_root_id: prev_root_id,
+        }
+    }
+
+    /// Write a linked chain of index roots `t=1..=len`. Each root at `t > 1`
+    /// carries a garbage manifest listing the leaf blob its predecessor
+    /// referenced, aged past any retention threshold. Roots whose `t` appears
+    /// in `manifest_gaps` are published without a manifest — the shape a build
+    /// with an empty garbage set produces.
+    ///
+    /// Returns the root CIDs and the superseded leaf CIDs, each indexed by
+    /// `t - 1`.
+    async fn write_linked_chain(
+        storage: &MemoryStorage,
+        len: i64,
+        manifest_gaps: &[i64],
+    ) -> (Vec<ContentId>, Vec<ContentId>) {
+        let aged_ts = current_timestamp_ms() - (60 * 60 * 1000);
+        let mut root_cids: Vec<ContentId> = Vec::new();
+        let mut leaf_cids: Vec<ContentId> = Vec::new();
+
+        for t in 1..=len {
+            let (leaf_cid, leaf_addr) =
+                cid_and_addr(ContentKind::IndexLeaf, format!("leaf-{t}").as_bytes());
+            storage
+                .write_bytes(&leaf_addr, b"superseded leaf")
+                .await
+                .unwrap();
+            leaf_cids.push(leaf_cid);
+
+            let garbage = if t > 1 && !manifest_gaps.contains(&t) {
+                let (garb_cid, garb_addr) =
+                    cid_and_addr(ContentKind::GarbageRecord, format!("garb-{t}").as_bytes());
+                let superseded = &leaf_cids[(t - 2) as usize];
+                let json = format!(
+                    r#"{{"ledger_id": "{LEDGER}", "t": {t}, "garbage": ["{superseded}"], "created_at_ms": {aged_ts}}}"#
+                );
+                storage
+                    .write_bytes(&garb_addr, json.as_bytes())
+                    .await
+                    .unwrap();
+                Some(BinaryGarbageRef { id: garb_cid })
+            } else {
+                None
+            };
+
+            let prev_index = root_cids.last().map(|id| BinaryPrevIndexRef {
+                t: t - 1,
+                id: id.clone(),
+            });
+            let (root_cid, root_addr) =
+                cid_and_addr(ContentKind::IndexRoot, format!("root-{t}").as_bytes());
+            storage
+                .write_bytes(&root_addr, &minimal_fir6(t, prev_index, garbage))
+                .await
+                .unwrap();
+            root_cids.push(root_cid);
+        }
+
+        (root_cids, leaf_cids)
+    }
+
+    /// A rebuild publishes through `encode_and_write_root_v6` with no
+    /// `GarbageContext`, so the prior index head reaches the new root only via
+    /// `Fir6Inputs::prev_index_root_id`. Dropping it severs the prev-index
+    /// chain: a later chain walk stops at this root and every earlier version
+    /// is orphaned beyond GC's reach (#1548).
+    #[tokio::test]
+    async fn rebuild_root_links_prior_index_chain() {
+        let storage = MemoryStorage::new();
+        let store = test_store(&storage);
+        let (prior_head, _) = cid_and_addr(ContentKind::IndexRoot, b"prior-head");
+
+        let result = encode_and_write_root_v6(
+            &store,
+            minimal_fir6_inputs(9, Some(prior_head.clone())),
+            None,
+            IndexStats::default(),
+        )
+        .await
+        .unwrap();
+
+        let published = IndexRoot::decode(&store.get(&result.root_id).await.unwrap()).unwrap();
+        assert_eq!(
+            published.prev_index.map(|p| p.id),
+            Some(prior_head),
+            "a rebuild root must link the prior index head; without it the chain \
+             walk terminates here and every earlier root is unreachable"
+        );
+    }
+
+    /// Reindex over an existing chain, then GC. The consolidated root
+    /// supersedes the whole prior chain, so everything past the retention
+    /// window must become collectable (#1548).
+    #[tokio::test]
+    async fn reindex_publish_leaves_superseded_roots_collectable() {
+        let storage = MemoryStorage::new();
+        let (root_cids, leaf_cids) = write_linked_chain(&storage, 3, &[]).await;
+        let store = test_store(&storage);
+
+        let reindexed = encode_and_write_root_v6(
+            &store,
+            minimal_fir6_inputs(4, Some(root_cids[2].clone())),
+            None,
+            IndexStats::default(),
+        )
+        .await
+        .unwrap();
+
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let result = clean_garbage(&store, &reindexed.root_id, config)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.indexes_cleaned, 2,
+            "t=1 and t=2 are past the retention window and must be released"
+        );
+        assert!(
+            !store.has(&root_cids[0]).await.unwrap(),
+            "t=1 root released"
+        );
+        assert!(
+            !store.has(&root_cids[1]).await.unwrap(),
+            "t=2 root released"
+        );
+        assert!(
+            !store.has(&leaf_cids[0]).await.unwrap(),
+            "t=1 leaf released"
+        );
+        assert!(
+            !store.has(&leaf_cids[1]).await.unwrap(),
+            "t=2 leaf released"
+        );
+        assert!(store.has(&root_cids[2]).await.unwrap(), "t=3 retained");
+        assert!(store.has(&reindexed.root_id).await.unwrap(), "current root");
+    }
+
+    /// Retention promises `current + max_old_indexes` versions. A root
+    /// published without a garbage manifest stops the collector's oldest-first
+    /// walk, so every version newer than the gap is retained forever and the
+    /// chain grows without bound (#1548).
+    #[tokio::test]
+    async fn gc_bounds_retained_chain_despite_manifest_gap() {
+        let storage = MemoryStorage::new();
+        let (root_cids, _) = write_linked_chain(&storage, 6, &[4]).await;
+        let store = test_store(&storage);
+
+        let max_old_indexes = 1;
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(max_old_indexes),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        clean_garbage(&store, &root_cids[5], config).await.unwrap();
+
+        let mut retained = Vec::new();
+        for (i, cid) in root_cids.iter().enumerate() {
+            if store.has(cid).await.unwrap() {
+                retained.push(i + 1);
+            }
+        }
+
+        assert!(
+            retained.len() <= 1 + max_old_indexes as usize,
+            "retention keeps current + {max_old_indexes} old roots, but t={retained:?} survive"
+        );
     }
 }
