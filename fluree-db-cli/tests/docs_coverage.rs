@@ -8,10 +8,12 @@
 //! outlives its command, the index skips a page, or the published book (the
 //! `SUMMARY.md` TOC) orphans one.
 //!
-//! Assumes the default/all-features surface: CI runs `--all-features`, so
-//! feature-gated commands (validate/cluster) are present and their docs are
-//! required. A `--no-default-features` build would report their pages as
-//! orphans — that direction is not supported.
+//! Assumes the full command surface: the gating features (`server`, `shacl`,
+//! `iceberg`, `aws`) are all DEFAULT features of this crate, so a plain
+//! `cargo test -p fluree-db-cli` sees every command — no `--all-features`
+//! needed (CI's `--all-features` is belt-and-suspenders, not load-bearing).
+//! Only a `--no-default-features` build would report the feature-gated pages
+//! as orphans; that direction is not supported.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -130,10 +132,21 @@ fn every_nested_action_is_mentioned_in_its_doc() {
 #[test]
 fn readme_indexes_every_command() {
     let readme = read(&docs_dir().join("cli/README.md"));
+    // A page counts as linked in any of the markdown link forms the corpus
+    // could reasonably use: `(name.md)`, `(./name.md)`, or `(name.md#anchor`.
+    // The README currently uses only the bare form, but the gate shouldn't
+    // fail honest links written the other ways — the assertion is "linked",
+    // not "linked in one house style".
+    let linked = |name: &str| {
+        readme.contains(&format!("({name}.md)"))
+            || readme.contains(&format!("(./{name}.md)"))
+            || readme.contains(&format!("({name}.md#"))
+            || readme.contains(&format!("(./{name}.md#"))
+    };
     let missing: Vec<String> = visible_top_level()
         .iter()
         .map(|c| c.get_name().to_string())
-        .filter(|name| !readme.contains(&format!("({name}.md)")))
+        .filter(|name| !linked(name))
         .collect();
     assert!(
         missing.is_empty(),

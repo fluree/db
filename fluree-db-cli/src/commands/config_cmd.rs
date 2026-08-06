@@ -87,23 +87,32 @@ fn list_toml(config_path: &Path, reveal: bool) -> CliResult<()> {
         return Ok(());
     }
 
-    let doc = if reveal { doc } else { redact_toml(doc)? };
+    let doc = if reveal {
+        doc
+    } else {
+        let (doc, redacted) = redact_toml(doc)?;
+        if redacted {
+            eprintln!("note: credential values shown as [redacted]; pass --reveal to print them");
+        }
+        doc
+    };
     print_toml_flat("", &doc);
     Ok(())
 }
 
 /// Redact credential values in a parsed config for display, reusing the same
 /// key policy as graph-source info (`redact_json_secrets`). Round-trips
-/// through JSON: the only lossy case is a TOML datetime becoming a string,
-/// which prints identically in the flat listing.
-fn redact_toml(doc: toml::Value) -> CliResult<toml::Value> {
+/// through JSON losslessly — toml's serde form carries datetimes as a
+/// private magic key (`$__toml_private_datetime`) that deserializes back to
+/// a real `Datetime`. Returns the (possibly) redacted doc and whether
+/// anything was redacted; printing is the caller's business.
+fn redact_toml(doc: toml::Value) -> CliResult<(toml::Value, bool)> {
     let mut json = serde_json::to_value(&doc)
         .map_err(|e| CliError::Config(format!("failed to render config: {e}")))?;
-    if fluree_db_api::ledger_info::redact_json_secrets(&mut json) {
-        eprintln!("note: credential values shown as [redacted]; pass --reveal to print them");
-    }
-    serde_json::from_value(json)
-        .map_err(|e| CliError::Config(format!("failed to render config: {e}")))
+    let redacted = fluree_db_api::ledger_info::redact_json_secrets(&mut json);
+    let doc = serde_json::from_value(json)
+        .map_err(|e| CliError::Config(format!("failed to render config: {e}")))?;
+    Ok((doc, redacted))
 }
 
 /// Look up a dotted key path in a TOML value.
@@ -424,4 +433,56 @@ pub async fn run_set_origins(ledger: &str, file: &Path, dirs: &FlureeDir) -> Cli
 
     println!("Config set for '{ledger_id}' (CID: {cid})");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use fluree_db_nameservice_sync::{OidcLoginFlow, RemoteAuth, RemoteAuthType};
+
+    /// The REAL tie between `RemoteAuth` (fluree-db-nameservice-sync) and the
+    /// redaction policy (`SECRET_CONFIG_KEYS` in fluree-db-api) — this crate
+    /// is the one place both are in scope. The struct literal is deliberately
+    /// EXHAUSTIVE (no `..Default::default()`): adding a field to `RemoteAuth`
+    /// fails to compile here, forcing its author through this test, and the
+    /// assertion then requires any credential-family field to be redacted
+    /// before `fluree config list` can ship it.
+    #[test]
+    fn every_remote_auth_credential_field_is_redacted() {
+        let auth = RemoteAuth {
+            auth_type: Some(RemoteAuthType::OidcDevice),
+            token: Some("live-access-credential".into()),
+            issuer: Some("https://stack.example".into()),
+            client_id: Some("cli-client".into()),
+            exchange_url: Some("https://stack.example/v1/fluree/auth/exchange".into()),
+            refresh_token: Some("live-refresh-credential".into()),
+            scopes: Some(vec!["openid".into(), "offline_access".into()]),
+            redirect_port: Some(8400),
+            login_flow: Some(OidcLoginFlow::DeviceCode),
+        };
+
+        let mut value = serde_json::to_value(&auth).expect("RemoteAuth serializes");
+        fluree_db_api::ledger_info::redact_json_secrets(&mut value);
+
+        // Every serialized key in a credential family must come out redacted.
+        let obj = value
+            .as_object()
+            .expect("RemoteAuth serializes to an object");
+        for (key, val) in obj {
+            let k = key.to_ascii_lowercase();
+            if k.contains("token") || k.contains("secret") || k.contains("password") {
+                assert_eq!(
+                    val,
+                    &serde_json::Value::String("[redacted]".into()),
+                    "credential-family field '{key}' survived redaction"
+                );
+            }
+        }
+        // Belt to the suspenders: the live values are gone wholesale.
+        let rendered = value.to_string();
+        assert!(!rendered.contains("live-access-credential"));
+        assert!(!rendered.contains("live-refresh-credential"));
+        // Identifying fields survive (they're how `config list` stays useful).
+        assert!(rendered.contains("https://stack.example"));
+        assert!(rendered.contains("cli-client"));
+    }
 }
