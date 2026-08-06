@@ -3803,22 +3803,31 @@ impl FusedR2rmlAggregateOperator {
         if m == 0 {
             return Ok(None); // a branch with no dim is not a semi-join (defensive)
         }
-        // A chain pattern's VAR-OBJECT members (`star_bindings`) OTHER than its next-hop
-        // FK impose a BGP existence requirement (the object column must be non-null for
-        // the triple to match) — and, across two branches sharing the object var, a
-        // cross-branch equality — NEITHER of which this keep-min membership build honors:
-        // it projects only join / subject / constraint / next-FK columns and never
-        // consults `star_bindings`. Silently dropping such a member OVER-ADMITS the root
-        // FK (e.g. `?c :segment "Enterprise" ; :region ?r` with a null region admits a
-        // customer the generic BGP excludes). The ONLY star_binding a chain pattern may
-        // carry is the FK to its next hop — a branch join var, consumed by the hop
-        // resolution below. Any other var-object member declines to the generic path
-        // (never over-admit); honoring it is a follow-on (project the column + a per-
-        // column non-null drop + a cross-branch shared-var equality pass).
+        // A chain pattern's VAR-OBJECT members OTHER than its next-hop FK impose a BGP
+        // existence requirement (the object column must be non-null for the triple to
+        // match) — and, across two branches sharing the object var, a cross-branch
+        // equality — NEITHER of which this keep-min membership build honors: it projects
+        // only join / subject / constraint / next-FK columns and never consults a bound
+        // object member. Silently dropping one OVER-ADMITS the root FK (e.g.
+        // `?c :segment "Enterprise" ; :region ?r` with a null region admits a customer
+        // the generic BGP excludes). The rewrite's subject-star fold puts the FIRST
+        // var-object member in `object_var` and only ADDITIONAL members in
+        // `star_bindings` (rewrite.rs; pinned by
+        // `rewrite_emits_single_var_member_semijoin_terminal_as_object_var`), so BOTH
+        // fields must be checked — a star_bindings-only guard misses the common
+        // single-member shape. The ONLY var-object member a chain pattern may carry is
+        // the FK to its next hop — a branch join var, consumed by the hop resolution
+        // below. Any other declines to the generic path (never over-admit); this also
+        // closes the K>=2 cross-branch shared-var correlation case for both fields.
+        // Honoring one is a follow-on (project the column + a per-column non-null drop +
+        // a cross-branch shared-var equality pass). Declining HERE — before the
+        // chain-constraint gather and projection below — is why neither needs
+        // object_var handling.
         if chain.iter().any(|p| {
-            p.star_bindings
-                .iter()
-                .any(|(_, v)| !branch.join_vars.contains(v))
+            p.object_var.is_some_and(|v| !branch.join_vars.contains(&v))
+                || p.star_bindings
+                    .iter()
+                    .any(|(_, v)| !branch.join_vars.contains(v))
         }) {
             return Ok(None);
         }
@@ -6570,6 +6579,14 @@ mod tests {
                 .with_predicate_object(PredicateObjectMap {
                     predicate_map: PredicateMap::constant("http://ex/segment"),
                     object_map: ObjectMap::column("SEGMENT"),
+                })
+                // A scalar leaf attribute on the semi-join terminal — used by the
+                // rewrite-driven `?c :segment "Enterprise" ; :region ?r` fixtures to make
+                // the var-object member (?r) land in `object_var` by construction (the
+                // rewrite folds a SOLE var member into object_var).
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/region"),
+                    object_map: ObjectMap::column("REGION"),
                 }),
             TriplesMap::new("#Product", "product")
                 .with_subject_template("http://ex/prod/{PRODUCT_KEY}")
@@ -6865,30 +6882,199 @@ mod tests {
         );
     }
 
-    /// B2 (review id=3717398030): a semi-join CHAIN pattern that carries a VAR-OBJECT
-    /// member (`star_bindings`) OTHER than its next-hop FK must DECLINE the fuse.
-    /// `build_semi_join_membership` projects only join / subject / constraint / next-FK
-    /// columns and never consults `star_bindings`, so a leaf var-object member — a BGP
-    /// existence requirement (the object column must be non-null for the triple to
-    /// match) — would be silently dropped and OVER-ADMIT the root FK (a customer with a
-    /// null region is folded in though the generic BGP excludes it). This uses the REAL
-    /// two-forms representation the rewrite emits (memory: r2rml-const-object-two-forms):
-    /// segment lives in `star_constraints` BECAUSE the customer subject now ALSO carries
-    /// the `?r` (region) var-object member — exactly the shape id=3717398038 flagged as
-    /// otherwise unemittable. `?r` (VarId 30) is a leaf object var, NOT a branch join
-    /// var and NOT a group-by var, so the branch stays a SEMI-JOIN and the join topology
-    /// is unchanged (still decomposes). Pre-fix `resolve_branching_star_at_open`
-    /// returned `Some(..)` (folded, ignoring the region existence → over-count); the
-    /// guard makes it DECLINE (`Ok(None)` → the generic path, which honors the region
-    /// BGP). The interior `order` pattern's ONLY star_binding is `(customer, ?c)`, its
-    /// next-hop FK (a branch join var) — so the guard must NOT decline the clean shape.
+    /// FIDELITY PIN (id=3717398030 refix): prove the EXACT representation the rewrite
+    /// emits for a semi-join terminal `?c :segment "Enterprise" ; :region ?r` — a SINGLE
+    /// var-object member. Per the star fold in rewrite.rs, the FIRST var member becomes
+    /// the base pattern's `object_var` and only ADDITIONAL var members go to
+    /// `star_bindings`; the const-object member folds to `star_constraints` (a var member
+    /// is present). So the single `?r` member is emitted `object_var=Some(?r)`,
+    /// `star_bindings=[]`. The earlier B2 fixture used `star_bindings=[region]` — a shape
+    /// the rewrite ONLY emits for a 2nd+ member — so its guard check went green against a
+    /// representation that never occurs. This pin fails loudly if that emission ever
+    /// changes, so the decline test below can field-build the real rep with confidence.
+    #[test]
+    fn rewrite_emits_single_var_member_semijoin_terminal_as_object_var() {
+        use fluree_db_core::{FlakeValue, LedgerSnapshot};
+        use fluree_db_r2rml::mapping::PredicateMap;
+        const SEGMENT: &str = "http://ex/segment";
+        const REGION: &str = "http://ex/region";
+        let customer = TriplesMap::new("#Customer", "customer")
+            .with_subject_template("http://ex/cust/{CUSTOMER_KEY}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(SEGMENT),
+                object_map: ObjectMap::column("SEGMENT"),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(REGION),
+                object_map: ObjectMap::column("REGION"),
+            });
+        let mapping = CompiledR2rmlMapping::new(vec![customer]);
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let (c, r) = (VarId(3), VarId(30));
+        let seg_const = Pattern::Triple(TriplePattern::new(
+            Ref::Var(c),
+            Ref::Iri(Arc::from(SEGMENT)),
+            Term::Value(FlakeValue::String("Enterprise".to_string())),
+        ));
+        let region_var = Pattern::Triple(TriplePattern::new(
+            Ref::Var(c),
+            Ref::Iri(Arc::from(REGION)),
+            Term::Var(r),
+        ));
+        let out = rewrite_patterns_for_r2rml(
+            &[seg_const, region_var],
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            false,
+            false,
+        )
+        .patterns;
+        let folded: Vec<&R2rmlPattern> = out
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            folded.len(),
+            1,
+            "the two same-subject members fold to ONE pattern: {out:?}"
+        );
+        let cp = folded[0];
+        assert_eq!(
+            cp.object_var,
+            Some(r),
+            "the single var-object member must be emitted as object_var, NOT star_bindings"
+        );
+        assert!(
+            cp.star_bindings.is_empty(),
+            "star_bindings is populated ONLY by a 2nd+ var member; got {:?}",
+            cp.star_bindings
+        );
+        assert_eq!(
+            cp.star_constraints.len(),
+            1,
+            "the const-object segment folds to star_constraints (a var member is present)"
+        );
+        assert_eq!(cp.star_constraints[0].0, SEGMENT);
+    }
+
+    /// Build the crt_join_reorder BGP as pre-rewrite triples and fold it THROUGH the
+    /// actual rewrite (not hand-built leaf patterns), so each subject star's members land
+    /// in the REAL fields by construction — critically, a SOLE var-object member folds
+    /// into `object_var` (the interior FK `?o :customer ?c`, and — when `with_region` —
+    /// the leaf `?c :region ?r`), NOT `star_bindings`. Var ids match `crt_op` (qty=10,
+    /// cat=12). This is the generate-through-the-rewrite discipline that keeps the B2
+    /// tests honest about the representation they exercise.
+    fn crt_rewritten(with_region: bool) -> Vec<R2rmlPattern> {
+        use fluree_db_core::{FlakeValue, LedgerSnapshot};
+        let (ol, o, p, c) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let (qty, cat, r) = (VarId(10), VarId(12), VarId(30));
+        let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let t = |s: VarId, pred: &str, obj: Term| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Iri(Arc::from(pred)),
+                obj,
+            ))
+        };
+        let mut bgp = vec![
+            t(ol, "http://ex/quantity", Term::Var(qty)),
+            t(ol, "http://ex/order", Term::Var(o)),
+            t(ol, "http://ex/product", Term::Var(p)),
+            t(o, "http://ex/customer", Term::Var(c)),
+            t(
+                c,
+                "http://ex/segment",
+                Term::Value(FlakeValue::String("Enterprise".to_string())),
+            ),
+            t(p, "http://ex/category", Term::Var(cat)),
+            t(
+                p,
+                "http://ex/isCurrent",
+                Term::Value(FlakeValue::Boolean(true)),
+            ),
+        ];
+        if with_region {
+            bgp.push(t(c, "http://ex/region", Term::Var(r)));
+        }
+        rewrite_patterns_for_r2rml(&bgp, "gs:main", &snapshot, Some(&mapping), false, false)
+            .patterns
+            .into_iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// OVER-DECLINE GUARD (id=3717398030 refix): the rewrite folds a SOLE FK member into
+    /// `object_var` too — the interior `?o :customer ?c` is emitted `object_var=Some(?c)`
+    /// where `?c` IS the branch's next-hop join var. The `object_var` guard must NOT trip
+    /// on that (declining it would swing from under- to OVER-declining and break the clean
+    /// crt fuse). Built THROUGH the rewrite so the FK lands in `object_var` by
+    /// construction; asserts the clean crt semi-join still FUSES. Stays green on the old
+    /// star_bindings-only guard too — it is a regression guard, not a bug reproduction.
+    #[tokio::test]
+    async fn p3_semijoin_interior_fk_in_object_var_still_fuses() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+        let pats = crt_rewritten(false);
+        // The interior order pattern carries the customer FK in object_var (the real
+        // single-member emission) — exactly the next-hop join var the guard must NOT
+        // decline.
+        assert!(
+            pats.iter().any(|p| p.object_var == Some(VarId(3))),
+            "the interior FK `?o :customer ?c` must fold into object_var: {pats:?}"
+        );
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let provider = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches: clean_batches(),
+        };
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)])
+            .expect("clean crt still decomposes with the FK in object_var");
+        let op = crt_op();
+        let resolved = op
+            .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+            .await
+            .expect("resolve must not error");
+        assert!(
+            resolved.is_some(),
+            "the clean crt semi-join (interior FK in object_var, a JOIN var) must still \
+             FUSE — the object_var guard must not over-decline a next-hop FK"
+        );
+    }
+
+    /// B2 (review id=3717398030): a semi-join CHAIN pattern whose var-object member is a
+    /// LEAF (not its next-hop FK) must DECLINE the fuse — `build_semi_join_membership`
+    /// never consults a bound object member, so it would silently drop the region
+    /// existence requirement and OVER-ADMIT a null-region customer the generic BGP
+    /// excludes. Built THROUGH the rewrite: `?c :segment "Enterprise" ; :region ?r` folds
+    /// to `object_var=Some(?r)` (a SOLE var member, `star_bindings=[]`), so the guard MUST
+    /// check `object_var` — the prior star_bindings-only guard (46534f669) was SILENT here
+    /// and left the bug live (RED on that guard, GREEN after covering object_var). Paired
+    /// with `p3_semijoin_interior_fk_in_object_var_still_fuses` for the over-decline side.
     #[tokio::test]
     async fn p3_semijoin_chain_var_object_member_declines() {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::LedgerSnapshot;
         let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
-        let mut pats = crt_patterns(true); // segment in star_constraints (the two-forms arm)
-        pats[2].star_bindings = vec![("http://ex/region".into(), VarId(30))];
+        let pats = crt_rewritten(true);
+        // The customer terminal carries the leaf `?r` in object_var (NOT a join var) —
+        // the exact shape the star_bindings-only guard missed.
+        assert!(
+            pats.iter().any(|p| p.object_var == Some(VarId(30))),
+            "the leaf member `?c :region ?r` must fold into object_var: {pats:?}"
+        );
         let refs: Vec<&R2rmlPattern> = pats.iter().collect();
         let provider = CrtProvider {
             mapping: Arc::clone(&mapping),
@@ -6907,9 +7093,9 @@ mod tests {
             .expect("resolve must not error");
         assert!(
             resolved.is_none(),
-            "a semi-join chain pattern with a leaf var-object member must DECLINE the \
-             fuse (the membership build cannot honor the region existence requirement); \
-             pre-fix it admitted and over-counted"
+            "a semi-join chain pattern whose object_var is a leaf var member must DECLINE \
+             (the membership build cannot honor the region existence requirement); the \
+             star_bindings-only guard was silent because the single member is in object_var"
         );
     }
 
