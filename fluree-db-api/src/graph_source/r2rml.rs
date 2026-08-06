@@ -148,6 +148,9 @@ fn int_pushdown_literal(
             scale: 0,
         }),
         _ => Some(LiteralValue::Int64(n)),
+    }
+}
+
 /// One materialize scan: what to read, how it was chosen, and how stale the window is.
 ///
 /// A struct rather than a tuple because `window_age_ms` is easy to drop silently
@@ -4150,6 +4153,10 @@ mod tests {
             table: TableConfig::Identifier("ns.t".to_string()),
             io: IoConfig::default(),
             mapping: None,
+            // This fixture exercises auth fingerprinting, not CDC semantics, so the
+            // materialization options stay absent (their serde defaults).
+            delete: None,
+            order_by: None,
         }
         .to_json()
         .unwrap()

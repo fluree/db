@@ -3339,6 +3339,7 @@ mod tests {
                 },
                 scope: None,
                 audience: None,
+            },
             // Metadata-server auth carries no secret (tokens are fetched at
             // runtime), so there is nothing to redact — but the canary below
             // still requires it to be covered.

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::error::{IcebergError, Result};
 use crate::io::SendIcebergStorage;
-use crate::manifest::{parse_manifest, parse_manifest_list_with_deletes};
+use crate::manifest::{parse_manifest, parse_manifest_list, parse_manifest_list_with_deletes};
 use crate::metadata::{Schema, Snapshot, TableMetadata};
 use crate::scan::planner::{
     effective_sequence_number, FileScanTask, IncrementalScanPlan, ScanConfig, ScanPlan,

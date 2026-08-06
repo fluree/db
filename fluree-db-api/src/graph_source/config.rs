@@ -522,6 +522,10 @@ impl IcebergConnectionConfig {
             };
         } else {
             tracing::warn!("with_auth_bearer_token_ref has no effect in Direct catalog mode");
+        }
+        self
+    }
+
     /// Set Google metadata-server authentication (REST mode only).
     ///
     /// Mints and refreshes short-lived Google OAuth tokens from the GCE/GKE

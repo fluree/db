@@ -204,6 +204,17 @@ impl AuthConfig {
                 scope: scope.clone(),
                 audience: audience.clone(),
             }),
+            // No secret material to hydrate: the credential is minted per call from
+            // the instance metadata server and lives only in an in-memory
+            // `CachedToken`. Written out rather than matched by a wildcard so a NEW
+            // variant still fails compilation here and earns an explicit decision.
+            AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url,
+            } => Ok(AuthConfig::GoogleMetadata {
+                scopes: scopes.clone(),
+                metadata_url: metadata_url.clone(),
+            }),
         }
     }
 }
