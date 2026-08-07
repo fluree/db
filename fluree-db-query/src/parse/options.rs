@@ -28,6 +28,7 @@ use super::ast::{
     UnresolvedOptions, UnresolvedSortDirection, UnresolvedSortSpec,
 };
 use super::error::{ParseError, Result};
+use super::filter_common;
 use super::filter_sexpr;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -331,6 +332,7 @@ fn parse_having_with_aggregates(
         }
         other => parse_filter_expr(other)?,
     };
+    filter_common::reject_constant_bool_expr(&raw_expr, "having")?;
 
     let mut aggregates: Vec<UnresolvedAggregateSpec> = Vec::new();
     let mut counter: usize = 0;
