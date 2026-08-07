@@ -1,0 +1,9 @@
+# p2_category_rollup — Fluree/SPARQL side. Shape-equivalent to corpus q012
+# (q012 groups by product name+top10; this groups by category to match the pair spec).
+# fact edw:OrderLine -> edw:product -> dim edw:Product{category,isCurrent}.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?cat (SUM(?qty) AS ?u)
+WHERE { ?ol a edw:OrderLine ; edw:quantity ?qty ; edw:product ?p .
+        ?p edw:category ?cat ; edw:isCurrent true . }
+GROUP BY ?cat
+ORDER BY DESC(?u) ?cat

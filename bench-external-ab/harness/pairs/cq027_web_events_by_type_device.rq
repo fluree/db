@@ -1,0 +1,5 @@
+# cq027 — corpus q027_web_events_by_type_device (+ deterministic ORDER BY).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?et ?dev (COUNT(?e) AS ?n)
+WHERE { ?e a edw:WebEvent ; edw:eventType ?et ; edw:deviceType ?dev . }
+GROUP BY ?et ?dev ORDER BY ?et ?dev
