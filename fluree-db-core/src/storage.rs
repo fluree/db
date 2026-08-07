@@ -505,30 +505,63 @@ impl<S: Storage> StorageContentStore<S> {
     /// under the per-branch namespace (`mydb/main/index/objects/dicts/{sha}.dict`).
     /// Returns `None` for non-dict CIDs.
     fn legacy_dict_address(&self, id: &ContentId) -> Option<String> {
-        if id.codec() != crate::CODEC_FLUREE_DICT_BLOB {
-            return None;
-        }
-        let prefix = ledger_id_prefix_for_path(&self.ledger_id);
-        let hex = id.digest_hex();
-        Some(format!(
-            "fluree:{}://{}/index/objects/dicts/{}.dict",
-            self.method, prefix, hex
-        ))
+        legacy_dict_address(&self.method, &self.ledger_id, id)
     }
 
     /// Index roots were stored with a `.json` extension before the switch to `.fir6`.
     /// Returns `None` for non-IndexRoot CIDs.
     fn legacy_index_root_address(&self, id: &ContentId) -> Option<String> {
-        if id.codec() != crate::CODEC_FLUREE_INDEX_ROOT {
-            return None;
-        }
-        let prefix = ledger_id_prefix_for_path(&self.ledger_id);
-        let hex = id.digest_hex();
-        Some(format!(
-            "fluree:{}://{}/index/roots/{}.json",
-            self.method, prefix, hex
-        ))
+        legacy_index_root_address(&self.method, &self.ledger_id, id)
     }
+}
+
+/// The pre-global-dicts address, where dict blobs lived under the per-branch
+/// namespace (`mydb/main/index/objects/dicts/{sha}.dict`).
+///
+/// Returns `None` for non-dict CIDs.
+pub fn legacy_dict_address(method: &str, ledger_id: &str, id: &ContentId) -> Option<String> {
+    if id.codec() != crate::CODEC_FLUREE_DICT_BLOB {
+        return None;
+    }
+    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let hex = id.digest_hex();
+    Some(format!(
+        "fluree:{method}://{prefix}/index/objects/dicts/{hex}.dict"
+    ))
+}
+
+/// The index-root address from before the `.json` to `.fir6` rename.
+///
+/// Returns `None` for non-`IndexRoot` CIDs.
+pub fn legacy_index_root_address(method: &str, ledger_id: &str, id: &ContentId) -> Option<String> {
+    if id.codec() != crate::CODEC_FLUREE_INDEX_ROOT {
+        return None;
+    }
+    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let hex = id.digest_hex();
+    Some(format!("fluree:{method}://{prefix}/index/roots/{hex}.json"))
+}
+
+/// Every address at which a CID's blob could physically live, current layout
+/// first.
+///
+/// The storage layout has changed twice — dict blobs moved from the per-branch
+/// namespace to `@shared`, and index roots moved from `.json` to `.fir6` — and
+/// [`ContentStore::get`] falls back through the older forms. Anything deciding
+/// that a blob is unreferenced must account for all of them, or it will delete
+/// a live blob that exists only at a legacy address.
+///
+/// Returns an empty vector when the CID's codec is unrecognised. Callers that
+/// delete must treat that as "cannot locate this blob" and decline to act, not
+/// as "this blob occupies no addresses".
+pub fn candidate_addresses(method: &str, ledger_id: &str, id: &ContentId) -> Vec<String> {
+    let mut addresses = Vec::new();
+    if let Some(kind) = id.content_kind() {
+        addresses.push(content_address(method, kind, ledger_id, &id.digest_hex()));
+    }
+    addresses.extend(legacy_dict_address(method, ledger_id, id));
+    addresses.extend(legacy_index_root_address(method, ledger_id, id));
+    addresses
 }
 
 #[async_trait]
@@ -1251,4 +1284,79 @@ pub trait StorageCas: Debug + Send + Sync {
     where
         F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
         T: Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content_kind::DictKind;
+    use crate::storage::memory::MemoryStorage;
+
+    const LEDGER: &str = "mydb:main";
+
+    /// `candidate_addresses` exists so that callers deciding a blob is
+    /// unreferenced see every address `ContentStore::get` would resolve it to.
+    /// A dict blob left at the pre-`@shared` address is readable, so it must
+    /// also be listed — otherwise a sweep deletes a live blob.
+    #[tokio::test]
+    async fn candidate_addresses_cover_the_legacy_dict_fallback() {
+        let storage = MemoryStorage::new();
+        let id = ContentId::new(
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"dict bytes",
+        );
+        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &id)
+            .expect("dict CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"dict bytes").await.unwrap();
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        assert_eq!(
+            store.get(&id).await.unwrap(),
+            b"dict bytes",
+            "reads fall back to the legacy dict address"
+        );
+        assert!(
+            candidate_addresses(storage.storage_method(), LEDGER, &id).contains(&legacy),
+            "the address reads fall back to must be listed as a candidate"
+        );
+    }
+
+    /// Same coupling for index roots written before the `.json` to `.fir6`
+    /// rename.
+    #[tokio::test]
+    async fn candidate_addresses_cover_the_legacy_index_root_fallback() {
+        let storage = MemoryStorage::new();
+        let id = ContentId::new(ContentKind::IndexRoot, b"root bytes");
+        let legacy = legacy_index_root_address(storage.storage_method(), LEDGER, &id)
+            .expect("index-root CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"root bytes").await.unwrap();
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        assert_eq!(
+            store.get(&id).await.unwrap(),
+            b"root bytes",
+            "reads fall back to the legacy index-root address"
+        );
+        assert!(
+            candidate_addresses(storage.storage_method(), LEDGER, &id).contains(&legacy),
+            "the address reads fall back to must be listed as a candidate"
+        );
+    }
+
+    /// The current-layout address always leads, so callers that only need the
+    /// canonical location can take the first entry.
+    #[test]
+    fn candidate_addresses_lead_with_the_current_layout() {
+        let id = ContentId::new(ContentKind::IndexLeaf, b"leaf");
+        let addresses = candidate_addresses("memory", LEDGER, &id);
+        assert_eq!(
+            addresses.first().map(String::as_str),
+            Some(
+                content_address("memory", ContentKind::IndexLeaf, LEDGER, &id.digest_hex())
+                    .as_str()
+            )
+        );
+    }
 }
