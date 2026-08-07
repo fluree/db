@@ -2503,6 +2503,7 @@ impl<'a> HydrationFormatter<'a> {
         enforcer
             .filter_flakes_for_graph(
                 self.db.snapshot,
+                self.db.g_id,
                 self.db.overlay,
                 self.db.t,
                 tracker,
