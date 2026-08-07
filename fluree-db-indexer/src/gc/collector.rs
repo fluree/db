@@ -427,57 +427,18 @@ mod tests {
         prev_index: Option<BinaryPrevIndexRef>,
         garbage: Option<BinaryGarbageRef>,
     ) -> Vec<u8> {
-        let dummy_cid = ContentId::new(ContentKind::IndexLeaf, b"dummy");
-        let dummy_tree = DictTreeRefs {
-            branch: dummy_cid.clone(),
-            leaves: Vec::new(),
-        };
-        let root = IndexRoot {
-            ledger_id: LEDGER.to_string(),
-            index_t: t,
-            base_t: 0,
-            subject_id_encoding: fluree_db_core::SubjectIdEncoding::Narrow,
-            namespace_codes: BTreeMap::new(),
-            predicate_sids: Vec::new(),
-            graph_iris: Vec::new(),
-            datatype_iris: Vec::new(),
-            language_tags: Vec::new(),
-            dict_refs: DictRefs {
-                forward_packs: DictPackRefs {
-                    string_fwd_packs: Vec::new(),
-                    subject_fwd_ns_packs: Vec::new(),
-                },
-                subject_reverse: dummy_tree.clone(),
-                string_reverse: dummy_tree,
-            },
-            subject_watermarks: Vec::new(),
-            string_watermark: 0,
-            lex_sorted_string_ids: false,
-            total_commit_size: 0,
-            total_asserts: 0,
-            total_retracts: 0,
-            graph_arenas: Vec::new(),
-            default_graph_orders: Vec::new(),
-            named_graphs: Vec::new(),
-            stats: None,
-            schema: None,
+        crate::gc::test_support::minimal_fir6_for(
+            LEDGER,
+            t,
             prev_index,
             garbage,
-            sketch_ref: None,
-            has_annotations: false,
-            annotation_index: None,
-            had_annotation_arena: false,
-            o_type_table: IndexRoot::build_o_type_table(&[], &[]),
-            ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
-        };
-        root.encode()
+            ContentId::new(ContentKind::IndexLeaf, b"dummy"),
+        )
     }
 
     /// Helper: create a CID and its derived memory-storage address.
     fn cid_and_addr(kind: ContentKind, data: &[u8]) -> (ContentId, String) {
-        let cid = ContentId::new(kind, data);
-        let addr = fluree_db_core::content_address("memory", kind, LEDGER, &cid.digest_hex());
-        (cid, addr)
+        crate::gc::test_support::cid_and_addr_for(LEDGER, kind, data)
     }
 
     #[test]

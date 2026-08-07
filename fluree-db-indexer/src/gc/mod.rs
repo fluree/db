@@ -34,9 +34,13 @@
 
 pub(crate) mod collector;
 mod record;
+mod sweep;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use collector::clean_garbage;
 pub use record::GarbageRecord;
+pub use sweep::{plan_sweep, BranchIndexHead, SweepPlan};
 
 use crate::error::Result;
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
