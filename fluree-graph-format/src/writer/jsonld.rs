@@ -14,7 +14,7 @@ use super::terms::WriterTerms;
 use super::{blank::BlankLabeler, Deferred, Out, WriterConfig, WriterStats};
 use crate::jsonld::{format_jsonld, JsonLdFormatConfig};
 use fluree_graph_ir::{
-    Datatype, Graph, GraphSink, LiteralValue, SinkError, SinkResult, TermId, Triple,
+    Datatype, Graph, GraphSink, LiteralValue, SinkError, SinkResult, TermId, TermScope, Triple,
 };
 use std::io::Write;
 
@@ -60,7 +60,7 @@ impl<W: Write> JsonLdWriter<W> {
     /// The two are separate because they answer different questions:
     /// [`WriterConfig`] decides what the *labels* are, the format config
     /// decides what the *document* looks like. Blank-node labelling is applied
-    /// here, by the writer, so `fluree rdf convert` has one blank-node
+    /// here, by the writer, so `fluree convert` has one blank-node
     /// contract across every output syntax; leave the format config's own
     /// [`BlankNodePolicy`](crate::BlankNodePolicy) at its default
     /// (`PreserveLabeled`) or it will relabel a second time.
@@ -117,6 +117,13 @@ impl<W: Write> GraphSink for JsonLdWriter<W> {
         self.graph.add_prefix(prefix, namespace_iri);
     }
 
+    /// Store the producer's own `Arc<str>` rather than a second copy. This
+    /// writer keeps a whole `Graph`, so the saving is per distinct IRI twice
+    /// over: the table entry and every triple that clones it.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.terms.iri_shared(iri)
+    }
+
     fn term_iri(&mut self, iri: &str) -> TermId {
         self.terms.iri(iri)
     }
@@ -131,6 +138,14 @@ impl<W: Write> GraphSink for JsonLdWriter<W> {
 
     fn term_literal_value(&mut self, value: LiteralValue, datatype: Datatype) -> TermId {
         self.terms.literal_value(value, datatype)
+    }
+
+    /// Honor a producer's statement-scope declaration. This writer keeps the
+    /// whole document in a `Graph` regardless — it is the document tier — but
+    /// the term table need not be a second copy of it, and every triple is
+    /// cloned into the graph before its slot can be reused.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        self.terms.set_scope(scope);
     }
 
     fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) -> SinkResult {

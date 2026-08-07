@@ -128,15 +128,39 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         let mut lexer = StreamingLexer::new(input);
         let current_token = lexer.next_token()?;
 
-        // Pre-size caches based on input length. ~20 bytes per token on
-        // average in Turtle, ~3 tokens per unique term → ~60 bytes per
-        // unique term. Cap at 2M to avoid reserving hundreds of MB for
-        // very large chunks.
-        let est_unique = (input.len() / 60).min(2_000_000);
+        // Size the caches from the CALLER's estimate, or start small when
+        // there is none.
+        //
+        // What this replaces was `input.len()/60` capped at 2M, reserved into
+        // BOTH maps unconditionally: on a 118 MB document that is ~1.97M
+        // entries each, which at hashbrown's load factor is 2 × 4.19M buckets
+        // ≈ 210 MB of empty table before a single token is read, for a document
+        // holding 800K distinct terms.
+        //
+        // The reason it moved to the caller rather than shrinking is that the
+        // cost of guessing wrong CHANGES SIGN around a million distinct terms.
+        // Below it, reserving wastes the table. Above it, growing wastes more:
+        // hashbrown doubles, the grow path holds the old table and the new one
+        // at once, and the peak runs ~1.5× the final table — about +200 MiB per
+        // in-flight chunk at 2M distinct terms, on the bulk-import path whose
+        // budget formula was calibrated with the reservation in place. Neither
+        // default is right for both, and only the caller knows which side it is
+        // on: import knows its chunk size and corpus shape, `fluree convert`
+        // is handed an arbitrary document and knows nothing.
+        //
+        // The clamp is not a second guess at the right size — it is a bound on
+        // how wrong a hint can be. A caller deriving an estimate from a chunk
+        // size can be wrong by a lot, and reserving on a bad hint should cost
+        // what the old unconditional estimate cost, not more.
+        const INITIAL_TERM_CACHE: usize = 1024;
+        const MAX_TERM_CACHE_HINT: usize = 2_000_000;
+        let reserve = options
+            .distinct_terms_hint
+            .map_or(INITIAL_TERM_CACHE, |n| n.min(MAX_TERM_CACHE_HINT));
         let mut iri_term_cache = FxHashMap::default();
-        iri_term_cache.reserve(est_unique);
+        iri_term_cache.reserve(reserve);
         let mut prefixed_term_cache = FxHashMap::default();
-        prefixed_term_cache.reserve(est_unique);
+        prefixed_term_cache.reserve(reserve);
 
         Ok(Self {
             current_graph: None,
@@ -311,8 +335,15 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             return id;
         }
         self.iri_cache_misses += 1;
-        let id = self.sink.term_iri(iri);
-        self.iri_term_cache.insert(Arc::<str>::from(iri), id);
+        // One allocation, two owners. The cache needs an `Arc<str>` for its
+        // key either way, so building it here and handing the sink a reference
+        // lets a storing sink clone the pointer instead of allocating its own
+        // copy of the same bytes — 800K allocations and ~37 MiB on a corpus
+        // with 800K distinct terms. A sink that does not override
+        // `term_iri_shared` gets the old behavior through the default body.
+        let shared = Arc::<str>::from(iri);
+        let id = self.sink.term_iri_shared(&shared);
+        self.iri_term_cache.insert(shared, id);
         id
     }
 
@@ -3775,7 +3806,7 @@ mod tests {
     // =========================================================================
 
     /// A sink that accepts `budget` triples and then fails, standing in for a
-    /// writer whose downstream pipe closed (`fluree rdf convert f.ttl | head`).
+    /// writer whose downstream pipe closed (`fluree convert f.ttl | head`).
     struct FailingSink {
         budget: usize,
         emitted: usize,

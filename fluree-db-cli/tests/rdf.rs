@@ -1,4 +1,4 @@
-//! End-to-end tests for `fluree rdf`.
+//! End-to-end tests for the RDF file verbs: `parse`, `count`, `convert`.
 //!
 //! These drive the real binary, because most of what this surface promises is
 //! only true at the process boundary: exit codes, which stream output lands
@@ -90,15 +90,15 @@ fn stdout_of(cmd: &mut Command) -> String {
 }
 
 // ============================================================================
-// check
+// parse
 // ============================================================================
 
 #[test]
-fn check_accepts_a_valid_turtle_file() {
+fn parse_accepts_a_valid_turtle_file() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .success()
@@ -106,11 +106,11 @@ fn check_accepts_a_valid_turtle_file() {
 }
 
 #[test]
-fn check_rejects_a_broken_turtle_file_with_exit_1_and_a_located_diagnostic() {
+fn parse_rejects_a_broken_turtle_file_with_exit_1_and_a_located_diagnostic() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -123,20 +123,16 @@ fn check_rejects_a_broken_turtle_file_with_exit_1_and_a_located_diagnostic() {
 }
 
 #[test]
-fn check_reads_ntriples_by_extension() {
+fn parse_reads_ntriples_by_extension() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.nt", VALID_NTRIPLES);
-    rdf_cmd()
-        .args(["rdf", "check"])
-        .arg(&path)
-        .assert()
-        .success();
+    rdf_cmd().args(["parse"]).arg(&path).assert().success();
 }
 
 #[test]
-fn check_reads_stdin_when_no_file_is_named() {
+fn parse_reads_stdin_when_no_file_is_named() {
     rdf_cmd()
-        .args(["rdf", "check", "--syntax", "turtle"])
+        .args(["parse", "--syntax", "turtle"])
         .write_stdin(VALID_TURTLE)
         .assert()
         .success()
@@ -144,54 +140,50 @@ fn check_reads_stdin_when_no_file_is_named() {
 }
 
 #[test]
-fn check_reads_stdin_when_the_file_is_a_dash() {
+fn parse_reads_stdin_when_the_file_is_a_dash() {
     rdf_cmd()
-        .args(["rdf", "check", "-"])
+        .args(["parse", "-"])
         .write_stdin(VALID_TURTLE)
         .assert()
         .success();
 }
 
 #[test]
-fn check_sniffs_the_syntax_of_a_pipe_with_no_flag() {
+fn parse_sniffs_the_syntax_of_a_pipe_with_no_flag() {
     // Nothing names the syntax: no extension, no --syntax. The leading
     // `@prefix` has to be enough.
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .write_stdin(VALID_TURTLE)
         .assert()
         .success();
 }
 
 #[test]
-fn check_decompresses_a_gzipped_file() {
+fn parse_decompresses_a_gzipped_file() {
     let tmp = TempDir::new().unwrap();
     let path = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
-    rdf_cmd()
-        .args(["rdf", "check"])
-        .arg(&path)
-        .assert()
-        .success();
+    rdf_cmd().args(["parse"]).arg(&path).assert().success();
 }
 
 #[test]
-fn check_decompresses_a_gzipped_pipe_from_its_magic_bytes() {
+fn parse_decompresses_a_gzipped_pipe_from_its_magic_bytes() {
     // A pipe has no suffix to read. Without magic-byte detection this is a
     // UTF-8 error on compressed bytes.
     let tmp = TempDir::new().unwrap();
     let path = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
     let bytes = std::fs::read(&path).unwrap();
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "check", "--syntax", "turtle"]);
+    cmd.args(["parse", "--syntax", "turtle"]);
     cmd.write_stdin(bytes).assert().success();
 }
 
 #[test]
-fn check_json_format_reports_the_diagnostic_with_offsets() {
+fn parse_json_format_reports_the_diagnostic_with_offsets() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     let out = rdf_cmd()
-        .args(["rdf", "check", "--format", "json"])
+        .args(["parse", "--format", "json"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -214,23 +206,23 @@ fn check_json_format_reports_the_diagnostic_with_offsets() {
 }
 
 #[test]
-fn check_json_format_on_a_clean_document_reports_an_empty_diagnostic_array() {
+fn parse_json_format_on_a_clean_document_reports_an_empty_diagnostic_array() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "check", "--format", "json"]).arg(&path);
+    cmd.args(["parse", "--format", "json"]).arg(&path);
     let v: serde_json::Value = serde_json::from_str(&stdout_of(&mut cmd)).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["diagnostics"].as_array().unwrap().len(), 0);
 }
 
 #[test]
-fn check_under_quiet_says_nothing_on_success_and_still_exits_0() {
+fn parse_under_quiet_says_nothing_on_success_and_still_exits_0() {
     // The loop-over-ten-thousand-files case: the exit code is the answer.
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["-q", "rdf", "check"])
+        .args(["-q", "parse"])
         .arg(&path)
         .assert()
         .success()
@@ -247,7 +239,7 @@ fn count_reports_the_triple_count_of_a_known_fixture() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "count"])
+        .args(["count"])
         .arg(&path)
         .assert()
         .success()
@@ -262,11 +254,11 @@ fn count_under_quiet_prints_only_the_number() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).arg(&path);
+    cmd.args(["-q", "count"]).arg(&path);
     assert_eq!(
         stdout_of(&mut cmd).trim(),
         VALID_TURTLE_TRIPLES.to_string(),
-        "`$(fluree rdf count -q f.ttl)` has to be usable as a number"
+        "`$(fluree count -q f.ttl)` has to be usable as a number"
     );
 }
 
@@ -282,7 +274,7 @@ fn count_of_a_collection_matches_the_rdf_spine_not_flattened_list_items() {
         "<http://e/s> <http://e/p> ( \"a\" \"b\" \"c\" ) .\n",
     );
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).arg(&path);
+    cmd.args(["-q", "count"]).arg(&path);
     assert_eq!(stdout_of(&mut cmd).trim(), "7");
 }
 
@@ -291,7 +283,7 @@ fn count_reads_a_zstd_file() {
     let tmp = TempDir::new().unwrap();
     let path = zst_fixture(&tmp, "valid.ttl.zst", VALID_TURTLE);
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).arg(&path);
+    cmd.args(["-q", "count"]).arg(&path);
     assert_eq!(stdout_of(&mut cmd).trim(), VALID_TURTLE_TRIPLES.to_string());
 }
 
@@ -302,16 +294,16 @@ fn count_reads_a_gzipped_file_and_agrees_with_the_plain_one() {
     let gz = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
 
     let mut a = rdf_cmd();
-    a.args(["-q", "rdf", "count"]).arg(&plain);
+    a.args(["-q", "count"]).arg(&plain);
     let mut b = rdf_cmd();
-    b.args(["-q", "rdf", "count"]).arg(&gz);
+    b.args(["-q", "count"]).arg(&gz);
     assert_eq!(stdout_of(&mut a), stdout_of(&mut b));
 }
 
 #[test]
 fn count_reads_stdin() {
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).write_stdin(VALID_NTRIPLES);
+    cmd.args(["-q", "count"]).write_stdin(VALID_NTRIPLES);
     assert_eq!(stdout_of(&mut cmd).trim(), "2");
 }
 
@@ -320,7 +312,7 @@ fn count_refuses_to_print_a_partial_number_for_a_broken_document() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     rdf_cmd()
-        .args(["rdf", "count"])
+        .args(["count"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -333,7 +325,7 @@ fn count_time_writes_to_stderr_so_stdout_stays_pipeable() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let out = rdf_cmd()
-        .args(["-q", "rdf", "count", "--time"])
+        .args(["-q", "count", "--time"])
         .arg(&path)
         .assert()
         .success()
@@ -360,7 +352,7 @@ fn an_explicit_syntax_overrides_a_misleading_extension() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "actually-turtle.nq", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check", "--syntax", "turtle"])
+        .args(["parse", "--syntax", "turtle"])
         .arg(&path)
         .assert()
         .success();
@@ -375,7 +367,7 @@ fn a_syntax_with_no_reader_is_refused_by_name_with_what_it_waits_on() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "data.rdf", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "count"])
+        .args(["count"])
         .arg(&path)
         .assert()
         .code(EXIT_USAGE)
@@ -388,7 +380,7 @@ fn a_syntax_with_no_reader_is_refused_by_name_with_what_it_waits_on() {
 /// The scanner sliced the 4/8-byte hex window by byte index after checking
 /// only that the bytes existed. A multi-byte character straddling that window
 /// is not a char boundary, so the slice panicked and took the process with it
-/// — exit 101 out of `fluree rdf check`, on input a user can trivially have.
+/// — exit 101 out of `fluree parse`, on input a user can trivially have.
 /// Both escape positions (literal and IRI) went through the same scanner.
 #[test]
 fn a_multibyte_char_in_an_escape_window_is_an_error_not_a_panic() {
@@ -414,12 +406,12 @@ fn a_multibyte_char_in_an_escape_window_is_an_error_not_a_panic() {
         // a panic also fails `success()`, so that weaker assertion would
         // have passed against the bug.
         rdf_cmd()
-            .args(["rdf", "check"])
+            .args(["parse"])
             .arg(&path)
             .assert()
             .code(EXIT_DOCUMENT_INVALID);
         rdf_cmd()
-            .args(["rdf", "convert"])
+            .args(["convert"])
             .arg(&path)
             .arg("--syntax")
             .arg("nquads")
@@ -444,7 +436,7 @@ fn a_signed_hex_payload_is_refused_not_decoded() {
     ] {
         let path = fixture(&tmp, name, body);
         rdf_cmd()
-            .args(["rdf", "check"])
+            .args(["parse"])
             .arg(&path)
             .assert()
             .code(EXIT_DOCUMENT_INVALID);
@@ -463,7 +455,7 @@ fn well_formed_escapes_still_decode() {
     );
     let out = tmp.path().join("ok.out.nq");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .arg("-o")
         .arg(&out)
@@ -495,7 +487,7 @@ fn repeated_subject_blocks_round_trip_through_the_new_readers() {
 
     let written = tmp.path().join("written.trig");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&src)
         .arg("-o")
         .arg(&written)
@@ -513,7 +505,7 @@ fn repeated_subject_blocks_round_trip_through_the_new_readers() {
     // Now read THAT back through the TriG reader and out as N-Quads.
     let quads = tmp.path().join("rep.nq");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&written)
         .arg("-o")
         .arg(&quads)
@@ -539,7 +531,7 @@ fn repeated_subject_blocks_round_trip_through_the_new_readers() {
     // are presentation, not statements.
     let again = tmp.path().join("again.trig");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&quads)
         .arg("-o")
         .arg(&again)
@@ -548,7 +540,7 @@ fn repeated_subject_blocks_round_trip_through_the_new_readers() {
 
     let back = tmp.path().join("back.nq");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&again)
         .arg("-o")
         .arg(&back)
@@ -587,7 +579,7 @@ fn a_dataset_round_trips_through_trig_and_nquads() {
     let back = tmp.path().join("back.trig");
 
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&src)
         .arg("-o")
         .arg(&nq)
@@ -607,7 +599,7 @@ fn a_dataset_round_trips_through_trig_and_nquads() {
     );
 
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&nq)
         .arg("-o")
         .arg(&back)
@@ -626,7 +618,7 @@ fn an_unidentifiable_input_names_the_flag_instead_of_guessing() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "mystery", "42 is not a document\n");
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .code(EXIT_USAGE)
@@ -641,7 +633,7 @@ fn binary_input_is_reported_as_binary_not_as_an_unknown_syntax() {
     let path = tmp.path().join("mystery");
     std::fs::write(&path, [0xff, 0xfe, 0x00, 0x01]).unwrap();
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .code(EXIT_USAGE)
@@ -654,7 +646,7 @@ fn syntax_aliases_are_accepted() {
     let path = fixture(&tmp, "data.txt", VALID_NTRIPLES);
     for alias in ["nt", "ntriples", "n-triples"] {
         rdf_cmd()
-            .args(["rdf", "check", "--syntax", alias])
+            .args(["parse", "--syntax", alias])
             .arg(&path)
             .assert()
             .success();
@@ -670,7 +662,7 @@ fn a_missing_file_exits_2_not_1() {
     // The contract that makes these verbs scriptable: 1 means the RDF is
     // bad, 2 means the invocation is.
     rdf_cmd()
-        .args(["rdf", "check", "/nonexistent/nope.ttl"])
+        .args(["parse", "/nonexistent/nope.ttl"])
         .assert()
         .code(EXIT_USAGE)
         .stderr(predicate::str::contains("nope.ttl"));
@@ -680,7 +672,7 @@ fn a_missing_file_exits_2_not_1() {
 fn a_directory_given_as_input_exits_2() {
     let tmp = TempDir::new().unwrap();
     rdf_cmd()
-        .args(["rdf", "count", "--syntax", "turtle"])
+        .args(["count", "--syntax", "turtle"])
         .arg(tmp.path())
         .assert()
         .code(EXIT_USAGE);
@@ -701,13 +693,13 @@ fn every_exit_code_in_the_contract_is_reachable() {
         cmd.assert().get_output().status.code().unwrap()
     };
 
-    assert_eq!(code(&["rdf", "check"], Some(&valid)), 0);
-    assert_eq!(code(&["rdf", "check"], Some(&broken)), 1);
-    assert_eq!(code(&["rdf", "check", "/no/such.ttl"], None), 2);
+    assert_eq!(code(&["parse"], Some(&valid)), 0);
+    assert_eq!(code(&["parse"], Some(&broken)), 1);
+    assert_eq!(code(&["parse", "/no/such.ttl"], None), 2);
 }
 
 // ============================================================================
-// convert (stub)
+// convert defaults
 // ============================================================================
 
 #[test]
@@ -717,7 +709,7 @@ fn convert_writes_the_default_syntax_when_nothing_names_one() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "convert"]).arg(&path);
+    cmd.args(["convert"]).arg(&path);
     let out = stdout_of(&mut cmd);
 
     assert_eq!(out.lines().count(), VALID_TURTLE_TRIPLES as usize);
@@ -736,7 +728,7 @@ fn profile_json_carries_the_whole_schema_and_lands_on_stderr() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let out = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json"])
+        .args(["-q", "count", "--profile=json"])
         .arg(&path)
         .assert()
         .success()
@@ -793,7 +785,7 @@ fn profile_json_records_which_rule_resolved_the_syntax() {
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
 
     let explicit = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--syntax", "turtle"])
+        .args(["-q", "count", "--profile=json", "--syntax", "turtle"])
         .arg(&path)
         .assert()
         .success()
@@ -804,7 +796,7 @@ fn profile_json_records_which_rule_resolved_the_syntax() {
     assert_eq!(v["corpus"]["syntax_source"], "explicit");
 
     let sniffed = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json"])
+        .args(["-q", "count", "--profile=json"])
         .write_stdin(VALID_TURTLE)
         .assert()
         .success()
@@ -821,7 +813,7 @@ fn profile_json_reports_the_compression_layer_and_both_byte_counts() {
     let tmp = TempDir::new().unwrap();
     let path = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json"])
+        .args(["-q", "count", "--profile=json"])
         .arg(&path)
         .assert()
         .success()
@@ -854,7 +846,7 @@ fn no_hash_omits_the_fingerprint_entirely() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -879,7 +871,7 @@ fn the_same_document_fingerprints_identically_plain_and_compressed() {
 
     let hash_of = |path: &Path| -> String {
         let stderr = rdf_cmd()
-            .args(["-q", "rdf", "count", "--profile=json"])
+            .args(["-q", "count", "--profile=json"])
             .arg(path)
             .assert()
             .success()
@@ -898,7 +890,7 @@ fn profile_human_prints_a_table_to_stderr() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile"])
+        .args(["-q", "count", "--profile"])
         .arg(&path)
         .assert()
         .success()
@@ -909,11 +901,11 @@ fn profile_human_prints_a_table_to_stderr() {
 }
 
 #[test]
-fn profile_works_on_check_as_well_as_count() {
+fn profile_works_on_parse_as_well_as_count() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "check", "--profile=json"])
+        .args(["-q", "parse", "--profile=json"])
         .arg(&path)
         .assert()
         .success()
@@ -921,7 +913,29 @@ fn profile_works_on_check_as_well_as_count() {
         .stderr
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
-    assert_eq!(v["verb"], "check");
+    // The verb as typed, not the module it dispatches into. A baseline whose
+    // `verb` names a command that is not in `--help` sends whoever reads it
+    // looking for one.
+    assert_eq!(v["verb"], "parse");
+}
+
+#[test]
+fn the_alias_still_reports_the_verb_it_dispatched_to() {
+    // `check` is the spelling that works, `parse` is the spelling that is
+    // documented — a profile taken through the alias has to say the latter,
+    // or two baselines of the same run disagree on what ran.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let stderr = rdf_cmd()
+        .args(["-q", "check", "--profile=json"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(v["verb"], "parse");
 }
 
 #[test]
@@ -933,7 +947,7 @@ fn the_sink_estimate_declines_to_report_a_number_it_cannot_resolve() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", &VALID_TURTLE.repeat(400));
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -996,7 +1010,7 @@ fn git_sha_names_the_build_not_whatever_checkout_the_shell_is_in() {
     let corpus = fixture(&tmp, "valid.ttl", VALID_TURTLE);
     let stderr = rdf_cmd()
         .current_dir(&repo)
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&corpus)
         .assert()
         .success()
@@ -1020,7 +1034,7 @@ fn the_sink_line_is_absent_when_nothing_reached_the_sink() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "empty.ttl", "");
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -1032,7 +1046,7 @@ fn the_sink_line_is_absent_when_nothing_reached_the_sink() {
     assert!(v["sink"]["floor_ns_per_call"].is_null());
 
     let human = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile", "--no-hash"])
+        .args(["-q", "count", "--profile", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -1053,7 +1067,7 @@ fn the_below_floor_bound_is_stated_per_call_not_as_an_aggregate() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", &VALID_TURTLE.repeat(400));
     let out = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile", "--no-hash"])
+        .args(["-q", "count", "--profile", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -1064,7 +1078,7 @@ fn the_below_floor_bound_is_stated_per_call_not_as_an_aggregate() {
     assert!(text.contains("per call"), "{text}");
 
     let json = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -1092,7 +1106,7 @@ fn the_trusted_verdict_is_split_so_a_gate_can_key_on_the_phases() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", &VALID_TURTLE.repeat(400));
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .success()
@@ -1113,7 +1127,7 @@ fn profiling_a_broken_document_still_emits_the_profile() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     let stderr = rdf_cmd()
-        .args(["rdf", "count", "--profile=json", "--no-hash"])
+        .args(["count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -1133,7 +1147,7 @@ fn profiling_a_broken_document_still_emits_the_profile() {
 #[test]
 fn profile_written_with_a_space_says_so_instead_of_hunting_for_a_file() {
     rdf_cmd()
-        .args(["rdf", "count", "--profile", "json"])
+        .args(["count", "--profile", "json"])
         .assert()
         .code(EXIT_USAGE)
         .stderr(predicate::str::contains("--profile=json"));
@@ -1146,20 +1160,12 @@ fn empty_input_exits_0_whether_it_is_a_file_or_a_pipe() {
     // the empty graph in every syntax.
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "empty.ttl", "");
-    rdf_cmd()
-        .args(["rdf", "check"])
-        .arg(&path)
-        .assert()
-        .success();
+    rdf_cmd().args(["parse"]).arg(&path).assert().success();
 
-    rdf_cmd()
-        .args(["rdf", "check"])
-        .write_stdin("")
-        .assert()
-        .success();
+    rdf_cmd().args(["parse"]).write_stdin("").assert().success();
 
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).write_stdin("");
+    cmd.args(["-q", "count"]).write_stdin("");
     assert_eq!(stdout_of(&mut cmd).trim(), "0");
 }
 
@@ -1175,7 +1181,7 @@ fn a_byte_order_mark_does_not_defeat_syntax_detection() {
         "\u{feff}<http://e/s> <http://e/p> \"o\" .\n",
     );
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .args(["-q", "count", "--profile=json", "--no-hash"])
         .arg(&path)
         .assert()
         .get_output()
@@ -1193,23 +1199,89 @@ fn a_byte_order_mark_does_not_defeat_syntax_detection() {
 // ============================================================================
 
 #[test]
-fn rdf_help_lists_every_verb() {
-    rdf_cmd()
-        .args(["rdf", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("check"))
-        .stdout(predicate::str::contains("count"))
-        .stdout(predicate::str::contains("convert"));
+fn every_verb_is_in_the_top_level_help() {
+    // They are top-level commands now, so the top-level help is the only
+    // place a user can discover them — there is no group page to drill into.
+    let mut cmd = rdf_cmd();
+    cmd.arg("--help");
+    let help = stdout_of(&mut cmd);
+    for verb in ["parse", "count", "convert"] {
+        assert!(help.contains(verb), "top-level help omits {verb}:\n{help}");
+    }
 }
 
 #[test]
-fn rdf_appears_in_the_top_level_help() {
+fn the_rdf_group_is_gone() {
+    // Pins the dissolution. `rdf` was never released — every PR carrying it
+    // is unmerged — so there is deliberately no compat shim, and a shim that
+    // came back later would silently reintroduce the two-word surface this
+    // rename removed. It has to fail as an unknown subcommand.
     rdf_cmd()
-        .arg("--help")
+        .args(["rdf", "convert", "f.ttl"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("rdf"));
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
+
+    let mut cmd = rdf_cmd();
+    cmd.arg("--help");
+    let help = stdout_of(&mut cmd);
+    for line in help.lines() {
+        assert!(
+            !line.trim_start().starts_with("rdf "),
+            "top-level help still advertises an `rdf` command: {line}"
+        );
+    }
+}
+
+#[test]
+fn check_is_a_hidden_alias_for_parse() {
+    // Muscle memory from the group era still works…
+    let tmp = TempDir::new().unwrap();
+    let ok = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let bad = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
+
+    rdf_cmd().args(["check"]).arg(&ok).assert().success();
+    rdf_cmd()
+        .args(["check"])
+        .arg(&bad)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID);
+
+    // …and it really is `parse`, not a second implementation: the flag only
+    // `parse` has resolves, and the profile names the verb the user should
+    // be typing rather than the alias they typed.
+    let mut cmd = rdf_cmd();
+    cmd.args(["check", "--format", "json"]).arg(&ok);
+    let report: serde_json::Value = serde_json::from_str(&stdout_of(&mut cmd)).unwrap();
+    assert_eq!(report["schema"], "fluree.rdf.check.v1");
+
+    // …but it stays out of `--help`, because listing both spellings would put
+    // the ambiguity with `validate` back on the page the rename cleared.
+    //
+    // Asserted against clap's rendering rather than the line's first word: a
+    // visible alias is not a row of its own, it is an `[aliases: check]` tail
+    // on `parse`'s row, so a test that only checked how rows *start* would
+    // pass with the alias fully advertised.
+    let mut cmd = rdf_cmd();
+    cmd.arg("--help");
+    let help = stdout_of(&mut cmd);
+    let parse_row = help
+        .lines()
+        .find(|l| l.trim_start().starts_with("parse "))
+        .unwrap_or_else(|| panic!("top-level help lists no `parse` row:\n{help}"));
+    assert!(
+        !parse_row.contains("aliases:"),
+        "the `check` alias must stay hidden; clap advertises visible ones: {parse_row}"
+    );
+    // Scoped to command rows, not the whole help text: a future top-level
+    // verb whose one-line description mentions "checks" (a `doctor`, say)
+    // must not read as a phantom alias regression. What this guards is
+    // someone adding `check` back as a real command.
+    let check_row = help.lines().find(|l| l.trim_start().starts_with("check"));
+    assert!(
+        check_row.is_none(),
+        "no top-level command row may be named `check`: {check_row:?}"
+    );
 }
 
 #[test]
@@ -1217,7 +1289,7 @@ fn count_help_lists_every_nameable_syntax_including_the_unbuilt_ones() {
     // Naming a syntax is how a user finds out it is not built yet, so the
     // full set has to be discoverable from help.
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "count", "--help"]);
+    cmd.args(["count", "--help"]);
     let help = stdout_of(&mut cmd);
     for syntax in [
         "turtle", "ntriples", "nquads", "trig", "jsonld", "rdfxml", "rdfjson", "jelly",
@@ -1233,12 +1305,12 @@ fn no_rdf_verb_requires_a_fluree_directory() {
     // with HOME redirected so the global-config fallback cannot rescue it.
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
-    for verb in ["check", "count"] {
+    for verb in ["parse", "count"] {
         let mut cmd = rdf_cmd();
         cmd.current_dir(tmp.path());
         cmd.env("HOME", tmp.path());
         cmd.env("FLUREE_HOME", tmp.path().join("nowhere"));
-        cmd.args(["rdf", verb]).arg(&path).assert().success();
+        cmd.args([verb]).arg(&path).assert().success();
     }
 }
 
@@ -1426,7 +1498,7 @@ fn next_permutation(items: &mut [usize]) -> bool {
 
 fn convert_to_string(path: &Path, to: &str) -> String {
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "convert"]).arg(path).args(["--to", to]);
+    cmd.args(["convert"]).arg(path).args(["--to", to]);
     stdout_of(&mut cmd)
 }
 
@@ -1659,7 +1731,7 @@ fn the_output_file_extension_picks_the_syntax_and_the_flag_overrides_it() {
 
     let by_ext = tmp.path().join("out.nt");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(&by_ext)
@@ -1670,7 +1742,7 @@ fn the_output_file_extension_picks_the_syntax_and_the_flag_overrides_it() {
     // --to wins over an extension that says otherwise.
     let overridden = tmp.path().join("out2.nt");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(&overridden)
@@ -1687,7 +1759,7 @@ fn convert_reads_stdin_and_a_gzipped_file() {
     let tmp = TempDir::new().unwrap();
 
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "convert", "--syntax", "turtle", "--to", "nt"])
+    cmd.args(["convert", "--syntax", "turtle", "--to", "nt"])
         .write_stdin(VALID_TURTLE);
     let from_stdin = stdout_of(&mut cmd);
     assert_eq!(from_stdin.lines().count(), VALID_TURTLE_TRIPLES as usize);
@@ -1714,7 +1786,7 @@ fn a_closed_downstream_pipe_ends_the_run_quietly() {
     let path = fixture(&tmp, "big.ttl", &big);
 
     let mut convert = StdCommand::new(assert_cmd::cargo::cargo_bin!("fluree"))
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "nt"])
         .env("NO_COLOR", "1")
@@ -1750,7 +1822,7 @@ fn converting_a_broken_document_exits_1_and_says_the_output_is_partial() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "nt"])
         .assert()
@@ -1766,7 +1838,7 @@ fn an_output_syntax_with_no_writer_is_refused_by_name() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "rdfxml"])
         .assert()
@@ -1780,7 +1852,7 @@ fn a_compressed_output_name_is_refused_rather_than_written_plain() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .arg("-o")
         .arg(tmp.path().join("out.nt.gz"))
@@ -1795,7 +1867,7 @@ fn pretty_is_refused_rather_than_silently_ignored() {
     let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
     // Wrong syntax for it: the flag itself is the complaint.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "nt", "--pretty"])
         .assert()
@@ -1805,7 +1877,7 @@ fn pretty_is_refused_rather_than_silently_ignored() {
     // Right syntax, but not built: say so rather than emit blocks-tier output
     // under a flag that promised something else.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "turtle", "--pretty"])
         .assert()
@@ -1825,7 +1897,7 @@ fn the_bnode_policy_flag_changes_which_labels_come_out() {
     );
 
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "convert"])
+    cmd.args(["convert"])
         .arg(&path)
         .args(["--to", "nt", "--bnode-policy", "preserve"]);
     let preserved = stdout_of(&mut cmd);
@@ -1880,7 +1952,7 @@ fn over_threshold_blanks(head: &str) -> String {
 
 fn convert_preserving(path: &Path, threads: &str) -> String {
     let mut cmd = rdf_cmd();
-    cmd.args(["--parallelism", threads, "rdf", "convert"])
+    cmd.args(["--parallelism", threads, "convert"])
         .arg(path)
         .args(["--to", "nt", "--bnode-policy", "preserve"]);
     stdout_of(&mut cmd)
@@ -1895,7 +1967,7 @@ fn preserving_labels_says_so_in_the_profile() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&input)
         .arg("-o")
         .arg(&out)
@@ -1940,7 +2012,7 @@ fn supplied_prefixes_compact_turtle_output() {
     );
 
     let mut cmd = rdf_cmd();
-    cmd.args(["rdf", "convert"]).arg(&path).args([
+    cmd.args(["convert"]).arg(&path).args([
         "--to",
         "turtle",
         "--prefixes",
@@ -1966,7 +2038,7 @@ fn convert_profile_json_carries_the_serialize_and_write_phases() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "convert"])
+        .args(["-q", "convert"])
         .arg(&path)
         .arg("-o")
         .arg(&out)
@@ -2003,7 +2075,7 @@ fn convert_time_reports_the_statements_it_wrote() {
     let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
     let out = tmp.path().join("out.nt");
     rdf_cmd()
-        .args(["-q", "rdf", "convert"])
+        .args(["-q", "convert"])
         .arg(&path)
         .arg("-o")
         .arg(&out)
@@ -2021,7 +2093,7 @@ fn a_conversion_to_a_file_reports_what_it_wrote_and_a_pipe_stays_clean() {
     // To a file: a summary is useful.
     let out = tmp.path().join("out.nt");
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .arg("-o")
         .arg(&out)
@@ -2031,7 +2103,7 @@ fn a_conversion_to_a_file_reports_what_it_wrote_and_a_pipe_stays_clean() {
 
     // To stdout: the same line would sit beside the data it describes.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&path)
         .args(["--to", "nt"])
         .assert()
@@ -2047,7 +2119,7 @@ fn convert_needs_no_fluree_directory_either() {
     cmd.current_dir(tmp.path());
     cmd.env("HOME", tmp.path());
     cmd.env("FLUREE_HOME", tmp.path().join("nowhere"));
-    cmd.args(["rdf", "convert"])
+    cmd.args(["convert"])
         .arg(&path)
         .args(["--to", "nt"])
         .assert()
@@ -2064,7 +2136,7 @@ fn a_prefix_namespace_that_is_not_an_iri_is_refused_before_anything_is_written()
 
     // Inline form.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "turtle", "--prefixes", r#"{"ok":"not an iri"}"#])
         .assert()
@@ -2077,7 +2149,7 @@ fn a_prefix_namespace_that_is_not_an_iri_is_refused_before_anything_is_written()
     // File form, through a @context wrapper — the shape a user actually has.
     let ctx = fixture(&tmp, "ctx.json", r#"{"@context":{"bad":"nope"}}"#);
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "turtle"])
         .arg("--prefixes")
@@ -2089,7 +2161,7 @@ fn a_prefix_namespace_that_is_not_an_iri_is_refused_before_anything_is_written()
 
     // And a good namespace still works, so the check is not just "refuse".
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args([
             "--to",
@@ -2113,7 +2185,7 @@ fn a_prefixes_argument_of_the_wrong_json_shape_says_so() {
         (r#""x""#, "a string"),
     ] {
         rdf_cmd()
-            .args(["rdf", "convert"])
+            .args(["convert"])
             .arg(&input)
             .args(["--to", "turtle", "--prefixes", arg])
             .assert()
@@ -2125,7 +2197,7 @@ fn a_prefixes_argument_of_the_wrong_json_shape_says_so() {
     }
     // A genuinely missing path still reports a missing path.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "turtle", "--prefixes", "/nonexistent/ctx.json"])
         .assert()
@@ -2148,7 +2220,7 @@ fn a_refusal_names_its_cause_not_the_latch_and_offers_a_remedy() {
     );
 
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&collide)
         .args(["--to", "nt", "--bnode-policy", "preserve"])
         .assert()
@@ -2174,7 +2246,7 @@ fn a_refusal_names_its_cause_not_the_latch_and_offers_a_remedy() {
         ),
     );
     rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&big)
         .args(["--to", "nt", "--bnode-policy", "preserve"])
         .assert()
@@ -2193,7 +2265,7 @@ fn a_refusal_that_needs_no_input_does_not_truncate_the_output_file() {
     std::fs::write(&victim, "PRE-EXISTING\n").unwrap();
 
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(&victim)
@@ -2218,7 +2290,7 @@ fn profile_json_output_is_not_corrupted_by_the_completion_summary() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(&out)
@@ -2239,7 +2311,7 @@ fn profile_json_output_is_not_corrupted_by_the_completion_summary() {
 
     // The human profile still gets its summary, since nothing is parsing it.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(&out)
@@ -2257,7 +2329,7 @@ fn a_refusal_blames_the_output_syntax_the_way_it_was_chosen() {
     let input = fixture(&tmp, "in.ttl", VALID_TURTLE);
 
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("--pretty")
         .assert()
@@ -2267,7 +2339,7 @@ fn a_refusal_blames_the_output_syntax_the_way_it_was_chosen() {
 
     // Named explicitly: blame the flag.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nq", "--pretty"])
         .assert()
@@ -2276,7 +2348,7 @@ fn a_refusal_blames_the_output_syntax_the_way_it_was_chosen() {
 
     // From the extension: blame the extension.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .arg("-o")
         .arg(tmp.path().join("out.nq"))
@@ -2301,11 +2373,11 @@ const BAD_TERM_TURTLE: &str = concat!(
 const BAD_LANG_TURTLE: &str = "<http://example.org/s> <http://example.org/p> \"string\"@1 .\n";
 
 #[test]
-fn check_rejects_a_document_whose_terms_are_not_terms() {
+fn parse_rejects_a_document_whose_terms_are_not_terms() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "bad-term.ttl", BAD_TERM_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -2316,11 +2388,11 @@ fn check_rejects_a_document_whose_terms_are_not_terms() {
 }
 
 #[test]
-fn check_rejects_a_malformed_language_tag() {
+fn parse_rejects_a_malformed_language_tag() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "bad-lang.ttl", BAD_LANG_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -2335,7 +2407,7 @@ fn nocheck_accepts_what_validation_rejects() {
     for (name, content) in [("t.ttl", BAD_TERM_TURTLE), ("l.ttl", BAD_LANG_TURTLE)] {
         let path = fixture(&tmp, name, content);
         rdf_cmd()
-            .args(["rdf", "check", "--nocheck"])
+            .args(["parse", "--nocheck"])
             .arg(&path)
             .assert()
             .success()
@@ -2350,7 +2422,7 @@ fn nocheck_does_not_disable_syntax_checking() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
     rdf_cmd()
-        .args(["rdf", "check", "--nocheck"])
+        .args(["parse", "--nocheck"])
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
@@ -2361,13 +2433,9 @@ fn nocheck_does_not_disable_syntax_checking() {
 fn count_validates_by_default_and_nocheck_opts_out() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "bad-term.ttl", BAD_TERM_TURTLE);
+    rdf_cmd().args(["count"]).arg(&path).assert().failure();
     rdf_cmd()
-        .args(["rdf", "count"])
-        .arg(&path)
-        .assert()
-        .failure();
-    rdf_cmd()
-        .args(["rdf", "count", "--nocheck"])
+        .args(["count", "--nocheck"])
         .arg(&path)
         .assert()
         .success();
@@ -2382,7 +2450,7 @@ fn the_profile_reports_whether_terms_were_validated() {
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
 
     let out = rdf_cmd()
-        .args(["rdf", "count", "--profile=json"])
+        .args(["count", "--profile=json"])
         .arg(&path)
         .assert()
         .success()
@@ -2393,7 +2461,7 @@ fn the_profile_reports_whether_terms_were_validated() {
     assert_eq!(v["validated"], serde_json::json!(true));
 
     let out = rdf_cmd()
-        .args(["rdf", "count", "--profile=json", "--nocheck"])
+        .args(["count", "--profile=json", "--nocheck"])
         .arg(&path)
         .assert()
         .success()
@@ -2404,6 +2472,135 @@ fn the_profile_reports_whether_terms_were_validated() {
     assert_eq!(v["validated"], serde_json::json!(false));
 }
 
+/// Two statements whose language tags are not language tags. Small, because
+/// the site that reads it is serial whatever the document's size.
+const BAD_LANG_PAIR: &str = "@prefix ex: <http://example.org/> .\n\
+                             ex:a ex:p \"one\"@1 .\n\
+                             ex:b ex:p \"two\"@1 .\n";
+
+/// The same defect, past the parallel gate.
+///
+/// Every statement lexes and parses; only term validation rejects them, which
+/// is exactly what `--nocheck` turns off. Sized past the gate on purpose: the
+/// flag was honoured on the serial path and hardcoded away everywhere else, so
+/// a fixture under the gate would have exercised the one site that worked.
+fn bad_langtag_corpus() -> String {
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..60_000 {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:p \"a literal wide enough to reach the parallel threshold {i}\"@1 .\n"
+        ));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate — it would \
+         convert serially and prove nothing about the parallel site",
+        ttl.len()
+    );
+    ttl
+}
+
+/// The three places `convert` can reach a parser. `--nocheck` reached one.
+#[derive(Copy, Clone)]
+enum ParseSite {
+    /// `rdf::parse_into`, which honoured the flag all along.
+    Serial,
+    /// `write_chunk`, once per worker.
+    Parallel,
+    /// `parse_recovering`, once per resync.
+    Recovery,
+}
+
+impl ParseSite {
+    const ALL: [Self; 3] = [Self::Serial, Self::Parallel, Self::Recovery];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Serial => "--parallelism 1",
+            Self::Parallel => "--parallelism 8",
+            Self::Recovery => "--continue-on-error",
+        }
+    }
+
+    fn command(self, input: &Path, nocheck: bool) -> Command {
+        let mut cmd = rdf_cmd();
+        match self {
+            Self::Serial => cmd.args(["--parallelism", "1"]),
+            Self::Parallel => cmd.args(["--parallelism", "8"]),
+            Self::Recovery => &mut cmd,
+        };
+        cmd.args(["convert"]).arg(input).args(["--to", "nt"]);
+        if matches!(self, Self::Recovery) {
+            cmd.arg("--continue-on-error");
+        }
+        if nocheck {
+            cmd.arg("--nocheck");
+        }
+        cmd
+    }
+}
+
+#[test]
+fn nocheck_reaches_every_parse_site() {
+    // `--nocheck` was threaded into `rdf::parse_into` and built from nothing
+    // at the other three sites, so above the 4 MiB gate the same document
+    // exited 0 at `--parallelism 1` and 1 at `--parallelism 8`. The flag is
+    // documented never to be a correctness decision, and that is one.
+    let tmp = TempDir::new().unwrap();
+    let big = fixture(&tmp, "bad-lang-big.ttl", &bad_langtag_corpus());
+    let small = fixture(&tmp, "bad-lang-small.ttl", BAD_LANG_PAIR);
+
+    for site in ParseSite::ALL {
+        // Recovery is serial by construction, so its site needs no bulk — and
+        // without `--nocheck` it resyncs once per bad statement, which on the
+        // big fixture would be 60,000 re-parses.
+        let input = match site {
+            ParseSite::Recovery => &small,
+            _ => &big,
+        };
+        site.command(input, true)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("skipped").not());
+        site.command(input, false)
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID);
+        let _ = site.name();
+    }
+}
+
+#[test]
+fn nocheck_converts_identically_at_every_width() {
+    // Agreeing on the exit code is not enough. `--nocheck` turns off a check,
+    // not a parser, so the two widths must produce the same document — the
+    // failure this guards against is a parallel path that accepts the file by
+    // reading it with different options rather than the same ones.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "bad-lang.ttl", &bad_langtag_corpus());
+
+    let mut produced: Vec<Vec<u8>> = Vec::new();
+    for threads in ["1", "8"] {
+        let out = tmp.path().join(format!("out{threads}.nt"));
+        rdf_cmd()
+            .args(["--parallelism", threads, "-q", "convert"])
+            .arg(&input)
+            .args(["--to", "nt", "--nocheck"])
+            .arg("-o")
+            .arg(&out)
+            .assert()
+            .success();
+        produced.push(std::fs::read(&out).unwrap());
+    }
+    // Compared by hand rather than with assert_eq!, which would print two
+    // twenty-megabyte vectors on failure.
+    assert!(
+        produced[0] == produced[1],
+        "--nocheck produced different documents at 1 and 8 workers ({} vs {} bytes)",
+        produced[0].len(),
+        produced[1].len()
+    );
+}
+
 /// A BOM-prefixed document is ordinary input, not an error. Windows editors
 /// emit them and riot eats them.
 #[test]
@@ -2411,7 +2608,7 @@ fn a_byte_order_mark_does_not_break_the_verbs() {
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "bom.ttl", &format!("\u{FEFF}{VALID_TURTLE}"));
     rdf_cmd()
-        .args(["rdf", "check"])
+        .args(["parse"])
         .arg(&path)
         .assert()
         .success()
@@ -2434,6 +2631,123 @@ fn parallel_corpus(statements: usize) -> String {
     ttl
 }
 
+/// An above-threshold `.nt` document that is valid TURTLE and invalid
+/// N-Triples, in the way `body` chooses.
+fn above_threshold_nt(head: &str, body: impl Fn(usize) -> String) -> String {
+    let mut nt = String::from(head);
+    for i in 0..100_000 {
+        nt.push_str(&body(i));
+    }
+    assert!(
+        nt.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate — it would \
+         convert serially and prove nothing about the parallel reader",
+        nt.len()
+    );
+    nt
+}
+
+#[test]
+fn a_line_format_is_read_strictly_at_every_parallelism() {
+    // The strict N-Triples reader exists to reject what Turtle accepts —
+    // directives, prefixed names, bare numbers — because that is what every
+    // other tool in the field does. The parallel path parsed every chunk with
+    // the TURTLE parser whatever the input was, so those documents were
+    // refused at `--parallelism 1` and accepted on the default path, which is
+    // the path any real-sized `.nt` file takes.
+    let tmp = TempDir::new().unwrap();
+
+    let cases: [(&str, String); 2] = [
+        // A directive at the top: the chunker lifts it as a header and hands
+        // it to every worker, so the prefixed names below resolve — as Turtle.
+        (
+            "prefixed names under a directive",
+            above_threshold_nt("@prefix ex: <http://example.org/> .\n", |i| {
+                format!("ex:s{i} ex:p \"a literal wide enough to reach the threshold {i}\" .\n")
+            }),
+        ),
+        // No directive anywhere, so nothing about the header is involved: a
+        // bare number is simply not an N-Triples term.
+        (
+            "bare numbers",
+            above_threshold_nt("", |i| {
+                format!(
+                    "<http://example.org/s{i}> <http://example.org/p> {i} . \
+                     <http://example.org/s{i}> <http://example.org/q> \"padding to widen the corpus\" .\n"
+                )
+            }),
+        ),
+    ];
+
+    for (name, doc) in &cases {
+        let input = fixture(&tmp, &format!("{}.nt", name.replace(' ', "_")), doc);
+        for threads in ["1", "8"] {
+            rdf_cmd()
+                .args(["--parallelism", threads, "convert"])
+                .arg(&input)
+                .args(["--to", "nt"])
+                .assert()
+                .code(EXIT_DOCUMENT_INVALID)
+                .stderr(predicate::str::contains("--parallelism").not());
+            let _ = name;
+        }
+    }
+}
+
+#[test]
+fn an_input_that_cannot_be_cut_converts_serially() {
+    // TriG writes fine as concatenated fragments, which is what the OUTPUT
+    // check answers — but its statements live inside `GRAPH … { … }` blocks
+    // and the boundary scanner cuts at `.`, so cutting the INPUT lands inside
+    // a brace-scoped block. Only the output syntax was consulted, so this was
+    // chunked as though it were Turtle.
+    let tmp = TempDir::new().unwrap();
+    let mut trig = String::from("@prefix ex: <http://example.org/> .\n");
+    for g in 0..4_000 {
+        trig.push_str(&format!("ex:g{g} {{\n"));
+        for i in 0..20 {
+            trig.push_str(&format!(
+                "  ex:s{g}_{i} ex:p \"a literal wide enough to reach the threshold {g} {i}\" .\n"
+            ));
+        }
+        trig.push_str("}\n");
+    }
+    assert!(trig.len() > MIN_PARALLEL_BYTES, "{}", trig.len());
+    let input = fixture(&tmp, "graphs.trig", &trig);
+    let out = tmp.path().join("out.nq");
+
+    let stderr = rdf_cmd()
+        .args(["--parallelism", "8", "-q", "convert"])
+        .arg(&input)
+        .args(["--to", "nq"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(
+        v["host"]["threads_used"], 1,
+        "reason: {}",
+        v["host"]["parallel_reason"]
+    );
+    assert!(
+        v["host"]["parallel_reason"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be cut"),
+        "{}",
+        v["host"]["parallel_reason"]
+    );
+    // And the conversion is whole: 4_000 graphs x 20 statements.
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(written.lines().count(), 80_000);
+}
+
 #[test]
 fn parallelism_does_not_change_the_output_bytes() {
     // The gate the whole parallel design is built around. A user must be able
@@ -2444,7 +2758,7 @@ fn parallelism_does_not_change_the_output_bytes() {
     let convert_with = |threads: &str, out: &str| -> Vec<u8> {
         let path = tmp.path().join(out);
         rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt"])
             .arg("-o")
@@ -2487,7 +2801,7 @@ fn a_blank_node_named_in_two_chunks_stays_one_node_through_the_cli() {
 
     let out = tmp.path().join("out.nt");
     rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -2526,7 +2840,7 @@ fn a_syntax_that_chunking_would_change_falls_back_to_serial() {
     let with = |threads: &str, out: &str| -> Vec<u8> {
         let path = tmp.path().join(out);
         rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "turtle"])
             .arg("-o")
@@ -2551,7 +2865,7 @@ fn the_profile_reports_the_parallel_decision_and_its_phases() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["--parallelism", "4", "-q", "rdf", "convert"])
+        .args(["--parallelism", "4", "-q", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -2582,6 +2896,22 @@ fn the_profile_reports_the_parallel_decision_and_its_phases() {
     assert!(phases.contains(&"workers"), "phases: {phases:?}");
     assert!(phases.contains(&"reassembly"), "phases: {phases:?}");
 
+    // The pre-scan must be visible and must have fired. A lane that exists but
+    // reports nothing is how 43% of the wall went unattributed for a whole
+    // bucket, so "the lane is present" is not enough to assert.
+    assert!(phases.contains(&"chunk"), "phases: {phases:?}");
+    let chunk_ns = v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["phase"] == "chunk")
+        .and_then(|p| p["ns"].as_u64())
+        .unwrap();
+    assert!(
+        chunk_ns > 0,
+        "the chunk lane reported zero on a chunked run"
+    );
+
     // Worker time is a cross-thread sum, so it may exceed wall — and must not
     // have been folded into the sequential total.
     let unattributed = v["unattributed_ns"].as_u64().unwrap();
@@ -2590,6 +2920,430 @@ fn the_profile_reports_the_parallel_decision_and_its_phases() {
         unattributed <= wall,
         "unattributed {unattributed} > wall {wall}"
     );
+    // And the pre-scan is no longer hiding inside it: what the chunker costs
+    // now has a name.
+    assert!(
+        unattributed < chunk_ns,
+        "unattributed {unattributed} did not shrink below the chunk lane {chunk_ns} — \
+         the scan is still being charged to nobody"
+    );
+}
+
+#[test]
+fn a_serial_run_reports_no_chunk_phase() {
+    // The lane is not decoration: the serial path never chunks, so the phase
+    // must be absent rather than reported as a suspicious zero.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &parallel_corpus(60_000));
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["--parallelism", "1", "-q", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+
+    let phases: Vec<&str> = v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["phase"].as_str().unwrap())
+        .collect();
+    assert!(!phases.contains(&"chunk"), "phases: {phases:?}");
+}
+
+/// 120,000 statements with one that does not parse, far enough in to land in
+/// a late chunk.
+///
+/// Past the chunker's one-megabyte header scan as well, and that is not
+/// incidental: the scan TOKENIZES what it reads, so a document that fails to
+/// lex inside the first megabyte cannot be chunked at all and the whole run
+/// falls back to serial — testing the path this fixture exists to reach.
+fn corpus_with_a_late_error() -> String {
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..120_000 {
+        if i == 90_000 {
+            ttl.push_str("ex:bad ex:p ?? .\n");
+        }
+        ttl.push_str(&format!(
+            "ex:s{i} ex:name \"person {i}\" ; ex:age {} .\n",
+            i % 90
+        ));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate",
+        ttl.len()
+    );
+    ttl
+}
+
+#[test]
+fn a_parallel_parse_failure_is_located_like_a_serial_one() {
+    // A worker parses `prefix block + its chunk`, so the offset a failing
+    // chunk reports is an offset into that synthesized document — on this
+    // fixture it names a line about 60,000 short. Rendering it against the
+    // real file would be worse than saying nothing, and saying nothing is
+    // what the parallel path did: the serial run pointed at
+    // `late-error.ttl:90002:13` and the parallel run at `late-error.ttl`.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "late-error.ttl", &corpus_with_a_late_error());
+
+    let mut reports = Vec::new();
+    for threads in ["1", "8"] {
+        let assert = rdf_cmd()
+            .args(["--parallelism", threads, "convert"])
+            .arg(&input)
+            .args(["--to", "nt"])
+            .arg("-o")
+            .arg(tmp.path().join(format!("out{threads}.nt")))
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID);
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        // Line 1 is the header, then 90,000 statements, then this one; the
+        // `?` sits at column 13.
+        assert!(
+            stderr.contains("late-error.ttl:90002:13:"),
+            "--parallelism {threads} did not anchor the failure in the document: {stderr}"
+        );
+        reports.push(stderr);
+    }
+    assert_eq!(
+        reports[0], reports[1],
+        "the two widths described the same failure differently"
+    );
+}
+
+/// A header past the chunker's one-megabyte prefix scan, over a body big
+/// enough to clear the parallel gate.
+///
+/// Directives beyond the scan window are indistinguishable, to the chunker,
+/// from directives after data — so this is an unchunkable document that is
+/// nevertheless perfectly legal Turtle and must still convert.
+fn oversized_header_corpus() -> String {
+    // `splitter::PREFIX_SCAN_SIZE`, which is private. Restated rather than
+    // exported: the test needs a header the scan cannot finish, and any value
+    // at or above the real one gives that.
+    const PREFIX_SCAN_SIZE: usize = 1024 * 1024;
+    let mut ttl = String::new();
+    let mut n = 0;
+    while ttl.len() < PREFIX_SCAN_SIZE + 4096 {
+        ttl.push_str(&format!("@prefix p{n}: <http://example.org/ns{n}/> .\n"));
+        n += 1;
+    }
+    for i in 0..60_000 {
+        ttl.push_str(&format!(
+            "p0:s{i} p0:name \"a literal wide enough to push the body past the gate {i}\" .\n"
+        ));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate",
+        ttl.len()
+    );
+    ttl
+}
+
+#[test]
+fn a_run_that_falls_back_to_serial_still_reports_what_the_attempt_cost() {
+    // `threads_used: 1` beside a non-zero `chunk` lane is not a contradiction
+    // in the profile: the scan really did run, found the document unchunkable,
+    // and the run then converted serially. On a fallback that time is pure
+    // overhead — the one case where the lane's number is most worth having —
+    // and `Phase::Chunk` used to document itself as "a serial run reports
+    // zero", which makes this pairing read as a bug in the profile instead.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "bighdr.ttl", &oversized_header_corpus());
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["-q", "--parallelism", "8", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+
+    assert_eq!(
+        v["host"]["threads_used"], 1,
+        "reason: {}",
+        v["host"]["parallel_reason"]
+    );
+    let chunk_ns = v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["phase"] == "chunk")
+        .and_then(|p| p["ns"].as_u64());
+    assert!(
+        chunk_ns.is_some_and(|ns| ns > 0),
+        "the attempt that forced the fallback was charged to nobody: {}",
+        v["phases"]
+    );
+
+    // And the document converted, which is the point of falling back rather
+    // than refusing.
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap().lines().count(),
+        60_000
+    );
+}
+
+/// A valid document whose long literal opens inside the header scan window and
+/// closes past it.
+///
+/// `find_safe_header` backs the window up to a newline, which for this document
+/// lands inside the literal — so the header region on its own is an
+/// unterminated string. Nothing is wrong with the document.
+fn literal_spanning_the_header_window() -> String {
+    const PREFIX_SCAN_SIZE: usize = 1024 * 1024;
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\nex:doc ex:body \"\"\"\n");
+    while ttl.len() < PREFIX_SCAN_SIZE + 512 * 1024 {
+        ttl.push_str("lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do.\n");
+    }
+    ttl.push_str("\"\"\" .\n");
+    for i in 0..60_000 {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:p \"a literal wide enough to push this past the gate {i}\" .\n"
+        ));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate",
+        ttl.len()
+    );
+    ttl
+}
+
+#[test]
+fn a_long_literal_spanning_the_header_window_still_chunks() {
+    // The header scan used to tokenize its whole window before looking at a
+    // single token, so a document that failed to lex ANYWHERE in the first
+    // megabyte could not be chunked — including this one, which is valid. The
+    // run fell back to serial and blamed the input: "the input could not be
+    // split into chunks".
+    //
+    // Pulling tokens lazily stops the walk at `ex:doc`, about forty bytes in,
+    // and the literal is never lexed at all.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "longlit.ttl", &literal_spanning_the_header_window());
+
+    let mut produced: Vec<Vec<u8>> = Vec::new();
+    for threads in ["1", "8"] {
+        let out = tmp.path().join(format!("out{threads}.nt"));
+        let stderr = rdf_cmd()
+            .args(["--parallelism", threads, "convert"])
+            .arg(&input)
+            .args(["--to", "nt"])
+            .arg("-o")
+            .arg(&out)
+            .args(["--profile=json", "--no-hash"])
+            .assert()
+            .success()
+            .get_output()
+            .stderr
+            .clone();
+        let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+        if threads == "8" {
+            assert_eq!(
+                v["host"]["threads_used"], 8,
+                "a valid document lost parallelism to its own header scan. reason: {}",
+                v["host"]["parallel_reason"]
+            );
+        }
+        produced.push(std::fs::read(&out).unwrap());
+    }
+    assert!(
+        produced[0] == produced[1],
+        "the two widths disagree ({} vs {} bytes)",
+        produced[0].len(),
+        produced[1].len()
+    );
+}
+
+#[test]
+fn a_lexical_defect_after_the_header_does_not_force_serial() {
+    // The larger class the long literal is one instance of: ANY lex failure
+    // inside the scan window used to sink chunking, so a typo 300 KB into a
+    // 5 MB file quietly moved the whole run onto the serial path. Harmless for
+    // correctness — the document fails either way — but it means "unchunkable"
+    // reported a property of the document's SHAPE when the cause was a defect,
+    // and the two want different fixes from a user.
+    let tmp = TempDir::new().unwrap();
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..120_000 {
+        if i == 12_000 {
+            ttl.push_str("ex:bad ex:p ?? .\n");
+        }
+        ttl.push_str(&format!(
+            "ex:s{i} ex:p \"a literal wide enough to push this past the gate {i}\" .\n"
+        ));
+    }
+    assert!(ttl.len() > MIN_PARALLEL_BYTES, "{}", ttl.len());
+    let input = fixture(&tmp, "defect.ttl", &ttl);
+
+    let assert = rdf_cmd()
+        .args(["--parallelism", "8", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(tmp.path().join("out.nt"))
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(
+        !stderr.contains("converting serially"),
+        "a defect past the header still costs the whole run its parallelism: {stderr}"
+    );
+    // And it is still refused, at the right place: line 1 is the header, then
+    // 12,000 statements, then this one.
+    assert!(
+        stderr.contains("defect.ttl:12002:13:"),
+        "the defect was not reported where it is: {stderr}"
+    );
+}
+
+#[test]
+fn a_malformed_header_is_still_refused() {
+    // The negative control. Lazy tokenizing must not turn into "never look at
+    // the header": a directive that does not lex is a real defect IN the
+    // header, chunking must still refuse it, and the document must still fail.
+    // Without this the fix could silently start accepting broken headers.
+    let tmp = TempDir::new().unwrap();
+    let mut ttl = String::from("@prefix ex: <http://example.org/ .\n");
+    for i in 0..120_000 {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:p \"a literal wide enough to push this past the gate {i}\" .\n"
+        ));
+    }
+    assert!(ttl.len() > MIN_PARALLEL_BYTES, "{}", ttl.len());
+    let input = fixture(&tmp, "badhdr.ttl", &ttl);
+
+    rdf_cmd()
+        .args(["--parallelism", "8", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(tmp.path().join("out.nt"))
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .stderr(predicate::str::contains("converting serially"))
+        .stderr(predicate::str::contains("badhdr.ttl:1:13:"));
+}
+
+#[test]
+fn json_profile_stderr_is_parseable_on_a_chunking_fallback() {
+    // `2> run.json` is the bench lane's idiom, so stderr under `--profile=json`
+    // is a document and not a place for prose. Five of the six prose sites
+    // knew that; the fallback note did not, and it is emitted on exactly the
+    // documents most likely to be profiled — the big ones that turn out not to
+    // chunk. Note the absence of `-q` here: passing it would hide the bug
+    // rather than test it.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "bighdr.ttl", &oversized_header_corpus());
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["--parallelism", "8", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+
+    serde_json::from_slice::<serde_json::Value>(&stderr).unwrap_or_else(|e| {
+        panic!(
+            "stderr is not a JSON document: {e}\n{}",
+            String::from_utf8_lossy(&stderr)
+        )
+    });
+}
+
+#[test]
+fn quiet_silences_courtesy_lines_and_never_the_diagnostics() {
+    // The two levels, pinned apart. `-q` is for the ✓ line and the fallback
+    // note; it must never reach a skip, the swallow note, or the closing
+    // warning, because a script that asked for quiet still may not read a
+    // partial conversion as a whole one. Folding the levels together is the
+    // obvious simplification and this is what refuses it.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
+    let out = tmp.path().join("out.nt");
+
+    for quiet in [false, true] {
+        let mut cmd = rdf_cmd();
+        if quiet {
+            cmd.arg("-q");
+        }
+        let stderr = cmd
+            .args(["convert"])
+            .arg(&input)
+            .args(["--to", "nt", "--continue-on-error"])
+            .arg("-o")
+            .arg(&out)
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID)
+            .get_output()
+            .stderr
+            .clone();
+        let stderr = String::from_utf8(stderr).unwrap();
+
+        assert!(
+            stderr.contains("skipped:"),
+            "-q {quiet}: a dropped statement went unreported: {stderr}"
+        );
+        assert!(
+            stderr.contains("2 statement(s) skipped"),
+            "-q {quiet}: the closing warning is not a courtesy: {stderr}"
+        );
+    }
+
+    // And under a JSON profile both levels go quiet, whatever -q says, because
+    // stderr is carrying a document either way.
+    for quiet in [false, true] {
+        let mut cmd = rdf_cmd();
+        if quiet {
+            cmd.arg("-q");
+        }
+        let stderr = cmd
+            .args(["convert"])
+            .arg(&input)
+            .args(["--to", "nt", "--continue-on-error"])
+            .arg("-o")
+            .arg(&out)
+            .args(["--profile=json", "--no-hash"])
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID)
+            .get_output()
+            .stderr
+            .clone();
+        serde_json::from_slice::<serde_json::Value>(&stderr).unwrap_or_else(|e| {
+            panic!(
+                "-q {quiet}: stderr is not a JSON document: {e}\n{}",
+                String::from_utf8_lossy(&stderr)
+            )
+        });
+    }
 }
 
 // ============================================================================
@@ -2612,7 +3366,7 @@ fn continue_on_error_keeps_the_good_statements_and_exits_1() {
     let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
 
     let out = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -2642,7 +3396,7 @@ fn without_the_flag_the_first_error_still_stops_the_run() {
     let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
 
     let out = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .assert()
@@ -2664,7 +3418,7 @@ fn a_clean_document_under_continue_on_error_exits_0() {
     let tmp = TempDir::new().unwrap();
     let input = fixture(&tmp, "clean.ttl", VALID_TURTLE);
     let out = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -2695,7 +3449,7 @@ fn a_skipped_statement_leaves_no_fragment_behind() {
     );
 
     let out = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -2720,7 +3474,7 @@ fn every_skip_is_located_in_the_original_document() {
     let tmp = TempDir::new().unwrap();
     let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -2728,6 +3482,200 @@ fn every_skip_is_located_in_the_original_document() {
         // The two bad statements are on lines 3 and 5 of the file.
         .stderr(predicate::str::contains("partly.ttl:3:"))
         .stderr(predicate::str::contains("partly.ttl:5:"));
+}
+
+/// Four lines: a header, a good statement, junk carrying no terminator of its
+/// own, and the statement whose terminator the resync therefore runs to.
+const UNTERMINATED_JUNK: &str = "@prefix ex: <http://example.org/> .\n\
+                                 ex:a ex:p \"1\" .\n\
+                                 junk with no terminator\n\
+                                 ex:c ex:p \"3\" .\n";
+
+/// The same document with the junk terminated, so the resync stops at the
+/// junk's own `.` and takes nothing with it.
+const TERMINATED_JUNK: &str = "@prefix ex: <http://example.org/> .\n\
+                               ex:a ex:p \"1\" .\n\
+                               junk with a terminator .\n\
+                               ex:c ex:p \"3\" .\n";
+
+/// Convert with `--continue-on-error` and return `(stdout, stderr)`.
+fn recover(input: &Path) -> (String, String) {
+    let assert = rdf_cmd()
+        .args(["convert"])
+        .arg(input)
+        .args(["--to", "nt", "--continue-on-error"])
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID);
+    (
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap(),
+        String::from_utf8(assert.get_output().stderr.clone()).unwrap(),
+    )
+}
+
+#[test]
+fn a_resync_that_swallows_the_next_statement_says_so() {
+    // Recovery resumes at the next statement TERMINATOR, so junk without one
+    // ends at the terminator belonging to the statement AFTER it — which is
+    // then never parsed, never diagnosed and never counted. The run reported
+    // "1 statement(s) skipped" having lost two, with stderr byte-identical to
+    // the honest case, and being identical is what made it undetectable.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(&tmp, "unterminated.ttl", UNTERMINATED_JUNK));
+
+    // The loss is real: `ex:c` never reaches the output, and the count says
+    // one. That count cannot be repaired — nothing parsed those bytes, so
+    // nothing knows how many statements they held.
+    assert_eq!(out.lines().count(), 1, "{out}");
+    assert!(stderr.contains("1 statement(s) skipped"), "{stderr}");
+
+    // So the span is reported instead, on its own line.
+    assert!(
+        stderr.contains("note:"),
+        "a resync that lost a statement said nothing about it: {stderr}"
+    );
+    // `ex:c ex:p "3" .` is 15 bytes.
+    assert!(
+        stderr.contains("consumed 15 more byte(s)"),
+        "the note must name how much it swallowed, not merely that it did: {stderr}"
+    );
+    assert!(
+        stderr.contains("resumed at line 4"),
+        "the note must name where the parse picked up again: {stderr}"
+    );
+}
+
+#[test]
+fn a_resync_that_stops_at_its_own_terminator_stays_silent() {
+    // The negative control, and the reason the note has a line of its own: a
+    // run that lost only what it reported keeps exactly the stderr it always
+    // had. A note here would be noise on every recoverable document.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(&tmp, "terminated.ttl", TERMINATED_JUNK));
+
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(stderr.contains("1 statement(s) skipped"), "{stderr}");
+    assert!(
+        !stderr.contains("note:") && !stderr.contains("resync consumed"),
+        "the honest case grew a note it did not need: {stderr}"
+    );
+}
+
+#[test]
+fn the_swallowed_span_stops_where_the_parse_resumed() {
+    // The span is the statement the resync ate, not everything after the
+    // error. What follows the resume point on the SAME line survives, and
+    // reporting it as lost would be a second wrong number in place of the
+    // first one.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(
+        &tmp,
+        "tail.ttl",
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p \"1\" .\n\
+         junk with no terminator\n\
+         ex:c ex:p \"3\" . ex:d ex:p \"4\" .\n",
+    ));
+
+    assert!(
+        stderr.contains("consumed 15 more byte(s)") && stderr.contains("resumed at line 4"),
+        "{stderr}"
+    );
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(
+        out.contains("\"4\""),
+        "the statement after the resume point was reported lost, and was not: {out}"
+    );
+}
+
+#[test]
+fn a_multi_line_statement_is_not_reported_as_swallowed() {
+    // A statement may span lines and still carry its own terminator, so the
+    // resync lands on ITS `.` and eats nothing. The first version of this
+    // warning split the error-to-resume span at the first newline and reported
+    // whatever followed, which on this document is the statement's own second
+    // line: 24 bytes announced as lost while `ex:c` converted fine.
+    //
+    // The positional shape here is identical to the honest case in
+    // `a_resync_that_swallows_the_next_statement_says_so` — error on line 3,
+    // resume at the end of line 4 — so nothing about WHERE the bytes are can
+    // separate them. Only what they say.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(
+        &tmp,
+        "multi.ttl",
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p \"ok\" .\n\
+         ex:bad ~~~ \"still the same statement\"\n\
+             ex:more \"and more\" .\n\
+         ex:c ex:p \"fine\" .\n",
+    ));
+
+    assert_eq!(
+        out.lines().count(),
+        2,
+        "nothing was lost, so nothing may be missing: {out}"
+    );
+    assert!(stderr.contains("1 statement(s) skipped"), "{stderr}");
+    assert!(
+        !stderr.contains("resync consumed"),
+        "the statement's own second line was reported as swallowed: {stderr}"
+    );
+}
+
+#[test]
+fn a_continuation_after_a_semicolon_is_not_reported_as_swallowed() {
+    // The idiomatic multi-line spelling: `;` then an indented predicate. Same
+    // requirement as above and the more common shape in real documents.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(
+        &tmp,
+        "semi-healthy.ttl",
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p \"1\" .\n\
+         ex:bad ~~~ \"x\" ;\n\
+             ex:more \"and more\" .\n\
+         ex:c ex:p \"3\" .\n",
+    ));
+
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(
+        !stderr.contains("resync consumed"),
+        "a `;` continuation was reported as a swallowed statement: {stderr}"
+    );
+}
+
+#[test]
+fn a_statement_lost_after_a_semicolon_is_still_reported() {
+    // The trap, and the reason this file does NOT check for a trailing `;`.
+    //
+    // That check is the obvious way to recognise a continuation, and it
+    // suppresses exactly the case the warning exists for: `ex:bad ~~~ ;` has no
+    // terminator of its own, so the resync runs to line 4's `.` and eats
+    // `ex:c` whole. With a punctuator check in place this document lost a
+    // statement and said nothing — measured, not theorised.
+    //
+    // The standalone-parse test gets both this and the case above right,
+    // because a `;` continuation is `predicate object` and does not parse as a
+    // statement on its own, while `ex:c ex:p "3" .` does.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(
+        &tmp,
+        "semi-lossy.ttl",
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p \"1\" .\n\
+         ex:bad ~~~ ;\n\
+         ex:c ex:p \"3\" .\n",
+    ));
+
+    assert_eq!(
+        out.lines().count(),
+        1,
+        "`ex:c` was eaten by the resync: {out}"
+    );
+    assert!(
+        stderr.contains("resync consumed"),
+        "a statement was lost and the run said nothing: {stderr}"
+    );
 }
 
 // ============================================================================
@@ -2763,7 +3711,7 @@ fn blank_heavy_corpus(statements: usize) -> String {
 fn convert_at(tmp: &TempDir, input: &Path, threads: &str, out: &str) -> String {
     let path = tmp.path().join(out);
     rdf_cmd()
-        .args(["--parallelism", threads, "rdf", "convert"])
+        .args(["--parallelism", threads, "convert"])
         .arg(input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -2940,7 +3888,7 @@ fn turtle_runs_parallel_and_declares_its_prefixes_exactly_once() {
     let convert = |threads: &str, out: &str| -> String {
         let path = tmp.path().join(out);
         rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "turtle"])
             .arg("-o")
@@ -2960,13 +3908,13 @@ fn turtle_runs_parallel_and_declares_its_prefixes_exactly_once() {
     // And the result is a document our own reader accepts, with every triple.
     let reparsed = tmp.path().join("p.ttl");
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).arg(&reparsed);
+    cmd.args(["-q", "count"]).arg(&reparsed);
     let parallel_count = stdout_of(&mut cmd).trim().to_string();
 
     let serial_path = tmp.path().join("s.ttl");
     std::fs::write(&serial_path, convert("1", "s.ttl")).unwrap();
     let mut cmd = rdf_cmd();
-    cmd.args(["-q", "rdf", "count"]).arg(&serial_path);
+    cmd.args(["-q", "count"]).arg(&serial_path);
     assert_eq!(
         parallel_count,
         stdout_of(&mut cmd).trim(),
@@ -2982,7 +3930,7 @@ fn a_parallel_turtle_run_is_byte_identical_to_itself() {
     let convert = |out: &str| -> Vec<u8> {
         let path = tmp.path().join(out);
         rdf_cmd()
-            .args(["--parallelism", "8", "rdf", "convert"])
+            .args(["--parallelism", "8", "convert"])
             .arg(&input)
             .args(["--to", "turtle"])
             .arg("-o")
@@ -3003,7 +3951,7 @@ fn the_profile_records_the_load_average() {
     let out = tmp.path().join("out.nt");
 
     let stderr = rdf_cmd()
-        .args(["-q", "rdf", "convert"])
+        .args(["-q", "convert"])
         .arg(&input)
         .arg("-o")
         .arg(&out)
@@ -3034,20 +3982,31 @@ fn the_profile_records_the_load_average() {
 // input over the parallel threshold piped to `head` hung, which is the default
 // path.
 //
-// Two mechanisms keep this live, and the reviewer's four-way mutation table is
-// the reason to describe them carefully: receiver ownership (the receiver is
-// borrowed from outside the scope closure, so nothing can drop it before the
-// join) and the shutdown flag. EITHER ONE ALONE SUFFICES — remove ownership and
-// the suite still passes, remove the flag and it still passes — and only
-// removing BOTH hangs. Restoring the pre-fix receiver shape on its own makes
-// the matrix below fail at `--parallelism 4 × immediate close` in 10s while the
-// `-o FILE` control still passes.
+// What the matrix below does and does not prove, re-derived rather than
+// inherited — the previous claim here was stale and stale in the dangerous
+// direction.
 //
-// So: either mechanism alone suffices; keep both; the mutation that proves it
-// removes both. The earlier phrasing here — "the flag governs how promptly
-// workers stop, the ownership governs whether they stop at all" — reads as
-// though the flag were a mere optimization, which invites deleting a second
-// liveness guarantee that a single-mutation test can never catch.
+// It proves the run ENDS on a dead reader, at every width. It does NOT show any
+// termination mechanism to be load-bearing. With the prompt receiver drop, the
+// write-failure stop and the unconditional post-loop stop ALL removed, it still
+// passes: `rx` is a local of the scope closure and drops when that closure
+// returns, which is before `thread::scope` joins. The old four-way table
+// ("either one alone suffices … only removing BOTH hangs") described a receiver
+// shape this file no longer has, and the only way to learn that was to run the
+// cells again instead of trusting the sentence.
+//
+// So what are those mechanisms for? Promptness, which is worth having and is
+// not what this matrix measures. Without them a worker keeps taking chunks
+// until the channel fills and then parks in `send` until the closure returns —
+// on a 4 GiB input piped to `head -1`, converting most of the file for nobody.
+// Keep them; just do not believe this matrix is what guards them.
+//
+// The mechanism that IS load-bearing for liveness is the unconditional
+// `budget.stop()` after the reassembly loop, and a different test proves it:
+// `a_parse_error_wakes_workers_waiting_on_the_output_budget` hangs at the 90s
+// ceiling without it. That case needs a SATURATED budget, which a dead reader
+// never produces — which is exactly why this matrix cannot see it, and why
+// reading these two tests as covering the same thing is the mistake to avoid.
 
 /// `ParallelPlan::MIN_PARALLEL_BYTES`: below this an input converts serially
 /// whatever `--parallelism` says, so a fixture under it tests the wrong path.
@@ -3086,7 +4045,7 @@ fn spawn_convert(input: &Path, threads: &str, out: Option<&Path>) -> std::proces
     use std::process::{Command as StdCommand, Stdio};
 
     let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("fluree"));
-    cmd.args(["--parallelism", threads, "rdf", "convert"])
+    cmd.args(["--parallelism", threads, "convert"])
         .arg(input)
         .args(["--to", "nt"]);
     if let Some(out) = out {
@@ -3234,6 +4193,106 @@ fn a_file_destination_completes_at_every_parallelism() {
     }
 }
 
+/// A corpus whose N-Triples output runs many times its Turtle input, with a
+/// statement that lexes but does not parse early in the second chunk.
+///
+/// Both properties are load-bearing. The expansion — every prefixed name blows
+/// up to a ~200-byte IRI — is what lets the handful of chunks that can be in
+/// flight at once exceed the output budget's 32 MiB floor; without it the
+/// budget never binds, no worker ever waits, and the case under test does not
+/// arise. And the bad statement must LEX, because the chunker tokenizes the
+/// first megabyte looking for the header: a lexical error there makes the
+/// document unchunkable and the whole run falls back to serial.
+fn output_heavy_corpus_with_a_parse_error() -> String {
+    let ns = format!("http://example.org/{}/", "a".repeat(180));
+    let mut ttl = format!("@prefix ex: <{ns}> .\n");
+    for i in 0..200_000 {
+        if i == 12_000 {
+            // Three tokens, all valid; the object is simply missing.
+            ttl.push_str("ex:bad ex:p .\n");
+        }
+        ttl.push_str(&format!("ex:s{i} ex:p ex:o{i} .\n"));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate",
+        ttl.len()
+    );
+    ttl
+}
+
+#[test]
+fn a_parse_error_wakes_workers_waiting_on_the_output_budget() {
+    // The third way out of the reassembly loop, and the one that woke nobody.
+    // The writer is the only thread that releases budget, and it leaves three
+    // ways: every chunk written, a write failure, and a parse error that cuts
+    // the document short with bytes still charged. Only the first two
+    // signalled, so a worker waiting for room waited for a release that could
+    // never come and `thread::scope` joined it forever — the dead-destination
+    // deadlock again, reached through the memory bound instead of the channel.
+    //
+    // Getting a worker INTO that wait is the whole difficulty. With a fast
+    // destination the writer drains faster than the pool fills, the budget
+    // never binds, and this passes without exercising anything: that is
+    // exactly what a first attempt against `-o FILE` did. So the destination
+    // here is a pipe drained more slowly than the pool produces. The writer
+    // stalls on the pipe, the workers run ahead until the budget is full, and
+    // they are parked in `wait_for_room` when the erroring chunk is written.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(
+        &tmp,
+        "budget.ttl",
+        &output_heavy_corpus_with_a_parse_error(),
+    );
+
+    let mut child = spawn_convert(&input, "8", None);
+    let stdout = child.stdout.take().unwrap();
+    // ~2 MB/s, against a debug-build pool that manages several times that. The
+    // ratio is the only thing that matters and it fails safe: on a machine so
+    // loaded that the pool drops below the reader, the budget simply never
+    // fills and this passes without having exercised the wait. It cannot go
+    // red for being slow — only for not finishing at all.
+    let drain = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdout = stdout;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n;
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        total
+    });
+
+    let (code, stderr) = wait_bounded(child, "parse error under a saturated output budget");
+    let read = drain.join().expect("the drain thread must not panic");
+
+    assert_eq!(
+        code,
+        Some(EXIT_DOCUMENT_INVALID),
+        "a cut-short document must exit as an invalid one. stderr: {stderr}"
+    );
+    // Line 1 is the header, then 12,000 statements, then this one.
+    assert!(
+        stderr.contains("budget.ttl:12002:13:"),
+        "the run ended, but not on the parse error: {stderr}"
+    );
+    // Without this the fixture could be silently converting on the serial
+    // path, where there are no workers and nothing to deadlock.
+    assert!(
+        !stderr.contains("converting serially"),
+        "the fixture was not chunked, so no worker ever ran: {stderr}"
+    );
+    assert!(
+        read > 0,
+        "nothing was written before the failure, so the writer never stalled \
+         on the pipe and the budget never filled"
+    );
+}
+
 #[test]
 fn a_mid_file_directive_falls_back_to_serial_rather_than_refusing() {
     // §1.4 specifies a fallback, and the document is legal Turtle: only the
@@ -3252,7 +4311,7 @@ fn a_mid_file_directive_falls_back_to_serial_rather_than_refusing() {
     let out = tmp.path().join("out.nt");
 
     rdf_cmd()
-        .args(["--parallelism", "8", "rdf", "convert"])
+        .args(["--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -3284,7 +4343,7 @@ fn a_mid_file_directive_falls_back_to_serial_rather_than_refusing() {
 
     // And the reason is reported rather than implicit.
     let stderr = rdf_cmd()
-        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .args(["-q", "--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -3308,6 +4367,52 @@ fn a_mid_file_directive_falls_back_to_serial_rather_than_refusing() {
 }
 
 #[test]
+fn recovery_reads_a_line_format_strictly_too() {
+    // Recovery re-parses fragments, and it re-parsed them with the TURTLE
+    // parser whatever the input was — so `--continue-on-error` on a `.nt` file
+    // accepted every Turtle-only construct the strict reader exists to reject.
+    // Silently, too: recovery reports what it SKIPS, and a construct that
+    // parses is never skipped, so the report said nothing was wrong.
+    let tmp = TempDir::new().unwrap();
+    // Every line terminates, including the junk one. Resync scans forward to
+    // the next terminator, so a junk line WITHOUT one swallows the statement
+    // after it — which would hide the very line this test is about.
+    let nt = "<http://example.org/a> <http://example.org/p> \"ok\" .\n\
+              <http://example.org/b> <http://example.org/p> 42 .\n\
+              not a triple at all .\n\
+              <http://example.org/c> <http://example.org/p> \"fine\" .\n";
+    let input = fixture(&tmp, "recoverable.nt", nt);
+    let out = tmp.path().join("out.nt");
+
+    let assert = rdf_cmd()
+        .args(["convert"])
+        .arg(&input)
+        .args(["--to", "nt", "--continue-on-error"])
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    // Two skips, not one: the junk line AND the bare number, which is a
+    // perfectly good Turtle integer and not an N-Triples term.
+    assert!(
+        stderr.contains("2 statement(s) skipped"),
+        "the bare number must be skipped as well as the junk line: {stderr}"
+    );
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(
+        written.lines().count(),
+        2,
+        "only the two valid N-Triples statements survive:\n{written}"
+    );
+    assert!(
+        !written.contains("42"),
+        "a bare number reached the output:\n{written}"
+    );
+}
+
+#[test]
 fn continue_on_error_still_emits_the_profile() {
     // Recovery is exactly when profiling matters — resync re-parses from each
     // error — and the two flags were mutually exclusive by accident.
@@ -3315,7 +4420,7 @@ fn continue_on_error_still_emits_the_profile() {
     let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
 
     let stderr = rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args([
             "--to",
@@ -3343,7 +4448,7 @@ fn continue_on_error_still_emits_the_profile() {
 
     // Without --profile the human diagnostics are still there.
     rdf_cmd()
-        .args(["rdf", "convert"])
+        .args(["convert"])
         .arg(&input)
         .args(["--to", "nt", "--continue-on-error"])
         .assert()
@@ -3358,7 +4463,7 @@ fn continue_on_error_still_emits_the_profile() {
 //
 // Reviewers found three separate cases of one flag silently overriding
 // another (coe x profile, -o x profile-json, parallel x bnode-policy). The
-// documented table in `docs/cli/rdf/convert.md` is the contract; these are its
+// documented table in `docs/cli/convert.md` is the contract; these are its
 // assertions. Each interaction is exercised in BOTH the serial and the
 // parallel path, because two of the three defects existed only on one side.
 //
@@ -3397,7 +4502,7 @@ fn continue_on_error_with_json_profile_keeps_stderr_parseable() {
     for threads in ["1", "8"] {
         let out = tmp.path().join(format!("out{threads}.nt"));
         let assert = rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt"])
             .arg("-o")
@@ -3424,7 +4529,7 @@ fn continue_on_error_with_human_profile_prints_both() {
     for threads in ["1", "8"] {
         let out = tmp.path().join(format!("h{threads}.nt"));
         rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt"])
             .arg("-o")
@@ -3456,7 +4561,7 @@ fn continue_on_error_forces_the_serial_path_and_reports_it() {
 
     // Control: the same corpus WITHOUT the flag does go parallel.
     let control = rdf_cmd()
-        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .args(["-q", "--parallelism", "8", "convert"])
         .arg(fixture(&tmp, "clean.nt", &interaction_corpus()))
         .args(["--to", "nt"])
         .arg("-o")
@@ -3473,7 +4578,7 @@ fn continue_on_error_forces_the_serial_path_and_reports_it() {
     );
 
     let assert = rdf_cmd()
-        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .args(["-q", "--parallelism", "8", "convert"])
         .arg(&input)
         .args(["--to", "nt"])
         .arg("-o")
@@ -3509,7 +4614,7 @@ fn output_file_and_json_profile_never_share_a_stream() {
     for threads in ["1", "8"] {
         let out = tmp.path().join(format!("o{threads}.nt"));
         let assert = rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt"])
             .arg("-o")
@@ -3528,7 +4633,7 @@ fn output_file_and_json_profile_never_share_a_stream() {
 
         // Without -o the converted bytes take stdout and the JSON still does not.
         let assert = rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt", "--profile=json", "--no-hash"])
             .assert()
@@ -3548,7 +4653,7 @@ fn preserve_bnode_labels_forces_the_serial_path_and_reports_it() {
     let reason_for = |policy: &str| -> (u64, String) {
         let out = tmp.path().join(format!("out-{policy}.nt"));
         let assert = rdf_cmd()
-            .args(["-q", "--parallelism", "8", "rdf", "convert"])
+            .args(["-q", "--parallelism", "8", "convert"])
             .arg(&input)
             .args(["--to", "nt", "--bnode-policy", policy])
             .arg("-o")
@@ -3581,7 +4686,7 @@ fn base_is_inert_for_line_formats_in_both_modes() {
     let input = fixture(&tmp, "abs.nt", "<http://e/s> <http://e/p> <http://e/o> .\n");
     for threads in ["1", "8"] {
         rdf_cmd()
-            .args(["--parallelism", threads, "rdf", "convert"])
+            .args(["--parallelism", threads, "convert"])
             .arg(&input)
             .args(["--to", "nt", "--base", "http://other.example/"])
             .assert()

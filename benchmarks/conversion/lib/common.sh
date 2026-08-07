@@ -287,6 +287,74 @@ arch_is_comparable() {
 	esac
 }
 
+# ---------------------------------------------------------------------------
+# Cross-agent bench lock
+# ---------------------------------------------------------------------------
+#
+# Several agents share this machine and each other's CPU. A timed run started
+# while someone else is compiling does not measure the tool, and — worse — the
+# contamination is ASYMMETRIC: a build that begins midway through a matrix hits
+# the cells that happen to run last, so one column is measured under load that
+# the others never saw. That is not noise a median removes; it is a systematic
+# bias in favour of whoever ran first.
+#
+# This happened: a competitor matrix recorded its four competitor tools at
+# load/core 0.43-0.62 and its own tool's cells, which run last, at 1.07-1.65.
+# The comparison understated our own performance by construction.
+#
+# The filesystem is the only channel these agents share, so the lock is a file.
+# It is advisory — nothing enforces it but cooperation — which is why it
+# records WHO holds it and since when, so a stale one can be diagnosed rather
+# than guessed at.
+BENCH_LOCK="${BENCH_LOCK:-/private/tmp/claude-501/-Users-ajohnson-fluree-db/BENCH-LOCK}"
+
+bench_lock_acquire() {
+	local holder="${1:-$(basename "$0")}"
+
+	if [ -e "$BENCH_LOCK" ]; then
+		printf 'error: another agent holds the bench lock:\n\n' >&2
+		sed 's/^/    /' "$BENCH_LOCK" >&2
+		printf '\n  %s\n' "$BENCH_LOCK" >&2
+		printf '  Wait for them to release it. If you are certain it is stale\n' >&2
+		printf '  (the pid is gone and the time is old), remove it deliberately.\n' >&2
+		exit 1
+	fi
+
+	mkdir -p "$(dirname "$BENCH_LOCK")"
+	# O_EXCL via noclobber: two agents racing here must not both win.
+	if ! (
+		set -o noclobber
+		printf 'holder: %s\npid:    %s\nstart:  %s\nhost:   %s\nload:   %s per core\n' \
+			"$holder" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(host_class)" \
+			"$(host_load_per_core)" >"$BENCH_LOCK"
+	) 2>/dev/null; then
+		die "lost the race for $BENCH_LOCK — another agent took it just now."
+	fi
+
+	# Release on any exit, including a failure partway through a matrix. A lock
+	# left behind by a crashed run blocks everyone until someone reasons about
+	# whether it is stale.
+	#
+	# PIPE is in the list because it is not hypothetical: piping a run into
+	# `head` kills the shell before an EXIT trap alone would fire, and the
+	# stale lock then blocks the other agent. Found by testing exactly that.
+	#
+	# This trap REPLACES any EXIT trap the caller installed — bash has one
+	# EXIT slot per shell. Today's callers (run-matrix, differential) have
+	# none. If a script with its own EXIT guard ever takes the lock (e.g.
+	# check-correctness's ABORTED-is-not-a-pass trap), chain the two bodies
+	# in one trap — installing this one as-is would silently delete a
+	# no-silent-pass guard.
+	trap 'bench_lock_release' EXIT INT TERM PIPE HUP
+	info "bench lock acquired by $holder"
+}
+
+bench_lock_release() {
+	if [ -e "$BENCH_LOCK" ] && grep -q "pid:    $$\$" "$BENCH_LOCK" 2>/dev/null; then
+		rm -f "$BENCH_LOCK"
+	fi
+}
+
 sha256_of() {
 	local file="$1"
 	if command -v sha256sum >/dev/null 2>&1; then

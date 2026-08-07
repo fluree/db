@@ -1,17 +1,17 @@
-# fluree rdf convert
+# fluree convert
 
 Convert an RDF document from one syntax to another. No ledger, no `.fluree/`,
 no connection — a file (or stdin) goes in and a file (or stdout) comes out.
 
 ```bash
-fluree rdf convert [<FILE>] [--to <SYNTAX>] [-o <FILE>] [options]
+fluree convert [<FILE>] [--to <SYNTAX>] [-o <FILE>] [options]
 ```
 
 ```bash
-fluree rdf convert dump.ttl --to nt > dump.nt
-fluree rdf convert dump.ttl -o dump.jsonld
-fluree rdf convert dump.nt.gz --to turtle --prefixes ctx.json
-cat dump.ttl | fluree rdf convert --syntax turtle --to nquads
+fluree convert dump.ttl --to nt > dump.nt
+fluree convert dump.ttl -o dump.jsonld
+fluree convert dump.nt.gz --to turtle --prefixes ctx.json
+cat dump.ttl | fluree convert --syntax turtle --to nquads
 ```
 
 Conversion into the four text syntaxes is streaming: the parser emits into the
@@ -31,13 +31,13 @@ planning around:
   dump that is the difference between a conversion and an OOM.
 
   Reproduce it with the corpus `scripts/rdf-rss-fixture.py` already generates
-  for the [peak-RSS table](README.md#memory) — `distinct.ttl` is the same
+  for the [peak-RSS table](rdf-files.md#memory) — `distinct.ttl` is the same
   shape, scaled up — and read the figure back out of the profile:
 
   ```bash
   python3 scripts/rdf-rss-fixture.py /tmp
   for to in nt jsonld; do
-    fluree rdf convert /tmp/distinct.ttl --to $to -o /tmp/out.$to \
+    fluree convert /tmp/distinct.ttl --to $to -o /tmp/out.$to \
       --profile=json --no-hash 2>&1 >/dev/null \
       | jq -r "\"$to: \(.host.peak_rss_bytes) bytes RSS for \(.corpus.bytes_decoded) in\""
   done
@@ -69,7 +69,7 @@ through `fluree insert`, not this path yet. RDF/XML, RDF/JSON and Jelly have
 neither reader nor writer yet, and naming one produces a refusal that says so.
 
 ```console
-$ fluree rdf convert dump.ttl --to rdfxml
+$ fluree convert dump.ttl --to rdfxml
 error: cannot write rdfxml yet — the RDF/XML writer lands with the XML family
   help: writable today: turtle, ntriples, nquads, trig, jsonld
 ```
@@ -85,7 +85,7 @@ First rule that answers wins:
    to get when you did not say.
 
 ```console
-$ fluree rdf convert dump.ttl
+$ fluree convert dump.ttl
 <http://example.org/alice> <http://example.org/name> "Alice" .
 <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .
 <http://example.org/bob> <http://example.org/name> "Bob"@en .
@@ -107,7 +107,7 @@ $ fluree rdf convert dump.ttl
 | `--time` | Print elapsed time and throughput to stderr |
 | `--profile[=FORMAT]` | Per-phase timing breakdown (`human` or `json`) |
 
-See [the `rdf` overview](README.md) for input handling, compression and syntax
+See [RDF file tools](rdf-files.md) for input handling, compression and syntax
 resolution, which are shared by every verb.
 
 ### How the flags interact
@@ -157,7 +157,7 @@ no two nodes merge and none splits. This is what `riot` and Oxigraph do, and
 it is what makes output deterministic.
 
 Fluree's own `_:fdb-…` stable identifiers pass through verbatim under either
-policy, so `fluree export | fluree rdf convert` keeps working; they are
+policy, so `fluree export | fluree convert` keeps working; they are
 addressable identifiers rather than incidental syntax.
 
 `--bnode-policy preserve` emits the input's labels unchanged wherever they are
@@ -172,7 +172,7 @@ could merge a user's node with one the writer minted. The error names the label
 and the remedy:
 
 ```console
-$ fluree rdf convert collide.ttl --to nt --bnode-policy preserve
+$ fluree convert collide.ttl --to nt --bnode-policy preserve
 error: the output is incomplete — the writer refused an event: blank-node label
   `fdbw-1` is inside the `_:fdbw-` namespace this writer reserves for anonymous
   nodes; preserving it could merge it with a minted node. Relabel instead of preserving.
@@ -190,7 +190,7 @@ Prefixes declared by the input are always carried into Turtle and TriG output.
 `@context` document works unchanged, with or without the `@context` wrapper.
 
 ```console
-$ fluree rdf convert dump.nt --to turtle --prefixes '{"ex":"http://example.org/"}'
+$ fluree convert dump.nt --to turtle --prefixes '{"ex":"http://example.org/"}'
 @prefix ex: <http://example.org/> .
 
 ex:alice
@@ -208,7 +208,7 @@ refused before anything is written, rather than producing a document this
 tool's own reader would reject:
 
 ```console
-$ fluree rdf convert dump.ttl --to turtle --prefixes '{"ok":"not an iri"}'
+$ fluree convert dump.ttl --to turtle --prefixes '{"ok":"not an iri"}'
 error: --prefixes: namespace for 'ok' is not an absolute IRI: 'not an iri'
   help: a namespace needs a scheme, like "http://example.org/" — a relative or
   malformed one produces a document no RDF reader accepts
@@ -241,7 +241,7 @@ that away for double the disk and no streaming to the final path.
 The error says which you got:
 
 ```console
-$ fluree rdf convert broken.ttl --to nt -o out.nt
+$ fluree convert broken.ttl --to nt -o out.nt
 error: broken.ttl:3:16: unexpected character '?'
   wrote 1 statement(s) before the document stopped parsing — the output is a
   prefix of the conversion, not the whole of it
@@ -257,7 +257,7 @@ path exactly, so the flag is never a correctness decision; `0` — the default �
 uses as many threads as the host reports.
 
 ```bash
-fluree rdf convert big.ttl --to nt -o big.nt --parallelism 8
+fluree convert big.ttl --to nt -o big.nt --parallelism 8
 ```
 
 The document is cut at statement boundaries, each worker parses its chunk and
@@ -293,6 +293,14 @@ Parallelism trades memory for threads: in-flight chunks are bounded, so peak
 usage is roughly `(threads + queue) × chunk output size` rather than the whole
 output.
 
+Before any worker starts, the document is scanned once, single-threaded, to
+find the statement boundaries it can be cut at. That scan is the floor on what
+parallelism can achieve — no thread count reduces it — and it is reported as
+the `chunk` phase, so when sixteen threads do not divide your wall clock by
+sixteen, the profile says how much of the answer is this pass. It is a single
+sweep over the input at scan speed rather than a parse, which on ordinary
+hardware puts it well under a second for a corpus of a few hundred megabytes.
+
 `--profile` reports `threads_used` and a `parallel_reason`, so a run that fell
 back to serial says why. It also records the machine's 1-minute load average
 next to the core count, and prints a `LOADED` line when the average exceeds the
@@ -304,7 +312,7 @@ and this is the only way to tell after the fact.
 Skip the statements that do not parse and keep the rest:
 
 ```console
-$ fluree rdf convert partly-broken.ttl --to nt --continue-on-error > out.nt
+$ fluree convert partly-broken.ttl --to nt --continue-on-error > out.nt
 skipped: partly-broken.ttl:3:11: unexpected character '?'
 skipped: partly-broken.ttl:5:11: unexpected character '?'
 warning: 2 statement(s) skipped, 3 written → stdout
@@ -334,7 +342,7 @@ Not yet. `-o out.nt.gz` is refused rather than writing plain N-Triples into a
 file whose name promises gzip:
 
 ```bash
-fluree rdf convert in.ttl --to nt | gzip > out.nt.gz
+fluree convert in.ttl --to nt | gzip > out.nt.gz
 ```
 
 Compressed *input* decompresses transparently, which is why the asymmetry gets
@@ -350,7 +358,7 @@ the sink estimate does not clear its measurement floor, rather than being
 invented from a number that is not there.
 
 ```console
-$ fluree rdf convert big.ttl --to nt -o big.nt --profile
+$ fluree convert big.ttl --to nt -o big.nt --profile
   ┌───────────┬──────────────┬──────────────┐
   │ phase     │           ms │       % wall │
   ├───────────┼──────────────┼──────────────┤

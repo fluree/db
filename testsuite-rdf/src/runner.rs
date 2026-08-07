@@ -17,7 +17,7 @@ use crate::vocab::rdft;
 pub enum ParseMode {
     /// [`ParserOptions::conformant`] — spine collections, preserved numeric
     /// lexical forms. **This is the mode the suite gates**: it is the shape
-    /// `fluree rdf convert` has to produce, and the shape W3C defines.
+    /// `fluree convert` has to produce, and the shape W3C defines.
     Conformant,
     /// [`ParserOptions::default`] — the ingest shape (indexed list items,
     /// canonicalized numerics). Deliberately lossy as RDF, so its failures

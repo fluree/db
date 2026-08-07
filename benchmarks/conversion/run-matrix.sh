@@ -24,6 +24,7 @@ set -euo pipefail
 
 require_bash 5 "EPOCHREALTIME (the measurement clock) is a bash 5 builtin"
 require_dot_decimal_clock
+bench_lock_acquire "run-matrix"
 require_cmd jq
 ensure_dirs
 
@@ -234,18 +235,18 @@ for tool in "${ELIGIBLE[@]}"; do
 	riot)
 		xmx="$(jq -r '.tools.riot.jvm.xmx' "$TOOLS_LOCK")"
 		export JVM_ARGS="$xmx"
-		run_cell riot check_false ttl "$ttl" riot --output=NT --check=false "$ttl"
-		run_cell riot check_true ttl "$ttl" riot --output=NT --check=true "$ttl"
-		run_cell riot check_false nt "$nt" riot --output=NT --check=false "$nt"
-		run_cell riot check_true nt "$nt" riot --output=NT --check=true "$nt"
+		run_cell riot check_false ttl "$ttl" riot --output=NT --nocheck "$ttl"
+		run_cell riot check_true ttl "$ttl" riot --output=NT --check "$ttl"
+		run_cell riot check_false nt "$nt" riot --output=NT --nocheck "$nt"
+		run_cell riot check_true nt "$nt" riot --output=NT --check "$nt"
 		;;
 	serdi)
 		run_cell serdi default ttl "$ttl" serdi -o ntriples "$ttl"
 		run_cell serdi default nt "$nt" serdi -i ntriples -o ntriples "$nt"
 		;;
 	oxigraph)
-		run_cell oxigraph default ttl "$ttl" oxigraph convert --from-format ttl --to-format nt --file "$ttl"
-		run_cell oxigraph default nt "$nt" oxigraph convert --from-format nt --to-format nt --file "$nt"
+		run_cell oxigraph default ttl "$ttl" oxigraph convert --from-file "$ttl" --from-format ttl --to-format nt
+		run_cell oxigraph default nt "$nt" oxigraph convert --from-file "$nt" --from-format nt --to-format nt
 		;;
 	rapper)
 		run_cell rapper default ttl "$ttl" rapper -i turtle -o ntriples "$ttl"
@@ -255,15 +256,52 @@ for tool in "${ELIGIBLE[@]}"; do
 done
 
 # --- our own column ---------------------------------------------------------
-FLUREE_BIN="$REPO_ROOT/target/release/fluree"
+#
+# Our column is the only one with a checking dimension AND the only one that
+# parallelizes Turtle, so it needs the most rows — and the worker count has to
+# be in the row NAME, because it is not in the command line by default.
+#
+# `--parallelism` defaults to 0, which the CLI reads as "as many as this host
+# has". A cell that passes no parallelism flag is therefore not a serial cell;
+# on this 16-core host it is a 16-worker cell, and the first version of this
+# matrix labelled two such rows `validate` and `nocheck` and presented them
+# opposite single-threaded competitors. Every row below states its worker count.
+#
+#   serial-*   --parallelism 1. The only rows comparable with serdi, rapper,
+#              oxigraph and riot, all of which are single-threaded here.
+#   auto-*     no flag: what a user gets, at this host's core count. Ours alone.
+#   par8-*     --parallelism 8, a fixed count so the row means the same thing on
+#              a different host. Ours alone.
+#
+# The checking dimension crosses that: `validate` is the default (IRI and
+# language-tag validation on, comparable with riot --check), `nocheck` turns it
+# off (comparable with riot --nocheck).
+#
+# The auto and par8 rows are never averaged with the serial rows and never
+# presented as a win over anyone: no other tool in this matrix parallelizes
+# Turtle, so they are our own ceiling, not a comparison.
+FLUREE_BIN="${FLUREE_BIN:-$REPO_ROOT/target/release/fluree}"
 if [ -x "$FLUREE_BIN" ]; then
-	if "$FLUREE_BIN" rdf convert --help >/dev/null 2>&1 &&
-		! "$FLUREE_BIN" rdf convert "$ttl" --to ntriples >/dev/null 2>&1; then
-		info "fluree rdf convert is present but not yet implemented on this branch — our cells deferred"
-		info "  (check/count exist; convert lands with the writers. The matrix carries the column already.)"
+	if ! "$FLUREE_BIN" convert "$ttl" --to ntriples >/dev/null 2>&1; then
+		info "fluree convert did not run — our cells deferred (see $FLUREE_BIN convert --help)"
 	else
-		run_cell fluree default ttl "$ttl" "$FLUREE_BIN" rdf convert "$ttl" --to ntriples
-		run_cell fluree default nt "$nt" "$FLUREE_BIN" rdf convert "$nt" --to ntriples
+		run_cell fluree serial-validate ttl "$ttl" \
+			"$FLUREE_BIN" convert "$ttl" --to ntriples --parallelism 1
+		run_cell fluree serial-validate nt "$nt" \
+			"$FLUREE_BIN" convert "$nt" --to ntriples --parallelism 1
+		run_cell fluree serial-nocheck ttl "$ttl" \
+			"$FLUREE_BIN" convert "$ttl" --to ntriples --nocheck --parallelism 1
+		run_cell fluree serial-nocheck nt "$nt" \
+			"$FLUREE_BIN" convert "$nt" --to ntriples --nocheck --parallelism 1
+		# Parallel rows are OURS ALONE — labelled with their worker count,
+		# never averaged with the serial rows.
+		run_cell fluree auto-validate ttl "$ttl" "$FLUREE_BIN" convert "$ttl" --to ntriples
+		run_cell fluree auto-nocheck ttl "$ttl" \
+			"$FLUREE_BIN" convert "$ttl" --to ntriples --nocheck
+		run_cell fluree par8-validate ttl "$ttl" \
+			"$FLUREE_BIN" convert "$ttl" --to ntriples --parallelism 8
+		run_cell fluree par8-nocheck ttl "$ttl" \
+			"$FLUREE_BIN" convert "$ttl" --to ntriples --nocheck --parallelism 8
 	fi
 else
 	info "target/release/fluree not built — our cells skipped (cargo build --release -p fluree-db-cli)"
@@ -277,9 +315,11 @@ jq -n \
 	--argjson publishable "$PUBLISHABLE" --argjson runs "$RUNS" \
 	--argjson load_per_core "$LOAD_PER_CORE" --argjson load_contaminated "$LOAD_CONTAMINATED" \
 	--arg git_sha "$(git -C "$REPO_ROOT" rev-parse HEAD)" \
+	--argjson cores "$(host_cores)" \
 	--argjson eligible "$(printf '%s\n' "${ELIGIBLE[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
 	--argjson refused "$(printf '%s\n' "${REFUSED[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
 	'{run_id:$run_id, corpus:$corpus, host_class:$host, publishable:$publishable,
+	  available_parallelism:$cores,
 	  load_per_core:$load_per_core, load_contaminated:$load_contaminated,
 	  runs_per_cell:$runs, warmup_discarded:1,
 	  clock:"wall (bash EPOCHREALTIME builtin; no subprocess inside the measured interval)",

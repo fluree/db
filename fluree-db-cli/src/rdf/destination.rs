@@ -69,7 +69,7 @@ fn refuse_compressed_output(path: &Path) -> CliResult<()> {
     }
     Err(CliError::Usage(format!(
         "cannot write compressed output yet: '{}' names a {} file\n  {} write the plain \
-         file and compress it, or pipe: `fluree rdf convert in.ttl --to nt | gzip > out.nt.gz`",
+         file and compress it, or pipe: `fluree convert in.ttl --to nt | gzip > out.nt.gz`",
         path.display(),
         compression.as_str(),
         colored::Colorize::bold(colored::Colorize::cyan("help:")),

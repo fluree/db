@@ -22,7 +22,7 @@
 use super::terms::{write_nt_term, write_ttl_predicate, write_ttl_term, WriterTerms};
 use super::{blank::BlankLabeler, Deferred, Out, WriterConfig, WriterStats};
 use crate::prefix::{write_prefix_declarations, write_turtle_iri, PrefixMap};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, Term, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, Term, TermId, TermScope};
 use std::io::Write;
 
 /// Which graph the writer currently has open.
@@ -368,8 +368,23 @@ macro_rules! block_sink_common {
             }
         }
 
+        /// Honor a producer's statement-scope declaration: everything but a
+        /// labelled blank then recycles at the statement boundary. Sound here
+        /// because every emission clones the term out of the table before the
+        /// slot can be reused.
+        fn declare_term_scope(&mut self, scope: TermScope) {
+            self.0.terms.set_scope(scope);
+        }
+
         fn term_iri(&mut self, iri: &str) -> TermId {
             self.0.terms.iri(iri)
+        }
+
+        /// Store the producer's own `Arc<str>` rather than a second copy of
+        /// the same bytes. Same event as `term_iri`; only the allocation
+        /// differs.
+        fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+            self.0.terms.iri_shared(iri)
         }
 
         fn term_blank(&mut self, label: Option<&str>) -> TermId {

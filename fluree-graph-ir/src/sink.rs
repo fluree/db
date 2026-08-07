@@ -75,6 +75,29 @@ pub type SinkResult = std::result::Result<(), SinkError>;
 /// to the methods it counts so the adding diff touches it.
 pub const PROTOCOL_QUAD_EVENTS: usize = 2;
 
+/// How long the term ids a producer mints stay valid.
+///
+/// Declared by the producer through [`GraphSink::declare_term_scope`]; see
+/// [`TermId`] for the lifetime classes this chooses between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum TermScope {
+    /// The [`TermId`] contract as written: ids from `term_iri` and
+    /// `term_blank` are valid for the whole session, and the producer may
+    /// cache and reuse them across statements. The default, and the only safe
+    /// assumption about a producer that has not said otherwise.
+    #[default]
+    Session,
+    /// Every id this producer mints — literals, IRIs, blank nodes alike — is
+    /// dead once the statement it was minted in ends. The producer promises it
+    /// caches nothing across [`GraphSink::end_statement`].
+    ///
+    /// One thing survives regardless: a *labelled* blank node names the same
+    /// node everywhere in a document, so a sink that rewrites labels must keep
+    /// its label mapping for the session even under this scope. What recycles
+    /// is the storage behind the ids, not the identity of what they denote.
+    Statement,
+}
+
 /// Opaque term identifier for efficient triple emission
 ///
 /// `TermId` is only valid within a single sink session. It allows parsers
@@ -94,6 +117,10 @@ pub const PROTOCOL_QUAD_EVENTS: usize = 2;
 ///   until the next [`GraphSink::end_statement`] call. Literals are minted per
 ///   occurrence and never deduplicated, so retaining them across statements is
 ///   what makes a long document's term table grow without bound.
+///
+/// A producer that does not actually cache IRI and blank ids can say so with
+/// [`GraphSink::declare_term_scope`], which narrows the first class to the
+/// second and lets a sink reclaim those slots too. See [`TermScope`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TermId(pub(crate) u32);
 
@@ -176,6 +203,27 @@ pub trait GraphSink {
     /// The IRI should be fully expanded (not prefixed).
     fn term_iri(&mut self, iri: &str) -> TermId;
 
+    /// Create an IRI term from a string the producer is already keeping.
+    ///
+    /// Same event as [`Self::term_iri`] — every sink that counts, times or
+    /// records terms must treat the two identically — and the default body
+    /// forwards to it, so a sink that does not care never sees this.
+    ///
+    /// It exists because both sides were paying for the same string. A caching
+    /// producer holds an `Arc<str>` per distinct IRI so it can answer a repeat
+    /// occurrence without allocating; a sink handed only `&str` has no choice
+    /// but to allocate its own copy of the very bytes the producer is holding.
+    /// On a corpus with 800K distinct terms that is 800K allocations and about
+    /// 37 MiB of second copies. A sink that overrides this clones the `Arc`
+    /// instead: a refcount bump, no allocation, and the same lifetime it would
+    /// have given its own copy.
+    ///
+    /// Only worth overriding for a sink that STORES the term. One that renders
+    /// and forgets should leave the default alone.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.term_iri(iri)
+    }
+
     /// Create a blank node term and return its ID
     ///
     /// If `label` is Some, the blank node has that label (for consistent
@@ -212,6 +260,40 @@ pub trait GraphSink {
         // Implementations that support lists should override this
         let _ = index;
         self.emit_triple(subject, predicate, object)
+    }
+
+    /// Declare how long the ids this producer mints stay valid.
+    ///
+    /// Called once, before any term is minted. The default — and what a
+    /// producer that never calls this is taken to mean — is
+    /// [`TermScope::Session`], the contract [`TermId`] documents.
+    ///
+    /// This exists because the contract is written for the producer that needs
+    /// the most, and paid for by every sink regardless. A line-format reader
+    /// mints a fresh id for every term occurrence and caches nothing, so a
+    /// sink holding its ids for the session holds one entry per *occurrence*:
+    /// measured on a 4M-statement N-Triples document, 814 MiB of writer term
+    /// table for a document whose widest statement needs three slots. Declaring
+    /// [`TermScope::Statement`] lets the sink recycle at the statement boundary
+    /// it already observes, and costs the producer nothing it was doing anyway.
+    ///
+    /// A sink may ignore the declaration entirely; the default body does. What
+    /// a sink may NOT do is honor it without the producer having made it —
+    /// recycling a slot a producer still holds an id for is silent data
+    /// corruption, which is why this is a statement the producer makes rather
+    /// than something a sink infers.
+    ///
+    /// The declaration is a property of the SESSION, which means a sink is
+    /// driven by exactly one producer for its lifetime. Handing a sink that
+    /// has been told `Statement` to a second, caching producer would be
+    /// undetectable from inside — the second producer says nothing, so there
+    /// is nothing to notice — and the sinks in this workspace hold that
+    /// property structurally: a writer owns one destination and writes one
+    /// document. Debug builds of the writers stamp each recycled slot with the
+    /// statement that minted it and panic on a stale read, which catches the
+    /// reachable half of this: a producer that declares and then caches anyway.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        let _ = scope;
     }
 
     /// Whether this sink can consume quad events ([`Self::emit_quad`]).

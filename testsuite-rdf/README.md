@@ -47,7 +47,7 @@ vacuously green) suite.
 
 **Conformant mode** is `ParserOptions::conformant()`: `CollectionStyle::Spine`
 plus `NumericStyle::PreserveLexical`. That is the shape W3C defines and the
-shape `fluree rdf convert` must produce, so it is the shape that gates.
+shape `fluree convert` must produce, so it is the shape that gates.
 
 **Ingest-default mode** is `ParserOptions::default()` — indexed list items and
 canonicalized numeric literals. It is deliberately lossy as RDF, so it is

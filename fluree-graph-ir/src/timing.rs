@@ -73,7 +73,7 @@
 //! observation about a cooperating corpus, never as a measurement of an
 //! untrusted one.
 
-use crate::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
+use crate::{Datatype, GraphSink, LiteralValue, SinkResult, TermId, TermScope};
 use std::time::{Duration, Instant};
 
 /// A phase of an RDF pipeline run.
@@ -88,6 +88,25 @@ pub enum Phase {
     Read,
     /// Decoding a compression layer (`.gz`, `.zst`) off those bytes.
     Decompress,
+    /// Cutting the document into independently-parseable chunks.
+    ///
+    /// Single-threaded and whole-document, so it is the parallel path's Amdahl
+    /// term: it runs to completion before the first worker starts and no
+    /// thread count touches it.
+    ///
+    /// It measures the ATTEMPT, not the outcome. A run that never tries —
+    /// `--parallelism 1`, an input under the size gate — reports zero. A run
+    /// that tries and then falls back to serial, because a mid-file directive
+    /// or an oversized header makes the document unchunkable, reports what the
+    /// attempt cost while also reporting `threads_used: 1`. That pairing is
+    /// not a contradiction to be explained away: the scan really did run, and
+    /// on a fallback it is pure overhead, which is exactly the case worth
+    /// being able to see.
+    ///
+    /// It has its own lane because it went unattributed for a whole bucket and
+    /// turned out to be 43% of the wall at 16 threads. Time that no lane owns
+    /// is time nobody optimizes.
+    Chunk,
     /// Lexing and parsing the decoded text into sink events.
     Parse,
     /// Parse time summed across parallel workers.
@@ -113,9 +132,10 @@ pub enum Phase {
 
 impl Phase {
     /// Every phase, in pipeline order. Report ordering follows this.
-    pub const ALL: [Phase; 8] = [
+    pub const ALL: [Phase; 9] = [
         Phase::Read,
         Phase::Decompress,
+        Phase::Chunk,
         Phase::Parse,
         Phase::Workers,
         Phase::Reassembly,
@@ -135,7 +155,7 @@ impl Phase {
     /// of them to a pipeline total would claim more time than the run took,
     /// and the gap that is supposed to reveal unmeasured work would saturate
     /// to zero and reveal nothing.
-    pub const SEQUENTIAL: [Phase; 3] = [Phase::Read, Phase::Decompress, Phase::Parse];
+    pub const SEQUENTIAL: [Phase; 4] = [Phase::Read, Phase::Decompress, Phase::Chunk, Phase::Parse];
 
     /// Whether this phase runs inside another rather than beside it.
     pub fn is_nested(self) -> bool {
@@ -147,6 +167,7 @@ impl Phase {
         match self {
             Phase::Read => "read",
             Phase::Decompress => "decompress",
+            Phase::Chunk => "chunk",
             Phase::Parse => "parse",
             Phase::Workers => "workers",
             Phase::Reassembly => "reassembly",
@@ -160,12 +181,13 @@ impl Phase {
         match self {
             Phase::Read => 0,
             Phase::Decompress => 1,
-            Phase::Parse => 2,
-            Phase::Workers => 3,
-            Phase::Reassembly => 4,
-            Phase::Sink => 5,
-            Phase::Serialize => 6,
-            Phase::Write => 7,
+            Phase::Chunk => 2,
+            Phase::Parse => 3,
+            Phase::Workers => 4,
+            Phase::Reassembly => 5,
+            Phase::Sink => 6,
+            Phase::Serialize => 7,
+            Phase::Write => 8,
         }
     }
 }
@@ -352,7 +374,7 @@ pub struct SinkCounts {
 impl SinkCounts {
     /// Total RDF triples emitted, counting quads, list items and reifiers —
     /// everything that becomes an edge in the graph. This is the number a user
-    /// means by "how big is this file", and the one `fluree rdf count` prints.
+    /// means by "how big is this file", and the one `fluree count` prints.
     pub fn emitted(&self) -> u64 {
         self.triples + self.quads + self.list_items + self.reified
     }
@@ -799,6 +821,14 @@ impl<S: GraphSink> GraphSink for TimingSink<S> {
         self.forward(|s| s.term_iri(iri))
     }
 
+    /// The same event as `term_iri`, counted and timed identically — a sink
+    /// decorator that let this one through uncounted would silently drop every
+    /// IRI from the profile the moment a producer started sharing.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.counts.terms_iri += 1;
+        self.forward(|s| s.term_iri_shared(iri))
+    }
+
     fn term_blank(&mut self, label: Option<&str>) -> TermId {
         self.counts.terms_blank += 1;
         self.forward(|s| s.term_blank(label))
@@ -832,6 +862,13 @@ impl<S: GraphSink> GraphSink for TimingSink<S> {
 
     fn supports_quads(&self) -> bool {
         self.inner.supports_quads()
+    }
+
+    /// Forwarded: a decorator that swallowed this would leave the sink on the
+    /// conservative scope and silently give up the recycling the producer
+    /// offered.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        self.inner.declare_term_scope(scope);
     }
 
     fn emit_quad(
@@ -1031,7 +1068,7 @@ mod tests {
     // The three sinks below are the review probe's, reduced to what a unit
     // test needs: the cheap sink the estimator got wrong, a sink with real
     // measurable work, and the periodic corpus that defeats a fixed stride.
-    // Original probe: scratchpad/sink_bias_probe.rs from the `fluree rdf`
+    // Original probe: scratchpad/sink_bias_probe.rs from the RDF file verbs'
     // adversarial review.
     // ------------------------------------------------------------------
 
@@ -1040,6 +1077,9 @@ mod tests {
     #[derive(Default)]
     struct DiscardSink {
         next: u32,
+        /// Which IRI entry point the decorator forwarded to.
+        copying_calls: usize,
+        shared_calls: usize,
     }
 
     impl DiscardSink {
@@ -1053,6 +1093,11 @@ mod tests {
         fn on_base(&mut self, _: &str) {}
         fn on_prefix(&mut self, _: &str, _: &str) {}
         fn term_iri(&mut self, _: &str) -> TermId {
+            self.copying_calls += 1;
+            self.mint()
+        }
+        fn term_iri_shared(&mut self, _: &std::sync::Arc<str>) -> TermId {
+            self.shared_calls += 1;
             self.mint()
         }
         fn term_blank(&mut self, _: Option<&str>) -> TermId {
@@ -1083,6 +1128,33 @@ mod tests {
                 inner: DiscardSink::default(),
             }
         }
+    }
+
+    #[test]
+    fn a_shared_iri_reaches_the_inner_sink_shared_and_is_counted_the_same() {
+        // Two ways a decorator can quietly break this, neither of which shows
+        // up in output bytes. Forwarding `term_iri_shared` to the inner sink's
+        // `term_iri` puts the allocation back — the inner sink is storing, and
+        // it has to copy. Not counting it drops every IRI out of the profile
+        // the moment a producer starts sharing, so `--profile` would report
+        // zero IRI terms for a document full of them.
+        let mut sink = TimingSink::new(DiscardSink::default());
+        let shared: std::sync::Arc<str> = std::sync::Arc::from("http://example.org/a");
+        sink.term_iri_shared(&shared);
+        sink.term_iri_shared(&shared);
+        sink.term_iri("http://example.org/b");
+
+        assert_eq!(
+            sink.counts().terms_iri,
+            3,
+            "both entry points are the same event and must be counted alike"
+        );
+        let inner = sink.into_inner();
+        assert_eq!(
+            inner.shared_calls, 2,
+            "the decorator must forward the shared form as the shared form"
+        );
+        assert_eq!(inner.copying_calls, 1, "and the copying form as itself");
     }
 
     /// Busy-wait. A `sleep` this short is dominated by scheduler granularity;
@@ -1517,12 +1589,22 @@ mod tests {
     fn the_sampling_error_bound_is_reported_and_grows_with_dispersion() {
         // A uniform corpus and a wildly varying one must not report the same
         // confidence in an extrapolation from the same number of samples.
-        let mut uniform = TimingSink::new(SpinSink::new(Duration::from_micros(20)));
-        drive_discard(&mut uniform, 3_000);
-        let uniform_err = uniform
-            .sink_timing()
-            .relative_std_error
-            .expect("more than one sample");
+        // Both arms are measured as the MINIMUM over three trials. Contention
+        // only ever adds dispersion — a preempted statement is indistinguishable
+        // from a slow one — so the minimum is each arm's least-corrupted
+        // estimate. Comparing single trials made this test flaky on a loaded
+        // machine: one unlucky pause in the uniform arm could out-disperse a
+        // corpus that genuinely varies by 200x.
+        let uniform_err = (0..3)
+            .map(|_| {
+                let mut uniform = TimingSink::new(SpinSink::new(Duration::from_micros(20)));
+                drive_discard(&mut uniform, 3_000);
+                uniform
+                    .sink_timing()
+                    .relative_std_error
+                    .expect("more than one sample")
+            })
+            .fold(f64::INFINITY, f64::min);
 
         struct Erratic {
             statement: u64,
@@ -1555,15 +1637,19 @@ mod tests {
             }
         }
 
-        let mut erratic = TimingSink::new(Erratic {
-            statement: 0,
-            inner: DiscardSink::default(),
-        });
-        drive_discard(&mut erratic, 3_000);
-        let erratic_err = erratic
-            .sink_timing()
-            .relative_std_error
-            .expect("more than one sample");
+        let erratic_err = (0..3)
+            .map(|_| {
+                let mut erratic = TimingSink::new(Erratic {
+                    statement: 0,
+                    inner: DiscardSink::default(),
+                });
+                drive_discard(&mut erratic, 3_000);
+                erratic
+                    .sink_timing()
+                    .relative_std_error
+                    .expect("more than one sample")
+            })
+            .fold(f64::INFINITY, f64::min);
 
         assert!(
             erratic_err > uniform_err,

@@ -874,6 +874,9 @@ pub enum Commands {
     },
 
     /// Export ledger data as RDF (Turtle, N-Triples, N-Quads, TriG, JSON-LD) or as a `.flpack` archive
+    ///
+    /// `export` writes a ledger out; to convert an RDF file between syntaxes
+    /// without a ledger, see `fluree convert`.
     Export {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
@@ -1163,19 +1166,100 @@ pub enum Commands {
         action: DocsAction,
     },
 
-    /// RDF syntax tooling: check, count, and convert files without a ledger
+    /// Parse an RDF file and report syntax errors
     ///
-    /// These verbs read files, not databases — no `fluree init`, no ledger,
-    /// no connection. Input may be a path, `-`, or piped on stdin, and
+    /// Reads a file, not a database — no `fluree init`, no ledger, no
+    /// connection. Input may be a path, `-`, or piped on stdin, and
     /// `.gz` / `.zst` inputs decompress transparently.
     ///
+    /// Exits 0 when the document parses, 1 when it does not, and 2 when the
+    /// invocation itself was wrong (missing file, unknown syntax). This is a
+    /// syntax check; to check data against SHACL shapes, see `fluree
+    /// validate`.
+    ///
     /// Examples:
-    ///   fluree rdf check dump.ttl
-    ///   fluree rdf count dump.nt.gz --time
-    ///   cat dump.ttl | fluree rdf count --profile=json
-    Rdf {
-        #[command(subcommand)]
-        action: RdfAction,
+    ///   fluree parse dump.ttl
+    ///   fluree parse dump.nt.gz --format json
+    ///   cat dump.ttl | fluree parse --syntax turtle
+    #[command(alias = "check")]
+    Parse {
+        #[command(flatten)]
+        common: RdfCommonArgs,
+
+        /// Diagnostic format.
+        #[arg(long, value_enum, default_value_t = crate::rdf::check::CheckFormat::Table)]
+        format: crate::rdf::check::CheckFormat,
+    },
+
+    /// Count the statements in an RDF file
+    ///
+    /// Reads a file, not a database — no `fluree init`, no ledger, no
+    /// connection. Input may be a path, `-`, or piped on stdin, and
+    /// `.gz` / `.zst` inputs decompress transparently.
+    ///
+    /// Collections are counted as the rdf:first/rdf:rest spine they denote,
+    /// so the number is comparable with other RDF tools. Under `--quiet` the
+    /// output is the bare total, for capturing in a shell variable.
+    ///
+    /// Examples:
+    ///   fluree count dump.ttl
+    ///   fluree count dump.nt.gz --time
+    ///   cat dump.ttl | fluree count --profile=json
+    Count {
+        #[command(flatten)]
+        common: RdfCommonArgs,
+    },
+
+    /// Convert an RDF file from one syntax to another
+    ///
+    /// Reads a file, not a database — no `fluree init`, no ledger, no
+    /// connection. Input may be a path, `-`, or piped on stdin, and
+    /// `.gz` / `.zst` inputs decompress transparently.
+    ///
+    /// `convert` reads a file; to write a ledger out as RDF, see `fluree
+    /// export`.
+    ///
+    /// Examples:
+    ///   fluree convert dump.ttl --to ntriples > dump.nt
+    ///   fluree convert dump.nt.gz --to turtle -o dump.ttl
+    ///   cat dump.ttl | fluree convert --syntax turtle --to nquads
+    Convert {
+        #[command(flatten)]
+        common: RdfCommonArgs,
+
+        /// Output syntax. Defaults to nquads.
+        #[arg(long, value_enum, value_name = "SYNTAX")]
+        to: Option<crate::rdf::syntax::RdfSyntax>,
+
+        /// Write to a file instead of stdout.
+        #[arg(short = 'o', long, value_name = "FILE")]
+        output: Option<PathBuf>,
+
+        /// Group and indent Turtle output. Buffers the whole graph; the
+        /// default streaming form does not. Not yet implemented.
+        #[arg(long)]
+        pretty: bool,
+
+        /// How blank-node labels reach the output. `relabel` (default) mints
+        /// fresh labels, as riot and Oxigraph do; `preserve` emits the
+        /// input's. Fluree's own `_:fdb-` stable identifiers pass through
+        /// either way. `preserve` converts serially, because the parallel
+        /// path's labelling is what makes workers independent.
+        #[arg(long, value_enum, default_value_t = BnodePolicyArg::Relabel)]
+        bnode_policy: BnodePolicyArg,
+
+        /// Skip statements that do not parse instead of stopping at the
+        /// first one. Every skip is reported, and the run exits 1 so a
+        /// partial conversion cannot be mistaken for a clean one.
+        #[arg(long)]
+        continue_on_error: bool,
+
+        /// Prefixes for compaction, as inline JSON or a path to a JSON file.
+        /// A JSON-LD `@context` document works unchanged. Turtle and TriG
+        /// compact IRIs with these and declare them; JSON-LD uses them as its
+        /// `@context`. Prefixes declared by the input are always included.
+        #[arg(long, value_name = "JSON|PATH")]
+        prefixes: Option<String>,
     },
 
     /// Manage Apache Iceberg table connections
@@ -2798,10 +2882,10 @@ pub enum UpstreamAction {
 }
 
 // =============================================================================
-// `fluree rdf` subcommands
+// RDF file verbs (`parse`, `count`, `convert`)
 // =============================================================================
 
-/// Arguments every `fluree rdf` verb takes.
+/// Arguments every RDF file verb takes.
 ///
 /// Flattened rather than repeated so `--syntax` means the same thing in every
 /// verb — the same reason [`PolicyArgs`] is flattened across query and
@@ -2809,7 +2893,7 @@ pub enum UpstreamAction {
 ///
 /// `--quiet` is deliberately absent, and not because it could not go here:
 /// it is `global = true` on [`Cli`], so clap already accepts it at any
-/// position — `fluree -q rdf count f.ttl` and `fluree rdf count -q f.ttl`
+/// position — `fluree -q count f.ttl` and `fluree count -q f.ttl`
 /// both work — and propagates it to every subcommand's matches. Redeclaring
 /// it would add a second argument with the same name for no behavior. The
 /// verbs read `cli.quiet`, threaded through `run()`.
@@ -2873,76 +2957,6 @@ pub enum BnodePolicyArg {
     Relabel,
     /// Emit the input's labels unchanged where they are legal to emit.
     Preserve,
-}
-
-/// `fluree rdf` verbs.
-#[derive(Subcommand)]
-pub enum RdfAction {
-    /// Convert a document from one RDF syntax to another
-    ///
-    /// Not yet implemented — no serializers have landed. The flags are final;
-    /// the writers are what is missing.
-    Convert {
-        #[command(flatten)]
-        common: RdfCommonArgs,
-
-        /// Output syntax. Defaults to nquads.
-        #[arg(long, value_enum, value_name = "SYNTAX")]
-        to: Option<crate::rdf::syntax::RdfSyntax>,
-
-        /// Write to a file instead of stdout.
-        #[arg(short = 'o', long, value_name = "FILE")]
-        output: Option<PathBuf>,
-
-        /// Group and indent Turtle output. Buffers the whole graph; the
-        /// default streaming form does not. Not yet implemented.
-        #[arg(long)]
-        pretty: bool,
-
-        /// How blank-node labels reach the output. `relabel` (default) mints
-        /// fresh labels, as riot and Oxigraph do; `preserve` emits the
-        /// input's. Fluree's own `_:fdb-` stable identifiers pass through
-        /// either way. `preserve` converts serially, because the parallel
-        /// path's labelling is what makes workers independent.
-        #[arg(long, value_enum, default_value_t = BnodePolicyArg::Relabel)]
-        bnode_policy: BnodePolicyArg,
-
-        /// Skip statements that do not parse instead of stopping at the
-        /// first one. Every skip is reported, and the run exits 1 so a
-        /// partial conversion cannot be mistaken for a clean one.
-        #[arg(long)]
-        continue_on_error: bool,
-
-        /// Prefixes for compaction, as inline JSON or a path to a JSON file.
-        /// A JSON-LD `@context` document works unchanged. Turtle and TriG
-        /// compact IRIs with these and declare them; JSON-LD uses them as its
-        /// `@context`. Prefixes declared by the input are always included.
-        #[arg(long, value_name = "JSON|PATH")]
-        prefixes: Option<String>,
-    },
-
-    /// Parse a document and report syntax errors
-    ///
-    /// Exits 0 when the document parses, 1 when it does not, and 2 when the
-    /// invocation itself was wrong (missing file, unknown syntax).
-    Check {
-        #[command(flatten)]
-        common: RdfCommonArgs,
-
-        /// Diagnostic format.
-        #[arg(long, value_enum, default_value_t = crate::rdf::check::CheckFormat::Table)]
-        format: crate::rdf::check::CheckFormat,
-    },
-
-    /// Count the statements in a document
-    ///
-    /// Collections are counted as the rdf:first/rdf:rest spine they denote,
-    /// so the number is comparable with other RDF tools. Under `--quiet` the
-    /// output is the bare total, for capturing in a shell variable.
-    Count {
-        #[command(flatten)]
-        common: RdfCommonArgs,
-    },
 }
 
 // =============================================================================

@@ -1,4 +1,4 @@
-//! `fluree rdf count` — how many statements are in this document.
+//! `fluree count` — how many statements are in this document.
 //!
 //! Counting is a parse with the results thrown away, which makes it the
 //! cheapest honest measurement of parser throughput there is: no sink work,
@@ -25,7 +25,7 @@ use colored::Colorize;
 use fluree_graph_ir::PhaseTimings;
 use std::time::Duration;
 
-/// Run `fluree rdf count`.
+/// Run `fluree count`.
 pub fn run(common: &RdfCommonArgs, quiet: bool) -> CliResult<()> {
     let mut timings = PhaseTimings::start();
     let loaded = rdf::load(common, &mut timings)?;
@@ -59,7 +59,7 @@ pub fn run(common: &RdfCommonArgs, quiet: bool) -> CliResult<()> {
     }
 
     if quiet {
-        // One number, for `$(fluree rdf count -q f.ttl)`.
+        // One number, for `$(fluree count -q f.ttl)`.
         println!("{}", counts.emitted());
     } else {
         println!("triples: {}", counts.triples);
@@ -89,7 +89,7 @@ pub fn run(common: &RdfCommonArgs, quiet: bool) -> CliResult<()> {
 /// The one-line `--time` footer: elapsed, triple rate, byte rate.
 ///
 /// Shared with `check`, and on stderr for the same reason the profile is —
-/// `fluree rdf count f.ttl --time | …` must keep piping the count.
+/// `fluree count f.ttl --time | …` must keep piping the count.
 pub fn print_timing(wall: Duration, triples: u64, bytes: u64) {
     let secs = wall.as_secs_f64();
     let (rate, mib) = if secs > 0.0 {

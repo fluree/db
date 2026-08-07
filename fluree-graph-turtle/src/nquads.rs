@@ -22,7 +22,7 @@
 //! nearly everywhere.
 
 use fluree_graph_ir::chars::{is_pn_chars, is_pn_chars_u, simple_escape, unicode_escape_value};
-use fluree_graph_ir::{Datatype, GraphSink, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, TermId, TermScope};
 use fluree_vocab::iri::{iri_violation, IriViolation};
 use fluree_vocab::lang::language_tag_violation;
 
@@ -121,6 +121,13 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
     }
 
     fn run(mut self) -> Result<()> {
+        // This reader has no term cache: every term on every line is minted
+        // fresh, and no id outlives the statement it was minted in. Saying so
+        // lets a sink recycle the storage behind them — for a writing sink,
+        // the difference between a table that grows with the document and one
+        // that is as wide as the widest line. The Turtle parser makes no such
+        // declaration, because it does cache.
+        self.sink.declare_term_scope(TermScope::Statement);
         loop {
             self.skip_between_statements();
             if self.peek().is_none() {

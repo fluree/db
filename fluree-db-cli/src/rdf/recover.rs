@@ -43,7 +43,10 @@
 
 use crate::error::CliResult;
 use crate::rdf::diagnostic::{self, Diagnostic};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
+use crate::rdf::syntax::RdfSyntax;
+use fluree_graph_ir::{
+    Datatype, GraphCollectorSink, GraphSink, LiteralValue, SinkResult, TermId, TermScope,
+};
 use fluree_graph_turtle::{splitter, ParserOptions};
 
 /// Records `@prefix` and `@base` so a resumed parse can be re-seeded.
@@ -82,6 +85,17 @@ impl<S: GraphSink> PrefixRecorder<S> {
 }
 
 impl<S: GraphSink> GraphSink for PrefixRecorder<S> {
+    /// Forwarded: swallowing this would quietly put the copy back.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.inner.term_iri_shared(iri)
+    }
+    /// Forwarded: a decorator that swallowed this would leave the sink on the
+    /// conservative scope and silently give up the recycling the producer
+    /// offered.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        self.inner.declare_term_scope(scope);
+    }
+
     fn on_prefix(&mut self, prefix: &str, namespace_iri: &str) {
         // A redeclaration shadows the earlier binding, matching Turtle.
         if let Some(existing) = self.prefixes.iter_mut().find(|(p, _)| p == prefix) {
@@ -142,9 +156,34 @@ impl<S: GraphSink> GraphSink for PrefixRecorder<S> {
 /// What a recovering parse skipped.
 #[derive(Debug, Default)]
 pub struct Recovery {
-    /// One per skipped statement, in document order, positioned against the
-    /// whole document rather than the fragment that failed.
+    /// One per recovery EVENT, in document order, positioned against the whole
+    /// document rather than the fragment that failed.
+    ///
+    /// Not one per statement lost: resync scans to the next terminator, so a
+    /// failing statement without one takes its neighbours with it. See
+    /// [`swallowed`](Self::swallowed).
     pub skipped: Vec<Diagnostic>,
+    /// Resyncs that consumed more than the line that failed.
+    pub swallowed: Vec<Swallowed>,
+}
+
+/// A resync that ran past the failing statement into following content.
+///
+/// Recovery finds the next statement TERMINATOR and resumes there. A failing
+/// statement that has no terminator of its own — junk text, a truncated line —
+/// therefore ends at the terminator of the statement AFTER it, and that
+/// statement is consumed without ever being parsed, diagnosed or counted.
+///
+/// Reported because the alternative is a run that says "1 statement skipped"
+/// having dropped two, with stderr byte-identical to the honest case. The
+/// count cannot be fixed — the swallowed bytes were never parsed, so nothing
+/// knows how many statements they held — but the span can be shown.
+#[derive(Debug)]
+pub struct Swallowed {
+    /// Bytes consumed beyond the failing statement's own line.
+    pub bytes: usize,
+    /// 1-based line the parse resumed at.
+    pub resume_line: usize,
 }
 
 impl Recovery {
@@ -158,9 +197,18 @@ impl Recovery {
 ///
 /// The sink must be configured with statement buffering; see the module docs
 /// for why that is a requirement and not a preference.
+///
+/// `source` picks the reader, for the same reason the streaming and parallel
+/// paths dispatch on it: the line formats are grammars defined by what they
+/// refuse. Recovering with the Turtle parser would not merely accept the
+/// Turtle-only constructs an N-Triples document must be refused for — it would
+/// accept them *silently*, since recovery reports what it skipped and a
+/// construct that parses is never skipped.
 pub fn parse_recovering<S: GraphSink>(
     text: &str,
+    source: RdfSyntax,
     base: Option<&str>,
+    options: ParserOptions,
     sink: &mut PrefixRecorder<S>,
 ) -> CliResult<Recovery> {
     let mut recovery = Recovery::default();
@@ -171,13 +219,8 @@ pub fn parse_recovering<S: GraphSink>(
         let effective_base = seeded_base.as_deref().or(base);
         let prefixes = sink.prefixes().to_vec();
 
-        let result = fluree_graph_turtle::parse_with_prefixes_base_options(
-            &text[offset..],
-            sink,
-            &prefixes,
-            effective_base,
-            ParserOptions::conformant(),
-        );
+        let fragment = &text[offset..];
+        let result = parse_fragment(fragment, sink, source, &prefixes, effective_base, options);
 
         let Err(error) = result else {
             return Ok(recovery);
@@ -201,6 +244,33 @@ pub fn parse_recovering<S: GraphSink>(
             // Nothing parseable remains.
             return Ok(recovery);
         };
+        // Did the resync eat a statement? If it did, that statement was
+        // consumed without being parsed — the failing one had no terminator of
+        // its own, so the scan ran to the next one, which belongs to the
+        // statement after it.
+        //
+        // Re-read the directives rather than reusing the snapshot above. That
+        // one was taken BEFORE this fragment was parsed, and parsing is what
+        // records them: on the first pass it is empty, so a candidate using a
+        // prefix the document declares on line 1 would fail to parse and the
+        // swallow would go unreported. Silently — which is the failure this
+        // note exists to end.
+        let seen_base = sink.base().map(str::to_string);
+        let seen_prefixes = sink.prefixes().to_vec();
+        if let Some(bytes) = swallowed_following_statement(
+            text,
+            error_at,
+            resume,
+            source,
+            &seen_prefixes,
+            seen_base.as_deref().or(base),
+            options,
+        ) {
+            recovery.swallowed.push(Swallowed {
+                bytes,
+                resume_line: text[..resume].lines().count().max(1),
+            });
+        }
         if resume <= offset {
             // Cannot happen — `next_statement_boundary` scans forward from
             // `error_at >= offset` — but a resync that failed to advance would
@@ -211,6 +281,117 @@ pub fn parse_recovering<S: GraphSink>(
         if offset >= text.len() {
             return Ok(recovery);
         }
+    }
+}
+
+/// Bytes of a following statement the resync consumed, if it consumed one.
+///
+/// # Why a positional test cannot answer this
+///
+/// The span from the error to the resume point covers the failing statement,
+/// and a line break with content after it *might* mean the scan ran past the
+/// failing line into the next statement. It might equally be a statement that
+/// spans lines, which is ordinary Turtle. These two are the same shape:
+///
+/// ```text
+/// junk with no terminator                 ex:bad ~~~ "still the same statement"
+/// ex:c ex:p "3" .                             ex:more "and more" .
+/// ```
+///
+/// Error on line N, resume at the end of line N+1, in both — and only the left
+/// one lost anything. The one signal that separates them by position is
+/// indentation, and Turtle has no line structure; the splitter carries a test
+/// (`a_mid_line_directive_is_detected_like_any_other`) asserting exactly that.
+/// So the question has to be about what the bytes ARE.
+///
+/// # Why a `;`/`,` check is not also applied
+///
+/// It looks obvious — a statement whose last byte before the break is `;` or
+/// `,` is unfinished, so the next line is its continuation — and it is wrong in
+/// the direction that matters. `ex:bad ~~~ ;` followed by `ex:c ex:p "3" .` has
+/// no terminator of its own, so the resync really does eat `ex:c`, and a
+/// punctuator check suppresses the warning for the exact case the warning
+/// exists to report. Measured, not reasoned: with that check in place `ex:c`
+/// vanished from the output and stderr said nothing.
+///
+/// It buys nothing either. A `;` continuation is `predicate object` and a `,`
+/// continuation is one object, so neither parses standalone as a statement —
+/// the test below already refutes them.
+///
+/// # Residual
+///
+/// A tail that is genuinely a continuation and happens to be a well-formed
+/// statement on its own is still reported. That needs the failing prefix to end
+/// at a term boundary carrying no punctuator, which is rare; and for that same
+/// shape, when the failing statement truly had no terminator, reporting is the
+/// CORRECT answer. Stated rather than hidden, because a warning whose whole
+/// value is trustworthiness should not claim a certainty it cannot have.
+fn swallowed_following_statement(
+    text: &str,
+    error_at: usize,
+    resume: usize,
+    source: RdfSyntax,
+    prefixes: &[(String, String)],
+    base: Option<&str>,
+    options: ParserOptions,
+) -> Option<usize> {
+    let span = text.get(error_at..resume)?;
+    let after = span.find('\n').map(|nl| &span[nl + 1..])?;
+    if after.trim().is_empty() {
+        return None;
+    }
+
+    // Does it stand alone? A statement the resync consumed is a statement, and
+    // parses as one against the prefixes in force. A continuation is a fragment
+    // of one and does not. Same reader, prefixes and options the recovering
+    // parse itself used — anything else answers a different question than the
+    // one being asked.
+    let mut probe = GraphCollectorSink::new();
+    if parse_fragment(after, &mut probe, source, prefixes, base, options).is_err() {
+        return None;
+    }
+    // A span of nothing but comments parses cleanly and is not a lost
+    // statement.
+    probe.into_graph().iter().next()?;
+
+    Some(after.len())
+}
+
+/// The four readers `rdf::parse_into` dispatches to, in one place.
+///
+/// Lifted out of [`parse_recovering`] because the swallow check re-parses a
+/// candidate span and must use exactly the reader the recovery used. This file
+/// has already paid once for a copied dispatch — `--nocheck` was honoured at
+/// one of five sites — and a second copy is how that happens again.
+///
+/// Named arms rather than a catch-all, so a syntax added later has to choose a
+/// reader here instead of silently inheriting Turtle's. The line formats take
+/// neither prefixes nor a base, because they have neither.
+fn parse_fragment<S: GraphSink>(
+    fragment: &str,
+    sink: &mut S,
+    source: RdfSyntax,
+    prefixes: &[(String, String)],
+    base: Option<&str>,
+    options: ParserOptions,
+) -> Result<(), fluree_graph_turtle::TurtleError> {
+    match source {
+        RdfSyntax::NTriples => fluree_graph_turtle::parse_ntriples(fragment, sink),
+        RdfSyntax::NQuads => fluree_graph_turtle::parse_nquads(fragment, sink),
+        RdfSyntax::TriG => fluree_graph_turtle::parse_with_prefixes_base_options(
+            fragment,
+            sink,
+            prefixes,
+            base,
+            options.with_dialect(fluree_graph_turtle::Dialect::TriG),
+        ),
+        RdfSyntax::Turtle
+        | RdfSyntax::JsonLd
+        | RdfSyntax::RdfXml
+        | RdfSyntax::RdfJson
+        | RdfSyntax::Jelly => fluree_graph_turtle::parse_with_prefixes_base_options(
+            fragment, sink, prefixes, base, options,
+        ),
     }
 }
 
@@ -246,7 +427,14 @@ mod tests {
         let config = WriterConfig::new().with_statement_buffering(true);
         let writer = NTriplesWriter::with_config(Vec::new(), &config);
         let mut sink = PrefixRecorder::new(writer);
-        let recovery = parse_recovering(ttl, None, &mut sink).expect("recovery must not fail");
+        let recovery = parse_recovering(
+            ttl,
+            RdfSyntax::Turtle,
+            None,
+            ParserOptions::conformant(),
+            &mut sink,
+        )
+        .expect("recovery must not fail");
         let mut writer = sink.into_inner();
         writer.finish().ok();
         (String::from_utf8(writer.into_inner()).unwrap(), recovery)

@@ -38,6 +38,7 @@ use crate::error::{CliError, CliResult};
 use crate::rdf::syntax::RdfSyntax;
 use fluree_graph_ir::{
     Datatype, Graph, GraphCollectorSink, GraphSink, LiteralValue, SinkResult, Term, TermId,
+    TermScope,
 };
 use fluree_graph_turtle::{splitter, ParserOptions};
 
@@ -58,6 +59,22 @@ impl ParallelConfig {
     /// the pool fed. Granularity starvation costs more than per-chunk
     /// overhead saves.
     pub const DEFAULT_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
+    /// How many bytes of converted output may wait to be written.
+    ///
+    /// Every worker needs room for one chunk's output or the pool serializes,
+    /// and N-Triples output runs several times its Turtle input — so the floor
+    /// is `workers × chunk_bytes × 4`, and the ceiling stops a wide pool on
+    /// large chunks from reserving a gigabyte. The clamp only binds at extremes:
+    /// 16 workers on 2.3 MB chunks want 147 MB and get it.
+    pub fn output_budget_bytes(&self, workers: usize) -> usize {
+        const FLOOR: usize = 32 * 1024 * 1024;
+        const CEILING: usize = 256 * 1024 * 1024;
+        let want = (workers as u64)
+            .saturating_mul(self.chunk_bytes)
+            .saturating_mul(4);
+        (want as usize).clamp(FLOOR, CEILING)
+    }
 
     /// Size chunks so every worker gets several, without going under a floor
     /// where per-chunk overhead dominates.
@@ -104,6 +121,127 @@ pub fn can_run_parallel(syntax: RdfSyntax) -> bool {
     )
 }
 
+/// Whether a document in this syntax can be cut at Turtle statement boundaries.
+///
+/// A different question from [`can_run_parallel`], which asks whether the
+/// OUTPUT survives being written as concatenated fragments. This asks whether
+/// the INPUT survives being cut, and the two have different answers:
+///
+/// - **TriG** writes fine in fragments but does not cut: its statements live
+///   inside `GRAPH … { … }` blocks, and the boundary scanner cuts at `.`, so a
+///   chunk boundary lands inside a brace-scoped block and neither half parses.
+/// - **JSON-LD** is a single JSON document with no statement terminators at
+///   all; cutting it at Turtle boundaries produces fragments that are not JSON.
+///
+/// Only `target` was consulted before this existed, so both were chunked as
+/// though they were Turtle.
+pub fn can_chunk_input(syntax: RdfSyntax) -> bool {
+    matches!(
+        syntax,
+        RdfSyntax::Turtle | RdfSyntax::NTriples | RdfSyntax::NQuads
+    )
+}
+
+/// A byte budget for converted output waiting to be written.
+///
+/// The channel bounds how many CHUNKS are in flight, which is not a bound on
+/// memory: one chunk's N-Triples output is several times its Turtle input, and
+/// the reorder buffer is unbounded besides — an early chunk that finishes last
+/// parks every later chunk in `pending` with nothing to cap the pile. At 16
+/// workers on a 4 million triple corpus that was ~200 MB of buffered output and
+/// a run sitting near a gigabyte.
+///
+/// This bounds the buffered output and nothing else, which is worth stating
+/// plainly because the number people take from it is too small. A run's peak is
+/// this budget (256 MB at the ceiling) PLUS one chunk of overshoot per worker
+/// PLUS the whole input, which `convert` holds in memory. Measured: **1620 MiB
+/// peak RSS on a 745 MiB input at K=16 defaults**, on a box with no paging.
+/// Quoting the budget alone understates a real run by roughly the size of its
+/// input.
+///
+/// Workers wait here before taking work, never while holding a finished chunk.
+/// That ordering is what makes it deadlock-free: the writer never waits on this
+/// budget, so it always drains, so the bytes a waiting worker needs released
+/// are always on their way out.
+struct OutputBudget {
+    limit: usize,
+    state: std::sync::Mutex<BudgetState>,
+    room: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct BudgetState {
+    /// Bytes of produced output not yet written.
+    held: usize,
+    /// Set when the run is ending, so waiters stop rather than wait for room
+    /// that will never be released.
+    ///
+    /// This is the pool's ONLY shutdown signal, and living in here is the
+    /// point. It used to sit beside an external `AtomicBool` that workers read
+    /// at the top of their loop, and nothing tied the two together: the flag's
+    /// setter neither took this mutex nor notified this condvar, so a worker
+    /// parked in [`OutputBudget::wait_for_room`] was woken by `release` or
+    /// `stop` and never by the flag. Liveness therefore rested on one call site
+    /// remembering to do both, and a second setter — a cancellation path, a
+    /// deadline — would have reintroduced the hang.
+    stopped: bool,
+}
+
+impl OutputBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            state: std::sync::Mutex::new(BudgetState::default()),
+            room: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Block until the budget is under its limit. `false` means stop.
+    ///
+    /// Under-limit rather than room-for-one-more, because a chunk's output size
+    /// is unknown until it has been produced. The overshoot is therefore one
+    /// chunk per worker, which is exactly the memory the pool needs to work at
+    /// all.
+    ///
+    /// # Why there is no timeout
+    ///
+    /// Both halves of the predicate — `held` and `stopped` — live inside the
+    /// mutex this condvar waits on, and every writer of either takes that mutex
+    /// and calls `notify_all` after. That is the textbook condvar contract, and
+    /// it is what makes the wakeup reliable.
+    ///
+    /// An earlier version read an external `AtomicBool` for shutdown while the
+    /// setter took no lock and sent no notification, and leaned on a 50 ms
+    /// `wait_timeout` to notice. That is a lost wakeup papered over by polling:
+    /// the honest description would have been "notices within one timeout
+    /// period", not "cannot miss the flag". Making the wakeup reliable is the
+    /// fix; a timeout is not.
+    fn wait_for_room(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while !state.stopped && state.held >= self.limit {
+            state = self.room.wait(state).unwrap();
+        }
+        !state.stopped
+    }
+
+    fn charge(&self, bytes: usize) {
+        self.state.lock().unwrap().held += bytes;
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.held = state.held.saturating_sub(bytes);
+        drop(state);
+        self.room.notify_all();
+    }
+
+    /// End the run: wake every waiter and keep them awake.
+    fn stop(&self) {
+        self.state.lock().unwrap().stopped = true;
+        self.room.notify_all();
+    }
+}
+
 /// Renames a collector's anonymous mints into a per-chunk namespace.
 ///
 /// Anonymous nodes arrive as `term_blank(None)` and every collector answers
@@ -138,6 +276,17 @@ impl<S: GraphSink> ChunkScopedBlanks<S> {
 }
 
 impl<S: GraphSink> GraphSink for ChunkScopedBlanks<S> {
+    /// Forwarded: swallowing this would quietly put the copy back.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.inner.term_iri_shared(iri)
+    }
+    /// Forwarded: a decorator that swallowed this would leave the sink on the
+    /// conservative scope and silently give up the recycling the producer
+    /// offered.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        self.inner.declare_term_scope(scope);
+    }
+
     fn term_blank(&mut self, label: Option<&str>) -> TermId {
         match label {
             // A document-scoped label. Two chunks naming it mean one node.
@@ -253,6 +402,17 @@ impl<S: GraphSink> DeterministicBlanks<S> {
 }
 
 impl<S: GraphSink> GraphSink for DeterministicBlanks<S> {
+    /// Forwarded: swallowing this would quietly put the copy back.
+    fn term_iri_shared(&mut self, iri: &std::sync::Arc<str>) -> TermId {
+        self.inner.term_iri_shared(iri)
+    }
+    /// Forwarded: a decorator that swallowed this would leave the sink on the
+    /// conservative scope and silently give up the recycling the producer
+    /// offered.
+    fn declare_term_scope(&mut self, scope: TermScope) {
+        self.inner.declare_term_scope(scope);
+    }
+
     fn term_blank(&mut self, label: Option<&str>) -> TermId {
         match label {
             Some(label) => {
@@ -348,6 +508,8 @@ pub fn convert_parallel<S: GraphSink>(
     text: &str,
     base: Option<&str>,
     sink: &mut S,
+    source: RdfSyntax,
+    options: ParserOptions,
     config: ParallelConfig,
 ) -> CliResult<ParallelOutcome> {
     let (prefix_block, ranges) =
@@ -371,7 +533,15 @@ pub fn convert_parallel<S: GraphSink>(
                     let Some(range) = ranges.get(index) else {
                         break;
                     };
-                    mine.push(parse_chunk(index, prefix_block, &text[range.clone()], base));
+                    mine.push(parse_chunk(
+                        index,
+                        prefix_block,
+                        &text[range.clone()],
+                        range.start,
+                        base,
+                        source,
+                        options,
+                    ));
                 }
                 mine
             }));
@@ -436,7 +606,9 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
     text: &str,
     base: Option<&str>,
     out: &mut W,
+    source: RdfSyntax,
     syntax: RdfSyntax,
+    options: ParserOptions,
     writer_config: &fluree_graph_format::WriterConfig,
     config: ParallelConfig,
     ranges: &[std::ops::Range<usize>],
@@ -446,24 +618,32 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
     let workers = config.workers.min(chunk_count).max(1);
 
     let next = std::sync::atomic::AtomicUsize::new(0);
-    // Set when the destination is gone. Workers check it so they stop parsing
-    // promptly instead of finishing the chunk they are on and every chunk
-    // after it — on a 4 GiB input piped to `head -1` that is the difference
-    // between exiting now and converting the whole file for nobody.
-    let shutdown = std::sync::atomic::AtomicBool::new(false);
     // Capacity >= workers so a worker can always deposit and never blocks
     // holding the chunk the writer is waiting for.
     let (tx, rx) = std::sync::mpsc::sync_channel::<ChunkBytes>(workers.max(2));
+    let budget = OutputBudget::new(config.output_budget_bytes(workers));
 
     std::thread::scope(|scope| -> Result<ParallelOutcome, ParallelFailure> {
         let next = &next;
-        let shutdown = &shutdown;
+        let budget = &budget;
 
         for _ in 0..workers {
             let tx = tx.clone();
             scope.spawn(move || {
                 loop {
-                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Wait for room BEFORE taking work, never while holding a
+                    // finished chunk. A worker that blocked with output in hand
+                    // could be holding the very chunk the writer is waiting
+                    // for, which is the deadlock this pool has already had
+                    // once; waiting here cannot, because a waiting worker holds
+                    // nothing.
+                    //
+                    // This is also where a worker learns the run is over: the
+                    // call returns false the moment `stopped` is set, whether
+                    // or not it ever had to block. That is why there is no
+                    // separate flag to check first — one signal, read in one
+                    // place, so it cannot be set without waking anyone.
+                    if !budget.wait_for_room() {
                         break;
                     }
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -474,13 +654,19 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
                         index,
                         prefix_block,
                         &text[range.clone()],
+                        range.start,
                         base,
+                        source,
                         syntax,
+                        options,
                         writer_config,
                     );
+                    let produced_bytes = produced.bytes.len();
+                    budget.charge(produced_bytes);
                     // A closed receiver is the other half of the same signal:
                     // the writer is gone, so there is nothing left to do.
                     if tx.send(produced).is_err() {
+                        budget.release(produced_bytes);
                         break;
                     }
                 }
@@ -510,11 +696,17 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
                 if first_error.is_none() {
                     first_error = ready.error;
                 }
+                // Released here, not when the chunk is dropped: this iteration
+                // owns the last reference to those bytes, and a worker blocked
+                // on the budget should be freed the moment the memory is
+                // reclaimable rather than one loop later.
+                budget.release(ready.bytes.len());
                 if let Err(e) = out.write_all(&ready.bytes) {
-                    // Terminate the pool before anything else. Setting the flag
-                    // stops workers that have not yet blocked; dropping the
-                    // receiver wakes the ones that have.
-                    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // Terminate the pool before anything else. `stop` reaches
+                    // workers wherever they are in the loop — parked waiting
+                    // for room, or about to ask for it — and dropping the
+                    // receiver wakes any that are blocked in `send` instead.
+                    budget.stop();
                     rx = None;
                     write_failure = Some(e);
                     break;
@@ -543,9 +735,19 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
             }
         }
 
+        // This thread is the only one that releases budget, and it is done
+        // releasing. Any worker still waiting for room would wait for a
+        // release that can never come, and `thread::scope` would join it
+        // forever — the same shape as the dead-destination deadlock, reached
+        // through the memory bound instead of the channel. Unconditional,
+        // because it must hold however the loop above ended: all chunks
+        // written, a write failure, or a parse error cutting the document
+        // short with bytes still charged in `pending`.
+        budget.stop();
+
         // Whatever is still queued is dropped; the workers holding the rest
-        // see the flag or the closed channel and stop. Dropping here rather
-        // than at the end of the scope keeps the join prompt.
+        // see the stop above or the closed channel and stop. Dropping here
+        // rather than at the end of the scope keeps the join prompt.
         drop(rx);
         drop(pending);
 
@@ -587,6 +789,39 @@ impl std::fmt::Display for ParallelFailure {
     }
 }
 
+/// Move a chunk-local error position into the whole document.
+///
+/// A worker parses `prefix_block + body`, so the offset its parser reports is
+/// an offset into that synthesized document. Rendered against the real file it
+/// names a line inside the chunk — off by however many lines preceded the
+/// chunk — which is worse than saying nothing, and saying nothing is what the
+/// parallel path did: the serial path reported `file.ttl:120002:19: …` and the
+/// parallel path reported `file.ttl: …` on the same document.
+///
+/// The map is exact both sides of the seam. The prelude is a verbatim copy of
+/// the document's own header, so an offset inside it is already a document
+/// offset; an offset past it is `chunk start + (offset − prelude length)`.
+/// Only the parse result goes through here — a failure to build the writer
+/// carries a placeholder `0` that is not a position and must not be rendered
+/// as one.
+fn relocate(
+    error: fluree_graph_turtle::TurtleError,
+    prefix_len: usize,
+    doc_offset: usize,
+) -> fluree_graph_turtle::TurtleError {
+    use fluree_graph_turtle::TurtleError as E;
+    let moved = |pos: usize| match pos.checked_sub(prefix_len) {
+        Some(in_body) => doc_offset + in_body,
+        None => pos,
+    };
+    match error {
+        E::Lexer { position, message } => E::lexer(moved(position), message),
+        E::Parse { position, message } => E::parse(moved(position), message),
+        // No position to move.
+        other => other,
+    }
+}
+
 /// One chunk's bytes, ready to concatenate.
 struct ChunkBytes {
     index: usize,
@@ -597,17 +832,39 @@ struct ChunkBytes {
 }
 
 /// Parse one chunk straight into its own writer.
+///
+/// `source` picks the reader and `syntax` picks the writer. They are separate
+/// parameters because using one for both was a silent correctness bug: every
+/// chunk was parsed with the Turtle parser whatever the input actually was, so
+/// an N-Triples file large enough to chunk was read by a parser that accepts
+/// directives, prefixed names and bare numbers — the very things the strict
+/// N-Triples reader exists to reject. `--parallelism 1` refused those
+/// documents and the default path accepted them.
+#[allow(clippy::too_many_arguments)]
 fn write_chunk(
     index: usize,
     prefix_block: &str,
     body: &str,
+    doc_offset: usize,
     base: Option<&str>,
+    source: RdfSyntax,
     syntax: RdfSyntax,
+    options: ParserOptions,
     writer_config: &fluree_graph_format::WriterConfig,
 ) -> ChunkBytes {
-    let mut doc = String::with_capacity(prefix_block.len() + body.len());
-    doc.push_str(prefix_block);
-    doc.push_str(body);
+    // Only copy when there is a prelude to prepend. The line formats have no
+    // directives, so their prefix block is empty and every chunk was being
+    // copied into a fresh String to no purpose — ~80 MB of pointless copying on
+    // a 4 million triple N-Triples corpus, which is also the case where the
+    // chunks are biggest.
+    let doc: std::borrow::Cow<'_, str> = if prefix_block.is_empty() {
+        std::borrow::Cow::Borrowed(body)
+    } else {
+        let mut owned = String::with_capacity(prefix_block.len() + body.len());
+        owned.push_str(prefix_block);
+        owned.push_str(body);
+        std::borrow::Cow::Owned(owned)
+    };
 
     // Preserve, because the labels reaching the writer are already the final
     // ones: `DeterministicBlanks` has done the renaming that makes them
@@ -638,13 +895,38 @@ fn write_chunk(
     let mut sink = DeterministicBlanks::new(writer, index);
 
     let started = std::time::Instant::now();
-    let result = fluree_graph_turtle::parse_with_prefixes_base_options(
-        &doc,
-        &mut sink,
-        &[],
-        base,
-        ParserOptions::conformant(),
-    );
+    // The same four readers `rdf::parse_into` dispatches to, for the same
+    // reason: the line formats are grammars defined by what they refuse, so
+    // reading them with the Turtle parser accepts documents this tool is being
+    // asked to reject. `base` is not threaded into them, because N-Triples and
+    // N-Quads have no base and no relative IRIs for it to apply to.
+    let result = match source {
+        RdfSyntax::NTriples => fluree_graph_turtle::parse_ntriples(&doc, &mut sink),
+        RdfSyntax::NQuads => fluree_graph_turtle::parse_nquads(&doc, &mut sink),
+        RdfSyntax::TriG => fluree_graph_turtle::parse_with_prefixes_base_options(
+            &doc,
+            &mut sink,
+            &[],
+            base,
+            options.with_dialect(fluree_graph_turtle::Dialect::TriG),
+        ),
+        // Turtle, plus every syntax `can_chunk_input` refuses — none of which
+        // reaches a worker. Named rather than caught by `_`, so adding a
+        // syntax is a compile error here instead of a silent inheritance of
+        // Turtle's reader. That is not hypothetical: writing this arm out is
+        // what revealed RdfXml, RdfJson and Jelly were already in the enum.
+        RdfSyntax::Turtle
+        | RdfSyntax::JsonLd
+        | RdfSyntax::RdfXml
+        | RdfSyntax::RdfJson
+        | RdfSyntax::Jelly => fluree_graph_turtle::parse_with_prefixes_base_options(
+            &doc,
+            &mut sink,
+            &[],
+            base,
+            options,
+        ),
+    };
     let parse_nanos = started.elapsed().as_nanos();
 
     let mut writer = sink.into_inner();
@@ -659,31 +941,68 @@ fn write_chunk(
         parse_nanos,
         error: result
             .err()
+            .map(|e| relocate(e, prefix_block.len(), doc_offset))
             .or_else(|| finish.err().map(fluree_graph_turtle::TurtleError::Sink)),
     }
 }
 
 /// Parse one chunk into its own collector, with its mints scoped to the chunk.
-fn parse_chunk(index: usize, prefix_block: &str, body: &str, base: Option<&str>) -> ChunkResult {
-    let mut doc = String::with_capacity(prefix_block.len() + body.len());
-    doc.push_str(prefix_block);
-    doc.push_str(body);
+fn parse_chunk(
+    index: usize,
+    prefix_block: &str,
+    body: &str,
+    doc_offset: usize,
+    base: Option<&str>,
+    source: RdfSyntax,
+    options: ParserOptions,
+) -> ChunkResult {
+    let doc: std::borrow::Cow<'_, str> = if prefix_block.is_empty() {
+        std::borrow::Cow::Borrowed(body)
+    } else {
+        let mut owned = String::with_capacity(prefix_block.len() + body.len());
+        owned.push_str(prefix_block);
+        owned.push_str(body);
+        std::borrow::Cow::Owned(owned)
+    };
 
     let mut sink = ChunkScopedBlanks::new(GraphCollectorSink::new(), index);
     let started = std::time::Instant::now();
-    let result = fluree_graph_turtle::parse_with_prefixes_base_options(
-        &doc,
-        &mut sink,
-        &[],
-        base,
-        ParserOptions::conformant(),
-    );
+    // The same dispatch as `write_chunk`. This path has no callers today —
+    // `parse_into_parallel` is `pub` and unused — but it carried BOTH bugs its
+    // sibling had, and a dead path is exactly where a bug waits: `check` and
+    // `count` inherit this the day they go parallel, and would inherit a Turtle
+    // parser reading N-Triples and a hardcoded `conformant()` ignoring
+    // `--nocheck`. Fixed rather than deleted for that reason.
+    let result = match source {
+        RdfSyntax::NTriples => fluree_graph_turtle::parse_ntriples(&doc, &mut sink),
+        RdfSyntax::NQuads => fluree_graph_turtle::parse_nquads(&doc, &mut sink),
+        RdfSyntax::TriG => fluree_graph_turtle::parse_with_prefixes_base_options(
+            &doc,
+            &mut sink,
+            &[],
+            base,
+            options.with_dialect(fluree_graph_turtle::Dialect::TriG),
+        ),
+        RdfSyntax::Turtle
+        | RdfSyntax::JsonLd
+        | RdfSyntax::RdfXml
+        | RdfSyntax::RdfJson
+        | RdfSyntax::Jelly => fluree_graph_turtle::parse_with_prefixes_base_options(
+            &doc,
+            &mut sink,
+            &[],
+            base,
+            options,
+        ),
+    };
     let parse_nanos = started.elapsed().as_nanos();
 
     ChunkResult {
         index,
         graph: sink.into_inner().into_graph(),
-        error: result.err(),
+        error: result
+            .err()
+            .map(|e| relocate(e, prefix_block.len(), doc_offset)),
         parse_nanos,
     }
 }
@@ -830,6 +1149,8 @@ mod tests {
             text,
             None,
             &mut w,
+            RdfSyntax::Turtle,
+            ParserOptions::conformant(),
             ParallelConfig {
                 workers,
                 chunk_bytes,
