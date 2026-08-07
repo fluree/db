@@ -214,6 +214,22 @@ pub trait R2rmlProvider: Debug + Send + Sync {
         let _ = graph_source_id;
         std::collections::HashMap::new()
     }
+
+    /// MAJOR-2 (#1529 review): assert the snapshots read during a materialize build
+    /// are trustworthy — every table stayed on ONE `metadata_location`, and pinning
+    /// is actually in effect. Returns `Err(R2rmlError::BuildSnapshotIntegrity)` when a
+    /// build must be refused. Default: `Ok` — a non-Iceberg / test provider has no
+    /// moving-snapshot hazard. A real Iceberg-backed provider overrides this to
+    /// refuse when the loadTable cache is disabled (pinning is then a no-op) or when
+    /// a table yielded a second distinct `metadata_location` mid-build (the source
+    /// committed and the twin's stamped watermark would not describe its contents).
+    fn verify_build_snapshot_integrity(
+        &self,
+        graph_source_id: &str,
+    ) -> std::result::Result<(), fluree_db_r2rml::R2rmlError> {
+        let _ = graph_source_id;
+        Ok(())
+    }
 }
 
 /// The pinned snapshot of one Iceberg table at build time — the twin's per-table
