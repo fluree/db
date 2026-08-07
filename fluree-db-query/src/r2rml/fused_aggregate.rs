@@ -8339,6 +8339,98 @@ mod tests {
         FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()))
     }
 
+    /// PERF MICROBENCH (id=3717398040): isolate the per-row FK-PROBE allocation the
+    /// borrowed-scratch fix (d6eaa782c) removes — the cost cq027 (single-table, 0 semi-joins,
+    /// 1 resolver) structurally CANNOT observe but the s1 pair (K=2 semi-joins + 1 resolver =
+    /// K+R=3 probes/row) does. Times the OLD fresh-`Vec` probe (`get_join_key_from_batch` +
+    /// `HashSet::contains(&vec)` / `HashMap::get(&vec)`) against the NEW borrowed-scratch probe
+    /// (`fill_join_key_from_batch` + `.contains(scratch.as_slice())` / `.get(scratch.as_slice())`)
+    /// over a representative fact batch, both paths reading the SAME columns and probing the
+    /// SAME sets — so the delta is precisely the per-row `Vec` alloc/free the fix eliminates
+    /// (the component `String`s are allocated by BOTH paths; only the `Vec` differs). Ignored;
+    /// run in release for meaningful numbers:
+    /// `cargo test -p fluree-db-query --release fk_probe_alloc -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf microbench; run explicitly with --release --nocapture"]
+    fn fk_probe_alloc_microbench() {
+        use std::time::Instant;
+        let rows = 300_000usize;
+        // 3 single-column FKs: 2 semi-join membership probes + 1 group-resolver probe per row.
+        let batch = mk_batch(vec![
+            icol(
+                "CUSTOMER_KEY",
+                1,
+                (0..rows as i64).map(|i| Some(i % 5000)).collect(),
+            ),
+            icol(
+                "AGENT_KEY",
+                2,
+                (0..rows as i64).map(|i| Some(i % 500)).collect(),
+            ),
+            icol(
+                "PRODUCT_KEY",
+                3,
+                (0..rows as i64).map(|i| Some(i % 1000)).collect(),
+            ),
+        ]);
+        let cust_cols = vec!["CUSTOMER_KEY".to_string()];
+        let agent_cols = vec!["AGENT_KEY".to_string()];
+        let prod_cols = vec!["PRODUCT_KEY".to_string()];
+        let cust_set: std::collections::HashSet<Vec<String>> =
+            (0..5000i64).map(|i| vec![i.to_string()]).collect();
+        let agent_set: std::collections::HashSet<Vec<String>> =
+            (0..500i64).map(|i| vec![i.to_string()]).collect();
+        let prod_map: std::collections::HashMap<Vec<String>, Vec<GKey>> = (0..1000i64)
+            .map(|i| (vec![i.to_string()], vec![GKey::Str(format!("p{i}"))]))
+            .collect();
+
+        // OLD: a fresh owned `Vec<String>` per probe.
+        let t0 = Instant::now();
+        let mut old_hits = 0usize;
+        for row in 0..rows {
+            if let Some(k) = get_join_key_from_batch(&cust_cols, &batch, row) {
+                old_hits += cust_set.contains(&k) as usize;
+            }
+            if let Some(k) = get_join_key_from_batch(&agent_cols, &batch, row) {
+                old_hits += agent_set.contains(&k) as usize;
+            }
+            if let Some(k) = get_join_key_from_batch(&prod_cols, &batch, row) {
+                old_hits += prod_map.contains_key(&k) as usize;
+            }
+        }
+        let old = t0.elapsed();
+
+        // NEW: one reused scratch buffer, probed by borrowed slice.
+        let t1 = Instant::now();
+        let mut new_hits = 0usize;
+        let mut scratch: Vec<String> = Vec::new();
+        for row in 0..rows {
+            if fill_join_key_from_batch(&cust_cols, &batch, row, &mut scratch) {
+                new_hits += cust_set.contains(scratch.as_slice()) as usize;
+            }
+            if fill_join_key_from_batch(&agent_cols, &batch, row, &mut scratch) {
+                new_hits += agent_set.contains(scratch.as_slice()) as usize;
+            }
+            if fill_join_key_from_batch(&prod_cols, &batch, row, &mut scratch) {
+                new_hits += prod_map.contains_key(scratch.as_slice()) as usize;
+            }
+        }
+        let new = t1.elapsed();
+
+        assert_eq!(old_hits, new_hits, "both probe paths must be answer-identical");
+        let probes = (rows * 3) as f64;
+        let (o_ns, n_ns) = (old.as_nanos() as f64, new.as_nanos() as f64);
+        eprintln!("FK-probe alloc microbench: {rows} rows x 3 probes = {} probes", rows * 3);
+        eprintln!("  OLD fresh-Vec:        {old:?}  ({:.1} ns/probe)", o_ns / probes);
+        eprintln!("  NEW borrowed-scratch: {new:?}  ({:.1} ns/probe)", n_ns / probes);
+        eprintln!(
+            "  SAVED (Vec alloc share): {:?}  ({:.1} ns/probe, {:.0}% of OLD)",
+            old.saturating_sub(new),
+            (o_ns - n_ns) / probes,
+            100.0 * (o_ns - n_ns) / o_ns.max(1.0)
+        );
+    }
+
     /// Resolve + fold an S1 fixture through the branching-star path
     /// (`decompose_branching_star` + `resolve_branching_star_at_open`, called directly),
     /// returning `(category, SUM)` sorted by category. Passes `gen_enabled=true` to
