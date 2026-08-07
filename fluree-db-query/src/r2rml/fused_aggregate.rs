@@ -1845,7 +1845,8 @@ impl Operator for FusedR2rmlAggregateOperator {
                 // drop; each set's FK child columns are also null-dropped by
                 // `validity_cols`, so this probe never sees a null-FK row on the reachable
                 // path. #1583: rests on each FK being single-valued (see `SemiJoinSet`).
-                if !Self::row_passes_semi_joins(&resolved.semi_joins, &batch, row, &mut fk_scratch) {
+                if !Self::row_passes_semi_joins(&resolved.semi_joins, &batch, row, &mut fk_scratch)
+                {
                     continue;
                 }
                 let accs: &mut Vec<Acc> = if gcols.is_empty() {
@@ -6483,9 +6484,18 @@ mod tests {
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
 
-        // One-ref-key plan (P2a): GROUP BY ?c only.
+        // One-ref-key plan (P2a): a TRUE single ref binding (customerRef -> ?c), grouped
+        // by ?c. s2_two_ref_plan also binds productRef -> ?p; leaving that un-grouped ref
+        // in place would (correctly, post-B1 / id=3717339897) DECLINE — a ref binding that
+        // is not a GROUP BY key gets no resolver, so its dangling FKs can't be dropped and
+        // fusing it would over-count. That decline is exactly what `two_off` asserts below;
+        // the single-ref fuse must therefore use a plan without the second, un-grouped ref.
         let one_ref_op = || {
             let mut op = s2_two_ref_plan();
+            if let Pattern::R2rml(fact) = &mut op.inner_patterns[0] {
+                fact.star_bindings
+                    .retain(|(pred, _)| pred.as_str() != "http://ex/productRef");
+            }
             op.group_by = vec![VarId(1)];
             FusedR2rmlAggregateOperator::new(op, Box::new(EmptyOperator::new()))
         };
@@ -6497,20 +6507,32 @@ mod tests {
         let mut two_off = two_ref_op();
         two_off.multifact_gen = false;
         assert!(
-            two_off.resolve_at_open(&ctx).await.expect("resolve").is_none(),
+            two_off
+                .resolve_at_open(&ctx)
+                .await
+                .expect("resolve")
+                .is_none(),
             "GEN off must DECLINE the ≥2 ref-key fold"
         );
         let mut one_off = one_ref_op();
         one_off.multifact_gen = false;
         assert!(
-            one_off.resolve_at_open(&ctx).await.expect("resolve").is_some(),
+            one_off
+                .resolve_at_open(&ctx)
+                .await
+                .expect("resolve")
+                .is_some(),
             "GEN off must STILL fuse a single ref-key fold (byte-identical to P2a)"
         );
         // ON: two-ref fuses.
         let mut two_on = two_ref_op();
         two_on.multifact_gen = true;
         assert!(
-            two_on.resolve_at_open(&ctx).await.expect("resolve").is_some(),
+            two_on
+                .resolve_at_open(&ctx)
+                .await
+                .expect("resolve")
+                .is_some(),
             "GEN on must FUSE the ≥2 ref-key fold"
         );
     }
@@ -6849,9 +6871,12 @@ mod tests {
         let group_by = [VarId(12)];
 
         // Pass shuffled; decomposition must recover the star regardless of order.
-        let starr =
-            FusedR2rmlAggregateOperator::decompose_branching_star(&[&c, &p, &ol, &o], &group_by, true)
-                .expect("crt_join_reorder shape must decompose");
+        let starr = FusedR2rmlAggregateOperator::decompose_branching_star(
+            &[&c, &p, &ol, &o],
+            &group_by,
+            true,
+        )
+        .expect("crt_join_reorder shape must decompose");
         assert_eq!(
             starr.root.subject_var,
             Some(VarId(0)),
@@ -8417,12 +8442,24 @@ mod tests {
         }
         let new = t1.elapsed();
 
-        assert_eq!(old_hits, new_hits, "both probe paths must be answer-identical");
+        assert_eq!(
+            old_hits, new_hits,
+            "both probe paths must be answer-identical"
+        );
         let probes = (rows * 3) as f64;
         let (o_ns, n_ns) = (old.as_nanos() as f64, new.as_nanos() as f64);
-        eprintln!("FK-probe alloc microbench: {rows} rows x 3 probes = {} probes", rows * 3);
-        eprintln!("  OLD fresh-Vec:        {old:?}  ({:.1} ns/probe)", o_ns / probes);
-        eprintln!("  NEW borrowed-scratch: {new:?}  ({:.1} ns/probe)", n_ns / probes);
+        eprintln!(
+            "FK-probe alloc microbench: {rows} rows x 3 probes = {} probes",
+            rows * 3
+        );
+        eprintln!(
+            "  OLD fresh-Vec:        {old:?}  ({:.1} ns/probe)",
+            o_ns / probes
+        );
+        eprintln!(
+            "  NEW borrowed-scratch: {new:?}  ({:.1} ns/probe)",
+            n_ns / probes
+        );
         eprintln!(
             "  SAVED (Vec alloc share): {:?}  ({:.1} ns/probe, {:.0}% of OLD)",
             old.saturating_sub(new),
