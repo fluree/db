@@ -9,12 +9,97 @@
 //! - [`memory`]: In-memory backend ([`MemoryStorage`], [`MemoryContentStore`])
 //! - [`file`]: Filesystem backend behind the `native` feature ([`FileStorage`])
 
+/// When a write to `FileStorage` is reported complete.
+///
+/// Both settings are atomic — a reader never observes a partial file either
+/// way. They differ in what survives the machine losing power.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Durability {
+    /// Report complete once the bytes and the directory entry naming them have
+    /// been flushed to the device. Survives power loss; costs an fsync of the
+    /// staged file and one of its parent directory per write.
+    #[default]
+    Sync,
+    /// Report complete once the bytes reach the OS page cache. Survives process
+    /// death, but a power loss or kernel panic can lose writes already reported
+    /// as committed.
+    PageCache,
+}
+
+impl Durability {
+    /// Environment variable selecting the default for new `FileStorage`.
+    pub const ENV_VAR: &'static str = "FLUREE_STORAGE_FSYNC";
+
+    pub(crate) fn syncs(&self) -> bool {
+        matches!(self, Durability::Sync)
+    }
+
+    /// Default read from [`Self::ENV_VAR`], falling back to [`Self::Sync`] when
+    /// unset or unrecognized.
+    ///
+    /// Read once per storage construction rather than per write, so tests set
+    /// the field through `FileStorage::with_durability` and never race on
+    /// process environment.
+    fn from_env() -> Self {
+        Self::from_env_override().unwrap_or_default()
+    }
+
+    /// The setting [`Self::ENV_VAR`] asks for, or `None` when it is unset.
+    ///
+    /// Distinguishing "unset" from "set to on" is what lets configuration
+    /// supply a value that an operator can still override for one run.
+    pub fn from_env_override() -> Option<Self> {
+        std::env::var(Self::ENV_VAR)
+            .ok()
+            .as_deref()
+            .map(|v| Self::parse(Some(v)))
+    }
+
+    /// Resolve the setting for a storage instance.
+    ///
+    /// Environment beats configuration beats the default, matching the
+    /// precedence documented in `docs/operations/configuration.md` — a checked-in
+    /// config file never outranks an operator's one-off override.
+    pub fn resolve(configured: Option<Self>) -> Self {
+        Self::resolve_from(Self::from_env_override(), configured)
+    }
+
+    /// Pure half of [`Self::resolve`], so the precedence rule is testable
+    /// without touching process environment.
+    fn resolve_from(env: Option<Self>, configured: Option<Self>) -> Self {
+        env.or(configured).unwrap_or_default()
+    }
+
+    /// Pure half of [`Self::from_env`], so the accepted spellings are testable
+    /// without touching process environment.
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => Durability::PageCache,
+            _ => Durability::Sync,
+        }
+    }
+
+    /// Parse a configuration mode name (`sync` / `page-cache`).
+    ///
+    /// Named modes rather than the environment variable's boolean: a config
+    /// file is read to understand a deployment, and a name says what it does.
+    /// Returns `None` for an unrecognized value so the caller can reject it
+    /// rather than silently pick a durability the operator did not ask for.
+    pub fn from_mode_name(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "sync" | "fsync" => Some(Durability::Sync),
+            "page-cache" | "pagecache" => Some(Durability::PageCache),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod file;
 mod memory;
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-pub use file::{Durability, FileStorage, STORAGE_METHOD_FILE};
+pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
 
 use crate::address_path::{ledger_id_to_path_prefix, shared_prefix_for_path};

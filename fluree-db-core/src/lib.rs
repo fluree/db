@@ -180,6 +180,7 @@ pub use storage::{
     ContentAddressedWrite,
     ContentStore,
     ContentWriteResult,
+    Durability,
     ListResult,
     MemoryContentStore,
     MemoryStorage,

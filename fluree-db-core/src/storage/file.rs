@@ -12,56 +12,13 @@ use crate::{
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
+pub use super::Durability;
+
 /// Storage method for local filesystem storage.
 pub const STORAGE_METHOD_FILE: &str = "file";
 
 /// Suffix marking a staging file left by an interrupted atomic write.
 const TMP_SUFFIX: &str = ".tmp";
-
-/// When a write to [`FileStorage`] is reported complete.
-///
-/// Both settings are atomic — a reader never observes a partial file either
-/// way. They differ in what survives the machine losing power.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Durability {
-    /// Report complete once the bytes and the directory entry naming them have
-    /// been flushed to the device. Survives power loss; costs an fsync of the
-    /// staged file and one of its parent directory per write.
-    #[default]
-    Sync,
-    /// Report complete once the bytes reach the OS page cache. Survives process
-    /// death, but a power loss or kernel panic can lose writes already reported
-    /// as committed.
-    PageCache,
-}
-
-impl Durability {
-    /// Environment variable selecting the default for new [`FileStorage`].
-    pub const ENV_VAR: &'static str = "FLUREE_STORAGE_FSYNC";
-
-    fn syncs(&self) -> bool {
-        matches!(self, Durability::Sync)
-    }
-
-    /// Default read from [`Self::ENV_VAR`], falling back to [`Self::Sync`] when
-    /// unset or unrecognized.
-    ///
-    /// Read once per storage construction rather than per write, so tests set
-    /// the field through [`FileStorage::with_durability`] and never race on
-    /// process environment.
-    fn from_env() -> Self {
-        Self::parse(std::env::var(Self::ENV_VAR).ok().as_deref())
-    }
-
-    /// Pure half of [`Self::from_env`], so the accepted spellings are testable
-    /// without touching process environment.
-    fn parse(value: Option<&str>) -> Self {
-        match value.map(|v| v.trim().to_ascii_lowercase()) {
-            Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => Durability::PageCache,
-            _ => Durability::Sync,
-        }
-    }
-}
 
 /// fsync the directory holding `path` so the rename or link that put the file
 /// there survives power loss.
@@ -720,6 +677,33 @@ mod tests {
         for v in ["1", "true", "on", "", "nonsense"] {
             assert_eq!(Durability::parse(Some(v)), Durability::Sync, "{v:?}");
         }
+    }
+
+    /// Environment beats configuration beats the default, so an operator can
+    /// override a checked-in config file for one run without editing it.
+    #[test]
+    fn durability_precedence_is_env_then_config_then_default() {
+        use Durability::{PageCache, Sync};
+        assert_eq!(Durability::resolve_from(None, None), Sync);
+        assert_eq!(Durability::resolve_from(None, Some(PageCache)), PageCache);
+        assert_eq!(Durability::resolve_from(Some(Sync), Some(PageCache)), Sync);
+        assert_eq!(
+            Durability::resolve_from(Some(PageCache), Some(Sync)),
+            PageCache
+        );
+    }
+
+    #[test]
+    fn durability_mode_names_parse_and_reject() {
+        use Durability::{PageCache, Sync};
+        assert_eq!(Durability::from_mode_name("sync"), Some(Sync));
+        assert_eq!(Durability::from_mode_name(" SYNC "), Some(Sync));
+        assert_eq!(Durability::from_mode_name("page-cache"), Some(PageCache));
+        assert_eq!(Durability::from_mode_name("page_cache"), Some(PageCache));
+        // Unrecognized must be rejected, not defaulted — a typo in a config
+        // file should fail loudly rather than pick a durability silently.
+        assert_eq!(Durability::from_mode_name("eventually"), None);
+        assert_eq!(Durability::from_mode_name(""), None);
     }
 
     #[test]
