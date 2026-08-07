@@ -18,6 +18,49 @@ pub const STORAGE_METHOD_FILE: &str = "file";
 /// Suffix marking a staging file left by an interrupted atomic write.
 const TMP_SUFFIX: &str = ".tmp";
 
+/// When a write to [`FileStorage`] is reported complete.
+///
+/// Both settings are atomic — a reader never observes a partial file either
+/// way. They differ in what survives the machine losing power.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Durability {
+    /// Report complete once the bytes and the directory entry naming them have
+    /// been flushed to the device. Survives power loss; costs an fsync of the
+    /// staged file and one of its parent directory per write.
+    #[default]
+    Sync,
+    /// Report complete once the bytes reach the OS page cache. Survives process
+    /// death, but a power loss or kernel panic can lose writes already reported
+    /// as committed.
+    PageCache,
+}
+
+impl Durability {
+    fn syncs(&self) -> bool {
+        matches!(self, Durability::Sync)
+    }
+}
+
+/// fsync the directory holding `path` so the rename or link that put the file
+/// there survives power loss.
+///
+/// Unix-only: Windows exposes no equivalent, so the call is skipped and the
+/// weaker guarantee accepted rather than failing the write. Mirrors
+/// `fluree-db-consensus/src/raft/storage/fs.rs`.
+fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Distinguishes staging files from content within one process. Writers to the
 /// same address are not always serialized (`write_bytes` takes no lock), so a
 /// fixed staging name would let two writers clobber each other's partial file
@@ -45,13 +88,19 @@ fn is_tmp_artifact(name: &str) -> bool {
 ///
 /// The staging file is removed if writing fails, so an error leaves nothing
 /// behind for `list_prefix` or a later reader to find.
-fn stage_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+/// The contents are flushed before the staging path is returned, so a caller
+/// that then makes the file visible has its bytes on the device first.
+fn stage_bytes(path: &Path, bytes: &[u8], durability: Durability) -> std::io::Result<PathBuf> {
     use std::io::Write;
 
     let tmp = tmp_sibling(path);
     let staged = (|| {
         let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(bytes)
+        file.write_all(bytes)?;
+        if durability.syncs() {
+            file.sync_all()?;
+        }
+        Ok(())
     })();
     if let Err(e) = staged {
         let _ = std::fs::remove_file(&tmp);
@@ -64,11 +113,14 @@ fn stage_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
 ///
 /// A concurrent reader of `path` observes either the previous contents or the
 /// complete new contents; the final name is never a partially written file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = stage_bytes(path, bytes)?;
+fn write_atomic(path: &Path, bytes: &[u8], durability: Durability) -> std::io::Result<()> {
+    let tmp = stage_bytes(path, bytes, durability)?;
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
+    }
+    if durability.syncs() {
+        fsync_parent_dir(path)?;
     }
     Ok(())
 }
@@ -79,8 +131,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// `hard_link` rather than `rename` because `rename` would replace an existing
 /// file, and the create-if-absent answer is what callers use to detect a
 /// duplicate ledger.
-fn create_new_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
-    let tmp = stage_bytes(path, bytes)?;
+fn create_new_atomic(path: &Path, bytes: &[u8], durability: Durability) -> std::io::Result<bool> {
+    let tmp = stage_bytes(path, bytes, durability)?;
     let created = match std::fs::hard_link(&tmp, path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -90,6 +142,10 @@ fn create_new_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
         }
     };
     let _ = std::fs::remove_file(&tmp);
+    // The unlink of the staging entry rides along on the same directory fsync.
+    if created && durability.syncs() {
+        fsync_parent_dir(path)?;
+    }
     Ok(created)
 }
 
@@ -98,6 +154,10 @@ fn create_new_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
 pub struct FileStorage {
     /// Base directory for index files
     base_path: std::path::PathBuf,
+    /// When a write is reported complete. Applies to source-of-truth content;
+    /// derived content is written [`Durability::PageCache`] regardless, since
+    /// it can be rebuilt from the commit chain.
+    durability: Durability,
 }
 
 impl FileStorage {
@@ -105,9 +165,36 @@ impl FileStorage {
     ///
     /// The base path should be the ledger's data directory containing the ledger
     /// subdirectories (e.g. `mydb/main/index/...`).
+    ///
+    /// Defaults to [`Durability::Sync`].
     pub fn new(base_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             base_path: base_path.into(),
+            durability: Durability::default(),
+        }
+    }
+
+    /// Set when writes are reported complete.
+    pub fn with_durability(mut self, durability: Durability) -> Self {
+        self.durability = durability;
+        self
+    }
+
+    /// When writes to this storage are reported complete.
+    pub fn durability(&self) -> Durability {
+        self.durability
+    }
+
+    /// Durability for a write of `kind`.
+    ///
+    /// Derived content is recomputable from the commit chain, so it is never
+    /// worth an fsync — that keeps index builds off the sync path even when the
+    /// ledger's own writes are durable.
+    fn durability_for(&self, kind: ContentKind) -> Durability {
+        if kind.is_derived() {
+            Durability::PageCache
+        } else {
+            self.durability
         }
     }
 
@@ -354,30 +441,8 @@ impl StorageRead for FileStorage {
 #[async_trait]
 impl StorageWrite for FileStorage {
     async fn write_bytes(&self, address: &str, bytes: &[u8]) -> Result<()> {
-        let path = self.resolve_path(address)?;
-        let bytes = bytes.to_vec();
-        let for_err = path.clone();
-
-        // One blocking hop for mkdir + stage + rename, rather than one per
-        // `tokio::fs` call.
-        tokio::task::spawn_blocking(move || {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    crate::error::Error::io(format!(
-                        "Failed to create directory {}: {}",
-                        parent.display(),
-                        e
-                    ))
-                })?;
-            }
-            // Overwrites if present, which is idempotent for content-addressed
-            // writes: the address is derived from these bytes.
-            write_atomic(&path, &bytes).map_err(|e| {
-                crate::error::Error::io(format!("Failed to write {}: {}", path.display(), e))
-            })
-        })
-        .await
-        .map_err(|e| crate::error::Error::io(format!("write {} join: {e}", for_err.display())))?
+        self.write_bytes_durable(address, bytes, self.durability)
+            .await
     }
 
     async fn delete(&self, address: &str) -> Result<()> {
@@ -411,7 +476,8 @@ impl ContentAddressedWrite for FileStorage {
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
         let address = content_address(STORAGE_METHOD_FILE, kind, ledger_id, content_hash_hex);
-        self.write_bytes(&address, bytes).await?;
+        self.write_bytes_durable(&address, bytes, self.durability_for(kind))
+            .await?;
         Ok(ContentWriteResult {
             address,
             content_hash: content_hash_hex.to_string(),
@@ -421,11 +487,46 @@ impl ContentAddressedWrite for FileStorage {
 }
 
 impl FileStorage {
+    /// `write_bytes` with an explicit durability, so a content write can pick
+    /// one from its [`ContentKind`].
+    async fn write_bytes_durable(
+        &self,
+        address: &str,
+        bytes: &[u8],
+        durability: Durability,
+    ) -> Result<()> {
+        let path = self.resolve_path(address)?;
+        let bytes = bytes.to_vec();
+        let for_err = path.clone();
+
+        // One blocking hop for mkdir + stage + rename, rather than one per
+        // `tokio::fs` call.
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    crate::error::Error::io(format!(
+                        "Failed to create directory {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+            // Overwrites if present, which is idempotent for content-addressed
+            // writes: the address is derived from these bytes.
+            write_atomic(&path, &bytes, durability).map_err(|e| {
+                crate::error::Error::io(format!("Failed to write {}: {}", path.display(), e))
+            })
+        })
+        .await
+        .map_err(|e| crate::error::Error::io(format!("write {} join: {e}", for_err.display())))?
+    }
+
     /// Create-if-absent file insert inside `spawn_blocking`.
     ///
     /// Stages the bytes and links them into place, so a caller that observes
     /// the file sees it complete.
     async fn blocking_insert(&self, path: PathBuf, bytes: Vec<u8>) -> StorageExtResult<bool> {
+        let durability = self.durability;
         tokio::task::spawn_blocking(move || {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -433,7 +534,7 @@ impl FileStorage {
                 })?;
             }
 
-            create_new_atomic(&path, &bytes)
+            create_new_atomic(&path, &bytes, durability)
                 .map_err(|e| StorageExtError::io(format!("write {}: {}", path.display(), e)))
         })
         .await
@@ -512,8 +613,9 @@ impl FileStorage {
         locked: LockedFile,
         new_bytes: Vec<u8>,
     ) -> StorageExtResult<()> {
+        let durability = self.durability;
         tokio::task::spawn_blocking(move || {
-            write_atomic(&locked.path, &new_bytes)
+            write_atomic(&locked.path, &new_bytes, durability)
                 .map_err(|e| StorageExtError::io(format!("write {}: {}", locked.path.display(), e)))
             // lock released when `locked._lock_file` is dropped
         })
@@ -573,6 +675,74 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = FileStorage::new(dir.path());
         (dir, storage)
+    }
+
+    /// A ledger that reports a commit written must not lose it to power loss,
+    /// so the safe setting is the one you get without asking.
+    #[test]
+    fn durability_defaults_to_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(FileStorage::new(dir.path()).durability(), Durability::Sync);
+        assert_eq!(
+            FileStorage::new(dir.path())
+                .with_durability(Durability::PageCache)
+                .durability(),
+            Durability::PageCache
+        );
+    }
+
+    /// Index builds write far more objects than commits do; paying an fsync per
+    /// index node would put the sync cost on the path that can least afford it,
+    /// for content a rebuild reproduces.
+    #[test]
+    fn derived_content_never_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path());
+        assert_eq!(storage.durability(), Durability::Sync);
+
+        for kind in [
+            ContentKind::IndexRoot,
+            ContentKind::IndexBranch,
+            ContentKind::IndexLeaf,
+            ContentKind::StatsSketch,
+            ContentKind::HistorySidecar,
+        ] {
+            assert_eq!(
+                storage.durability_for(kind),
+                Durability::PageCache,
+                "{kind:?} is derived"
+            );
+        }
+    }
+
+    #[test]
+    fn source_of_truth_content_follows_the_configured_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [Durability::Sync, Durability::PageCache] {
+            let storage = FileStorage::new(dir.path()).with_durability(mode);
+            for kind in [ContentKind::Commit, ContentKind::Txn] {
+                assert_eq!(storage.durability_for(kind), mode, "{kind:?}");
+            }
+        }
+    }
+
+    /// Both settings stage and rename; they differ only in what is flushed.
+    #[tokio::test]
+    async fn page_cache_mode_still_writes_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::PageCache);
+
+        storage.write_bytes("k.json", b"v").await.unwrap();
+        assert_eq!(storage.read_bytes("k.json").await.unwrap(), b"v");
+        assert!(storage.insert("n.json", b"a").await.unwrap());
+        assert!(!storage.insert("n.json", b"b").await.unwrap());
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| is_tmp_artifact(n))
+            .collect();
+        assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
     }
 
     /// Staging names append to the full file name so a multi-part extension

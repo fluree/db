@@ -14,7 +14,7 @@ mod file;
 mod memory;
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-pub use file::{FileStorage, STORAGE_METHOD_FILE};
+pub use file::{Durability, FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
 
 use crate::address_path::{ledger_id_to_path_prefix, shared_prefix_for_path};
