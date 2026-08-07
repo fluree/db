@@ -1576,6 +1576,87 @@ fn config_list_empty() {
         .stdout(predicate::str::contains("no configuration set"));
 }
 
+#[test]
+fn manifest_emits_machine_readable_surface() {
+    let tmp = TempDir::new().unwrap();
+    // Needs no .fluree/ directory — pure introspection of the clap tree.
+    let assert = fluree_cmd(&tmp).arg("manifest").assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&stdout).expect("manifest is JSON");
+
+    assert_eq!(manifest["manifest_version"], 1);
+    assert_eq!(manifest["name"], "fluree");
+    assert!(manifest["version"].as_str().is_some_and(|v| !v.is_empty()));
+
+    let paths: Vec<Vec<&str>> = manifest["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            c["path"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect()
+        })
+        .collect();
+    // The surface dependent repos teach.
+    assert!(paths.contains(&vec!["query"]));
+    assert!(paths.contains(&vec!["remote", "add"]));
+    assert!(paths.contains(&vec!["auth", "login"]));
+    assert!(paths.contains(&vec!["model", "access", "enable"]));
+    // Hidden machine commands (this one included) never leak into the
+    // teachable surface.
+    assert!(!paths.contains(&vec!["manifest"]));
+}
+
+#[test]
+fn config_list_redacts_credentials_unless_revealed() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    // A remote with a stored bearer token — the shape `remote add --token`
+    // and `auth login` persist (access + refresh tokens).
+    fluree_cmd(&tmp)
+        .args([
+            "config",
+            "set",
+            "remotes.origin.auth.token",
+            "sekrit-access",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "config",
+            "set",
+            "remotes.origin.auth.refresh_token",
+            "sekrit-refresh",
+        ])
+        .assert()
+        .success();
+
+    // Default list masks both values but keeps the keys visible.
+    fluree_cmd(&tmp)
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remotes.origin.auth.token"))
+        .stdout(predicate::str::contains("[redacted]"))
+        .stdout(predicate::str::contains("sekrit-access").not())
+        .stdout(predicate::str::contains("sekrit-refresh").not())
+        .stderr(predicate::str::contains("--reveal"));
+
+    // --reveal prints the raw values (the documented raw-config escape hatch).
+    fluree_cmd(&tmp)
+        .args(["config", "list", "--reveal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sekrit-access"))
+        .stdout(predicate::str::contains("sekrit-refresh"));
+}
+
 // ============================================================================
 // v1.1 — Completions tests
 // ============================================================================

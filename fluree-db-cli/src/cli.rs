@@ -978,6 +978,21 @@ pub enum Commands {
         shell: clap_complete::Shell,
     },
 
+    /// Emit a machine-readable manifest of this binary's CLI surface (JSON)
+    ///
+    /// Hidden machine plumbing: generated from the clap definitions (command
+    /// paths, flags, value enums, positionals, compiled features — no help
+    /// text), published as a release asset, and consumed by CI in dependent
+    /// repos to validate the `fluree ...` strings they ship. Named without a
+    /// `__` prefix because clap_complete's bash generator uses `__` as its
+    /// command-path separator and panics on such names.
+    #[command(hide = true)]
+    Manifest {
+        /// Write to a file instead of stdout
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+    },
+
     /// Manage JWS tokens for authentication
     Token {
         #[command(subcommand)]
@@ -2446,7 +2461,14 @@ pub enum ConfigAction {
     },
 
     /// List all configuration values
-    List,
+    ///
+    /// Credential values (tokens, refresh tokens, client secrets) print as
+    /// `[redacted]`; pass `--reveal` to print them in the clear.
+    List {
+        /// Print credential values in the clear instead of `[redacted]`
+        #[arg(long)]
+        reveal: bool,
+    },
 
     /// Set origin configuration for a ledger (content origins for CID-based fetch)
     SetOrigins {
@@ -2748,7 +2770,7 @@ pub enum AuthAction {
     /// composes into .env files and shell substitution:
     /// `FLUREE_TOKEN=$(fluree auth token --remote prod)`. Warns on stderr
     /// if the token is expired. The refresh token is never printed; use
-    /// `fluree config list` only if you truly need the raw config.
+    /// `fluree config list --reveal` only if you truly need the raw config.
     Token {
         /// Remote name (defaults to only configured remote)
         #[arg(long)]

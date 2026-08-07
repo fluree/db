@@ -7,10 +7,15 @@
 //! Bulk import now writes V2-native sorted-commit artifacts directly, so this
 //! module consumes those artifacts without a bulk-import-only V1 → V2 pass.
 
+use crate::run_index::build::fd_plan::{
+    plan_fd_usage, FdPlan, IMPORT_CONCURRENT_ORDERS, REBUILD_CONCURRENT_ORDERS,
+};
 use crate::run_index::build::index_build::{
-    build_all_indexes, BuildAllConfig, IndexBuildResult, PersistingLeafWriter,
+    build_all_indexes, cascade_runs_to_fan_in, BuildAllConfig, IndexBuildError, IndexBuildResult,
+    PersistingLeafWriter,
 };
 use crate::run_index::build::merge::KWayMerge;
+use crate::run_index::runs::run_file::StreamingRunFileWriter;
 use crate::run_index::runs::run_writer::{
     MultiOrderConfig, MultiOrderRunWriter, MultiOrderRunWriterWithOp,
 };
@@ -18,9 +23,11 @@ use crate::run_index::runs::spool::{
     link_chunk_run_files_to_flat, remap_commit_to_runs_with_op, remap_sorted_commit_v2_to_runs,
     MmapStringRemap, MmapSubjectRemap, SortedCommitMergeReaderV2, SubjectRemap,
 };
+use crate::run_index::runs::streaming_reader::{MergeSource, StreamingRunReader};
 use crate::stats::{stats_record_from_v2, SpotClassStats, DT_REF_ID};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::cmp_v2_spot;
+use fluree_db_binary_index::format::run_record_v2::{cmp_v2_spot, RunRecordV2};
+use fluree_db_core::fd_limit::FdBudget;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::o_type_registry::OTypeRegistry;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -119,6 +126,11 @@ pub struct BuildConfig {
     pub run_budget_bytes: usize,
     /// Worker count for chunk-parallel secondary-order generation.
     pub worker_count: usize,
+    /// File-descriptor budget the build plans its fan-in/fan-out within
+    /// (see [`crate::run_index::build::fd_plan`]). Use
+    /// [`FdBudget::detect`] for real builds; [`FdBudget::unlimited`]
+    /// preserves the legacy unbudgeted behavior.
+    pub fd_budget: FdBudget,
     /// Remap progress counter (optional).
     pub remap_progress: Option<Arc<AtomicU64>>,
     /// Merge/build progress counter (optional).
@@ -292,6 +304,103 @@ fn mmap_readonly(path: &Path) -> io::Result<memmap2::Mmap> {
     unsafe { memmap2::Mmap::map(&file) }
 }
 
+/// Bounded pool of append-mode class-membership bucket writers.
+///
+/// The scatter pass sprays `TypeEntry` records across
+/// [`CLASS_MEMBERSHIP_BUCKETS`] logical bucket files. Opening all of them up
+/// front held 256 descriptors for the whole pass — the entire soft limit on a
+/// stock macOS shell — so at most `max_open` writers are open at once; the
+/// least-recently-used writer is flushed and closed on eviction and its
+/// bucket transparently reopened in append mode on the next write.
+///
+/// Correctness: bucket files are created lazily, so a bucket that never
+/// receives an entry has no file (the materialization pass treats missing as
+/// empty). Records are fixed-width and every eviction flushes the `BufWriter`
+/// before closing, so no partial record can straddle a close/reopen boundary.
+/// Within-bucket record order is irrelevant — the materialization pass sorts —
+/// which is what makes append-reopen lossless.
+///
+/// Performance: bucket choice is a hash, so under a pool smaller than 256 the
+/// access pattern is LRU's worst case and evictions are proportional to the
+/// shortfall. That tax is intended to be RARE — the startup/preflight
+/// `RLIMIT_NOFILE` raise normally lifts macOS's 256 default well above the
+/// point where the pool binds — so don't "optimize" the pool away; it exists
+/// for the environments where the raise cannot succeed.
+struct BucketWriterPool {
+    dir: PathBuf,
+    max_open: usize,
+    slots: Vec<Option<std::io::BufWriter<std::fs::File>>>,
+    /// Monotonic use stamps per bucket; eviction takes the open slot with the
+    /// lowest stamp (linear scan over 256 slots — evictions are rare relative
+    /// to entry volume and the scan is cache-resident).
+    last_used: Vec<u64>,
+    clock: u64,
+    open_count: usize,
+}
+
+impl BucketWriterPool {
+    fn new(dir: PathBuf, max_open: usize) -> Self {
+        Self {
+            dir,
+            max_open: max_open.max(1),
+            slots: (0..CLASS_MEMBERSHIP_BUCKETS).map(|_| None).collect(),
+            last_used: vec![0; CLASS_MEMBERSHIP_BUCKETS],
+            clock: 0,
+            open_count: 0,
+        }
+    }
+
+    fn bucket_path(dir: &Path, bucket: usize) -> PathBuf {
+        dir.join(format!("bucket_{bucket:03}.typ"))
+    }
+
+    fn writer(&mut self, bucket: usize) -> io::Result<&mut std::io::BufWriter<std::fs::File>> {
+        use std::io::Write;
+
+        self.clock += 1;
+        self.last_used[bucket] = self.clock;
+        if self.slots[bucket].is_none() {
+            if self.open_count >= self.max_open {
+                let victim = self
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
+                    .min_by_key(|&i| self.last_used[i])
+                    .expect("open_count >= max_open >= 1 implies an open slot");
+                let mut evicted = self.slots[victim].take().expect("victim slot is open");
+                evicted.flush()?;
+                self.open_count -= 1;
+            }
+            // `append` covers both first open and reopen-after-eviction;
+            // `File::create` would truncate previously scattered entries.
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(Self::bucket_path(&self.dir, bucket))?;
+            self.slots[bucket] = Some(std::io::BufWriter::new(file));
+            self.open_count += 1;
+        }
+        Ok(self.slots[bucket]
+            .as_mut()
+            .expect("slot ensured open above"))
+    }
+
+    /// Flush and close every open writer. Errors instead of silently dropping
+    /// buffered entries (a plain `drop` would swallow flush failures).
+    fn finish(mut self) -> io::Result<()> {
+        use std::io::Write;
+
+        for slot in &mut self.slots {
+            if let Some(writer) = slot.as_mut() {
+                writer.flush()?;
+            }
+            *slot = None;
+        }
+        Ok(())
+    }
+}
+
 impl DiskClassMembership {
     fn classes_of(&self, g_id: u16, sid: u64, out: &mut Vec<u64>) {
         out.clear();
@@ -396,7 +505,15 @@ impl ClassMembership {
 
     /// Build from per-chunk `.types` sidecars whose IDs are chunk-local and are
     /// remapped to global via each commit's `MmapSubjectRemap`. Import path.
-    fn build_from_commits(commits: &[CommitInput], scratch_dir: &Path) -> io::Result<Option<Self>> {
+    ///
+    /// `max_open_writers` bounds how many partition files the scatter pass
+    /// holds open simultaneously (see [`BucketWriterPool`]); size it from
+    /// [`FdPlan::scatter_pool`].
+    fn build_from_commits(
+        commits: &[CommitInput],
+        scratch_dir: &Path,
+        max_open_writers: usize,
+    ) -> io::Result<Option<Self>> {
         use std::io::{BufReader, BufWriter, Read, Write};
 
         let build_start = Instant::now();
@@ -420,11 +537,7 @@ impl ClassMembership {
         std::fs::create_dir_all(&index_dir)?;
         std::fs::create_dir_all(&data_dir)?;
 
-        let mut partition_writers = Vec::with_capacity(CLASS_MEMBERSHIP_BUCKETS);
-        for bucket in 0..CLASS_MEMBERSHIP_BUCKETS {
-            let path = partition_dir.join(format!("bucket_{bucket:03}.typ"));
-            partition_writers.push(BufWriter::new(std::fs::File::create(path)?));
-        }
+        let mut partition_writers = BucketWriterPool::new(partition_dir.clone(), max_open_writers);
 
         for commit in commits {
             let Some(types_map_path) = &commit.types_map_path else {
@@ -450,7 +563,7 @@ impl ClassMembership {
                 distinct_classes.insert(c_global);
                 let bucket = class_membership_bucket(g_id, s_global);
                 write_type_entry(
-                    &mut partition_writers[bucket],
+                    partition_writers.writer(bucket)?,
                     TypeEntry {
                         g_id,
                         subject: s_global,
@@ -463,18 +576,21 @@ impl ClassMembership {
         if !saw_sidecar {
             return Ok(None);
         }
-        for writer in &mut partition_writers {
-            writer.flush()?;
-        }
-        drop(partition_writers);
+        partition_writers.finish()?;
 
         let mut buckets = Vec::with_capacity(CLASS_MEMBERSHIP_BUCKETS);
         let mut subject_entries = 0usize;
         let mut non_empty_buckets = 0usize;
         let bucket_build_start = Instant::now();
         for bucket in 0..CLASS_MEMBERSHIP_BUCKETS {
-            let partition_path = partition_dir.join(format!("bucket_{bucket:03}.typ"));
-            let partition_bytes = std::fs::metadata(&partition_path)?.len();
+            let partition_path = BucketWriterPool::bucket_path(&partition_dir, bucket);
+            // Bucket files are created lazily by the writer pool: a bucket
+            // that never received an entry has no file at all.
+            let partition_bytes = match std::fs::metadata(&partition_path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+                Err(e) => return Err(e),
+            };
             if partition_bytes == 0 {
                 buckets.push(None);
                 continue;
@@ -948,11 +1064,22 @@ pub fn build_indexes_from_commits(
     mut stats_hook: Option<&mut crate::stats::IdStatsHook>,
 ) -> io::Result<(BuildResult, Option<SpotClassStats>)> {
     let overall_start = Instant::now();
+    let fd_plan = plan_fd_usage(
+        config.fd_budget,
+        config.worker_count,
+        IMPORT_CONCURRENT_ORDERS,
+    );
     tracing::info!(
         chunks = commits.len(),
         worker_count = config.worker_count,
         run_budget_bytes = config.run_budget_bytes,
         g_id = config.g_id,
+        fd_soft_limit = config.fd_budget.soft,
+        fd_reserve = config.fd_budget.reserve,
+        scatter_pool = fd_plan.scatter_pool,
+        spot_fan_in = fd_plan.spot_fan_in,
+        worker_cap = fd_plan.worker_cap,
+        merge_fan_in_per_order = fd_plan.merge_fan_in_per_order,
         "starting build_indexes_from_commits"
     );
     log_index_memory("build_indexes_from_commits:start");
@@ -969,7 +1096,11 @@ pub fn build_indexes_from_commits(
     // while letting that membership heap drop before the secondary phases begin.
     let spot_rdf_type_p_id = stats_hook.as_ref().and_then(|hook| hook.rdf_type_p_id());
     let spot_class_membership = if spot_rdf_type_p_id.is_some() {
-        ClassMembership::build_from_commits(commits, &config.run_dir.join("class_membership"))?
+        ClassMembership::build_from_commits(
+            commits,
+            &config.run_dir.join("class_membership"),
+            fd_plan.scatter_pool,
+        )?
     } else {
         None
     };
@@ -982,8 +1113,13 @@ pub fn build_indexes_from_commits(
             "class membership built for ref-target stats"
         );
     }
-    let (spot_result, spot_class_stats) =
-        build_spot_index_from_commits(commits, config, spot_rdf_type_p_id, spot_class_membership)?;
+    let (spot_result, spot_class_stats) = build_spot_index_from_commits(
+        commits,
+        config,
+        spot_rdf_type_p_id,
+        spot_class_membership,
+        &fd_plan,
+    )?;
     log_index_memory("spot_build:joined_before_secondary_phases");
 
     // Phase 1: Generate secondary-order runs in parallel.
@@ -991,7 +1127,18 @@ pub fn build_indexes_from_commits(
         stage.store(BUILD_STAGE_REMAP, Ordering::Relaxed);
     }
     let remap_start = Instant::now();
-    let worker_count = config.worker_count.max(1).min(commits.len().max(1));
+    // The fd cap changes worker_count → per_thread_budget_bytes → run-file
+    // boundaries, which permutes equal-comparing records across a chunk's
+    // run files (RunWriter sorts unstably per flush). That is unobservable
+    // because bulk import assigns one t per chunk, so records comparing
+    // Equal under a secondary-order comparator within a chunk are equal in
+    // every serialized field. (Pre-existing worker_count variation by CPU
+    // count already leaned on the same invariant.)
+    let worker_count = config
+        .worker_count
+        .max(1)
+        .min(commits.len().max(1))
+        .min(fd_plan.worker_cap);
     let per_thread_budget_bytes = (config.run_budget_bytes / worker_count).max(64 * 1024 * 1024);
     log_index_memory("secondary_run_generation:start");
     tracing::info!(
@@ -1136,14 +1283,17 @@ pub fn build_indexes_from_commits(
         skip_history: true, // Append-only: no time-travel data.
         g_id: config.g_id,
         progress: config.build_progress.clone(),
-        // Build the secondary orders (PSOT/POST/OPST) concurrently, bounded by
-        // the import core budget. SPOT has already completed, so this
-        // concurrency no longer overlaps with the class-membership heap.
-        // build_all_indexes clamps this to the number of buildable orders.
-        max_concurrency: config.worker_count,
+        // Build the secondary orders (PSOT/POST/OPST) concurrently. SPOT has
+        // already completed, so this concurrency no longer overlaps with the
+        // class-membership heap. Taken from the SAME plan field the fan-in
+        // share was divided by — never independently from worker_count — so
+        // the merge budget cannot drift from the actual concurrency.
+        // build_all_indexes still clamps to the number of buildable orders.
+        max_concurrency: fd_plan.order_concurrency,
+        fan_in_cap: fd_plan.merge_fan_in_per_order,
     };
 
-    let mut order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
+    let mut order_results = build_all_indexes(&build_config).map_err(index_build_err_to_io)?;
     log_index_memory("secondary_index_merge:complete");
     order_results.push((RunSortOrder::Spot, spot_result));
 
@@ -1186,6 +1336,7 @@ fn build_spot_index_from_commits(
     config: &BuildConfig,
     rdf_type_p_id: Option<u32>,
     class_membership: Option<ClassMembership>,
+    fd_plan: &FdPlan,
 ) -> io::Result<(IndexBuildResult, Option<SpotClassStats>)> {
     let g_id = config.g_id;
     let index_dir = &config.index_dir;
@@ -1197,26 +1348,12 @@ fn build_spot_index_from_commits(
     tracing::info!(
         chunks = commits.len(),
         g_id,
+        spot_fan_in = fd_plan.spot_fan_in,
         "starting direct SPOT build from sorted commits"
     );
     log_index_memory("spot_build:start");
-    let streams: Vec<SortedCommitMergeReaderV2<MmapSubjectRemap, MmapStringRemap>> = commits
-        .iter()
-        .map(|commit| {
-            let s_remap = MmapSubjectRemap::open(&commit.subject_remap_path)?;
-            let str_remap = MmapStringRemap::open(&commit.string_remap_path)?;
-            SortedCommitMergeReaderV2::open(
-                &commit.commit_path,
-                commit.record_count,
-                s_remap,
-                str_remap,
-                commit.lang_remap.clone(),
-                g_id,
-            )
-        })
-        .collect::<io::Result<Vec<_>>>()?;
 
-    if streams.is_empty() {
+    if commits.is_empty() {
         return Ok((
             IndexBuildResult {
                 graphs: Vec::new(),
@@ -1228,7 +1365,6 @@ fn build_spot_index_from_commits(
         ));
     }
 
-    let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
     let order = RunSortOrder::Spot;
 
     // Streams each completed leaf to disk as produced (see PersistingLeafWriter)
@@ -1244,32 +1380,87 @@ fn build_spot_index_from_commits(
     )?;
     writer.set_skip_history(true);
 
-    let mut total_rows = 0u64;
-    let mut progress_batch = 0u64;
     let mut class_stats_collector =
         rdf_type_p_id.map(|p_id| SpotClassStatsCollector::new(p_id, class_membership));
-    while let Some((record, op)) = merge.next_record()? {
-        if op == 0 {
-            continue;
+
+    let total_rows = if commits.len() <= fd_plan.spot_fan_in {
+        // Flat merge: one long-lived reader per chunk, all open at once.
+        // The common case, and byte-for-byte the pre-budget behavior.
+        let streams = open_spot_commit_readers(commits, g_id)?;
+        let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
+        pump_spot_merge(
+            &mut merge,
+            &mut writer,
+            g_id,
+            class_stats_collector.as_mut(),
+            progress.as_deref(),
+        )?
+    } else {
+        // More chunks than the FD budget allows open at once: merge
+        // consecutive chunk groups into globally-remapped intermediate run
+        // files first (each group holds ≤ spot_fan_in readers), then feed
+        // the final merge from those. Grouping is consecutive and the group
+        // outputs are consumed in group order, so the emitted record
+        // sequence — and therefore every leaf byte — is identical to the
+        // flat merge (see `cascade_runs_to_fan_in` for the full argument).
+        tracing::info!(
+            chunks = commits.len(),
+            spot_fan_in = fd_plan.spot_fan_in,
+            "chunk count exceeds fd budget; hierarchical SPOT merge"
+        );
+        let scratch = config.run_dir.join("spot_cascade");
+        if scratch.exists() {
+            std::fs::remove_dir_all(&scratch)?;
         }
-        if let Some(ref mut collector) = class_stats_collector {
-            collector.on_record(&record);
-        }
-        writer.push_record(record)?;
-        total_rows += 1;
-        progress_batch += 1;
-        if progress_batch >= PROGRESS_BATCH_SIZE {
-            if let Some(ref ctr) = progress {
-                ctr.fetch_add(progress_batch, Ordering::Relaxed);
+        let pass_dir = scratch.join("pass_1");
+        std::fs::create_dir_all(&pass_dir)?;
+
+        let mut intermediates = Vec::with_capacity(commits.len().div_ceil(fd_plan.spot_fan_in));
+        for (i, group) in commits.chunks(fd_plan.spot_fan_in).enumerate() {
+            let streams = open_spot_commit_readers(group, g_id)?;
+            let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
+            let out_path = pass_dir.join(format!("merged_{i:06}.frn"));
+            // Carry op bytes through verbatim (with-op intermediates), so
+            // this arm agrees with the flat arm by construction: the shared
+            // pump's `op == 0` skip sees the same ops either way. Today the
+            // V2 spool reader reports a uniform op = 1 (no `peek_op`
+            // override), but the spool wire format round-trips retractions
+            // and the pump guards for them — preserve, don't assume, exactly
+            // as `cascade_runs_to_fan_in` does.
+            let mut inter = StreamingRunFileWriter::create(&out_path, order, true)?;
+            while let Some((record, op)) = merge.next_record()? {
+                inter.push(record, op)?;
             }
-            progress_batch = 0;
+            inter.finish()?;
+            intermediates.push(out_path);
         }
-    }
-    if progress_batch > 0 {
-        if let Some(ref ctr) = progress {
-            ctr.fetch_add(progress_batch, Ordering::Relaxed);
-        }
-    }
+        // chunks > spot_fan_in² leaves the first pass still over the cap;
+        // reduce the intermediates themselves (rare, tiny-budget case).
+        let intermediates = cascade_runs_to_fan_in(
+            intermediates,
+            order,
+            fd_plan.spot_fan_in,
+            &scratch.join("cascade"),
+        )?;
+
+        let streams: Vec<StreamingRunReader> = intermediates
+            .iter()
+            .map(|p| StreamingRunReader::open(p))
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
+        let rows = pump_spot_merge(
+            &mut merge,
+            &mut writer,
+            g_id,
+            class_stats_collector.as_mut(),
+            progress.as_deref(),
+        )?;
+        drop(merge);
+        // Reclaim the intermediate copy of the dataset before the
+        // secondary-order phases start writing their own run files.
+        std::fs::remove_dir_all(&scratch)?;
+        rows
+    };
 
     let result = writer.finish()?;
     tracing::info!(
@@ -1288,6 +1479,91 @@ fn build_spot_index_from_commits(
         },
         class_stats_collector.map(SpotClassStatsCollector::finish),
     ))
+}
+
+/// Unwrap an [`IndexBuildError`] into an `io::Error` **preserving the
+/// original OS error** — a plain `io::Error::other` wrapper erases
+/// `raw_os_error`, which would make descriptor exhaustion (`EMFILE`) inside
+/// the secondary-order merges invisible to the import layer's diagnostics.
+fn index_build_err_to_io(e: IndexBuildError) -> io::Error {
+    match e {
+        IndexBuildError::Io(io_err) => io_err,
+        other => io::Error::other(other),
+    }
+}
+
+/// Open one remapping SPOT reader per commit chunk. Each holds one real file
+/// descriptor (the sorted-commit `BufReader`) for its lifetime; the two remap
+/// mmaps drop their `File` on open and cost address space only.
+fn open_spot_commit_readers(
+    commits: &[CommitInput],
+    g_id: u16,
+) -> io::Result<Vec<SortedCommitMergeReaderV2<MmapSubjectRemap, MmapStringRemap>>> {
+    commits
+        .iter()
+        .map(|commit| {
+            let s_remap = MmapSubjectRemap::open(&commit.subject_remap_path)?;
+            let str_remap = MmapStringRemap::open(&commit.string_remap_path)?;
+            SortedCommitMergeReaderV2::open(
+                &commit.commit_path,
+                commit.record_count,
+                s_remap,
+                str_remap,
+                commit.lang_remap.clone(),
+                g_id,
+            )
+        })
+        .collect()
+}
+
+/// Drain a SPOT merge into the leaf writer (and class-stats collector),
+/// batching progress updates. Shared by the flat and hierarchical SPOT
+/// arms so both consume the merged sequence identically.
+///
+/// `g_id` is restamped onto every record before consumption: the FRN2 run
+/// wire format carries no g_id (readers decode it as 0), so records arriving
+/// through the hierarchical arm's intermediate run files would otherwise
+/// reach the class-stats collector as g_id 0 — silently folding a named
+/// graph's class stats into the default graph's. The flat arm's records
+/// already carry `g_id` (its readers filter on it), so the stamp is a no-op
+/// there; the pipeline is graph-scoped by construction either way.
+fn pump_spot_merge<T, F>(
+    merge: &mut KWayMerge<T, F>,
+    writer: &mut PersistingLeafWriter,
+    g_id: u16,
+    mut class_stats_collector: Option<&mut SpotClassStatsCollector>,
+    progress: Option<&AtomicU64>,
+) -> io::Result<u64>
+where
+    T: MergeSource,
+    F: Fn(&RunRecordV2, &RunRecordV2) -> std::cmp::Ordering,
+{
+    let mut total_rows = 0u64;
+    let mut progress_batch = 0u64;
+    while let Some((mut record, op)) = merge.next_record()? {
+        if op == 0 {
+            continue;
+        }
+        record.g_id = g_id;
+        if let Some(collector) = class_stats_collector.as_deref_mut() {
+            collector.on_record(&record);
+        }
+        writer.push_record(record)?;
+        total_rows += 1;
+        progress_batch += 1;
+        if progress_batch >= PROGRESS_BATCH_SIZE {
+            if let Some(ctr) = progress {
+                ctr.fetch_add(progress_batch, Ordering::Relaxed);
+            }
+            progress_batch = 0;
+        }
+    }
+    if progress_batch > 0 {
+        if let Some(ctr) = progress {
+            ctr.fetch_add(progress_batch, Ordering::Relaxed);
+        }
+    }
+    Ok(total_rows)
 }
 
 /// Build V3 indexes from globally-remapped sorted commit files (rebuild path).
@@ -1359,6 +1635,11 @@ pub fn build_indexes_from_remapped_commits(
     }
     let build_start = Instant::now();
 
+    let rebuild_fd_plan = plan_fd_usage(
+        config.fd_budget,
+        config.worker_count,
+        REBUILD_CONCURRENT_ORDERS,
+    );
     let build_config = BuildAllConfig {
         base_run_dir: config.run_dir.clone(),
         index_dir: config.index_dir.clone(),
@@ -1370,11 +1651,14 @@ pub fn build_indexes_from_remapped_commits(
         g_id: config.g_id,
         progress: config.build_progress.clone(),
         // Rebuild path builds all 4 orders here (no separate SPOT thread), so
-        // concurrency can cover all of them, bounded by the core budget.
-        max_concurrency: config.worker_count,
+        // concurrency can cover all of them — which is why the fan-in share
+        // divides by 4, not the import path's 3. Concurrency and share both
+        // come from the same plan so they cannot drift apart.
+        max_concurrency: rebuild_fd_plan.order_concurrency,
+        fan_in_cap: rebuild_fd_plan.merge_fan_in_per_order,
     };
 
-    let order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
+    let order_results = build_all_indexes(&build_config).map_err(index_build_err_to_io)?;
 
     let build_elapsed = build_start.elapsed();
 
@@ -1501,6 +1785,7 @@ mod tests {
             zstd_level: 1,
             run_budget_bytes: 256 * 1024,
             worker_count: 1,
+            fd_budget: FdBudget::unlimited(),
             remap_progress: None,
             build_progress: None,
             stage_marker: None,
@@ -1535,6 +1820,257 @@ mod tests {
         assert_eq!(leaf_dir[1].p_const, Some(2));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hierarchical SPOT merge (chunk count above the fan-in cap) must
+    /// produce byte-identical leaves to the flat merge — leaf and branch
+    /// CIDs are content-addressed, so CID equality is byte equality.
+    #[test]
+    fn spot_hierarchical_matches_flat() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = OTypeRegistry::builtin_only();
+
+        // 5 chunks × 41 records: interleaved disjoint subjects plus one
+        // shared identical-comparing record per chunk (comparators exclude
+        // t), so the cross-group tie-break seam is exercised.
+        let mut commits = Vec::new();
+        for j in 0..5u64 {
+            let commit_path = dir.path().join(format!("commit_{j:05}.fsv2"));
+            let mut recs: Vec<RunRecordV2> = (0..40u64)
+                .map(|i| {
+                    let s = i * 5 + j;
+                    RunRecordV2::from_v1(
+                        &RunRecord::new(
+                            0,
+                            SubjectId(s),
+                            1,
+                            ObjKind::NUM_INT,
+                            ObjKey::encode_i64(s as i64),
+                            j as u32 + 1,
+                            true,
+                            3,
+                            0,
+                            None,
+                        ),
+                        &registry,
+                    )
+                })
+                .collect();
+            recs.push(RunRecordV2::from_v1(
+                &RunRecord::new(
+                    0,
+                    SubjectId(1000),
+                    1,
+                    ObjKind::NUM_INT,
+                    ObjKey::encode_i64(7),
+                    j as u32 + 1,
+                    true,
+                    3,
+                    0,
+                    None,
+                ),
+                &registry,
+            ));
+            recs.sort_by(cmp_v2_spot);
+
+            let mut spool = SortedCommitWriterV2::new(&commit_path, 0).unwrap();
+            for rec in &recs {
+                spool.push(rec).unwrap();
+            }
+            let info = spool.finish().unwrap();
+
+            let subj_path = dir.path().join(format!("subjects_{j:05}.rmp"));
+            let subj_data: Vec<u8> = (0u64..1024).flat_map(u64::to_le_bytes).collect();
+            std::fs::write(&subj_path, &subj_data).unwrap();
+            let str_path = dir.path().join(format!("strings_{j:05}.rmp"));
+            let str_data: Vec<u8> = (0u32..10).flat_map(u32::to_le_bytes).collect();
+            std::fs::write(&str_path, &str_data).unwrap();
+
+            commits.push(CommitInput {
+                commit_path,
+                record_count: info.record_count,
+                subject_remap_path: subj_path,
+                string_remap_path: str_path,
+                lang_remap: vec![],
+                types_map_path: None,
+            });
+        }
+
+        let build = |tag: &str, plan: &FdPlan| {
+            let config = BuildConfig {
+                run_dir: dir.path().join(format!("runs_{tag}")),
+                index_dir: dir.path().join(format!("index_{tag}")),
+                g_id: 0,
+                leaflet_target_rows: 16,
+                leaf_target_rows: 64,
+                zstd_level: 1,
+                run_budget_bytes: 256 * 1024,
+                worker_count: 1,
+                fd_budget: FdBudget::unlimited(),
+                remap_progress: None,
+                build_progress: None,
+                stage_marker: None,
+            };
+            std::fs::create_dir_all(&config.run_dir).unwrap();
+            build_spot_index_from_commits(&commits, &config, None, None, plan)
+                .unwrap()
+                .0
+        };
+
+        let unlimited = plan_fd_usage(FdBudget::unlimited(), 1, IMPORT_CONCURRENT_ORDERS);
+        let constrained = FdPlan {
+            spot_fan_in: 2,
+            ..unlimited
+        };
+
+        let flat = build("flat", &unlimited);
+        let hier = build("hier", &constrained);
+
+        assert_eq!(flat.total_rows, 5 * 41);
+        assert_eq!(flat.total_rows, hier.total_rows);
+        let cids = |r: &IndexBuildResult| {
+            r.graphs
+                .iter()
+                .flat_map(|g| {
+                    std::iter::once(g.branch_cid.clone())
+                        .chain(g.leaf_infos.iter().map(|l| l.leaf_cid.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(cids(&flat), cids(&hier));
+
+        // The hierarchical arm must clean up its intermediate copy.
+        assert!(!dir.path().join("runs_hier/spot_cascade").exists());
+    }
+
+    /// Regression for the FRN2 g_id round-trip bug: run wire records carry no
+    /// g_id (readers decode 0), so the hierarchical arm's intermediates used
+    /// to hand the class-stats collector g_id-0 records — silently folding a
+    /// named graph's class stats into the default graph and resolving ref
+    /// targets against the wrong graph. The pump now restamps g_id; this test
+    /// runs both arms at g_id 5 with a live collector + membership and
+    /// requires identical, correctly-keyed stats.
+    #[test]
+    fn spot_hierarchical_matches_flat_stats_nonzero_graph() {
+        const G: u16 = 5;
+        const TYPE_P: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // 5 chunks × 40 subjects (disjoint, interleaved). Each subject: one
+        // rdf:type assertion, one literal, one ref into a typed neighbor.
+        let mut commits = Vec::new();
+        for j in 0..5u64 {
+            let commit_path = dir.path().join(format!("commit_{j:05}.fsv2"));
+            let mut recs: Vec<RunRecordV2> = Vec::new();
+            for i in 0..40u64 {
+                let s = i * 5 + j;
+                recs.push(RunRecordV2 {
+                    s_id: SubjectId(s),
+                    o_key: 1000 + s % 3,
+                    p_id: TYPE_P,
+                    t: j as u32 + 1,
+                    o_i: fluree_db_binary_index::format::run_record::LIST_INDEX_NONE,
+                    o_type: OType::IRI_REF.as_u16(),
+                    g_id: G,
+                });
+                recs.push(RunRecordV2 {
+                    s_id: SubjectId(s),
+                    o_key: ObjKey::encode_i64(s as i64).as_u64(),
+                    p_id: 1,
+                    t: j as u32 + 1,
+                    o_i: fluree_db_binary_index::format::run_record::LIST_INDEX_NONE,
+                    o_type: OType::XSD_INTEGER.as_u16(),
+                    g_id: G,
+                });
+                recs.push(RunRecordV2 {
+                    s_id: SubjectId(s),
+                    o_key: (s + 1) % 200,
+                    p_id: 2,
+                    t: j as u32 + 1,
+                    o_i: fluree_db_binary_index::format::run_record::LIST_INDEX_NONE,
+                    o_type: OType::IRI_REF.as_u16(),
+                    g_id: G,
+                });
+            }
+            recs.sort_by(cmp_v2_spot);
+
+            let mut spool = SortedCommitWriterV2::new(&commit_path, 0).unwrap();
+            for rec in &recs {
+                spool.push(rec).unwrap();
+            }
+            let info = spool.finish().unwrap();
+
+            let subj_path = dir.path().join(format!("subjects_{j:05}.rmp"));
+            let subj_data: Vec<u8> = (0u64..1024).flat_map(u64::to_le_bytes).collect();
+            std::fs::write(&subj_path, &subj_data).unwrap();
+            let str_path = dir.path().join(format!("strings_{j:05}.rmp"));
+            let str_data: Vec<u8> = (0u32..10).flat_map(u32::to_le_bytes).collect();
+            std::fs::write(&str_path, &str_data).unwrap();
+
+            commits.push(CommitInput {
+                commit_path,
+                record_count: info.record_count,
+                subject_remap_path: subj_path,
+                string_remap_path: str_path,
+                lang_remap: vec![],
+                types_map_path: None,
+            });
+        }
+
+        // Membership keyed under g_id 5 so ref-target class resolution only
+        // succeeds when the collector sees correctly-stamped records.
+        let types_path = dir.path().join("global.types");
+        let entries: Vec<(u16, u64, u64)> = (0..200u64).map(|s| (G, s, 1000 + s % 3)).collect();
+        write_types_sidecar(&types_path, &entries);
+
+        let build = |tag: &str, plan: &FdPlan| {
+            let membership =
+                ClassMembership::build_from_global_types(std::slice::from_ref(&types_path))
+                    .unwrap()
+                    .expect("membership");
+            let config = BuildConfig {
+                run_dir: dir.path().join(format!("runs_{tag}")),
+                index_dir: dir.path().join(format!("index_{tag}")),
+                g_id: G,
+                leaflet_target_rows: 16,
+                leaf_target_rows: 64,
+                zstd_level: 1,
+                run_budget_bytes: 256 * 1024,
+                worker_count: 1,
+                fd_budget: FdBudget::unlimited(),
+                remap_progress: None,
+                build_progress: None,
+                stage_marker: None,
+            };
+            std::fs::create_dir_all(&config.run_dir).unwrap();
+            build_spot_index_from_commits(&commits, &config, Some(TYPE_P), Some(membership), plan)
+                .unwrap()
+        };
+
+        let unlimited = plan_fd_usage(FdBudget::unlimited(), 1, IMPORT_CONCURRENT_ORDERS);
+        let constrained = FdPlan {
+            spot_fan_in: 2,
+            ..unlimited
+        };
+
+        let (flat_result, flat_stats) = build("statflat", &unlimited);
+        let (hier_result, hier_stats) = build("stathier", &constrained);
+        let flat_stats = flat_stats.expect("flat stats");
+        let hier_stats = hier_stats.expect("hier stats");
+
+        assert_eq!(flat_result.total_rows, hier_result.total_rows);
+
+        // Non-vacuous: counts exist, keyed under the named graph, and ref
+        // targets resolved through the membership.
+        assert!(!flat_stats.class_counts.is_empty());
+        assert!(flat_stats.class_counts.keys().all(|&(g, _)| g == G));
+        assert!(!flat_stats.class_prop_refs.is_empty());
+
+        assert_eq!(flat_stats.class_counts, hier_stats.class_counts);
+        assert_eq!(flat_stats.class_prop_dts, hier_stats.class_prop_dts);
+        assert_eq!(flat_stats.class_prop_langs, hier_stats.class_prop_langs);
+        assert_eq!(flat_stats.class_prop_refs, hier_stats.class_prop_refs);
     }
 
     /// Helper: write `.types` sidecar entries (g_id: u16, s_id: u64, class_sid64: u64).
@@ -1597,10 +2133,13 @@ mod tests {
             },
         ];
 
-        let membership =
-            ClassMembership::build_from_commits(&commits, &dir.path().join("membership"))
-                .unwrap()
-                .expect("membership");
+        let membership = ClassMembership::build_from_commits(
+            &commits,
+            &dir.path().join("membership"),
+            usize::MAX,
+        )
+        .unwrap()
+        .expect("membership");
         assert!(matches!(membership, ClassMembership::Disk(_)));
         assert_eq!(membership.summary().1, 4);
         assert_eq!(membership.summary().2, 3);
@@ -1614,6 +2153,77 @@ mod tests {
         assert_eq!(buf, vec![4000]);
         membership.collect_classes(0, 999, &mut buf);
         assert!(buf.is_empty());
+    }
+
+    /// A tiny writer pool (forcing heavy LRU eviction and append-reopen)
+    /// must produce byte-for-byte the same membership as the unbounded
+    /// scatter, including buckets that never receive an entry (lazily
+    /// uncreated files read as empty).
+    #[test]
+    fn scatter_pool_matches_unbounded() {
+        let build = |max_open: usize| {
+            let dir = tempfile::tempdir().unwrap();
+            let types0 = dir.path().join("chunk_00000.types");
+            let types1 = dir.path().join("chunk_00001.types");
+            let subj0 = dir.path().join("subjects_00000.rmp");
+            let subj1 = dir.path().join("subjects_00001.rmp");
+            let str0 = dir.path().join("strings_00000.rmp");
+            let str1 = dir.path().join("strings_00001.rmp");
+            write_identity_subject_remap(&subj0, 6000);
+            write_identity_subject_remap(&subj1, 6000);
+            write_identity_string_remap(&str0, 1);
+            write_identity_string_remap(&str1, 1);
+
+            // ~500 subjects spraying across many (but not all) buckets, with
+            // interleaved revisits so evicted buckets are reopened mid-pass.
+            let entries0: Vec<(u16, u64, u64)> = (0..500u64)
+                .map(|s| (0u16, s * 7 % 1500, 1000 + s % 70))
+                .collect();
+            let entries1: Vec<(u16, u64, u64)> = (0..500u64)
+                .map(|s| (0u16, s * 13 % 1500, 1000 + s % 90))
+                .collect();
+            write_types_sidecar(&types0, &entries0);
+            write_types_sidecar(&types1, &entries1);
+
+            let commits = vec![
+                CommitInput {
+                    commit_path: dir.path().join("unused0.fsv2"),
+                    record_count: 0,
+                    subject_remap_path: subj0,
+                    string_remap_path: str0,
+                    lang_remap: vec![],
+                    types_map_path: Some(types0),
+                },
+                CommitInput {
+                    commit_path: dir.path().join("unused1.fsv2"),
+                    record_count: 0,
+                    subject_remap_path: subj1,
+                    string_remap_path: str1,
+                    lang_remap: vec![],
+                    types_map_path: Some(types1),
+                },
+            ];
+
+            let membership =
+                ClassMembership::build_from_commits(&commits, &dir.path().join("m"), max_open)
+                    .unwrap()
+                    .expect("membership");
+            let mut buf = Vec::new();
+            let per_subject: Vec<(u64, Vec<u64>)> = (0..1500u64)
+                .map(|s| {
+                    membership.collect_classes(0, s, &mut buf);
+                    (s, buf.clone())
+                })
+                .collect();
+            // Keep the tempdir alive until reads are done (mmaps hold pages,
+            // not paths, but the reads above already completed regardless).
+            drop(dir);
+            (membership.summary().1, membership.summary().2, per_subject)
+        };
+
+        let unbounded = build(usize::MAX);
+        let pooled = build(4);
+        assert_eq!(unbounded, pooled);
     }
 
     #[test]

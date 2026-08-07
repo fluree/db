@@ -226,6 +226,11 @@ async fn run_add(
                     eprintln!("  Run `fluree auth login --remote {name}` to authenticate");
                 }
             }
+            if let Some(ref min) = discovered.cli_min_version {
+                if let Some(warning) = cli_min_version_warning(env!("CARGO_PKG_VERSION"), min) {
+                    eprintln!("  {} {}", "warn:".yellow().bold(), warning);
+                }
+            }
         }
         Ok(None) => {
             // No discovery endpoint or not reachable yet — that's fine
@@ -241,7 +246,17 @@ async fn run_add(
     } else if input_url.ends_with("/fluree") {
         input_url.clone()
     } else {
-        format!("{}/fluree", input_url.trim_end_matches('/'))
+        // Discovery didn't resolve a base and the input doesn't look like an
+        // API base — this is a guess, so say so instead of failing silently
+        // later with 404s on every request.
+        let guessed = format!("{}/fluree", input_url.trim_end_matches('/'));
+        eprintln!(
+            "  {} discovery unavailable — storing guessed API base '{guessed}'; \
+             if requests fail, re-add with the full API base URL \
+             (e.g. 'https://host/v1/fluree')",
+            "warn:".yellow().bold(),
+        );
+        guessed
     };
 
     let config = RemoteConfig {
@@ -264,6 +279,34 @@ async fn run_add(
 pub(crate) struct DiscoveredRemote {
     pub(crate) api_base_url: Option<String>,
     pub(crate) auth: Option<RemoteAuth>,
+    /// Oldest CLI release whose command surface matches what the stack's
+    /// docs and UI teach (the optional `cli.min_version` discovery field).
+    pub(crate) cli_min_version: Option<String>,
+}
+
+/// Warning to print when the running CLI predates the stack's advertised
+/// `cli.min_version`. Pure so it is unit-testable; lenient about versions
+/// that don't parse as `x.y.z` (no warning — never block on a malformed
+/// advertisement).
+pub(crate) fn cli_min_version_warning(current: &str, min: &str) -> Option<String> {
+    fn parse(v: &str) -> Option<Vec<u64>> {
+        // Ignore pre-release/build suffixes ("4.2.0-rc.1" → 4.2.0).
+        let core = v.trim().split(['-', '+']).next()?;
+        let parts: Vec<u64> = core
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<Result<_, _>>()
+            .ok()?;
+        (!parts.is_empty()).then_some(parts)
+    }
+    let (cur, min_v) = (parse(current)?, parse(min)?);
+    (cur < min_v).then(|| {
+        format!(
+            "this server expects fluree {min} or newer (you have {current}); \
+             commands its docs reference may not exist in this binary — \
+             upgrade via your original install method"
+        )
+    })
 }
 
 /// Attempt to fetch `/.well-known/fluree.json` from the remote origin and parse
@@ -401,6 +444,13 @@ pub(crate) async fn discover_remote(remote_url: &str) -> Result<Option<Discovere
         }
     }
 
+    // Optional CLI compatibility advertisement (`cli.min_version`).
+    out.cli_min_version = body
+        .get("cli")
+        .and_then(|c| c.get("min_version"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
     Ok(Some(out))
 }
 
@@ -534,5 +584,34 @@ fn auth_display_short(auth: &RemoteAuth) -> &'static str {
                 "none"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cli_min_version_warning;
+
+    #[test]
+    fn min_version_warning_fires_only_when_older() {
+        assert!(cli_min_version_warning("4.1.2", "4.1.3").is_some());
+        assert!(cli_min_version_warning("4.0.9", "4.1.3").is_some());
+        assert!(cli_min_version_warning("4.1.3", "4.1.3").is_none());
+        assert!(cli_min_version_warning("4.2.0", "4.1.3").is_none());
+        assert!(cli_min_version_warning("5.0.0", "4.9.9").is_none());
+    }
+
+    #[test]
+    fn min_version_warning_handles_prerelease_and_short_forms() {
+        // Pre-release suffix is ignored for the comparison.
+        assert!(cli_min_version_warning("4.2.0-rc.1", "4.1.3").is_none());
+        // A shorter version is older than its extension.
+        assert!(cli_min_version_warning("4.1", "4.1.3").is_some());
+    }
+
+    #[test]
+    fn min_version_warning_never_fires_on_malformed_advertisements() {
+        assert!(cli_min_version_warning("4.1.3", "not-a-version").is_none());
+        assert!(cli_min_version_warning("not-a-version", "4.1.3").is_none());
+        assert!(cli_min_version_warning("4.1.3", "").is_none());
     }
 }
