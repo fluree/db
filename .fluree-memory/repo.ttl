@@ -1007,16 +1007,17 @@ mem:fact-01kz2g1ebaseline05depth000 a mem:Fact ;
     mem:updatedAt "2026-07-30T22:20:00.000000+00:00"^^xsd:dateTime .
 
 mem:fact-01kz2g1fbaseline06citopo00 a mem:Fact ;
-    mem:content "CI topology: ci.yml is the only pull_request workflow and triggers ONLY when the PR base is main — a PR based on another branch gets ZERO checks (record local gate results in the PR body; budget a fmt-drift cleanup when the branch finally retargets main). Draft PRs are NOT skipped. Workspace clippy runs WITHOUT -D warnings (advisory); the only -D warnings in CI is inside the testsuite-sparql job, which also runs the full W3C suite (submodules, 45-min timeout, registers may only shrink). No rust-toolchain pin — jobs float on dtolnay stable. bench-compare runs per-PR only when bench-relevant paths change, with --allow-host-mismatch (wall/mem breaches are warnings; phase-share drift enforces); full bench is nightly cron." ;
+    mem:content "CI topology: ci.yml is the only pull_request workflow and triggers ONLY when the PR base is main — a PR based on another branch gets ZERO checks (record local gate results in the PR body; budget a fmt-drift cleanup when the branch finally retargets main). Draft PRs are NOT skipped. Workspace clippy enforces -D warnings, and rust-toolchain.toml pins the toolchain, so lint versions no longer float. The testsuite-sparql job runs the full W3C suite with its own fmt/clippy -D warnings gates (submodules, 45-min timeout, registers may only shrink). bench-compare runs per-PR only when bench-relevant paths change, with --allow-host-mismatch (wall/mem breaches are warnings; phase-share drift enforces); full bench is nightly cron." ;
     mem:tag "ci" ;
     mem:tag "clippy" ;
     mem:tag "github-actions" ;
     mem:tag "gotcha" ;
     mem:scope mem:repo ;
     mem:artifactRef ".github/workflows/bench.yml" ;
+    mem:artifactRef "rust-toolchain.toml" ;
     mem:artifactRef ".github/workflows/ci.yml" ;
     mem:createdAt "2026-07-30T21:00:05.000000+00:00"^^xsd:dateTime ;
-    mem:updatedAt "2026-07-30T22:20:00.000000+00:00"^^xsd:dateTime .
+    mem:updatedAt "2026-08-07T00:00:00.000000+00:00"^^xsd:dateTime .
 
 mem:fact-01kz2g1gbaseline07policy00 a mem:Fact ;
     mem:content "Policy conditions fail CLOSED at every point: unparseable f:query → warn + PolicyValue::Deny (make_policy_query_value); condition returning zero rows → required policy denies un-overridably, non-required simply doesn't grant; missing both f:allow and f:query → Deny; no executor wired → NoOpQueryExecutor returns false; executor error → propagates, aborting the decision. The REAL footgun is lenient IRI resolution: resolve_iri uses encode_iri() with an EMPTY-namespace fallback (not strict), and unresolvable cross-ledger targets are silently DROPPED with only a warn log — a policy can end up applying to FEWER targets than authored, which reads as enforcement working while quietly narrowed." ;
