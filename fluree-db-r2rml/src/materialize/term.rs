@@ -847,20 +847,49 @@ pub fn materialize_predicate_from_batch(
 
 /// Get the join key values for a row (used for RefObjectMap joins)
 ///
-/// Returns the child column values as strings for hash-based join matching.
+/// Returns the child column values as strings for hash-based join matching, or
+/// `None` if any key column is NULL (the row has no join key). Allocates a fresh
+/// `Vec` per call — for the per-fact-row PROBE path use [`fill_join_key_from_batch`]
+/// with a reused buffer instead; this owned-`Vec` form is for the BUILD path that
+/// inserts the key into a map (which needs ownership anyway).
 pub fn get_join_key_from_batch(
     child_columns: &[String],
     batch: &ColumnBatch,
     row_idx: usize,
 ) -> Option<Vec<String>> {
     let mut key_values = Vec::with_capacity(child_columns.len());
-    for col_name in child_columns {
-        {
-            let v = column_value_as_string(batch, col_name, row_idx)?;
-            key_values.push(v);
-        }
+    if fill_join_key_from_batch(child_columns, batch, row_idx, &mut key_values) {
+        Some(key_values)
+    } else {
+        None
     }
-    Some(key_values)
+}
+
+/// Fill `scratch` with a row's join-key column values, REUSING the buffer across
+/// rows so a per-row probe allocates no `Vec` (the N1 borrowed-scratch idiom applied
+/// to the FK probe). Returns `false` — leaving `scratch` cleared — when any key
+/// column is NULL (the row has no join key and cannot match, mirroring
+/// [`get_join_key_from_batch`]'s `None`). The probe caller then queries the set/map
+/// via `scratch.as_slice()` (`Vec<String>: Borrow<[String]>`), so no owned key is
+/// built for a lookup. NOTE: the component `String`s are still allocated per fill
+/// (`column_value_as_string` owns its result); interning the FK key to a fixed-width
+/// tuple to remove those too is a deferred follow-on — this removes only the per-row
+/// `Vec` allocation.
+pub fn fill_join_key_from_batch(
+    child_columns: &[String],
+    batch: &ColumnBatch,
+    row_idx: usize,
+    scratch: &mut Vec<String>,
+) -> bool {
+    scratch.clear();
+    for col_name in child_columns {
+        let Some(v) = column_value_as_string(batch, col_name, row_idx) else {
+            scratch.clear();
+            return false;
+        };
+        scratch.push(v);
+    }
+    true
 }
 
 #[cfg(test)]

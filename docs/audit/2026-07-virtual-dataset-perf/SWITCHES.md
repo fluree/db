@@ -21,11 +21,12 @@ else, including empty, reads as ON. This is the shared `env_switch_enabled`
 switches are read **once** and cached for the process (`OnceLock`) — set them in the
 environment before launch, not mid-run. **The sole exceptions** are noted per row:
 `FLUREE_ICEBERG_ALLOW_MOR_DELETES` is an inverted-polarity *escape hatch* read fresh
-on each call (its default-OFF is the SAFE state), the three fused-aggregate switches
+on each call (its default-OFF is the SAFE state), the four fused-aggregate switches
 (`FLUREE_FUSED_VECTOR_FOLD` / `FLUREE_FUSED_R2RML_OUTPUT_BOUND` /
-`FLUREE_FUSED_R2RML_MULTIFACT`) are read at fused-operator **construction** (per
-query) into operator fields rather than a process `OnceLock` (id=3717339910; still
-"set at launch" in practice), and the numeric/TTL knobs are values, not booleans.
+`FLUREE_FUSED_R2RML_MULTIFACT` / `FLUREE_FUSED_R2RML_MULTIFACT_GEN`) are read at
+fused-operator **construction** (per query) into operator fields rather than a process
+`OnceLock` (id=3717339910, id=3717398054; still "set at launch" in practice), and the
+numeric/TTL knobs are values, not booleans.
 
 ## 1. R2RML rewrite / operator levers
 
@@ -36,6 +37,7 @@ query) into operator fields rather than a process `OnceLock` (id=3717339910; sti
 | `FLUREE_FUSED_VECTOR_FOLD` | on | **N1** vectorized GROUP BY fold: a borrowed-key dense-id dict (`HashTable`) in place of a `HashMap<Vec<GKey>, Vec<Acc>>` that clones a fresh owned key every row. Read at operator construction (per query). | Byte-identical owned-key `HashMap` fold. | #1582 |
 | `FLUREE_FUSED_R2RML_OUTPUT_BOUND` | on | Emit a GROUP BY rollup in bounded chunks (≤8192 groups/batch) across `next_batch` calls so a high-cardinality result never fully materializes at once. Read at operator construction (per query). | Single-batch emission (same rows). NB: a bare `LIMIT` with no `ORDER BY` can return a different prefix on vs off — group order is unspecified. | #1582 |
 | `FLUREE_FUSED_R2RML_MULTIFACT` | on | **P3** fused multi-fact branching-star join (one GROUP-KEY branch + one SEMI-JOIN branch, keep-min-then-filter membership) — the crt_join_reorder class. Read at operator construction (per query). | Decline the branching star to the generic pipeline (pre-P3, byte-identical). | #1582 |
+| `FLUREE_FUSED_R2RML_MULTIFACT_GEN` | on | **S1/S2 generality WIDENING** over #1582's exactly-one-of-each cut: admits K≥2 SEMI-JOIN branches (S1, the multi-filter BI shape) and ≥2 ref-IRI GROUP-BY keys (S2). Rides ON TOP of `_MULTIFACT` / `_AGG_JOIN` (either of those off declines the whole family regardless). Read at operator construction (per query) into the `multifact_gen` field; threaded as a bool argument into the static `decompose_branching_star` (the K≥2 gate), and read from the field at the ≥2-ref gate. | Decline ONLY the generality increment — a K=1 branching star and a single ref-IRI key still fuse, so behavior is byte-identical to #1582. | #1589 |
 | `FLUREE_R2RML_SHARED_PREDICATE_FUSION` | on | **E1** shared-predicate class collapse: when strong fusion fails, still collapse a separate class scan into the star for a base predicate SHARED across disjoint-subject classes (the `ex:category` round-2 fix). | Falls through to the weaker pre-E1 `class_prune_hint` (star + separate class scan, still correct). Distinct from `CRAWL_CLASS_FUSION`. | E1 #1514, **retro-switched by this PR** |
 | `FLUREE_R2RML_STAR_TM_PRUNE` | on | Prune bound-subject TriplesMaps a star cannot reach (detail-view over-scan 16→3 tables). | Scan every candidate TriplesMap. | PR-3 (#1484) |
 | `FLUREE_R2RML_REF_TARGET_PRUNE` | on | Propagate a `RefObjectMap`'s target class to prune downstream shared-predicate resolution (q031 fan-out 7→2 loadTables). Declines unless every binding source of the var is provably that one ref. | Resolve the shared predicate against all mapping dims. | F20 (#1502) |
