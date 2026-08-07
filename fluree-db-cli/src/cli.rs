@@ -319,6 +319,16 @@ pub enum Commands {
         #[arg(long, default_value_t = 0)]
         parallelism: usize,
 
+        /// Namespace that salts the blank-node ids this import mints.
+        /// Defaults to the ledger id, so importing one source tree into two
+        /// ledgers gives them disjoint blank nodes. Pass the same value to
+        /// both to make them mint IDENTICAL ids instead — for a
+        /// rebuild-and-diff, a sharded load of one logical dataset, or a
+        /// staging/production pair you want to compare node-for-node.
+        /// Any string; two imports match iff they agree on it.
+        #[arg(long)]
+        skolem_namespace: Option<String>,
+
         /// Records per leaflet in index files. Default: 25000.
         /// Larger values produce fewer, bigger leaflets (less I/O, more memory per read).
         #[arg(long, default_value_t = 25_000)]

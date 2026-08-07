@@ -3331,3 +3331,70 @@ fn bm25_create_rejects_invalid_json() {
             "indexing query must be valid JSON",
         ));
 }
+
+// ============================================================================
+// `create --from … --skolem-namespace`
+// ============================================================================
+
+/// Import `doc.ttl` into `ledger` and return the `@id` of its labeled blank
+/// node, as the CLI reports it.
+fn import_and_read_blank_id(tmp: &TempDir, ledger: &str, namespace: Option<&str>) -> String {
+    let data = tmp.path().join(format!("{ledger}-src"));
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("doc.ttl"),
+        "@prefix schema: <http://schema.org/> .\n_:shared schema:name \"Shared\" .\n",
+    )
+    .unwrap();
+
+    let mut cmd = fluree_cmd(tmp);
+    cmd.args(["create", ledger, "--from"]).arg(&data);
+    if let Some(ns) = namespace {
+        cmd.args(["--skolem-namespace", ns]);
+    }
+    cmd.assert().success();
+
+    let out = fluree_cmd(tmp)
+        .args([
+            "query",
+            "--ledger",
+            ledger,
+            "-e",
+            r#"{"select": ["?s"], "where": {"@id": "?s", "http://schema.org/name": "Shared"}}"#,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    let id = out
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '[' || c == ']')
+        .find(|tok| tok.starts_with("_:fdb-"))
+        .unwrap_or_else(|| panic!("no minted blank-node id in query output: {out}"))
+        .to_string();
+    id
+}
+
+/// The default salt is the ledger id, so two ledgers loaded from equivalent
+/// sources hold different blank nodes; `--skolem-namespace` overrides that on
+/// both sides so they line up.
+#[test]
+fn skolem_namespace_flag_controls_cross_ledger_blank_node_identity() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let default_a = import_and_read_blank_id(&tmp, "salt-default-a", None);
+    let default_b = import_and_read_blank_id(&tmp, "salt-default-b", None);
+    assert_ne!(
+        default_a, default_b,
+        "without the flag the ledger id salts the mint"
+    );
+
+    let shared_a = import_and_read_blank_id(&tmp, "salt-shared-a", Some("one-corpus"));
+    let shared_b = import_and_read_blank_id(&tmp, "salt-shared-b", Some("one-corpus"));
+    assert_eq!(
+        shared_a, shared_b,
+        "--skolem-namespace must reach the import builder on both sides"
+    );
+}

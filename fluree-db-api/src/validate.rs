@@ -215,9 +215,20 @@ impl ValidateReport {
 
 /// Render an IRI or blank-node label as a Turtle term.
 ///
-/// Skolemized blank-node labels may carry characters that are invalid in a
-/// Turtle BLANK_NODE_LABEL (e.g. `/` and `:` from embedded ledger ids) —
-/// sanitize them so the emitted document always parses.
+/// A blank-node label may carry characters that are invalid in a Turtle
+/// BLANK_NODE_LABEL — map them to `-` so the emitted report always parses.
+///
+/// Two label shapes still need it. Ledgers imported by Fluree 4.1.4 or earlier
+/// hold ids that embedded the ledger id, so they contain `/` and `:`
+/// (`fdb-lubm:main-1-genid10`); current import ids are `[0-9a-z-]` only (see
+/// `fluree_db_core::skolem`) and pass through unchanged. Client-authored
+/// labels can also carry characters JSON-LD accepts and Turtle does not.
+///
+/// The rewrite is **lossy**: two labels differing only in sanitized characters
+/// collapse onto one. That is acceptable here — a validation report is
+/// human-facing output, not a round-trippable serialization of the graph — and
+/// it is why the same rewrite is deliberately NOT applied on the export path
+/// (`crate::export`), where identity has to survive.
 fn turtle_term(iri_or_bnode: &str) -> String {
     match iri_or_bnode.strip_prefix("_:") {
         Some(label) => {

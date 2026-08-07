@@ -51,6 +51,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             chunk_size_mb,
             memory_budget_mb,
             parallelism,
+            skolem_namespace,
             leaflet_rows,
             leaflets_per_leaf,
             remote,
@@ -137,6 +138,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                     cli.parallelism
                 },
                 chunk_size_mb,
+                skolem_namespace,
                 leaflet_rows,
                 leaflets_per_leaf,
                 edge_policy,

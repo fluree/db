@@ -70,6 +70,7 @@ pub mod runtime_small_dicts;
 pub mod schema_hierarchy;
 pub mod serde;
 pub mod sid;
+pub mod skolem;
 pub mod stats_view;
 pub mod stats_wire;
 pub mod storage;

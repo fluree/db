@@ -32,6 +32,7 @@ fluree create <LEDGER> [OPTIONS]
 
 - `--memory-budget-mb <MB>` — Memory budget in MB (0 = auto: 60% of system RAM). Drives chunk size, concurrency, and indexer run budget. Set this to cap how much memory the import uses; auto-detected thread count shrinks to fit it.
 - `--parallelism <N>` — Number of parallel parse threads (0 = auto: most logical cores, capped to fit the memory budget; explicit values honored as-is, floored at 1).
+- `--skolem-namespace <id>` — Namespace salting the blank-node ids this import mints (default: the ledger id). See [Blank nodes](#blank-nodes).
 
 ## Description
 
@@ -40,6 +41,63 @@ Creates a new empty ledger with the given name and sets it as the active ledger.
 Use `--from` to create a ledger pre-populated with data from a Turtle, N-Triples, N-Quads, TriG, or JSON-LD file (or a directory of same-format files). Any input may be gzip- or zstd-compressed and is decoded transparently (`data.ttl.gz`, `dump.nq.zst`, mixed directories — the underlying RDF extension classifies the file). N-Triples (`.nt`) is a strict subset of Turtle and is parsed by the same parser. N-Quads (`.nq`) and TriG (`.trig`) support named graphs — queryable after import via the `#<graph-iri>` fragment. For large Turtle/N-Triples files (including `.ttl.gz`/`.nt.gz`), the CLI splits work into chunks and runs parallel parse threads — though compressed inputs decode single-threaded; TriG/N-Quads/JSON-LD use a serial path. Tune with `--memory-budget-mb` and `--parallelism` if needed.
 
 **Directory imports (`.ttl`/`.nt`)** are *rechunked by bytes* rather than one-chunk-per-file: large files are sub-split at statement boundaries and many small files are coalesced into `~chunk_size` work items. This keeps the import fully parallel and bounds the number of commits and sorted index runs regardless of how the data is packaged — so a directory of one big file, or of hundreds of tiny shards, both import at full speed. Coalescing engages automatically once a directory holds more than 64 sub-`chunk_size` files; a file containing a labeled blank node (`_:`) or an `@base` directive is never coalesced (it would change RDF document scope) and is imported as its own chunk. Set `FLUREE_IMPORT_COALESCE_THRESHOLD=<n>` to change the gate (`0` disables coalescing — every file becomes its own commit, the legacy behavior). Directories containing any `.trig`/`.nq`/`.jsonld` continue to use the per-file serial path.
+
+### Blank nodes
+
+Import skolemizes every blank node in its source into the reserved `_:fdb-…`
+label space, and queries return those labels as the node's `@id`. The minted id
+is `_:fdb-d<scope>-<label>`, where `<label>` is the label as written in the
+source and `<scope>` identifies the **document** it came from. Only `[0-9a-z-]`
+appears in it, so the id can be written back in SPARQL, Turtle, or JSON-LD to
+edit the node in place — see
+[Editing blank-node structures](../transactions/update-where-delete-insert.md#editing-blank-node-structures-stable-_fdb--ids).
+
+A label unifies across its whole document and stays distinct between documents,
+so `_:x` in two files is two nodes no matter how the importer chunks them. What
+counts as a document:
+
+| source | document |
+|---|---|
+| `.ttl`/`.nt`/`.trig`/`.nq`/`.jsonld` | one file |
+| `.jsonl`/`.ndjson` | one **context segment** (see below) |
+
+The scope is derived from the document's path relative to the import root, so
+importing the same tree from `/tmp/x` and from `/data/x` mints the same ids, and
+adding a file to the directory does not renumber anything.
+
+**ndjson context segments.** A lone `{"@context": …}` line replaces the shared
+context for the lines that follow, which is what makes `cat a.jsonl b.jsonl >
+combined.jsonl` work. Each such switch ends one document and starts the next, so
+`a.jsonl`'s `_:x` and `b.jsonl`'s `_:x` stay distinct through the seam. Within a
+segment a label unifies across every chunk.
+
+> **Caveat.** If you write ndjson in the "every line is an independent document"
+> style — an inline `@context` on *every* line — Fluree treats those lines as
+> ordinary nodes in one `@graph`, which is one document. A `_:x` reused across
+> such lines therefore resolves to **one** node. That is correct JSON-LD (node
+> objects carrying local contexts inside a shared graph are co-document), but it
+> is not what the NDJSON-of-independent-documents convention would suggest. Use
+> a lone context line to separate them, or give the nodes real `@id`s.
+
+**Cross-ledger identity.** The ledger id salts the mint, so importing one source
+tree into two ledgers gives them disjoint blank nodes. Pass the same
+`--skolem-namespace <id>` to both to make them mint *identical* ids instead —
+for a rebuild-and-diff, a sharded load of one logical dataset, or a
+staging/production pair you want to compare node for node.
+
+**Tracing an id back to its file.** Each source document contributes one triple
+to the ledger's `txn-meta` graph:
+
+```sparql
+SELECT ?source WHERE {
+  GRAPH <urn:fluree:mydb:main#txn-meta> {
+    _:fdb-d1t3k9x0abcdef <https://ns.flur.ee/db#importSource> ?source
+  }
+}
+```
+
+The subject is the first 19 characters of the id (`_:fdb-` plus the 14-character
+scope).
 
 ### Property-graph imports (CSV & Cypher)
 
