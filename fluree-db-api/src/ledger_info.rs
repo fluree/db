@@ -3404,6 +3404,18 @@ mod tests {
                 scope: None,
                 audience: None,
             },
+            // GoogleMetadata holds no secret material and so earns no allowlist
+            // entry. Both fields are plain `String`, not `ConfigValue`: there is
+            // no secret-capable field to seed with a sentinel. The credential is
+            // minted per call from the instance metadata server and lives only in
+            // the in-memory `CachedToken`, which is never serialized — its `Debug`
+            // is hand-written to print `***` for exactly this reason. Recorded
+            // explicitly because the canary below asks for a decision, and
+            // "nothing to redact" is a decision, not an omission.
+            AuthConfig::GoogleMetadata {
+                scopes: Some("https://www.googleapis.com/auth/cloud-platform".to_string()),
+                metadata_url: None,
+            },
         ];
 
         // Exhaustiveness canary — NO wildcard arm. A new AuthConfig variant
@@ -3413,7 +3425,8 @@ mod tests {
             match auth {
                 AuthConfig::None
                 | AuthConfig::Bearer { .. }
-                | AuthConfig::OAuth2ClientCredentials { .. } => {}
+                | AuthConfig::OAuth2ClientCredentials { .. }
+                | AuthConfig::GoogleMetadata { .. } => {}
             }
         }
 
