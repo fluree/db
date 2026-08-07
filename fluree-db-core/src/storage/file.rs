@@ -36,8 +36,30 @@ pub enum Durability {
 }
 
 impl Durability {
+    /// Environment variable selecting the default for new [`FileStorage`].
+    pub const ENV_VAR: &'static str = "FLUREE_STORAGE_FSYNC";
+
     fn syncs(&self) -> bool {
         matches!(self, Durability::Sync)
+    }
+
+    /// Default read from [`Self::ENV_VAR`], falling back to [`Self::Sync`] when
+    /// unset or unrecognized.
+    ///
+    /// Read once per storage construction rather than per write, so tests set
+    /// the field through [`FileStorage::with_durability`] and never race on
+    /// process environment.
+    fn from_env() -> Self {
+        Self::parse(std::env::var(Self::ENV_VAR).ok().as_deref())
+    }
+
+    /// Pure half of [`Self::from_env`], so the accepted spellings are testable
+    /// without touching process environment.
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => Durability::PageCache,
+            _ => Durability::Sync,
+        }
     }
 }
 
@@ -86,10 +108,10 @@ fn is_tmp_artifact(name: &str) -> bool {
 
 /// Write `bytes` to a staging sibling of `path`, returning the staging path.
 ///
-/// The staging file is removed if writing fails, so an error leaves nothing
-/// behind for `list_prefix` or a later reader to find.
-/// The contents are flushed before the staging path is returned, so a caller
-/// that then makes the file visible has its bytes on the device first.
+/// Under [`Durability::Sync`] the contents are flushed before returning, so a
+/// caller that then makes the file visible has its bytes on the device first.
+/// The staging file is removed if any step fails, leaving nothing behind for
+/// `list_prefix` or a later reader to find.
 fn stage_bytes(path: &Path, bytes: &[u8], durability: Durability) -> std::io::Result<PathBuf> {
     use std::io::Write;
 
@@ -166,11 +188,13 @@ impl FileStorage {
     /// The base path should be the ledger's data directory containing the ledger
     /// subdirectories (e.g. `mydb/main/index/...`).
     ///
-    /// Defaults to [`Durability::Sync`].
+    /// Durability defaults to [`Durability::Sync`], overridable for this
+    /// process by [`Durability::ENV_VAR`] or per instance by
+    /// [`Self::with_durability`].
     pub fn new(base_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             base_path: base_path.into(),
-            durability: Durability::default(),
+            durability: Durability::from_env(),
         }
     }
 
@@ -678,11 +702,29 @@ mod tests {
     }
 
     /// A ledger that reports a commit written must not lose it to power loss,
-    /// so the safe setting is the one you get without asking.
+    /// so the safe setting is the one you get without asking. Asserted on the
+    /// parse, not on a constructed storage, so the test does not depend on the
+    /// environment it runs in.
     #[test]
     fn durability_defaults_to_sync() {
+        assert_eq!(Durability::default(), Durability::Sync);
+        assert_eq!(Durability::parse(None), Durability::Sync);
+    }
+
+    #[test]
+    fn durability_env_opts_out_on_falsey_spellings() {
+        for v in ["0", "false", "off", "no", "OFF", " false "] {
+            assert_eq!(Durability::parse(Some(v)), Durability::PageCache, "{v:?}");
+        }
+        // Anything else keeps the safe setting rather than guessing.
+        for v in ["1", "true", "on", "", "nonsense"] {
+            assert_eq!(Durability::parse(Some(v)), Durability::Sync, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn with_durability_overrides_the_default() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(FileStorage::new(dir.path()).durability(), Durability::Sync);
         assert_eq!(
             FileStorage::new(dir.path())
                 .with_durability(Durability::PageCache)
@@ -697,8 +739,7 @@ mod tests {
     #[test]
     fn derived_content_never_syncs() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = FileStorage::new(dir.path());
-        assert_eq!(storage.durability(), Durability::Sync);
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
 
         for kind in [
             ContentKind::IndexRoot,
