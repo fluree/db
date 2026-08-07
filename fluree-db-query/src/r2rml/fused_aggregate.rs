@@ -1103,8 +1103,12 @@ struct GroupKeyResolver {
     fact_fk_cols: Vec<String>,
     /// FK key → group-key GKey tuple. Only fully-non-null dim rows are inserted,
     /// so a probe miss collapses "dangling FK" and "dim row with null group
-    /// attribute" into one drop, exactly as the inner join does.
-    map: std::collections::HashMap<Vec<String>, Vec<GKey>>,
+    /// attribute" into one drop, exactly as the inner join does. `Arc`d so two ref
+    /// group keys to the SAME dim on the SAME parent join cols (e.g. shipTo/billTo →
+    /// Customer) share ONE built map instead of scanning + holding it twice
+    /// (id=3717398042). Sound to share because the map is a constraint-free keep-min
+    /// parent-key → IRI lookup fully determined by (parent TM, parent cols).
+    map: Arc<std::collections::HashMap<Vec<String>, Vec<GKey>>>,
 }
 
 /// P3 (multi-fact branching-star join, crt_join_reorder class): one FK branch off
@@ -2538,7 +2542,24 @@ impl FusedR2rmlAggregateOperator {
         // the generic path does. The resolvers are built in `ref_group_keys` order, so
         // resolver index `i` matches the `KeySource::Dim { resolver: i, .. }` plan above.
         let mut group_resolvers: Vec<GroupKeyResolver> = Vec::with_capacity(ref_group_keys.len());
+        // id=3717398042: two ref group keys to the SAME dim on the SAME parent join cols
+        // (e.g. shipTo/billTo → Customer) build an IDENTICAL keep-min parent-key → IRI map
+        // — its contents depend only on (parent TM, parent cols), never on the fact-side
+        // FK. Cache the built map by that pair and share it (Arc) so the second key reuses
+        // the first's scan + map instead of re-scanning the dim and holding a duplicate.
+        let mut dim_map_cache: std::collections::HashMap<
+            (String, Vec<String>),
+            Arc<std::collections::HashMap<Vec<String>, Vec<GKey>>>,
+        > = std::collections::HashMap::new();
         for (fk_child_cols, parent_cols, parent_tm_iri) in ref_group_keys {
+            let cache_key = (parent_tm_iri.clone(), parent_cols.clone());
+            if let Some(shared) = dim_map_cache.get(&cache_key) {
+                group_resolvers.push(GroupKeyResolver {
+                    fact_fk_cols: fk_child_cols,
+                    map: Arc::clone(shared),
+                });
+                continue;
+            }
             let Some(parent_tm) = mapping.triples_maps.get(&parent_tm_iri) else {
                 return Ok(None);
             };
@@ -2598,6 +2619,8 @@ impl FusedR2rmlAggregateOperator {
                 }
                 ctx.record_alloc((map.len() - map_before) * crate::context::GROUP_EST_BYTES);
             }
+            let map = Arc::new(map);
+            dim_map_cache.insert(cache_key, Arc::clone(&map));
             group_resolvers.push(GroupKeyResolver {
                 fact_fk_cols: fk_child_cols,
                 map,
@@ -3782,7 +3805,10 @@ impl FusedR2rmlAggregateOperator {
             count_non_null_cols: Vec::new(),
             // The join path is a single terminal-dim resolver (resolver index 0),
             // matching the `KeySource::Dim { resolver: 0, .. }` plan above.
-            group_resolvers: vec![GroupKeyResolver { fact_fk_cols, map }],
+            group_resolvers: vec![GroupKeyResolver {
+                fact_fk_cols,
+                map: Arc::new(map),
+            }],
             semi_joins,
             group_key_plan,
             fact_constraints: fact_checks,
@@ -3836,6 +3862,18 @@ impl FusedR2rmlAggregateOperator {
         // not scalar/group objects.
         let mut semi_joins: Vec<SemiJoinSet> = Vec::with_capacity(semi_branches.len());
         let mut strip: Vec<VarId> = Vec::with_capacity(semi_branches.len());
+        // KNOWN CEILING (id=3717398042, non-blocking): two semi-branches touching the
+        // SAME dim table each scan it independently and hold their own keep-min map. Unlike
+        // the S2 ref-IRI dedup above, a semi-join membership SET's contents depend on the
+        // branch's own constraints (the s1_same_table shape filters buyer='Enterprise' vs
+        // seller='SMB' on the SAME Customer table), so a (parent_tm, parent_cols) share is
+        // NOT sound here — a sound dedup needs a full-signature key (constraints + next-hop)
+        // or a scan-once-build-N-filtered-sets refactor. Left as a tracked follow-on (the
+        // independent builds are sound; see s1_same_table_semi_branches_independent) rather
+        // than folded into this PR. See also the ScanFilter-pushdown ceiling: the membership
+        // scan intentionally passes no filters/top-k — keep-min must see ALL rows to pick
+        // the min parent subject BEFORE the constraint filter, so a full resident dim scan +
+        // resident keep-min map is a structural cost of this keep-min-then-filter approach.
         for semi_branch in &semi_branches {
             let Some(sj) = self
                 .build_semi_join_membership(ctx, mapping, root, root_tm, semi_branch)
