@@ -72,6 +72,27 @@ pub enum NumericStyle {
     PreserveLexical,
 }
 
+/// Which grammar the parser accepts.
+///
+/// TriG is Turtle plus named-graph blocks, sharing one lexer and one set of
+/// term/statement productions — so it is a mode of the same parser rather
+/// than a fork, for the same reason [`CollectionStyle`] is: one grammar, one
+/// conformance surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Dialect {
+    /// Turtle. A `{` or a `GRAPH` keyword is a syntax error.
+    #[default]
+    Turtle,
+    /// TriG: `GRAPH label { … }`, bare `label { … }`, and bare `{ … }`
+    /// default-graph blocks, alongside ordinary Turtle statements.
+    ///
+    /// Named-graph output requires a quad-capable sink
+    /// ([`GraphSink::supports_quads`](fluree_graph_ir::GraphSink::supports_quads));
+    /// the parser refuses named graphs against a triple-only sink rather than
+    /// folding them into the default graph.
+    TriG,
+}
+
 /// Conformance knobs for the Turtle parser.
 ///
 /// The default is today's ingest behavior in every field; opting in is
@@ -83,6 +104,23 @@ pub struct ParserOptions {
     pub collections: CollectionStyle,
     /// How numeric literals reach the sink.
     pub numerics: NumericStyle,
+    /// Which grammar to accept.
+    pub dialect: Dialect,
+    /// Whether to check that the terms a document denotes are RDF terms —
+    /// IRIs that are IRIs after escape expansion and base resolution, and
+    /// well-formed language tags.
+    ///
+    /// Off by default, and that is the load-bearing part. The grammar checks
+    /// happen in the lexer regardless; what this adds is a scan of every
+    /// resolved IRI and every language tag, which ingest does not need — it
+    /// consumes documents this database wrote — and which sits directly on
+    /// the bulk-import hot path. A conversion tool has the opposite need:
+    /// it must not emit a document asserting a term that is not a term.
+    ///
+    /// [`ParserOptions::conformant`] turns it on, so "conformant" means
+    /// conformant, and the benchmark cell that compares against a validating
+    /// reader validates too.
+    pub validate: bool,
 }
 
 impl ParserOptions {
@@ -92,12 +130,15 @@ impl ParserOptions {
         Self::default()
     }
 
-    /// Faithful-RDF preset: spine collections and preserved numeric
-    /// lexical forms — what a syntax-conformant reader/converter wants.
+    /// Faithful-RDF preset: spine collections, preserved numeric lexical
+    /// forms, and term validation — what a syntax-conformant
+    /// reader/converter wants.
     pub fn conformant() -> Self {
         Self {
             collections: CollectionStyle::Spine,
             numerics: NumericStyle::PreserveLexical,
+            dialect: Dialect::Turtle,
+            validate: true,
         }
     }
 
@@ -110,6 +151,18 @@ impl ParserOptions {
     /// Set the numeric style.
     pub fn with_numerics(mut self, numerics: NumericStyle) -> Self {
         self.numerics = numerics;
+        self
+    }
+
+    /// Set the dialect.
+    pub fn with_dialect(mut self, dialect: Dialect) -> Self {
+        self.dialect = dialect;
+        self
+    }
+
+    /// Turn term validation on or off.
+    pub fn with_validation(mut self, validate: bool) -> Self {
+        self.validate = validate;
         self
     }
 }
@@ -126,16 +179,34 @@ mod tests {
         assert_eq!(o, ParserOptions::new());
     }
 
+    /// The ingest contract in one assertion. Validation costs a scan of every
+    /// resolved IRI, and bulk import runs on this default — if it ever flips,
+    /// the import path silently takes that cost.
     #[test]
-    fn conformant_preset_opts_into_both() {
+    fn validation_is_off_by_default() {
+        assert!(!ParserOptions::default().validate);
+        assert!(!ParserOptions::new().validate);
+        // And the other knobs do not drag it along.
+        assert!(
+            !ParserOptions::new()
+                .with_collections(CollectionStyle::Spine)
+                .with_numerics(NumericStyle::PreserveLexical)
+                .validate
+        );
+    }
+
+    #[test]
+    fn conformant_preset_opts_into_all_three() {
         let o = ParserOptions::conformant();
         assert_eq!(o.collections, CollectionStyle::Spine);
         assert_eq!(o.numerics, NumericStyle::PreserveLexical);
+        assert!(o.validate, "conformant must mean conformant");
         assert_eq!(
             o,
             ParserOptions::new()
                 .with_collections(CollectionStyle::Spine)
                 .with_numerics(NumericStyle::PreserveLexical)
+                .with_validation(true)
         );
     }
 }

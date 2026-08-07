@@ -13,8 +13,8 @@
 
 use anyhow::Result;
 use testsuite_rdf::{
-    check_testsuite, report_testsuite, ParseMode, RDF11_NTRIPLES, RDF11_TURTLE, RDF12_NTRIPLES,
-    RDF12_TURTLE,
+    check_testsuite, report_testsuite, ParseMode, RDF11_NQUADS, RDF11_NTRIPLES, RDF11_TRIG,
+    RDF11_TURTLE, RDF12_NTRIPLES, RDF12_TURTLE,
 };
 
 mod registers;
@@ -30,13 +30,23 @@ fn rdf11_turtle_conformant() -> Result<()> {
     check_testsuite(&RDF11_TURTLE, ParseMode::Conformant, reg::RDF11_TURTLE)
 }
 
-/// RDF 1.1 N-Triples: positive/negative syntax.
-///
-/// Runs through the Turtle parser — see the register's category E for what
-/// that costs and why the negative half is currently unenforceable.
+/// RDF 1.1 N-Triples, through the strict line reader (NOT the Turtle parser).
 #[test]
 fn rdf11_ntriples_conformant() -> Result<()> {
     check_testsuite(&RDF11_NTRIPLES, ParseMode::Conformant, reg::RDF11_NTRIPLES)
+}
+
+/// RDF 1.1 N-Quads, through the strict line reader.
+#[test]
+fn rdf11_nquads_conformant() -> Result<()> {
+    check_testsuite(&RDF11_NQUADS, ParseMode::Conformant, reg::RDF11_NQUADS)
+}
+
+/// RDF 1.1 TriG: syntax and eval, the latter compared against N-Quads gold
+/// files through the strict reader.
+#[test]
+fn rdf11_trig_conformant() -> Result<()> {
+    check_testsuite(&RDF11_TRIG, ParseMode::Conformant, reg::RDF11_TRIG)
 }
 
 // =============================================================================

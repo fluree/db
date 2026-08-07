@@ -35,3 +35,13 @@ mod token;
 
 pub use lexer::{tokenize, tokenize_with_comments, Lexer};
 pub use token::{keyword_from_str, Token, TokenKind};
+
+/// This crate's transcription of the `IRIREF` exclusion set.
+///
+/// Exported for ONE reason: it is the fourth independent copy of that set in
+/// this workspace, and the differential that binds the other three lives in a
+/// light crate which cannot depend on the SPARQL engine. The binding test sits
+/// in `fluree-db-cli`, which already depends on both sides, and needs to name
+/// this function to compare it. Re-exported rather than made a public module so
+/// the widening is exactly one item wide.
+pub use chars::is_iri_char;

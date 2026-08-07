@@ -171,20 +171,18 @@ impl GraphSink for DatasetCollectorSink {
 
     /// Append an indexed list element to the default graph.
     ///
-    /// The protocol has no quad form of this event, so "the default graph" is
-    /// the only thing an `emit_list_item` can currently mean — it is not a
-    /// routing choice this sink makes. A producer that wants a Fluree-style
-    /// indexed collection *inside a named graph* has no way to say so today
-    /// and would silently land it here.
+    /// This event carries no graph term, so the default graph is the only
+    /// thing it can mean — it is not a routing choice this sink makes. A
+    /// producer that wants an indexed collection inside a NAMED graph now
+    /// says so with [`GraphSink::emit_quad_list_item`]; before that event
+    /// existed it had no way to, and the item landed here, which is silent
+    /// cross-graph data movement.
     ///
-    /// That is a gap in the protocol, not in this sink, and it is narrow:
-    /// under the spine collection style a collection is ordinary triples and
-    /// goes through [`GraphSink::emit_quad`] like anything else. It bites
-    /// only the indexed style, which exists for Fluree ingest. Whether the
-    /// trait grows a quad form belongs to whoever owns the protocol; until
-    /// then this routing is pinned by test, and
-    /// [`PROTOCOL_QUAD_EVENTS`](crate::PROTOCOL_QUAD_EVENTS) is the tripwire
-    /// for widening the quad surface.
+    /// The reasoning that used to live here — "a gap in the protocol, narrow
+    /// because the spine style routes through `emit_quad` anyway" — is
+    /// retired by that addition. What remains true is the narrowness: under
+    /// the spine style a collection is ordinary triples, so only the indexed
+    /// style (Fluree ingest) ever reaches either list-item event.
     fn emit_list_item(
         &mut self,
         subject: TermId,
@@ -197,6 +195,37 @@ impl GraphSink for DatasetCollectorSink {
         let o = self.get_term(object).clone();
         self.dataset
             .default_graph_mut()
+            .add_list_item(s, p, o, index);
+        Ok(())
+    }
+
+    /// Append an indexed list element to `graph`, creating it on first use.
+    ///
+    /// The quad sibling of `emit_list_item`. It refuses a literal graph name
+    /// for the same reason [`Self::emit_quad`] does: the dataset keys graphs
+    /// by that term and no syntax can serialize a literal there.
+    fn emit_quad_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+        graph: TermId,
+    ) -> SinkResult {
+        if self.get_term(graph).is_literal() {
+            return Err(SinkError::rejected(
+                "a literal cannot name a graph; graph names are IRIs or blank nodes",
+            ));
+        }
+
+        let s = self.get_term(subject).clone();
+        let p = self.get_term(predicate).clone();
+        let o = self.get_term(object).clone();
+
+        self.mark_named_graph(graph);
+        let name = self.terms.get(graph);
+        self.dataset
+            .graph_mut(Some(name))
             .add_list_item(s, p, o, index);
         Ok(())
     }
@@ -278,6 +307,109 @@ impl GraphSink for DatasetCollectorSink {
 mod tests {
     use super::*;
     use crate::{GraphCollectorSink, Quad};
+
+    /// The event that closed the protocol's cross-graph gap: an indexed list
+    /// item inside a named graph lands in THAT graph, not the default one.
+    /// Before `emit_quad_list_item` existed a producer had no way to say
+    /// which graph it meant, and the item silently moved to the default
+    /// graph.
+    #[test]
+    fn an_indexed_list_item_lands_in_its_named_graph() {
+        let mut sink = DatasetCollectorSink::new();
+        let s = sink.term_iri("http://a/s");
+        let p = sink.term_iri("http://a/p");
+        let o = sink.term_literal("first", Datatype::xsd_string(), None);
+        let g = sink.term_iri("http://a/g");
+        sink.emit_quad_list_item(s, p, o, 0, g).unwrap();
+        sink.end_statement();
+
+        let dataset = sink.into_dataset();
+        assert_eq!(
+            dataset.default_graph().len(),
+            0,
+            "the item must NOT land in the default graph"
+        );
+        let named = dataset.named_graph(&Term::iri("http://a/g")).unwrap();
+        assert_eq!(named.len(), 1);
+        assert_eq!(named.iter().next().unwrap().list_index, Some(0));
+    }
+
+    /// The triple form still means the default graph — it carries no graph
+    /// term, so there is nothing else it could mean.
+    #[test]
+    fn a_list_item_without_a_graph_term_means_the_default_graph() {
+        let mut sink = DatasetCollectorSink::new();
+        let s = sink.term_iri("http://a/s");
+        let p = sink.term_iri("http://a/p");
+        let o = sink.term_literal("first", Datatype::xsd_string(), None);
+        sink.emit_list_item(s, p, o, 0).unwrap();
+        sink.end_statement();
+
+        assert_eq!(sink.into_dataset().default_graph().len(), 1);
+    }
+
+    /// A literal cannot name a graph, in the indexed form either.
+    #[test]
+    fn a_literal_graph_name_is_refused_for_indexed_items_too() {
+        let mut sink = DatasetCollectorSink::new();
+        let s = sink.term_iri("http://a/s");
+        let p = sink.term_iri("http://a/p");
+        let o = sink.term_iri("http://a/o");
+        let g = sink.term_literal("not a graph", Datatype::xsd_string(), None);
+        assert!(sink.emit_quad_list_item(s, p, o, 0, g).is_err());
+    }
+
+    /// A triple-only sink refuses the indexed quad form rather than
+    /// relocating it — the same fail-closed posture `emit_quad` takes.
+    #[test]
+    fn a_triple_only_sink_refuses_the_indexed_quad_form() {
+        // `supports_quads()` is false here, so a correct producer never calls
+        // this. The backstop is what keeps a BUGGY one from losing the graph
+        // name, so it is what this test exercises — via the trait default,
+        // reached through a sink that claims the capability it cannot honor.
+        struct Claims(GraphCollectorSink);
+        impl GraphSink for Claims {
+            fn term_iri(&mut self, iri: &str) -> TermId {
+                self.0.term_iri(iri)
+            }
+            fn term_blank(&mut self, label: Option<&str>) -> TermId {
+                self.0.term_blank(label)
+            }
+            fn term_literal(
+                &mut self,
+                value: &str,
+                datatype: Datatype,
+                language: Option<&str>,
+            ) -> TermId {
+                self.0.term_literal(value, datatype, language)
+            }
+            fn term_literal_value(&mut self, value: LiteralValue, datatype: Datatype) -> TermId {
+                self.0.term_literal_value(value, datatype)
+            }
+            fn emit_triple(&mut self, s: TermId, p: TermId, o: TermId) -> SinkResult {
+                self.0.emit_triple(s, p, o)
+            }
+            fn on_prefix(&mut self, prefix: &str, namespace: &str) {
+                self.0.on_prefix(prefix, namespace);
+            }
+            fn on_base(&mut self, base: &str) {
+                self.0.on_base(base);
+            }
+            fn supports_quads(&self) -> bool {
+                true
+            }
+        }
+
+        let mut sink = Claims(GraphCollectorSink::new());
+        let s = sink.term_iri("http://a/s");
+        let p = sink.term_iri("http://a/p");
+        let o = sink.term_iri("http://a/o");
+        let g = sink.term_iri("http://a/g");
+        let err = sink
+            .emit_quad_list_item(s, p, o, 0, g)
+            .expect_err("the default body must refuse, not silently drop the graph");
+        assert!(format!("{err}").contains("named graph"), "{err}");
+    }
 
     /// Hand-fed event sequence: no TriG parser exists in the light crates
     /// yet, so the tests drive the protocol directly, in the order a
@@ -427,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn list_items_land_in_the_default_graph_because_the_protocol_has_no_quad_form() {
+    fn list_items_without_a_graph_land_in_the_default_graph() {
         // What this guarantees, precisely: the ROUTING of today's
         // `emit_list_item` is pinned, so it cannot start going somewhere else
         // unnoticed. What it does NOT do is notice a new quad-shaped event

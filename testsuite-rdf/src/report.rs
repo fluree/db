@@ -92,7 +92,10 @@ pub struct Conformance {
 pub const DENOMINATOR_POLICY: &str = "total = passed + failed + ignored; registered \
     (ignored) tests count in the denominator and NOT the numerator, so a known \
     failure depresses the pass rate. Only entries with gating=true (RDF 1.1, \
-    conformant mode) gate CI; rdf12 and ingest-default runs are informational.";
+    conformant mode) gate CI; rdf12 and ingest-default runs are informational. \
+    NOTE: the informational rdf12 N-Triples row moved 18 -> 19 when the strict \
+    line reader landed — an RDF 1.2 test that needed a real N-Triples reader, \
+    not an RDF 1.2 capability gain; do not read it as progress on 1.2.";
 
 /// Write a per-suite JSON report (testsuite-sparql's shape).
 pub fn write_json_report(path: &str, report: &SuiteReport, entries: &[TestEntry]) -> Result<()> {

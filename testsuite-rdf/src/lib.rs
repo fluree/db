@@ -112,6 +112,25 @@ pub const RDF11_NTRIPLES: Suite = Suite {
     expected_total: 70,
 };
 
+/// RDF 1.1 N-Quads.
+pub const RDF11_NQUADS: Suite = Suite {
+    format: "nquads",
+    spec: "rdf11",
+    manifests: &["https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl"],
+    expected_total: 87,
+};
+
+/// RDF 1.1 TriG.
+///
+/// Syntax tests gate; the 147 eval tests are registered pending an N-Quads
+/// reader, since they compare against `.nq` gold files.
+pub const RDF11_TRIG: Suite = Suite {
+    format: "trig",
+    spec: "rdf11",
+    manifests: &["https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl"],
+    expected_total: 356,
+};
+
 /// RDF 1.2 Turtle — informational (asserting subset only), RDF 1.2 tests only.
 pub const RDF12_TURTLE: Suite = Suite {
     format: "turtle",
@@ -363,10 +382,24 @@ mod tests {
     }
 
     /// A failing test NOT in the register must fail the suite.
+    ///
+    /// Driven in `IngestDefault` mode, and it has to be. This test needs a
+    /// suite run that genuinely FAILS, and in `Conformant` mode there is no
+    /// longer such a run: every RDF 1.1 suite is at 100% with an empty
+    /// register, so the assertion had nothing left to assert and the check
+    /// itself started failing the moment the last register emptied.
+    ///
+    /// The ingest default is the right substitute rather than a workaround.
+    /// Its failures are a DESIGN property — indexed list items and
+    /// canonicalized numerics are deliberately lossy as RDF, which is why that
+    /// mode is reported and never gated — so this test is anchored to
+    /// something that cannot be "fixed" out from under it, unlike a parser
+    /// defect that someone is actively trying to remove.
     #[test]
     fn an_unregistered_failure_fails_the_suite() {
-        let err = check_testsuite(&RDF11_TURTLE, ParseMode::Conformant, &[])
-            .expect_err("the known failures must fail an empty register");
+        let err = check_testsuite(&RDF11_TURTLE, ParseMode::IngestDefault, &[]).expect_err(
+            "the ingest default's known conformance failures must fail an empty register",
+        );
         let msg = format!("{err:#}");
         assert!(
             msg.contains("failing test(s)"),

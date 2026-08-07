@@ -1,0 +1,20 @@
+[package]
+name = "bench-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Tested helpers for the Tier-2 conversion benchmark harness"
+
+# Deliberately NOT a workspace member (the root workspace excludes this path).
+# It is out-of-band tooling, it must not lengthen `cargo check --workspace`, and
+# it is not in CI — same treatment as testsuite-sparql and testsuite-shacl.
+#
+# Deliberately ZERO fluree dependencies. This crate normalizes competitor output
+# and our own output for diffing, so it must not be built out of the thing under
+# test: routing both sides through our parser would make a bug in our reader
+# cancel itself out and disappear from the differential.
+
+[dependencies]
+
+[lints.clippy]
+all = "warn"

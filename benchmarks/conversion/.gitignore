@@ -1,0 +1,13 @@
+# Fetched competitor binaries and source artifacts (pinned in tools.lock.json).
+.tools/
+# Fetched and generated corpora. Never vendored: dbpedia-live is CC-BY-SA, and
+# DBLP republishes in place, so a committed copy silently becomes a different
+# corpus from the one the URL serves.
+.corpora/
+# Run outputs. The interesting ones get promoted to bench-baselines/ by hand.
+.results/
+# Recorded corpus hashes — machine-local, since which dump you fetched depends
+# on the day you fetched it.
+corpora.local.json
+# Helper build artifacts.
+harness/target/

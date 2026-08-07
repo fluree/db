@@ -17,10 +17,13 @@ use std::path::Path;
 /// is what keeps the `write` phase's clock reads off the hot path.
 const OUT_BUF: usize = 64 * 1024;
 
+/// The concrete output type every writer is parameterized over.
+pub type Out = BufWriter<TimedWriter<Box<dyn Write>>>;
+
 /// A destination ready to be written to, plus the clock watching it.
 pub struct Destination {
     /// The buffered, timed sink.
-    pub out: BufWriter<TimedWriter<Box<dyn Write>>>,
+    pub out: Out,
     /// Live handle on time spent in real I/O.
     pub clock: WriteClock,
 }

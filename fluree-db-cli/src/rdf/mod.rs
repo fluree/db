@@ -16,7 +16,9 @@ pub mod count;
 pub mod destination;
 pub mod diagnostic;
 pub mod input;
+pub mod parallel;
 pub mod profile;
+pub mod recover;
 pub mod syntax;
 pub mod writer;
 
@@ -29,10 +31,10 @@ use fluree_graph_ir::{
 use fluree_graph_turtle::{ParserOptions, TurtleError};
 use input::RdfInput;
 use std::time::Duration;
-use syntax::Resolved;
+use syntax::{RdfSyntax, Resolved};
 
 /// Dispatch an `rdf` subcommand.
-pub fn run(action: &RdfAction, quiet: bool) -> CliResult<()> {
+pub fn run(action: &RdfAction, quiet: bool, parallelism: usize) -> CliResult<()> {
     let common = match action {
         RdfAction::Convert { common, .. }
         | RdfAction::Check { common, .. }
@@ -48,6 +50,7 @@ pub fn run(action: &RdfAction, quiet: bool) -> CliResult<()> {
             pretty,
             bnode_policy,
             prefixes,
+            continue_on_error,
         } => convert::run(
             common,
             &convert::ConvertArgs {
@@ -56,6 +59,8 @@ pub fn run(action: &RdfAction, quiet: bool) -> CliResult<()> {
                 pretty: *pretty,
                 bnode_policy: *bnode_policy,
                 prefixes: prefixes.as_deref(),
+                parallelism,
+                continue_on_error: *continue_on_error,
             },
             quiet,
         ),
@@ -168,6 +173,17 @@ impl GraphSink for DiscardSink {
         Ok(())
     }
 
+    fn emit_quad_list_item(
+        &mut self,
+        _s: TermId,
+        _p: TermId,
+        _o: TermId,
+        _index: i32,
+        _g: TermId,
+    ) -> SinkResult {
+        Ok(())
+    }
+
     /// Same reasoning for RDF 1.2 reifiers, which the Turtle parser emits
     /// today for asserting forms — refusing them would make `check` reject
     /// documents the parser actually accepts.
@@ -257,6 +273,20 @@ pub struct ParseOutcome {
     pub error: Option<TurtleError>,
 }
 
+/// Parser options for every `fluree rdf` verb.
+///
+/// One function so the verbs cannot drift: `check`, `count` and `convert` must
+/// describe the same parse, and the only knob a user turns is `--nocheck`.
+///
+/// Validation is ON unless asked otherwise. These verbs exist to tell a user
+/// something true about a document — whether it is valid, how many statements
+/// it holds, what it says in another syntax — and all three answers are wrong
+/// if a term that is not an RDF term is counted, blessed, or written back out.
+/// `--nocheck` is the disclosed fast path, not the default.
+pub fn verb_options(nocheck: bool) -> ParserOptions {
+    ParserOptions::conformant().with_validation(!nocheck)
+}
+
 /// Parse a Turtle-family document, timing and counting it.
 ///
 /// Uses [`ParserOptions::conformant`], not the ingest default: these verbs
@@ -267,10 +297,12 @@ pub struct ParseOutcome {
 /// `fluree rdf count` would disagree with every other tool in the field.
 pub fn parse_document(
     text: &str,
+    syntax: RdfSyntax,
     base: Option<&str>,
+    options: ParserOptions,
     timings: &mut PhaseTimings,
 ) -> CliResult<ParseOutcome> {
-    let run = parse_into(text, base, DiscardSink::new(), timings);
+    let run = parse_into(text, syntax, base, DiscardSink::new(), options, timings);
     // A sink failure is the pipeline's problem, not the document's — a broken
     // pipe or a full disk must not be reported as a syntax error. The discard
     // sink has none, but the shared path can.
@@ -318,17 +350,25 @@ pub struct ParseRun<S> {
 ///
 /// # Conformant options are not optional here
 ///
-/// [`ParserOptions::conformant`], never the ingest default. These verbs report
-/// on and reproduce the RDF a document denotes, so collections must arrive as
-/// the `rdf:first`/`rdf:rest` spine W3C says they are and numeric literals
-/// must keep the lexical form they were written with. Under the ingest options
-/// a collection arrives as indexed list items instead — which `count` would
-/// under-report, and which every writer refuses outright, because an indexed
-/// list item is a Fluree storage shape with no RDF serialization.
+/// `options` is built by [`verb_options`], which starts from
+/// [`ParserOptions::conformant`] and never the ingest default. These verbs
+/// report on and reproduce the RDF a document denotes, so collections must
+/// arrive as the `rdf:first`/`rdf:rest` spine W3C says they are and numeric
+/// literals must keep the lexical form they were written with. Under the
+/// ingest options a collection arrives as indexed list items instead — which
+/// `count` would under-report, and which every writer refuses outright,
+/// because an indexed list item is a Fluree storage shape with no RDF
+/// serialization.
+///
+/// The one thing a caller may vary is term validation (`--nocheck`), and it
+/// travels as part of `options` precisely so all three verbs vary it the same
+/// way or not at all.
 pub fn parse_into<S: GraphSink>(
     text: &str,
+    syntax: RdfSyntax,
     base: Option<&str>,
     sink: S,
+    options: ParserOptions,
     timings: &mut PhaseTimings,
 ) -> ParseRun<S> {
     // Seeding the sampler from the corpus keeps repeat profiles of one input
@@ -337,13 +377,42 @@ pub fn parse_into<S: GraphSink>(
     let mut sink = TimingSink::with_corpus(sink, text.as_bytes());
 
     timings.enter(Phase::Parse);
-    let result = fluree_graph_turtle::parse_with_prefixes_base_options(
-        text,
-        &mut sink,
-        &[],
-        base,
-        ParserOptions::conformant(),
-    );
+    // Four readers, one shape. The two line formats go through the STRICT
+    // scanner rather than the Turtle parser: they are not Turtle subsets to a
+    // reader, they are grammars defined by what they refuse, and reading them
+    // with the Turtle parser would accept documents `fluree rdf check` is
+    // being asked to reject.
+    //
+    // `base` is deliberately not threaded into the line formats: N-Triples
+    // and N-Quads have no base and no relative IRIs, so there is nothing for
+    // it to apply to. A `--base` passed alongside one of them is inert, not
+    // silently mis-applied.
+    //
+    // `.nt` goes through the STRICT reader, not the Turtle parser — the
+    // riot-parity answer, and a deliberate behavior change: a `.nt` file
+    // containing a directive, a prefixed name, a bare number or a
+    // long-quoted string used to be accepted (all of it is valid Turtle)
+    // and is now rejected (none of it is valid N-Triples). That is the
+    // point of `fluree rdf check` on an N-Triples file; accepting it
+    // would make the verb agree with no other tool in the field.
+    let result = match syntax {
+        RdfSyntax::NTriples => fluree_graph_turtle::parse_ntriples(text, &mut sink),
+        RdfSyntax::NQuads => fluree_graph_turtle::parse_nquads(text, &mut sink),
+        RdfSyntax::TriG => fluree_graph_turtle::parse_with_prefixes_base_options(
+            text,
+            &mut sink,
+            &[],
+            base,
+            options.with_dialect(fluree_graph_turtle::Dialect::TriG),
+        ),
+        _ => fluree_graph_turtle::parse_with_prefixes_base_options(
+            text,
+            &mut sink,
+            &[],
+            base,
+            options,
+        ),
+    };
     // `finish` is the owner's call, and the owner is here. The writers latch
     // their failures precisely so this call sees one that had no earlier
     // return value to ride out on.
@@ -355,6 +424,58 @@ pub fn parse_into<S: GraphSink>(
             counts: sink.counts(),
             sink: sink.sink_timing(),
             error: result.err(),
+        },
+        sink: sink.into_inner(),
+        finished,
+    }
+}
+
+/// Parse across threads and replay into `sink`, in the shape [`parse_into`]
+/// returns so the two paths are interchangeable at the call site.
+///
+/// The sink is written on this thread only — see [`parallel`] for why that is
+/// a correctness requirement and not a simplification.
+pub fn parse_into_parallel<S: GraphSink>(
+    text: &str,
+    base: Option<&str>,
+    sink: S,
+    config: parallel::ParallelConfig,
+    timings: &mut PhaseTimings,
+) -> ParseRun<S> {
+    let mut sink = TimingSink::with_corpus(sink, text.as_bytes());
+
+    timings.enter(Phase::Parse);
+    let outcome = parallel::convert_parallel(text, base, &mut sink, config);
+    let finished = sink.finish();
+    timings.finish();
+
+    // Worker parse time is a sum across threads, so it exceeds the wall clock
+    // by roughly the speedup. Recorded on its own lane rather than added to
+    // Parse, which would claim more wall than the run took.
+    let (error, workers_nanos, wait_nanos) = match outcome {
+        Ok(o) => (o.error, o.worker_parse_nanos, o.reassembly_wait_nanos),
+        // A chunking failure is a usage problem, not a parse error; surface it
+        // through `finished` so the caller reports it as the pipeline's.
+        Err(e) => {
+            return ParseRun {
+                outcome: ParseOutcome {
+                    counts: sink.counts(),
+                    sink: sink.sink_timing(),
+                    error: None,
+                },
+                sink: sink.into_inner(),
+                finished: Err(fluree_graph_ir::SinkError::rejected(e.to_string())),
+            };
+        }
+    };
+    timings.set(Phase::Workers, Duration::from_nanos(workers_nanos as u64));
+    timings.set(Phase::Reassembly, Duration::from_nanos(wait_nanos as u64));
+
+    ParseRun {
+        outcome: ParseOutcome {
+            counts: sink.counts(),
+            sink: sink.sink_timing(),
+            error,
         },
         sink: sink.into_inner(),
         finished,
@@ -388,6 +509,12 @@ pub fn report_run(
             // Hashing happens here, after `wall` was taken — see the
             // `wall_ns` docs for what the measured window covers.
             sha256: (!common.no_hash).then(|| profile::sha256_hex(&loaded.text)),
+            validate: !common.nocheck,
+            // check and count parse on the calling thread; only convert has a
+            // parallel path.
+            skipped_statements: None,
+            threads_used: 1,
+            parallel_reason: "verb parses on the calling thread",
         };
         profile::ProfileReport::build(&ctx, timings, wall, outcome.counts, outcome.sink)
             .emit(format)?;
@@ -413,7 +540,14 @@ mod tests {
     use super::*;
 
     fn parse(doc: &str) -> ParseOutcome {
-        parse_document(doc, None, &mut PhaseTimings::start()).unwrap()
+        parse_document(
+            doc,
+            RdfSyntax::Turtle,
+            None,
+            verb_options(false),
+            &mut PhaseTimings::start(),
+        )
+        .unwrap()
     }
 
     fn args_with(input: Option<&str>, profile: Option<profile::ProfileFormat>) -> RdfCommonArgs {
@@ -424,6 +558,7 @@ mod tests {
             time: false,
             profile,
             no_hash: false,
+            nocheck: false,
         }
     }
 
@@ -538,8 +673,14 @@ mod tests {
     #[test]
     fn a_base_iri_resolves_relative_references() {
         let mut timings = PhaseTimings::start();
-        let out =
-            parse_document("<a> <b> <c> .\n", Some("http://example.org/"), &mut timings).unwrap();
+        let out = parse_document(
+            "<a> <b> <c> .\n",
+            RdfSyntax::Turtle,
+            Some("http://example.org/"),
+            verb_options(false),
+            &mut timings,
+        )
+        .unwrap();
         assert!(out.error.is_none(), "{:?}", out.error);
         assert_eq!(out.counts.triples, 1);
 
@@ -552,7 +693,14 @@ mod tests {
     fn parsing_charges_its_time_to_the_parse_phase_only() {
         let mut timings = PhaseTimings::start();
         let doc = "<http://e/s> <http://e/p> \"o\" .\n".repeat(200);
-        parse_document(&doc, None, &mut timings).unwrap();
+        parse_document(
+            &doc,
+            RdfSyntax::Turtle,
+            None,
+            verb_options(false),
+            &mut timings,
+        )
+        .unwrap();
         assert!(timings.elapsed(Phase::Parse) > Duration::ZERO);
         assert_eq!(timings.elapsed(Phase::Read), Duration::ZERO);
         assert_eq!(timings.elapsed(Phase::Decompress), Duration::ZERO);

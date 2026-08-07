@@ -90,6 +90,19 @@ pub enum Phase {
     Decompress,
     /// Lexing and parsing the decoded text into sink events.
     Parse,
+    /// Parse time summed across parallel workers.
+    ///
+    /// Deliberately not part of the sequential sum: it is a sum over threads,
+    /// so on a run that scales it EXCEEDS the wall clock, and adding it to the
+    /// pipeline total would claim more time than the run took. Read it against
+    /// `parse` to see the speedup — `workers / parse` is the effective width.
+    Workers,
+    /// Wall time the ordered replay took, waiting on chunks and writing them.
+    ///
+    /// Near-zero means the worker pool is the bottleneck; large means
+    /// reassembly is, which is the number that says whether more threads would
+    /// help.
+    Reassembly,
     /// Sink dispatch: what the consumer of the events does with them.
     Sink,
     /// Rendering terms back into an output syntax.
@@ -100,14 +113,34 @@ pub enum Phase {
 
 impl Phase {
     /// Every phase, in pipeline order. Report ordering follows this.
-    pub const ALL: [Phase; 6] = [
+    pub const ALL: [Phase; 8] = [
         Phase::Read,
         Phase::Decompress,
         Phase::Parse,
+        Phase::Workers,
+        Phase::Reassembly,
         Phase::Sink,
         Phase::Serialize,
         Phase::Write,
     ];
+
+    /// Phases that run one after another and together account for the wall
+    /// clock. Everything else happens *inside* one of these.
+    ///
+    /// The distinction is what makes "unattributed time" meaningful. On the
+    /// streaming path the sink, the serializer and the writer all run during
+    /// the parse — the writer is called from inside the parse loop — and the
+    /// parallel phases are stranger still: `Workers` is a sum across threads
+    /// that exceeds the wall clock whenever the run scales at all. Adding any
+    /// of them to a pipeline total would claim more time than the run took,
+    /// and the gap that is supposed to reveal unmeasured work would saturate
+    /// to zero and reveal nothing.
+    pub const SEQUENTIAL: [Phase; 3] = [Phase::Read, Phase::Decompress, Phase::Parse];
+
+    /// Whether this phase runs inside another rather than beside it.
+    pub fn is_nested(self) -> bool {
+        !Self::SEQUENTIAL.contains(&self)
+    }
 
     /// Stable machine-readable name — the key used in `--profile=json`.
     pub fn as_str(self) -> &'static str {
@@ -115,6 +148,8 @@ impl Phase {
             Phase::Read => "read",
             Phase::Decompress => "decompress",
             Phase::Parse => "parse",
+            Phase::Workers => "workers",
+            Phase::Reassembly => "reassembly",
             Phase::Sink => "sink",
             Phase::Serialize => "serialize",
             Phase::Write => "write",
@@ -126,9 +161,11 @@ impl Phase {
             Phase::Read => 0,
             Phase::Decompress => 1,
             Phase::Parse => 2,
-            Phase::Sink => 3,
-            Phase::Serialize => 4,
-            Phase::Write => 5,
+            Phase::Workers => 3,
+            Phase::Reassembly => 4,
+            Phase::Sink => 5,
+            Phase::Serialize => 6,
+            Phase::Write => 7,
         }
     }
 }
@@ -806,6 +843,18 @@ impl<S: GraphSink> GraphSink for TimingSink<S> {
     ) -> SinkResult {
         self.counts.quads += 1;
         self.forward(|s| s.emit_quad(subject, predicate, object, graph))
+    }
+
+    fn emit_quad_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+        graph: TermId,
+    ) -> SinkResult {
+        self.counts.quads += 1;
+        self.forward(|s| s.emit_quad_list_item(subject, predicate, object, index, graph))
     }
 
     fn supports_reified_triples(&self) -> bool {

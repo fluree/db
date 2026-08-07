@@ -97,8 +97,10 @@ $ fluree rdf convert dump.ttl
 |--------|-------------|
 | `--to <SYNTAX>` | Output syntax. Overrides the `-o` extension |
 | `-o, --output <FILE>` | Write to a file instead of stdout |
-| `--bnode-policy <POLICY>` | `relabel` (default) or `preserve` |
+| `--bnode-policy <POLICY>` | `relabel` (default) or `preserve`. `preserve` converts serially |
 | `--prefixes <JSON\|PATH>` | Prefixes for compaction — inline JSON or a file. Namespaces must be absolute IRIs |
+| `--continue-on-error` | Skip unparseable statements; report each and exit 1 |
+| `--parallelism <N>` | Parse threads (global flag). `1` is the serial path exactly |
 | `--pretty` | Buffered, regrouped Turtle. **Not implemented** |
 | `--syntax <SYNTAX>` | Input syntax, overriding extension and sniffing |
 | `--base <IRI>` | Base IRI for resolving relative references |
@@ -107,6 +109,28 @@ $ fluree rdf convert dump.ttl
 
 See [the `rdf` overview](README.md) for input handling, compression and syntax
 resolution, which are shared by every verb.
+
+### How the flags interact
+
+Some flags change what another flag does. Every such pair is listed here, and
+each row is asserted by a test in **both** the serial and the parallel path —
+a flag that quietly overrides another is the defect this table exists to
+prevent, and three of them were found by review before it existed.
+
+**A new flag must add a row.** If it interacts with nothing, say so in the row;
+"nothing" is a claim a reader can check, and an absent row is not.
+
+| Flags together | What happens | Why |
+|---|---|---|
+| `--continue-on-error` + `--profile=json` | Per-skip diagnostics are **not** printed; the count travels as `skipped_statements` in the JSON. Exit stays `1` | Under `--profile=json` stderr is one JSON document. Printing a diagnostic per skipped statement beside it would make it unparseable, so the machine-readable channel carries the machine-readable fact |
+| `--continue-on-error` + `--profile` (human) | Both are printed: each skip, then the phase table | Both are prose on stderr; nothing to corrupt |
+| `--continue-on-error` + `--parallelism <N>` | Converts **serially**, and `parallel_reason` says so | Resync needs the document as one sequence of statements; a chunk boundary is not a place a skipped statement can be reasoned about |
+| `-o FILE` + `--profile=json` | Converted bytes go to the file, JSON to stderr, and **stdout stays empty** | The two never share a stream, so `-o` is safe to combine with either profile format |
+| no `-o` + `--profile=json` | Converted bytes to stdout, JSON to stderr | Same rule, which is why the profile goes to stderr on every verb |
+| `--bnode-policy preserve` + `--parallelism <N>` | Converts **serially**, and `parallel_reason` says so | Preserved labels are only unique document-wide; independent per-chunk relabellers cannot honour them. Silently relabelling under parallelism was a real defect, fixed rather than documented |
+| `--pretty` + `--to <non-turtle>` | Refused as a usage error naming how the syntax was chosen | `--pretty` is a Turtle fidelity tier; it has no meaning for the other syntaxes |
+| `--base` + `.nt`/`.nq` input | Inert, not applied | The line grammars have no base and no relative IRIs, so there is nothing to resolve |
+| `--parallelism <N>` + non-line output | Converts serially | Chunking changes the bytes for a syntax that folds across statements; see [Parallelism](#parallelism) |
 
 ## Fidelity
 
@@ -226,10 +250,83 @@ error: broken.ttl:3:16: unexpected character '?'
 The same applies to a blank-node collision under `--bnode-policy preserve`:
 the refusal arrives mid-parse, so `-o` is already partial when it does.
 
-`--continue-on-error`, which would skip the bad statement and carry on, needs
-statement-scoped output buffering to be correct (a Turtle statement emits
-triples during descent, before its terminating `.` proves it well-formed). The
-writers support that buffering; wiring it to a flag is the next piece of work.
+### Parallelism
+
+`--parallelism <N>` (the global flag) parses across threads. `1` is the serial
+path exactly, so the flag is never a correctness decision; `0` — the default —
+uses as many threads as the host reports.
+
+```bash
+fluree rdf convert big.ttl --to nt -o big.nt --parallelism 8
+```
+
+The document is cut at statement boundaries, each worker parses its chunk and
+writes its own bytes, and the fragments are concatenated in order. Every text
+syntax participates; JSON-LD does not, because it is document-at-once and there
+are no fragments to concatenate.
+
+**Parallel and serial output are equivalent, not identical.** Blank-node labels
+are assigned by a deterministic function of (label, chunk) so that workers need
+no coordination, and that does not produce the same labels a single serial pass
+does. What is guaranteed:
+
+- the same input at the same `--parallelism` is **byte-identical across runs**
+  — thread scheduling cannot reach the output;
+- serial and parallel denote the **same graph**: same triples, same number of
+  distinct blank nodes, and a blank node named in two chunks is still one node.
+
+`riot` makes no cross-mode byte promise either. If you need byte-stability
+across a change of thread count, pin `--parallelism`.
+
+That labelling is also why `--bnode-policy preserve` converts **serially**,
+whatever `--parallelism` says: the two ask for opposite things, and preserving
+the input's labels is the one the user asked for by name. `--profile` reports it
+as the `parallel_reason`. The cost is speed, not fidelity.
+
+Two smaller consequences worth knowing. In Turtle and TriG output, prefixes are
+declared once — by the first chunk — and a subject whose statements straddle a
+chunk boundary is written as two subject blocks rather than one. Both are valid
+blocks-tier output; the tier already declines to regroup a subject that recurs
+later in a document.
+
+Parallelism trades memory for threads: in-flight chunks are bounded, so peak
+usage is roughly `(threads + queue) × chunk output size` rather than the whole
+output.
+
+`--profile` reports `threads_used` and a `parallel_reason`, so a run that fell
+back to serial says why. It also records the machine's 1-minute load average
+next to the core count, and prints a `LOADED` line when the average exceeds the
+core count — a duration measured on a contended machine is not a measurement,
+and this is the only way to tell after the fact.
+
+### `--continue-on-error`
+
+Skip the statements that do not parse and keep the rest:
+
+```console
+$ fluree rdf convert partly-broken.ttl --to nt --continue-on-error > out.nt
+skipped: partly-broken.ttl:3:11: unexpected character '?'
+skipped: partly-broken.ttl:5:11: unexpected character '?'
+warning: 2 statement(s) skipped, 3 written → stdout
+```
+
+**It still exits 1.** Skipping is not success — riot's rule, and the one thing
+a script must not do is read a partial conversion as a whole one. A clean
+document under the flag exits 0 and says nothing.
+
+A skipped statement contributes **nothing**, not even the part of itself that
+had already been written. Turtle emits during descent, so
+`ex:bad ex:p "one" ; ex:q "two" ; ex:r ??` has two triples in flight before the
+failure is known; the flag turns on statement buffering so the rollback is
+real. Each skip is reported with its position in the original file.
+
+Recovery is serial: resync needs to see the document as one sequence of
+statements, so `--continue-on-error` and `--parallelism` do not combine — the
+former wins, and `--profile` reports why.
+
+The recovery point is the next statement boundary after the error. A directive
+that gets skipped over as part of a bad statement is therefore lost, and the
+statements needing it fail in turn — each reported, none silent.
 
 ## Compressed output
 

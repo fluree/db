@@ -29,7 +29,13 @@ use std::time::Duration;
 pub fn run(common: &RdfCommonArgs, quiet: bool) -> CliResult<()> {
     let mut timings = PhaseTimings::start();
     let loaded = rdf::load(common, &mut timings)?;
-    let outcome = rdf::parse_document(&loaded.text, common.base.as_deref(), &mut timings)?;
+    let outcome = rdf::parse_document(
+        &loaded.text,
+        loaded.resolved.syntax,
+        common.base.as_deref(),
+        rdf::verb_options(common.nocheck),
+        &mut timings,
+    )?;
     let wall = timings.wall();
     let counts = outcome.counts;
 
