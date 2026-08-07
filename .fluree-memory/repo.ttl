@@ -2654,6 +2654,35 @@ mem:fact-01kye0e6kqs8q712xrcvdednee a mem:Fact ;
     mem:branch "main" ;
     mem:createdAt "2026-07-26T01:25:39.063758+00:00"^^xsd:dateTime .
 
+mem:fact-01kzdve41rj841p1kgdkqkd32b a mem:Fact ;
+    mem:content "PR #1422 (iceberg materialize tracking worker) as of 2026-08-07: rebased 0-behind main, CI green except infra-flake testsuite-sparql. Fixed at head: B1 MoR guard, B5 create race, B3 engine seam. Fixed locally (uncommitted, branch pr-1422-review): NEW-1 budget comment rewritten to measured flake/JSON ratios (kept /4 — worst ratio 2.5× leaves headroom); NEW-2 worker spawn gated on indexing_enabled (test worker_requires_local_indexing; durability tests now run indexing-enabled). Still open: B2 unbounded MaterializeAccum memory (two-pass or spill design needed), B4 rr:graphMap query-path parity (#1581 has vocab half), M-2 offline scan coverage decision (A/B/C), watermark contract vs #1529 stamp. Auth split #1567." ;
+    mem:tag "graph-sources" ;
+    mem:tag "iceberg" ;
+    mem:tag "materialize" ;
+    mem:tag "pr-1422" ;
+    mem:tag "review" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/graph_source/r2rml_materialize.rs" ;
+    mem:artifactRef "fluree-db-api/src/materialize.rs" ;
+    mem:artifactRef "fluree-db-iceberg/src/scan/send_planner.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-07T10:13:55.384690+00:00"^^xsd:dateTime .
+
+mem:fact-01kzdveh3fna6wddbkmkeabmxn a mem:Fact ;
+    mem:content "Mastering Phase 1A asks on PR #1422 scan layer — IMPLEMENTED (uncommitted) on branch pr-1422-review 2026-08-07: (1) scan_for_materialize_stream takes to_snapshot_id: Option<i64> (None = current; explicit pin resolves or typed-errors, never fall-forward; full arm uses plan_scan_for_snapshot); (2) new QueryError::SnapshotNotFound { table, snapshot_id } raised at provider layer, planner IcebergError::SnapshotNotFound translated in both entry points; (3) TableMetadata::schema_for_snapshot (snapshot schema-id → schema, fallback current) used by both planners (send + non-Send, SYNC comment) and both provider entry points; unit test schema_for_snapshot_follows_the_snapshot_schema_id. scan_table_incremental kept with doc-comment steer (no #[deprecated])." ;
+    mem:tag "iceberg" ;
+    mem:tag "mastering" ;
+    mem:tag "pr-1422" ;
+    mem:tag "scan-api" ;
+    mem:tag "sense" ;
+    mem:tag "snapshot" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/graph_source/r2rml.rs" ;
+    mem:artifactRef "fluree-db-iceberg/src/metadata/table.rs" ;
+    mem:artifactRef "fluree-db-iceberg/src/scan/send_planner.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-07T10:14:08.751291+00:00"^^xsd:dateTime .
+
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;
     mem:tag "iri" ;
@@ -3050,6 +3079,34 @@ mem:fact-01kx4zresym4eghmrzn2wcchx5 a mem:Fact ;
     mem:artifactRef "fluree-db-server/src/routes/transact.rs" ;
     mem:branch "perf/property-path-batched-frontier" ;
     mem:createdAt "2026-07-10T03:04:54.846310+00:00"^^xsd:dateTime .
+
+mem:decision-01kzdzqzsrwt4wbyr5dt9veshp a mem:Decision ;
+    mem:content "PR #1422 engine convergence phase 1 (uncommitted on branch pr-1422-review): extracted pub TmEmitContext + emit_row + emit_row_terms from emit_batch in the shared enumerator (behavior-identical; emit_row_terms takes a caller-supplied subject for classify-then-emit callers). build_live_node in r2rml_materialize.rs = NodeCollector (TripleObserver→SubjectNode, rdf:type→@type routing) + emit_row_terms; hand-rolled POM loop deleted. Deltas: templated predicates now emit (were silently dropped); ParentIndexSet::new validates mapping fail-closed; FK edges still drop (parents unindexed) but counted+warned. Phase 2: indexing FK parents needs a window-vs-whole-table answer." ;
+    mem:tag "convergence" ;
+    mem:tag "enumerator" ;
+    mem:tag "materialize" ;
+    mem:tag "pr-1422" ;
+    mem:tag "r2rml" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/graph_source/r2rml_materialize.rs" ;
+    mem:artifactRef "fluree-db-r2rml/src/materialize/graph.rs" ;
+    mem:branch "pr-1422-review" ;
+    mem:createdAt "2026-08-07T11:29:13.016348+00:00"^^xsd:dateTime .
+
+mem:decision-01kze5dezv1zr8e3s415yknbh1 a mem:Decision ;
+    mem:content "PR #1422 B2-minimum implemented (uncommitted, pr-1422-review): fail-loud accumulator memory budget, not the full two-pass redesign. MaterializeAccum tracks estimated bytes incrementally (per-entry usize in KeyState; tombstone-replace SHRINKS; sized via estimated_json_bytes so chunk + memory budgets share one model); gate checks per batch, PRE-COMMIT (no target touched, watermark un-advanced); typed ApiError::MaterializeMemoryBudget; FLUREE_MATERIALIZE_MEMORY_BUDGET_MB default 1024, 0=off; accum_budget_override test param. Comparative engine test + accounting unit test. Docs: configuration.md env rows + iceberg.md limitations extended (FK/graphMap/compaction/multi-node/budget caveats)." ;
+    mem:tag "b2" ;
+    mem:tag "iceberg" ;
+    mem:tag "materialize" ;
+    mem:tag "memory-budget" ;
+    mem:tag "pr-1422" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/graph-sources/iceberg.md" ;
+    mem:artifactRef "docs/operations/configuration.md" ;
+    mem:artifactRef "fluree-db-api/src/error.rs" ;
+    mem:artifactRef "fluree-db-api/src/graph_source/r2rml_materialize.rs" ;
+    mem:branch "pr-1422-review" ;
+    mem:createdAt "2026-08-07T13:08:19.579414+00:00"^^xsd:dateTime .
 
 mem:fact-01kvg5mrhz4zvhg425038pfj7m a mem:Fact ;
     mem:content "SPARQL UPDATE annotation tails are rejected inside GRAPH{}/WITH<g> (\"default-graph only\") only because the lowering never emits f:reifiesGraph — NOT a storage limit (JSON-LD path + EdgeKey fully support named-graph annotations). Closing it is SMALL/localized: add a graph_iri param to expand_annotated_triples + expand_annotated_triples_in_quad_pattern, emit one f:reifiesGraph TriplePattern when graph is non-default (graph IRI already available: with_graph_iri in lower_modify ~L894; GraphName::Iri at the GRAPH rejection ~L410), delete reject_with_scoped_annotations + the two rejection blocks (~L414, ~L517). Downstream .with_graph_id stamping + EdgeKey decoder validation already correct; no schema/invariant changes." ;

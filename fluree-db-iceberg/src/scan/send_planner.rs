@@ -72,9 +72,13 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
 
     /// Inner planning implementation (see [`Self::plan_scan_for_snapshot`]).
     async fn plan_scan_for_snapshot_inner(&self, snapshot: &Snapshot) -> Result<ScanPlan> {
+        // Project against the schema in effect AT `snapshot`, not the current
+        // one — for a historical snapshot under schema evolution the two
+        // differ, and the name→field-id mapping / type interpretation must
+        // follow the pinned snapshot. Identical for `snapshot` = current.
         let schema = self
             .metadata
-            .current_schema()
+            .schema_for_snapshot(snapshot)
             .ok_or_else(|| IcebergError::Metadata("No current schema".to_string()))?;
 
         // Clone schema into Arc for sharing with tasks
@@ -224,9 +228,15 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         };
         let to_seq = to_snapshot.sequence_number;
 
+        // Schema at the `to` snapshot, not current — see the same choice in
+        // `plan_scan_for_snapshot_inner`. The whole window's files are read
+        // under `to`'s schema: files added earlier in the window were written
+        // under `to`'s schema or an ancestor of it, and Iceberg field ids are
+        // stable across evolution, so `to`'s name→id mapping is correct for
+        // every file the window can select.
         let schema = self
             .metadata
-            .current_schema()
+            .schema_for_snapshot(to_snapshot)
             .ok_or_else(|| IcebergError::Metadata("No current schema".to_string()))?;
         let schema_arc = Arc::new(schema.clone());
         let (projected_field_ids, projected_columns) = self.resolve_projection(schema)?;

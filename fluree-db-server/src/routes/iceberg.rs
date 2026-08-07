@@ -401,7 +401,10 @@ async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<i
     }
 
     let worker = state.materialize_worker.as_ref().ok_or_else(|| {
-        ServerError::bad_request("materialization tracking worker is not running on this node")
+        ServerError::bad_request(
+            "materialization tracking worker is not running on this node (peer role, or \
+             indexing disabled — materialization needs a local indexer to drain novelty)",
+        )
     })?;
 
     let interval = worker.track(

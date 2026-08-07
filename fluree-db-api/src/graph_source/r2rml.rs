@@ -241,6 +241,28 @@ impl ScanChoice {
     }
 }
 
+/// Field ids to project for `projection` against `schema`: every non-nested
+/// field when `projection` is empty, else the named columns that exist in the
+/// schema (unknown names are skipped — the consumer treats them as absent).
+fn projected_field_ids(
+    schema: &fluree_db_iceberg::metadata::Schema,
+    projection: &[String],
+) -> Vec<i32> {
+    if projection.is_empty() {
+        schema
+            .fields
+            .iter()
+            .filter(|f| !f.is_nested())
+            .map(|f| f.id)
+            .collect()
+    } else {
+        projection
+            .iter()
+            .filter_map(|col| schema.field_by_name(col).map(|f| f.id))
+            .collect()
+    }
+}
+
 /// Translate resolved scan filters into an Iceberg pushdown `Expression` for
 /// file pruning. Filters on unknown columns are skipped; an empty result is
 /// `None`. Conservative — pruning never drops matching rows because the
@@ -1036,10 +1058,22 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// Scan only the data files ADDED in the snapshot window
     /// `(from_snapshot_id, to_snapshot_id]` (append-only incremental).
     ///
+    /// Prefer [`Self::scan_for_materialize_stream`] with an explicit
+    /// `to_snapshot_id`: it has the same explicit-window semantics but yields
+    /// batches instead of collecting them, so peak memory is bounded by the
+    /// scan concurrency rather than the window size. This collecting variant
+    /// holds the whole window in memory (a `try_collect()` a streaming caller
+    /// could have written for itself) and remains for callers that genuinely
+    /// need the `Vec`.
+    ///
     /// `from_snapshot_id = None` reads the full live state of `to_snapshot_id`
     /// (initial materialization). The caller must verify the window is
     /// incremental-safe (`TableMetadata::window_is_append_only`, allowing
     /// compaction) and fall back to a full scan otherwise.
+    ///
+    /// A snapshot id that no longer resolves in the table metadata — typically
+    /// expired by the source's snapshot retention — is a typed
+    /// [`QueryError::SnapshotNotFound`], never a silent fall-forward.
     pub async fn scan_table_incremental(
         &self,
         graph_source_id: &str,
@@ -1052,29 +1086,40 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
 
-        let schema = metadata
-            .current_schema()
-            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids: Vec<i32> = if projection.is_empty() {
-            schema
-                .fields
-                .iter()
-                .filter(|f| !f.is_nested())
-                .map(|f| f.id)
-                .collect()
+        let snapshot_err_table = if table_name.is_empty() {
+            graph_source_id
         } else {
-            projection
-                .iter()
-                .filter_map(|col| schema.field_by_name(col).map(|f| f.id))
-                .collect()
+            table_name
         };
+        let to_snapshot =
+            metadata
+                .snapshot(to_snapshot_id)
+                .ok_or_else(|| QueryError::SnapshotNotFound {
+                    table: snapshot_err_table.to_string(),
+                    snapshot_id: to_snapshot_id,
+                })?;
+        let schema = metadata
+            .schema_for_snapshot(to_snapshot)
+            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        let projected_field_ids = projected_field_ids(schema, projection);
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
         let plan = planner
             .plan_incremental(from_snapshot_id, to_snapshot_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Failed to plan incremental scan: {e}")))?;
+            .map_err(|e| match e {
+                // `to` was resolved above, so the only snapshot the planner can
+                // fail to find is `from` (`None` never reaches this arm: the
+                // planner treats it as "since genesis" without a lookup).
+                fluree_db_iceberg::IcebergError::SnapshotNotFound(_) => {
+                    QueryError::SnapshotNotFound {
+                        table: snapshot_err_table.to_string(),
+                        snapshot_id: from_snapshot_id.unwrap_or(to_snapshot_id),
+                    }
+                }
+                e => QueryError::Internal(format!("Failed to plan incremental scan: {e}")),
+            })?;
 
         info!(
             from_snapshot_id = ?from_snapshot_id,
@@ -1087,15 +1132,27 @@ impl<'a> FlureeR2rmlProvider<'a> {
         self.read_scan_tasks(&storage, plan.added_tasks).await
     }
 
-    /// Resolve the source table's current snapshot and read the rows to
-    /// materialize, choosing incremental vs full automatically. The choice and
-    /// its reason are [`ScanChoice`] — read that first, because "full" covers
-    /// one routine case and one that should page someone.
+    /// Read the rows to materialize for the window ending at `to_snapshot_id`
+    /// (`None` = the source table's current snapshot), choosing incremental vs
+    /// full automatically. The choice and its reason are [`ScanChoice`] — read
+    /// that first, because "full" covers one routine case and one that should
+    /// page someone.
+    ///
+    /// **Pinned reads.** An explicit `to_snapshot_id` pins the read: the
+    /// window `(from, to]` and the projection schema both follow the pinned
+    /// snapshot (its `schema-id`, so a historical read under schema evolution
+    /// projects the columns its rows were written with). A pin that no longer
+    /// resolves in the table metadata — typically expired by the source's
+    /// snapshot retention — is a typed [`QueryError::SnapshotNotFound`],
+    /// **never** a fall-forward: the from-side fall-forward below is a
+    /// deliberate freshness/correctness trade a sync-to-head consumer wants,
+    /// but silently moving a caller's `to` pin would change what the caller
+    /// asked to read.
     ///
     /// Returns `(to_snapshot_id, incremental, batches)`:
-    /// - `to_snapshot_id` — the source's current snapshot id (the new
+    /// - `to_snapshot_id` — the resolved snapshot id of this read (the new
     ///   watermark to persist), or `None` if the table has no snapshots yet
-    ///   (nothing to materialize).
+    ///   (nothing to materialize; only possible when the caller didn't pin).
     /// - `incremental` — whether an added-files-only scan was used (vs a full
     ///   read of the live table state).
     ///
@@ -1136,12 +1193,33 @@ impl<'a> FlureeR2rmlProvider<'a> {
         table_name: &str,
         projection: &[String],
         from_snapshot_id: Option<i64>,
+        to_snapshot_id: Option<i64>,
     ) -> QueryResult<MaterializeScan> {
         let (storage, metadata, _loc) = self
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
 
-        let Some(to_snapshot_id) = metadata.current_snapshot().map(|s| s.snapshot_id) else {
+        let snapshot_err_table = if table_name.is_empty() {
+            graph_source_id
+        } else {
+            table_name
+        };
+        let to_snapshot = match to_snapshot_id {
+            // A caller's pin must resolve — typed error, never fall-forward
+            // (see the doc comment).
+            Some(id) => {
+                Some(
+                    metadata
+                        .snapshot(id)
+                        .ok_or_else(|| QueryError::SnapshotNotFound {
+                            table: snapshot_err_table.to_string(),
+                            snapshot_id: id,
+                        })?,
+                )
+            }
+            None => metadata.current_snapshot(),
+        };
+        let Some(to_snapshot) = to_snapshot else {
             // Table has no snapshots: nothing to materialize.
             return Ok(MaterializeScan {
                 to_snapshot_id: None,
@@ -1150,23 +1228,14 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 stream: empty_batch_stream(),
             });
         };
+        let to_snapshot_id = to_snapshot.snapshot_id;
 
+        // Schema AT the `to` snapshot (falls back to current when the snapshot
+        // carries no schema-id) — identical to current for an unpinned read.
         let schema = metadata
-            .current_schema()
+            .schema_for_snapshot(to_snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids: Vec<i32> = if projection.is_empty() {
-            schema
-                .fields
-                .iter()
-                .filter(|f| !f.is_nested())
-                .map(|f| f.id)
-                .collect()
-        } else {
-            projection
-                .iter()
-                .filter_map(|col| schema.field_by_name(col).map(|f| f.id))
-                .collect()
-        };
+        let projected_field_ids = projected_field_ids(schema, projection);
 
         let choice = ScanChoice::decide(&metadata, from_snapshot_id, to_snapshot_id);
         let incremental = choice.is_incremental();
@@ -1204,8 +1273,19 @@ impl<'a> FlureeR2rmlProvider<'a> {
             let plan = planner
                 .plan_incremental(from_snapshot_id, to_snapshot_id)
                 .await
-                .map_err(|e| {
-                    QueryError::Internal(format!("Failed to plan incremental scan: {e}"))
+                .map_err(|e| match e {
+                    // Both window ends resolved before planning (`to` above,
+                    // `from` inside the ScanChoice window walk), so this arm is
+                    // a should-not-happen backstop — but keep it typed so a pin
+                    // that expires between those checks and the manifest read
+                    // still surfaces as what it is.
+                    fluree_db_iceberg::IcebergError::SnapshotNotFound(_) => {
+                        QueryError::SnapshotNotFound {
+                            table: snapshot_err_table.to_string(),
+                            snapshot_id: from_snapshot_id.unwrap_or(to_snapshot_id),
+                        }
+                    }
+                    e => QueryError::Internal(format!("Failed to plan incremental scan: {e}")),
                 })?;
             info!(
                 from_snapshot_id = ?from_snapshot_id,
@@ -1216,8 +1296,11 @@ impl<'a> FlureeR2rmlProvider<'a> {
             );
             plan.added_tasks
         } else {
+            // Full read of the `to` snapshot's live state — the pinned snapshot
+            // when the caller supplied one, the current snapshot otherwise
+            // (`plan_scan()` is exactly `plan_scan_for_snapshot(current)`).
             let plan = planner
-                .plan_scan()
+                .plan_scan_for_snapshot(to_snapshot)
                 .await
                 .map_err(|e| QueryError::Internal(format!("Failed to plan full scan: {e}")))?;
             info!(
@@ -1241,11 +1324,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
         // source ended up full-reading 739k rows on every poll.
         let window_age_ms = from_snapshot_id
             .and_then(|from| metadata.snapshot(from).map(|s| s.timestamp_ms))
-            .and_then(|from_ms| {
-                metadata
-                    .snapshot(to_snapshot_id)
-                    .map(|to| to.timestamp_ms.saturating_sub(from_ms))
-            });
+            .map(|from_ms| to_snapshot.timestamp_ms.saturating_sub(from_ms));
 
         let stream = self.stream_scan_tasks(&storage, tasks);
         Ok(MaterializeScan {

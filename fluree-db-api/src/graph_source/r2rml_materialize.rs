@@ -56,9 +56,9 @@ use fluree_db_iceberg::DeleteConvention;
 use fluree_db_query::r2rml::R2rmlProvider;
 use fluree_db_r2rml::mapping::TriplesMap;
 use fluree_db_r2rml::materialize::{
-    batch_has_column, column_is_orderable, column_sort_key, column_string,
-    expand_template_from_batch, materialize_graph_from_batch, materialize_object_from_batch,
-    materialize_subject_from_batch, RdfTerm,
+    batch_has_column, column_is_orderable, column_sort_key, column_string, emit_row_terms,
+    expand_template_from_batch, materialize_graph_from_batch, materialize_subject_from_batch,
+    MaterializeStats, ParentIndexSet, RdfTerm, TmEmitContext, TripleObserver,
 };
 use fluree_vocab::UnresolvedDatatypeConstraint;
 
@@ -237,7 +237,9 @@ impl MaterializeSource for FlureeR2rmlProvider<'_> {
         from_snapshot_id: Option<i64>,
     ) -> Result<MaterializeScan> {
         Ok(self
-            .scan_for_materialize_stream(graph_source_id, table_name, &[], from_snapshot_id)
+            // `to = None`: the sync-to-head worker always reads to the source's
+            // current snapshot; explicit pins are for point-in-time consumers.
+            .scan_for_materialize_stream(graph_source_id, table_name, &[], from_snapshot_id, None)
             .await?)
     }
 }
@@ -284,7 +286,8 @@ impl Fluree {
             source_graph_source_id,
             target_ledger_id,
             force_full,
-            // Production always derives its own transaction budget.
+            // Production always derives its own transaction and memory budgets.
+            None,
             None,
         )
         .await
@@ -304,6 +307,11 @@ impl Fluree {
     /// which took minutes through the transact path. A parameter only tests supply is a
     /// smell; a multi-minute unit test nobody runs is a worse one, and an env var would be
     /// process-global and flaky under parallel tests.
+    ///
+    /// `accum_budget_override` overrides the accumulator memory budget
+    /// ([`materialize_memory_budget_bytes`]) for the same reason: the shipped
+    /// default is 1 GiB, so proving the gate fires would otherwise need a
+    /// gigabyte-scale test window.
     pub(crate) async fn materialize_from_source(
         &self,
         provider: &dyn MaterializeSource,
@@ -311,6 +319,7 @@ impl Fluree {
         target_ledger_id: &str,
         force_full: bool,
         txn_budget_override: Option<usize>,
+        accum_budget_override: Option<usize>,
     ) -> Result<MaterializeResult> {
         // 1. Compiled R2RML mapping (subject / predicate / object maps) and the
         //    materialization options (delete convention + latest-by-key ordering).
@@ -353,6 +362,18 @@ impl Fluree {
             }
         }
 
+        // Shared-enumerator emission state. The parent-index plan validates the
+        // whole mapping up front (fail-closed on a RefObjectMap naming an unknown
+        // parent TriplesMap — a broken mapping, not a silent drop). Parents are
+        // not yet INDEXED on this incremental path, so FK edges drop as dangling
+        // (counted in `emit_stats.ref_dangling` and warned about below) — the
+        // same net behavior as before, now visible. Indexing parents here needs
+        // a window-vs-whole-table answer first: a parent row referenced by a new
+        // child row may sit OUTSIDE the incremental window.
+        let parents = ParentIndexSet::new(&mapping)
+            .map_err(|e| ApiError::Config(format!("invalid R2RML mapping: {e}")))?;
+        let mut emit_stats = MaterializeStats::default();
+        let accum_budget = accum_budget_override.unwrap_or_else(materialize_memory_budget_bytes);
         let mut accum = MaterializeAccum::default();
         let mut rows_read = 0usize;
         let mut incremental_all = true;
@@ -402,6 +423,13 @@ impl Fluree {
             {
                 watermark_refresh_due = true;
             }
+            // Per-TriplesMap emit hoists (constant predicates, class terms, FK
+            // joins), built once per table scan and reused for every row.
+            let tm_ctxs: Vec<TmEmitContext<'_>> = tms
+                .iter()
+                .map(|tm| TmEmitContext::new(tm))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| ApiError::Config(format!("invalid R2RML mapping: {e}")))?;
             let mut batch_stream = scan.stream;
             // Only count a table as contributing once it actually has a snapshot.
             if let Some(to) = to_id {
@@ -451,20 +479,52 @@ impl Fluree {
                     else {
                         continue;
                     };
-                    for tm in tms {
+                    for ctx in &tm_ctxs {
                         materialize_row_into(
-                            tm,
+                            ctx,
                             batch,
                             row,
                             row_target.clone(),
                             delete_convention.as_ref(),
                             order_by.as_deref(),
                             latest_by_key,
+                            &parents,
+                            &mut emit_stats,
                             &mut accum,
                         )?;
                     }
                 }
+
+                // Pre-OOM circuit breaker on the pass's dominant memory term
+                // (the retained-node accumulator). Checked per batch — one
+                // batch's contribution is bounded by the scan batch size — and
+                // firing here is PRE-COMMIT: no retract has run, no target is
+                // touched, the watermark stays put, so the failure leaves
+                // everything as the last successful poll did. See
+                // `ApiError::MaterializeMemoryBudget` for the operator levers.
+                if accum_budget > 0 && accum.estimated_bytes() > accum_budget {
+                    return Err(ApiError::MaterializeMemoryBudget {
+                        table: (*table_name).to_string(),
+                        estimated_bytes: accum.estimated_bytes(),
+                        budget_bytes: accum_budget,
+                        distinct_subjects: accum.len(),
+                    });
+                }
             }
+        }
+
+        // FK edges the enumerator would have emitted but couldn't: the mapping
+        // carries RefObjectMaps, and this path does not index parents yet. Before
+        // the shared enumerator this was an undetectable silent drop; now it is a
+        // counted, warned-about one.
+        if emit_stats.ref_dangling > 0 {
+            warn!(
+                source = %source_graph_source_id,
+                dropped_fk_edges = emit_stats.ref_dangling,
+                "materialize: mapping has RefObjectMap foreign-key edges, which the \
+                 incremental materializer does not materialize (parents are not indexed); \
+                 the virtual query path still serves them"
+            );
         }
 
         let incremental = any_table && incremental_all;
@@ -551,12 +611,21 @@ impl Fluree {
         // safe because a larger window breaches any of them.
         //
         // The budget is measured in serialized JSON-LD bytes (cheap to estimate
-        // here) while the ceiling is in flake bytes. JSON-LD text runs several times
-        // larger than the flakes it yields — that window was ~108 flake-bytes per
-        // row against JSON nodes of a few hundred bytes — so budgeting JSON bytes at
-        // a QUARTER of the flake ceiling errs in the safe direction. Over-chunking is
-        // nearly free: `reindex_min_bytes` is 1 MiB, so the indexer drains novelty
-        // between chunks rather than letting it accumulate toward the ceiling.
+        // here) while the ceiling is in flake bytes, so the divisor must absorb the
+        // flake/JSON size ratio. Measured across four data shapes, the flakes a
+        // document yields run 0.96–2.5× its JSON size — about the SAME size,
+        // sometimes larger, never dramatically smaller. (The outage window above
+        // happened to be a low-ratio shape, ~108 flake-bytes per row against JSON
+        // nodes of a few hundred bytes; the ratio is shape-dependent — long IRIs
+        // and per-flake overheads dominate narrow rows.) Budgeting JSON at a
+        // QUARTER of the flake ceiling therefore holds even at the worst measured
+        // ratio: 2.5 × 1/4 ≈ 0.63 of the ceiling per chunk, with the rest as
+        // headroom for the estimate itself. Over-chunking is nearly free WHEN a
+        // local indexer is running: `reindex_min_bytes` (default 100 bytes —
+        // `server_defaults.rs`) keeps novelty draining between chunks rather than
+        // letting it accumulate toward the ceiling. A node without a local indexer
+        // has no such drain, which is why the tracking worker only runs where
+        // indexing is enabled (`fluree-db-server/src/state.rs`).
         let txn_budget =
             txn_budget_override.unwrap_or((self.index_config.reindex_max_bytes / 4).max(1 << 20));
 
@@ -943,6 +1012,10 @@ struct KeyState {
     rank: Option<(i128, String)>,
     /// The winning row's live node, or `None` if the winning row is a tombstone.
     node: Option<SubjectNode>,
+    /// Estimated payload bytes of this state (rank + node), maintained by
+    /// [`MaterializeAccum`]'s accounting. Key bytes are counted separately, once,
+    /// on first insert — a replace keeps the map's existing key allocation.
+    bytes: usize,
 }
 
 /// Accumulator key: **(target ledger, graph, subject)**.
@@ -957,15 +1030,50 @@ struct KeyState {
 /// So the same subject IRI in two targets (or two graphs) is independent keys.
 type AccumKey = (String, Option<String>, String);
 
+/// Flat per-entry overhead added to the accumulator's byte estimate on first
+/// insert of a key: the BTreeMap node share, the [`KeyState`] itself, and the
+/// containers' headers. Approximate by design — the estimate is a pre-OOM
+/// circuit breaker (see [`ApiError::MaterializeMemoryBudget`]), not a meter.
+const ACCUM_ENTRY_OVERHEAD: usize = 96;
+
 /// Per-pass latest-by-key accumulator: one [`KeyState`] per [`AccumKey`]. The
 /// BTreeMap keeps keys in a stable order (deterministic transaction) and groups
 /// naturally by target ledger (the first tuple element) at commit time.
+///
+/// `bytes` tracks the estimated resident size incrementally — this map is the
+/// pass's dominant memory term (one retained node per distinct key for the
+/// whole window), and the pass aborts with a typed error when it outgrows the
+/// materialize memory budget rather than letting the kernel OOM-kill the
+/// server. Replacements apply a delta; a tombstone replacing a live node
+/// SHRINKS the estimate (its payload drops).
 #[derive(Default)]
 struct MaterializeAccum {
     keys: BTreeMap<AccumKey, KeyState>,
+    /// Estimated resident bytes: Σ per-entry (key + payload + overhead).
+    bytes: usize,
 }
 
 impl MaterializeAccum {
+    /// Estimated payload bytes of one entry's state (rank + node).
+    fn state_bytes(rank: &Option<(i128, String)>, node: &Option<SubjectNode>) -> usize {
+        let rank_bytes = rank.as_ref().map_or(0, |(_, s)| 16 + s.len());
+        rank_bytes + node.as_ref().map_or(0, SubjectNode::estimated_bytes)
+    }
+
+    /// Estimated bytes of an entry's key strings.
+    fn key_bytes(key: &AccumKey) -> usize {
+        key.0.len() + key.1.as_ref().map_or(0, String::len) + key.2.len()
+    }
+
+    /// Estimated resident bytes of the whole accumulator.
+    fn estimated_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Distinct (target, graph, subject) keys accumulated.
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
     /// Record a classified row for `subject_iri` in `target` / `graph`. `rank` is
     /// the row's ordering key (from the `order_by` column) or `None` for
     /// scan-order. `node` is the live node, or `None` for a tombstone. The row
@@ -983,10 +1091,30 @@ impl MaterializeAccum {
         node: Option<SubjectNode>,
     ) {
         let key = (target, graph, subject_iri);
-        match self.keys.get(&key) {
+        match self.keys.get_mut(&key) {
             Some(existing) if rank < existing.rank => {} // older row: ignore
-            _ => {
-                self.keys.insert(key, KeyState { rank, node });
+            Some(existing) => {
+                // Replace: payload delta only (the map keeps its key). A
+                // tombstone replacing a live node shrinks the estimate.
+                let new_bytes = Self::state_bytes(&rank, &node);
+                self.bytes = self.bytes - existing.bytes + new_bytes;
+                *existing = KeyState {
+                    rank,
+                    node,
+                    bytes: new_bytes,
+                };
+            }
+            None => {
+                let new_bytes = Self::state_bytes(&rank, &node);
+                self.bytes += Self::key_bytes(&key) + ACCUM_ENTRY_OVERHEAD + new_bytes;
+                self.keys.insert(
+                    key,
+                    KeyState {
+                        rank,
+                        node,
+                        bytes: new_bytes,
+                    },
+                );
             }
         }
     }
@@ -1003,16 +1131,36 @@ impl MaterializeAccum {
     ) {
         let key = (target, graph, subject_iri);
         match self.keys.get_mut(&key) {
-            Some(KeyState {
-                node: Some(existing),
-                ..
-            }) => existing.merge(node),
-            _ => {
+            Some(state) if state.node.is_some() => {
+                if let Some(existing) = state.node.as_mut() {
+                    existing.merge(node);
+                }
+                let new_bytes = Self::state_bytes(&state.rank, &state.node);
+                self.bytes = self.bytes - state.bytes + new_bytes;
+                state.bytes = new_bytes;
+            }
+            Some(state) => {
+                // Entry with no node (unreachable in additive mode, which never
+                // records tombstones): replace the payload, delta the estimate.
+                let node = Some(node);
+                let new_bytes = Self::state_bytes(&None, &node);
+                self.bytes = self.bytes - state.bytes + new_bytes;
+                *state = KeyState {
+                    rank: None,
+                    node,
+                    bytes: new_bytes,
+                };
+            }
+            None => {
+                let node = Some(node);
+                let new_bytes = Self::state_bytes(&None, &node);
+                self.bytes += Self::key_bytes(&key) + ACCUM_ENTRY_OVERHEAD + new_bytes;
                 self.keys.insert(
                     key,
                     KeyState {
                         rank: None,
-                        node: Some(node),
+                        node,
+                        bytes: new_bytes,
                     },
                 );
             }
@@ -1402,6 +1550,24 @@ impl Fluree {
 /// RAISE THIS ONLY WITH THE RETENTION IN HAND. If a deployment shortens snapshot
 /// retention, this must shorten with it, or watermarks silently expire and every
 /// poll becomes a full read. Override with `FLUREE_MATERIALIZE_WATERMARK_REFRESH_MINS`.
+/// The materialize accumulator's memory budget in bytes, from
+/// `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024 MiB; `0` disables the
+/// gate). See [`ApiError::MaterializeMemoryBudget`] for what exceeding it
+/// means and the levers. The default caps a runaway window at ~1 GiB of
+/// estimated accumulator — roughly 2-4M modest subjects — instead of letting
+/// it grow to whatever the container allows (measured: 21.4 GiB before the
+/// kernel intervened).
+fn materialize_memory_budget_bytes() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let mb = std::env::var("FLUREE_MATERIALIZE_MEMORY_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1024);
+        mb.saturating_mul(1024 * 1024)
+    })
+}
+
 fn watermark_refresh_bound_ms() -> i64 {
     static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -1685,6 +1851,21 @@ impl SubjectNode {
         }
     }
 
+    /// Approximate heap bytes held by this node: id + type IRIs + predicate
+    /// keys + JSON values — sized with [`estimated_json_bytes`], the same model
+    /// the transaction chunker uses, so the accumulator budget and the chunk
+    /// budget agree about what a node "weighs" — plus a small per-element
+    /// container overhead.
+    fn estimated_bytes(&self) -> usize {
+        let types: usize = self.types.iter().map(|t| t.len() + 8).sum();
+        let preds: usize = self
+            .predicates
+            .iter()
+            .map(|(k, vs)| k.len() + 32 + vs.iter().map(estimated_json_bytes).sum::<usize>())
+            .sum();
+        self.id.len() + types + preds
+    }
+
     fn add_type(&mut self, class: &str) {
         if !self.types.iter().any(|c| c == class) {
             self.types.push(class.to_string());
@@ -1775,43 +1956,67 @@ impl SubjectNode {
 
 /// The `rdf:type` predicate IRI. A predicate-object map asserting it is treated
 /// as a subject class (data-driven typing), not an ordinary predicate — see
-/// [`build_live_node`].
+/// [`NodeCollector`].
 const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
-/// Build a live `SubjectNode` from one source row (subject classes + the
-/// constant-predicate objects). RefObjectMap joins are resolved at query time,
-/// not during materialization.
+/// A [`TripleObserver`] that collects one row's triples into a [`SubjectNode`]
+/// (the JSON-LD upsert shape). The subject is fixed by the caller — the
+/// classification pass has already materialized and screened it — so observed
+/// subject terms are not consulted.
+///
+/// A triple whose predicate is `rdf:type` with an IRI object is routed to the
+/// node's `@type`, not to an ordinary predicate. `rr:class` is constant-only,
+/// so per-row typing (e.g. `as:Announce` vs `as:Article` from a `type` column)
+/// must be a POM with `rr:predicate rdf:type` — routing it to `@type` lets it
+/// UNION across sources in additive mode, where an ordinary predicate would be
+/// upserted and clobber other sources' types on a shared subject. (A non-IRI
+/// rdf:type object is malformed; it falls through as an ordinary predicate.)
+/// Constant `rr:class` classes arrive through the same rdf:type route, emitted
+/// by the shared enumerator.
+struct NodeCollector {
+    node: SubjectNode,
+}
+
+impl TripleObserver for NodeCollector {
+    fn observe(
+        &mut self,
+        _subject: &RdfTerm,
+        predicate: &str,
+        object: &RdfTerm,
+    ) -> fluree_db_r2rml::R2rmlResult<()> {
+        match object {
+            RdfTerm::Iri(iri) if predicate == RDF_TYPE_IRI => self.node.add_type(iri),
+            other => self
+                .node
+                .add_object(predicate, rdf_term_to_jsonld(other.clone())),
+        }
+        Ok(())
+    }
+}
+
+/// Build a live `SubjectNode` from one source row via the shared enumerator
+/// ([`emit_row_terms`]) — the same row→triples semantics as the bulk twin
+/// builder (`fluree materialize`), so the two engines cannot drift on POM
+/// interpretation. Relative to the hand-rolled predecessor this also emits
+/// templated (non-constant) predicates and RefObjectMap foreign-key edges —
+/// the latter only when `parents` has been indexed; unindexed parents drop the
+/// edge as dangling (counted in `stats.ref_dangling`), matching the previous
+/// behavior of not materializing FK joins.
 fn build_live_node(
-    tm: &TriplesMap,
+    ctx: &TmEmitContext<'_>,
     batch: &ColumnBatch,
     row: usize,
+    parents: &ParentIndexSet,
+    stats: &mut MaterializeStats,
     id: String,
 ) -> Result<SubjectNode> {
-    let mut node = SubjectNode::new(id);
-    for class in &tm.subject_map.classes {
-        node.add_type(class);
-    }
-    for pom in &tm.predicate_object_maps {
-        let Some(predicate) = pom.predicate_map.as_constant() else {
-            continue;
-        };
-        let obj = materialize_object_from_batch(&pom.object_map, batch, row)
-            .map_err(|e| ApiError::Internal(format!("R2RML object materialization failed: {e}")))?;
-        if let Some(term) = obj {
-            // A data-driven `rdf:type` object map is a CLASS, not an ordinary
-            // predicate. `rr:class` is constant-only, so per-row typing (e.g.
-            // `as:Announce` vs `as:Article` from a `type` column) must be a POM
-            // with `rr:predicate rdf:type`. Route it to the subject's @type so it
-            // UNIONS across sources in additive mode — as an ordinary predicate it
-            // would be upserted and clobber other sources' types on a shared
-            // subject. (A non-IRI rdf:type object is malformed; fall through.)
-            match term {
-                RdfTerm::Iri(iri) if predicate == RDF_TYPE_IRI => node.add_type(&iri),
-                other => node.add_object(predicate, rdf_term_to_jsonld(other)),
-            }
-        }
-    }
-    Ok(node)
+    let subject = RdfTerm::Iri(id.clone());
+    let mut collector = NodeCollector {
+        node: SubjectNode::new(id),
+    };
+    emit_row_terms(ctx, batch, row, &subject, parents, &mut collector, stats)
+        .map_err(|e| ApiError::Internal(format!("R2RML row materialization failed: {e}")))?;
+    Ok(collector.node)
 }
 
 /// Expand one source row through a triples map into the accumulator. The subject
@@ -1838,15 +2043,18 @@ fn resolve_target_ledger(target: &str, batch: &ColumnBatch, row: usize) -> Optio
 
 #[allow(clippy::too_many_arguments)]
 fn materialize_row_into(
-    tm: &TriplesMap,
+    ctx: &TmEmitContext<'_>,
     batch: &ColumnBatch,
     row: usize,
     target_ledger: String,
     convention: Option<&DeleteConvention>,
     order_by: Option<&str>,
     latest_by_key: bool,
+    parents: &ParentIndexSet,
+    stats: &mut MaterializeStats,
     accum: &mut MaterializeAccum,
 ) -> Result<()> {
+    let tm = ctx.tm();
     let subject_term = materialize_subject_from_batch(&tm.subject_map, batch, row)
         .map_err(|e| ApiError::Internal(format!("R2RML subject materialization failed: {e}")))?;
     let subject_iri = match subject_term {
@@ -1869,7 +2077,7 @@ fn materialize_row_into(
 
     if !latest_by_key {
         // Legacy additive: merge this live row into the (target, graph, subject) node.
-        let node = build_live_node(tm, batch, row, subject_iri.clone())?;
+        let node = build_live_node(ctx, batch, row, parents, stats, subject_iri.clone())?;
         accum.merge_live(target_ledger, graph_iri, subject_iri, node);
         return Ok(());
     }
@@ -1883,7 +2091,14 @@ fn materialize_row_into(
     let node = if is_tombstone {
         None
     } else {
-        Some(build_live_node(tm, batch, row, subject_iri.clone())?)
+        Some(build_live_node(
+            ctx,
+            batch,
+            row,
+            parents,
+            stats,
+            subject_iri.clone(),
+        )?)
     };
     accum.record(target_ledger, graph_iri, subject_iri, rank, node);
     Ok(())
@@ -2251,6 +2466,56 @@ mod tests {
     }
 
     #[test]
+    fn accum_bytes_follows_insert_replace_merge_and_tombstone() {
+        // The byte estimate is the input to the pre-OOM circuit breaker, so its
+        // accounting must track every mutation path. The one a naive
+        // implementation gets wrong: a tombstone REPLACING a live node must
+        // SHRINK the estimate (the payload drops; key + overhead remain).
+        let mut a = MaterializeAccum::default();
+        assert_eq!(a.estimated_bytes(), 0);
+
+        let fat = |iri: &str| {
+            let mut n = SubjectNode::new(iri.to_string());
+            n.add_object("http://ex/name", json!("a-reasonably-long-value"));
+            Some(n)
+        };
+
+        a.record(TGT.into(), None, "urn:a".into(), ts(100), fat("urn:a"));
+        let after_insert = a.estimated_bytes();
+        assert!(after_insert > 0, "fresh insert must grow the estimate");
+
+        // An older row is ignored: no change.
+        a.record(TGT.into(), None, "urn:a".into(), ts(50), fat("urn:a"));
+        assert_eq!(a.estimated_bytes(), after_insert);
+
+        // A newer tombstone replaces the live node: estimate shrinks but stays
+        // positive (the entry itself remains).
+        a.record(TGT.into(), None, "urn:a".into(), ts(200), None);
+        let after_tombstone = a.estimated_bytes();
+        assert!(
+            after_tombstone < after_insert,
+            "tombstone replacing a live node must shrink: {after_insert} -> {after_tombstone}"
+        );
+        assert!(after_tombstone > 0);
+        assert_eq!(a.len(), 1, "replace, not a second entry");
+
+        // Additive merge with a NEW predicate must grow the existing node.
+        let mut b = MaterializeAccum::default();
+        let mut n1 = SubjectNode::new("urn:m".to_string());
+        n1.add_object("http://ex/p1", json!("v1"));
+        b.merge_live(TGT.into(), None, "urn:m".into(), n1);
+        let first = b.estimated_bytes();
+        let mut n2 = SubjectNode::new("urn:m".to_string());
+        n2.add_object("http://ex/p2", json!("v2"));
+        b.merge_live(TGT.into(), None, "urn:m".into(), n2);
+        assert!(
+            b.estimated_bytes() > first,
+            "additive merge must grow the estimate"
+        );
+        assert_eq!(b.len(), 1);
+    }
+
+    #[test]
     fn record_isolates_same_subject_across_graphs() {
         // The SAME subject IRI in two different graphs is two independent keys —
         // per-(tenant,user) statements about one entity never collide. Recording a
@@ -2492,7 +2757,9 @@ mod tests {
     #[test]
     fn build_live_node_routes_rdf_type_pom_to_union_type() {
         use fluree_db_iceberg::io::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
-        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap};
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+        };
         use std::sync::Arc;
 
         // A source row whose `type` column holds a full-IRI class (data-driven typing).
@@ -2520,7 +2787,13 @@ mod tests {
             },
         );
 
-        let node = build_live_node(&tm, &batch, 0, "urn:s".to_string()).unwrap();
+        // No RefObjectMaps anywhere, so an empty mapping's (empty) parent plan
+        // is equivalent to this tm's.
+        let parents = ParentIndexSet::new(&CompiledR2rmlMapping::new(vec![])).unwrap();
+        let ctx = TmEmitContext::new(&tm).unwrap();
+        let mut stats = MaterializeStats::default();
+        let node =
+            build_live_node(&ctx, &batch, 0, &parents, &mut stats, "urn:s".to_string()).unwrap();
         // The rdf:type POM is routed to @type (the additive union-insert path),
         // NOT to predicates (which would be upserted and clobber other sources'
         // classes on a shared subject IRI).
@@ -2751,7 +3024,7 @@ mod engine_tests {
         );
 
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_native:main", false, None)
+            .materialize_from_source(&src, "people:main", "people_native:main", false, None, None)
             .await
             .expect("materialize");
 
@@ -2793,7 +3066,7 @@ mod engine_tests {
         );
 
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_native:main", false, None)
+            .materialize_from_source(&src, "people:main", "people_native:main", false, None, None)
             .await
             .expect("materialize");
 
@@ -2820,7 +3093,14 @@ mod engine_tests {
             src.window_age_ms = age;
 
             let result = fluree
-                .materialize_from_source(&src, "people:main", "people_native:main", false, None)
+                .materialize_from_source(
+                    &src,
+                    "people:main",
+                    "people_native:main",
+                    false,
+                    None,
+                    None,
+                )
                 .await
                 .expect("materialize");
 
@@ -2851,7 +3131,14 @@ mod engine_tests {
         );
 
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_{tenant}:main", false, None)
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                None,
+            )
             .await
             .expect("materialize");
 
@@ -2901,7 +3188,14 @@ mod engine_tests {
             let fluree = FlureeBuilder::memory().build_memory();
             let src = FakeSource::new(people_mapping(), vec![batch(&rows)]);
             let result = fluree
-                .materialize_from_source(&src, "people:main", "people_native:main", false, budget)
+                .materialize_from_source(
+                    &src,
+                    "people:main",
+                    "people_native:main",
+                    false,
+                    budget,
+                    None,
+                )
                 .await
                 .expect("materialize");
             assert_eq!(
@@ -2923,6 +3217,129 @@ mod engine_tests {
              unbounded reached t={unbounded}, budget=200B reached t={chunked} — chunking \
              is not happening at the call site"
         );
+    }
+
+    /// Templated (non-constant) predicates must materialize. The hand-rolled emission
+    /// this engine used before the shared enumerator silently DROPPED any POM whose
+    /// predicate was not `rr:predicate`-constant, so a twin was missing triples the
+    /// virtual query path serves. The shared enumerator expands
+    /// `rr:predicateMap`/`rr:template` per row; this pins that the expanded predicate
+    /// actually lands in the target ledger. Result-level counters cannot see it — a
+    /// subject whose only POM is dropped still upserts (id + type), so
+    /// `subjects_upserted` is identical either way and only ledger content
+    /// distinguishes the two behaviors.
+    #[tokio::test]
+    async fn a_templated_predicate_materializes_into_the_target() {
+        let tm = TriplesMap::new("http://tm/people", "people")
+            .with_subject_template("http://ex/person/{id}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::template(
+                    "http://ex/attr/{attr}",
+                    vec!["attr".to_string()],
+                ),
+                object_map: ObjectMap::column("score"),
+            });
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            mapping,
+            vec![batch(&[
+                ("id", &["1"]),
+                ("attr", &["height"]),
+                ("score", &["tall"]),
+            ])],
+        );
+        let result = fluree
+            .materialize_from_source(&src, "people:main", "people_native:main", false, None, None)
+            .await
+            .expect("materialize");
+        assert_eq!(result.subjects_upserted, 1);
+
+        let ledger = fluree.ledger("people_native:main").await.expect("target");
+        let db = crate::GraphDb::from_ledger_state(&ledger);
+        let q = json!({
+            "select": ["?o"],
+            "where": { "@id": "http://ex/person/1", "http://ex/attr/height": "?o" }
+        });
+        let out = fluree
+            .query(&db, &q)
+            .await
+            .expect("query")
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("format")
+            .to_string();
+        assert!(
+            out.contains("tall"),
+            "the templated predicate's triple must land in the twin: {out}"
+        );
+    }
+
+    /// The accumulator memory budget is a PRE-COMMIT circuit breaker: a window whose
+    /// estimated accumulator exceeds it must fail with the typed error BEFORE anything is
+    /// applied — no target ledger created, no state-ledger watermark persisted — and the
+    /// SAME window under the default budget must succeed. The comparative shape is what
+    /// makes it mutation-sensitive: gutting the gate turns the failing arm into the
+    /// passing arm.
+    #[tokio::test]
+    async fn a_window_larger_than_the_memory_budget_fails_before_any_commit() {
+        let ids: Vec<String> = (0..40).map(|i| i.to_string()).collect();
+        let names: Vec<String> = (0..40).map(|i| format!("person-{i:04}")).collect();
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let rows = vec![("id", id_refs.as_slice()), ("name", name_refs.as_slice())];
+
+        // Arm 1: a 200-byte budget cannot hold 40 subjects — typed error, nothing applied.
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(people_mapping(), vec![batch(&rows)]);
+        let err = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_native:main",
+                false,
+                None,
+                Some(200),
+            )
+            .await
+            .expect_err("40 subjects cannot fit a 200-byte accumulator budget");
+        match &err {
+            ApiError::MaterializeMemoryBudget {
+                estimated_bytes,
+                budget_bytes,
+                distinct_subjects,
+                ..
+            } => {
+                assert_eq!(*budget_bytes, 200);
+                assert!(*estimated_bytes > 200);
+                assert!(*distinct_subjects > 0);
+            }
+            other => panic!("expected MaterializeMemoryBudget, got: {other:?}"),
+        }
+        assert!(
+            !fluree
+                .ledger_exists("people_native:main")
+                .await
+                .expect("exists check"),
+            "pre-commit abort must not create or touch the target ledger"
+        );
+        assert!(
+            !fluree
+                .ledger_exists(MATERIALIZE_STATE_LEDGER)
+                .await
+                .expect("exists check"),
+            "pre-commit abort must not persist a watermark"
+        );
+
+        // Arm 2: the same window under the default budget applies fully.
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(people_mapping(), vec![batch(&rows)]);
+        let result = fluree
+            .materialize_from_source(&src, "people:main", "people_native:main", false, None, None)
+            .await
+            .expect("materialize");
+        assert_eq!(result.subjects_upserted, 40);
     }
 
     /// A row whose template column is NULL cannot be routed anywhere, so it is skipped
@@ -2960,7 +3377,14 @@ mod engine_tests {
         let src = FakeSource::new(people_mapping(), vec![b]);
 
         let result = fluree
-            .materialize_from_source(&src, "people:main", "people_{tenant}:main", false, None)
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                None,
+            )
             .await
             .expect("materialize");
 

@@ -465,6 +465,154 @@ fn rdf_term_bytes(term: &RdfTerm) -> usize {
 // Emission
 // ---------------------------------------------------------------------------
 
+/// Per-TriplesMap hoists for row emission (O4):
+///  - canonical joins for the RefObjectMap POMs;
+///  - the constant rdf:type object terms (was `RdfTerm::iri(class.clone())` per
+///    row — a fresh heap clone of every class IRI on every fact/dim row);
+///  - each POM's constant predicate as a borrow (the overwhelmingly common
+///    case), so the hot data-triple path avoids the per-row predicate clone.
+///
+/// Build once per TriplesMap and reuse across every batch and row — the
+/// contents depend only on the mapping, not on any batch.
+pub struct TmEmitContext<'a> {
+    tm: &'a TriplesMap,
+    ref_joins: Vec<Option<(Vec<String>, Vec<String>)>>,
+    class_terms: Vec<RdfTerm>,
+    const_preds: Vec<Option<&'a str>>,
+}
+
+impl<'a> TmEmitContext<'a> {
+    pub fn new(tm: &'a TriplesMap) -> R2rmlResult<Self> {
+        let ref_joins = tm
+            .predicate_object_maps
+            .iter()
+            .map(|pom| match &pom.object_map {
+                ObjectMap::RefObjectMap(rom) => canonical_join(rom).map(Some),
+                _ => Ok(None),
+            })
+            .collect::<R2rmlResult<Vec<_>>>()?;
+        let class_terms = tm
+            .classes()
+            .iter()
+            .map(|c| RdfTerm::iri(c.clone()))
+            .collect();
+        let const_preds = tm
+            .predicate_object_maps
+            .iter()
+            .map(|pom| match &pom.predicate_map {
+                PredicateMap::Constant(iri) => Some(iri.as_str()),
+                _ => None,
+            })
+            .collect();
+        Ok(Self {
+            tm,
+            ref_joins,
+            class_terms,
+            const_preds,
+        })
+    }
+
+    /// The TriplesMap this context was built from.
+    pub fn tm(&self) -> &'a TriplesMap {
+        self.tm
+    }
+}
+
+/// Emit every triple produced by one row of `tm`'s logical table through
+/// `observer`. Parent indexes for any `RefObjectMap` targets must already be
+/// populated; an unindexed parent drops the edge as dangling
+/// (`stats.ref_dangling`), which is R2RML inner-join semantics.
+///
+/// Returns the number of triples emitted for the row. The caller is
+/// responsible for folding that into `stats.per_tm` — kept out of here so a
+/// per-batch caller pays one `tm.iri` clone per batch, not per row (O4). A
+/// null subject key emits nothing and returns 0.
+pub fn emit_row(
+    ctx: &TmEmitContext<'_>,
+    batch: &ColumnBatch,
+    row: usize,
+    parents: &ParentIndexSet,
+    observer: &mut dyn TripleObserver,
+    stats: &mut MaterializeStats,
+) -> R2rmlResult<u64> {
+    let subject = match materialize_subject_from_batch(&ctx.tm.subject_map, batch, row)? {
+        Some(s) => s,
+        None => return Ok(0), // null subject key → no triples for this row
+    };
+    stats.subjects += 1;
+    emit_row_terms(ctx, batch, row, &subject, parents, observer, stats)
+}
+
+/// [`emit_row`] for a caller-supplied subject term: emits the row's triples
+/// without re-materializing (or counting) the subject. For callers that have
+/// already materialized and screened the row's subject — e.g. the incremental
+/// materializer, which classifies each row by subject (tombstone vs live,
+/// routing) before deciding to emit it.
+pub fn emit_row_terms(
+    ctx: &TmEmitContext<'_>,
+    batch: &ColumnBatch,
+    row: usize,
+    subject: &RdfTerm,
+    parents: &ParentIndexSet,
+    observer: &mut dyn TripleObserver,
+    stats: &mut MaterializeStats,
+) -> R2rmlResult<u64> {
+    let tm = ctx.tm;
+    let mut tm_triples: u64 = 0;
+
+    // rdf:type triples, one per declared class.
+    for class_term in &ctx.class_terms {
+        observer.observe(subject, fluree_vocab::rdf::TYPE, class_term)?;
+        stats.type_triples += 1;
+        tm_triples += 1;
+    }
+
+    // Predicate-object maps.
+    for (i, pom) in tm.predicate_object_maps.iter().enumerate() {
+        let predicate: Cow<str> = match ctx.const_preds[i] {
+            Some(iri) => Cow::Borrowed(iri),
+            None => match materialize_predicate_from_batch(&pom.predicate_map, batch, row)? {
+                Some(p) => Cow::Owned(p),
+                None => continue, // null templated/column predicate → no triple
+            },
+        };
+
+        match &pom.object_map {
+            ObjectMap::RefObjectMap(rom) => {
+                let (parent_cols, child_cols) = ctx.ref_joins[i]
+                    .as_ref()
+                    .expect("ref POM has a precomputed canonical join");
+                let child_key = match get_join_key_from_batch(child_cols, batch, row) {
+                    Some(k) => k,
+                    None => continue, // null FK → no triple
+                };
+                match parents.lookup(&rom.parent_triples_map, parent_cols, &child_key) {
+                    Some(parent_subject) => {
+                        observer.observe(subject, &predicate, parent_subject)?;
+                        stats.ref_triples += 1;
+                        *stats
+                            .ref_edges
+                            .entry((tm.iri.clone(), predicate.to_string()))
+                            .or_default() += 1;
+                        tm_triples += 1;
+                    }
+                    None => stats.ref_dangling += 1, // dangling/absent parent → no triple
+                }
+            }
+            other => match materialize_object_from_batch(other, batch, row)? {
+                Some(object) => {
+                    observer.observe(subject, &predicate, &object)?;
+                    stats.data_triples += 1;
+                    tm_triples += 1;
+                }
+                None => stats.null_objects += 1, // null object column → no triple
+            },
+        }
+    }
+
+    Ok(tm_triples)
+}
+
 /// Emit every triple produced by one TriplesMap's batch of rows. Parent indexes
 /// for any `RefObjectMap` targets must already be populated (guaranteed by
 /// [`enumerate_from_batches`] / the dims-first driver).
@@ -475,94 +623,14 @@ pub fn emit_batch(
     observer: &mut dyn TripleObserver,
     stats: &mut MaterializeStats,
 ) -> R2rmlResult<()> {
-    // Precompute once per batch, not per row (O4):
-    //  - canonical joins for the RefObjectMap POMs;
-    //  - the constant rdf:type object terms (was `RdfTerm::iri(class.clone())` per
-    //    row — a fresh heap clone of every class IRI on every fact/dim row);
-    //  - each POM's constant predicate as a borrow (the overwhelmingly common
-    //    case), so the hot data-triple path avoids the per-row predicate clone.
-    let ref_joins: Vec<Option<(Vec<String>, Vec<String>)>> = tm
-        .predicate_object_maps
-        .iter()
-        .map(|pom| match &pom.object_map {
-            ObjectMap::RefObjectMap(rom) => canonical_join(rom).map(Some),
-            _ => Ok(None),
-        })
-        .collect::<R2rmlResult<Vec<_>>>()?;
-    let class_terms: Vec<RdfTerm> = tm
-        .classes()
-        .iter()
-        .map(|c| RdfTerm::iri(c.clone()))
-        .collect();
-    let const_preds: Vec<Option<&str>> = tm
-        .predicate_object_maps
-        .iter()
-        .map(|pom| match &pom.predicate_map {
-            PredicateMap::Constant(iri) => Some(iri.as_str()),
-            _ => None,
-        })
-        .collect();
+    let ctx = TmEmitContext::new(tm)?;
 
     // Fold this TriplesMap's triple total into `per_tm` ONCE at the end (one
     // `tm.iri` clone per batch, not one per emitted triple).
     let mut tm_triples: u64 = 0;
 
     for row in 0..batch.num_rows {
-        let subject = match materialize_subject_from_batch(&tm.subject_map, batch, row)? {
-            Some(s) => s,
-            None => continue, // null subject key → no triples for this row
-        };
-        stats.subjects += 1;
-
-        // rdf:type triples, one per declared class.
-        for class_term in &class_terms {
-            observer.observe(&subject, fluree_vocab::rdf::TYPE, class_term)?;
-            stats.type_triples += 1;
-            tm_triples += 1;
-        }
-
-        // Predicate-object maps.
-        for (i, pom) in tm.predicate_object_maps.iter().enumerate() {
-            let predicate: Cow<str> = match const_preds[i] {
-                Some(iri) => Cow::Borrowed(iri),
-                None => match materialize_predicate_from_batch(&pom.predicate_map, batch, row)? {
-                    Some(p) => Cow::Owned(p),
-                    None => continue, // null templated/column predicate → no triple
-                },
-            };
-
-            match &pom.object_map {
-                ObjectMap::RefObjectMap(rom) => {
-                    let (parent_cols, child_cols) = ref_joins[i]
-                        .as_ref()
-                        .expect("ref POM has a precomputed canonical join");
-                    let child_key = match get_join_key_from_batch(child_cols, batch, row) {
-                        Some(k) => k,
-                        None => continue, // null FK → no triple
-                    };
-                    match parents.lookup(&rom.parent_triples_map, parent_cols, &child_key) {
-                        Some(parent_subject) => {
-                            observer.observe(&subject, &predicate, parent_subject)?;
-                            stats.ref_triples += 1;
-                            *stats
-                                .ref_edges
-                                .entry((tm.iri.clone(), predicate.to_string()))
-                                .or_default() += 1;
-                            tm_triples += 1;
-                        }
-                        None => stats.ref_dangling += 1, // dangling/absent parent → no triple
-                    }
-                }
-                other => match materialize_object_from_batch(other, batch, row)? {
-                    Some(object) => {
-                        observer.observe(&subject, &predicate, &object)?;
-                        stats.data_triples += 1;
-                        tm_triples += 1;
-                    }
-                    None => stats.null_objects += 1, // null object column → no triple
-                },
-            }
-        }
+        tm_triples += emit_row(&ctx, batch, row, parents, observer, stats)?;
     }
 
     if tm_triples > 0 {

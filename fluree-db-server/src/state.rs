@@ -282,13 +282,20 @@ impl AppState {
         let storage_vend_scope = resolve_storage_vend_scope(&config);
 
         // Spawn the R2RML/Iceberg materialization tracking worker on write
-        // nodes. Peers forward writes elsewhere, so they don't run it. (In Raft
-        // mode the worker currently runs on every node and writes directly via
-        // `Fluree::upsert`; gating it to the leader is a follow-up — single-node
-        // and peer deployments are correct today.)
+        // nodes that index locally. Peers forward writes elsewhere, so they
+        // don't run it. Nodes with `indexing_enabled = false` (external-indexer
+        // mode) don't either: the materializer's chunked commits rely on the
+        // LOCAL indexer draining novelty between chunks (see the txn-budget
+        // comment in `r2rml_materialize.rs`) — with `.without_indexing()`
+        // nothing drains, novelty only grows, and any sync bigger than the
+        // ceiling parks on backpressure until it fails. `POST /iceberg/track`
+        // on such a node returns the "worker is not running" error. (In Raft
+        // mode the worker currently runs on every qualifying node and writes
+        // directly via `Fluree::upsert`; gating it to the leader is a follow-up
+        // — single-node and peer deployments are correct today.)
         #[cfg(feature = "iceberg")]
         let (materialize_worker, materialize_worker_task) =
-            if config.server_role != ServerRole::Peer {
+            if config.server_role != ServerRole::Peer && config.indexing_enabled {
                 let worker = fluree_db_api::MaterializeTrackingWorker::new(Arc::clone(&fluree));
                 let handle = worker.handle();
                 let task = tokio::spawn(worker.run());

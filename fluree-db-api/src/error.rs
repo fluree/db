@@ -248,6 +248,40 @@ pub enum ApiError {
     #[error("Invalid configuration: {0}")]
     Config(String),
 
+    /// A materialize pass's subject accumulator outgrew its memory budget.
+    ///
+    /// A pre-OOM circuit breaker, not an allocator meter: the bytes are
+    /// ESTIMATED (string lengths + JSON value sizes + flat per-entry overhead)
+    /// as rows accumulate, and the pass aborts BEFORE any commit — no retract
+    /// has run, no target ledger is touched, the watermark is un-advanced, so
+    /// the failure leaves everything exactly as the last successful poll did.
+    /// The previous behavior was the kernel OOM-killing the whole server with
+    /// no log line (measured: 21.4 GiB resident on a 735k-row full re-read,
+    /// killed every 4-6 minutes, watermark never advancing).
+    ///
+    /// This failure is DETERMINISTIC: the same window fails identically on the
+    /// next poll. Levers, in order: an incremental window this large usually
+    /// means the poll interval is too long — shorten it so windows stay small;
+    /// a FULL read this large has no window to shrink — raise
+    /// `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; 0 disables the
+    /// gate) for a scheduled off-peak sync until streaming finalization lands.
+    #[error(
+        "materialize window for table '{table}' needs ~{estimated_bytes} B of accumulator \
+         memory ({distinct_subjects} distinct subjects) against a budget of {budget_bytes} B; \
+         nothing was committed. Shorten the poll interval (smaller windows) or raise \
+         FLUREE_MATERIALIZE_MEMORY_BUDGET_MB (0 disables)"
+    )]
+    MaterializeMemoryBudget {
+        /// Source table whose window overflowed the accumulator.
+        table: String,
+        /// Estimated resident bytes of the accumulator at abort.
+        estimated_bytes: usize,
+        /// The configured budget in bytes.
+        budget_bytes: usize,
+        /// Distinct (target, graph, subject) keys accumulated at abort.
+        distinct_subjects: usize,
+    },
+
     /// Unresolved `owl:imports` in the reasoning schema closure.
     ///
     /// Produced when a graph reachable from `f:schemaSource` declares

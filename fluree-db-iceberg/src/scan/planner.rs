@@ -240,9 +240,11 @@ impl<'a, S: IcebergStorage> ScanPlanner<'a, S> {
 
     /// Plan a scan for a specific snapshot.
     pub async fn plan_scan_for_snapshot(&self, snapshot: &Snapshot) -> Result<ScanPlan> {
+        // Schema at `snapshot`, not current — mirrors `SendScanPlanner`
+        // (send_planner.rs); keep the two in sync.
         let schema = self
             .metadata
-            .current_schema()
+            .schema_for_snapshot(snapshot)
             .ok_or_else(|| IcebergError::Metadata("No current schema".to_string()))?;
 
         // Clone schema into Arc for sharing with tasks

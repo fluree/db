@@ -37,12 +37,40 @@ const POLL: Duration = Duration::from_millis(50);
 async fn state_in(tmp: &TempDir) -> Arc<AppState> {
     let cfg = ServerConfig {
         cors_enabled: false,
-        indexing_enabled: false,
+        // The tracking worker only spawns where a local indexer runs (it relies
+        // on the indexer draining novelty between materialize chunks), and the
+        // worker is what these tests exercise — so indexing stays at its
+        // shipped default (enabled). `worker_requires_local_indexing` below
+        // pins the disabled-indexing behavior.
+        indexing_enabled: true,
         storage_path: Some(tmp.path().to_path_buf()),
         ..Default::default()
     };
     let telemetry = TelemetryConfig::with_server_config(&cfg);
     Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"))
+}
+
+/// A node with `indexing_enabled = false` (external-indexer mode) must NOT run
+/// the tracking worker: materialize chunking relies on the local indexer
+/// draining novelty between chunks, and without one novelty only grows until
+/// every large sync parks on backpressure. The `/track` route surfaces this as
+/// its "worker is not running" error rather than accepting a job that can
+/// never drain.
+#[tokio::test]
+async fn worker_requires_local_indexing() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    assert!(
+        state.materialize_worker.is_none(),
+        "tracking worker must not spawn without a local indexer"
+    );
 }
 
 async fn tracking(app: &Router) -> Value {

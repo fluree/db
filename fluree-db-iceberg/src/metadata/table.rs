@@ -98,6 +98,24 @@ impl TableMetadata {
         self.schemas.iter().find(|s| s.schema_id == id)
     }
 
+    /// The schema in effect AT `snapshot` — the one its rows were written and
+    /// committed under — falling back to [`Self::current_schema`] when the
+    /// snapshot carries no `schema-id` or the id is unknown (both legal:
+    /// `schema-id` is optional on v1-era snapshots).
+    ///
+    /// Reads pinned to a historical snapshot must project against this, not
+    /// `current_schema()`: Iceberg reads Parquet by field id, so what schema
+    /// evolution breaks is the name→id mapping (a column renamed since the pin
+    /// resolves to nothing, or to a different field) and type interpretation
+    /// (a re-typed column decodes wrong). When `snapshot` IS the current
+    /// snapshot the two agree and this is a no-op.
+    pub fn schema_for_snapshot(&self, snapshot: &super::Snapshot) -> Option<&Schema> {
+        snapshot
+            .schema_id
+            .and_then(|id| self.schema(id))
+            .or_else(|| self.current_schema())
+    }
+
     /// Get the partition spec by ID.
     pub fn partition_spec(&self, id: i32) -> Option<&PartitionSpec> {
         self.partition_specs.iter().find(|s| s.spec_id == id)
@@ -464,6 +482,42 @@ mod tests {
             default_sort_order_id: 0,
             properties: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn schema_for_snapshot_follows_the_snapshot_schema_id() {
+        let bare_schema = |id: i32| Schema {
+            schema_id: id,
+            identifier_field_ids: vec![],
+            fields: vec![],
+        };
+        let mut m = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+        ]);
+        // Schema evolved after snapshot 1: current is 1, snapshot 1 pinned 0.
+        m.schemas = vec![bare_schema(0), bare_schema(1)];
+        m.current_schema_id = 1;
+        m.snapshots[0].schema_id = Some(0);
+
+        // Pinned snapshot → its own (historical) schema, not current.
+        let s1 = m.snapshot(1).unwrap();
+        assert_eq!(m.schema_for_snapshot(s1).unwrap().schema_id, 0);
+
+        // Snapshot pinning the current schema → current.
+        m.snapshots[1].schema_id = Some(1);
+        let s2 = m.snapshot(2).unwrap();
+        assert_eq!(m.schema_for_snapshot(s2).unwrap().schema_id, 1);
+
+        // No schema-id on the snapshot (v1-era metadata) → fall back to current.
+        m.snapshots[0].schema_id = None;
+        let s1 = m.snapshot(1).unwrap();
+        assert_eq!(m.schema_for_snapshot(s1).unwrap().schema_id, 1);
+
+        // Unknown schema-id → fall back to current rather than failing the read.
+        m.snapshots[0].schema_id = Some(99);
+        let s1 = m.snapshot(1).unwrap();
+        assert_eq!(m.schema_for_snapshot(s1).unwrap().schema_id, 1);
     }
 
     #[test]

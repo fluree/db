@@ -506,6 +506,52 @@ target. The materializer enforces what it can and documents the rest:
   commit to the state ledger**, never before the data — so an interrupted run
   re-materializes the same window on the next pass (self-healing, because the data
   writes are idempotent: whole-subject replace / idempotent insert+upsert).
+- **A window is applied as several transactions**, chunked to fit the target
+  ledger's novelty ceiling. An interrupted or failed pass can therefore leave a
+  target *partially applied* — some subjects re-asserted, others not yet — until
+  the next successful poll re-materializes the window (the watermark only
+  advances after the whole window commits).
+- **A window's working memory is budgeted, not unbounded.** The pass retains one
+  node per distinct subject in the window; a window whose estimated accumulator
+  exceeds `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; `0` disables)
+  fails *before any commit* with a typed error naming the size and the levers —
+  instead of the process being OOM-killed. An incremental window that large
+  usually means the poll interval is too long; a *full* read that large needs a
+  raised budget until streaming finalization lands. This failure recurs every
+  poll until the budget or window changes.
+- **Merge-on-read tables fail closed on both materialize paths** (incremental
+  added-files scans and full reads), exactly as on the query path — see
+  [Limitations](#limitations) item 4 and `FLUREE_ICEBERG_ALLOW_MOR_DELETES`.
+  Materializing makes the guard *more* important, not less: a query returning
+  deleted rows is a transient wrong answer, but a materialized twin commits them
+  as state and advances the watermark past the window.
+- **Foreign-key (`rr:refObjectMap`) edges are not materialized.** The virtual
+  query path resolves them at query time; the materializer does not yet index
+  parent tables, so FK edges are absent from the twin (each pass logs a warning
+  with the dropped-edge count when the mapping carries them).
+- **`rr:graphMap` routing is materialize-only today.** The materializer places
+  rows into named graphs per the subject map's graph map; the virtual query path
+  does not yet read graph maps, so a graph-scoped query returns different
+  results against the source and its twin. Query-path parity is a tracked
+  follow-up.
+- **Compaction can silently turn incremental into a full re-read.** The
+  incremental window treats `replace` (compaction) snapshots as safe when the
+  writer preserves data sequence numbers (Spark's `rewrite_data_files` default).
+  A compaction that *reassigns* sequence numbers makes every rewritten file look
+  newly added — correctness is unaffected (the writes are idempotent), but the
+  cheap incremental poll silently becomes a full-table read. If a tracked
+  source shows periodic cost spikes, check the source's compaction settings.
+- **In a multi-node deployment the worker runs on every write node** (every
+  non-peer node with indexing enabled) with its own job set, so two nodes
+  tracking the same `(source, target)` will interleave their commits;
+  leader-gating is a tracked follow-up. Nodes running external-indexer mode
+  (`indexing_enabled = false`) do not run the worker at all — materialization
+  needs a local indexer draining novelty between chunks — and `POST
+  /iceberg/track` on such a node returns an error saying so.
+- **A templated target creates ledgers without bound** — one per distinct
+  partition value that appears in the source. Malformed or high-cardinality
+  partition columns create that many ledgers; the template columns are the
+  operator's responsibility to keep bounded and well-formed.
 
 ## Partition Pruning
 
