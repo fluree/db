@@ -10,10 +10,88 @@ use crate::{
     StorageCas, StorageExtError, StorageExtResult, StorageMethod, StorageRead, StorageWrite,
 };
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Storage method for local filesystem storage.
 pub const STORAGE_METHOD_FILE: &str = "file";
+
+/// Suffix marking a staging file left by an interrupted atomic write.
+const TMP_SUFFIX: &str = ".tmp";
+
+/// Distinguishes staging files from content within one process. Writers to the
+/// same address are not always serialized (`write_bytes` takes no lock), so a
+/// fixed staging name would let two writers clobber each other's partial file
+/// and rename the result into place.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Staging path alongside `path`, unique per process and per call.
+///
+/// Appends rather than replacing the extension so `foo.json` stages as
+/// `foo.json.<pid>.<seq>.tmp`, keeping the final name recoverable by eye and
+/// leaving multi-part extensions intact.
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{seq}{TMP_SUFFIX}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// True for a staging file left behind by an interrupted write.
+fn is_tmp_artifact(name: &str) -> bool {
+    name.ends_with(TMP_SUFFIX)
+}
+
+/// Write `bytes` to a staging sibling of `path`, returning the staging path.
+///
+/// The staging file is removed if writing fails, so an error leaves nothing
+/// behind for `list_prefix` or a later reader to find.
+fn stage_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+
+    let tmp = tmp_sibling(path);
+    let staged = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)
+    })();
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(tmp)
+}
+
+/// Stage `bytes` and rename them onto `path`.
+///
+/// A concurrent reader of `path` observes either the previous contents or the
+/// complete new contents; the final name is never a partially written file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = stage_bytes(path, bytes)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Stage `bytes` and link them onto `path` only if `path` is absent.
+///
+/// Returns `false` when `path` already exists, leaving it untouched. Uses
+/// `hard_link` rather than `rename` because `rename` would replace an existing
+/// file, and the create-if-absent answer is what callers use to detect a
+/// duplicate ledger.
+fn create_new_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let tmp = stage_bytes(path, bytes)?;
+    let created = match std::fs::hard_link(&tmp, path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    Ok(created)
+}
 
 /// File-based storage backed by `tokio::fs`.
 #[derive(Debug, Clone)]
@@ -251,6 +329,11 @@ impl StorageRead for FileStorage {
                 if file_type.is_dir() {
                     dirs_to_visit.push(path);
                 } else if file_type.is_file() {
+                    // A staging file left by an interrupted write is not
+                    // content and must not be handed out as an address.
+                    if is_tmp_artifact(&entry.file_name().to_string_lossy()) {
+                        continue;
+                    }
                     // Convert back to relative path from base
                     if let Ok(relative) = path.strip_prefix(&self.base_path) {
                         let relative_str = relative.to_string_lossy().to_string();
@@ -272,22 +355,29 @@ impl StorageRead for FileStorage {
 impl StorageWrite for FileStorage {
     async fn write_bytes(&self, address: &str, bytes: &[u8]) -> Result<()> {
         let path = self.resolve_path(address)?;
+        let bytes = bytes.to_vec();
+        let for_err = path.clone();
 
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                crate::error::Error::io(format!(
-                    "Failed to create directory {}: {}",
-                    parent.display(),
-                    e
-                ))
-            })?;
-        }
-
-        // Write file (overwrites if exists - idempotent for content-addressed)
-        tokio::fs::write(&path, bytes).await.map_err(|e| {
-            crate::error::Error::io(format!("Failed to write {}: {}", path.display(), e))
+        // One blocking hop for mkdir + stage + rename, rather than one per
+        // `tokio::fs` call.
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    crate::error::Error::io(format!(
+                        "Failed to create directory {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+            // Overwrites if present, which is idempotent for content-addressed
+            // writes: the address is derived from these bytes.
+            write_atomic(&path, &bytes).map_err(|e| {
+                crate::error::Error::io(format!("Failed to write {}: {}", path.display(), e))
+            })
         })
+        .await
+        .map_err(|e| crate::error::Error::io(format!("write {} join: {e}", for_err.display())))?
     }
 
     async fn delete(&self, address: &str) -> Result<()> {
@@ -331,9 +421,10 @@ impl ContentAddressedWrite for FileStorage {
 }
 
 impl FileStorage {
-    /// Atomic file insert inside `spawn_blocking`.
+    /// Create-if-absent file insert inside `spawn_blocking`.
     ///
-    /// Uses `O_CREAT | O_EXCL` for atomic create-if-not-exists.
+    /// Stages the bytes and links them into place, so a caller that observes
+    /// the file sees it complete.
     async fn blocking_insert(&self, path: PathBuf, bytes: Vec<u8>) -> StorageExtResult<bool> {
         tokio::task::spawn_blocking(move || {
             if let Some(parent) = path.parent() {
@@ -342,25 +433,8 @@ impl FileStorage {
                 })?;
             }
 
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    file.write_all(&bytes).map_err(|e| {
-                        StorageExtError::io(format!("write {}: {}", path.display(), e))
-                    })?;
-                    Ok(true)
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-                Err(e) => Err(StorageExtError::io(format!(
-                    "open {}: {}",
-                    path.display(),
-                    e
-                ))),
-            }
+            create_new_atomic(&path, &bytes)
+                .map_err(|e| StorageExtError::io(format!("write {}: {}", path.display(), e)))
         })
         .await
         .map_err(|e| StorageExtError::io(format!("spawn_blocking join: {e}")))?
@@ -439,25 +513,8 @@ impl FileStorage {
         new_bytes: Vec<u8>,
     ) -> StorageExtResult<()> {
         tokio::task::spawn_blocking(move || {
-            let tmp_path = locked.path.with_extension("tmp");
-            {
-                use std::io::Write;
-                let mut tmp = std::fs::File::create(&tmp_path).map_err(|e| {
-                    StorageExtError::io(format!("create {}: {}", tmp_path.display(), e))
-                })?;
-                tmp.write_all(&new_bytes).map_err(|e| {
-                    StorageExtError::io(format!("write {}: {}", tmp_path.display(), e))
-                })?;
-            }
-            std::fs::rename(&tmp_path, &locked.path).map_err(|e| {
-                StorageExtError::io(format!(
-                    "rename {} -> {}: {}",
-                    tmp_path.display(),
-                    locked.path.display(),
-                    e
-                ))
-            })?;
-            Ok(())
+            write_atomic(&locked.path, &new_bytes)
+                .map_err(|e| StorageExtError::io(format!("write {}: {}", locked.path.display(), e)))
             // lock released when `locked._lock_file` is dropped
         })
         .await
@@ -505,5 +562,125 @@ impl StorageCas for FileStorage {
             CasAction::Abort(t) => Ok(CasOutcome::Aborted(t)),
         }
         // Lock released when `locked` is dropped (on Abort path, dropped here)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn storage() -> (tempfile::TempDir, FileStorage) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = FileStorage::new(dir.path());
+        (dir, storage)
+    }
+
+    /// Staging names append to the full file name so a multi-part extension
+    /// survives; `with_extension` would have turned `a.json.gz` into `a.json`.
+    #[test]
+    fn tmp_sibling_appends_to_the_full_file_name() {
+        let tmp = tmp_sibling(Path::new("/data/a.json.gz"));
+        let name = tmp.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("a.json.gz."), "got {name}");
+        assert!(is_tmp_artifact(&name), "got {name}");
+        assert_eq!(tmp.parent(), Some(Path::new("/data")));
+    }
+
+    /// Two staging paths for one address never collide, which is what lets
+    /// unsynchronized writers to the same address stage concurrently.
+    #[test]
+    fn tmp_sibling_is_unique_per_call() {
+        let a = tmp_sibling(Path::new("/data/x"));
+        let b = tmp_sibling(Path::new("/data/x"));
+        assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn write_bytes_leaves_no_staging_file() {
+        let (dir, storage) = storage();
+        storage.write_bytes("a/b/c.json", b"hello").await.unwrap();
+
+        assert_eq!(storage.read_bytes("a/b/c.json").await.unwrap(), b"hello");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("a/b"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| is_tmp_artifact(n))
+            .collect();
+        assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
+    }
+
+    /// An overwrite replaces the whole file rather than truncating in place, so
+    /// a shorter payload cannot leave a tail of the previous contents behind.
+    #[tokio::test]
+    async fn write_bytes_overwrite_replaces_entire_contents() {
+        let (_dir, storage) = storage();
+        storage
+            .write_bytes("k.json", &vec![b'x'; 4096])
+            .await
+            .unwrap();
+        storage.write_bytes("k.json", b"short").await.unwrap();
+
+        assert_eq!(storage.read_bytes("k.json").await.unwrap(), b"short");
+    }
+
+    #[tokio::test]
+    async fn insert_reports_creation_once_and_preserves_the_original() {
+        let (_dir, storage) = storage();
+
+        assert!(storage.insert("ns/led.json", b"first").await.unwrap());
+        assert!(!storage.insert("ns/led.json", b"second").await.unwrap());
+        assert_eq!(storage.read_bytes("ns/led.json").await.unwrap(), b"first");
+    }
+
+    #[tokio::test]
+    async fn insert_leaves_no_staging_file_on_either_outcome() {
+        let (dir, storage) = storage();
+        storage.insert("ns/led.json", b"first").await.unwrap();
+        storage.insert("ns/led.json", b"second").await.unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("ns"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| is_tmp_artifact(n))
+            .collect();
+        assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
+    }
+
+    /// A staging file left by an interrupted write is not content; handing it
+    /// out as an address would let callers read a partial object.
+    #[tokio::test]
+    async fn list_prefix_skips_staging_files() {
+        let (dir, storage) = storage();
+        storage
+            .write_bytes("fluree:file://d/real.json", b"v")
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("d/real.json.999.0.tmp"), b"partial").unwrap();
+
+        let listed = storage.list_prefix("d").await.unwrap();
+        assert_eq!(listed, vec!["fluree:file://d/real.json".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn compare_and_swap_writes_through_staging() {
+        let (dir, storage) = storage();
+        storage.insert("h.json", b"v0").await.unwrap();
+
+        let outcome: CasOutcome<()> = storage
+            .compare_and_swap("h.json", |cur| {
+                assert_eq!(cur, Some(b"v0".as_slice()));
+                Ok(CasAction::Write(b"v1".to_vec()))
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, CasOutcome::Written));
+        assert_eq!(storage.read_bytes("h.json").await.unwrap(), b"v1");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| is_tmp_artifact(n))
+            .collect();
+        assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
     }
 }
