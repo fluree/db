@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use fluree_db_iceberg::catalog::LoadTableResponse;
 use fluree_db_iceberg::credential::VendedCredentials;
-use fluree_db_iceberg::io::S3IcebergStorage;
+use fluree_db_iceberg::io::IcebergStorageBackend;
 use fluree_db_query::r2rml::TableWatermark;
 
 /// Master switch for all Iceberg catalog caching. Read once from
@@ -96,7 +96,7 @@ pub(crate) struct IcebergCatalogSession {
     /// (`aws_config` load + S3 client + HTTP client) per scan. Invalidated by
     /// `store_load_table`: any fresh loadTable (including a creds-expiry reload)
     /// drops the entry, so a client built from stale credentials is never served.
-    storages: Mutex<HashMap<String, Arc<S3IcebergStorage>>>,
+    storages: Mutex<HashMap<String, Arc<IcebergStorageBackend>>>,
     /// Location-only snapshot pins from the loadTable-metadata cache's pointer
     /// rung (`21-loadtable-metadata-cache.md`): that path resolves a snapshot's
     /// `metadata_location` from disk WITHOUT a loadTable GET, so it has NO vended
@@ -230,7 +230,7 @@ impl IcebergCatalogSession {
     /// invalidated by a creds refresh. A hit lets a later scan (or the slice-1
     /// prefetch→scan) skip rebuilding the AWS SDK client. `None` when the cache is
     /// disabled or after a fresh loadTable dropped the entry.
-    pub(crate) fn cached_storage(&self, key: &str) -> Option<Arc<S3IcebergStorage>> {
+    pub(crate) fn cached_storage(&self, key: &str) -> Option<Arc<IcebergStorageBackend>> {
         if !cache_enabled() {
             return None;
         }
@@ -241,7 +241,7 @@ impl IcebergCatalogSession {
     /// Paired with `cached_storage`; `store_load_table` invalidates on a creds
     /// refresh, so an entry here always corresponds to the currently pinned creds.
     /// No-op when the cache is disabled.
-    pub(crate) fn store_storage(&self, key: String, storage: Arc<S3IcebergStorage>) {
+    pub(crate) fn store_storage(&self, key: String, storage: Arc<IcebergStorageBackend>) {
         if !cache_enabled() {
             return;
         }
@@ -311,6 +311,7 @@ impl IcebergCatalogSession {
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
+    use fluree_db_iceberg::io::S3IcebergStorage;
 
     fn creds(expires_in_secs: Option<i64>) -> VendedCredentials {
         VendedCredentials {
@@ -471,11 +472,11 @@ mod tests {
             key.clone(),
             &resp("s3://snap-A.json", Some(creds(Some(3600)))),
         );
-        let storage = Arc::new(
+        let storage = Arc::new(IcebergStorageBackend::S3(
             S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
                 .await
                 .expect("offline SDK client construction"),
-        );
+        ));
         s.store_storage(key.clone(), Arc::clone(&storage));
         assert!(
             s.cached_storage(&key).is_some(),
@@ -503,11 +504,11 @@ mod tests {
         // on; the r2rml helper test drives the same contract end-to-end.
         let s = IcebergCatalogSession::default();
         let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
-        let storage = Arc::new(
+        let storage = Arc::new(IcebergStorageBackend::S3(
             S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
                 .await
                 .expect("offline SDK client construction"),
-        );
+        ));
         s.store_storage(key.clone(), Arc::clone(&storage));
         // No `store_load_table` in between (Direct mode's flow) — the client must
         // still be served, and it must be the very same Arc.

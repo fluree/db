@@ -441,10 +441,13 @@ pub struct IcebergConnectionConfig {
 pub enum CatalogMode {
     /// Connect to a REST catalog at the given URI.
     Rest(Box<RestCatalogMode>),
-    /// Read directly from an S3 table location (no REST catalog).
+    /// Read directly from a table location (no REST catalog): an S3 prefix,
+    /// or a local path (`file://` URI / absolute path) for catalog-less
+    /// tables on the local filesystem.
     Direct {
-        /// S3 prefix for the table root directory.
-        /// Example: "s3://bucket/warehouse/my_namespace/my_table"
+        /// Table root directory.
+        /// Examples: "s3://bucket/warehouse/my_namespace/my_table",
+        /// "file:///data/warehouse/my_namespace/my_table"
         table_location: String,
     },
 }
@@ -963,9 +966,17 @@ impl IcebergCreateConfig {
                         "Table location cannot be empty for direct catalog mode",
                     ));
                 }
-                if !table_location.starts_with("s3://") && !table_location.starts_with("s3a://") {
+                let is_object_store =
+                    table_location.starts_with("s3://") || table_location.starts_with("s3a://");
+                // Local catalog-less tables: `file://` URIs (incl. the
+                // `file:/abs` single-slash variant) or bare absolute paths.
+                // Mirrors `fluree_db_iceberg::config`'s Direct validation.
+                let is_local =
+                    table_location.starts_with("file:/") || table_location.starts_with('/');
+                if !is_object_store && !is_local {
                     return Err(crate::ApiError::config(format!(
-                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), got: {table_location}"
+                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), a \
+                         file:// URI, or an absolute local path, got: {table_location}"
                     )));
                 }
             }
