@@ -1126,7 +1126,20 @@ where
             let result = super::root_assembly::encode_and_write_root_v6(
                 &content_store,
                 fir6_inputs,
-                None, // GC chain deferred for V3 milestone.
+                // The ledger's current index head, so the rebuilt root LINKS into the
+                // chain instead of starting a fresh lineage.
+                //
+                // This was `None, // GC chain deferred for V3 milestone`, and that
+                // deferral was silently destructive: a rebuilt root with no
+                // `prev_index` makes every earlier version unreachable, and since
+                // nothing reclaims by reachability their artifacts can never be
+                // freed. A rebuild is the FALLBACK path — taken whenever incremental
+                // indexing aborts, e.g. `Cannot allocate memory` under memory
+                // pressure — so each such failure quietly converted a RECOVERABLE
+                // error into permanent disk loss. Live evidence: 226 roots on one
+                // ledger, 15 reachable, 211 orphaned, traced to two roots carrying
+                // no `prev_index`.
+                prev_root_id.clone(),
                 IndexStats {
                     flake_count: total_rows as usize,
                     leaf_count: v3_result
