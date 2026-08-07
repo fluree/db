@@ -20,6 +20,7 @@ fluree memory <COMMAND>
 | `update <ID>` | Update a memory in place |
 | `forget <ID>` | Delete a memory |
 | `status` | Show memory store status |
+| `audit` | Flag stale, unportable, or narration-style memories and coverage gaps |
 | `export` | Export all current memories as JSON |
 | `import <FILE>` | Import memories from a JSON file |
 | `mcp-install` | Install MCP configuration for an IDE |
@@ -282,6 +283,24 @@ Memory Store Status
     decision: 2
     constraint: 3
 ```
+
+## fluree memory audit
+
+Audit the store against the working tree: content and tag hygiene, refs that no
+longer resolve, refs whose files changed since the memory was last verified,
+and (branch scope) changed files no memory covers.
+
+```bash
+fluree memory audit              # memories from the current branch, vs main
+fluree memory audit --all        # the whole store
+fluree memory audit --base develop --format json
+```
+
+Scope defaults to the current git branch; `--all` audits everything. The audit
+is read-only — act on findings with `update` (an update that changes no field
+means "re-verified at HEAD"), `forget`, or `add`. See
+[the audit reference](../memory/cli/audit.md) for flag meanings and the
+[hygiene guide](../memory/guides/hygiene-and-auditing.md) for the rubric.
 
 ## fluree memory export / import
 
