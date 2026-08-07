@@ -8,8 +8,8 @@ use fluree_graph_ir::{Graph, Term, Triple};
 
 use crate::error::{R2rmlError, R2rmlResult};
 use crate::mapping::{
-    ConstantValue, JoinCondition, LogicalTable, ObjectMap, PredicateMap, PredicateObjectMap,
-    RefObjectMap, SubjectMap, TermType, TriplesMap,
+    ConstantValue, GraphMap, JoinCondition, LogicalTable, ObjectMap, PredicateMap,
+    PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
 };
 use crate::vocab::R2RML;
 
@@ -212,7 +212,111 @@ impl<'a> MappingExtractor<'a> {
             }
         }
 
+        // Extract rr:graph / rr:graphMap (subject-map-level named-graph routing).
+        subject_map.graph_map = self.extract_graph_map(&sm_triples)?;
+
         Ok(subject_map)
+    }
+
+    /// Extract a graph map from a term's triples: `rr:graph <iri>` (constant
+    /// shortcut) or `rr:graphMap [ rr:template | rr:column | rr:constant ]`.
+    /// Returns `Ok(None)` when neither is present (the triples land in the
+    /// default graph). A graph term is always an IRI, so there is no term-type
+    /// to parse.
+    ///
+    /// Support here is deliberately a **subset** of R2RML, and the unsupported
+    /// constructs are rejected rather than ignored. Silently dropping a graph
+    /// map is not a missing feature, it is wrong output: the materializer keys
+    /// its accumulator on `(target, graph, subject)`, so a dropped graph map
+    /// makes `graph` `None` for every row and two partitions' rows for the same
+    /// subject IRI collapse into one key, where one silently overwrites the
+    /// other. A `ConfigError` naming the construct is cheaper than that.
+    ///
+    /// Rejected:
+    /// - a second `rr:graphMap`, or `rr:graph` and `rr:graphMap` together —
+    ///   both are cumulative in the spec, and we implement one graph;
+    /// - `rr:graph rr:defaultGraph`, which would otherwise parse as an ordinary
+    ///   constant and mint a named graph literally called `...r2rml#defaultGraph`.
+    ///
+    /// (POM-level graph maps are rejected separately, where POMs are parsed.)
+    fn extract_graph_map(&self, triples: &[&Triple]) -> R2rmlResult<Option<GraphMap>> {
+        let graph_shortcuts = self.find_objects(triples, R2RML::GRAPH);
+        let graph_maps = self.find_objects(triples, R2RML::GRAPH_MAP);
+
+        // R2RML treats rr:graph and rr:graphMap as cumulative and repeatable —
+        // a term can name several graphs and the triple goes into all of them.
+        // We implement exactly one, so anything that asks for more must fail
+        // rather than have all but the first silently discarded.
+        if graph_shortcuts.len() + graph_maps.len() > 1 {
+            return Err(R2rmlError::Unsupported(format!(
+                "multiple graph maps on one term map ({} rr:graph + {} rr:graphMap): \
+                 R2RML treats these as cumulative, but only a single graph per term \
+                 map is supported. Use one rr:graph or one rr:graphMap.",
+                graph_shortcuts.len(),
+                graph_maps.len()
+            )));
+        }
+
+        // rr:graph <iri> — constant shortcut.
+        if let Some(graph_obj) = graph_shortcuts.first() {
+            if let Some(iri) = self.term_to_iri(graph_obj) {
+                if iri == R2RML::DEFAULT_GRAPH {
+                    return Err(R2rmlError::Unsupported(
+                        "rr:graph rr:defaultGraph is not supported. It would be parsed as \
+                         an ordinary constant and mint a named graph called \
+                         'http://www.w3.org/ns/r2rml#defaultGraph'. Omit the graph map \
+                         entirely to target the default graph."
+                            .to_string(),
+                    ));
+                }
+                return Ok(Some(GraphMap::constant(iri)));
+            }
+        }
+
+        // rr:graphMap [ ... ] — a term map producing the graph IRI.
+        let Some(graph_map_obj) = graph_maps.into_iter().next() else {
+            return Ok(None);
+        };
+        let gm_triples = self.get_triples_for_term(&graph_map_obj);
+        if let Some(constant_obj) = self.find_object_optional(&gm_triples, R2RML::CONSTANT) {
+            if self.term_to_iri(&constant_obj).as_deref() == Some(R2RML::DEFAULT_GRAPH) {
+                return Err(R2rmlError::Unsupported(
+                    "rr:graphMap [ rr:constant rr:defaultGraph ] is not supported. Omit the \
+                     graph map entirely to target the default graph."
+                        .to_string(),
+                ));
+            }
+        }
+        let mut graph_map = GraphMap::default();
+
+        if let Some(template_obj) = self.find_object_optional(&gm_triples, R2RML::TEMPLATE) {
+            if let Some(template) = self.term_to_string(&template_obj) {
+                graph_map.template_columns = crate::mapping::extract_template_columns(&template);
+                graph_map.template = Some(template);
+            }
+        }
+        if let Some(column_obj) = self.find_object_optional(&gm_triples, R2RML::COLUMN) {
+            if let Some(col) = self.term_to_string(&column_obj) {
+                graph_map.column = Some(col);
+            }
+        }
+        if let Some(constant_obj) = self.find_object_optional(&gm_triples, R2RML::CONSTANT) {
+            if let Some(iri) = self.term_to_iri(&constant_obj) {
+                graph_map.constant = Some(iri);
+            }
+        }
+
+        // A graphMap that parsed no usable value source is a malformed mapping,
+        // not an absent one — treating it as absent is how routing silently
+        // degrades to the default graph.
+        if graph_map.is_empty() {
+            return Err(R2rmlError::Unsupported(
+                "rr:graphMap has no rr:template, rr:column or rr:constant, so it names no \
+                 graph. Omit it to target the default graph."
+                    .to_string(),
+            ));
+        }
+        Ok(Some(graph_map))
     }
 
     /// Extract all predicate-object maps from a TriplesMap
@@ -233,6 +337,29 @@ impl<'a> MappingExtractor<'a> {
     /// Extract a single predicate-object map
     fn extract_predicate_object_map(&self, pom_term: &Term) -> R2rmlResult<PredicateObjectMap> {
         let pom_triples = self.get_triples_for_term(pom_term);
+
+        // R2RML places a triple in the union of its subject map's and its
+        // predicate-object map's graph maps. `PredicateObjectMap` has no graph
+        // map field, so a POM-level one would be read by nothing and its
+        // triples would land in the default graph — the silent cross-partition
+        // collapse described on `extract_graph_map`. Reject it: unimplemented
+        // is a fine thing to be, silently wrong is not. POM-level support can
+        // follow separately without changing this error's meaning.
+        if self
+            .find_object_optional(&pom_triples, R2RML::GRAPH)
+            .is_some()
+            || self
+                .find_object_optional(&pom_triples, R2RML::GRAPH_MAP)
+                .is_some()
+        {
+            return Err(R2rmlError::Unsupported(
+                "rr:graph / rr:graphMap on a predicate-object map is not supported. Only \
+                 subject-map-level graph maps are honored; a POM-level graph map would be \
+                 ignored and its triples would land in the default graph. Move the graph \
+                 map to the subject map."
+                    .to_string(),
+            ));
+        }
 
         // Extract predicate map
         let predicate_map = self.extract_predicate_map(&pom_triples)?;
@@ -548,6 +675,73 @@ mod tests {
         } else {
             panic!("Expected column object map");
         }
+        // No graph map -> triples land in the default graph.
+        assert!(tm.subject_map.graph_map.is_none());
+    }
+
+    #[test]
+    fn test_extract_subject_graph_map_template() {
+        // rr:graphMap [ rr:template ... ] on the subject map routes every row's
+        // triples into a per-row named graph (e.g. one graph per tenant/user).
+        let graph = parse_r2rml(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#ActorMapping> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "actor" ] ;
+                rr:subjectMap [
+                    rr:template "http://example.org/{id}" ;
+                    rr:class ex:Profile ;
+                    rr:graphMap [ rr:template "http://example.org/graph/tenant/{tenant_id}/user/{user_id}" ]
+                ] ;
+                rr:predicateObjectMap [
+                    rr:predicate ex:name ;
+                    rr:objectMap [ rr:column "as_name" ]
+                ] .
+        "#,
+        );
+        let extractor = MappingExtractor::new(&graph);
+        let tms = extractor.extract_all().unwrap();
+        let gm = tms[0]
+            .subject_map
+            .graph_map
+            .as_ref()
+            .expect("graph map parsed");
+        assert_eq!(
+            gm.template.as_deref(),
+            Some("http://example.org/graph/tenant/{tenant_id}/user/{user_id}")
+        );
+        assert_eq!(gm.template_columns, vec!["tenant_id", "user_id"]);
+        assert!(gm.constant.is_none() && gm.column.is_none());
+    }
+
+    #[test]
+    fn test_extract_subject_graph_constant_shortcut() {
+        // rr:graph <iri> is the constant-graph shortcut for rr:graphMap [ rr:constant <iri> ].
+        let graph = parse_r2rml(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [
+                    rr:template "http://example.org/{id}" ;
+                    rr:graph ex:g1
+                ] ;
+                rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "c" ] ] .
+        "#,
+        );
+        let extractor = MappingExtractor::new(&graph);
+        let tms = extractor.extract_all().unwrap();
+        let gm = tms[0]
+            .subject_map
+            .graph_map
+            .as_ref()
+            .expect("graph map parsed");
+        assert_eq!(gm.constant.as_deref(), Some("http://example.org/g1"));
+        assert!(gm.template.is_none() && gm.column.is_none());
     }
 
     #[test]

@@ -258,4 +258,126 @@ mod tests {
             .get("http://example.org/mapping#AirlineMapping")
             .is_some());
     }
+
+    // ---------------------------------------------------------------------
+    // Named-graph routing: what is supported, and what is refused.
+    //
+    // The refusals matter more than the acceptances. Graph maps drive the
+    // materializer's `(target, graph, subject)` accumulator key, so a construct
+    // that is parsed-but-ignored does not degrade to "no routing" — it makes
+    // two partitions' rows for one subject IRI collapse into a single key where
+    // one silently overwrites the other. Each test below is a construct that a
+    // reader of the R2RML spec would reasonably write and that we do not
+    // implement; the assertion is that it is rejected rather than obeyed
+    // halfway.
+    // ---------------------------------------------------------------------
+
+    /// Wrap a subject-map body and a predicate-object-map body in a triples map.
+    fn mapping_with(subject_map_body: &str, pom_body: &str) -> String {
+        format!(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [ rr:template "http://example.org/s/{{id}}" ; {subject_map_body} ] ;
+                rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] {pom_body} ] .
+            "#
+        )
+    }
+
+    fn compile_err(ttl: &str) -> String {
+        let loader = R2rmlLoader::from_turtle(ttl).expect("turtle should parse");
+        match loader.compile() {
+            Ok(_) => panic!("expected the mapping to be rejected, but it compiled"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn graph_map_of(ttl: &str) -> Option<crate::mapping::GraphMap> {
+        let loader = R2rmlLoader::from_turtle(ttl).expect("turtle should parse");
+        let mapping = loader.compile().expect("mapping should compile");
+        mapping
+            .get("http://example.org/mapping#M")
+            .expect("triples map present")
+            .subject_map
+            .graph_map
+            .clone()
+    }
+
+    #[test]
+    fn graph_shortcut_and_graph_map_are_supported() {
+        let by_shortcut = graph_map_of(&mapping_with("rr:graph ex:g1", ""));
+        assert_eq!(
+            by_shortcut.and_then(|g| g.constant),
+            Some("http://example.org/g1".to_string())
+        );
+
+        let by_template = graph_map_of(&mapping_with(
+            r#"rr:graphMap [ rr:template "http://example.org/tenant/{tenant}" ]"#,
+            "",
+        ));
+        assert_eq!(
+            by_template.and_then(|g| g.template),
+            Some("http://example.org/tenant/{tenant}".to_string())
+        );
+
+        // No graph map at all stays the default graph — unchanged behaviour.
+        assert!(graph_map_of(&mapping_with("", "")).is_none());
+    }
+
+    #[test]
+    fn rejects_a_graph_map_on_a_predicate_object_map() {
+        // R2RML puts a triple in the union of the subject map's and the POM's
+        // graph maps. We read only the subject map, so a POM-level graph map
+        // would route nothing and land in the default graph.
+        let err = compile_err(&mapping_with("", "; rr:graph ex:g1"));
+        assert!(
+            err.contains("predicate-object map"),
+            "error should name the construct: {err}"
+        );
+
+        let err = compile_err(&mapping_with("", "; rr:graphMap [ rr:constant ex:g1 ]"));
+        assert!(err.contains("predicate-object map"), "{err}");
+    }
+
+    #[test]
+    fn rejects_more_than_one_graph_per_term_map() {
+        // rr:graph and rr:graphMap are both repeatable and cumulative in the
+        // spec. We implement a single graph, so asking for two must fail rather
+        // than quietly keep whichever we happened to read first.
+        let err = compile_err(&mapping_with("rr:graph ex:g1 ; rr:graph ex:g2", ""));
+        assert!(err.contains("multiple graph maps"), "{err}");
+
+        let err = compile_err(&mapping_with(
+            "rr:graph ex:g1 ; rr:graphMap [ rr:constant ex:g2 ]",
+            "",
+        ));
+        assert!(err.contains("multiple graph maps"), "{err}");
+    }
+
+    #[test]
+    fn rejects_default_graph_rather_than_minting_a_graph_named_after_it() {
+        // `rr:graph rr:defaultGraph` previously parsed as an ordinary IRI
+        // constant, producing a real named graph called
+        // "http://www.w3.org/ns/r2rml#defaultGraph". That is wrong output, not
+        // a missing feature.
+        let err = compile_err(&mapping_with("rr:graph rr:defaultGraph", ""));
+        assert!(err.contains("defaultGraph"), "{err}");
+
+        let err = compile_err(&mapping_with(
+            "rr:graphMap [ rr:constant rr:defaultGraph ]",
+            "",
+        ));
+        assert!(err.contains("defaultGraph"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_graph_map_that_names_no_graph() {
+        // A graphMap with no template/column/constant used to be treated as
+        // absent, which is the same silent degradation by another route.
+        let err = compile_err(&mapping_with("rr:graphMap [ rr:termType rr:IRI ]", ""));
+        assert!(err.contains("names no graph"), "{err}");
+    }
 }
