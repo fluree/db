@@ -31,7 +31,7 @@ use fluree_db_binary_index::format::run_record_v2::{
     write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
 };
 use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
-use fluree_db_binary_index::read::column_types::ColumnProjection;
+use fluree_db_binary_index::read::column_types::{ColumnBatch, ColumnProjection};
 
 use super::novelty_merge::{merge_novelty, MergeInput, MergeOutput};
 
@@ -365,15 +365,22 @@ fn merge_and_encode_leaflet(
     (superseded, superseded_ops): (&[RunRecordV2], &[u8]),
     matched: &mut Vec<RunRecordV2>,
 ) -> io::Result<Vec<ProcessedLeafletV3>> {
-    // 1. Load existing leaflet columns.
-    let projection = ColumnProjection::all();
-    let batch = load_leaflet_columns(
-        input.leaf_bytes,
-        entry,
-        payload_base,
-        &projection,
-        input.order,
-    )?;
+    // 1. Load existing leaflet columns. A leaflet emptied by a prior
+    //    retract-all (`empty_encoded_leaflet_with_keys`) carries no column
+    //    blocks at all — treat it as zero rows instead of demanding blocks
+    //    that were never written.
+    let batch = if entry.row_count == 0 {
+        ColumnBatch::empty()
+    } else {
+        let projection = ColumnProjection::all();
+        load_leaflet_columns(
+            input.leaf_bytes,
+            entry,
+            payload_base,
+            &projection,
+            input.order,
+        )?
+    };
 
     // 2. Load existing history from sidecar.
     let existing_history = load_existing_history(entry, input.sidecar_bytes)?;
@@ -1039,6 +1046,61 @@ mod tests {
             dir.entries[0].first_key, orig_header.first_key,
             "empty leaflet must preserve original first_key for routing"
         );
+    }
+
+    /// Regression: a leaflet emptied by retraction is written with zero column
+    /// blocks (`empty_encoded_leaflet_with_keys`). A LATER incremental that
+    /// routes novelty back into that leaflet must be able to merge into it —
+    /// previously `merge_and_encode_leaflet` demanded `ColumnProjection::all()`
+    /// without a row_count==0 guard and failed with
+    /// "missing column block for SId", forcing a full rebuild.
+    #[test]
+    fn test_update_after_retract_all_reinserts_into_empty_leaflet() {
+        // Generation 1: build a leaf, retract everything.
+        let records = vec![rec2(100, 1, 10, 1), rec2(200, 1, 20, 1)];
+        let (leaf_bytes, sidecar) = build_test_leaf(&records, RunSortOrder::Spot);
+
+        let retracts = vec![rec2(100, 1, 10, 5), rec2(200, 1, 20, 5)];
+        let ops = vec![0u8, 0];
+        let input = LeafUpdateInput {
+            leaf_bytes: &leaf_bytes,
+            novelty: &retracts,
+            novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
+            order: RunSortOrder::Spot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 10000,
+            sidecar_bytes: sidecar.as_deref(),
+        };
+        let gen1 = update_leaf(&input).unwrap();
+        assert_eq!(gen1.leaves.len(), 1);
+        assert_eq!(gen1.leaves[0].info.total_rows, 0);
+
+        // Generation 2: insert a new fact into the now-empty leaflet.
+        let empty_leaf_bytes = &gen1.leaves[0].info.leaf_bytes;
+        let empty_sidecar = gen1.leaves[0].info.sidecar_bytes.clone();
+        let novelty = vec![rec2(150, 1, 15, 9)];
+        let ops = vec![1u8];
+        let input = LeafUpdateInput {
+            leaf_bytes: empty_leaf_bytes,
+            novelty: &novelty,
+            novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
+            order: RunSortOrder::Spot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 10000,
+            sidecar_bytes: empty_sidecar.as_deref(),
+        };
+        let gen2 = update_leaf(&input)
+            .expect("merging novelty into an emptied-by-retract leaflet must not fail");
+        assert_eq!(gen2.leaves.len(), 1);
+        assert_eq!(gen2.leaves[0].info.total_rows, 1);
     }
 
     /// Regression: when a leaflet splits into multiple chunks, history entries
