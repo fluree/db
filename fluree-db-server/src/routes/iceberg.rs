@@ -48,6 +48,13 @@ pub struct IcebergMapRequest {
     pub oauth2_scope: Option<String>,
     /// OAuth2 audience
     pub oauth2_audience: Option<String>,
+    /// Use Google metadata-server auth (GKE Workload Identity / GCE) for the REST
+    /// catalog, minting + auto-refreshing short-lived tokens — for Google Iceberg
+    /// REST catalogs (BigLake), where a static `auth_bearer` would expire.
+    #[serde(default)]
+    pub auth_google_metadata: bool,
+    /// Optional OAuth scopes for `auth_google_metadata` (defaults to cloud-platform).
+    pub auth_google_scopes: Option<String>,
     /// Warehouse identifier
     pub warehouse: Option<String>,
     /// Disable vended credentials
@@ -60,6 +67,16 @@ pub struct IcebergMapRequest {
     /// Use path-style S3 URLs
     #[serde(default)]
     pub s3_path_style: bool,
+    /// Tombstone/delete convention: source column inspected to classify a row
+    /// as a delete during materialization. Omit to disable retraction.
+    pub delete_column: Option<String>,
+    /// Column values that mark a row as a delete. A `null` element matches a NULL
+    /// `delete_column` value (null-payload tombstone), e.g. `["d", "delete"]`,
+    /// `[null]`, or `["d", null]`. Required when `delete_column` is set.
+    #[serde(default)]
+    pub delete_values: Vec<Option<String>>,
+    /// Ordering column for latest-by-key materialization (e.g. `event_timestamp`).
+    pub order_by: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -189,6 +206,408 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
     .await
 }
 
+/// Request body for `POST /v1/fluree/iceberg/materialize`
+#[derive(Deserialize)]
+pub struct IcebergMaterializeRequest {
+    /// Source graph source id (the R2RML/Iceberg source to read).
+    pub source: String,
+    /// Target native ledger to materialize into (created if absent).
+    pub target: String,
+    /// Force a full re-read, ignoring the watermark persisted in the target
+    /// ledger. Default `false`: resolve the watermark and refresh incrementally
+    /// (full only on the first run or a non-incremental-safe window).
+    #[serde(default)]
+    pub force_full: bool,
+}
+
+/// Response for `POST /v1/fluree/iceberg/materialize`
+#[derive(Serialize)]
+pub struct IcebergMaterializeResponse {
+    pub source: String,
+    pub target: String,
+    /// The watermark this pass started from (previously-materialized snapshot).
+    pub from_snapshot_id: Option<i64>,
+    /// The source snapshot now materialized (the persisted watermark).
+    pub to_snapshot_id: Option<i64>,
+    /// Whether an incremental (added-files-only) scan was used.
+    pub incremental: bool,
+    /// Whether anything was committed (false on a no-delta poll).
+    pub committed: bool,
+    pub rows_read: usize,
+    pub subjects_upserted: usize,
+    pub subjects_retracted: usize,
+}
+
+/// Materialize an R2RML / Iceberg graph source into a native ledger.
+///
+/// POST /v1/fluree/iceberg/materialize
+pub async fn iceberg_materialize(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    iceberg_materialize_local(state, request)
+        .await
+        .into_response()
+}
+
+async fn iceberg_materialize_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: IcebergMaterializeRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+
+    let span = create_request_span(
+        "iceberg:materialize",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.source),
+        None,
+        None,
+    );
+    async move {
+        tracing::info!(
+            status = "start",
+            source = %req.source,
+            target = %req.target,
+            force_full = req.force_full,
+            "iceberg materialize requested"
+        );
+
+        let result = state
+            .fluree
+            .materialize_r2rml_graph_source(&req.source, &req.target, req.force_full)
+            .await
+            .map_err(ServerError::Api)?;
+
+        let response = IcebergMaterializeResponse {
+            source: req.source.clone(),
+            target: req.target.clone(),
+            from_snapshot_id: result.from_snapshot_id,
+            to_snapshot_id: result.to_snapshot_id,
+            incremental: result.incremental,
+            committed: result.committed,
+            rows_read: result.rows_read,
+            subjects_upserted: result.subjects_upserted,
+            subjects_retracted: result.subjects_retracted,
+        };
+
+        tracing::info!(
+            status = "success",
+            source = %response.source,
+            target = %response.target,
+            to_snapshot_id = ?response.to_snapshot_id,
+            incremental = response.incremental,
+            committed = response.committed,
+            rows_read = response.rows_read,
+            subjects_upserted = response.subjects_upserted,
+            subjects_retracted = response.subjects_retracted,
+            "iceberg materialize complete"
+        );
+        Ok((StatusCode::OK, Json(response)))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Request body for `POST /v1/fluree/iceberg/track` and `/untrack`.
+#[derive(Deserialize)]
+pub struct IcebergTrackRequest {
+    /// Source graph source id to track.
+    pub source: String,
+    /// Target native ledger to keep materialized.
+    pub target: String,
+    /// How often the worker re-syncs this job, in seconds. Omit to use the
+    /// worker's default (30s). Ignored by `/untrack`. Must be > 0.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+    /// Block the response until the opportunistic first sync finishes.
+    ///
+    /// Defaults to FALSE: registration is durable the moment it is persisted, and
+    /// the worker polls regardless, so the first sync is a latency optimisation
+    /// rather than part of the operation. Waiting for it made `track` take as long
+    /// as a full materialize — on a fresh volume, bootstrap registers 17 sources
+    /// and each one blocked on a FULL read, serialising 17 backfills inside pod
+    /// startup.
+    ///
+    /// Set true when a caller genuinely wants the first sync's numbers in the
+    /// response (tests, one-off manual runs on a small source).
+    #[serde(default)]
+    pub wait_for_first_sync: bool,
+}
+
+/// Response for `POST /v1/fluree/iceberg/track`.
+#[derive(Serialize)]
+pub struct IcebergTrackResponse {
+    pub source: String,
+    pub target: String,
+    /// Whether the worker is now tracking this pair.
+    pub tracked: bool,
+    /// The effective poll interval for this job, in seconds.
+    pub poll_interval_secs: u64,
+    /// Number of jobs the worker is tracking.
+    pub tracked_jobs: usize,
+    /// What happened to the opportunistic first sync: `scheduled` (left to the
+    /// tracking worker's next tick), `completed`, or `failed`.
+    ///
+    /// Separate from `tracked` because the two are genuinely independent, and
+    /// conflating them was a real defect: a first sync that lost a commit race made
+    /// the whole call return an error even though the job was registered AND
+    /// persisted beforehand. Operators reasonably read `track ERROR` as "tracking
+    /// did not happen" when it had.
+    pub first_sync: &'static str,
+    /// Numbers from the first sync — only present when `wait_for_first_sync` was set
+    /// and it succeeded. `null` otherwise, which existing consumers already tolerate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial: Option<IcebergMaterializeResponse>,
+    /// Why the first sync failed, when it did. Never fails the call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_sync_error: Option<String>,
+}
+
+/// Register a `source → target` materialization tracking job and run an
+/// immediate first sync. The worker then keeps the target fresh on its poll
+/// interval (incremental when safe).
+///
+/// POST /v1/fluree/iceberg/track
+pub async fn iceberg_track(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    iceberg_track_local(state, request).await.into_response()
+}
+
+async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
+    let _headers = FlureeHeaders::from_headers(request.headers())?;
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: IcebergTrackRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    if req.poll_interval_secs == Some(0) {
+        return Err(ServerError::bad_request(
+            "poll_interval_secs must be greater than 0",
+        ));
+    }
+
+    let worker = state.materialize_worker.as_ref().ok_or_else(|| {
+        ServerError::bad_request(
+            "materialization tracking worker is not running on this node (peer role, or \
+             indexing disabled — materialization needs a local indexer to drain novelty)",
+        )
+    })?;
+
+    let interval = worker.track(
+        &req.source,
+        &req.target,
+        req.poll_interval_secs.map(std::time::Duration::from_secs),
+    );
+
+    // Persist the job so a restart restores it instead of silently stopping
+    // materialization until a client re-issues this call. Written after the
+    // in-memory registration and before the first sync, so the durable record
+    // and the running worker never disagree in the direction that loses work.
+    state
+        .fluree
+        .persist_materialize_job(&fluree_db_api::PersistedMaterializeJob {
+            source: req.source.clone(),
+            target: req.target.clone(),
+            poll_interval_secs: interval.as_secs(),
+        })
+        .await
+        .map_err(ServerError::Api)?;
+
+    // The opportunistic first sync — populate the target without waiting a poll cycle.
+    //
+    // It is NOT part of registration, and the code above is what makes that true: the
+    // job is in the worker AND persisted before we get here. So this must neither
+    // block the response nor be able to fail it. Previously it did both:
+    //
+    //   * `?` on its error made `track` report failure for a job that was already
+    //     registered and durable. A first sync losing a commit race produced
+    //     `track ERROR: Commit conflict ...`, which reads as "tracking did not happen".
+    //   * awaiting it made `track` cost a full materialize. On a fresh volume nothing
+    //     is tracked, so bootstrap registers all 17 sources and each blocked on a FULL
+    //     read — 17 backfills serialised inside pod startup.
+    let tracked_jobs = worker.tracked_jobs().len();
+    let (first_sync, initial, first_sync_error) = if req.wait_for_first_sync {
+        match state
+            .fluree
+            .materialize_r2rml_graph_source(&req.source, &req.target, false)
+            .await
+        {
+            Ok(result) => (
+                "completed",
+                Some(IcebergMaterializeResponse {
+                    source: req.source.clone(),
+                    target: req.target.clone(),
+                    from_snapshot_id: result.from_snapshot_id,
+                    to_snapshot_id: result.to_snapshot_id,
+                    incremental: result.incremental,
+                    committed: result.committed,
+                    rows_read: result.rows_read,
+                    subjects_upserted: result.subjects_upserted,
+                    subjects_retracted: result.subjects_retracted,
+                }),
+                None,
+            ),
+            // Reported, never fatal: the job is tracked and the worker will retry.
+            Err(e) => {
+                tracing::warn!(
+                    source = %req.source,
+                    target = %req.target,
+                    error = %e,
+                    "iceberg/track: first sync failed; the job IS tracked and the worker \
+                     will retry on its next poll"
+                );
+                ("failed", None, Some(e.to_string()))
+            }
+        }
+    } else {
+        // DELIBERATELY NOT SPAWNED. Leave it to the tracking worker's next tick.
+        //
+        // Spawning looked like the obvious way to keep the latency benefit without
+        // blocking, and it is a trap: the worker polls jobs through a SERIAL outer loop,
+        // but spawned tasks bypass that entirely. Registering 17 sources therefore
+        // launched 17 unbounded concurrent materializes — and the per-window accumulator
+        // is the one memory term nothing currently bounds (~10 GiB for a single
+        // ~800k-row window). Measured locally: 873 % CPU, i.e. ~9 cores, on what should
+        // be background work.
+        //
+        // The synchronous version was accidentally providing the serialisation. Removing
+        // the await must not also remove the brake.
+        //
+        // Cost of leaving it to the worker: up to one poll interval before data appears
+        // (30 s default, and the caller can pass poll_interval_secs to shorten it). That
+        // is a small price for keeping first-sync concurrency equal to the worker's,
+        // which is the only place it is bounded.
+        ("scheduled", None, None)
+    };
+
+    let response = IcebergTrackResponse {
+        source: req.source,
+        target: req.target,
+        tracked: true,
+        poll_interval_secs: interval.as_secs(),
+        tracked_jobs,
+        first_sync,
+        initial,
+        first_sync_error,
+    };
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Stop tracking a `source → target` pair (leaves already-materialized data).
+///
+/// POST /v1/fluree/iceberg/untrack
+pub async fn iceberg_untrack(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    iceberg_untrack_local(state, request).await.into_response()
+}
+
+async fn iceberg_untrack_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    let _headers = FlureeHeaders::from_headers(request.headers())?;
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: IcebergTrackRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let worker = state.materialize_worker.as_ref().ok_or_else(|| {
+        ServerError::bad_request("materialization tracking worker is not running on this node")
+    })?;
+    let removed = worker.untrack(&req.source, &req.target);
+
+    // Durable too, or a restart would resurrect the job.
+    state
+        .fluree
+        .forget_materialize_job(&req.source, &req.target)
+        .await
+        .map_err(ServerError::Api)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "source": req.source,
+            "target": req.target,
+            "removed": removed,
+            "tracked_jobs": worker.tracked_jobs().len(),
+        })),
+    ))
+}
+
+/// Tracking-worker status: tracked jobs + cumulative stats.
+///
+/// GET /v1/fluree/iceberg/tracking
+pub async fn iceberg_tracking_status(State(state): State<Arc<AppState>>) -> Response {
+    let Some(worker) = state.materialize_worker.as_ref() else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "running": false, "jobs": [] })),
+        )
+            .into_response();
+    };
+    let jobs: Vec<_> = worker
+        .job_infos()
+        .into_iter()
+        .map(|j| {
+            serde_json::json!({
+                "source": j.source,
+                "target": j.target,
+                "poll_interval_secs": j.poll_interval_secs,
+            })
+        })
+        .collect();
+    let stats = worker.stats();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "running": true,
+            "jobs": jobs,
+            "stats": {
+                "polls": stats.polls,
+                "syncs_committed": stats.syncs_committed,
+                "syncs_noop": stats.syncs_noop,
+                // Surfaced separately from failures on purpose: a non-zero rate here
+                // means the INDEXER is the bottleneck, which is a capacity signal, not
+                // a fault. Counting deferrals as failures is how 1,050 of them once
+                // presented as an outage and hid the real cause.
+                "syncs_deferred": stats.syncs_deferred,
+                "syncs_failed": stats.syncs_failed,
+                // Polls where the targets did not land uniformly. For a fan-out job this
+                // is the normal steady state, not an anomaly.
+                "syncs_partial": stats.syncs_partial,
+
+                // READ THESE for progress. The counters above are per POLL, and a poll
+                // fans out to many independent target ledgers, so they cannot express
+                // partial progress: a window with 21 of 22 targets committed scored zero
+                // commits and one deferral, and was consequently diagnosed as a stall.
+                "targets_committed": stats.targets_committed,
+                "targets_deferred": stats.targets_deferred,
+                "targets_failed": stats.targets_failed,
+
+                "tracked_jobs": stats.tracked_jobs,
+            }
+        })),
+    )
+        .into_response()
+}
+
 fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::IcebergCreateConfig> {
     let mode = req.mode.to_lowercase();
     let mut config = match mode.as_str() {
@@ -242,6 +661,11 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
             config = config.with_oauth2_audience(audience);
         }
     }
+    // Google metadata-server auth (refreshable) — for BigLake / GKE Workload
+    // Identity. Overrides any static bearer configured above.
+    if req.auth_google_metadata {
+        config = config.with_auth_google_metadata(req.auth_google_scopes.clone());
+    }
     if let Some(ref wh) = req.warehouse {
         config = config.with_warehouse(wh);
     }
@@ -256,6 +680,19 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
     }
     if req.s3_path_style {
         config = config.with_s3_path_style(true);
+    }
+    if let Some(ref column) = req.delete_column {
+        let convention = fluree_db_api::DeleteConvention {
+            column: column.clone(),
+            deleted_values: req.delete_values.clone(),
+        };
+        convention
+            .validate()
+            .map_err(|e| ServerError::bad_request(format!("invalid delete convention: {e}")))?;
+        config = config.with_delete_convention(convention);
+    }
+    if let Some(ref order_by) = req.order_by {
+        config = config.with_order_by(order_by);
     }
 
     Ok(config)
@@ -881,6 +1318,8 @@ mod tests {
             branch: None,
             connection: build_iceberg_connection(&req.connection).unwrap(),
             table_identifier: "ns.tbl".to_string(),
+            delete_convention: None,
+            order_by: None,
         };
         assert!(create.is_rest());
         let gs = create.to_iceberg_gs_config();

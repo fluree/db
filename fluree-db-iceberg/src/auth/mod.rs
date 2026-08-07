@@ -8,11 +8,17 @@
 //!
 //! - [`BearerTokenAuth`] - Static bearer token authentication
 //! - [`OAuth2ClientCredentials`] - OAuth2 client credentials flow with token caching
+//! - [`GoogleMetadataAuth`] - Google metadata-server tokens (GKE Workload
+//!   Identity / GCE), refreshed automatically — for Google Iceberg REST catalogs
+//!   (BigLake), where a static bearer would expire
 
 mod bearer;
+mod google_metadata;
 mod oauth2;
+mod token;
 
 pub use bearer::BearerTokenAuth;
+pub use google_metadata::{GoogleMetadataAuth, GoogleMetadataConfig};
 pub use oauth2::{OAuth2ClientCredentials, OAuth2Config};
 
 use crate::config_value::{ConfigValue, SecretResolver};
@@ -83,6 +89,19 @@ pub enum AuthConfig {
         #[serde(default)]
         audience: Option<String>,
     },
+    /// Google metadata-server OAuth (GKE Workload Identity / GCE). Mints and
+    /// refreshes short-lived access tokens from the instance metadata server —
+    /// for Google Iceberg REST catalogs (BigLake), where a static bearer would
+    /// expire after ~1h with no way to renew.
+    #[serde(rename = "google_metadata")]
+    GoogleMetadata {
+        /// OAuth scopes (comma-separated). Defaults to cloud-platform.
+        #[serde(default)]
+        scopes: Option<String>,
+        /// Token endpoint override (defaults to the metadata server). For tests.
+        #[serde(default)]
+        metadata_url: Option<String>,
+    },
 }
 
 impl AuthConfig {
@@ -110,6 +129,13 @@ impl AuthConfig {
                 };
                 Ok(Box::new(OAuth2ClientCredentials::new(config)?))
             }
+            AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url,
+            } => Ok(Box::new(GoogleMetadataAuth::new(google_metadata_config(
+                scopes,
+                metadata_url,
+            ))?)),
         }
     }
 
@@ -140,6 +166,12 @@ impl AuthConfig {
                 };
                 Ok(std::sync::Arc::new(OAuth2ClientCredentials::new(config)?))
             }
+            AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url,
+            } => Ok(std::sync::Arc::new(GoogleMetadataAuth::new(
+                google_metadata_config(scopes, metadata_url),
+            )?)),
         }
     }
 
@@ -172,8 +204,35 @@ impl AuthConfig {
                 scope: scope.clone(),
                 audience: audience.clone(),
             }),
+            // No secret material to hydrate: the credential is minted per call from
+            // the instance metadata server and lives only in an in-memory
+            // `CachedToken`. Written out rather than matched by a wildcard so a NEW
+            // variant still fails compilation here and earns an explicit decision.
+            AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url,
+            } => Ok(AuthConfig::GoogleMetadata {
+                scopes: scopes.clone(),
+                metadata_url: metadata_url.clone(),
+            }),
         }
     }
+}
+
+/// Build a [`GoogleMetadataConfig`], applying optional overrides over the
+/// defaults (metadata-server URL + cloud-platform scope).
+fn google_metadata_config(
+    scopes: &Option<String>,
+    metadata_url: &Option<String>,
+) -> GoogleMetadataConfig {
+    let mut config = GoogleMetadataConfig::default();
+    if let Some(scopes) = scopes {
+        config.scopes = scopes.clone();
+    }
+    if let Some(metadata_url) = metadata_url {
+        config.metadata_url = metadata_url.clone();
+    }
+    config
 }
 
 /// No-op authentication (for testing or public catalogs).
@@ -223,6 +282,21 @@ mod tests {
             }
             _ => panic!("Expected bearer auth"),
         }
+    }
+
+    #[test]
+    fn test_parse_google_metadata_auth() {
+        // Minimal form (no overrides) — defaults to the metadata server + cloud-platform.
+        let config: AuthConfig = serde_json::from_str(r#"{"type": "google_metadata"}"#).unwrap();
+        assert!(matches!(
+            config,
+            AuthConfig::GoogleMetadata {
+                scopes: None,
+                metadata_url: None
+            }
+        ));
+        // Provider construction succeeds (no network I/O at build time).
+        assert!(config.create_provider_arc().is_ok());
     }
 
     #[test]
