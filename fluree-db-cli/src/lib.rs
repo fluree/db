@@ -51,6 +51,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             chunk_size_mb,
             memory_budget_mb,
             parallelism,
+            skolem_namespace,
             leaflet_rows,
             leaflets_per_leaf,
             remote,
@@ -137,6 +138,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                     cli.parallelism
                 },
                 chunk_size_mb,
+                skolem_namespace,
                 leaflet_rows,
                 leaflets_per_leaf,
                 edge_policy,
@@ -199,6 +201,11 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         Commands::Graph { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::graph::run(action, &fluree_dir, direct).await
+        }
+
+        Commands::Bm25 { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::bm25::run(action, &fluree_dir, direct).await
         }
 
         Commands::Insert {
@@ -702,6 +709,44 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 }
             }
         }
+
+        #[cfg(feature = "iceberg")]
+        Commands::Materialize {
+            graph_source,
+            into,
+            output,
+            output_path,
+            verify,
+            max_performance,
+            allow_mor_deletes,
+            allow_duplicate_parent_keys,
+            home,
+            tmp_dir,
+        } => {
+            // `--home` resolves through the same helper as `--config` (it takes
+            // precedence); else the tracked `.fluree/` or the global home.
+            let fluree_dir = config::require_fluree_dir_or_global(home.as_deref().or(config_path))?;
+            let params = commands::materialize::MaterializeParams {
+                graph_source: &graph_source,
+                into: into.as_deref(),
+                output,
+                output_path: output_path.as_deref(),
+                verify,
+                max_performance,
+                allow_mor_deletes,
+                allow_duplicate_parent_keys,
+                parallelism: cli.parallelism,
+                memory_budget_mb: cli.memory_budget_mb,
+                quiet: cli.quiet,
+                tmp_dir: tmp_dir.as_deref(),
+            };
+            commands::materialize::run(&fluree_dir, &params).await
+        }
+
+        #[cfg(not(feature = "iceberg"))]
+        Commands::Materialize { .. } => Err(error::CliError::Usage(
+            "`fluree materialize` requires the `iceberg` feature (enabled by default)".to_string(),
+        )),
 
         Commands::Mcp { action } => match action {
             cli::McpAction::Serve {

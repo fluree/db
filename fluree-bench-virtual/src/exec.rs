@@ -277,6 +277,33 @@ impl Engine {
 
         let is_virtual = target.is_virtual();
         let alias = target.alias.clone();
+
+        // Browse-shape corpus members are JSON-LD select-map crawls: they MUST run
+        // through the JSON-LD query path (which triggers the crawl expansion on a
+        // virtual target and native binary-index hydration on native) rather than
+        // `.sparql()`. Detect + parse up front so a malformed body is a clean
+        // error, not a panic mid-scan. A JSON-LD body's result is a node-document
+        // array, which `canon::canonicalize` already handles (bare-array branch).
+        let jsonld_input = if is_jsonld_body(sparql) {
+            match serde_json::from_str::<Value>(&jsonld_source(sparql)) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    watchdog.abort();
+                    return Outcome {
+                        wall: Duration::ZERO,
+                        status: Status::Error,
+                        rows: 0,
+                        hash: String::new(),
+                        heads: None,
+                        counters: spans::aggregate(&self.capture.take()),
+                        error: Some(format!("JSON-LD body parse error: {e}")),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+
         // A CONSTRUCT/DESCRIBE result is an RDF graph, not a solution table:
         // SPARQL-JSON renders it as empty bindings, so format such queries as
         // JSON-LD (`{"@graph":[...]}`) and let `canon` count/hash the nodes.
@@ -296,7 +323,24 @@ impl Engine {
         let start = Instant::now();
         let result = self.rt.block_on(async move {
             let fut = async move {
-                if use_from {
+                if let Some(json) = jsonld_input.as_ref() {
+                    // JSON-LD select-map browse crawl: graph-targeted, JSON-LD
+                    // format. `.with_r2rml()` (virtual) routes the select-map
+                    // through the crawl expansion; native runs binary-index
+                    // hydration. The result is a node-document array.
+                    let graph = fluree.graph(&alias);
+                    let builder = graph
+                        .query()
+                        .jsonld(json)
+                        .format(FormatterConfig::jsonld())
+                        .execution_options(exec_opts);
+                    let builder = if is_virtual {
+                        builder.with_r2rml()
+                    } else {
+                        builder
+                    };
+                    builder.execute_formatted().await
+                } else if use_from {
                     // `query_from()` auto-applies `.with_r2rml()` under the iceberg
                     // feature, so the graph source resolves from the FROM IRI in the
                     // query text (works on the native handle and the virtual target,
@@ -475,6 +519,28 @@ fn is_from_query(sparql: &str) -> bool {
         .map(str::trim_start)
         .filter(|l| !l.starts_with('#'))
         .any(|l| l.to_ascii_uppercase().contains("FROM <"))
+}
+
+/// True when a query file body is a JSON-LD document (a browse select-map crawl)
+/// rather than SPARQL: its first non-comment, non-blank line begins with `{`.
+/// SPARQL's first such line is always a `PREFIX`/`SELECT`/`CONSTRUCT`/`ASK`
+/// keyword, so the two are unambiguous.
+fn is_jsonld_body(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .is_some_and(|l| l.starts_with('{'))
+}
+
+/// Strip leading `#` comment lines from a JSON-LD body so the corpus's
+/// descriptive comment header (which JSON cannot carry inline) is kept in the
+/// file yet dropped before parsing. Only whole comment lines are removed; the
+/// JSON body itself has none.
+fn jsonld_source(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Extract the single scalar COUNT value from a `SELECT (COUNT(*) AS ?n)` result.

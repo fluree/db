@@ -75,7 +75,11 @@ pub fn default_reindex_max_bytes() -> usize {
 /// reach this budget. Page-cache pages are clean and reclaimable, so two-thirds
 /// is a soft target that still leaves the OS room to back the heap, the leaflet
 /// cache, and in-flight requests.
+///
+/// Only consumed by the `native` warming path.
+#[cfg(feature = "native")]
 const WARM_BUDGET_NUMERATOR: u64 = 2;
+#[cfg(feature = "native")]
 const WARM_BUDGET_DENOMINATOR: u64 = 3;
 
 /// Fallback warming budget when RAM detection is unavailable (WASM, sandbox).
@@ -123,6 +127,15 @@ pub fn default_index_config() -> fluree_db_ledger::IndexConfig {
 
 pub const DEFAULT_AUTH_MODE: &str = "none";
 pub const DEFAULT_JWKS_CACHE_TTL: u64 = 300;
+
+// ── BM25 auto-sync ──────────────────────────────────────────────────
+
+/// Whether the server keeps BM25 indexes current automatically.
+///
+/// Off by default: it introduces background storage writes on a server that
+/// otherwise performs none for graph sources. Without it an index only advances
+/// when something calls `POST /v1/fluree/bm25/sync` or `fluree bm25 sync`.
+pub const DEFAULT_BM25_AUTO_SYNC: bool = false;
 
 // ── MCP ─────────────────────────────────────────────────────────────
 

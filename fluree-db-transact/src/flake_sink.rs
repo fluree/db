@@ -11,7 +11,7 @@ use crate::value_convert::{convert_native_literal, convert_string_literal};
 use fluree_db_core::edge::EdgeKey;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -48,7 +48,7 @@ enum ResolvedTerm {
 /// let mut ns = NamespaceRegistry::from_db(&db);
 /// let mut sink = FlakeSink::new(&mut ns, new_t, txn_id);
 /// fluree_graph_turtle::parse(ttl, &mut sink)?;
-/// let flakes = sink.finish().expect("no invariant violation");
+/// let flakes = sink.into_flakes().expect("no invariant violation");
 /// ```
 pub struct FlakeSink<'a> {
     /// Resolved terms indexed by TermId
@@ -93,9 +93,15 @@ impl<'a> FlakeSink<'a> {
 
     /// Consume the sink and return the accumulated flakes, or surface the
     /// first storage-invariant violation observed during parsing as a hard
-    /// error. Mirrors [`ImportSink::finish`](crate::import_sink::ImportSink)
+    /// error. Mirrors
+    /// [`ImportSink::into_parts`](crate::import_sink::ImportSink::into_parts)
     /// — bad input must fail the transaction, not silently omit a triple.
-    pub fn finish(self) -> Result<Vec<Flake>, TransactError> {
+    ///
+    /// Distinct from the protocol's [`GraphSink::finish`] (flush/finalize):
+    /// this is the sink's *product*. Deferred-error semantics are unchanged
+    /// by the fallible protocol — `emit_*` still records the first violation
+    /// and keeps going, and this method is where it becomes a hard error.
+    pub fn into_flakes(self) -> Result<Vec<Flake>, TransactError> {
         if let Some(err) = self.invariant_error {
             return Err(err);
         }
@@ -260,16 +266,24 @@ impl GraphSink for FlakeSink<'_> {
         })
     }
 
-    fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) {
+    fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) -> SinkResult {
         if let Some(flake) = self.build_flake(subject, predicate, object, None) {
             self.flakes.push(flake);
         }
+        Ok(())
     }
 
-    fn emit_list_item(&mut self, subject: TermId, predicate: TermId, object: TermId, index: i32) {
+    fn emit_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+    ) -> SinkResult {
         if let Some(flake) = self.build_flake(subject, predicate, object, Some(index)) {
             self.flakes.push(flake);
         }
+        Ok(())
     }
 
     fn supports_reified_triples(&self) -> bool {
@@ -287,18 +301,18 @@ impl GraphSink for FlakeSink<'_> {
         predicate: TermId,
         object: TermId,
         reifier: TermId,
-    ) {
+    ) -> SinkResult {
         let Some(s) = self.resolve_sid(subject) else {
-            return;
+            return Ok(());
         };
         let Some(p) = self.resolve_sid(predicate) else {
-            return;
+            return Ok(());
         };
         let Some((o, dtc)) = self.resolve_object(object) else {
-            return;
+            return Ok(());
         };
         let Some(ann) = self.resolve_sid(reifier) else {
-            return;
+            return Ok(());
         };
 
         match crate::generate::flakes::reified_triple_bundle(s, p, o, &dtc, &ann, self.t) {
@@ -310,6 +324,7 @@ impl GraphSink for FlakeSink<'_> {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -337,9 +352,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/alice");
         let p = sink.term_iri("http://example.org/name");
         let o = sink.term_literal("Alice", Datatype::xsd_string(), None);
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         let f = &flakes[0];
         assert!(f.op); // assertion
@@ -356,9 +371,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/alice");
         let p = sink.term_iri("http://example.org/age");
         let o = sink.term_literal_value(LiteralValue::Integer(30), Datatype::xsd_integer());
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::Long(30)));
     }
@@ -371,9 +386,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/x");
         let p = sink.term_iri("http://example.org/val");
         let o = sink.term_literal_value(LiteralValue::Double(3.13), Datatype::xsd_double());
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::Double(d) if (*d - 3.13).abs() < f64::EPSILON));
     }
@@ -386,9 +401,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/x");
         let p = sink.term_iri("http://example.org/active");
         let o = sink.term_literal_value(LiteralValue::Boolean(true), Datatype::xsd_boolean());
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::Boolean(true)));
     }
@@ -401,9 +416,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/alice");
         let p = sink.term_iri("http://example.org/name");
         let o = sink.term_literal("Alice", Datatype::rdf_lang_string(), Some("en"));
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         let f = &flakes[0];
         assert!(matches!(&f.o, FlakeValue::String(s) if s == "Alice"));
@@ -458,9 +473,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/alice");
         let p = sink.term_iri("http://example.org/knows");
         let o = sink.term_iri("http://example.org/bob");
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         let f = &flakes[0];
         assert!(matches!(&f.o, FlakeValue::Ref(_)));
@@ -478,11 +493,11 @@ mod tests {
         let o0 = sink.term_literal_value(LiteralValue::Integer(10), Datatype::xsd_integer());
         let o1 = sink.term_literal_value(LiteralValue::Integer(20), Datatype::xsd_integer());
         let o2 = sink.term_literal_value(LiteralValue::Integer(30), Datatype::xsd_integer());
-        sink.emit_list_item(s, p, o0, 0);
-        sink.emit_list_item(s, p, o1, 1);
-        sink.emit_list_item(s, p, o2, 2);
+        sink.emit_list_item(s, p, o0, 0).unwrap();
+        sink.emit_list_item(s, p, o1, 1).unwrap();
+        sink.emit_list_item(s, p, o2, 2).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 3);
         for (i, f) in flakes.iter().enumerate() {
             let meta = f.m.as_ref().expect("list items should have meta");
@@ -499,9 +514,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/event");
         let p = sink.term_iri("http://example.org/date");
         let o = sink.term_literal("2024-01-15T10:30:00Z", Datatype::xsd_date_time(), None);
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::DateTime(_)));
     }
@@ -514,9 +529,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/x");
         let p = sink.term_iri("http://example.org/count");
         let o = sink.term_literal("42", Datatype::xsd_integer(), None);
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::Long(42)));
     }
@@ -530,9 +545,9 @@ mod tests {
         let s = sink.term_iri("http://example.org/x");
         let p = sink.term_iri("http://example.org/count");
         let o = sink.term_literal("42", Datatype::xsd_long(), None);
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         assert_eq!(flakes.len(), 1);
         assert!(matches!(&flakes[0].o, FlakeValue::Long(42)));
         // dt must be xsd:long (declared), not xsd:integer (inferred)
@@ -556,10 +571,10 @@ mod tests {
         let p = sink.term_iri("http://example.org/worksFor");
         let o = sink.term_iri("http://example.org/acme");
         let r = sink.term_iri("http://example.org/reifier");
-        sink.emit_triple(s, p, o);
-        sink.emit_reified_triple(s, p, o, r);
+        sink.emit_triple(s, p, o).unwrap();
+        sink.emit_reified_triple(s, p, o, r).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         // 1 base + 3 bundle flakes.
         assert_eq!(flakes.len(), 4);
         let base = &flakes[0];
@@ -598,10 +613,10 @@ mod tests {
         let p = sink.term_iri("http://example.org/label");
         let o = sink.term_literal("chat", Datatype::rdf_lang_string(), Some("fr"));
         let r = sink.term_iri("http://example.org/reifier");
-        sink.emit_triple(s, p, o);
-        sink.emit_reified_triple(s, p, o, r);
+        sink.emit_triple(s, p, o).unwrap();
+        sink.emit_reified_triple(s, p, o, r).unwrap();
 
-        let flakes = sink.finish().expect("no invariant violation");
+        let flakes = sink.into_flakes().expect("no invariant violation");
         // 1 base + 4 bundle flakes (S, P, O, Lang).
         assert_eq!(flakes.len(), 5);
         let base = &flakes[0];
@@ -642,9 +657,11 @@ mod tests {
             Datatype::from_iri(fluree_vocab::fluree::EMBEDDING_VECTOR),
             None,
         );
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let err = sink.finish().expect_err("invariant violation must abort");
+        let err = sink
+            .into_flakes()
+            .expect_err("invariant violation must abort");
         let msg = err.to_string();
         assert!(
             msg.contains("embeddingVector"),

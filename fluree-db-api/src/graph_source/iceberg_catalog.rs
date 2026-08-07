@@ -625,8 +625,9 @@ pub(crate) fn table_schema_from_metadata(
 /// tiers share, BEFORE any summary-derived count is surfaced. The Schema tier
 /// fills `row_count` from `total-records` and the Stats tier aggregates over the
 /// live data files; neither subtracts merge-on-read deletes, so both over-count a
-/// MoR snapshot. Mirrors the two scan planners (`ensure_summary_scannable`), so
-/// the preview can no longer return silent over-counts the planners would refuse.
+/// MoR snapshot. Mirrors the two scan planners (which run the same zero-I/O
+/// summary guard), so the preview can no longer return silent over-counts the
+/// planners would refuse.
 ///
 /// Returns the operator override flag (`FLUREE_ICEBERG_ALLOW_MOR_DELETES`) so the
 /// Stats-tier manifest-list backstop reuses it and the env is read exactly once.
@@ -634,10 +635,15 @@ pub(crate) fn table_schema_from_metadata(
 /// two-tier guard is unit-testable without a live catalog.
 fn preview_summary_guard(metadata: &TableMetadata, table_display: &str) -> Result<bool> {
     match metadata.current_snapshot() {
-        Some(snapshot) => Ok(fluree_db_iceberg::ensure_summary_scannable(
-            snapshot,
-            table_display,
-        )?),
+        Some(snapshot) => {
+            // Inlined summary guard: the converged iceberg crate exposes no shared
+            // `ensure_summary_scannable` helper (both scan planners inline this
+            // same pair). Read the override once, run the zero-I/O summary check,
+            // and return the flag for the Stats-tier manifest backstop to reuse.
+            let allowed = fluree_db_iceberg::mor_deletes_allowed();
+            fluree_db_iceberg::ensure_no_summary_deletes(snapshot, table_display, allowed)?;
+            Ok(allowed)
+        }
         // No current snapshot ⇒ no counts to over-count; still surface the
         // override flag for the (delete-free) Stats manifest path.
         None => Ok(fluree_db_iceberg::mor_deletes_allowed()),

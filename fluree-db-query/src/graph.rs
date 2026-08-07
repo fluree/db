@@ -47,7 +47,9 @@ use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::r2rml::{rewrite_patterns_for_r2rml, unsupported_subscope_error};
+use crate::r2rml::{
+    r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml, unsupported_subscope_error,
+};
 use crate::seed::{BatchSeedOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
@@ -109,7 +111,7 @@ pub struct GraphOperator {
     /// top-k row from partition p is among p's k largest, so the global top-k is a
     /// subset of the union of the per-partition results (the authoritative sort
     /// above re-selects the exact k).
-    topk: Option<(VarId, usize)>,
+    topk: Option<(VarId, usize, bool)>,
     /// Plan-time decision: seed the enumerated graph variable into the inner
     /// subplan. True only when the inner patterns bind the graph var in EVERY
     /// solution (required top-level triple / property path / slice-free
@@ -294,19 +296,16 @@ impl GraphOperator {
                 ctx.trust_fk_refs,
             );
 
-            // If there are unconverted patterns in an R2RML graph source, return an error.
-            // R2RML graph sources don't have ledger-backed indexes, so unconverted patterns
-            // (e.g., bound subject or bound object constraints) would silently return empty
-            // results instead of the expected matches. Fail explicitly so users know their
-            // query contains unsupported patterns.
+            // If there are unconverted patterns in an R2RML graph source, refuse
+            // with a typed error. R2RML graph sources have no ledger-backed index,
+            // so an unconverted pattern (a VARIABLE predicate paired with a BOUND
+            // term) would silently return empty instead of the expected matches.
+            // Fail explicitly with the stable `err:r2rml/UnsupportedPattern` code.
             if rewrite_result.unconverted_count > 0 {
-                return Err(crate::error::QueryError::InvalidQuery(format!(
-                    "R2RML graph source '{}' contains {} pattern(s) that cannot be converted \
-                     to R2RML scans. Patterns with bound subjects (e.g., <iri> ex:name ?o) or \
-                     bound objects (e.g., ?s ex:name \"value\") are not yet supported in R2RML \
-                     graph sources.",
-                    graph_iri, rewrite_result.unconverted_count
-                )));
+                return Err(r2rml_unsupported_pattern_error(
+                    &graph_iri,
+                    rewrite_result.unconverted_count,
+                ));
             }
             // Non-lowered sub-scope patterns (property/shortest paths,
             // subqueries) whose bodies would evaluate against the R2RML source's
@@ -356,8 +355,8 @@ impl GraphOperator {
         if let Some(budget) = self.row_budget {
             inner.set_row_budget(budget);
         }
-        if let Some((sort_var, k)) = self.topk {
-            inner.set_topk(sort_var, k);
+        if let Some((sort_var, k, ascending)) = self.topk {
+            inner.set_topk(sort_var, k, ascending);
         }
         // Rebuild-boundary memory accounting (D1): this correlated inner subplan is
         // rebuilt per parent row/batch and is genuinely dropped at the end of this
@@ -519,11 +518,10 @@ impl GraphOperator {
             ctx.trust_fk_refs,
         );
         if rewrite_result.unconverted_count > 0 {
-            return Err(crate::error::QueryError::InvalidQuery(format!(
-                "R2RML graph source '{}' contains {} pattern(s) that cannot be converted \
-                 to R2RML scans.",
-                graph_iri, rewrite_result.unconverted_count
-            )));
+            return Err(r2rml_unsupported_pattern_error(
+                &graph_iri,
+                rewrite_result.unconverted_count,
+            ));
         }
         // Non-lowered sub-scope patterns (property/shortest paths, subqueries)
         // that would silently evaluate against the R2RML source's empty native
@@ -550,8 +548,8 @@ impl GraphOperator {
         if let Some(budget) = self.row_budget {
             inner.set_row_budget(budget);
         }
-        if let Some((sort_var, k)) = self.topk {
-            inner.set_topk(sort_var, k);
+        if let Some((sort_var, k, ascending)) = self.topk {
+            inner.set_topk(sort_var, k, ascending);
         }
         // Rebuild-boundary memory accounting (D1): this correlated inner subplan is
         // rebuilt per parent row/batch and is genuinely dropped at the end of this
@@ -674,11 +672,11 @@ impl Operator for GraphOperator {
         self.row_budget = Some(budget);
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize) {
+    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
         // Record the top-k directive; threaded into the per-parent inner subplan
         // (like `row_budget`). NOT forwarded to `self.child` (the parent seed is
         // not the scan). Per-partition top-k is sound (see the field doc).
-        self.topk = Some((sort_var, k));
+        self.topk = Some((sort_var, k, ascending));
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {

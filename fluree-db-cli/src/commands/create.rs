@@ -11,6 +11,8 @@ pub struct ImportOpts {
     pub memory_budget_mb: usize,
     pub parallelism: usize,
     pub chunk_size_mb: usize,
+    /// Namespace salting minted blank-node ids. `None` = the ledger id.
+    pub skolem_namespace: Option<String>,
     pub leaflet_rows: usize,
     pub leaflets_per_leaf: usize,
     /// CSV/Cypher import: how relationship (edge) properties are encoded.
@@ -537,6 +539,9 @@ async fn run_bulk_import(
     }
     if import_opts.chunk_size_mb > 0 {
         builder = builder.chunk_size_mb(import_opts.chunk_size_mb);
+    }
+    if let Some(ns) = import_opts.skolem_namespace.as_deref() {
+        builder = builder.skolem_namespace(ns);
     }
     if import_opts.leaflet_rows != 25_000 {
         builder = builder.leaflet_rows(import_opts.leaflet_rows);

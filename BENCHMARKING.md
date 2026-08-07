@@ -1,4 +1,15 @@
-# Benchmarking
+# Internal benchmarks (regression gating)
+
+> **Looking for competitive benchmarks?** Head-to-head results against QLever,
+> Virtuoso, MillenniumDB, Memgraph, Neo4j, FalkorDB and others — reproducible
+> from pinned datasets — live in
+> [**fluree/benchmark-db**](https://github.com/fluree/benchmark-db). For the
+> architecture behind those numbers, see
+> [Performance architecture](docs/design/performance.md).
+>
+> This document covers something different: the in-repo criterion benches that
+> guard against *drift* between releases. They measure Fluree against its own
+> prior baselines, not against other engines.
 
 Performance benchmarks for the Fluree DB workspace. Use this doc to:
 

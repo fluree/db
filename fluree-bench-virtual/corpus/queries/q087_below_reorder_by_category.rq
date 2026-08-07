@@ -1,0 +1,16 @@
+# q087 below-reorder by category — the deployed production DNF shape Q2 (FAMILY-C).
+# fact(InventorySnapshot) -> dim(Product) FK join, GROUP BY the dim attribute
+# category, COUNT + two AVG folds, with a FACT-SIDE VAR-TO-VAR FILTER
+# (?onHand < ?reorder) — stats-unprunable (neither side constant). Before FAMILY-C
+# this DECLINED at the join-path blanket filter guard and materialized the whole
+# join (~5.0s virtual at SF0.1, DNF at deployed cold scale). The widening admits the
+# fact-side residual into the fused fold; `resolve_agg_folds` already folds the two
+# AVGs. Deterministic grouped result → Full hash-gated (native oracle == virtual). A
+# NULL on either side of the comparison excludes the row (BGP parity), not "less than".
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?category (COUNT(?snap) AS ?belowReorderCount) (AVG(?onHand) AS ?avgOnHand) (AVG(?reorder) AS ?avgReorder)
+WHERE { ?snap a edw:InventorySnapshot ; edw:onHandQty ?onHand ; edw:reorderPoint ?reorder ; edw:product ?prod .
+        ?prod edw:category ?category .
+        FILTER(?onHand < ?reorder) }
+GROUP BY ?category
+ORDER BY DESC(?belowReorderCount)

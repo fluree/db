@@ -124,8 +124,10 @@ pub const BLANK_NODE_PREFIX: &str = "_:";
 /// Label prefix reserved for Fluree-minted stable blank-node identifiers.
 ///
 /// Every skolemized blank node the system mints has a local name beginning
-/// with `fdb-` (e.g. `fdb-<ulid>`, `fdb-<txn>-<label>`), rendered as
-/// `_:fdb-...` in query results. Labels with this prefix are reserved: when
+/// with `fdb-` (e.g. `fdb-<uuid>` from `BNODE()`, `fdb-<txn>-<label>` from a
+/// staged transaction, `fdb-d<doc-scope>-<label>` from bulk import — see
+/// [`crate::skolem`]), rendered as `_:fdb-...` in query results. Labels with
+/// this prefix are reserved: when
 /// they appear in incoming queries or transactions they denote the *existing*
 /// stored node rather than minting a fresh one (RDF 1.1 §3.5 skolemization,
 /// kept in blank-node syntax). Client-chosen labels never collide because
@@ -164,9 +166,14 @@ pub fn stable_blank_node_local(iri: &str) -> Option<&str> {
 /// check built-ins because they have no standard IRI delimiters.
 pub fn canonical_split(iri: &str, mode: NsSplitMode) -> (&str, &str) {
     // Blank nodes always use the well-known `_:` prefix. Split it off first and
-    // unconditionally: the skolemized local part can contain colons (e.g.
-    // `_:fdb-<ledger>:<branch>-...`), which would otherwise make the generic
-    // opaque-IRI splitter cut at an embedded colon and drop the `_:` prefix,
+    // unconditionally: the skolemized local part can contain colons.
+    //
+    // Bulk import no longer mints them — its ids are `fdb-d<base36>-<label>`
+    // (see [`crate::skolem`]) — but ledgers imported before that change hold
+    // `_:fdb-<ledger>:<branch>-<t>-<label>`, and a user-authored label can
+    // carry a colon on any surface that admits one (JSON-LD does; SPARQL does
+    // not). Without this branch the generic opaque-IRI splitter would cut at
+    // the embedded colon and drop the `_:` prefix,
     // re-encoding the blank node into the EMPTY namespace (code 0). That breaks
     // round-tripping: a blank node written via the dedicated blank-node code (10)
     // would read back as a different Sid, so subject-bounded index lookups miss.

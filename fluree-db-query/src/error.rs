@@ -86,6 +86,23 @@ pub enum QueryError {
         budget_bytes: usize,
     },
 
+    /// A syntactically valid query used a pattern the R2RML rewrite cannot
+    /// convert to a table scan on a virtual (graph-source) dataset — currently a
+    /// VARIABLE predicate paired with a BOUND term (`?s ?p <iri>` / `?s ?p "x"`),
+    /// or a top-level VALUES clause on a subgraph crawl.
+    ///
+    /// Distinct from [`Self::InvalidQuery`] (which means *malformed*) so the API
+    /// layer can surface the stable `err:r2rml/UnsupportedPattern` machine code
+    /// at HTTP 400 that callers gate on, rather than matching the (previously
+    /// wrong) prose. The `#[error]` Display keeps the "cannot be converted to
+    /// R2RML scans" phrase existing prose-matchers rely on during migration; the
+    /// `detail` names the ACTUAL unsupported shape and stays actionable.
+    #[error(
+        "R2RML graph source query contains a pattern that cannot be converted to \
+         R2RML scans: {detail}"
+    )]
+    R2rmlUnsupportedPattern { detail: String },
+
     /// Object storage denied a read of an external table's data (S3 403 /
     /// `AccessDenied`).
     ///
@@ -194,6 +211,15 @@ impl QueryError {
     /// Create an execution error (runtime configuration/environment issue).
     pub fn execution(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
+    }
+
+    /// Create an [`Self::R2rmlUnsupportedPattern`] refusal with an actionable
+    /// detail (the shape that was refused and the supported alternative). Used by
+    /// the R2RML rewrite refusal sites and the graph-source crawl guard.
+    pub fn r2rml_unsupported_pattern(detail: impl Into<String>) -> Self {
+        Self::R2rmlUnsupportedPattern {
+            detail: detail.into(),
+        }
     }
 
     /// Convert an `io::Error` to a `QueryError`, preserving fuel-exhaustion

@@ -1,0 +1,8 @@
+# q081 customer_type_lookup_crawl — browse-parity Cluster B (D4), the ["@type"]
+#   select-map form (shape 7). At 733cb2c8e the constant-IRI ["@type"] select-map
+#   returned the [{}] stub on virtual; Cluster B returns @id + @type only for the
+#   bound subject (the requested projection, no forward properties). Single
+#   subject = deterministic, hash-gated Full.
+{
+  "select": {"http://data.fluree.dev/edw/customer/1": ["@type"]}
+}

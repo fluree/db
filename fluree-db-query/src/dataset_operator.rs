@@ -20,10 +20,13 @@
 //!
 //! See `docs/design/query-execution.md` for the pipeline overview.
 
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use fluree_db_core::{IndexType, ObjectBounds, Sid};
+use hashbrown::HashMap;
+use rustc_hash::{FxBuildHasher, FxHasher};
 
 use crate::binary_history::BinaryHistoryScanOperator;
 use crate::binary_scan::{schema_from_pattern_with_emit, BinaryScanOperator, EmitMask};
@@ -32,6 +35,7 @@ use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
 use crate::ir::triple::TriplePattern;
+use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::inline::{extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::temporal_mode::TemporalMode;
@@ -61,6 +65,21 @@ pub trait DatasetBuilder: Send + Sync {
     /// hint). Default: none. Scan builders override to expose the access path.
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
         serde_json::Map::new()
+    }
+
+    /// Whether this builder's scans emit every *variable* triple position (so
+    /// the emitted row carries full triple identity for the dedup key; constant
+    /// positions never form a column). The `DatasetOperator` cross-member
+    /// set-dedup (SPARQL §13.2) keys on the emitted row, so it is only sound when
+    /// no variable column is pruned. Defaults to `true` for builders that never
+    /// prune; `ScanDatasetBuilder` reports its actual mask so a dataset path that
+    /// arms dedup without setting `PlanningContext::multi_default_graph` (which
+    /// forces `EmitMask::ALL`) trips the `debug_assert` in
+    /// [`DatasetOperator::open`] instead of silently over-deduping. A ground
+    /// (all-constant) pattern legitimately emits zero columns and is `true` here;
+    /// its empty-mapping batches are collapsed separately by `BatchDeduper`.
+    fn emit_is_full(&self) -> bool {
+        true
     }
 }
 
@@ -155,6 +174,17 @@ impl DatasetBuilder for ScanDatasetBuilder {
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
+
+    fn emit_is_full(&self) -> bool {
+        // Full triple *identity* only requires that every VARIABLE position is
+        // emitted — a constant position never forms a column, so its mask bit is
+        // irrelevant to the dedup key. (`emit_mask_for_triple` sets constants to
+        // `true`, but the property-join planner leaves them `false`, so consult
+        // the pattern rather than assuming `s && p && o`.)
+        (!self.pattern.s.is_var() || self.emit.s)
+            && (!self.pattern.p.is_var() || self.emit.p)
+            && (!self.pattern.o.is_var() || self.emit.o)
+    }
 }
 
 // =============================================================================
@@ -165,6 +195,92 @@ impl DatasetBuilder for ScanDatasetBuilder {
 struct DatasetMember {
     operator: BoxedOperator,
     ledger_id: Arc<str>,
+}
+
+/// Cross-member set-deduplicator for a `>= 2`-member default union.
+///
+/// Per SPARQL §13.2 the default graph of a dataset is the RDF *merge* (a set)
+/// of its `FROM` graphs, so a triple present in two members must be emitted
+/// once. This holds a persistent seen-set across `next_batch` calls (the
+/// operator streams one member's batch per call) and drops rows whose full
+/// binding tuple has already been emitted.
+///
+/// Hashing mirrors [`DistinctOperator`](crate::distinct): rows are normalized
+/// with [`EqualityNorm`] so a late-materialized `EncodedSid`/`EncodedLit` and
+/// its decoded `Sid`/`Lit` twin collapse to one row. `Binding`'s manual
+/// `Eq`/`Hash` exclude history metadata, so this is only armed in current mode
+/// (see [`DatasetOperator::open`]).
+///
+/// MEMORY CLIFF (documented like `scan_graph_flakes`'s): unlike a
+/// single-graph scan, a `>= 2`-member default union is no longer
+/// bounded-memory streaming — the seen-set grows O(distinct emitted rows)
+/// with full normalized `Binding` signatures as keys, exactly like a
+/// user-requested `DISTINCT` (which is the price of §13.2 set semantics; a
+/// hash-only key was rejected because a collision would silently DROP a
+/// distinct row). Each RETAINED row charges one unit of fuel, so a fuel
+/// budget bounds the resident set; `drain_count` inherits the same cost when
+/// it forgoes the per-member count-only shortcut (surfaced to EXPLAIN via
+/// `plan_details.default_union_set_merge`).
+struct BatchDeduper {
+    seen: HashMap<Vec<Binding>, (), FxBuildHasher>,
+    norm: Option<EqualityNorm>,
+    /// Whether the empty solution mapping has already been emitted. A ground
+    /// (all-constant) pattern like `{ <s> <p> <o> }` emits a zero-column schema
+    /// even under forced `EmitMask::ALL` (only variable positions form columns),
+    /// so its matches can't be keyed by the row-tuple set below. The empty
+    /// mapping is itself a single set key, so it must survive at most once.
+    seen_empty: bool,
+}
+
+impl BatchDeduper {
+    fn new(ctx: &ExecutionContext<'_>) -> Self {
+        Self {
+            seen: HashMap::with_hasher(FxBuildHasher),
+            norm: equality_norm(ctx),
+            seen_empty: false,
+        }
+    }
+
+    /// Retain only rows whose (normalized) binding tuple has not been emitted
+    /// before, returning a batch of the new rows (may be empty).
+    fn retain_new(&mut self, batch: Batch) -> Result<Batch> {
+        // A ground (all-constant) pattern emits the empty solution mapping with
+        // no columns. Under set-merge (SPARQL §13.2) that mapping is a single
+        // solution, so a triple present in N default-union members must yield
+        // ONE empty solution, not N: emit it on first sight, suppress after.
+        // (`next_batch` only forwards non-empty batches, so a first-sight batch
+        // always carries at least one empty row; collapse its whole count to 1.)
+        if batch.schema().is_empty() {
+            if self.seen_empty {
+                return Ok(Batch::empty_schema_with_len(0));
+            }
+            self.seen_empty = true;
+            return Ok(Batch::empty_schema_with_len(1));
+        }
+        let num_cols = batch.schema().len();
+        let (store, gv) = EqualityNorm::parts(&self.norm);
+        let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+        for row_idx in 0..batch.len() {
+            let signature: Vec<Binding> = (0..num_cols)
+                .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), store, gv))
+                .collect();
+            let mut h = FxHasher::default();
+            signature.hash(&mut h);
+            let hash = h.finish();
+            let entry = self
+                .seen
+                .raw_entry_mut()
+                .from_hash(hash, |sig| *sig == signature);
+            if let hashbrown::hash_map::RawEntryMut::Vacant(v) = entry {
+                v.insert_hashed_nocheck(hash, signature, ());
+                for (col_idx, col) in columns.iter_mut().enumerate() {
+                    col.push(batch.get_by_col(row_idx, col_idx).clone());
+                }
+            }
+        }
+        let schema: Arc<[VarId]> = Arc::from(batch.schema().to_vec().into_boxed_slice());
+        Batch::new(schema, columns).map_err(|e| QueryError::Internal(e.to_string()))
+    }
 }
 
 /// Operator that fans triple-pattern evaluation across multiple graphs.
@@ -185,6 +301,14 @@ pub struct DatasetOperator {
     /// True when members span multiple distinct ledger IDs, requiring
     /// `Binding::Sid` → `Binding::IriMatch` conversion.
     needs_provenance: bool,
+    /// Temporal mode captured at planner-time. Set-deduplication of the default
+    /// union is only sound in current mode (history rows carry per-event
+    /// assert/retract metadata that the dedup key deliberately ignores).
+    mode: TemporalMode,
+    /// Cross-member set-deduplicator, armed in [`open`](Operator::open) only for
+    /// a current-mode `>= 2`-member default union. `None` for single graphs,
+    /// named-graph scopes, and history mode (bag semantics preserved).
+    dedup: Option<BatchDeduper>,
     /// T1.3: a top-of-tree `LIMIT` row budget, recorded by `set_row_budget` and
     /// threaded into each member's inner subtree at build time in `open` (mirrors
     /// `GraphOperator`, which builds its inner subplan the same way). Without this
@@ -194,7 +318,7 @@ pub struct DatasetOperator {
     /// T1.3: an `ORDER BY … LIMIT` top-k directive, applied per member like
     /// `row_budget`. Per-member top-k is sound — the outer sort merges the members'
     /// partial top-k into the global one.
-    topk: Option<(VarId, usize)>,
+    topk: Option<(VarId, usize, bool)>,
 }
 
 impl DatasetOperator {
@@ -206,6 +330,8 @@ impl DatasetOperator {
             members: Vec::new(),
             current_member: 0,
             needs_provenance: false,
+            mode: TemporalMode::Current,
+            dedup: None,
             row_budget: None,
             topk: None,
         }
@@ -221,8 +347,8 @@ impl DatasetOperator {
         if let Some(budget) = self.row_budget {
             member.set_row_budget(budget);
         }
-        if let Some((sort_var, k)) = self.topk {
-            member.set_topk(sort_var, k);
+        if let Some((sort_var, k, ascending)) = self.topk {
+            member.set_topk(sort_var, k, ascending);
         }
     }
 
@@ -243,7 +369,9 @@ impl DatasetOperator {
     ) -> Self {
         let builder =
             ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint, mode);
-        Self::new(Box::new(builder))
+        let mut op = Self::new(Box::new(builder));
+        op.mode = mode;
+        op
     }
 }
 
@@ -381,18 +509,25 @@ impl Operator for DatasetOperator {
         }
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize) {
+    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
         // T1.3: record ORDER BY … LIMIT top-k; applied per member like the row
         // budget. Per-member top-k is sound — the outer sort merges the members'
         // partial top-k into the global one (same reasoning as `GraphOperator`'s
         // per-partition top-k). Switch-gated.
         if crate::r2rml::dataset_budget_enabled() {
-            self.topk = Some((sort_var, k));
+            self.topk = Some((sort_var, k, ascending));
         }
     }
 
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
-        self.builder.plan_details()
+        let mut details = self.builder.plan_details();
+        // Post-open, report the armed §13.2 set-merge so EXPLAIN can say why
+        // memory grows with distinct rows and why COUNT(*) forgoes the
+        // per-member count-only shortcut on a multi-FROM union.
+        if self.dedup.is_some() {
+            details.insert("default_union_set_merge".to_string(), true.into());
+        }
+        details
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
@@ -432,6 +567,45 @@ impl Operator for DatasetOperator {
                         .as_ref()
                         .is_some_and(|d| d.spans_multiple_ledgers());
                 self.needs_provenance = multi_ledger;
+
+                // A `>= 2`-member active set is a default union (named scopes
+                // always resolve to exactly one member; see `active_graphs`), so
+                // enforce set semantics across members. Current mode only — the
+                // dedup key ignores the per-event assert/retract metadata that
+                // history rows must keep. The planner pairs this with forced
+                // `EmitMask::ALL` on the first scan (see
+                // `PlanningContext::multi_default_graph`) so that every *variable*
+                // position is emitted and the row tuple keys the set. A ground
+                // (all-constant) pattern still emits zero columns even so; those
+                // zero-column batches are the empty solution mapping, which the
+                // deduper collapses to a single solution (`BatchDeduper::retain_new`).
+                self.dedup = if graphs.len() >= 2 && self.mode.is_current() {
+                    // Soundness coupling: arming dedup on a `>= 2`-member union
+                    // requires the plan to have forced `EmitMask::ALL` (via
+                    // `PlanningContext::multi_default_graph`) so no variable
+                    // column is pruned. A future dataset path that arms a
+                    // multi-default scan without setting the flag would key the
+                    // dedup on a pruned mask and over-dedup distinct triples —
+                    // fail loudly here rather than silently.
+                    if !self.builder.emit_is_full() {
+                        // A pruned variable column under an armed dedup would
+                        // COLLAPSE DISTINCT TRIPLES (silent wrong cardinality).
+                        // This was a debug_assert, which compiles out in
+                        // release — fail loud there too: every known dataset
+                        // path forces full emission (make_first_scan under
+                        // multi_default_graph; joins/OPTIONAL/property-join
+                        // widen or hard-code ALL), so reaching this is a
+                        // planner bug, not a user error.
+                        return Err(QueryError::Internal(
+                            "multi-default-graph set-dedup armed on a scan with a pruned \
+                             variable column; the plan must force full variable emission"
+                                .to_string(),
+                        ));
+                    }
+                    Some(BatchDeduper::new(ctx))
+                } else {
+                    None
+                };
 
                 for graph in &graphs {
                     let mut inner = self.builder.build()?;
@@ -504,6 +678,25 @@ impl Operator for DatasetOperator {
                     } else {
                         batch
                     };
+                    // Set-merge the default union (SPARQL §13.2): drop triples an
+                    // earlier member already emitted. Deduplicating *after*
+                    // stamping keys the cross-ledger path on comparable
+                    // IRI-level (`IriMatch`) values. An all-duplicate batch
+                    // yields nothing — fetch the member's next batch.
+                    let result = match &mut self.dedup {
+                        Some(dedup) => {
+                            let deduped = dedup.retain_new(result)?;
+                            // Each RETAINED row grows the resident seen-set;
+                            // charge fuel so a budget bounds the memory cliff
+                            // (see the BatchDeduper doc).
+                            ctx.tracker.consume_fuel(deduped.len() as u64)?;
+                            if deduped.is_empty() {
+                                continue;
+                            }
+                            deduped
+                        }
+                        None => result,
+                    };
                     return Ok(Some(result));
                 }
                 None => {
@@ -544,6 +737,22 @@ impl Operator for DatasetOperator {
             "active_graphs() returned a different number of graphs than open() saw"
         );
 
+        // Set semantics for a `>= 2`-member default union (SPARQL §13.2): the
+        // per-member count-only sum below is a *bag* union that over-counts a
+        // triple shared across members. `self.dedup` is armed exactly for that
+        // case; count the deduplicated `next_batch` stream instead, forgoing the
+        // count-only optimization on this cold path.
+        if self.dedup.is_some() {
+            let mut n: u64 = 0;
+            while let Some(batch) = self.next_batch(ctx).await? {
+                ctx.check_cancelled()?;
+                n = n.checked_add(batch.len() as u64).ok_or_else(|| {
+                    QueryError::execution("COUNT(*) overflow in dataset drain_count")
+                })?;
+            }
+            return Ok(Some(n));
+        }
+
         let mut total: u64 = 0;
         while self.current_member < self.members.len() {
             let n = match &graphs {
@@ -572,6 +781,7 @@ impl Operator for DatasetOperator {
         }
         self.members.clear();
         self.current_member = 0;
+        self.dedup = None;
         self.state = OperatorState::Closed;
     }
 
@@ -626,7 +836,7 @@ mod tests {
     /// freshly built member.
     struct DirectiveRecorder {
         budget: Arc<Mutex<Option<usize>>>,
-        topk: Arc<Mutex<Option<(VarId, usize)>>>,
+        topk: Arc<Mutex<Option<(VarId, usize, bool)>>>,
         schema: Arc<[VarId]>,
         state: OperatorState,
     }
@@ -650,8 +860,8 @@ mod tests {
         fn set_row_budget(&mut self, budget: usize) {
             *self.budget.lock().unwrap() = Some(budget);
         }
-        fn set_topk(&mut self, sort_var: VarId, k: usize) {
-            *self.topk.lock().unwrap() = Some((sort_var, k));
+        fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+            *self.topk.lock().unwrap() = Some((sort_var, k, ascending));
         }
     }
 
@@ -659,7 +869,7 @@ mod tests {
     /// handles, so a test can read what the built member(s) received.
     struct RecorderBuilder {
         budget: Arc<Mutex<Option<usize>>>,
-        topk: Arc<Mutex<Option<(VarId, usize)>>>,
+        topk: Arc<Mutex<Option<(VarId, usize, bool)>>>,
         schema: Arc<[VarId]>,
     }
 
@@ -679,7 +889,7 @@ mod tests {
 
     type RecorderHandles = (
         Arc<Mutex<Option<usize>>>,
-        Arc<Mutex<Option<(VarId, usize)>>>,
+        Arc<Mutex<Option<(VarId, usize, bool)>>>,
     );
 
     fn recorder_dataset() -> (DatasetOperator, RecorderHandles) {
@@ -721,9 +931,9 @@ mod tests {
     #[tokio::test]
     async fn dataset_forwards_topk_to_member() {
         let (mut op, (_budget, topk)) = recorder_dataset();
-        op.set_topk(VarId(3), 5);
+        op.set_topk(VarId(3), 5, false);
         open_and_drain(&mut op).await;
-        assert_eq!(*topk.lock().unwrap(), Some((VarId(3), 5)));
+        assert_eq!(*topk.lock().unwrap(), Some((VarId(3), 5, false)));
     }
 
     #[tokio::test]

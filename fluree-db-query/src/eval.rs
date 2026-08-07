@@ -51,7 +51,9 @@ use crate::binding::{Binding, BindingRow, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::ir::{Expression, FlakeValue};
+use crate::parse::UnresolvedDatatypeConstraint;
 use crate::var_registry::VarId;
+use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::DatatypeConstraint;
 use helpers::eval_cached_bool_predicate;
 use num_traits::Zero;
@@ -172,6 +174,41 @@ impl Expression {
                             e,
                         )
                     })?;
+                    // xsd:float is folded to `FlakeValue::Double` at decode (the
+                    // NUM_F64 fast path in `context.rs`), dropping the float tag
+                    // the Lit path keeps via `lit_to_comparable`. Re-tag it from
+                    // the in-scope `dt_id` so `datatype(?f + ?f)` stays xsd:float
+                    // on the late-materialized (`EncodedLit`) path — one integer
+                    // compare on the hot decode arm (#1470).
+                    if *dt_id == DatatypeDictId::FLOAT.as_u16() {
+                        if let FlakeValue::Double(d) = val {
+                            return Ok(Some(ComparableValue::Float(d as f32)));
+                        }
+                    }
+                    // A stored language-tagged literal decodes to a bare string
+                    // (`FlakeValue::String` cannot carry the tag), so `=`/`!=`/
+                    // `IN` were tag-blind exactly on the production-typical
+                    // indexed path while the Lit path compares tag-aware
+                    // (#1468). Re-tag from the in-scope `lang_id` — symmetric
+                    // to the FLOAT re-tag above and to the `lang_id` check in
+                    // `binding_effective_bool`; one integer compare on the hot
+                    // arm, the meta decode only runs for lang-tagged rows.
+                    if *lang_id != 0 && matches!(&val, FlakeValue::String(_)) {
+                        return match ctx.and_then(|c| c.lang_tag_for_id(*lang_id)) {
+                            Some(tag) => Ok(Some(ComparableValue::TypedLiteral {
+                                val,
+                                dtc: Some(crate::parse::UnresolvedDatatypeConstraint::LangTag(tag)),
+                            })),
+                            // An UNRESOLVABLE nonzero lang_id (an
+                            // overlay-ephemeral id the persisted store can't
+                            // see — unreachable through today's scan paths,
+                            // pinned by the post-index-novelty test) must
+                            // surface as an unknown value, never degrade to a
+                            // tag-blind bare string (the exact silent-equality
+                            // bug this arm exists to fix).
+                            None => Ok(None),
+                        };
+                    }
                     Ok(ComparableValue::try_from(&val).ok())
                 }
                 Some(Binding::Sid { sid, .. }) => Ok(Some(ComparableValue::Sid(sid.clone()))),
@@ -457,14 +494,19 @@ fn lit_to_comparable(
         FlakeValue::String(s) if is_xsd_string(dtc) => {
             Some(ComparableValue::String(Arc::from(s.as_str())))
         }
-        // A string literal with a foreign *datatype* becomes a `TypedLiteral` so
-        // `=`/`!=` can distinguish it (D5). A language-tagged literal stays a
-        // plain String: no greenable equality test needs language-aware `=`, and
-        // carrying the tag would break the string builtins (CONTAINS/REPLACE/…)
-        // that operate on a String. Resolving the datatype Sid to an IRI needs
-        // the snapshot; without it, degrade to a bare string.
+        // A string literal with a foreign *datatype* or a language tag becomes a
+        // `TypedLiteral` so `=`/`!=` are datatype/lang-aware (D5/D7): a stored
+        // `"x"@en` must not equal `"x"@fr`. The tag needs no snapshot
+        // (`UnresolvedDatatypeConstraint::LangTag` holds the `Arc<str>`
+        // directly); the string builtins that accept a language-tagged argument
+        // stay transparent to it via `ComparableValue::string_arg`. Resolving a
+        // foreign datatype Sid to an IRI needs the snapshot; without it, degrade
+        // to a bare string.
         FlakeValue::String(s) => match dtc {
-            DatatypeConstraint::LangTag(_) => Some(ComparableValue::String(Arc::from(s.as_str()))),
+            DatatypeConstraint::LangTag(tag) => Some(ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s.clone()),
+                dtc: Some(UnresolvedDatatypeConstraint::LangTag(tag.clone())),
+            }),
             DatatypeConstraint::Explicit(_) => {
                 match ctx.and_then(|c| dtc.to_unresolved(c.active_snapshot)) {
                     Some(u) => Some(ComparableValue::TypedLiteral {
@@ -521,6 +563,15 @@ fn binding_effective_bool(
             lang_id,
             ..
         }) => {
+            // A language-tagged literal has no effective boolean value (§17.2.2),
+            // matching the Lit path (`lit_effective_bool` errors on it). The
+            // late-materialized decode collapses it to a bare string, so consult
+            // `lang_id` before decoding rather than reading string-truthiness —
+            // a consistency fix aligning the encoded path with the Lit/constant
+            // path (#1470).
+            if *lang_id != 0 {
+                return Err(ebv_type_error());
+            }
             let decoded =
                 ctx.and_then(|c| c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id));
             match decoded {
@@ -837,5 +888,77 @@ mod tests {
         // Row 1: age=30 → NOT(30 > 25) = NOT(true) = false
         let row1 = batch.row_view(1).unwrap();
         assert!(!expr.eval_to_bool::<_>(&row1, None).unwrap());
+    }
+
+    #[test]
+    fn test_lit_to_comparable_carries_lang_tag() {
+        // #1468: a stored language-tagged literal must carry its tag as a lang
+        // `TypedLiteral` rather than degrade to a bare String (which made
+        // `"x"@en` and `"x"@fr` collapse to equal). No context is needed — the
+        // tag is held directly by `UnresolvedDatatypeConstraint::LangTag`.
+        let cv = lit_to_comparable(
+            &FlakeValue::String("x".to_string()),
+            &DatatypeConstraint::LangTag(Arc::from("en")),
+            None,
+        );
+        match cv {
+            Some(ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s),
+                dtc: Some(UnresolvedDatatypeConstraint::LangTag(tag)),
+            }) => {
+                assert_eq!(s.as_str(), "x");
+                assert_eq!(tag.as_ref(), "en");
+            }
+            other => panic!("expected lang TypedLiteral, got {other:?}"),
+        }
+    }
+
+    fn lang_pair_batch() -> Batch {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        // col0 is always "x"@en; col1 is "x"@fr, "x"@en, then plain "x".
+        let col0 = vec![
+            Binding::lit_lang(FlakeValue::String("x".to_string()), "en"),
+            Binding::lit_lang(FlakeValue::String("x".to_string()), "en"),
+            Binding::lit_lang(FlakeValue::String("x".to_string()), "en"),
+        ];
+        let col1 = vec![
+            Binding::lit_lang(FlakeValue::String("x".to_string()), "fr"),
+            Binding::lit_lang(FlakeValue::String("x".to_string()), "en"),
+            Binding::lit(FlakeValue::String("x".to_string()), Sid::new(2, "string")),
+        ];
+        Batch::new(schema, vec![col0, col1]).unwrap()
+    }
+
+    #[test]
+    fn test_stored_lang_equality_is_tag_aware() {
+        // #1468: `=` over stored language-tagged literals compares the tag.
+        let batch = lang_pair_batch();
+        let eq = Expression::eq(Expression::Var(VarId(0)), Expression::Var(VarId(1)));
+        // "x"@en = "x"@fr → false
+        assert!(!eq
+            .eval_to_bool::<_>(&batch.row_view(0).unwrap(), None)
+            .unwrap());
+        // "x"@en = "x"@en → true
+        assert!(eq
+            .eval_to_bool::<_>(&batch.row_view(1).unwrap(), None)
+            .unwrap());
+        // "x"@en = "x" (plain) → false
+        assert!(!eq
+            .eval_to_bool::<_>(&batch.row_view(2).unwrap(), None)
+            .unwrap());
+    }
+
+    #[test]
+    fn test_stored_lang_inequality_is_tag_aware() {
+        let batch = lang_pair_batch();
+        let ne = Expression::ne(Expression::Var(VarId(0)), Expression::Var(VarId(1)));
+        // "x"@en != "x"@fr → true
+        assert!(ne
+            .eval_to_bool::<_>(&batch.row_view(0).unwrap(), None)
+            .unwrap());
+        // "x"@en != "x"@en → false
+        assert!(!ne
+            .eval_to_bool::<_>(&batch.row_view(1).unwrap(), None)
+            .unwrap());
     }
 }

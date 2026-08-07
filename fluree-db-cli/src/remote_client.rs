@@ -2701,6 +2701,50 @@ impl RemoteLedgerClient {
         )
         .await
     }
+
+    // =========================================================================
+    // BM25 graph source operations
+    // =========================================================================
+
+    /// Create a BM25 full-text index on the remote server.
+    ///
+    /// Calls `POST {base_url}/bm25/create`.
+    pub async fn bm25_create(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("bm25/create");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Sync a BM25 full-text index on the remote server.
+    ///
+    /// Calls `POST {base_url}/bm25/sync`, or `…/bm25/sync?t=<t>` to sync
+    /// through a specific source-ledger `t` rather than its head.
+    pub async fn bm25_sync(
+        &self,
+        index: &str,
+        target_t: Option<i64>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url_root("bm25/sync");
+        if let Some(t) = target_t {
+            url.push_str(&format!("?t={t}"));
+        }
+        let body = serde_json::json!({ "index": index });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
 }
 
 fn push_idempotency_key(ledger: &str, request: &fluree_db_api::PushCommitsRequest) -> String {

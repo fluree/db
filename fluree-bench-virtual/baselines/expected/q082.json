@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "query_id": "q082",
+  "result_hash": "ed2458df9c8a6e677c8062c909b473d64dee314081502644404d2dd8b0dd170b",
+  "rows": 1,
+  "head_rows": [
+    "{\"edw:name\":\"Customer 1\",\"edw:segment\":\"Consumer\"}"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KY0X3SHR4SYZAMCDDTF33GDT",
+    "commit": "be859fe97"
+  }
+}

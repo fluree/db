@@ -190,9 +190,12 @@ pub fn eval_lang_matches<R: RowAccess>(
     check_arity(args, 2, "LANGMATCHES")?;
     let tag = args[0].eval_to_comparable(row, ctx)?;
     let range = args[1].eval_to_comparable(row, ctx)?;
-    match (tag, range) {
-        (Some(ComparableValue::String(t)), Some(ComparableValue::String(r))) => {
-            let result = if r.as_ref() == "*" {
+    let (Some(tag), Some(range)) = (tag, range) else {
+        return Ok(None);
+    };
+    match (tag.string_arg(), range.string_arg()) {
+        (Some(t), Some(r)) => {
+            let result = if r == "*" {
                 !t.is_empty()
             } else {
                 let t_lower = t.to_lowercase();
@@ -203,7 +206,6 @@ pub fn eval_lang_matches<R: RowAccess>(
             };
             Ok(Some(ComparableValue::Bool(result)))
         }
-        (None, _) | (_, None) => Ok(None),
         _ => Err(QueryError::InvalidExpression(
             "LANGMATCHES requires string arguments".to_string(),
         )),
