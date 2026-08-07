@@ -78,6 +78,7 @@ fn rebuild_psot_first_fact_of_predicate_loses_replay_history() {
         skip_history: false,
         g_id: 0,
         progress: None,
+        fan_in_cap: usize::MAX,
     };
     let result = build_index(&config).unwrap();
     let leaf = &result.graphs[0].leaf_infos[0];

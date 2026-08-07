@@ -15,6 +15,7 @@
   - [insert](cli/insert.md)
   - [upsert](cli/upsert.md)
   - [update](cli/update.md)
+  - [load](cli/load.md)
   - [query](cli/query.md)
   - [validate](cli/validate.md)
   - [model](cli/model.md)
@@ -40,6 +41,7 @@
   - [track](cli/track.md)
   - [cache](cli/cache.md)
   - [server](cli/server.md)
+  - [server-integration](cli/server-integration.md)
   - [memory](cli/memory.md)
   - [mcp](cli/mcp.md)
   - [docs](cli/docs.md)
@@ -167,6 +169,7 @@
   - [BM25 graph source](graph-sources/bm25.md)
 
 - [Fluree for AI and agents](ai/README.md)
+  - [Claude Code and the CLI](ai/claude-code.md)
 
 - [Memory](memory/README.md)
   - [Getting started](memory/getting-started/README.md)

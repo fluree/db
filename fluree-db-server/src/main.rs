@@ -17,6 +17,10 @@ use fluree_db_server::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Best-effort raise of the open-file soft limit (macOS defaults to 256,
+    // which large imports exceed). Done before logging init; logged after.
+    let fd_raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
+
     // 1. Parse CLI + env via clap (get both typed config and raw matches)
     let matches = ServerConfig::command().get_matches();
     let mut config = ServerConfig::from_arg_matches(&matches)?;
@@ -37,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize telemetry (logging + optional tracing)
     let telemetry_config = TelemetryConfig::with_server_config(&config);
     init_logging(&telemetry_config);
+    fluree_db_core::fd_limit::log_raise_outcome(&fd_raise);
 
     // Log startup info
     tracing::info!(

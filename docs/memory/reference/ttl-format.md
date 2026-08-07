@@ -26,11 +26,14 @@ mem:decision-01JDABC a mem:Decision ;
     mem:scope mem:repo ;
     mem:artifactRef "fluree-db-indexer/" ;
     mem:createdAt "2026-02-22T14:05:00Z"^^xsd:dateTime ;
+    mem:updatedAt "2026-07-30T09:12:00Z"^^xsd:dateTime ;
     mem:rationale "no_std compatible, smaller output than bincode" ;
     mem:alternatives "bincode, CBOR, MessagePack" .
 ```
 
 Tags and artifact refs are sorted alphabetically within a memory for deterministic diffs. When a memory is updated, the TTL file is rewritten with the changes in place and git tracks the history.
+
+`mem:updatedAt` appears only once a memory has been updated, and every update stamps it — including one that changes no other field, which is how a re-verification against HEAD is recorded. [`fluree memory audit`](../cli/audit.md) reads it to decide whether a ref's file has moved on since the memory was last confirmed.
 
 ## Why TTL and not JSON
 

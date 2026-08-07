@@ -106,6 +106,16 @@ pub fn memory_to_turtle_block(mem: &Memory) -> String {
     )
     .unwrap();
 
+    // mem:updatedAt (optional; present once the memory has been updated or re-verified)
+    if let Some(u) = &mem.updated_at {
+        writeln!(
+            s,
+            "    mem:updatedAt \"{}\"^^xsd:dateTime ;",
+            escape_turtle_string(u)
+        )
+        .unwrap();
+    }
+
     // Type-specific optional predicates
     if let Some(r) = &mem.rationale {
         writeln!(s, "    mem:rationale \"{}\" ;", escape_turtle_string(r)).unwrap();
@@ -475,6 +485,7 @@ mod tests {
             artifact_refs: vec!["Cargo.toml".to_string()],
             branch: Some("main".to_string()),
             created_at: "2026-02-24T10:30:00+00:00".to_string(),
+            updated_at: None,
             rationale: None,
             alternatives: None,
         }
@@ -507,6 +518,41 @@ mod tests {
 
         let block = memory_to_turtle_block(&mem);
         assert!(block.contains("mem:severity \"must\""));
+    }
+
+    #[test]
+    fn turtle_block_writes_updated_at_after_created_at() {
+        let mut mem = make_test_memory();
+        mem.updated_at = Some("2026-07-30T09:00:00+00:00".to_string());
+
+        let block = memory_to_turtle_block(&mem);
+        let created = block.find("mem:createdAt").expect("createdAt present");
+        let updated = block
+            .find("mem:updatedAt \"2026-07-30T09:00:00+00:00\"^^xsd:dateTime")
+            .expect("updatedAt present as a typed dateTime");
+        assert!(created < updated, "updatedAt follows createdAt");
+    }
+
+    #[test]
+    fn updated_at_survives_the_import_round_trip() {
+        let mut mem = make_test_memory();
+        mem.updated_at = Some("2026-07-30T09:00:00+00:00".to_string());
+
+        let ttl = format!("{TURTLE_PREFIXES}\n{}", memory_to_turtle_block(&mem));
+        let parsed = parse_and_inject_fulltext(&ttl)
+            .expect("parses")
+            .expect("has nodes");
+        let node = &parsed["@graph"][0];
+        assert!(
+            node.to_string().contains("2026-07-30T09:00:00"),
+            "updatedAt must reach the ledger import payload: {node}"
+        );
+    }
+
+    #[test]
+    fn turtle_block_omits_updated_at_when_never_updated() {
+        let block = memory_to_turtle_block(&make_test_memory());
+        assert!(!block.contains("mem:updatedAt"));
     }
 
     #[test]
