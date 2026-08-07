@@ -15,9 +15,18 @@ use fluree_db_query::binary_scan::{
 };
 use fluree_graph_ir::canonical_xsd_double;
 use fluree_vocab::xsd;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
+
+// The escaping / prefix-compaction primitives live in `fluree-graph-format`,
+// where the streaming IR writers can share them. Re-exported here because
+// `fluree_db_api::export::{PrefixMap, write_escaped_iri, …}` is the path
+// callers already use.
+pub use fluree_graph_format::{
+    escape_iri_into, write_escaped_iri, write_escaped_ntriples_string, write_prefix_declarations,
+    write_turtle_iri, write_turtle_iri_or_bnode, write_typed_literal, PrefixMap,
+};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -252,104 +261,6 @@ impl<'a> ExportResolver<'a> {
 // Prefix map — IRI → prefixed name compression for Turtle/TriG
 // ---------------------------------------------------------------------------
 
-/// A sorted prefix map for compressing IRIs into prefixed names.
-///
-/// Prefixes are sorted by IRI length descending so that longest-prefix-first
-/// matching produces the most specific result.
-#[derive(Debug, Clone)]
-pub struct PrefixMap {
-    /// (prefix, namespace_iri) sorted by namespace IRI length descending.
-    entries: Vec<(String, String)>,
-}
-
-impl PrefixMap {
-    /// Build a prefix map from a JSON-LD `@context` object.
-    ///
-    /// Expects `{"prefix": "iri", ...}` — ignores entries where the value
-    /// is not a string or the key starts with `@`.
-    pub fn from_context(ctx: &serde_json::Value) -> Self {
-        let mut entries = Vec::new();
-        if let Some(obj) = ctx.as_object() {
-            for (key, val) in obj {
-                if key.starts_with('@') {
-                    continue;
-                }
-                if let Some(iri) = val.as_str() {
-                    entries.push((key.clone(), iri.to_string()));
-                }
-            }
-        }
-        // Sort by IRI length descending for longest-prefix-first matching
-        entries.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
-        PrefixMap { entries }
-    }
-
-    /// Build from an explicit map of prefix → IRI.
-    pub fn from_map(map: BTreeMap<String, String>) -> Self {
-        let mut entries: Vec<(String, String)> = map.into_iter().collect();
-        entries.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
-        PrefixMap { entries }
-    }
-
-    /// Try to compress a full IRI into a prefixed name (e.g., `ex:alice`).
-    ///
-    /// Returns `None` if no prefix matches or the local name contains
-    /// characters that are invalid in a Turtle prefixed name.
-    pub fn compact(&self, iri: &str) -> Option<String> {
-        for (prefix, ns) in &self.entries {
-            if let Some(local) = iri.strip_prefix(ns.as_str()) {
-                if is_valid_pname_local(local) {
-                    return Some(format!("{prefix}:{local}"));
-                }
-            }
-        }
-        None
-    }
-
-    /// Returns `true` if the map has any entries.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Iterate `(prefix, namespace_iri)` pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.entries.iter().map(|(p, n)| (p.as_str(), n.as_str()))
-    }
-}
-
-/// Check if `local` is a valid Turtle PN_LOCAL (simplified).
-///
-/// We allow ASCII alphanumeric, `-`, `_`, and `.` (but not leading/trailing `.`).
-/// This is conservative — the full Turtle grammar allows more, but this covers
-/// the vast majority of real-world local names without risking invalid output.
-fn is_valid_pname_local(local: &str) -> bool {
-    if local.is_empty() {
-        return true; // bare prefix like `ex:` is valid
-    }
-    if local.starts_with('.') || local.ends_with('.') {
-        return false;
-    }
-    local
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-}
-
-/// Write `@prefix` declarations to a Turtle/TriG writer.
-pub fn write_prefix_declarations<W: Write>(prefixes: &PrefixMap, writer: &mut W) -> io::Result<()> {
-    // Sort alphabetically for deterministic, readable output
-    let mut sorted: Vec<(&str, &str)> = prefixes.iter().collect();
-    sorted.sort_by_key(|(p, _)| *p);
-    for (prefix, ns) in sorted {
-        write!(writer, "@prefix {prefix}: <")?;
-        write_escaped_iri(writer, ns)?;
-        writeln!(writer, "> .")?;
-    }
-    if !prefixes.is_empty() {
-        writeln!(writer)?; // blank line after prefixes
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Turtle streaming export
 // ---------------------------------------------------------------------------
@@ -475,42 +386,6 @@ fn write_turtle_batch<W: Write>(
         stats.triples_written += 1;
     }
     Ok(())
-}
-
-/// Write an IRI as a Turtle prefixed name or `<full-iri>`.
-pub fn write_turtle_iri<W: Write>(w: &mut W, iri: &str, prefixes: &PrefixMap) -> io::Result<()> {
-    if let Some(pname) = prefixes.compact(iri) {
-        w.write_all(pname.as_bytes())
-    } else {
-        w.write_all(b"<")?;
-        write_escaped_iri(w, iri)?;
-        w.write_all(b">")
-    }
-}
-
-/// Write a subject term as Turtle (prefixed name, `<iri>`, or `_:bnode`).
-///
-/// Blank-node labels are written verbatim, deliberately: an export has to
-/// round-trip, and rewriting a label to fit the Turtle grammar would merge two
-/// distinct nodes onto one id (contrast `crate::validate`, whose report output
-/// sanitizes because it does not round-trip).
-///
-/// Current blank-node ids are all writable as-is: import mints `[0-9a-z-]`
-/// (see `fluree_db_core::skolem`), staged transactions mint hex, `BNODE()`
-/// mints a UUID. Ledgers imported by Fluree 4.1.4 or earlier hold ids that
-/// embedded the ledger id, so they contain `/` and `:` and an export of such a
-/// ledger emits Turtle that strict parsers reject — the identity is preserved,
-/// the syntax is not. Re-importing the source fixes it.
-fn write_turtle_iri_or_bnode<W: Write>(
-    w: &mut W,
-    iri: &str,
-    prefixes: &PrefixMap,
-) -> io::Result<()> {
-    if iri.starts_with("_:") {
-        w.write_all(iri.as_bytes())
-    } else {
-        write_turtle_iri(w, iri, prefixes)
-    }
 }
 
 /// Write a Turtle object term (with prefix compression for IRI refs).
@@ -1563,15 +1438,6 @@ fn resolve_datatype_iri(store: &BinaryIndexStore, o_type: u16) -> Option<String>
         .and_then(|sid| store.sid_to_iri(&sid))
 }
 
-/// Write `"lexical"^^<datatype_iri>`.
-fn write_typed_literal<W: Write>(w: &mut W, lexical: &str, datatype_iri: &str) -> io::Result<()> {
-    w.write_all(b"\"")?;
-    write_escaped_ntriples_string(w, lexical)?;
-    w.write_all(b"\"^^<")?;
-    write_escaped_iri(w, datatype_iri)?;
-    w.write_all(b">")
-}
-
 /// Write a typed literal using the Display impl for the lexical form.
 fn write_typed_literal_display<W: Write, T: std::fmt::Display>(
     w: &mut W,
@@ -1585,93 +1451,14 @@ fn write_typed_literal_display<W: Write, T: std::fmt::Display>(
     write_typed_literal(w, &lexical, &dt)
 }
 
-// ---------------------------------------------------------------------------
-// N-Triples escaping (W3C compliant)
-// ---------------------------------------------------------------------------
-
-/// Write an N-Triples-escaped string to `w`.
-///
-/// Escapes: `\` `"` `\n` `\r` `\t` and control chars (U+0000..U+001F, U+007F..U+009F)
-/// via `\uXXXX`.
-fn write_escaped_ntriples_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
-    for ch in s.chars() {
-        match ch {
-            '\\' => w.write_all(b"\\\\")?,
-            '"' => w.write_all(b"\\\"")?,
-            '\n' => w.write_all(b"\\n")?,
-            '\r' => w.write_all(b"\\r")?,
-            '\t' => w.write_all(b"\\t")?,
-            c if c.is_control() => {
-                let cp = c as u32;
-                if cp <= 0xFFFF {
-                    write!(w, "\\u{cp:04X}")?;
-                } else {
-                    write!(w, "\\U{cp:08X}")?;
-                }
-            }
-            c => {
-                let mut buf = [0u8; 4];
-                let encoded = c.encode_utf8(&mut buf);
-                w.write_all(encoded.as_bytes())?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Write an IRI with escaping per N-Triples/Turtle `IRIREF` grammar.
-///
-/// Disallowed characters in `IRIREF`:
-/// - ASCII control and space: U+0000..=U+0020
-/// - DEL + C1 controls: U+007F..=U+009F
-/// - Punctuation: `<`, `>`, `"`, `{`, `}`, `|`, `^`, `` ` ``, `\`
-///
-/// We percent-encode the UTF-8 bytes of these characters to ensure the output
-/// remains syntactically valid RDF, even if the stored IRI contains invalid
-/// characters.
-pub fn write_escaped_iri<W: Write>(w: &mut W, iri: &str) -> io::Result<()> {
-    for ch in iri.chars() {
-        let cp = ch as u32;
-        let is_forbidden_range = cp <= 0x20 || (0x7F..=0x9F).contains(&cp);
-        let is_forbidden_punct = matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\');
-
-        if is_forbidden_range || is_forbidden_punct {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            for &b in encoded.as_bytes() {
-                write!(w, "%{b:02X}")?;
-            }
-        } else {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            w.write_all(encoded.as_bytes())?;
-        }
-    }
-    Ok(())
-}
-
-/// Escape an IRI into a pre-allocated String (for graph term caching).
-fn escape_iri_into(out: &mut String, iri: &str) {
-    for ch in iri.chars() {
-        let cp = ch as u32;
-        let is_forbidden_range = cp <= 0x20 || (0x7F..=0x9F).contains(&cp);
-        let is_forbidden_punct = matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\');
-
-        if is_forbidden_range || is_forbidden_punct {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            for &b in encoded.as_bytes() {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    // The escaping / prefix cases below now exercise `fluree-graph-format`
+    // through this module's re-export. They are kept here deliberately: the
+    // primitives have their own unit tests in that crate, and these pin the
+    // re-export path, which is what existing callers
+    // (`fluree_db_api::export::PrefixMap`, `export_builder.rs`) resolve
+    // through.
     use super::*;
 
     #[test]
@@ -1692,27 +1479,37 @@ mod tests {
     }
 
     #[test]
+    /// Export escapes IRIs with `UCHAR`, not percent-encoding — the latter
+    /// changed the IRI, merging distinct resources. See
+    /// `fluree_graph_format::write_escaped_iri` for the full argument; this
+    /// pins that the export path picks up the fixed behavior.
     fn test_escape_iri() {
         let mut buf = Vec::new();
         write_escaped_iri(&mut buf, "http://example.org/foo>bar").unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "http://example.org/foo%3Ebar"
+            "http://example.org/foo\\u003Ebar"
         );
 
         let mut buf = Vec::new();
         write_escaped_iri(&mut buf, "http://example.org/a\\b<c\"d").unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "http://example.org/a%5Cb%3Cc%22d"
+            "http://example.org/a\\u005Cb\\u003Cc\\u0022d"
         );
 
         let mut buf = Vec::new();
         write_escaped_iri(&mut buf, "http://example.org/a b\tc").unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "http://example.org/a%20b%09c"
+            "http://example.org/a\\u0020b\\u0009c"
         );
+
+        // A percent sign is ordinary here, which is what keeps an IRI whose
+        // text really contains `%20` distinct from one containing a space.
+        let mut buf = Vec::new();
+        write_escaped_iri(&mut buf, "http://example.org/a%20b").unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "http://example.org/a%20b");
     }
 
     #[test]
@@ -1774,9 +1571,17 @@ mod tests {
         let pm = PrefixMap::from_context(&ctx);
         // Spaces and special chars → falls back to full IRI
         assert_eq!(pm.compact("http://example.org/has space"), None);
-        assert_eq!(pm.compact("http://example.org/has:colon"), None);
         // Leading/trailing dots invalid
         assert_eq!(pm.compact("http://example.org/.hidden"), None);
+        assert_eq!(pm.compact("http://example.org/trailing."), None);
+        // A '-' cannot START a local name, though it is legal later.
+        assert_eq!(pm.compact("http://example.org/-dash"), None);
+
+        // A colon is legal in `PN_LOCAL`, but the writer deliberately does
+        // not emit one: widening compaction would change export's output for
+        // no correctness gain. Recorded as a separate decision rather than
+        // taken as a side effect — see `is_emittable_local`.
+        assert_eq!(pm.compact("http://example.org/has:colon"), None);
     }
 
     #[test]

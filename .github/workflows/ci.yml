@@ -240,3 +240,45 @@ jobs:
           cargo run -p fluree-bench-support --bin bench-baseline -- \
             compare --baseline bench-baselines/guardrails-pre.json \
             --allow-host-mismatch
+
+  testsuite-rdf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # testsuite-rdf has no submodule of its own: it READS
+          # testsuite-sparql/rdf-tests through a relative path, so that one
+          # checkout serves both harnesses at one commit. See
+          # testsuite-rdf/README.md.
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: "testsuite-rdf -> target"
+
+      - name: Format
+        working-directory: testsuite-rdf
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: testsuite-rdf
+        run: cargo clippy --all-targets -- -D warnings
+
+      # W3C RDF syntax conformance. The RDF 1.1 Turtle and N-Triples suites
+      # gate in conformant parser mode: every test must pass or be listed in
+      # tests/registers/mod.rs, which is policed in BOTH directions (an
+      # unexpected failure and a stale register entry each fail the suite), so
+      # the register can only shrink. The RDF 1.2 suites and the
+      # ingest-default mode run in the same invocation but never gate.
+      # See testsuite-rdf/README.md.
+      #
+      # Only three small crates compile here (graph-ir, graph-turtle, the
+      # harness) and the suites themselves finish in well under a second, so
+      # this budget is build time, not test time.
+      - name: Run W3C RDF syntax test suites
+        working-directory: testsuite-rdf
+        timeout-minutes: 20
+        run: cargo test

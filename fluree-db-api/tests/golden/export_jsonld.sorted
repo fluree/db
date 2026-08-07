@@ -1,0 +1,13 @@
+    "ex": "http://example.org/ns/",
+    "exdeep": "http://example.org/ns/deep/",
+    "schema": "http://schema.org/",
+    "xsd": "http://www.w3.org/2001/XMLSchema#"
+    {"@id": "ex:alice", "@type": "schema:Person", "ex:active": true, "ex:age": {"@value":42,"@type":"xsd:integer"}, "http://example.org/ns/has space": "local name that cannot be a PN_LOCAL", "ex:joined": {"@value":"2020-01-02T03:04:05.000000Z","@type":"xsd:dateTime"}, "ex:knows": {"@id":"ex:bob"}, "ex:label": [{"@value":"Alice","@language":"en"}, {"@value":"Alicia","@language":"es"}], "ex:note": "quote:\" backslash:\\ newline:\n tab:\t nul:\u0000", "ex:ratio": {"@value":0.25,"@type":"xsd:double"}, "ex:score": {"@value":"99.5","@type":"xsd:decimal"}, "schema:name": "Alice", "exdeep:nested": "longest prefix wins"},
+    {"@id": "ex:bob", "@type": "schema:Person", "ex:knows": [{"@id":"ex:alice"}, {"@id":"ex:carol"}], "schema:name": "Bob"},
+    {"@id": "http://example.org/ns/odd|iri", "schema:name": "Subject whose IRI needs IRIREF escaping"}
+  "@context": {
+  "@graph": [
+  ]
+  },
+{
+}

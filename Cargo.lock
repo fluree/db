@@ -2594,6 +2594,7 @@ dependencies = [
  "csv",
  "dirs 5.0.1",
  "flate2",
+ "fluree-bench-support",
  "fluree-db-api",
  "fluree-db-binary-index",
  "fluree-db-core",
@@ -2608,6 +2609,9 @@ dependencies = [
  "fluree-db-query",
  "fluree-db-r2rml",
  "fluree-db-server",
+ "fluree-graph-format",
+ "fluree-graph-ir",
+ "fluree-graph-turtle",
  "fluree-vocab",
  "futures",
  "hex",
@@ -3318,6 +3322,7 @@ name = "fluree-graph-format"
 version = "4.1.4"
 dependencies = [
  "fluree-graph-ir",
+ "fluree-graph-turtle",
  "fluree-vocab",
  "pretty_assertions",
  "serde",

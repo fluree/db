@@ -39,22 +39,36 @@ pub enum CollectionStyle {
     Spine,
 }
 
-/// How numeric literal tokens reach the sink.
+/// How value-typed literal tokens reach the sink.
+///
+/// "Numeric" is the historical name and the majority of the lane; the switch
+/// governs every token Turtle spells as a bare value rather than a quoted
+/// string — `Integer`, `Double`, and the `true`/`false` keywords. They move
+/// together because they share one hazard: a canonicalized token and the same
+/// term written longhand (`"1"^^xsd:integer`, `"true"^^xsd:boolean`) produce
+/// DIFFERENT [`Term`](fluree_graph_ir::Term)s, since `Term`'s equality and
+/// hash are variant-sensitive. Splitting the knob would let a caller pick a
+/// combination in which one spelling of one datatype silently fails to
+/// deduplicate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NumericStyle {
-    /// `Integer` and `Double` tokens are parsed into native
+    /// `Integer`, `Double` and the boolean keywords are parsed into native
     /// [`LiteralValue`](fluree_graph_ir::LiteralValue) values, discarding the
     /// source spelling. `+1`, `01`, and `1` all become `Integer(1)`; `1e0`
-    /// and `1.0E0` both become `Double(1.0)`.
+    /// and `1.0E0` both become `Double(1.0)`; `true` becomes `Boolean(true)`.
     ///
     /// Correct for ingest, where the value is what gets stored, and lossy for
     /// conversion, where the lexical form is part of the term's identity.
     #[default]
     Canonicalize,
 
-    /// Numeric literals keep their source lexical form, typed as
-    /// `xsd:integer` / `xsd:double`, exactly as `Decimal` and
+    /// Value-typed literals keep their source lexical form, typed as
+    /// `xsd:integer` / `xsd:double` / `xsd:boolean`, exactly as `Decimal` and
     /// i64-overflowing integer tokens already do.
+    ///
+    /// This is what makes `true` and `"true"^^xsd:boolean` — one RDF term
+    /// written two ways — one IR term, so a graph containing both holds one
+    /// triple rather than two.
     PreserveLexical,
 }
 

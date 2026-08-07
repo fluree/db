@@ -7,6 +7,11 @@
 //! Criterion already produces its own statistics; this helper is for the
 //! domain-specific cross-scenario comparisons benches sometimes want
 //! (e.g., "JSON-LD vs Turtle at each scale", with a ratio column).
+//!
+//! **This module is on a shipped runtime path**, not test-only:
+//! `fluree rdf --profile` renders its phase table through
+//! [`print_summary`], deliberately, so a profile and a bench summary are the
+//! same table. Changing its output changes user-visible CLI output.
 
 use std::fmt::Write;
 

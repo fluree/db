@@ -15,6 +15,8 @@ mod it_edge_annotations;
 mod it_edge_annotations_indexed;
 #[path = "it_edge_annotations_parse.rs"]
 mod it_edge_annotations_parse;
+#[path = "it_export_golden.rs"]
+mod it_export_golden;
 #[path = "it_fast_group_count.rs"]
 mod it_fast_group_count;
 #[path = "it_file_backed.rs"]
