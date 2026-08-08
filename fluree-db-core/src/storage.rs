@@ -620,12 +620,17 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
-        let address = self.cid_to_address(id)?;
-        match self.storage.delete(&address).await {
-            Ok(()) => Ok(()),
-            Err(crate::error::Error::NotFound(_)) => Ok(()),
-            Err(e) => Err(e),
+        // Delete every address the blob could occupy, not just the current
+        // layout: on a ledger predating the `@shared` dict move or the
+        // `.fir6` rename, the only copy sits at a legacy address, and
+        // releasing just the canonical one silently reclaims nothing.
+        for address in candidate_addresses(&self.method, &self.ledger_id, id) {
+            match self.storage.delete(&address).await {
+                Ok(()) | Err(crate::error::Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
+        Ok(())
     }
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
@@ -1343,6 +1348,33 @@ mod tests {
             candidate_addresses(storage.storage_method(), LEDGER, &id).contains(&legacy),
             "the address reads fall back to must be listed as a candidate"
         );
+    }
+
+    /// A garbage manifest names a CID, not an address. On a ledger predating
+    /// the `@shared` dict move the only copy sits at the legacy address, so
+    /// releasing just the canonical one reclaims nothing while reporting
+    /// success — the leak GC exists to prevent.
+    #[tokio::test]
+    async fn release_reclaims_a_blob_at_its_legacy_address() {
+        let storage = MemoryStorage::new();
+        let id = ContentId::new(
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"legacy dict",
+        );
+        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &id)
+            .expect("dict CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"legacy dict").await.unwrap();
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        store.release(&id).await.expect("release succeeds");
+
+        assert!(
+            !storage.exists(&legacy).await.unwrap(),
+            "the legacy-located blob must actually be reclaimed"
+        );
+        assert!(!store.has(&id).await.unwrap(), "and be unreachable after");
     }
 
     /// The current-layout address always leads, so callers that only need the
