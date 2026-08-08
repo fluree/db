@@ -451,6 +451,48 @@ impl IndexerOrchestrator {
 /// Per-ledger state map
 type LedgerStates = BTreeMap<String, LedgerIndexState>;
 
+/// Ledgers currently held by an exclusive maintenance operation.
+///
+/// A `std` mutex rather than tokio's, so [`MaintenanceGuard`] can release on
+/// drop: every critical section is a set insert, remove, or lookup with no
+/// await inside.
+type MaintenanceHolds = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// Excludes index builds for one ledger until dropped.
+///
+/// Reindex and the storage sweep write index artifacts outside the worker's
+/// admission path, so they hold this for the whole operation.
+/// [`TriggerHandle::wait_for_idle`] is not a substitute: it reports that a
+/// ledger *was* idle, and a build can start again the moment it returns.
+///
+/// Only the in-process worker consults this. An external indexer writing to
+/// the same storage is not excluded, so operations relying on it are safe
+/// only in single-process deployments.
+pub struct MaintenanceGuard {
+    ledger_id: String,
+    holds: MaintenanceHolds,
+    /// Wakes the worker on release so deferred builds resume promptly rather
+    /// than waiting for the next commit to tick.
+    tick: watch::Sender<u64>,
+}
+
+impl std::fmt::Debug for MaintenanceGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaintenanceGuard")
+            .field("ledger_id", &self.ledger_id)
+            .finish()
+    }
+}
+
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        if let Ok(mut holds) = self.holds.lock() {
+            holds.remove(&self.ledger_id);
+        }
+        self.tick.send_modify(|t| *t = t.wrapping_add(1));
+    }
+}
+
 /// Fires its inner `oneshot::Sender<()>` on drop. Wrapped in an
 /// `Arc` and shared across every external `IndexerHandle` clone so
 /// the worker's `oneshot::Receiver<()>` wakes exactly when the *last*
@@ -499,6 +541,8 @@ pub struct TriggerHandle {
     tick: watch::Sender<u64>,
     /// Notifier for idle state changes
     idle_notify: Arc<Notify>,
+    /// Ledgers held for maintenance (shared with worker)
+    maintenance: MaintenanceHolds,
 }
 
 impl std::fmt::Debug for TriggerHandle {
@@ -596,6 +640,29 @@ impl TriggerHandle {
         );
 
         IndexCompletion { receiver: rx }
+    }
+
+    /// Exclude index builds for `ledger_id` until the returned guard drops.
+    ///
+    /// Returns `None` when another maintenance operation already holds the
+    /// ledger. Callers report that rather than waiting — a sweep queued behind
+    /// a multi-hour reindex is indistinguishable from a hang.
+    ///
+    /// This excludes builds the in-process worker would *start*. A build
+    /// already in progress runs to completion, so callers that need the ledger
+    /// quiet must also [`cancel`](Self::cancel) and
+    /// [`wait_for_idle`](Self::wait_for_idle) after acquiring; taking the
+    /// guard first is what keeps a new build from starting in between.
+    pub fn acquire_maintenance(&self, ledger_id: &str) -> Option<MaintenanceGuard> {
+        let mut holds = self.maintenance.lock().ok()?;
+        if !holds.insert(ledger_id.to_string()) {
+            return None;
+        }
+        Some(MaintenanceGuard {
+            ledger_id: ledger_id.to_string(),
+            holds: Arc::clone(&self.maintenance),
+            tick: self.tick.clone(),
+        })
     }
 
     /// Cancel pending/queued work for a ledger
@@ -722,6 +789,12 @@ impl IndexerHandle {
         self.trigger.trigger(ledger_id, min_t).await
     }
 
+    /// Exclude index builds for a ledger. See
+    /// [`TriggerHandle::acquire_maintenance`].
+    pub fn acquire_maintenance(&self, ledger_id: &str) -> Option<MaintenanceGuard> {
+        self.trigger.acquire_maintenance(ledger_id)
+    }
+
     /// Cancel pending/queued work for a ledger. See
     /// [`TriggerHandle::cancel`].
     pub async fn cancel(&self, ledger_id: &str) -> bool {
@@ -805,10 +878,26 @@ pub struct BackgroundIndexerWorker {
     /// reached — safe because GC re-scans the full prev-index chain on every
     /// run, so a skipped pass is reattempted after the next successful index.
     gc_semaphore: Arc<Semaphore>,
+    /// Shared with the handle. Builds for a held ledger are deferred rather
+    /// than started; see [`MaintenanceGuard`].
+    maintenance: MaintenanceHolds,
 }
 
 /// Max concurrent background-GC tasks (see `BackgroundIndexerWorker::gc_semaphore`).
 const MAX_CONCURRENT_GC: usize = 4;
+
+impl BackgroundIndexerWorker {
+    /// Whether an exclusive maintenance operation currently holds `ledger_id`.
+    ///
+    /// A poisoned lock reports "held", so a panic while mutating the set
+    /// stalls indexing rather than admitting builds the sweep believes are
+    /// excluded.
+    fn maintenance_held(&self, ledger_id: &str) -> bool {
+        self.maintenance
+            .lock()
+            .map_or(true, |holds| holds.contains(ledger_id))
+    }
+}
 
 impl BackgroundIndexerWorker {
     /// Create a new worker and its associated handle.
@@ -825,11 +914,13 @@ impl BackgroundIndexerWorker {
         let (tick_tx, tick_rx) = watch::channel(0u64);
         let idle_notify = Arc::new(Notify::new());
         let (shutdown, shutdown_rx) = ShutdownTrigger::pair();
+        let maintenance: MaintenanceHolds = Arc::default();
 
         let trigger = TriggerHandle {
             states: Arc::clone(&states),
             tick: tick_tx,
             idle_notify: Arc::clone(&idle_notify),
+            maintenance: Arc::clone(&maintenance),
         };
         let handle = IndexerHandle {
             trigger: trigger.clone(),
@@ -847,6 +938,7 @@ impl BackgroundIndexerWorker {
             subscriber_trigger: trigger,
             event_bus: None,
             gc_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GC)),
+            maintenance,
         };
 
         (worker, handle)
@@ -1101,6 +1193,17 @@ impl BackgroundIndexerWorker {
                 return;
             }
         };
+
+        // Defer while an exclusive maintenance operation holds the ledger.
+        // The phase stays `Pending`, so the work resumes on the tick the
+        // guard sends when it releases.
+        if self.maintenance_held(ledger_id) {
+            debug!(
+                ledger_id = %ledger_id,
+                "Deferring queued indexing; ledger is held for maintenance"
+            );
+            return;
+        }
 
         // Mark as in-progress
         {
@@ -2410,6 +2513,92 @@ mod tests {
         // Now completion should resolve as cancelled
         let outcome = completion.wait().await;
         assert!(matches!(outcome, IndexOutcome::Cancelled));
+    }
+
+    fn maintenance_test_handle() -> IndexerHandle {
+        let (_worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(MemoryStorage::new())),
+            Arc::new(MemoryNameService::new()),
+            IndexerConfig::small(),
+        );
+        handle
+    }
+
+    /// Maintenance is exclusive per ledger. A second acquire is refused rather
+    /// than queued, so an admin operation reports the conflict instead of
+    /// blocking behind a build of unbounded length.
+    #[test]
+    fn maintenance_is_exclusive_per_ledger() {
+        let handle = maintenance_test_handle();
+
+        let held = handle
+            .acquire_maintenance("test:main")
+            .expect("first acquire succeeds");
+        assert!(
+            handle.acquire_maintenance("test:main").is_none(),
+            "a second acquire on the same ledger is refused"
+        );
+
+        drop(held);
+        assert!(
+            handle.acquire_maintenance("test:main").is_some(),
+            "releasing frees the ledger for the next operation"
+        );
+    }
+
+    /// The hold is scoped to one ledger — maintenance on one must not stall
+    /// indexing for any other.
+    #[test]
+    fn maintenance_on_one_ledger_leaves_others_free() {
+        let handle = maintenance_test_handle();
+
+        let _held = handle
+            .acquire_maintenance("test:main")
+            .expect("first acquire succeeds");
+        assert!(
+            handle.acquire_maintenance("other:main").is_some(),
+            "a different ledger is unaffected"
+        );
+    }
+
+    /// A build queued while maintenance is held stays pending rather than
+    /// starting, and the guard's release wakes the worker so it resumes
+    /// without waiting for the next commit.
+    #[tokio::test]
+    async fn a_held_ledger_defers_rather_than_starts_a_build() {
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(MemoryStorage::new())),
+            Arc::new(MemoryNameService::new()),
+            IndexerConfig::small(),
+        );
+
+        let guard = handle
+            .acquire_maintenance("test:main")
+            .expect("acquire succeeds");
+        assert!(
+            worker.maintenance_held("test:main"),
+            "the worker sees the hold and defers admission"
+        );
+
+        let _completion = handle.trigger("test:main", 1).await;
+        let status = handle.status("test:main").await.expect("ledger is tracked");
+        assert_eq!(
+            status.phase,
+            IndexPhase::Pending,
+            "queued work stays pending while the ledger is held"
+        );
+
+        let ticks_before = *worker.tick_rx.borrow();
+        drop(guard);
+        assert!(
+            !worker.maintenance_held("test:main"),
+            "releasing clears the hold"
+        );
+        assert_ne!(
+            *worker.tick_rx.borrow(),
+            ticks_before,
+            "releasing wakes the worker so deferred work resumes"
+        );
     }
 
     #[tokio::test]
