@@ -7,12 +7,13 @@
 //!
 //! Paths are resolved as the metadata wrote them: `file:///abs/path` URIs
 //! (what pyiceberg emits for a local warehouse) and bare absolute paths are
-//! accepted verbatim. There is deliberately NO prefix remapping yet — the
-//! day-1 contract is "the writer wrote local paths" (we control the writer).
-//! A table *copied* from an object store carries `s3://...` data-file URIs in
-//! its manifests, which this backend rejects with a clear error naming the
-//! problem; supporting that requires location-prefix remapping (tracked as a
-//! follow-up on the local-storage feature).
+//! accepted verbatim. A table that was COPIED or MOVED — whose manifests still
+//! reference the original location (possibly an `s3://` URI) — reads through a
+//! location remap ([`FileIcebergStorage::with_remap`]): the provider infers it
+//! by comparing the metadata's own `location` with the configured
+//! `table_location`, so "copy the table directory, point at it" needs no
+//! configuration. An object-store URI that does NOT match the remap prefix is
+//! rejected with an error naming the copied-table cause.
 
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
@@ -26,15 +27,59 @@ use crate::io::storage::{IcebergStorage, SendIcebergStorage};
 
 /// Storage backend that reads Iceberg files from the local filesystem.
 ///
-/// Stateless: every read resolves the path it is handed (a `file://` URI or a
-/// bare absolute path). `Clone` is required by the Parquet reader, which clones
-/// the storage into per-range read tasks — trivially cheap here.
+/// Every read resolves the path it is handed (a `file://` URI or a bare
+/// absolute path), optionally through a location remap (see
+/// [`Self::with_remap`]) for tables that were copied or moved. `Clone` is
+/// required by the Parquet reader, which clones the storage into per-range
+/// read tasks — trivially cheap here.
 #[derive(Clone, Debug, Default)]
-pub struct FileIcebergStorage;
+pub struct FileIcebergStorage {
+    /// `(from_prefix, to_root)`: file references starting with `from_prefix`
+    /// (as the manifests wrote them — possibly an `s3://` URI) resolve under
+    /// `to_root` instead. `None` = paths resolve as written.
+    remap: Option<(String, String)>,
+}
 
 impl FileIcebergStorage {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// A storage whose reads remap the location prefix `from` (the table root
+    /// the metadata/manifests were WRITTEN under — the metadata's own
+    /// `location`, possibly an `s3://` URI) to the local root `to` (where the
+    /// table sits NOW — the configured `table_location`).
+    ///
+    /// This is what makes "copy the table directory, point at it" work:
+    /// Iceberg manifests reference data files by absolute URI, so a relocated
+    /// table's references all carry the ORIGINAL prefix. Only reads whose path
+    /// starts with `from` (on a `/` boundary) are rewritten, and they are
+    /// rewritten toward the operator-configured `to` — never toward anything
+    /// derived from the (untrusted) metadata itself.
+    pub fn with_remap(from: impl Into<String>, to: impl Into<String>) -> Self {
+        let from = from.into().trim_end_matches('/').to_string();
+        let to = to.into().trim_end_matches('/').to_string();
+        Self {
+            remap: Some((from, to)),
+        }
+    }
+
+    /// Apply the location remap, if configured and the prefix matches on a
+    /// path-segment boundary; otherwise the path passes through unchanged.
+    fn apply_remap<'a>(&self, path: &'a str) -> std::borrow::Cow<'a, str> {
+        if let Some((from, to)) = &self.remap {
+            if let Some(rest) = path.strip_prefix(from.as_str()) {
+                if rest.is_empty() {
+                    return std::borrow::Cow::Owned(to.clone());
+                }
+                if let Some(rest) = rest.strip_prefix('/') {
+                    return std::borrow::Cow::Owned(format!("{to}/{rest}"));
+                }
+                // Prefix matched mid-segment (e.g. `/tab` vs `/table2`):
+                // not this table's root — fall through unchanged.
+            }
+        }
+        std::borrow::Cow::Borrowed(path)
     }
 
     /// Whether `location` addresses the local filesystem: a `file://` URI or a
@@ -172,42 +217,42 @@ fn storage_io_err(op: &str, path: &Path, e: &std::io::Error) -> IcebergError {
 #[async_trait(?Send)]
 impl IcebergStorage for FileIcebergStorage {
     async fn read(&self, path: &str) -> Result<Bytes> {
-        Self::read_impl(path).await
+        Self::read_impl(&self.apply_remap(path)).await
     }
 
     async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
-        Self::read_range_impl(path, range).await
+        Self::read_range_impl(&self.apply_remap(path), range).await
     }
 
     async fn file_size(&self, path: &str) -> Result<u64> {
-        Self::file_size_impl(path).await
+        Self::file_size_impl(&self.apply_remap(path)).await
     }
 
     async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
-        Self::list_files_impl(prefix).await
+        Self::list_files_impl(&self.apply_remap(prefix)).await
     }
 }
 
 #[async_trait]
 impl SendIcebergStorage for FileIcebergStorage {
     async fn read(&self, path: &str) -> Result<Bytes> {
-        Self::read_impl(path).await
+        Self::read_impl(&self.apply_remap(path)).await
     }
 
     async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
-        Self::read_range_impl(path, range).await
+        Self::read_range_impl(&self.apply_remap(path), range).await
     }
 
     async fn file_size(&self, path: &str) -> Result<u64> {
-        Self::file_size_impl(path).await
+        Self::file_size_impl(&self.apply_remap(path)).await
     }
 
     async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
-        Self::list_dir_impl(prefix).await
+        Self::list_dir_impl(&self.apply_remap(prefix)).await
     }
 
     async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
-        Self::list_files_impl(prefix).await
+        Self::list_files_impl(&self.apply_remap(prefix)).await
     }
 }
 
@@ -219,6 +264,33 @@ mod tests {
         std::fs::create_dir_all(root.join("metadata")).unwrap();
         std::fs::write(root.join("metadata/a.txt"), b"hello world").unwrap();
         std::fs::create_dir_all(root.join("data")).unwrap();
+    }
+
+    #[test]
+    fn remap_rewrites_only_boundary_prefixed_paths() {
+        let s = FileIcebergStorage::with_remap("s3://bucket/wh/table", "file:///local/copy");
+        // Data-file reference under the old root → under the new root.
+        assert_eq!(
+            s.apply_remap("s3://bucket/wh/table/data/00001.parquet"),
+            "file:///local/copy/data/00001.parquet"
+        );
+        // Exact root match.
+        assert_eq!(s.apply_remap("s3://bucket/wh/table"), "file:///local/copy");
+        // Mid-segment prefix (`table2` is a DIFFERENT table): untouched.
+        assert_eq!(
+            s.apply_remap("s3://bucket/wh/table2/data/x.parquet"),
+            "s3://bucket/wh/table2/data/x.parquet"
+        );
+        // Unrelated path: untouched.
+        assert_eq!(s.apply_remap("/elsewhere/f"), "/elsewhere/f");
+        // Trailing slashes normalize away on both ends.
+        let s = FileIcebergStorage::with_remap("file:///old/root/", "/new/root/");
+        assert_eq!(
+            s.apply_remap("file:///old/root/m/v1.json"),
+            "/new/root/m/v1.json"
+        );
+        // No remap configured: identity.
+        assert_eq!(FileIcebergStorage::new().apply_remap("/x/y"), "/x/y");
     }
 
     #[test]

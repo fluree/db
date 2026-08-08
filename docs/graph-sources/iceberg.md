@@ -200,11 +200,15 @@ disk. Ideal for local development and test datasets.
 }
 ```
 
-The table's metadata must reference its data files by **local paths** (which is
-what a local pyiceberg/Spark warehouse writes). A table *copied* from an object
-store still carries `s3://...` file references in its manifests and is rejected
-with an error naming that cause — location remapping for copied tables is a
-tracked follow-up.
+**Copied and moved tables work with zero configuration.** Iceberg metadata
+references data files by absolute URI, so a table copied down from an object
+store (or moved on disk) carries its *original* location in every manifest.
+Fluree infers the relocation automatically: when the metadata's own `location`
+differs from the configured `table_location`, file references under the old
+root are read from the new one. Copy the table directory, point
+`table_location` at it, done — whether the manifests say `s3://bucket/...` or
+`file:///old/path/...`. (Only whole-directory copies are inferred; a table
+whose manifests reference files *outside* its own root is not remapped.)
 
 **Direct mode requirements:**
 

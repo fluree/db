@@ -832,6 +832,9 @@ impl<'a> FlureeR2rmlProvider<'a> {
             })?
         };
 
+        // The effective Direct table location, captured for the relocated-table
+        // remap inference below (None for REST).
+        let mut direct_location: Option<String> = None;
         let (load_response, storage) = match &iceberg_config.catalog {
             CatalogConfig::Rest {
                 uri,
@@ -907,6 +910,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
                             })?,
                         ))
                     };
+                direct_location = Some(table_location.clone());
                 let cache = self.fluree.r2rml_cache();
                 let load_response = if let Some(metadata_location) =
                     cache.get_direct_metadata_location(table_location).await
@@ -960,6 +964,11 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 .await;
             metadata
         };
+
+        // Relocated local table (copied/moved after writing): remap manifest
+        // file references from the metadata's declared root to the configured
+        // location. No-op for REST, S3, and locally-written tables.
+        let storage = remap_local_storage(storage, &metadata, direct_location.as_deref());
 
         Ok((storage, metadata, metadata_location))
     }
@@ -2282,6 +2291,7 @@ impl FlureeR2rmlProvider<'_> {
         // Resolve metadata location and create storage based on catalog mode.
         // `mut` so we can move the REST catalog's inline metadata out of the
         // response below (see the metadata resolution) without cloning it.
+        let mut direct_location: Option<String> = None;
         let (mut load_response, storage) = match &iceberg_config.catalog {
             CatalogConfig::Rest {
                 uri,
@@ -2452,6 +2462,7 @@ impl FlureeR2rmlProvider<'_> {
                     )
                     .await?;
                 let table_location = &effective_location;
+                direct_location = Some(effective_location.clone());
 
                 info!(
                     table_location = %table_location,
@@ -2570,6 +2581,9 @@ impl FlureeR2rmlProvider<'_> {
                 .map(|s| s.timestamp_ms)
                 .unwrap_or(0),
         );
+        // Relocated local table: remap manifest file references (no-op for
+        // REST/S3 and locally-written tables) BEFORE the ready-wrap.
+        let storage = remap_local_storage(storage, &metadata, direct_location.as_deref());
         Ok((
             Arc::new(LazyS3Storage::ready(storage)),
             metadata,
@@ -3259,6 +3273,47 @@ async fn resolve_table_metadata<S: SendIcebergStorage>(
 /// table returns that Arc. `cached_storage`/`store_storage` are gated on
 /// `cache_enabled()`, so with caching disabled this still builds per call
 /// (matching REST and the pre-#1498 behavior).
+/// Infer the location remap for a RELOCATED local Direct table — one copied or
+/// moved after being written, so its metadata/manifests reference the ORIGINAL
+/// root. Both ends of the mapping are already known: the metadata's own
+/// `location` (the old root — possibly an `s3://` URI, the copied-from-S3
+/// case) and the configured `table_location` (where the table sits now). So
+/// "copy the table directory, point at it" needs zero configuration. Identical
+/// roots — the common locally-written case — leave the storage untouched, as
+/// does any non-local backend.
+fn remap_local_storage(
+    storage: Arc<IcebergStorageBackend>,
+    metadata: &TableMetadata,
+    direct_location: Option<&str>,
+) -> Arc<IcebergStorageBackend> {
+    let Some(configured) = direct_location else {
+        return storage;
+    };
+    if !matches!(storage.as_ref(), IcebergStorageBackend::File(_)) {
+        return storage;
+    }
+    // `file:///x`, `file:/x`, and `/x` are the same local root spelled three
+    // ways — never remap between spellings of one root.
+    fn local_path(s: &str) -> &str {
+        s.strip_prefix("file://")
+            .or_else(|| s.strip_prefix("file:"))
+            .unwrap_or(s)
+    }
+    let declared = metadata.location.trim_end_matches('/');
+    let configured = configured.trim_end_matches('/');
+    if local_path(declared) == local_path(configured) {
+        return storage;
+    }
+    debug!(
+        declared = %declared,
+        configured = %configured,
+        "local Direct table is relocated; remapping manifest file references"
+    );
+    Arc::new(IcebergStorageBackend::File(FileIcebergStorage::with_remap(
+        declared, configured,
+    )))
+}
+
 async fn direct_session_storage(
     session: &super::catalog_session::IcebergCatalogSession,
     lt_key: &str,

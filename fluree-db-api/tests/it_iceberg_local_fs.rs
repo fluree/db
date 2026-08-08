@@ -5,21 +5,23 @@
 //! reads, the R2RML query path, and the snapshot-pinned/incremental scan
 //! surface — against an actual Iceberg table on the local filesystem.
 //!
-//! Env-gated so CI (which has no local table) skips it: point
-//! `FLUREE_LOCAL_ICEBERG_TABLE` at a table root written by pyiceberg/Spark,
-//! e.g.
+//! Runs in CI against the COMMITTED fixture `tests/fixtures/iceberg/silver/
+//! people` — a real pyiceberg-written two-snapshot table (5 rows:
+//! alice..erin; snapshot 1 = 3 rows, snapshot 2 = +2). The fixture's metadata
+//! carries the ABSOLUTE paths it was written under (`file:///tmp/...`), so
+//! reading it from a checkout also proves the relocated-table location remap:
+//! the provider infers `metadata.location → configured table_location` and
+//! rewrites every manifest file reference.
+//!
+//! Regenerate the fixture (needs `pip install "pyiceberg[sql-sqlite,pyarrow]"`):
 //!
 //! ```bash
-//! # Write the fixture (needs: pip install "pyiceberg[sql-sqlite,pyarrow]"):
 //! python3 scripts/local/write_local_iceberg_table.py /tmp/fluree-local-iceberg
-//! FLUREE_LOCAL_ICEBERG_TABLE=file:///tmp/fluree-local-iceberg/silver/people \
-//!   cargo test -p fluree-db-api --features iceberg,native --test it_iceberg_local_fs -- --nocapture
+//! cp -r /tmp/fluree-local-iceberg/silver/people fluree-db-api/tests/fixtures/iceberg/silver/people
 //! ```
 //!
-//! The expected fixture is the two-snapshot `silver.people` table (5 rows:
-//! alice..erin, snapshot 1 = 3 rows, snapshot 2 = +2 rows); the assertions
-//! adapt to row COUNTS so any two-append table with an `id`+`name` column
-//! works.
+//! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the fixture to
+//! run against any table with the same shape.
 
 #![cfg(all(feature = "iceberg", feature = "native"))]
 
@@ -47,24 +49,24 @@ const PEOPLE_R2RML: &str = r#"
         ] .
 "#;
 
-fn table_location() -> Option<String> {
-    match std::env::var("FLUREE_LOCAL_ICEBERG_TABLE") {
-        Ok(loc) if !loc.trim().is_empty() => Some(loc),
-        _ => {
-            eprintln!(
-                "skipping: set FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table to run \
-                 the local-Iceberg end-to-end test"
-            );
-            None
+fn table_location() -> String {
+    if let Ok(loc) = std::env::var("FLUREE_LOCAL_ICEBERG_TABLE") {
+        if !loc.trim().is_empty() {
+            return loc;
         }
     }
+    // The committed fixture, resolved from the crate dir so the test runs from
+    // any checkout location — which is exactly what exercises the remap (the
+    // fixture's metadata references the /tmp path it was written under).
+    format!(
+        "file://{}/tests/fixtures/iceberg/silver/people",
+        env!("CARGO_MANIFEST_DIR")
+    )
 }
 
 #[tokio::test]
 async fn local_table_end_to_end() {
-    let Some(location) = table_location() else {
-        return;
-    };
+    let location = table_location();
     let fluree = FlureeBuilder::memory().build_memory();
 
     // 1. Register the graph source: Direct mode, file:// location, inline
