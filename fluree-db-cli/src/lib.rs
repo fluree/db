@@ -656,6 +656,22 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 .await
         }
 
+        Commands::Sweep {
+            ledger,
+            dry_run,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::sweep::run_sweep(
+                ledger.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+                dry_run,
+            )
+            .await
+        }
+
         #[cfg(feature = "server")]
         Commands::Server { action } => commands::server::run(action, config_path).await,
 

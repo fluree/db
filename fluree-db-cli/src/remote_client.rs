@@ -1976,6 +1976,48 @@ impl RemoteLedgerClient {
             .map_err(|e| RemoteLedgerError::InvalidResponse(format!("reindex response: {e}")))
     }
 
+    /// Report which index artifacts a sweep would reclaim, without deleting.
+    ///
+    /// Shares `REINDEX_TIMEOUT`: planning walks every branch's index chain and
+    /// expands each root, so it scales with index size the same way a rebuild
+    /// does.
+    pub async fn sweep_plan(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::SweepPlanResponse, RemoteLedgerError> {
+        let url = format!("{}/sweep/plan", self.base_url);
+        self.post_sweep(&url, ledger, "sweep plan").await
+    }
+
+    /// Reclaim index artifacts that no index chain references.
+    pub async fn sweep(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::SweepResponse, RemoteLedgerError> {
+        let url = self.op_url_root("sweep");
+        self.post_sweep(&url, ledger, "sweep").await
+    }
+
+    async fn post_sweep<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        ledger: &str,
+        operation: &str,
+    ) -> Result<T, RemoteLedgerError> {
+        let body = serde_json::json!({ "ledger": ledger });
+        let raw = self
+            .send_json_with_timeout(
+                reqwest::Method::POST,
+                url,
+                "application/json",
+                Some(RequestBody::Json(&body)),
+                Self::REINDEX_TIMEOUT,
+            )
+            .await?;
+        serde_json::from_value(raw)
+            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("{operation} response: {e}")))
+    }
+
     // =========================================================================
     // List ledgers
     // =========================================================================

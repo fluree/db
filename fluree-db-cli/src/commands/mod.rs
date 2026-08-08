@@ -35,6 +35,7 @@ pub mod remote;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod show;
+pub mod sweep;
 pub mod sync;
 pub mod token;
 pub mod track;
