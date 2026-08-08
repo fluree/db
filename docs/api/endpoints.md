@@ -2988,7 +2988,7 @@ When triggering indexing through the Rust API instead, see `Fluree::reindex` and
 
 Reclaim index artifacts that no index chain references. Admin-protected — requires the admin Bearer token when admin auth is enabled.
 
-The binary index garbage collector reclaims artifacts by *name*: each index root's garbage manifest lists what the previous version replaced, so the collector can only reach artifacts some manifest records. Artifacts orphaned another way — most commonly by a reindex published before 4.1.4, which severed the prev-index chain and left everything older unreachable — are invisible to it. A sweep finds those by the opposite method: it enumerates what storage holds, subtracts everything reachable from a live index chain, and releases the remainder.
+The binary index garbage collector reclaims artifacts by *name*: each index root's garbage manifest lists what the previous version replaced, so the collector can only reach artifacts some manifest records. Artifacts orphaned another way — most commonly by a reindex published by Fluree 4.1.4 or earlier, which severed the prev-index chain and left everything older unreachable — are invisible to it. A sweep finds those by the opposite method: it enumerates what storage holds, subtracts everything reachable from a live index chain, and releases the remainder.
 
 A sweep covers **every branch** of a ledger, so `ledger` names the ledger without a branch suffix. Dictionary blobs are shared across a ledger's branches, so a sweep scoped to one branch could release dictionaries a sibling branch still reads. Retracted-but-not-purged branches are included in the reachable set, so a soft-dropped branch stays recoverable.
 

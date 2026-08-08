@@ -25,7 +25,7 @@ fluree sweep [LEDGER] [--dry-run] [--remote <NAME>]
 
 Index builds leave superseded artifacts behind. The garbage collector normally reclaims them: each index root carries a manifest naming what the previous version replaced, and the collector releases exactly those. That only reaches artifacts some manifest records.
 
-A sweep finds the rest. It enumerates what storage actually holds, subtracts everything reachable from a live index chain, and releases the remainder. The usual source of such artifacts is a reindex published before 4.1.4, which severed the chain and left every earlier index version unreachable — so a ledger reindexed on an older version can hold a large volume of blobs no retention policy can ever truncate.
+A sweep finds the rest. It enumerates what storage actually holds, subtracts everything reachable from a live index chain, and releases the remainder. The usual source of such artifacts is a reindex published by Fluree **4.1.4 or earlier**, which severed the chain and left every earlier index version unreachable — so a ledger reindexed on one of those versions can hold a large volume of blobs no retention policy can ever truncate.
 
 A sweep covers **every branch** of a ledger, which is why `LEDGER` names the ledger rather than a branch — any `:branch` suffix is ignored. Dictionary blobs are shared across a ledger's branches, so a sweep scoped to one branch could release dictionaries a sibling branch still reads. Soft-dropped branches are treated as live, so dropping a branch without purging it stays reversible.
 
@@ -68,7 +68,7 @@ Artifacts that resist deletion are reported rather than treated as failures — 
 ## When to Use
 
 - **Disk usage far exceeds the data** — the ledger directory is many times the size of its commits.
-- **After reindexing on a version before 4.1.4** — those reindexes orphaned every earlier index version, and only a sweep reclaims them.
+- **After reindexing on Fluree 4.1.4 or earlier** — those reindexes orphaned every earlier index version, and only a sweep reclaims them.
 - **Periodically on write-heavy ledgers** — running it when nothing is reclaimable is a safe no-op.
 
 ## See Also
