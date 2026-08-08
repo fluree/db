@@ -1897,6 +1897,20 @@ mem:fact-01kv6sahj5se39hv5hkmjytznz a mem:Fact ;
     mem:createdAt "2026-06-15T23:19:32.677756+00:00"^^xsd:dateTime ;
     mem:rationale "Serial writes (summed S3 round-trips) blew the 15-min Lambda cap on a real 21 GB/74k-artifact DBLP restore; user chose the parallelize-writes fix. Sequential-stream-read ceiling is still unaddressed." .
 
+mem:fact-01kzemcff3b773aq7yckej9dhk a mem:Fact ;
+    mem:content "Local-filesystem Iceberg support (branch feature/iceberg-file-storage, commit 15ca56807, E2E-verified against a real pyiceberg table): Direct table_location accepts file:///, file:/, bare absolute paths. FileIcebergStorage; IcebergStorageBackend enum (S3|File) across api scan surface/session caches/lazy path; version-hint fallback lists metadata/ (new list_files trait method). GOTCHA the E2E test caught: Direct location validation exists in TWO places — fluree_db_iceberg::config AND fluree-db-api graph_source/config.rs validate() — both must accept a new scheme. Env-gated test it_iceberg_local_fs (FLUREE_LOCAL_ICEBERG_TABLE) + fixture writer scripts/local/write_local_iceberg_table.py cover query, incremental window, pinned read, typed SnapshotNotFound." ;
+    mem:tag "direct-mode" ;
+    mem:tag "file-storage" ;
+    mem:tag "graph-sources" ;
+    mem:tag "iceberg" ;
+    mem:tag "local-storage" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/graph_source/r2rml.rs" ;
+    mem:artifactRef "fluree-db-iceberg/src/catalog/direct.rs" ;
+    mem:artifactRef "fluree-db-iceberg/src/io/file_storage.rs" ;
+    mem:branch "feature/iceberg-file-storage" ;
+    mem:createdAt "2026-08-07T17:29:55.939416+00:00"^^xsd:dateTime .
+
 mem:fact-01kjg3zmevnz6mdn53wkqn08p0 a mem:Fact ;
     mem:content "Fluree uses CIDv1 for all content-addressed blobs. Implementation in fluree-db-core/src/content_id.rs wrapping `cid` crate.\n\nFormat: CIDv1 = version(1) + multicodec + multihash(SHA2-256, 32 bytes). Multicodec values in private-use range 0x300000+: Commit(0x300001), Txn(0x300002), IndexRoot(0x300003), IndexBranch/Leaf, DictBlob, Garbage, LedgerConfig, StatsSketch, GraphSourceSnapshot, SpatialIndex.\n\nKey APIs: ContentId::new(kind, bytes) hashes with SHA-256; verify(bytes) re-hashes and compares (NOT valid for commit-v2 which excludes trailing hash+sig); digest_hex() returns 64-char hex; Display uses base32-lower multibase." ;
     mem:tag "architecture" ;

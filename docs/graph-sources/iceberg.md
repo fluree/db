@@ -181,13 +181,40 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
 }
 ```
 
+**Local filesystem (no catalog, no object store):**
+
+A Direct `table_location` may also be a **local path** — a `file://` URI or a
+bare absolute path — for Iceberg tables written to the local filesystem (e.g.
+with pyiceberg or Spark against a local warehouse). No catalog service, no
+object store, no AWS credential resolution: the table is read straight from
+disk. Ideal for local development and test datasets.
+
+```json
+{
+  "catalog": {
+    "type": "direct",
+    "table_location": "file:///data/warehouse/logs/execution_log"
+  },
+  "table": "",
+  "io": { "vended_credentials": false }
+}
+```
+
+**Copied and moved tables work with zero configuration.** Iceberg metadata
+references data files by absolute URI, so a table copied down from an object
+store (or moved on disk) carries its *original* location in every manifest.
+Fluree infers the relocation automatically: when the metadata's own `location`
+differs from the configured `table_location`, file references under the old
+root are read from the new one. Copy the table directory, point
+`table_location` at it, done — whether the manifests say `s3://bucket/...` or
+`file:///old/path/...`. (Only whole-directory copies are inferred; a table
+whose manifests reference files *outside* its own root is not remapped.)
+
 **Direct mode requirements:**
 
-- `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`) pointing to the table root directory.
-- The table must contain a `metadata/` subdirectory with:
-  - `version-hint.text` — the current metadata filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
-  - The referenced `.metadata.json` file
-- Direct mode uses ambient AWS credentials (IAM roles, env vars, `~/.aws/credentials`). It does **not** support vended credentials.
+- `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`), a `file://` URI, or an absolute local path, pointing to the table root directory.
+- The table must contain a `metadata/` subdirectory with the current `.metadata.json` file, and (for S3 locations) `version-hint.text` — the current metadata filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
+- Direct mode uses ambient AWS credentials (IAM roles, env vars, `~/.aws/credentials`) for S3 locations. It does **not** support vended credentials. Local locations use no credentials at all.
 
 **How Direct metadata resolution works:**
 
@@ -195,7 +222,7 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
   - `"{table_location}/metadata/version-hint.text"` to get the current metadata filename
   - `"{table_location}/metadata/{filename}"` as the table’s current metadata
 - `version-hint.text` may contain a bare filename (e.g., `00001-abc.metadata.json`), a full absolute path (`s3://...` / `gs://...`), or a bare integer version `N` — the Iceberg Hadoop file-based catalog convention — which resolves to `vN.metadata.json`.
-- If `version-hint.text` is missing or empty, Direct mode fails with an error mentioning `version-hint.text`.
+- **Local tables don't need `version-hint.text`** (pyiceberg and most non-Hadoop writers never produce it): when the hint is absent, the `metadata/` directory is listed and the highest-versioned `*.metadata.json` is used. On S3, where listing is not performed, a missing or empty `version-hint.text` fails with an error mentioning `version-hint.text`.
 
 **Iceberg table setup must already exist:**
 

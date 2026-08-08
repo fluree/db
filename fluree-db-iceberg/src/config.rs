@@ -150,7 +150,8 @@ impl IcebergGsConfig {
         if let CatalogConfig::Direct { table_location } = &self.catalog {
             let path = table_location
                 .trim_start_matches("s3://")
-                .trim_start_matches("s3a://");
+                .trim_start_matches("s3a://")
+                .trim_start_matches("file://");
             let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
             if segments.len() >= 3 {
                 // segments[0] = bucket, segments[1..n-2] = warehouse path,
@@ -185,9 +186,17 @@ impl IcebergGsConfig {
                         "catalog.table_location is required".to_string(),
                     ));
                 }
-                if !table_location.starts_with("s3://") && !table_location.starts_with("s3a://") {
+                let is_object_store =
+                    table_location.starts_with("s3://") || table_location.starts_with("s3a://");
+                // `file:///abs/path` (and the `file:/abs` single-slash variant) or a
+                // bare absolute path: a catalog-less LOCAL table, read from the
+                // filesystem with no object store or catalog service involved.
+                let is_local =
+                    table_location.starts_with("file:/") || table_location.starts_with('/');
+                if !is_object_store && !is_local {
                     return Err(IcebergError::Config(format!(
-                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), got: {table_location}"
+                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), a \
+                         file:// URI, or an absolute local path, got: {table_location}"
                     )));
                 }
                 // Validate table identifier can be derived from table_location
@@ -243,11 +252,15 @@ pub enum CatalogConfig {
 
     /// Metadata location is already known (e.g., from iceberg-rust commit).
     /// The engine reads `version-hint.text` from the metadata directory
-    /// to resolve the current metadata file.
+    /// to resolve the current metadata file, falling back to a
+    /// metadata-directory listing on backends that support it (local
+    /// filesystem).
     Direct {
-        /// S3 prefix for the table root directory.
-        /// Must contain a `metadata/` subdirectory with Iceberg metadata files.
-        /// Example: "s3://bucket/warehouse/my_namespace/my_table"
+        /// Table root directory: an S3 prefix
+        /// (`s3://bucket/warehouse/my_namespace/my_table`) or a LOCAL path
+        /// (`file:///data/warehouse/ns/table` or a bare absolute path) for
+        /// catalog-less tables on the local filesystem. Must contain a
+        /// `metadata/` subdirectory with Iceberg metadata files.
         table_location: String,
     },
 }
@@ -640,6 +653,51 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("S3 URI"));
+    }
+
+    #[test]
+    fn test_validate_direct_accepts_local_locations() {
+        // Catalog-less local tables: file:// URIs and bare absolute paths are
+        // valid Direct locations (read from the local filesystem, no S3).
+        for loc in [
+            "file:///data/warehouse/ns/table",
+            "file:/data/warehouse/ns/table",
+            "/data/warehouse/ns/table",
+        ] {
+            let config = IcebergGsConfig {
+                catalog: CatalogConfig::direct(loc),
+                table: TableConfig::Identifier(String::new()),
+                io: IoConfig {
+                    vended_credentials: false,
+                    ..Default::default()
+                },
+                mapping: None,
+                delete: None,
+                order_by: None,
+            };
+            config.validate().unwrap_or_else(|e| {
+                panic!("local location {loc} must validate, got: {e}");
+            });
+            // The table identifier derives from the path's last two segments,
+            // same as S3 locations.
+            let id = config.table_identifier().unwrap();
+            assert_eq!(id.namespace, "ns");
+            assert_eq!(id.table, "table");
+        }
+
+        // Relative paths are still rejected.
+        let config = IcebergGsConfig {
+            catalog: CatalogConfig::direct("relative/path/table"),
+            table: TableConfig::Identifier(String::new()),
+            io: IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+            mapping: None,
+            delete: None,
+            order_by: None,
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]
