@@ -81,6 +81,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/create", post(ledger::create))
         .route("/drop", post(ledger::drop))
         .route("/reindex", post(ledger::reindex))
+        // Reclaims index artifacts no index chain references. Deletes storage
+        // and holds the ledger against indexing, so it is admin-gated and
+        // runs where the indexer does.
+        .route("/sweep", post(ledger::sweep))
+        .route("/sweep/plan", post(ledger::sweep_plan))
         .route("/branch", post(ledger::create_branch))
         .route("/drop-branch", post(ledger::drop_branch))
         .route("/drop-graph", post(ledger::drop_named_graph))

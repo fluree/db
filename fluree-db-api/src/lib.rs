@@ -249,7 +249,7 @@ pub use search::EmbeddedBm25SearchProvider;
 pub use fluree_db_indexer::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
     IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation, IndexStatusSnapshot,
-    IndexerConfig, IndexerHandle,
+    IndexerConfig, IndexerHandle, SweepPlan, SweepResult,
 };
 
 // Re-export commonly used types from child crates
