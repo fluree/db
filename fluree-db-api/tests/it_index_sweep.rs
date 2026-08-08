@@ -207,3 +207,55 @@ async fn sweeping_a_real_ledger_reclaims_strays_and_leaves_queries_intact() {
         "all three people survive the sweep: {results}"
     );
 }
+
+/// A reindex writes index artifacts before publishing the root that references
+/// them, so a sweep running alongside it would see them as unreferenced and
+/// delete them. Reindex must therefore take the same exclusive hold the sweep
+/// does, and report a conflict when it cannot (#1548).
+#[tokio::test]
+async fn reindex_refuses_while_the_ledger_is_held_for_maintenance() {
+    use fluree_db_api::ReindexOptions;
+
+    let mut fluree = FlureeBuilder::memory().build_memory();
+    let (local, handle) = crate::support::start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async {
+            fluree.create_ledger("holdtest").await.expect("create");
+            let cached = fluree.ledger_cached("holdtest").await.expect("cache");
+            fluree
+                .stage(&cached)
+                .insert(&json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "@id": "ex:a",
+                    "ex:v": 1
+                }))
+                .execute()
+                .await
+                .expect("insert");
+
+            // Stand in for a sweep already holding the ledger.
+            let _held = handle
+                .acquire_maintenance("holdtest:main")
+                .expect("acquire succeeds");
+
+            let err = fluree
+                .reindex("holdtest:main", ReindexOptions::default())
+                .await
+                .expect_err("reindex must not proceed while the ledger is held");
+
+            assert!(
+                err.to_string().contains("another maintenance operation"),
+                "expected a maintenance conflict, got: {err}"
+            );
+        })
+        .await;
+}

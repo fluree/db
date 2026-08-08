@@ -1679,12 +1679,21 @@ impl crate::Fluree {
             return Err(ApiError::NotFound("No commits to reindex".to_string()));
         }
 
-        // 2. Cancel background indexing if active
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            info!(ledger_id = %ledger_id, "Cancelling background indexing for reindex");
-            handle.cancel(&ledger_id).await;
-            handle.wait_for_idle(&ledger_id).await;
-        }
+        // 2. Hold the ledger against indexing for the whole rebuild.
+        //
+        // A reindex writes index artifacts before publishing the root that
+        // references them, so anything enumerating unreferenced artifacts
+        // meanwhile — a storage sweep — would see them as orphans and delete
+        // them. Cancelling and waiting for idle is not enough on its own: a
+        // build can start again the moment the wait returns. The guard is
+        // held until this function exits.
+        let _maintenance = match &self.indexing_mode {
+            IndexingMode::Background(handle) => {
+                info!(ledger_id = %ledger_id, "Holding ledger for reindex");
+                Some(hold_branch_quiesced(handle, &ledger_id).await?)
+            }
+            IndexingMode::Disabled => None,
+        };
 
         // Re-fetch the record after the background indexer has quiesced: a
         // background build racing this reindex may have published between
@@ -1976,6 +1985,19 @@ mod tests {
 // Storage sweep (reclaims index artifacts no index chain references)
 // =============================================================================
 
+/// Take an exclusive maintenance hold on one branch, reporting a conflict
+/// rather than blocking when another operation already holds it.
+async fn hold_branch_quiesced<'a>(
+    handle: &'a fluree_db_indexer::IndexerHandle,
+    ledger_id: &'a str,
+) -> Result<MaintenanceGuard> {
+    handle.hold_quiesced(ledger_id).await.ok_or_else(|| {
+        ApiError::BranchConflict(format!(
+            "another maintenance operation holds {ledger_id}; retry when it completes"
+        ))
+    })
+}
+
 impl crate::Fluree {
     /// Hold every branch of `ledger_name` excluded from indexing and collect
     /// their index heads.
@@ -2009,21 +2031,7 @@ impl crate::Fluree {
         let mut guards = Vec::with_capacity(records.len());
         if let IndexingMode::Background(handle) = &self.indexing_mode {
             for record in &records {
-                let guard = handle
-                    .acquire_maintenance(&record.ledger_id)
-                    .ok_or_else(|| {
-                        ApiError::BranchConflict(format!(
-                            "another maintenance operation holds {}; retry when it completes",
-                            record.ledger_id
-                        ))
-                    })?;
-                guards.push(guard);
-            }
-
-            // The guards stop new builds; these drain the ones already running.
-            for record in &records {
-                handle.cancel(&record.ledger_id).await;
-                handle.wait_for_idle(&record.ledger_id).await;
+                guards.push(hold_branch_quiesced(handle, &record.ledger_id).await?);
             }
         }
 
