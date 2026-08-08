@@ -533,7 +533,7 @@ pub fn legacy_dict_address(method: &str, ledger_id: &str, id: &ContentId) -> Opt
 /// The index-root address from before the `.json` to `.fir6` rename.
 ///
 /// Returns `None` for non-`IndexRoot` CIDs.
-pub fn legacy_index_root_address(method: &str, ledger_id: &str, id: &ContentId) -> Option<String> {
+fn legacy_index_root_address(method: &str, ledger_id: &str, id: &ContentId) -> Option<String> {
     if id.codec() != crate::CODEC_FLUREE_INDEX_ROOT {
         return None;
     }
