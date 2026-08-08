@@ -2984,6 +2984,108 @@ curl -X POST http://localhost:8090/v1/fluree/reindex \
 
 When triggering indexing through the Rust API instead, see `Fluree::reindex` and `ReindexOptions`. For background incremental indexing (which runs automatically as commits are made), see [Background indexing](../indexing-and-search/background-indexing.md).
 
+### POST /sweep
+
+Reclaim index artifacts that no index chain references. Admin-protected — requires the admin Bearer token when admin auth is enabled.
+
+The binary index garbage collector reclaims artifacts by *name*: each index root's garbage manifest lists what the previous version replaced, so the collector can only reach artifacts some manifest records. Artifacts orphaned another way — most commonly by a reindex published before 4.1.4, which severed the prev-index chain and left everything older unreachable — are invisible to it. A sweep finds those by the opposite method: it enumerates what storage holds, subtracts everything reachable from a live index chain, and releases the remainder.
+
+A sweep covers **every branch** of a ledger, so `ledger` names the ledger without a branch suffix. Dictionary blobs are shared across a ledger's branches, so a sweep scoped to one branch could release dictionaries a sibling branch still reads. Retracted-but-not-purged branches are included in the reachable set, so a soft-dropped branch stays recoverable.
+
+Only index artifacts are considered — every branch's `index/` prefix plus the ledger's shared dictionary namespace. Commits, transactions, and config blobs are never touched: they are reachable through the commit chain rather than the index chain, so a sweep cannot establish that they are unreferenced.
+
+Index builds for the ledger are held off for the duration, and the sweep runs synchronously. For large ledgers it walks every branch's index chain and expands each root, so it may run for many minutes; configure your HTTP client timeout accordingly. In peer mode, the request is forwarded to the transaction server.
+
+> **Single-process deployments only.** The hold that keeps index builds from writing during a sweep excludes the server's own indexer. An external or second-process indexer writing to the same storage is not excluded, and its in-flight artifacts — written before the root that references them — would be indistinguishable from orphans. Do not run a sweep against storage a separate indexer writes to.
+
+**URL:**
+```
+POST /sweep
+```
+
+**Request Body:**
+
+```json
+{
+  "ledger": "mydb"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger` | string | Ledger **name**, without a branch suffix. Required. |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/sweep \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -d '{"ledger": "mydb"}'
+```
+
+**Response:**
+
+```json
+{
+  "ledger": "mydb",
+  "reclaimed": 2847,
+  "failures": []
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `ledger` | Ledger the sweep ran against |
+| `reclaimed` | Number of orphaned artifacts released |
+| `failures` | Artifacts that could not be released, each with `address` and `error`. Reported rather than fatal — they stay in storage and the next sweep retries them. |
+
+**Status Codes:**
+- `200 OK` — sweep complete (including when nothing was reclaimed)
+- `400 Bad Request` — missing/invalid `ledger`
+- `401/403` — admin auth required
+- `404 Not Found` — ledger does not exist
+- `409 Conflict` — another maintenance operation holds one of the ledger's branches
+- `500 Internal Server Error` — sweep failed, or the storage backend cannot enumerate a prefix
+
+A sweep aborts without deleting anything if any index root cannot be read or expanded, or any prefix cannot be listed. An incomplete picture of what is reachable would classify live artifacts as orphans, so partial information is treated as a reason to stop rather than proceed.
+
+When sweeping through the Rust API instead, see `Fluree::sweep_index_storage`. From the CLI, use `fluree sweep <ledger>`.
+
+### POST /sweep/plan
+
+Report what [`POST /sweep`](#post-sweep) would reclaim, without deleting anything. Same request body, same admin protection, same exclusive hold — the report reflects a quiesced ledger.
+
+**URL:**
+```
+POST /sweep/plan
+```
+
+**Response:**
+
+```json
+{
+  "ledger": "mydb",
+  "orphan_count": 2847,
+  "scanned": 5216,
+  "live": 2369,
+  "orphans": [
+    "fluree:file://mydb/main/index/roots/3f2a….fir6",
+    "fluree:file://mydb/@shared/dicts/9c1b….dict"
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `ledger` | Ledger the plan was computed for |
+| `orphan_count` | Number of artifacts that would be released |
+| `scanned` | Artifacts examined across every swept prefix |
+| `live` | Distinct artifacts reachable from a live index chain |
+| `orphans` | Every address that would be released, in full, so the set can be audited before running the destructive form |
+
+From the CLI, use `fluree sweep <ledger> --dry-run`.
+
 ### POST /export/*ledger
 
 Return ledger data as RDF in the requested format (Turtle, N-Triples, N-Quads, TriG, or JSON-LD). Server-side equivalent of `fluree export`.

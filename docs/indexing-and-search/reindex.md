@@ -169,6 +169,8 @@ The reindex operation:
 5. **Publishes** the new index root via `publish_index_allow_equal`
 6. **Spawns** async garbage collection to clean up old index versions
 
+The published root links the index version it supersedes and carries a garbage manifest naming what that version replaced, so the new root participates in the GC chain like any incremental build. Roots published before 4.1.4 did neither: they severed the chain, leaving every earlier root permanently unreachable for garbage collection. A ledger reindexed on an earlier version still holds those artifacts, and only a [storage sweep](background-indexing.md#reclaiming-orphaned-artifacts) reclaims them.
+
 The rebuilt index preserves full time-travel history: retract-winner events and their preceding asserts are stored in Region 3 (history) of leaf nodes, enabling `as-of` queries at any past transaction time.
 
 ## Best Practices

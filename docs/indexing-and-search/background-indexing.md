@@ -270,8 +270,19 @@ Old index snapshots are retained for time-travel safety and concurrent query saf
 - `IndexerConfig.gc_max_old_indexes`
 - `IndexerConfig.gc_min_time_mins`
 
-No standalone HTTP compaction endpoint is currently exposed. Use `POST
-/v1/fluree/reindex` when you need to force a full index refresh.
+The collector reclaims artifacts by *name*. Each index root carries a garbage manifest listing what the previous version replaced, and the collector walks the prev-index chain releasing exactly those. It therefore reaches only artifacts that some manifest records.
+
+### Reclaiming orphaned artifacts
+
+Artifacts orphaned outside that chain are invisible to the collector. The main source is a reindex published before 4.1.4: it severed the prev-index chain, leaving every earlier root — and the blobs only those roots referenced — unreachable from any walk. Retention could never truncate past it, so a ledger that had been reindexed accumulated index artifacts without bound.
+
+`POST /v1/fluree/sweep` reclaims them, and `fluree sweep <ledger>` does the same from the CLI. A sweep enumerates what storage holds, subtracts everything reachable from a live index chain, and releases the remainder. Use `--dry-run` (or `POST /v1/fluree/sweep/plan`) to see what would be released first.
+
+A sweep is ledger-wide rather than per-branch, because dictionary blobs are shared across a ledger's branches. It touches only index artifacts — commits, transactions, and config blobs are reachable through the commit chain rather than the index chain, so a sweep cannot establish that they are unreferenced and never considers them.
+
+> **Single-process deployments only.** The hold that keeps index builds from writing during a sweep excludes the server's own indexer. An external or second-process indexer writing to the same storage is not excluded, and its in-flight artifacts would be indistinguishable from orphans.
+
+`POST /v1/fluree/reindex` rebuilds the index but does not reclaim anything by itself; a reindex published on 4.1.4 or later participates in the GC chain normally, so ordinary retention applies to it from then on.
 
 ## Troubleshooting
 
