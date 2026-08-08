@@ -460,8 +460,8 @@ type MaintenanceHolds = Arc<std::sync::Mutex<std::collections::HashSet<String>>>
 
 /// Excludes index builds for one ledger until dropped.
 ///
-/// Reindex and the storage sweep write index artifacts outside the worker's
-/// admission path, so they hold this for the whole operation.
+/// Operations that write index artifacts outside the worker's admission path
+/// — the storage sweep and reindex — hold this for their whole run.
 /// [`TriggerHandle::wait_for_idle`] is not a substitute: it reports that a
 /// ledger *was* idle, and a build can start again the moment it returns.
 ///
@@ -665,6 +665,25 @@ impl TriggerHandle {
         })
     }
 
+    /// Take an exclusive hold on `ledger_id` and drain any build already in
+    /// flight, so the caller can write index artifacts without racing one.
+    ///
+    /// The guard stops new builds from starting; [`cancel`](Self::cancel) and
+    /// [`wait_for_idle`](Self::wait_for_idle) drain the build that may already
+    /// be running. Acquiring the guard *first* is what closes the window
+    /// `wait_for_idle` leaves open on its own — without the hold, a build can
+    /// start again between the wait returning and the caller acting.
+    ///
+    /// Returns `None` when another maintenance operation already holds the
+    /// ledger. Callers report that rather than waiting: a sweep queued behind
+    /// a multi-hour reindex is indistinguishable from a hang.
+    pub async fn hold_quiesced(&self, ledger_id: &str) -> Option<MaintenanceGuard> {
+        let guard = self.acquire_maintenance(ledger_id)?;
+        self.cancel(ledger_id).await;
+        self.wait_for_idle(ledger_id).await;
+        Some(guard)
+    }
+
     /// Cancel pending/queued work for a ledger
     ///
     /// - Removes from pending queue (if not yet started)
@@ -795,6 +814,12 @@ impl IndexerHandle {
         self.trigger.acquire_maintenance(ledger_id)
     }
 
+    /// Take an exclusive hold and drain in-flight work. See
+    /// [`TriggerHandle::hold_quiesced`].
+    pub async fn hold_quiesced(&self, ledger_id: &str) -> Option<MaintenanceGuard> {
+        self.trigger.hold_quiesced(ledger_id).await
+    }
+
     /// Cancel pending/queued work for a ledger. See
     /// [`TriggerHandle::cancel`].
     pub async fn cancel(&self, ledger_id: &str) -> bool {
@@ -897,9 +922,7 @@ impl BackgroundIndexerWorker {
             .lock()
             .map_or(true, |holds| holds.contains(ledger_id))
     }
-}
 
-impl BackgroundIndexerWorker {
     /// Create a new worker and its associated handle.
     ///
     /// `nameservice` is the combined ledger-discovery + index-head
