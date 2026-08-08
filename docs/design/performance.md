@@ -41,6 +41,15 @@ r8a.4xlarge 16c/128 GB):
 Note that Fluree's write number is a *durable* write — committed and
 recoverable — compared against engines whose defaults are weaker.
 
+State the failure model when quoting these: durability here means the write
+survives the process dying. Surviving power loss additionally requires the
+storage backend to flush, which the file backend does by default
+(`FLUREE_STORAGE_FSYNC`, see [Configuration](../operations/configuration.md))
+and S3 does by acknowledging after replication. This table predates that
+default and was measured without the flush, so it is not a like-for-like
+comparison against an engine that fsyncs per commit; it needs a re-run before
+it is quoted again.
+
 > Internal criterion benchmarks that gate per-PR regressions are a different
 > thing entirely and are documented in [BENCHMARKING.md](../../BENCHMARKING.md).
 > They protect against drift; they do not measure competitors.

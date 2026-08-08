@@ -169,6 +169,27 @@ pub trait StorageWrite: Debug + Send + Sync {
 - `delete` is part of the core write trait (not separate) because any writable storage should support deletion
 - Implementations should be idempotent: deleting a non-existent address succeeds silently
 
+**Write visibility and durability.** The trait does not say when a write becomes
+visible or when it is safe against power loss; that is each backend's contract:
+
+| Backend | Visibility | Durability |
+|---|---|---|
+| `FileStorage` | Atomic. Bytes are staged beside the destination and moved into place, so a reader at the address sees the previous contents or the complete new contents, never a partial file. | Per `Durability` on the instance — `Sync` (default) flushes the file and its parent directory before returning; `PageCache` returns once the bytes reach the OS page cache. |
+| `MemoryStorage` | Atomic (map insert). | None — process lifetime only. |
+| `S3Storage` | Atomic (object PUT). | Acknowledged after replication. |
+
+`FileStorage` also narrows durability by `ContentKind`: kinds for which
+`ContentKind::is_derived()` is true (index nodes, dictionaries, sketches,
+annotation arenas) are written `PageCache` in either mode, because they are
+rebuildable from the commit chain and are written at much higher volume than
+commits. Source-of-truth kinds — `Commit`, `Txn`, `LedgerConfig`,
+`GraphSourceMapping` — follow the instance setting. The match is exhaustive, so
+adding a `ContentKind` forces this decision at compile time.
+
+Callers that need a durability guarantee should get it from the backend rather
+than adding flushes of their own; see
+[Storage durability](../operations/storage.md#durability).
+
 ### ContentAddressedWrite
 
 Extension trait for content-addressed (hash-based) writes. Extends `StorageWrite`.
@@ -255,22 +276,28 @@ Compare-and-swap operations for consistent distributed updates.
 
 ```rust
 #[async_trait]
-pub trait StorageCas {
-    /// Write only if the address doesn't exist
-    async fn write_if_absent(&self, address: &str, bytes: &[u8]) -> StorageExtResult<bool>;
+pub trait StorageCas: Debug + Send + Sync {
+    /// Write bytes only if the key does not already exist.
+    /// Returns `true` if the key was created, `false` if it already existed.
+    async fn insert(&self, address: &str, bytes: &[u8]) -> StorageExtResult<bool>;
 
-    /// Write only if the current version matches expected_etag
-    async fn write_if_match(
-        &self,
-        address: &str,
-        bytes: &[u8],
-        expected_etag: &str,
-    ) -> StorageExtResult<String>;
-
-    /// Read with version/etag for subsequent CAS operations
-    async fn read_with_etag(&self, address: &str) -> StorageExtResult<(Vec<u8>, String)>;
+    /// Atomic read-modify-write. The closure may be called more than once on
+    /// retry, so it must be a pure function of its input.
+    async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
+    where
+        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
+        T: Send;
 }
 ```
+
+This is the nameservice head path: `compare_and_swap` publishes a new head
+against the exact head a commit was built on, and `insert`'s create-if-absent
+answer is what detects a duplicate ledger.
+
+Both follow the same visibility and durability rules as `StorageWrite` above. On
+`FileStorage` they take the instance's `Durability` — nameservice records are
+source-of-truth, never derived — so with the default an acknowledged head
+publish has been flushed to the device.
 
 ### StorageDelete (nameservice)
 

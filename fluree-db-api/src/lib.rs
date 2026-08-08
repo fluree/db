@@ -1569,6 +1569,7 @@ impl FlureeBuilder {
             path: None,
             aes256_key: None,
             address_identifier: None,
+            durability: None,
         };
 
         let publisher = PublisherConfig {
