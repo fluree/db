@@ -40,7 +40,7 @@ pub(crate) mod test_support;
 
 pub use collector::clean_garbage;
 pub use record::GarbageRecord;
-pub use sweep::{plan_sweep, BranchIndexHead, SweepPlan};
+pub use sweep::{execute_sweep, plan_sweep, BranchIndexHead, SweepPlan, SweepResult};
 
 use crate::error::Result;
 use fluree_db_core::{ContentId, ContentKind, ContentStore};

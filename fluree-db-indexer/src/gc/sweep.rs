@@ -62,6 +62,15 @@ pub struct SweepPlan {
     pub live: usize,
 }
 
+/// Outcome of reclaiming a plan's orphans.
+#[derive(Debug, Default)]
+pub struct SweepResult {
+    /// Number of orphaned artifacts released.
+    pub reclaimed: usize,
+    /// Artifacts that could not be released, each with the reason.
+    pub failures: Vec<(String, String)>,
+}
+
 /// Determine which index artifacts under `ledger_name` are orphaned.
 ///
 /// Returns a plan; nothing is deleted. Callers that intend to reclaim must
@@ -97,6 +106,45 @@ where
         scanned: scanned.len(),
         live: live.len(),
     })
+}
+
+/// Release the orphans a plan identified.
+///
+/// The caller must still hold the ledger's index build excluded. A plan
+/// describes storage as it stood when planned, and a build that published in
+/// between will have made some of those addresses live.
+///
+/// A delete that fails is recorded and the sweep moves on. Planning is strict
+/// because partial information there misclassifies live artifacts, but a blob
+/// that resists deletion is merely a blob that stays put, and the next run
+/// retries it. Deletes are idempotent, so re-running a plan is safe.
+pub async fn execute_sweep<S>(storage: &S, plan: &SweepPlan) -> SweepResult
+where
+    S: Storage,
+{
+    let mut result = SweepResult::default();
+
+    for address in &plan.orphans {
+        match storage.delete(address).await {
+            Ok(()) => result.reclaimed += 1,
+            Err(e) => {
+                tracing::warn!(
+                    address,
+                    error = %e,
+                    "sweep could not release an orphaned artifact"
+                );
+                result.failures.push((address.clone(), e.to_string()));
+            }
+        }
+    }
+
+    tracing::info!(
+        reclaimed = result.reclaimed,
+        failed = result.failures.len(),
+        "sweep complete"
+    );
+
+    result
 }
 
 /// Every address reachable from any branch's index chain.
@@ -400,6 +448,86 @@ mod tests {
             plan.orphans.is_empty(),
             "a live dict at its legacy address must not be reclaimed: {:?}",
             plan.orphans
+        );
+    }
+
+    /// Reclaiming a severed chain's orphans frees exactly those artifacts and
+    /// leaves the live head intact, and a second plan then finds nothing —
+    /// the property the whole sweep exists to provide.
+    #[tokio::test]
+    async fn reclaimed_orphans_leave_the_ledger_swept_clean() {
+        let storage = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let (_, dict_addr) = cid_and_addr_for(
+            MAIN,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"live-dict",
+        );
+        storage.write_bytes(&dict_addr, b"dict").await.unwrap();
+        write_chain(&storage, MAIN, 3, &dict).await;
+
+        let (severed, severed_addr) =
+            cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"severed-root");
+        storage
+            .write_bytes(
+                &severed_addr,
+                &minimal_fir6_for(MAIN, 4, None, None, dict.clone()),
+            )
+            .await
+            .unwrap();
+
+        let branches = heads(&[(MAIN, Some(&severed))]);
+        let plan = plan_sweep(&storage, NAME, &branches).await.unwrap();
+        assert_eq!(plan.orphans.len(), 3, "the three stranded roots");
+
+        let result = execute_sweep(&storage, &plan).await;
+        assert_eq!(result.reclaimed, 3);
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+
+        assert!(
+            storage.exists(&severed_addr).await.unwrap(),
+            "the live head survives"
+        );
+        assert!(
+            storage.exists(&dict_addr).await.unwrap(),
+            "the dict it references survives"
+        );
+
+        let after = plan_sweep(&storage, NAME, &branches).await.unwrap();
+        assert!(
+            after.orphans.is_empty(),
+            "a swept ledger has nothing left to reclaim: {:?}",
+            after.orphans
+        );
+    }
+
+    /// Deletes are idempotent, so replaying a plan against already-reclaimed
+    /// storage neither fails nor double-counts real work.
+    #[tokio::test]
+    async fn replaying_a_plan_is_safe() {
+        let storage = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        write_chain(&storage, MAIN, 2, &dict).await;
+
+        let (severed, _) = cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"severed-root");
+        let (_, severed_addr) = cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"severed-root");
+        storage
+            .write_bytes(&severed_addr, &minimal_fir6_for(MAIN, 3, None, None, dict))
+            .await
+            .unwrap();
+
+        let branches = heads(&[(MAIN, Some(&severed))]);
+        let plan = plan_sweep(&storage, NAME, &branches).await.unwrap();
+        assert!(!plan.orphans.is_empty());
+
+        execute_sweep(&storage, &plan).await;
+        let replay = execute_sweep(&storage, &plan).await;
+        assert!(
+            replay.failures.is_empty(),
+            "replaying must not error: {:?}",
+            replay.failures
         );
     }
 
