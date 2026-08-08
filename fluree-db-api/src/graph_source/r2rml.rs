@@ -883,6 +883,29 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 (load_response, Arc::new(storage))
             }
             CatalogConfig::Direct { table_location } => {
+                // Warehouse-root resolution — the same step the query path
+                // (`load_table_context`) performs: when `table_location` is a
+                // catalog-less multi-table ROOT, resolve THIS table's own
+                // directory beneath it. Without this, pin resolution
+                // (`current_snapshot_id`) and materialize scans read
+                // `{root}/metadata/` and fail on any multi-table copy the
+                // query path handles fine. Single-table locations return
+                // unchanged, so existing sources are byte-identical.
+                let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
+                    graph_source_id,
+                    &table_id.namespace,
+                    &table_id.table,
+                );
+                let effective_location = self
+                    .resolve_direct_table_location(
+                        table_location,
+                        &table_id,
+                        &lt_key,
+                        &iceberg_config,
+                    )
+                    .await?;
+                let table_location = &effective_location;
+
                 let storage: Arc<S3IcebergStorage> = Arc::new(
                     S3IcebergStorage::from_default_chain(
                         iceberg_config.io.s3_region.as_deref(),
