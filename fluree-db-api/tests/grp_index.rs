@@ -3,6 +3,8 @@ mod support;
 
 #[path = "it_duration_index_roundtrip.rs"]
 mod it_duration_index_roundtrip;
+#[path = "it_index_sweep.rs"]
+mod it_index_sweep;
 #[path = "it_indexing_fuel.rs"]
 mod it_indexing_fuel;
 #[path = "it_indexing_stats.rs"]

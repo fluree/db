@@ -16,7 +16,8 @@ use fluree_db_core::{
     format_ledger_id, DEFAULT_BRANCH,
 };
 use fluree_db_indexer::{
-    clean_garbage, rebuild_index_from_commits_with_tracker, CleanGarbageConfig,
+    clean_garbage, execute_sweep, plan_sweep, rebuild_index_from_commits_with_tracker,
+    BranchIndexHead, CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
 };
 use fluree_db_nameservice::{GraphSourceType, NsRecord};
 use std::time::Duration;
@@ -1968,5 +1969,119 @@ mod tests {
     #[test]
     fn test_drop_status_default() {
         assert_eq!(DropStatus::default(), DropStatus::NotFound);
+    }
+}
+
+// =============================================================================
+// Storage sweep (reclaims index artifacts no index chain references)
+// =============================================================================
+
+impl crate::Fluree {
+    /// Hold every branch of `ledger_name` excluded from indexing and collect
+    /// their index heads.
+    ///
+    /// Enumerates through `all_records` rather than `list_branches` so that
+    /// **retracted** branches participate. A soft drop is reversible until the
+    /// name is purged, so a soft-dropped branch's index must survive a sweep.
+    /// Its own artifacts are safe either way — an unlisted branch contributes
+    /// no prefix to scan — but dict blobs are shared across a ledger's
+    /// branches, so omitting one would reclaim dicts it still reads.
+    async fn hold_ledger_for_maintenance(
+        &self,
+        ledger_name: &str,
+    ) -> Result<(Vec<MaintenanceGuard>, Vec<BranchIndexHead>)> {
+        let records: Vec<_> = self
+            .nameservice()
+            .all_records()
+            .await?
+            .into_iter()
+            .filter(|r| r.name == ledger_name)
+            .collect();
+
+        if records.is_empty() {
+            return Err(ApiError::NotFound(format!(
+                "Ledger not found: {ledger_name}"
+            )));
+        }
+
+        // Holds are per-branch, so a ledger-wide sweep must hold them all.
+        // Guards release on drop, so an early return frees whatever was taken.
+        let mut guards = Vec::with_capacity(records.len());
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            for record in &records {
+                let guard = handle
+                    .acquire_maintenance(&record.ledger_id)
+                    .ok_or_else(|| {
+                        ApiError::BranchConflict(format!(
+                            "another maintenance operation holds {}; retry when it completes",
+                            record.ledger_id
+                        ))
+                    })?;
+                guards.push(guard);
+            }
+
+            // The guards stop new builds; these drain the ones already running.
+            for record in &records {
+                handle.cancel(&record.ledger_id).await;
+                handle.wait_for_idle(&record.ledger_id).await;
+            }
+        }
+
+        // Re-read after quiescing: a build that published between the
+        // enumeration above and the drain would have advanced the index head,
+        // and planning against the stale one would treat the new root's
+        // artifacts as orphaned.
+        let mut branches = Vec::with_capacity(records.len());
+        for record in &records {
+            let current = self.nameservice().lookup(&record.ledger_id).await?;
+            branches.push(BranchIndexHead {
+                ledger_id: record.ledger_id.clone(),
+                index_head_id: current.and_then(|r| r.index_head_id),
+            });
+        }
+
+        Ok((guards, branches))
+    }
+
+    /// Borrow the managed storage a sweep needs, or explain why there is none.
+    fn sweepable_storage(&self) -> Result<&std::sync::Arc<dyn fluree_db_core::Storage>> {
+        match &self.backend {
+            fluree_db_core::StorageBackend::Managed(storage) => Ok(storage),
+            _ => Err(ApiError::Internal(
+                "storage sweep requires a managed storage backend (file, S3, or memory)"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Report which index artifacts under `ledger_name` no live index chain
+    /// references, without deleting anything.
+    ///
+    /// Takes the same exclusive hold as [`sweep_index_storage`](Self::sweep_index_storage)
+    /// so the report reflects a quiesced ledger, and releases it on return.
+    pub async fn plan_index_sweep(&self, ledger_name: &str) -> Result<SweepPlan> {
+        let storage = self.sweepable_storage()?;
+        let (_guards, branches) = self.hold_ledger_for_maintenance(ledger_name).await?;
+        Ok(plan_sweep(storage, ledger_name, &branches).await?)
+    }
+
+    /// Reclaim index artifacts that no live index chain references.
+    ///
+    /// Plans and deletes under one hold: a plan describes storage as it stood
+    /// when planned, so releasing between the two would let a build publish
+    /// artifacts the plan had already classified as orphaned.
+    pub async fn sweep_index_storage(&self, ledger_name: &str) -> Result<SweepResult> {
+        let storage = self.sweepable_storage()?;
+        let (_guards, branches) = self.hold_ledger_for_maintenance(ledger_name).await?;
+
+        let plan = plan_sweep(storage, ledger_name, &branches).await?;
+        info!(
+            ledger_name,
+            orphans = plan.orphans.len(),
+            scanned = plan.scanned,
+            live = plan.live,
+            "Reclaiming orphaned index artifacts"
+        );
+        Ok(execute_sweep(storage, &plan).await)
     }
 }
