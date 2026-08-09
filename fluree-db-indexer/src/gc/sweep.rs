@@ -38,6 +38,11 @@ use fluree_db_core::storage::{candidate_addresses, content_store_for};
 use fluree_db_core::{ContentId, Storage};
 use std::collections::HashSet;
 
+/// Concurrent storage deletes during a sweep. Deletes are independent
+/// round trips, so a serial pass over a large backlog is almost entirely
+/// latency.
+const RELEASE_CONCURRENCY: usize = 32;
+
 /// A branch's published index head, as the sweep needs it.
 ///
 /// The caller selects which branches participate. Every branch of the ledger
@@ -122,21 +127,36 @@ pub async fn execute_sweep<S>(storage: &S, plan: &SweepPlan) -> SweepResult
 where
     S: Storage,
 {
-    let mut result = SweepResult::default();
+    use futures::stream::StreamExt;
 
-    for address in &plan.orphans {
-        match storage.delete(address).await {
-            Ok(()) => result.reclaimed += 1,
-            Err(e) => {
+    // A backlog is the whole reason a sweep runs, so the delete count is the
+    // operation's dominant cost and every one of them is a storage round trip
+    // taken while the ledger is held out of indexing.
+    let outcomes: Vec<(String, Option<String>)> =
+        futures::stream::iter(plan.orphans.iter().cloned())
+            .map(|address| async move {
+                let error = storage.delete(&address).await.err().map(|e| e.to_string());
+                (address, error)
+            })
+            .buffer_unordered(RELEASE_CONCURRENCY)
+            .collect()
+            .await;
+
+    let mut result = SweepResult::default();
+    for (address, error) in outcomes {
+        match error {
+            None => result.reclaimed += 1,
+            Some(error) => {
                 tracing::warn!(
                     address,
-                    error = %e,
+                    error,
                     "sweep could not release an orphaned artifact"
                 );
-                result.failures.push((address.clone(), e.to_string()));
+                result.failures.push((address, error));
             }
         }
     }
+    result.failures.sort();
 
     tracing::info!(
         reclaimed = result.reclaimed,

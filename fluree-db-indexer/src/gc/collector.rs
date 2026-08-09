@@ -19,7 +19,13 @@ use crate::error::Result;
 use fluree_db_binary_index::IndexRoot;
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::ContentId;
+use futures::stream::StreamExt;
 use std::path::Path;
+
+/// Concurrent storage releases per garbage manifest. Releases are independent
+/// round trips, so a serial pass over a large manifest is almost entirely
+/// latency.
+const RELEASE_CONCURRENCY: usize = 32;
 
 /// Entry in the prev-index chain.
 pub(crate) struct IndexChainEntry {
@@ -105,29 +111,43 @@ async fn release_manifest_nodes(
         "GC releasing garbage record items"
     );
 
-    let mut released = 0;
-    for item in &record.garbage {
-        match item.parse::<ContentId>() {
-            Ok(cid) => {
-                if let Err(e) = store.release(&cid).await {
-                    tracing::debug!(
-                        %cid,
-                        error = %e,
-                        "Failed to release garbage node (may already be released)"
-                    );
-                } else {
-                    released += 1;
-                }
-            }
+    let cids: Vec<ContentId> = record
+        .garbage
+        .iter()
+        .filter_map(|item| match item.parse::<ContentId>() {
+            Ok(cid) => Some(cid),
             Err(e) => {
                 tracing::warn!(
                     item,
                     error = %e,
                     "Skipping unrecognized garbage item (not a valid CID)"
                 );
+                None
             }
-        }
-    }
+        })
+        .collect();
+
+    // Each release is an independent storage round trip. Stepping over absent
+    // manifests and untimestamped records means the first pass after this fix
+    // drains a backlog those two conditions had pinned, so a serial loop here
+    // is almost entirely latency — held against a GC semaphore permit.
+    let released = futures::stream::iter(cids)
+        .map(|cid| async move {
+            match store.release(&cid).await {
+                Ok(()) => 1,
+                Err(e) => {
+                    tracing::debug!(
+                        %cid,
+                        error = %e,
+                        "Failed to release garbage node (may already be released)"
+                    );
+                    0
+                }
+            }
+        })
+        .buffer_unordered(RELEASE_CONCURRENCY)
+        .fold(0usize, |acc, n| async move { acc + n })
+        .await;
 
     tracing::debug!(
         t = manifest_t,
