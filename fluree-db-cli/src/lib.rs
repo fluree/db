@@ -667,7 +667,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 &fluree_dir,
                 remote.as_deref(),
                 direct,
-                dry_run,
+                commands::sweep::SweepMode::from_dry_run(dry_run),
             )
             .await
         }
