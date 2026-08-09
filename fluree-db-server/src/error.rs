@@ -80,6 +80,14 @@ impl ServerError {
             }
 
             // Ledger management
+            ServerError::Api(ApiError::NoveltyDeferred { .. }) => errors::NOVELTY_DEFERRED,
+            ServerError::Api(ApiError::MaterializePartial { tally, .. }) => {
+                if tally.failed > 0 {
+                    errors::MATERIALIZE_PARTIAL
+                } else {
+                    errors::NOVELTY_DEFERRED
+                }
+            }
             ServerError::Api(ApiError::LedgerExists(_)) => errors::LEDGER_EXISTS,
 
             // Index operations
@@ -189,6 +197,23 @@ impl ServerError {
             }
 
             // 404 - Not Found
+            // Retryable backpressure, NOT a fault. The 503 belonged here, in
+            // ServerError's mapping, which is what the HTTP layer consults — putting it
+            // only on `ApiError::status_code()` left it dead and a deferral surfaced as
+            // a 500 `err:system/InternalError`, telling operators a normal capacity
+            // condition was an internal error.
+            ServerError::Api(ApiError::NoveltyDeferred { .. }) => StatusCode::SERVICE_UNAVAILABLE,
+            // A partial fan-out window splits by WHY it is incomplete. Deferral-only is
+            // the same retryable capacity condition as above; a target that actually
+            // failed is a fault and must not be dressed up as backpressure, or a
+            // permanently broken target would 503 forever and read as "just busy".
+            ServerError::Api(ApiError::MaterializePartial { tally, .. }) => {
+                if tally.failed > 0 {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
             ServerError::Api(ApiError::NotFound(_)) => StatusCode::NOT_FOUND,
 
             // 409 - Conflict
@@ -552,6 +577,58 @@ mod tests {
                 .contains("cannot be converted to R2RML scans"),
             "{}",
             json["error"]
+        );
+    }
+
+    use fluree_db_api::TargetTally;
+
+    fn partial(ok: usize, deferred: usize, failed: usize) -> ServerError {
+        ServerError::Api(ApiError::MaterializePartial {
+            tally: TargetTally {
+                ok,
+                deferred,
+                failed,
+            },
+            detail: "test".into(),
+        })
+    }
+
+    /// A partial window's status must be decided by WHY it is incomplete.
+    ///
+    /// Deferral is capacity and clears itself, so 503 ("try again") is honest. A target
+    /// that FAILED will not clear itself, and answering 503 would tell a caller to keep
+    /// retrying a permanently broken ledger while reporting it as merely busy — the same
+    /// mistake, in the other direction, as the 500 that a plain deferral used to return.
+    #[test]
+    fn partial_window_status_follows_the_reason_not_the_partialness() {
+        assert_eq!(
+            partial(21, 1, 0).status_code(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "deferral-only is retryable capacity pressure"
+        );
+        assert_eq!(
+            partial(21, 0, 1).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed target is a fault and must not be reported as backpressure"
+        );
+        // A failure alongside deferrals still reports the failure: it is the outcome
+        // needing attention, and burying it under the milder one is how a broken ledger
+        // stayed invisible for 20 minutes across 208 windows.
+        assert_eq!(
+            partial(20, 1, 1).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn partial_window_error_code_matches_its_status() {
+        assert_eq!(
+            partial(21, 1, 0).error_type(),
+            fluree_vocab::errors::NOVELTY_DEFERRED
+        );
+        assert_eq!(
+            partial(21, 0, 1).error_type(),
+            fluree_vocab::errors::MATERIALIZE_PARTIAL
         );
     }
 }

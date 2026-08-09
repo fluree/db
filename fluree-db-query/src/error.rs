@@ -55,6 +55,20 @@ pub enum QueryError {
     #[error("Dictionary lookup failed: {0}")]
     DictionaryLookup(String),
 
+    /// A caller-requested Iceberg snapshot does not exist in the table's
+    /// metadata — typically expired by the source table's snapshot retention.
+    ///
+    /// A typed variant (not `Internal`) so a consumer holding a snapshot pin
+    /// can DISTINGUISH "pin expired → re-pin / full-run invalidation" from a
+    /// transient scan failure it should retry — without string-matching.
+    #[error("snapshot {snapshot_id} not found for table '{table}' (expired by retention, or never existed)")]
+    SnapshotNotFound {
+        /// The table whose metadata was consulted.
+        table: String,
+        /// The requested snapshot id.
+        snapshot_id: i64,
+    },
+
     /// Resource limit exceeded
     #[error("Resource limit exceeded: {0}")]
     ResourceLimit(String),

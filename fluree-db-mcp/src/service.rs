@@ -148,6 +148,7 @@ mod tests {
             vec![
                 "kg_query",
                 "memory_add",
+                "memory_audit",
                 "memory_forget",
                 "memory_recall",
                 "memory_status",
@@ -159,7 +160,7 @@ mod tests {
     #[test]
     fn all_exposes_both_toolsets() {
         let names = tool_names(Toolset::ALL);
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
         assert!(names.contains(&"docs_search".to_string()));
         assert!(names.contains(&"memory_add".to_string()));
     }

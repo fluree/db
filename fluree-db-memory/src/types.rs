@@ -148,6 +148,10 @@ pub struct Memory {
     pub branch: Option<String>,
     /// Creation timestamp.
     pub created_at: String,
+    /// Timestamp of the last `update`, including an update that changed no
+    /// other field — that no-op is how an agent records "re-verified at HEAD".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 
     // -- Optional predicates (available on any kind) --
     /// Why this decision/constraint/fact exists.

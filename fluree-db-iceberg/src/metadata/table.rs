@@ -98,6 +98,24 @@ impl TableMetadata {
         self.schemas.iter().find(|s| s.schema_id == id)
     }
 
+    /// The schema in effect AT `snapshot` — the one its rows were written and
+    /// committed under — falling back to [`Self::current_schema`] when the
+    /// snapshot carries no `schema-id` or the id is unknown (both legal:
+    /// `schema-id` is optional on v1-era snapshots).
+    ///
+    /// Reads pinned to a historical snapshot must project against this, not
+    /// `current_schema()`: Iceberg reads Parquet by field id, so what schema
+    /// evolution breaks is the name→id mapping (a column renamed since the pin
+    /// resolves to nothing, or to a different field) and type interpretation
+    /// (a re-typed column decodes wrong). When `snapshot` IS the current
+    /// snapshot the two agree and this is a no-op.
+    pub fn schema_for_snapshot(&self, snapshot: &super::Snapshot) -> Option<&Schema> {
+        snapshot
+            .schema_id
+            .and_then(|id| self.schema(id))
+            .or_else(|| self.current_schema())
+    }
+
     /// Get the partition spec by ID.
     pub fn partition_spec(&self, id: i32) -> Option<&PartitionSpec> {
         self.partition_specs.iter().find(|s| s.spec_id == id)
@@ -106,6 +124,93 @@ impl TableMetadata {
     /// Get the default partition spec.
     pub fn default_partition_spec(&self) -> Option<&PartitionSpec> {
         self.partition_spec(self.default_spec_id)
+    }
+
+    /// The snapshots in the window `(from_id, to_id]`, newest first, walking the
+    /// `parent_snapshot_id` chain from `to_id` back toward `from_id`.
+    ///
+    /// `from_id = None` walks to the root (the full history up to `to_id`).
+    /// Returns an error if `to_id` is unknown, an ancestor is missing (e.g. an
+    /// expired snapshot), or `from_id` is not an ancestor of `to_id` (a branch or
+    /// rollback) — in all of which the caller should fall back to a full re-read.
+    pub fn snapshot_window(
+        &self,
+        from_id: Option<i64>,
+        to_id: i64,
+    ) -> crate::error::Result<Vec<&super::Snapshot>> {
+        if from_id == Some(to_id) {
+            return Ok(Vec::new());
+        }
+        let mut window = Vec::new();
+        let mut cur = self.snapshot(to_id).ok_or_else(|| {
+            crate::error::IcebergError::SnapshotNotFound(format!("snapshot {to_id} not found"))
+        })?;
+        loop {
+            window.push(cur);
+            match cur.parent_snapshot_id {
+                Some(pid) if Some(pid) == from_id => return Ok(window),
+                Some(pid) => {
+                    cur = self.snapshot(pid).ok_or_else(|| {
+                        crate::error::IcebergError::SnapshotNotFound(format!(
+                            "ancestor snapshot {pid} not found (history may be expired)"
+                        ))
+                    })?;
+                }
+                None => {
+                    // Reached the root snapshot.
+                    if from_id.is_none() {
+                        return Ok(window);
+                    }
+                    return Err(crate::error::IcebergError::Metadata(format!(
+                        "snapshot {} is not an ancestor of {to_id}",
+                        from_id.unwrap()
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Whether every snapshot in `(from_id, to_id]` was created by an `append`
+    /// operation. Only then does an added-files incremental scan capture all
+    /// changes (no `overwrite`/`delete`/`replace` => no updates or deletions to
+    /// miss). A snapshot with no recorded operation is treated as not-append-only
+    /// (fail safe: caller should full-refresh). Propagates `snapshot_window`
+    /// errors (unknown/expired/non-ancestor).
+    pub fn window_is_append_only(
+        &self,
+        from_id: Option<i64>,
+        to_id: i64,
+    ) -> crate::error::Result<bool> {
+        let window = self.snapshot_window(from_id, to_id)?;
+        Ok(window.iter().all(|s| s.operation() == Some("append")))
+    }
+
+    /// Whether every snapshot in `(from_id, to_id]` is incremental-safe for an
+    /// **added-files-only** scan — i.e. each is an `append` (new data files
+    /// only) or a `replace` (compaction: files rewritten without any logical
+    /// change). A `replace` is safe because Iceberg preserves each row's
+    /// `data_sequence_number` through compaction, so the sequence-number window
+    /// `(from.seq, to.seq]` still excludes the rewritten old rows — compaction
+    /// never surfaces as a spurious "added" row. `overwrite`/`delete`
+    /// operations carry row-level updates and deletions an added-files scan
+    /// cannot see, so they are NOT incremental-safe (the caller must
+    /// full-refresh). A snapshot with no recorded operation is treated as
+    /// unsafe (fail safe). Propagates `snapshot_window` errors
+    /// (unknown/expired/non-ancestor).
+    ///
+    /// This is the check the materialization path uses: it keeps routine
+    /// appends *and* periodic compaction on the cheap incremental path, while
+    /// still falling back to a full re-read whenever genuine updates/deletes
+    /// (overwrite/delete) appear in the window.
+    pub fn window_is_incremental_safe(
+        &self,
+        from_id: Option<i64>,
+        to_id: i64,
+    ) -> crate::error::Result<bool> {
+        let window = self.snapshot_window(from_id, to_id)?;
+        Ok(window
+            .iter()
+            .all(|s| matches!(s.operation(), Some("append" | "replace"))))
     }
 }
 
@@ -330,5 +435,185 @@ mod tests {
     fn test_properties() {
         let metadata = TableMetadata::from_json_str(SAMPLE_METADATA).unwrap();
         assert_eq!(metadata.properties.get("owner"), Some(&"test".to_string()));
+    }
+
+    // ---- incremental window helpers ----
+
+    fn snap(id: i64, parent: Option<i64>, seq: i64, op: Option<&str>) -> crate::metadata::Snapshot {
+        let mut summary = HashMap::new();
+        if let Some(o) = op {
+            summary.insert("operation".to_string(), o.to_string());
+        }
+        crate::metadata::Snapshot {
+            snapshot_id: id,
+            parent_snapshot_id: parent,
+            sequence_number: seq,
+            timestamp_ms: seq * 1000,
+            manifest_list: Some(format!("snap-{id}.avro")),
+            manifests: None,
+            summary,
+            schema_id: Some(0),
+        }
+    }
+
+    fn meta_with(snapshots: Vec<crate::metadata::Snapshot>) -> TableMetadata {
+        let current = snapshots.last().map(|s| s.snapshot_id);
+        let last_seq = snapshots
+            .iter()
+            .map(|s| s.sequence_number)
+            .max()
+            .unwrap_or(0);
+        TableMetadata {
+            format_version: 2,
+            table_uuid: None,
+            location: "s3://b/t".to_string(),
+            last_sequence_number: last_seq,
+            last_updated_ms: 0,
+            last_column_id: 1,
+            current_schema_id: 0,
+            schemas: vec![],
+            current_snapshot_id: current,
+            snapshots,
+            snapshot_log: vec![],
+            default_spec_id: 0,
+            partition_specs: vec![],
+            last_partition_id: 0,
+            sort_orders: vec![],
+            default_sort_order_id: 0,
+            properties: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn schema_for_snapshot_follows_the_snapshot_schema_id() {
+        let bare_schema = |id: i32| Schema {
+            schema_id: id,
+            identifier_field_ids: vec![],
+            fields: vec![],
+        };
+        let mut m = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+        ]);
+        // Schema evolved after snapshot 1: current is 1, snapshot 1 pinned 0.
+        m.schemas = vec![bare_schema(0), bare_schema(1)];
+        m.current_schema_id = 1;
+        m.snapshots[0].schema_id = Some(0);
+
+        // Pinned snapshot → its own (historical) schema, not current.
+        let s1 = m.snapshot(1).unwrap();
+        assert_eq!(m.schema_for_snapshot(s1).unwrap().schema_id, 0);
+
+        // Snapshot pinning the current schema → current.
+        m.snapshots[1].schema_id = Some(1);
+        let s2 = m.snapshot(2).unwrap();
+        assert_eq!(m.schema_for_snapshot(s2).unwrap().schema_id, 1);
+
+        // No schema-id on the snapshot (v1-era metadata) → fall back to current.
+        m.snapshots[0].schema_id = None;
+        let s1 = m.snapshot(1).unwrap();
+        assert_eq!(m.schema_for_snapshot(s1).unwrap().schema_id, 1);
+
+        // Unknown schema-id → fall back to current rather than failing the read.
+        m.snapshots[0].schema_id = Some(99);
+        let s1 = m.snapshot(1).unwrap();
+        assert_eq!(m.schema_for_snapshot(s1).unwrap().schema_id, 1);
+    }
+
+    #[test]
+    fn snapshot_window_walks_parent_chain() {
+        let m = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+            snap(3, Some(2), 3, Some("append")),
+        ]);
+        // (1, 3] -> snapshots 3 then 2 (newest first), excluding the `from` (1)
+        let ids: Vec<i64> = m
+            .snapshot_window(Some(1), 3)
+            .unwrap()
+            .iter()
+            .map(|s| s.snapshot_id)
+            .collect();
+        assert_eq!(ids, vec![3, 2]);
+        // from == to -> empty
+        assert!(m.snapshot_window(Some(3), 3).unwrap().is_empty());
+        // from = None -> full history
+        let full: Vec<i64> = m
+            .snapshot_window(None, 3)
+            .unwrap()
+            .iter()
+            .map(|s| s.snapshot_id)
+            .collect();
+        assert_eq!(full, vec![3, 2, 1]);
+        // `from` not an ancestor of `to` (branch/rollback) -> error
+        assert!(m.snapshot_window(Some(99), 3).is_err());
+        // unknown `to` -> error
+        assert!(m.snapshot_window(Some(1), 42).is_err());
+    }
+
+    #[test]
+    fn window_is_append_only_detects_non_append() {
+        let all_append = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+        ]);
+        assert!(all_append.window_is_append_only(Some(1), 2).unwrap());
+        // from == to -> empty window -> vacuously append-only (nothing to apply)
+        assert!(all_append.window_is_append_only(Some(2), 2).unwrap());
+
+        let with_overwrite = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("overwrite")),
+        ]);
+        assert!(!with_overwrite.window_is_append_only(Some(1), 2).unwrap());
+
+        // A snapshot with no recorded operation is not provably append-only.
+        let no_op = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, None),
+        ]);
+        assert!(!no_op.window_is_append_only(Some(1), 2).unwrap());
+    }
+
+    #[test]
+    fn window_is_incremental_safe_allows_compaction_but_not_overwrite() {
+        // append + compaction (replace) is incremental-safe: compaction
+        // preserves data_sequence_number, so the seq-number window still
+        // excludes the rewritten old rows.
+        let append_then_compact = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+            snap(3, Some(2), 3, Some("replace")),
+        ]);
+        assert!(append_then_compact
+            .window_is_incremental_safe(Some(1), 3)
+            .unwrap());
+        // ...but a pure replace window must NOT be treated as append-only.
+        assert!(!append_then_compact
+            .window_is_append_only(Some(1), 3)
+            .unwrap());
+
+        // overwrite carries row-level updates/deletes -> not incremental-safe.
+        let with_overwrite = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("overwrite")),
+        ]);
+        assert!(!with_overwrite
+            .window_is_incremental_safe(Some(1), 2)
+            .unwrap());
+
+        // delete carries row removals -> not incremental-safe.
+        let with_delete = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("delete")),
+        ]);
+        assert!(!with_delete.window_is_incremental_safe(Some(1), 2).unwrap());
+
+        // unrecorded operation -> fail safe.
+        let no_op = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, None),
+        ]);
+        assert!(!no_op.window_is_incremental_safe(Some(1), 2).unwrap());
     }
 }
