@@ -1192,7 +1192,6 @@ mod tests {
                     id: prior_head.clone(),
                 }),
             ),
-            None,
             IndexStats::default(),
         )
         .await
@@ -1225,7 +1224,6 @@ mod tests {
                     id: root_cids[1].clone(),
                 }),
             ),
-            None,
             IndexStats::default(),
         )
         .await
@@ -1261,7 +1259,6 @@ mod tests {
                     id: unreadable.clone(),
                 }),
             ),
-            None,
             IndexStats::default(),
         )
         .await
@@ -1297,7 +1294,6 @@ mod tests {
                     id: root_cids[2].clone(),
                 }),
             ),
-            None,
             IndexStats::default(),
         )
         .await

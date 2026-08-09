@@ -24,12 +24,11 @@ use std::time::Instant;
 use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
-use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef, LeafletCache};
+use fluree_db_binary_index::{BinaryPrevIndexRef, LeafletCache};
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
 use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::error::{IndexerError, Result};
-use crate::gc;
 use crate::run_index::build::incremental_branch::{
     touched_leaf_refs, update_branch_streaming, BranchUpdateConfig, BranchUpdateMeta,
     BranchUpdateResult,
@@ -3795,38 +3794,15 @@ pub async fn incremental_index(
         "Phase 4: root builder finalized"
     );
 
-    // Write the garbage manifest unconditionally. An empty manifest carries
-    // real information — this build replaced nothing — which a root with no
-    // manifest cannot express. The collector walks the prev-index chain
-    // oldest-first and stops at the first root whose manifest is absent, so a
-    // build that skipped the write would strand every newer version.
-    let garbage_strings: Vec<String> = replaced_cids
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect();
-    let garbage_write_started = Instant::now();
-    tracing::debug!(
-        replaced_cids = garbage_strings.len(),
-        index_t = new_root.index_t,
-        "Phase 4: writing garbage record"
-    );
-    let garbage_cid = gc::write_garbage_record(
-        content_store.as_ref(),
-        ledger_id,
-        new_root.index_t,
-        garbage_strings,
-    )
-    .await
-    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-    tracing::debug!(
-        %garbage_cid,
-        elapsed_ms = garbage_write_started.elapsed().as_millis() as u64,
-        "Phase 4: garbage record written"
-    );
-
-    // Set garbage on the root before encoding.
     let mut final_root = new_root;
-    final_root.garbage = Some(BinaryGarbageRef { id: garbage_cid });
+    super::root_assembly::attach_garbage_manifest(
+        content_store.as_ref(),
+        &mut final_root,
+        ledger_id,
+        &replaced_cids,
+    )
+    .await?;
+
     if let Some(stats) = final_root.stats.as_mut() {
         stats.distribute_total_size_by_flakes(final_root.total_commit_size);
     }

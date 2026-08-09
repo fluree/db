@@ -1129,9 +1129,6 @@ where
             let result = super::root_assembly::encode_and_write_root_v6(
                 &content_store,
                 fir6_inputs,
-                // No caller-computed garbage manifest yet; the prev-index link
-                // is carried by `Fir6Inputs::prev_index`.
-                None,
                 IndexStats {
                     flake_count: total_rows as usize,
                     leaf_count: v3_result
