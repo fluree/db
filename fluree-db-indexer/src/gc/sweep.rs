@@ -522,8 +522,8 @@ mod tests {
         let dict = dict_cid(b"live-dict");
         write_chain(&storage, MAIN, 2, &dict).await;
 
-        let (severed, _) = cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"severed-root");
-        let (_, severed_addr) = cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"severed-root");
+        let (severed, severed_addr) =
+            cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"severed-root");
         storage
             .write_bytes(&severed_addr, &minimal_fir6_for(MAIN, 3, None, None, dict))
             .await
