@@ -168,14 +168,12 @@ where
         };
         let store = content_store_for(storage.clone(), &branch.ledger_id);
 
+        // Dedup at the CID level before deriving addresses. Consecutive roots
+        // in a chain share nearly all of their CAS refs, so deriving per root
+        // would rebuild the same handful of addresses once per root.
+        let mut reachable: HashSet<ContentId> = HashSet::new();
         for entry in walk_prev_index_chain_cs(&store, head).await? {
-            record_addresses(&mut live, method, &branch.ledger_id, &entry.root_id)?;
-
-            if let Some(garbage_id) = &entry.garbage_id {
-                record_addresses(&mut live, method, &branch.ledger_id, garbage_id)?;
-            }
-
-            let reachable = collect_root_cas_ids_expanded(&store, &entry.root)
+            let expanded = collect_root_cas_ids_expanded(&store, &entry.root)
                 .await
                 .map_err(|e| {
                     IndexerError::StorageRead(format!(
@@ -183,34 +181,27 @@ where
                         entry.t, branch.ledger_id
                     ))
                 })?;
-            for id in &reachable {
-                record_addresses(&mut live, method, &branch.ledger_id, id)?;
+            reachable.insert(entry.root_id);
+            reachable.extend(entry.garbage_id);
+            reachable.extend(expanded);
+        }
+
+        for id in &reachable {
+            // An unrecognised codec is fatal rather than skipped: the sweep
+            // cannot locate the blob, so it cannot establish that any address
+            // is safe to delete.
+            let addresses = candidate_addresses(method, &branch.ledger_id, id);
+            if addresses.is_empty() {
+                return Err(IndexerError::StorageRead(format!(
+                    "cannot locate CID {id} (unrecognised codec {}); refusing to sweep",
+                    id.codec()
+                )));
             }
+            live.extend(addresses);
         }
     }
 
     Ok(live)
-}
-
-/// Record every address at which `id`'s blob could live.
-///
-/// An unrecognised codec is fatal rather than skipped: the sweep cannot locate
-/// the blob, so it cannot establish that any address is safe to delete.
-fn record_addresses(
-    live: &mut HashSet<String>,
-    method: &str,
-    ledger_id: &str,
-    id: &ContentId,
-) -> Result<()> {
-    let addresses = candidate_addresses(method, ledger_id, id);
-    if addresses.is_empty() {
-        return Err(IndexerError::StorageRead(format!(
-            "cannot locate CID {id} (unrecognised codec {}); refusing to sweep",
-            id.codec()
-        )));
-    }
-    live.extend(addresses);
-    Ok(())
 }
 
 /// Every address under the swept prefixes.
