@@ -19,8 +19,8 @@ A binary index build produces:
   - each leaf contains multiple **leaflets** (groups of independently compressed per-column blocks)
 - **Shared dictionary artifacts**:
   - small dictionaries (predicates, graphs, datatypes, languages) embedded in the **index root** (CAS) and/or persisted as flat files in local builds
-  - large dictionaries (subjects, strings) stored as **CoW single-level B-tree-like trees**
-    (a branch manifest `DTB1` + multiple leaf blobs `DLF1`/`DLR1`)
+  - large dictionaries (subjects, strings): reverse as **CoW single-level B-tree-like trees**
+    (a branch manifest `DTB1` + `DLR1` leaf blobs), forward as ID-range-routed **`FPK1` packs**
 - **Manifests / roots** that describe how to load the above either from a local directory layout
   or from the content store via `IndexRoot` (FIR6 binary format, CID-based).
 
@@ -51,7 +51,8 @@ Fact indexes exist in up to four sort orders (see `RunSortOrder`):
 - **Branch manifest**: maps key ranges to leaf files; used for routing.
 - **Column block**: a separately compressed single-column section inside a leaflet.
 - **History sidecar**: a separate CAS object holding a leaf's time-travel transition log.
-- **Dictionary tree**: a `DTB1` branch + `DLF1`/`DLR1` leaves for large keyspaces (subjects/strings).
+- **Dictionary tree**: a `DTB1` branch + `DLR1` leaves, holding the reverse (value → ID) direction for large keyspaces (subjects/strings).
+- **Forward pack**: an `FPK1` blob holding a contiguous ID range of a forward (ID → value) dictionary, routed from the index root.
 - **ContentId**: a CIDv1 value that uniquely identifies a content-addressed artifact by its hash and type. See [ContentId and ContentStore](content-id-and-contentstore.md).
 
 ## Physical layout (local build output)
@@ -117,7 +118,8 @@ At a high level the root contains:
   - `datatype_iris[]` (dt_id → datatype IRI)
   - `language_tags[]` (lang_id-1 → tag string; `lang_id = index + 1`, 0 = "no tag")
 - **Dictionary ContentIds** (CAS artifacts):
-  - tree blobs: subject/string forward & reverse (`DTB1` branch + `DLF1`/`DLR1` leaves)
+  - tree blobs: subject/string reverse (`DTB1` branch + `DLR1` leaves)
+  - forward packs: subject (per namespace) & string (`FPK1`), routed by ID range
   - optional per-predicate numbig arenas
   - optional per-predicate vector arenas (manifest + shards)
 - **Default graph routing** (inline leaf entries per sort order)
@@ -406,14 +408,16 @@ lens:    [u32] × count
 
 The forward file itself is a raw concatenation of bytes; access is via `(offset,len)` from the index.
 
-### Large dictionaries as CoW trees (`DTB1` + leaf blobs)
+### Large dictionaries
 
-Subjects and strings are large enough that we represent them as single-level CoW trees:
+Subjects and strings are large enough to need their own artifacts, and the two
+directions use different structures:
 
-- **Branch**: `DTB1` mapping key ranges to leaf ContentIds
-- **Leaves**:
-  - forward leaf (`DLF1`): numeric ID → value bytes
-  - reverse leaf (`DLR1`): key bytes → numeric ID
+- **Reverse** (value → ID) is a single-level **CoW tree**: a `DTB1` branch
+  mapping key ranges to `DLR1` leaf ContentIds. An incremental update rewrites
+  only the leaves whose key range it touches; untouched leaves keep their CIDs.
+- **Forward** (ID → value) is a set of **`FPK1` packs** routed by ID range
+  directly from the index root — not a tree. See below.
 
 #### Dictionary branch (`DTB1`)
 
@@ -432,15 +436,57 @@ Subjects and strings are large enough that we represent them as single-level CoW
 Keys are treated as raw bytes and compared lexicographically. For forward trees keyed by numeric ID,
 the branch uses **8-byte big-endian** keys (so lexical order matches numeric order).
 
-#### Forward dict leaf (`DLF1`)
+#### Forward dict pack (`FPK1`)
+
+Forward dictionaries are paged packs, each covering a contiguous ID range:
 
 ```text
-[magic: 4B "DLF1"]
-[entry_count: u32]
-[offset_table: u32 × entry_count]
-[data section]
-  entry := [id: u64 LE] [value_len: u32] [value_bytes]
+Header (40 bytes):
+  [magic: 4B "FPK1"] [version: u8=1] [kind: u8] [ns_code: u16 LE]
+  [first_id: u64 LE] [last_id: u64 LE]
+  [page_count: u32 LE] [page_dir_offset: u64 LE] [reserved: u32=0]
+
+Pages (concatenated):
+  page := [entry_count: u32 LE] [offsets: u32 LE × (entry_count+1)] [value bytes]
+
+Page directory (at page_dir_offset, 20 bytes per entry):
+  [page_first_id: u64 LE] [entry_count: u32 LE]
+  [page_offset: u32 LE] [page_len: u32 LE]
 ```
+
+IDs within a page are contiguous, so a lookup binary-searches the page
+directory and then indexes directly: `value = data[offsets[local]..offsets[local+1]]`.
+`kind` is `0` for the single global string stream and `1` for subject packs,
+which are per-namespace (`ns_code`). Targets are **512 KiB** per page and
+**16 MiB** per pack.
+
+Because the encoded length is `page_dir_offset + page_count * 20`, a pack can
+be sized from its 40-byte header alone — a range read, not a full fetch.
+
+**Routing** lives inline in the index root (`DictPackRefs`), as
+`{first_id, last_id, pack_cid}` per pack. Ranges must be ascending and
+non-overlapping; gaps between packs are legal.
+
+#### Forward pack tail compaction
+
+Each incremental build appends at least one pack per dict stream it touched,
+including a small trailing pack for a handful of new entries. Left alone that
+grows the routing table once per build forever — unbounded objects, unbounded
+mappings, and a root that grows on every publish.
+
+So after appending, the indexer merges the **tail** of each touched stream:
+the longest contiguous suffix that fits the 16 MiB target and whose members are
+either all small (≤ 64 KiB) or within a 4× size ratio of each other, requiring
+either 8 packs or a group already at half the target. Merging preserves input
+pages verbatim, rebasing their offsets — no dictionary value is decoded. Work
+is capped at 64 MiB of input per index cycle.
+
+Nothing records which packs were previously compacted: the rule is scale-free,
+decided from sizes and ID ranges alone, which is why no compaction state is
+carried in the root. Superseded packs are diffed out of the routing table by
+`IncrementalRootBuilder::set_dict_refs` and land in the garbage manifest, so
+they are reclaimed by the normal retention-aware GC — older roots keep
+referencing them until those roots age out.
 
 #### Reverse dict leaf (`DLR1`)
 
@@ -481,7 +527,8 @@ The `u16` big-endian prefix ensures that lexicographic byte comparisons match lo
   - leaf: magic `FLI3`, version `1`
 - Dictionary tree artifacts:
   - branch: magic `DTB1`
-  - leaves: magic `DLF1` / `DLR1`
+  - reverse leaves: magic `DLR1`
+  - forward packs: magic `FPK1`
 - Small dict blobs: magic `FRD1`
 
 When adding new fields, prefer:

@@ -1,10 +1,12 @@
 //! Incremental dictionary update: append new forward packs + CoW reverse tree update.
 //!
-//! ## Forward Packs (append-only)
+//! ## Forward Packs (append + tail compaction)
 //!
-//! New entries always have IDs above the existing watermark. We build new packs
-//! from only the new entries and append their `PackBranchEntry` refs to the
-//! existing list. All existing packs are reused unchanged.
+//! New entries always have IDs above the existing watermark, so new packs are
+//! built from only the new entries and appended to the existing routing list.
+//!
+//! Appending alone grows the routing table once per index build forever, so the
+//! tail is then compacted: see [`plan_tail_compaction`].
 //!
 //! ## Reverse Trees (CoW update)
 //!
@@ -142,6 +144,117 @@ pub fn build_incremental_subject_packs_for_ns(
         new_packs: result.packs,
         all_pack_refs: all_refs,
     })
+}
+
+// ============================================================================
+// Forward Pack Tail Compaction
+// ============================================================================
+
+/// Packs at or below this size are merged on sight, whatever their ratio.
+///
+/// Below one page a mapping cannot pay for itself, and these are the packs that
+/// drove the routing table to five figures. Collapsing them unconditionally is
+/// what clears that backlog; the growth rule below governs everything larger.
+pub const COMPACTION_SMALL_PACK_BYTES: u64 = 64 * 1024;
+
+/// Maximum encoded size of a compacted pack. Also the point at which a pack
+/// stops absorbing: nothing can merge into a pack already at the target.
+pub const COMPACTION_MAX_OUTPUT_BYTES: u64 = DEFAULT_TARGET_PACK_BYTES as u64;
+
+/// Tail entries considered in one planning pass. Bounds the size probes a
+/// single index cycle can issue per stream.
+pub const COMPACTION_MAX_WINDOW: usize = 32;
+
+/// Packs to gather before merging peers of a similar size.
+///
+/// This is the write-amplification guard, and wide beats narrow: merging `F`
+/// peers at a time rewrites each byte once per tier it climbs, so the cost of
+/// reaching the target is `log_F(target / smallest)` — about 3x at `F = 8`,
+/// versus roughly 8x for a scheme that absorbs into one growing pack (fanout 2,
+/// whose absorbed tail must itself be built by merges).
+const MIN_MERGE_PACKS: usize = 8;
+
+/// How far peer sizes may spread within one merge. Keeps a large pack from
+/// being rewritten to absorb a much smaller one, which is what makes the
+/// tiering implicit — no level has to be recorded anywhere.
+const MAX_SIZE_RATIO: u64 = 4;
+
+/// A group at or above this share of the output target may merge with fewer
+/// than [`MIN_MERGE_PACKS`] members.
+///
+/// Without this a stream stalls short of the target: once packs reach a size
+/// where eight of them exceed the 16 MiB cap, no full-width group can ever
+/// form again, and the largest achievable pack is pinned at a fraction of the
+/// target (from 113-byte input, the fanout ladder tops out near 3.7 MiB).
+const NEAR_TARGET_SHARE: u64 = 2;
+
+/// A planned merge of the final `refs[start..]` packs into one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailCompaction {
+    /// Index of the first pack to merge; the merge always runs to the tail.
+    pub start: usize,
+    /// Combined encoded size of the inputs, and so of the output.
+    pub input_bytes: u64,
+}
+
+/// Plan a tail merge for one forward-dictionary stream, or `None` to leave it.
+///
+/// `sizes[i]` is the encoded byte length of `refs[i]`. Picks the **longest**
+/// contiguous suffix that fits the output target and qualifies, so a backlog of
+/// tiny packs collapses in one merge rather than one tier at a time.
+///
+/// A suffix qualifies when its members are of comparable size (or all small),
+/// and there are either enough of them or enough bytes to be worth a rewrite.
+/// Nothing about the decision needs to know which packs were previously
+/// compacted — the rule is scale-free, which is why no compaction state is
+/// carried in the root.
+pub fn plan_tail_compaction(
+    refs: &[PackBranchEntry],
+    sizes: &[u64],
+    max_output_bytes: u64,
+) -> Option<TailCompaction> {
+    debug_assert_eq!(refs.len(), sizes.len());
+    if refs.len() < 2 {
+        return None;
+    }
+
+    // Longest suffix first; each step drops the oldest candidate.
+    let window_start = refs.len().saturating_sub(COMPACTION_MAX_WINDOW);
+    for start in window_start..refs.len() - 1 {
+        let group = &sizes[start..];
+        let total: u64 = group.iter().sum();
+        if total > max_output_bytes {
+            continue;
+        }
+        if !is_id_contiguous(&refs[start..]) {
+            continue;
+        }
+        if qualifies_for_merge(group, total, max_output_bytes) {
+            return Some(TailCompaction {
+                start,
+                input_bytes: total,
+            });
+        }
+    }
+
+    None
+}
+
+/// Merging non-adjacent packs would produce one spanning an ID gap, which the
+/// encoder rejects. Gaps between packs are legal, so this must be checked.
+fn is_id_contiguous(refs: &[PackBranchEntry]) -> bool {
+    refs.windows(2)
+        .all(|w| w[1].first_id == w[0].last_id.saturating_add(1))
+}
+
+fn qualifies_for_merge(sizes: &[u64], total: u64, max_output_bytes: u64) -> bool {
+    let largest = sizes.iter().copied().max().unwrap_or(0);
+    let smallest = sizes.iter().copied().min().unwrap_or(0);
+
+    let comparable = largest <= COMPACTION_SMALL_PACK_BYTES
+        || largest <= smallest.saturating_mul(MAX_SIZE_RATIO);
+
+    comparable && (sizes.len() >= MIN_MERGE_PACKS || total >= max_output_bytes / NEAR_TARGET_SHARE)
 }
 
 // ============================================================================
@@ -710,5 +823,148 @@ mod tests {
         assert_eq!(slices[0].len(), 1); // abc
         assert_eq!(slices[1].len(), 2); // baa, bcd
         assert_eq!(slices[2].len(), 1); // def
+    }
+
+    // ---- Tail compaction policy ----
+
+    /// Contiguous refs, one per size, starting at id 0.
+    fn contiguous_refs(sizes: &[u64]) -> Vec<PackBranchEntry> {
+        let mut refs = Vec::with_capacity(sizes.len());
+        let mut next_id = 0u64;
+        for (i, _) in sizes.iter().enumerate() {
+            refs.push(PackBranchEntry {
+                first_id: next_id,
+                last_id: next_id + 9,
+                pack_cid: dummy_cid(i as u32),
+            });
+            next_id += 10;
+        }
+        refs
+    }
+
+    fn plan(sizes: &[u64]) -> Option<TailCompaction> {
+        plan_tail_compaction(&contiguous_refs(sizes), sizes, COMPACTION_MAX_OUTPUT_BYTES)
+    }
+
+    #[test]
+    fn a_single_pack_is_never_compacted() {
+        assert_eq!(plan(&[]), None);
+        assert_eq!(plan(&[113]), None);
+    }
+
+    #[test]
+    fn tiny_packs_collapse_in_one_merge() {
+        // The observed pathology: a long run of ~113-byte packs. The whole run
+        // merges at once rather than one tier per cycle.
+        let sizes = vec![113u64; 20];
+        let p = plan(&sizes).expect("tiny tail must compact");
+        assert_eq!(p.start, 0, "the whole run should merge, not just a suffix");
+        assert_eq!(p.input_bytes, 113 * 20);
+
+        // But a couple of tiny packs are not yet worth a rewrite.
+        assert_eq!(plan(&[113, 113]), None);
+    }
+
+    #[test]
+    fn peers_merge_only_when_comparably_sized() {
+        let mb = 1024 * 1024u64;
+
+        // Eight peers within the size ratio.
+        assert!(plan(&[mb; 8]).is_some(), "eight equal packs must merge");
+
+        // A pack far larger than its neighbours is left alone rather than
+        // rewritten to absorb them.
+        let mut lopsided = vec![8 * mb];
+        lopsided.extend(std::iter::repeat_n(64 * 1024 + 1, 7));
+        assert_eq!(
+            plan(&lopsided),
+            None,
+            "a dominant pack must not be rewritten for a much smaller tail"
+        );
+    }
+
+    #[test]
+    fn a_pack_near_the_target_stops_being_rewritten() {
+        let near_target = 15 * 1024 * 1024u64;
+        assert_eq!(plan(&[near_target, 100 * 1024]), None);
+
+        let at_target = COMPACTION_MAX_OUTPUT_BYTES;
+        assert_eq!(plan(&[at_target, at_target]), None);
+    }
+
+    #[test]
+    fn a_near_target_group_merges_below_full_width() {
+        // The rule that keeps a stream from stalling short of the target:
+        // four 3.7 MiB peers cannot form a group of eight without blowing the
+        // 16 MiB cap, so they must be allowed to merge at four.
+        let big = 3_700_000u64;
+        let p = plan(&[big; 4]).expect("a near-target group must merge below full width");
+        assert_eq!(p.start, 0);
+        assert_eq!(p.input_bytes, big * 4);
+    }
+
+    #[test]
+    fn an_oversized_group_shrinks_to_the_longest_fitting_suffix() {
+        let mb = 1024 * 1024u64;
+        // 12+6+6 exceeds 16 MiB; the 6+6 suffix fits and is near-target.
+        let p = plan(&[12 * mb, 6 * mb, 6 * mb]).expect("suffix must compact");
+        assert_eq!(p.start, 1);
+        assert_eq!(p.input_bytes, 12 * mb);
+    }
+
+    #[test]
+    fn non_contiguous_packs_are_not_merged() {
+        // Gaps between packs are legal on disk; merging across one would
+        // produce a pack spanning ids it has no values for.
+        let sizes = vec![113u64; 20];
+        let mut refs = contiguous_refs(&sizes);
+        refs[9].first_id += 5; // punch a hole ahead of pack 9
+
+        let p = plan_tail_compaction(&refs, &sizes, COMPACTION_MAX_OUTPUT_BYTES);
+        assert_eq!(
+            p.map(|p| p.start),
+            Some(9),
+            "only the suffix after the gap may merge"
+        );
+    }
+
+    #[test]
+    fn repeated_merges_converge_on_the_output_target() {
+        // The property a fixed-width fanout could not deliver: a stream fed
+        // small packs forever must converge on the 16 MiB target, not stall at
+        // a fraction of it. Simulates many index cycles, each appending one
+        // small pack and compacting whatever qualifies.
+        let small = 32 * 1024u64;
+        let mut sizes: Vec<u64> = Vec::new();
+        let mut rewritten = 0u64;
+
+        for _ in 0..4000 {
+            sizes.push(small);
+            while let Some(p) = plan(&sizes) {
+                let merged: u64 = sizes[p.start..].iter().sum();
+                rewritten += merged;
+                sizes.truncate(p.start);
+                sizes.push(merged);
+            }
+        }
+
+        let total: u64 = sizes.iter().sum();
+        let largest = *sizes.iter().max().unwrap();
+
+        assert!(
+            largest > COMPACTION_MAX_OUTPUT_BYTES / 2,
+            "largest pack {largest} never approached the {COMPACTION_MAX_OUTPUT_BYTES} target"
+        );
+        assert!(
+            sizes.len()
+                <= (total / COMPACTION_MAX_OUTPUT_BYTES + COMPACTION_MAX_WINDOW as u64) as usize,
+            "pack count {} is not bounded by data size ({total} bytes)",
+            sizes.len()
+        );
+        // Write amplification stays near the ~3x a fanout-8 ladder implies.
+        assert!(
+            rewritten < total * 4,
+            "rewrote {rewritten} bytes for {total} bytes of data"
+        );
     }
 }

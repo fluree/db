@@ -283,7 +283,7 @@ pub(crate) fn read_string_array(data: &[u8], pos: &mut usize) -> io::Result<Vec<
 /// ```
 pub(crate) fn write_dict_pack_refs(buf: &mut Vec<u8>, packs: &DictPackRefs) {
     // String forward packs
-    buf.extend_from_slice(&(packs.string_fwd_packs.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&pack_count_u16(packs.string_fwd_packs.len(), "string").to_le_bytes());
     for entry in &packs.string_fwd_packs {
         buf.extend_from_slice(&entry.first_id.to_le_bytes());
         buf.extend_from_slice(&entry.last_id.to_le_bytes());
@@ -293,16 +293,33 @@ pub(crate) fn write_dict_pack_refs(buf: &mut Vec<u8>, packs: &DictPackRefs) {
     // Subject forward packs (per namespace)
     let mut sorted_ns = packs.subject_fwd_ns_packs.clone();
     sorted_ns.sort_by_key(|(ns_code, _)| *ns_code);
-    buf.extend_from_slice(&(sorted_ns.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&pack_count_u16(sorted_ns.len(), "subject namespace").to_le_bytes());
     for (ns_code, ns_packs) in &sorted_ns {
         buf.extend_from_slice(&ns_code.to_le_bytes());
-        buf.extend_from_slice(&(ns_packs.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&pack_count_u16(ns_packs.len(), "subject").to_le_bytes());
         for entry in ns_packs {
             buf.extend_from_slice(&entry.first_id.to_le_bytes());
             buf.extend_from_slice(&entry.last_id.to_le_bytes());
             write_cid(buf, &entry.pack_cid);
         }
     }
+}
+
+/// Pack counts are `u16` on the wire while the routing table itself is
+/// unbounded, so an unchecked cast would wrap and silently drop routing entries
+/// — a root that reads back cleanly having lost ID ranges.
+///
+/// Panicking aborts the in-progress build instead. Roots are immutable and
+/// published last, so the previously published index stays intact and readable;
+/// a failed build is recoverable, a truncated routing table is not.
+fn pack_count_u16(len: usize, what: &str) -> u16 {
+    u16::try_from(len).unwrap_or_else(|_| {
+        panic!(
+            "index root: {what} forward pack count {len} exceeds the u16 wire limit of {}; \
+             tail compaction should keep this far below the cap",
+            u16::MAX
+        )
+    })
 }
 
 /// Read forward dictionary pack refs.

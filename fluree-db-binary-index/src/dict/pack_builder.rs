@@ -13,7 +13,12 @@ use super::forward_pack::{encode_forward_pack, KIND_STRING_FWD, KIND_SUBJECT_FWD
 pub const DEFAULT_TARGET_PAGE_BYTES: usize = 512 * 1024;
 
 /// Default target pack size (bytes). Packs are large immutable CAS objects.
-pub const DEFAULT_TARGET_PACK_BYTES: usize = 256 * 1024 * 1024;
+///
+/// 16 MiB balances object count against the cost of a single cold cache fill:
+/// S3 has no special latency tier here, and a 16 MiB fetch breaks even with
+/// roughly six sequential 512 KiB page misses. It also bounds the work of one
+/// compaction merge, which rewrites at most this many bytes.
+pub const DEFAULT_TARGET_PACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// A single pack artifact produced by the builder, ready for CAS upload.
 #[derive(Debug)]
@@ -157,7 +162,7 @@ mod tests {
         // Small page target to force multiple pages.
         let result = build_string_forward_packs(&refs, 4096, DEFAULT_TARGET_PACK_BYTES).unwrap();
 
-        assert_eq!(result.packs.len(), 1); // Single pack (data well under 256MB)
+        assert_eq!(result.packs.len(), 1); // Single pack (data well under the target)
         let pack = ForwardPack::from_bytes(&result.packs[0].bytes).unwrap();
         assert!(
             pack.page_count() > 1,
