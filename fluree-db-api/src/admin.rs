@@ -2051,15 +2051,16 @@ impl crate::Fluree {
         Ok((guards, branches))
     }
 
-    /// Borrow the managed storage a sweep needs, or explain why there is none.
-    fn sweepable_storage(&self) -> Result<&std::sync::Arc<dyn fluree_db_core::Storage>> {
-        match &self.backend {
-            fluree_db_core::StorageBackend::Managed(storage) => Ok(storage),
-            _ => Err(ApiError::Internal(
-                "storage sweep requires a managed storage backend (file, S3, or memory)"
-                    .to_string(),
-            )),
-        }
+    /// The storage a sweep enumerates and deletes through.
+    ///
+    /// `None` only for permanent (append-only) backends, which cannot list a
+    /// prefix or delete.
+    fn sweepable_storage(&self) -> Result<std::sync::Arc<dyn fluree_db_core::Storage>> {
+        self.backend.admin_storage_cloned().ok_or_else(|| {
+            ApiError::Internal(
+                "storage sweep requires a backend that supports listing and deletion".to_string(),
+            )
+        })
     }
 
     /// Report which index artifacts under `ledger_name` no live index chain
@@ -2068,9 +2069,12 @@ impl crate::Fluree {
     /// Takes the same exclusive hold as [`sweep_index_storage`](Self::sweep_index_storage)
     /// so the report reflects a quiesced ledger, and releases it on return.
     pub async fn plan_index_sweep(&self, ledger_name: &str) -> Result<SweepPlan> {
+        // Reject a branch-qualified alias rather than silently sweeping the
+        // whole ledger: a sweep is ledger-wide because dict blobs are shared.
+        let ledger_name = parse_whole_ledger_input(ledger_name)?;
         let storage = self.sweepable_storage()?;
-        let (_guards, branches) = self.hold_ledger_for_maintenance(ledger_name).await?;
-        Ok(plan_sweep(storage, ledger_name, &branches).await?)
+        let (_guards, branches) = self.hold_ledger_for_maintenance(&ledger_name).await?;
+        Ok(plan_sweep(&storage, &ledger_name, &branches).await?)
     }
 
     /// Reclaim index artifacts that no live index chain references.
@@ -2079,17 +2083,20 @@ impl crate::Fluree {
     /// when planned, so releasing between the two would let a build publish
     /// artifacts the plan had already classified as orphaned.
     pub async fn sweep_index_storage(&self, ledger_name: &str) -> Result<SweepResult> {
+        // Reject a branch-qualified alias rather than silently sweeping the
+        // whole ledger: a sweep is ledger-wide because dict blobs are shared.
+        let ledger_name = parse_whole_ledger_input(ledger_name)?;
         let storage = self.sweepable_storage()?;
-        let (_guards, branches) = self.hold_ledger_for_maintenance(ledger_name).await?;
+        let (_guards, branches) = self.hold_ledger_for_maintenance(&ledger_name).await?;
 
-        let plan = plan_sweep(storage, ledger_name, &branches).await?;
+        let plan = plan_sweep(&storage, &ledger_name, &branches).await?;
         info!(
-            ledger_name,
+            ledger_name = %ledger_name,
             orphans = plan.orphans.len(),
             scanned = plan.scanned,
             live = plan.live,
             "Reclaiming orphaned index artifacts"
         );
-        Ok(execute_sweep(storage, &plan).await)
+        Ok(execute_sweep(&storage, &plan).await)
     }
 }
