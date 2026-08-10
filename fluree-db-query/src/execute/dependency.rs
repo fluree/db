@@ -15,7 +15,7 @@ use std::collections::HashSet;
 /// for all downstream consumers to function correctly.  The sets are
 /// computed once (backward from SELECT) and consulted by each operator to
 /// trim dead columns from its output.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VariableDeps {
     pub required_where_vars: Vec<VarId>,
     pub required_groupby_vars: Vec<VarId>,

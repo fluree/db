@@ -11,6 +11,8 @@ mod it_query_construct;
 mod it_query_negation;
 #[path = "it_query_sparql.rs"]
 mod it_query_sparql;
+#[path = "it_query_sparql_agg_over_group_key.rs"]
+mod it_query_sparql_agg_over_group_key;
 #[path = "it_query_sparql_annotations.rs"]
 mod it_query_sparql_annotations;
 #[path = "it_query_sparql_parse_errors.rs"]
