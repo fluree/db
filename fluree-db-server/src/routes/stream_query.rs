@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -257,6 +257,9 @@ async fn stream_query_inner(
     //  - Dataset: the connection/dataset path (policy, `from`/`fromNamed`,
     //    multi-ledger), which enforces per-request policy exactly like `/query`.
     let fluree = state.fluree.clone();
+    // Advisory headers attached to the 200 (empty for everything but the one
+    // dataset shape whose answer changed under §13.2 semantics).
+    let mut warn_headers = HeaderMap::new();
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
         if let Some(p) = bearer.0.as_ref() {
@@ -308,10 +311,12 @@ async fn stream_query_inner(
                 ));
             }
             let spec = if has_dataset {
-                crate::routes::query::ledger_scoped_sparql_dataset_spec(
-                    &ledger,
-                    dataset_clause.expect("has_dataset implies a clause"),
-                )?
+                let dc = dataset_clause.expect("has_dataset implies a clause");
+                warn_headers = crate::routes::query::dataset_semantics_warning_headers(
+                    dc,
+                    parsed.ast.as_ref(),
+                );
+                crate::routes::query::ledger_scoped_sparql_dataset_spec(&ledger, dc)?
             } else {
                 let mut spec = fluree_db_api::DatasetSpec::new();
                 spec.default_graphs.push(
@@ -435,7 +440,9 @@ async fn stream_query_inner(
     };
 
     tracing::info!(status = "start", ledger = %ledger, "streaming query started");
-    Ok(finish_stream(&state, fluree, stream_plan, tracker))
+    let mut response = finish_stream(&state, fluree, stream_plan, tracker);
+    response.headers_mut().extend(warn_headers);
+    Ok(response)
 }
 
 /// Spawn the producer for a resolved plan and assemble the NDJSON streaming

@@ -42,6 +42,24 @@ Fluree exposes two query styles over HTTP:
 
 If the request body tries to target a different ledger than the one in the URL, the server rejects it with a "Ledger mismatch" error.
 
+#### `FROM NAMED` with no `FROM` (changed in 4.1.4)
+
+A SPARQL dataset clause defines the query's dataset exhaustively (SPARQL 1.1 §13.2): the default graph is the union of the `FROM` clauses, so `FROM NAMED` alone leaves it **empty** and patterns written outside `GRAPH { ... }` match nothing. The embedded Rust API has always behaved this way; before 4.1.4 the HTTP ledger endpoint instead substituted the ledger's default graph, so the same query returned different answers on the two surfaces. The HTTP endpoint now follows §13.2 as well.
+
+To read the ledger's default graph alongside a named graph, name it explicitly:
+
+```sparql
+SELECT ?name ?archived
+FROM <default>
+FROM NAMED <http://example.org/ns/archive>
+WHERE {
+  ?person ex:name ?name .
+  GRAPH <http://example.org/ns/archive> { ?person ex:archived ?archived }
+}
+```
+
+A query with **no** dataset clause at all is unaffected — it reads the ledger's default graph as before. When a request does combine `FROM NAMED`-only with a pattern outside `GRAPH { ... }`, the response carries an `x-fdb-warning` header explaining why those patterns matched nothing; the status is still `200` and the body is the (correct, possibly empty) result.
+
 ### Txn metadata named graph (`#txn-meta`)
 
 The `txn-meta` graph contains per-commit metadata stored as triples. This is useful for auditing and operational metadata (machine address, internal user id, job id, etc.).
