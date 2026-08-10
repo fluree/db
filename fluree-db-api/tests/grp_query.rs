@@ -49,6 +49,8 @@ mod it_query_property;
 mod it_query_rdf_list_parity;
 #[path = "it_query_reverse.rs"]
 mod it_query_reverse;
+#[path = "it_query_self_loop_star_join.rs"]
+mod it_query_self_loop_star_join;
 #[path = "it_query_typed_json.rs"]
 mod it_query_typed_json;
 #[path = "it_query_vocab_id_compaction.rs"]
