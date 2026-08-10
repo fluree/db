@@ -3974,6 +3974,9 @@ pub async fn incremental_index(
             &novelty.shared.ns_prefixes,
             final_root.index_t,
         )?;
+        // Bail to a full rebuild rather than panicking in encode(); a rebuild
+        // re-cuts packs by size and is the only thing that shrinks this table.
+        super::root_assembly::ensure_pack_counts_encodable(&final_root)?;
 
         let root_encode_started = Instant::now();
         let root_bytes = final_root.encode();
@@ -4028,6 +4031,9 @@ pub async fn incremental_index(
             &novelty.shared.ns_prefixes,
             final_root.index_t,
         )?;
+        // Bail to a full rebuild rather than panicking in encode(); a rebuild
+        // re-cuts packs by size and is the only thing that shrinks this table.
+        super::root_assembly::ensure_pack_counts_encodable(&final_root)?;
         let root_encode_started = Instant::now();
         let root_bytes = final_root.encode();
         tracing::debug!(

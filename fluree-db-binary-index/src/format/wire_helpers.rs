@@ -49,6 +49,32 @@ pub struct DictPackRefs {
     pub subject_fwd_ns_packs: Vec<(u16, Vec<PackBranchEntry>)>,
 }
 
+/// Largest routing-table count the root's `u16` wire fields can carry.
+pub const PACK_COUNT_WIRE_MAX: usize = u16::MAX as usize;
+
+impl DictPackRefs {
+    /// The first count that would not fit its `u16` wire field, as
+    /// `(what, len)`, or `None` when the table encodes cleanly.
+    ///
+    /// Callers that can still choose a different route — incremental indexing,
+    /// which can defer to a full rebuild — check this BEFORE encoding, so an
+    /// oversized table becomes a recoverable abort rather than the panic in
+    /// [`write_dict_pack_refs`], which is the last-ditch invariant for paths
+    /// with nowhere left to go.
+    pub fn wire_count_overflow(&self) -> Option<(&'static str, usize)> {
+        if self.string_fwd_packs.len() > PACK_COUNT_WIRE_MAX {
+            return Some(("string", self.string_fwd_packs.len()));
+        }
+        if self.subject_fwd_ns_packs.len() > PACK_COUNT_WIRE_MAX {
+            return Some(("subject namespace", self.subject_fwd_ns_packs.len()));
+        }
+        self.subject_fwd_ns_packs
+            .iter()
+            .find(|(_, packs)| packs.len() > PACK_COUNT_WIRE_MAX)
+            .map(|(_, packs)| ("subject", packs.len()))
+    }
+}
+
 // ============================================================================
 // GC chain types (prev_index / garbage)
 // ============================================================================
@@ -382,4 +408,81 @@ pub(crate) fn read_dict_tree_refs(data: &[u8], pos: &mut usize) -> io::Result<Di
         leaves.push(read_cid(data, pos)?);
     }
     Ok(DictTreeRefs { branch, leaves })
+}
+
+#[cfg(test)]
+mod wire_count_tests {
+    use super::*;
+
+    fn entries(n: usize) -> Vec<PackBranchEntry> {
+        let cid = ContentId::from_hex_digest(
+            fluree_db_core::content_kind::CODEC_FLUREE_DICT_BLOB,
+            &fluree_db_core::sha256_hex(b"pack"),
+        )
+        .unwrap();
+        (0..n)
+            .map(|i| PackBranchEntry {
+                first_id: i as u64,
+                last_id: i as u64,
+                pack_cid: cid.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_table_at_the_wire_limit_encodes_and_one_past_it_does_not() {
+        // The boundary is what matters: `pack_count_u16` accepts exactly
+        // u16::MAX, so the pre-encode check must not abort a build that would
+        // have encoded fine.
+        let at_limit = DictPackRefs {
+            string_fwd_packs: entries(PACK_COUNT_WIRE_MAX),
+            subject_fwd_ns_packs: Vec::new(),
+        };
+        assert_eq!(at_limit.wire_count_overflow(), None, "u16::MAX still fits");
+
+        let over = DictPackRefs {
+            string_fwd_packs: entries(PACK_COUNT_WIRE_MAX + 1),
+            subject_fwd_ns_packs: Vec::new(),
+        };
+        assert_eq!(
+            over.wire_count_overflow(),
+            Some(("string", PACK_COUNT_WIRE_MAX + 1))
+        );
+    }
+
+    #[test]
+    fn every_u16_count_in_the_table_is_checked() {
+        // Three separate u16 fields are written: the string count, the
+        // namespace count, and each namespace's own pack count. A check that
+        // covered only the first would let the other two reach the panic.
+        let ns_overflow = DictPackRefs {
+            string_fwd_packs: Vec::new(),
+            subject_fwd_ns_packs: (0..=PACK_COUNT_WIRE_MAX)
+                .map(|i| (i as u16, Vec::new()))
+                .collect(),
+        };
+        assert_eq!(
+            ns_overflow.wire_count_overflow(),
+            Some(("subject namespace", PACK_COUNT_WIRE_MAX + 1))
+        );
+
+        let per_ns_overflow = DictPackRefs {
+            string_fwd_packs: Vec::new(),
+            subject_fwd_ns_packs: vec![(0, entries(2)), (1, entries(PACK_COUNT_WIRE_MAX + 1))],
+        };
+        assert_eq!(
+            per_ns_overflow.wire_count_overflow(),
+            Some(("subject", PACK_COUNT_WIRE_MAX + 1)),
+            "an oversized namespace is found even when earlier ones are fine"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_table_reports_no_overflow() {
+        let ordinary = DictPackRefs {
+            string_fwd_packs: entries(1200),
+            subject_fwd_ns_packs: vec![(0, entries(64)), (7, entries(19_629))],
+        };
+        assert_eq!(ordinary.wire_count_overflow(), None);
+    }
 }
