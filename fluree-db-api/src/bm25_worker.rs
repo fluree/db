@@ -31,7 +31,9 @@
 
 use crate::{ApiError, Result};
 use fluree_db_core::ledger_id::normalize_ledger_id;
-use fluree_db_nameservice::{GraphSourcePublisher, NameServiceEvent, NameServiceLookup};
+use fluree_db_nameservice::{
+    GraphSourcePublisher, GraphSourceType, NameServiceEvent, NameServiceLookup,
+};
 use futures::StreamExt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -395,11 +397,15 @@ impl Bm25MaintenanceWorker {
             }
             NameServiceEvent::GraphSourceConfigPublished {
                 graph_source_id,
+                source_type,
                 dependencies,
-                ..
             } => {
-                // Auto-register graph source if configured
-                if self.config.auto_register {
+                // BM25 only. Vector, R2RML and Iceberg sources have their own
+                // maintenance paths; registering one here would queue a
+                // `sync_bm25_index` against it on every commit to its source
+                // ledger, and every one of those fails. This mirrors the
+                // start-up pass, which already filters on `is_bm25()`.
+                if self.config.auto_register && *source_type == GraphSourceType::Bm25 {
                     self.state
                         .lock()
                         .register_graph_source(graph_source_id, dependencies);
@@ -781,6 +787,64 @@ mod tests {
             state.graph_sources_for_ledger("ledger1:main"),
             vec!["a:b:c"]
         );
+    }
+
+    fn worker() -> Bm25MaintenanceWorker {
+        Bm25MaintenanceWorker::new(Arc::new(crate::fluree_memory()))
+    }
+
+    fn config_published(graph_source_id: &str, source_type: GraphSourceType) -> NameServiceEvent {
+        NameServiceEvent::GraphSourceConfigPublished {
+            graph_source_id: graph_source_id.to_string(),
+            source_type,
+            dependencies: vec!["ledger1:main".to_string()],
+        }
+    }
+
+    /// A vector / R2RML / Iceberg source registered here would be handed to
+    /// `sync_bm25_index` on every commit to its source ledger, and every one of
+    /// those fails. The start-up pass already filters on `is_bm25()`; this is
+    /// the runtime half of the same rule.
+    #[tokio::test]
+    async fn only_bm25_sources_are_auto_registered() {
+        let worker = worker();
+
+        for source_type in [
+            GraphSourceType::Vector,
+            GraphSourceType::Geo,
+            GraphSourceType::R2rml,
+            GraphSourceType::Iceberg,
+            GraphSourceType::Unknown("custom".to_string()),
+        ] {
+            worker.process_event(&config_published("other:main", source_type.clone()));
+            assert!(
+                worker.handle().registered_graph_sources().is_empty(),
+                "{source_type:?} must not be registered with the BM25 worker"
+            );
+        }
+
+        worker.process_event(&config_published("search:main", GraphSourceType::Bm25));
+        assert_eq!(
+            worker.handle().registered_graph_sources(),
+            vec!["search:main"],
+            "a BM25 source must still auto-register"
+        );
+    }
+
+    /// `auto_register: false` still means no registration, whatever the type.
+    #[tokio::test]
+    async fn auto_register_off_registers_nothing() {
+        let worker = Bm25MaintenanceWorker::with_config(
+            Arc::new(crate::fluree_memory()),
+            Bm25WorkerConfig {
+                auto_register: false,
+                ..Bm25WorkerConfig::default()
+            },
+        );
+
+        worker.process_event(&config_published("search:main", GraphSourceType::Bm25));
+
+        assert!(worker.handle().registered_graph_sources().is_empty());
     }
 
     #[test]
