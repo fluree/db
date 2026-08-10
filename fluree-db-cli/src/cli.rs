@@ -138,7 +138,10 @@ impl PolicyArgs {
             },
             policy: self.resolve_policy()?,
             policy_values: self.resolve_policy_values()?,
-            default_allow: self.default_allow,
+            // `--default-allow` is a presence flag: absent stays unset so the
+            // ledger's `f:defaultAllow` can apply. There is no CLI spelling for
+            // an explicit `false`.
+            default_allow: self.default_allow.then_some(true),
         })
     }
 

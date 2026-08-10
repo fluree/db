@@ -337,7 +337,8 @@ pub fn configured_fulltext_properties_for_indexer(
 /// Algorithm:
 /// 1. No config policy → return opts unchanged
 /// 2. Query specifies policy → check override control:
-///    - Permitted → keep query opts
+///    - Permitted → keep query opts, but still fill fields the request left
+///      unset (`default_allow: None`) from config
 ///    - Denied → log warning, apply config defaults
 /// 3. No query policy → apply config defaults
 pub fn merge_policy_opts(
@@ -356,7 +357,15 @@ pub fn merge_policy_opts(
     if query_has_policy {
         // Check if override is permitted
         if policy.override_control.permits_override(server_identity) {
-            return opts.clone();
+            // The request's own policy inputs stand — but "carries an identity"
+            // is not an override of `f:defaultAllow`. Only an explicit
+            // `Some(v)` is; `None` means the caller never spoke, so the
+            // ledger's configured default still applies.
+            let mut merged = opts.clone();
+            if merged.default_allow.is_none() {
+                merged.default_allow = policy.default_allow;
+            }
+            return merged;
         }
         tracing::warn!(
             server_identity,
@@ -369,7 +378,7 @@ pub fn merge_policy_opts(
 
     // Apply default_allow from config (config says deny-by-default)
     if let Some(default_allow) = policy.default_allow {
-        merged.default_allow = default_allow;
+        merged.default_allow = Some(default_allow);
     }
 
     // Apply policy_class from config
@@ -2243,7 +2252,7 @@ mod tests {
         };
         let opts = GovernanceOptions::default();
         let merged = merge_policy_opts(&resolved, &opts, None);
-        assert!(!merged.default_allow);
+        assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
             Some(&["ex:DefaultPolicy".into()][..])
@@ -2286,7 +2295,7 @@ mod tests {
         };
         let merged = merge_policy_opts(&resolved, &opts, Some("did:key:alice"));
         // Config defaults applied despite query specifying identity
-        assert!(!merged.default_allow);
+        assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
             Some(&["ex:Locked".into()][..])
@@ -2333,7 +2342,7 @@ mod tests {
         };
         let merged = merge_policy_opts(&resolved, &opts, Some("did:key:non-admin"));
         // Server identity is not admin → override denied
-        assert!(!merged.default_allow);
+        assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
             Some(&["ex:Restricted".into()][..])

@@ -542,7 +542,7 @@ pub async fn wrap_identity_policy_view<'a>(
 ) -> Result<PolicyWrappedView<'a>> {
     let opts = GovernanceOptions {
         identity: Some(identity_iri.to_string()),
-        default_allow,
+        default_allow: Some(default_allow),
         ..Default::default()
     };
     wrap_policy_view(ledger, &opts).await

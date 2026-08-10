@@ -505,7 +505,7 @@ fn request_carries_policy(headers: &FlureeHeaders) -> bool {
         || headers.policy.is_some()
         || !headers.policy_class.is_empty()
         || headers.policy_values.is_some()
-        || headers.default_allow
+        || headers.default_allow == Some(true)
 }
 
 /// A fuel + time tracker for the streaming endpoint, honoring any `max-fuel`

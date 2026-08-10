@@ -318,7 +318,9 @@ impl SourcePolicyOverride {
             policy_class: self.policy_class.clone(),
             policy: self.policy.clone(),
             policy_values: self.policy_values.clone(),
-            default_allow: self.default_allow.unwrap_or(false),
+            // Already tri-state here; it used to collapse to `false` at this
+            // boundary, which is the same lost-unset bug one scope down.
+            default_allow: self.default_allow,
         }
     }
 }
@@ -771,7 +773,18 @@ pub struct GovernanceOptions {
     pub policy_class: Option<Vec<String>>,
     pub policy: Option<JsonValue>,
     pub policy_values: Option<HashMap<String, JsonValue>>,
-    pub default_allow: bool,
+    /// Tri-state default-allow: `None` means the caller did not say, so the
+    /// ledger's configured `f:defaultAllow` may fill it in
+    /// ([`crate::config_resolver::merge_policy_opts`]); `Some(v)` is an explicit
+    /// request-level override that wins over config. Resolve to a concrete bool
+    /// with [`GovernanceOptions::effective_default_allow`] — absent on both
+    /// sides is fail-closed (`false`).
+    ///
+    /// A bare `bool` here silently discarded a ledger's `f:defaultAllow true`
+    /// for every identity-carrying request: `merge_policy_opts` treats any
+    /// request with policy inputs as an override, and `false` was
+    /// indistinguishable from "unset".
+    pub default_allow: Option<bool>,
 }
 
 impl GovernanceOptions {
@@ -844,12 +857,13 @@ impl GovernanceOptions {
             }
         };
 
+        // Absent (or non-boolean) stays `None` so ledger config can fill it;
+        // an explicit `false` is preserved as an override of config.
         let default_allow = opts
             .get("default-allow")
             .or_else(|| opts.get("default_allow"))
             .or_else(|| opts.get("defaultAllow"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+            .and_then(serde_json::Value::as_bool);
 
         Ok(Self {
             identity,
@@ -860,12 +874,27 @@ impl GovernanceOptions {
         })
     }
 
+    /// Resolve the tri-state flag to the concrete bool the policy wrapper needs.
+    /// Call this only after [`crate::config_resolver::merge_policy_opts`] has had
+    /// a chance to fill `None` from the ledger's `f:defaultAllow`; still-unset
+    /// means nobody configured it, which is fail-closed.
+    pub fn effective_default_allow(&self) -> bool {
+        self.default_allow.unwrap_or(false)
+    }
+
+    /// Whether the request itself asked for policy enforcement.
+    ///
+    /// `Some(false)` deliberately does **not** count: it is the fail-closed
+    /// value, and treating it as a policy input would turn enforcement on for
+    /// an otherwise-anonymous request — the opposite of the pre-tri-state
+    /// behavior, where a literal `false` was indistinguishable from absent.
+    /// Only `Some(true)` contributes, exactly as the bare `bool` did.
     pub fn has_any_policy_inputs(&self) -> bool {
         self.identity.is_some()
             || self.policy_class.as_ref().is_some_and(|v| !v.is_empty())
             || self.policy.is_some()
             || self.policy_values.as_ref().is_some_and(|m| !m.is_empty())
-            || self.default_allow
+            || self.default_allow == Some(true)
     }
 }
 

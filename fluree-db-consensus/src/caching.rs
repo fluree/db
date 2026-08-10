@@ -739,7 +739,13 @@ fn hash_governance(hasher: &mut Sha256, governance: &GovernanceOptions) {
         }
         None => hasher.update([0u8]),
     }
-    hasher.update([u8::from(governance.default_allow)]);
+    // Tri-state: unset and explicit-false must digest differently, since only
+    // the former lets the ledger's `f:defaultAllow` widen access.
+    hasher.update([match governance.default_allow {
+        None => 0u8,
+        Some(false) => 1u8,
+        Some(true) => 2u8,
+    }]);
 }
 
 fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
@@ -2044,7 +2050,7 @@ mod tests {
         // construction inside the consensus layer — and it permits the write.
         let mut req = request(&ledger_id, None, sample_insert("alice"));
         req.governance = GovernanceOptions {
-            default_allow: true,
+            default_allow: Some(true),
             ..Default::default()
         };
 
@@ -2074,7 +2080,7 @@ mod tests {
                 "f:action": [{"@id": "f:view"}],
                 "f:allow": true
             }])),
-            default_allow: false,
+            default_allow: Some(false),
             ..Default::default()
         };
 

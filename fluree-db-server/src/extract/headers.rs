@@ -50,7 +50,11 @@ pub struct FlureeHeaders {
 
     /// Default-allow flag — when true, permit access in the absence of matching
     /// policy rules. Delivered via the `fluree-default-allow` header.
-    pub default_allow: bool,
+    ///
+    /// Tri-state, mirroring `GovernanceOptions::default_allow`: `None` when the
+    /// header is absent, so the ledger's configured `f:defaultAllow` applies;
+    /// `Some(v)` when the caller sent it, which overrides config.
+    pub default_allow: Option<bool>,
 
     /// Enable all metadata tracking
     pub track_meta: bool,
@@ -83,7 +87,7 @@ impl Default for FlureeHeaders {
             policy: None,
             policy_class: Vec::new(),
             policy_values: None,
-            default_allow: false,
+            default_allow: None,
             track_meta: false,
             track_fuel: false,
             track_time: false,
@@ -156,7 +160,7 @@ impl FlureeHeaders {
         }
 
         // Boolean headers (presence or "true" value)
-        fluree_headers.default_allow = is_header_truthy(headers, Self::DEFAULT_ALLOW);
+        fluree_headers.default_allow = header_bool_opt(headers, Self::DEFAULT_ALLOW);
         fluree_headers.track_meta = is_header_truthy(headers, Self::TRACK_META);
         fluree_headers.track_fuel =
             fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_FUEL);
@@ -407,12 +411,13 @@ impl FlureeHeaders {
             );
         }
 
-        if self.default_allow
-            && !opts.contains_key("default-allow")
-            && !opts.contains_key("default_allow")
-            && !opts.contains_key("defaultAllow")
-        {
-            opts.insert("default-allow".to_string(), JsonValue::Bool(true));
+        if let Some(default_allow) = self.default_allow {
+            if !opts.contains_key("default-allow")
+                && !opts.contains_key("default_allow")
+                && !opts.contains_key("defaultAllow")
+            {
+                opts.insert("default-allow".to_string(), JsonValue::Bool(default_allow));
+            }
         }
 
         if let Some(max_fuel) = self.max_fuel {
@@ -457,6 +462,15 @@ fn is_header_truthy(headers: &HeaderMap, name: &str) -> bool {
         Some(v) => v.eq_ignore_ascii_case("true") || v == "1" || v.is_empty(),
         None => false,
     }
+}
+
+/// Tri-state read of a boolean header: `None` when absent, `Some(truthy)` when
+/// present. Used where "the caller didn't say" must stay distinct from "the
+/// caller said false" — anything present but unrecognized reads as `Some(false)`,
+/// which is the fail-closed direction for a security-relevant header.
+fn header_bool_opt(headers: &HeaderMap, name: &str) -> Option<bool> {
+    get_header_str(headers, name)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1" || v.is_empty())
 }
 
 /// Axum extractor implementation

@@ -77,7 +77,7 @@ async fn sparql_policy_stored_ask_restricts_property() {
             "?$identity".to_string(),
             json!({"@id": "http://example.org/ns/aliceIdentity"}),
         )])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
 
@@ -321,7 +321,7 @@ async fn sparql_policy_positional_identity_unbound_fails_closed() {
     // Anonymous request: policy class selected, but NO identity provided.
     let anon_opts = GovernanceOptions {
         policy_class: Some(vec!["http://example.org/ns/EmployeePolicy".to_string()]),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let policy_ctx = policy_builder::build_policy_context_from_opts(
@@ -411,7 +411,7 @@ async fn sparql_policy_positional_identity_bound_still_allows() {
             "?$identity".to_string(),
             json!({"@id": "http://example.org/ns/aliceIdentity"}),
         )])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let policy_ctx = policy_builder::build_policy_context_from_opts(

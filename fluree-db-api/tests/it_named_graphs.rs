@@ -2374,7 +2374,7 @@ async fn test_graph_mgmt_honors_modify_policy() {
     }]);
     let qc_opts = fluree_db_api::GovernanceOptions {
         policy: Some(policy),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let policy_ctx = fluree_db_api::policy_builder::build_policy_context_from_opts(
@@ -2998,7 +2998,7 @@ INSERT DATA { <http://example.org/MyClass> a rdfs:Class }",
     }]);
     let qc_opts = fluree_db_api::GovernanceOptions {
         policy: Some(policy),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let policy_ctx = fluree_db_api::policy_builder::build_policy_context_from_opts(

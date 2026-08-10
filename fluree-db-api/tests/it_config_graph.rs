@@ -298,8 +298,9 @@ async fn policy_defaults_apply() {
     let resolved = view.resolved_config().expect("resolved config");
     let empty_opts = GovernanceOptions::default();
     let merged = config_resolver::merge_policy_opts(resolved, &empty_opts, None);
-    assert!(
-        !merged.default_allow,
+    assert_eq!(
+        merged.default_allow,
+        Some(false),
         "config's defaultAllow=false should apply when no query opts"
     );
     assert!(
@@ -613,12 +614,13 @@ async fn override_control_none_blocks() {
     // 4. Check that merge_policy_opts respects OverrideNone:
     //    Even with opts specifying default_allow=true, the config should win
     let opts_with_override = GovernanceOptions {
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let merged = config_resolver::merge_policy_opts(resolved, &opts_with_override, None);
-    assert!(
-        !merged.default_allow,
+    assert_eq!(
+        merged.default_allow,
+        Some(false),
         "OverrideNone should block query-time default_allow override"
     );
 }
@@ -674,28 +676,31 @@ async fn override_control_identity_restricted() {
 
     // Test actual gating behavior via merge_policy_opts
     let opts = GovernanceOptions {
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
 
     // Admin identity → override permitted (opts.default_allow=true passes through)
     let merged_admin = config_resolver::merge_policy_opts(resolved, &opts, Some("did:key:admin"));
-    assert!(
+    assert_eq!(
         merged_admin.default_allow,
+        Some(true),
         "admin identity should be permitted to override"
     );
 
     // Unknown identity → override denied (config.default_allow=false applied)
     let merged_user = config_resolver::merge_policy_opts(resolved, &opts, Some("did:key:user"));
-    assert!(
-        !merged_user.default_allow,
+    assert_eq!(
+        merged_user.default_allow,
+        Some(false),
         "non-admin identity should be denied override"
     );
 
     // No identity → override denied (config.default_allow=false applied)
     let merged_none = config_resolver::merge_policy_opts(resolved, &opts, None);
-    assert!(
-        !merged_none.default_allow,
+    assert_eq!(
+        merged_none.default_allow,
+        Some(false),
         "no identity should be denied override"
     );
 }
