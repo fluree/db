@@ -15,6 +15,8 @@ mod it_query_sparql;
 mod it_query_sparql_annotations;
 #[path = "it_query_sparql_parse_errors.rs"]
 mod it_query_sparql_parse_errors;
+#[path = "it_query_sparql_path_literal_object.rs"]
+mod it_query_sparql_path_literal_object;
 #[path = "it_query_sparql_setop_subselect.rs"]
 mod it_query_sparql_setop_subselect;
 #[path = "it_query_subquery.rs"]
