@@ -136,6 +136,19 @@ fn write_atomic(path: &Path, bytes: &[u8], policy: &WritePolicy) -> std::io::Res
     Ok(())
 }
 
+/// True for the errors a filesystem returns when it has no hard links at all.
+///
+/// exFAT, several FUSE filesystems and some NFS configurations refuse
+/// `link(2)` outright, with `EPERM` or `EOPNOTSUPP`. `O_EXCL` works
+/// everywhere, so those mounts get the create-if-absent guarantee back through
+/// the fallback below.
+fn rejects_hard_links(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+    )
+}
+
 /// Stage `bytes` and link them onto `path` only if `path` is absent.
 ///
 /// Returns `false` when `path` already exists, leaving it untouched. Uses
@@ -147,6 +160,14 @@ fn create_new_atomic(path: &Path, bytes: &[u8], policy: &WritePolicy) -> std::io
     let created = match std::fs::hard_link(&tmp, path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        // No hard links on this mount. Fall back to `O_CREAT|O_EXCL`, which
+        // keeps create-if-absent correct at the cost of the staged file's
+        // atomicity — a reader can catch this one mid-write. That is the
+        // pre-staging behaviour, so it is a floor, not a regression.
+        Err(e) if rejects_hard_links(&e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return create_new_in_place(path, bytes, policy);
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
@@ -158,6 +179,24 @@ fn create_new_atomic(path: &Path, bytes: &[u8], policy: &WritePolicy) -> std::io
         fsync_parent_dir(path, policy)?;
     }
     Ok(created)
+}
+
+/// Create-if-absent without a staging file, for mounts that refuse `link(2)`.
+fn create_new_in_place(path: &Path, bytes: &[u8], policy: &WritePolicy) -> std::io::Result<bool> {
+    use std::io::Write;
+
+    let mut file = match std::fs::File::create_new(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    file.write_all(bytes)?;
+    if policy.syncs() {
+        file.sync_all()?;
+        policy.record_fsync();
+        fsync_parent_dir(path, policy)?;
+    }
+    Ok(true)
 }
 
 /// File-based storage backed by `tokio::fs`.
@@ -917,6 +956,22 @@ mod tests {
             storage.fsyncs_issued() > 0,
             "source-of-truth content was not flushed"
         );
+    }
+
+    /// Mounts that refuse `link(2)` fall back to `O_CREAT|O_EXCL`, which has to
+    /// give the same create-if-absent answer — that answer is how a duplicate
+    /// ledger is detected.
+    #[tokio::test]
+    async fn create_new_in_place_matches_the_hard_link_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        let policy = storage.policy(Durability::Sync);
+        let path = dir.path().join("led.json");
+
+        assert!(create_new_in_place(&path, b"first", &policy).unwrap());
+        assert!(!create_new_in_place(&path, b"second", &policy).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        assert!(storage.fsyncs_issued() > 0, "fallback create did not flush");
     }
 
     /// Both settings stage and rename; they differ only in what is flushed.

@@ -299,6 +299,14 @@ Both follow the same visibility and durability rules as `StorageWrite` above. On
 source-of-truth, never derived — so with the default an acknowledged head
 publish has been flushed to the device.
 
+`insert` stages its bytes and hard-links them into place, since a rename would
+overwrite an existing file and destroy the create-if-absent answer. Filesystems
+that refuse `link(2)` outright — exFAT, some FUSE and NFS mounts, which report
+`EPERM` or `EOPNOTSUPP` — fall back to `O_CREAT|O_EXCL` and write in place. The
+create-if-absent answer and the durability are unchanged there; only the staged
+file's atomicity is lost, so on those mounts a reader can observe a partial file
+at a *newly created* address. Overwrites and CAS write-backs are unaffected.
+
 ### StorageDelete (nameservice)
 
 Delete with nameservice error semantics.
