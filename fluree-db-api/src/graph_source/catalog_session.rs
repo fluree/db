@@ -116,6 +116,15 @@ pub(crate) struct IcebergCatalogSession {
     /// build. Recorded unconditionally (independent of the loadTable cache toggle):
     /// even with caching off, the build must record the snapshot each scan read.
     snapshots: Mutex<HashMap<String, TableWatermark>>,
+    /// MAJOR-2 (#1529 review): tables that yielded a SECOND DISTINCT
+    /// `metadata_location` during this build, keyed by `snapshot_key`, with
+    /// `(first_location, conflicting_location)`. `snapshots` is first-writer-wins,
+    /// so a mid-build snapshot move (a source commit while a Direct source's 2s
+    /// metadata cache expired, or a REST source with pinning off) would otherwise be
+    /// silently pinned to the first location while later scans read the second — a
+    /// twin whose stamped watermark does not describe its contents. Recorded here so
+    /// the build can fail loud instead.
+    snapshot_conflicts: Mutex<HashMap<String, (String, String)>>,
     /// Warehouse-root child-directory listings, keyed by warehouse root, so a
     /// catalog-less multi-table Direct source LISTs each root exactly ONCE per
     /// build (not once per table). Always cached (independent of the loadTable
@@ -263,11 +272,49 @@ impl IcebergCatalogSession {
     /// scan of the same table keeps the first-recorded watermark, matching the
     /// `metadata_location` pin.
     pub(crate) fn record_snapshot(&self, key: String, watermark: TableWatermark) {
-        self.snapshots
+        let mut snaps = self.snapshots.lock().unwrap();
+        match snaps.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(watermark);
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                // MAJOR-2: first-writer-wins keeps the first snapshot, but if a later
+                // touch read a DIFFERENT metadata_location the source moved mid-build
+                // — record it so the build fails loud rather than baking a twin whose
+                // stamp lies. First conflict per table wins (stable).
+                if e.get().metadata_location != watermark.metadata_location {
+                    self.snapshot_conflicts
+                        .lock()
+                        .unwrap()
+                        .entry(key)
+                        .or_insert_with(|| {
+                            (
+                                e.get().metadata_location.clone(),
+                                watermark.metadata_location.clone(),
+                            )
+                        });
+                }
+            }
+        }
+    }
+
+    /// MAJOR-2: tables that yielded a second distinct `metadata_location` this build
+    /// for `graph_source_id`, as `(table_name, first_location, conflicting_location)`.
+    /// Empty on a clean build (every table stayed on one snapshot).
+    pub(crate) fn observed_snapshot_conflicts(
+        &self,
+        graph_source_id: &str,
+    ) -> Vec<(String, String, String)> {
+        let prefix = format!("{graph_source_id}\u{1f}");
+        self.snapshot_conflicts
             .lock()
             .unwrap()
-            .entry(key)
-            .or_insert(watermark);
+            .iter()
+            .filter_map(|(k, (first, second))| {
+                k.strip_prefix(&prefix)
+                    .map(|t| (t.to_string(), first.clone(), second.clone()))
+            })
+            .collect()
     }
 
     /// The cached child-directory listing for a warehouse `root`, if this build
@@ -346,6 +393,40 @@ mod tests {
         let hit = s.cached_load_table(&key).expect("hit after store");
         assert_eq!(hit.metadata_location, "s3://meta/1.json");
         assert!(hit.credentials.is_some());
+    }
+
+    #[test]
+    fn record_snapshot_flags_second_distinct_metadata_location() {
+        // MAJOR-2: first-writer-wins keeps snap-A, but a later scan reading snap-B
+        // means the source moved mid-build — a conflict the build must fail on.
+        let wm = |loc: &str| TableWatermark {
+            metadata_location: loc.to_string(),
+            snapshot_id: None,
+            sequence_number: None,
+        };
+        let s = IcebergCatalogSession::default();
+        let key = IcebergCatalogSession::snapshot_key("gs:main", "DW.FACT_ORDER");
+        s.record_snapshot(key.clone(), wm("s3://meta/snap-A.json"));
+        // Re-reading the SAME snapshot is not a conflict.
+        s.record_snapshot(key.clone(), wm("s3://meta/snap-A.json"));
+        assert!(
+            s.observed_snapshot_conflicts("gs:main").is_empty(),
+            "an identical re-read must not flag a conflict"
+        );
+        // A DISTINCT metadata_location flags the table.
+        s.record_snapshot(key, wm("s3://meta/snap-B.json"));
+        let conflicts = s.observed_snapshot_conflicts("gs:main");
+        assert_eq!(conflicts.len(), 1, "the moved table must be flagged");
+        assert_eq!(
+            conflicts[0],
+            (
+                "DW.FACT_ORDER".to_string(),
+                "s3://meta/snap-A.json".to_string(),
+                "s3://meta/snap-B.json".to_string()
+            )
+        );
+        // A different source's conflicts are scoped out.
+        assert!(s.observed_snapshot_conflicts("other:main").is_empty());
     }
 
     #[test]

@@ -139,6 +139,61 @@ async fn jsonld_constant_filter_keeps_all_rows() {
 }
 
 // =============================================================================
+// SPARQL-style spellings in JSON-LD FILTER must error, not silently no-op.
+// `contains(lcase(?n), "x")` used to parse to a truthy string constant, so the
+// filter matched every row (fail-open); a bare-word filter had the same trap.
+// =============================================================================
+
+#[tokio::test]
+async fn jsonld_sparql_style_filter_spelling_errors() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "exprsem/sparqlcall:jsonld").await;
+
+    let filter_err = |filter: &str| {
+        let q = json!({
+            "@context": ctx(),
+            "select": ["?n"],
+            "where": [
+                { "@id": "?s", "ex:name": "?n" },
+                ["filter", filter]
+            ]
+        });
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            support::query_jsonld(fluree, ledger, &q)
+                .await
+                .expect_err("filter must be rejected")
+                .to_string()
+        }
+    };
+
+    // Un-parenthesized SPARQL call spelling.
+    let msg = filter_err(r#"contains(lcase(?n), "zzz_no_match")"#).await;
+    assert!(msg.contains("SPARQL function-call syntax"), "got: {msg}");
+
+    // Parenthesized variant mis-tokenizes into `?n` in operator position; the
+    // error must diagnose that, not report "Unknown function: ?n".
+    let msg = filter_err(r#"(contains(lcase(?n), "alice"))"#).await;
+    assert!(msg.contains("operator position"), "got: {msg}");
+
+    // A bare-word filter is a truthy constant — equally fail-open.
+    let msg = filter_err("gustavo").await;
+    assert!(msg.contains("would match every row"), "got: {msg}");
+
+    // Control: the S-expression spelling still filters.
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?n"],
+        "where": [
+            { "@id": "?s", "ex:name": "?n" },
+            ["filter", "(contains (lcase ?n) \"alice\")"]
+        ]
+    });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &q).await, json!([["Alice"]]));
+}
+
+// =============================================================================
 // D2 — DATATYPE()/LANG() accept expression arguments (#1440)
 // =============================================================================
 

@@ -1547,6 +1547,42 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
     ) -> std::collections::HashMap<String, fluree_db_query::r2rml::TableWatermark> {
         self.session.pinned_tables(graph_source_id)
     }
+
+    /// MAJOR-2 (#1529 review): refuse a materialize build whose stamped watermark
+    /// could not be trusted. (1) With the loadTable metadata cache disabled the pin
+    /// machinery is a documented no-op, so no snapshot is actually held for the
+    /// build. (2) If any table yielded a second distinct `metadata_location` during
+    /// the build, the source committed mid-build and the twin would be stamped with a
+    /// snapshot it does not contain. Checked at the build's start (cache) and again
+    /// before the completion stamp (conflicts).
+    fn verify_build_snapshot_integrity(
+        &self,
+        graph_source_id: &str,
+    ) -> std::result::Result<(), fluree_db_r2rml::R2rmlError> {
+        use fluree_db_r2rml::R2rmlError;
+        if !super::catalog_session::cache_enabled() {
+            return Err(R2rmlError::BuildSnapshotIntegrity(
+                "the loadTable metadata cache is disabled (FLUREE_ICEBERG_LOADTABLE_CACHE=0), so \
+                 Iceberg snapshot pinning is a no-op and the twin's stamped watermark cannot be \
+                 guaranteed to describe its contents; re-enable the cache to materialize"
+                    .to_string(),
+            ));
+        }
+        let conflicts = self.session.observed_snapshot_conflicts(graph_source_id);
+        if let Some((table, first, second)) = conflicts.first() {
+            return Err(R2rmlError::BuildSnapshotIntegrity(format!(
+                "table '{table}' moved snapshots during the build (read metadata_location \
+                 '{first}' then '{second}'): the source committed mid-build, so the twin's stamped \
+                 watermark would not describe its contents. Re-run against a quiesced source.{}",
+                if conflicts.len() > 1 {
+                    format!(" ({} tables affected)", conflicts.len())
+                } else {
+                    String::new()
+                }
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Bounded concurrency for warming per-table catalog contexts in
@@ -2088,13 +2124,27 @@ impl FlureeR2rmlProvider<'_> {
             }
         };
 
-        let matched = fluree_db_iceberg::catalog::match_warehouse_table_dir(requested, &listing)
-            .map_err(|e| {
-                QueryError::InvalidQuery(format!(
-                    "warehouse-root resolution for table '{}': {e}",
-                    table_id.table
-                ))
-            })?;
+        let matched =
+            match fluree_db_iceberg::catalog::match_warehouse_table_dir(requested, &listing) {
+                Ok(m) => m,
+                Err(e) => {
+                    // MAJOR-3 (#1529 review): the leaf-name heuristic (split on the
+                    // FIRST '.') can misclassify a legitimate SINGLE-table direct
+                    // location as a warehouse root — a table dir suffixed like
+                    // `orders-1a2b3c4d`, or a dir literally `DW.FACT_ORDER`. A real
+                    // Iceberg table directory has a `metadata/` child; if the listing
+                    // has one, this IS a single table, so return the location
+                    // unchanged rather than fail with a confusing "no directory
+                    // matches" error.
+                    if listing_is_single_table(&listing) {
+                        return Ok(table_location.to_string());
+                    }
+                    return Err(QueryError::InvalidQuery(format!(
+                        "warehouse-root resolution for table '{}': {e}",
+                        table_id.table
+                    )));
+                }
+            };
         Ok(format!("{root}/{matched}"))
     }
 
@@ -3347,6 +3397,21 @@ async fn direct_session_storage(
     Ok(built)
 }
 
+/// MAJOR-3 (#1529 review): whether a listing of immediate child directory names
+/// denotes a SINGLE Iceberg table rather than a warehouse root. Every Iceberg
+/// table directory carries a `metadata/` child (its table metadata); a warehouse
+/// root instead holds per-table subdirectories. Used to recover the single-table
+/// case when the leaf-name warehouse heuristic misfires.
+fn listing_is_single_table(listing: &[String]) -> bool {
+    listing.iter().any(|d| {
+        d.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(d)
+            .eq_ignore_ascii_case("metadata")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4430,5 +4495,24 @@ mod tests {
             !Arc::ptr_eq(&first, &other),
             "a different table must not reuse another table's cached client"
         );
+    }
+
+    #[test]
+    fn listing_is_single_table_detects_metadata_child() {
+        // MAJOR-3: a single Iceberg table dir has a `metadata/` child (alongside
+        // `data/`); a warehouse root instead holds per-table subdirs. The former
+        // must be recovered as single-table even when the leaf-name heuristic
+        // misfired (suffixed dir, or a dir literally `DW.FACT_ORDER`).
+        assert!(super::listing_is_single_table(&[
+            "data/".to_string(),
+            "metadata/".to_string(),
+        ]));
+        assert!(super::listing_is_single_table(&["METADATA/".to_string()]));
+        // A warehouse root (only table subdirs, no metadata/ child) is NOT single.
+        assert!(!super::listing_is_single_table(&[
+            "fact_order.UIHGsQex/".to_string(),
+            "dim_customer.AbCdEf/".to_string(),
+        ]));
+        assert!(!super::listing_is_single_table(&[]));
     }
 }
