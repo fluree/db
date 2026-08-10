@@ -4648,6 +4648,7 @@ mod tests {
                 patterns: vec![Pattern::Triple(make_pattern(VarId(10), "q", VarId(11)))],
             }],
             source_body: None,
+            source_prologue: None,
         })];
 
         let strategy = choose_exists_strategy(&outer_schema, &inner);
@@ -4733,6 +4734,7 @@ mod tests {
                 },
             ],
             source_body: None,
+            source_prologue: None,
         })];
 
         let strategy = choose_exists_strategy(&outer_schema, &inner);

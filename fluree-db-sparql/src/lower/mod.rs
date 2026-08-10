@@ -622,6 +622,40 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         }
     }
 
+    /// Re-render the query's prologue as SPARQL declaration text, for prepending
+    /// to a remote SERVICE sub-query (see `ServicePattern::source_prologue`).
+    ///
+    /// Rendered from the resolved environment, not sliced from the source, which
+    /// buys three things: a relative `PREFIX` IRI arrives already resolved against
+    /// `BASE` (`prologue_environment` does that), the body's own bytes are never
+    /// touched so a literal that merely *looks* like a CURIE is safe, and the
+    /// output is independent of how the author spaced or cased the original.
+    ///
+    /// Prefixes are emitted in sorted order so the outgoing query text is
+    /// deterministic — `self.prefixes` is a `HashMap`. Every declared prefix is
+    /// forwarded, not just the ones the body uses: an unused `PREFIX` is legal
+    /// SPARQL, and deciding "used" would mean parsing the body slice again.
+    ///
+    /// Returns an empty string when the query declared no prologue.
+    fn render_prologue_sparql(&self) -> String {
+        let mut out = String::new();
+        if let Some(base) = &self.base {
+            out.push_str("BASE <");
+            out.push_str(base);
+            out.push_str(">\n");
+        }
+        let mut prefixes: Vec<(&Arc<str>, &Arc<str>)> = self.prefixes.iter().collect();
+        prefixes.sort_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
+        for (prefix, iri) in prefixes {
+            out.push_str("PREFIX ");
+            out.push_str(prefix);
+            out.push_str(": <");
+            out.push_str(iri);
+            out.push_str(">\n");
+        }
+        out
+    }
+
     /// Build a JSON-LD context object from the SPARQL prologue.
     fn build_jsonld_context_value(&self) -> serde_json::Value {
         use serde_json::{Map, Value as JsonValue};
@@ -656,6 +690,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
 mod tests {
     use super::*;
     use crate::parse::parse_sparql;
+    use fluree_db_core::Sid;
     use fluree_db_query::ir::triple::{Ref, Term};
     use fluree_db_query::ir::{AggregateFn, AggregateSpec, InputSemantics};
     use fluree_db_query::ir::{Expression, Grouping, PathModifier, Pattern};
@@ -692,6 +727,168 @@ mod tests {
         encoder.add_namespace("http://schema.org/", 101);
         encoder.add_namespace("http://xmlns.com/foaf/0.1/", 102);
         encoder
+    }
+
+    // ------------------------------------------------------------------
+    // Remote SERVICE prologue forwarding.
+    //
+    // `ServicePattern::source_body` is a verbatim slice of the SERVICE block, so
+    // it stops short of the query's PREFIX / BASE declarations. Shipping it bare
+    // changed what the query meant at the remote — loudly for a prefixed name
+    // ("Undefined prefix"), and silently for a relative IRI, which resolved
+    // against a different base and matched a different predicate.
+    // ------------------------------------------------------------------
+
+    /// Lower `sparql` and return its single SERVICE pattern.
+    fn lower_one_service(sparql: &str) -> fluree_db_query::ir::ServicePattern {
+        let ast = parse_sparql(sparql).ast.expect("parse");
+        let mut vars = VarRegistry::new();
+        let query = lower_sparql_with_source(&ast, &test_encoder(), &mut vars, Some(sparql))
+            .expect("lower");
+        let mut services: Vec<_> = query
+            .patterns
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::Service(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(services.len(), 1, "expected exactly one SERVICE pattern");
+        services.pop().unwrap()
+    }
+
+    /// The predicate `Ref`s of every triple in a pattern list, in order.
+    fn predicate_refs(patterns: &[Pattern]) -> Vec<Ref> {
+        patterns
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::Triple(t) => Some(t.p.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Lower a standalone query and return its triple predicates.
+    fn predicates_of(sparql: &str) -> Vec<Ref> {
+        let ast = parse_sparql(sparql).ast.expect("remote parse");
+        let mut vars = VarRegistry::new();
+        let q = lower_sparql_with_source(&ast, &test_encoder(), &mut vars, Some(sparql))
+            .expect("remote lower");
+        predicate_refs(&q.patterns)
+    }
+
+    /// A prefixed name in a SERVICE body must arrive at the remote with the
+    /// declaration that defines it. Without the prologue the remote rejects the
+    /// sub-query outright: `Undefined prefix 'ex'`.
+    #[test]
+    fn remote_service_query_forwards_prefix_declarations() {
+        let service = lower_one_service(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT * WHERE { ?s ex:local ?o . \
+             SERVICE <fluree:remote:conn/db:main> { ?s ex:p ?o . ?o ex:q \"x\" } }",
+        );
+        let sent = service.remote_query_text().expect("remote query text");
+
+        // Meaning first: the remote must be able to lower what we send, and must
+        // land on the same predicates we did. This is the loud failure mode —
+        // without the prologue `predicates_of` panics with `Undefined prefix
+        // 'ex'` (the LOWERER rejects it; the parser accepts it silently).
+        assert_eq!(
+            predicates_of(&sent),
+            predicate_refs(&service.patterns),
+            "remote must resolve the body to the same predicates we do"
+        );
+        assert!(
+            sent.contains("PREFIX ex: <http://example.org/>"),
+            "prologue must be forwarded: {sent}"
+        );
+        // ...and those are real encoded SIDs, not an accidental both-sides-broken
+        // match: `ex:` maps to namespace 100 in `test_encoder`.
+        assert_eq!(
+            predicates_of(&sent),
+            vec![Ref::Sid(Sid::new(100, "p")), Ref::Sid(Sid::new(100, "q"))]
+        );
+    }
+
+    /// The silent half: a relative IRI resolves against the parent's BASE. With
+    /// the prologue dropped it fell back to the empty namespace (code 0) — no
+    /// error, just a different predicate and therefore wrong results.
+    #[test]
+    fn remote_service_query_forwards_base_for_relative_iris() {
+        let service = lower_one_service(
+            "BASE <http://example.org/>\n\
+             SELECT * WHERE { ?s <local> ?o . \
+             SERVICE <fluree:remote:conn/db:main> { ?s <p> ?o } }",
+        );
+        let sent = service.remote_query_text().expect("remote query text");
+
+        // Meaning first. This is the SILENT failure mode: without BASE the remote
+        // still lowers cleanly, but `<p>` lands in namespace 0 (the empty
+        // namespace) instead of 100 (`http://example.org/`) — a different
+        // predicate, no error, wrong results.
+        assert_eq!(
+            predicates_of(&sent),
+            predicate_refs(&service.patterns),
+            "remote must resolve <p> against the same base we do"
+        );
+        assert_eq!(predicates_of(&sent), vec![Ref::Sid(Sid::new(100, "p"))]);
+        assert!(
+            sent.contains("BASE <http://example.org/>"),
+            "BASE must be forwarded: {sent}"
+        );
+    }
+
+    /// Why the fix forwards declarations instead of rewriting the body: the body
+    /// is shipped byte-for-byte, so a literal whose *text* looks like a CURIE or
+    /// a relative IRI is untouched. A naive string expansion would corrupt these.
+    #[test]
+    fn remote_service_query_does_not_rewrite_literals() {
+        let service = lower_one_service(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT * WHERE { \
+             SERVICE <fluree:remote:conn/db:main> { ?s ex:p \"ex:p is not a curie\" } }",
+        );
+        let sent = service.remote_query_text().expect("remote query text");
+        assert!(
+            sent.contains("\"ex:p is not a curie\""),
+            "literal text must survive verbatim: {sent}"
+        );
+    }
+
+    /// A query with no prologue ships exactly what it shipped before: the fix
+    /// adds declarations, it does not restructure the sub-query.
+    #[test]
+    fn remote_service_query_without_prologue_is_unchanged() {
+        let service = lower_one_service(
+            "SELECT * WHERE { SERVICE <fluree:remote:conn/db:main> { ?s <http://example.org/p> ?o } }",
+        );
+        assert_eq!(
+            service.remote_query_text().unwrap(),
+            "SELECT * WHERE { ?s <http://example.org/p> ?o }"
+        );
+    }
+
+    /// Multiple declarations are forwarded, in a deterministic (sorted) order —
+    /// `prefixes` is a HashMap, so unsorted output would make the outgoing query
+    /// text vary run to run.
+    #[test]
+    fn remote_service_query_prologue_is_deterministic() {
+        let src = "PREFIX zz: <http://example.org/z/>\n\
+                   PREFIX aa: <http://example.org/a/>\n\
+                   BASE <http://base.example/>\n\
+                   SELECT * WHERE { SERVICE <fluree:remote:conn/db:main> { ?s aa:p ?o } }";
+        let first = lower_one_service(src).remote_query_text().unwrap();
+        for _ in 0..4 {
+            assert_eq!(lower_one_service(src).remote_query_text().unwrap(), first);
+        }
+        assert!(
+            first.starts_with(
+                "BASE <http://base.example/>\n\
+                 PREFIX aa: <http://example.org/a/>\n\
+                 PREFIX zz: <http://example.org/z/>\n"
+            ),
+            "{first}"
+        );
     }
 
     #[test]

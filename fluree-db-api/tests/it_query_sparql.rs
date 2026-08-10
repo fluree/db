@@ -5417,6 +5417,63 @@ async fn sparql_service_remote_returns_mock_data() {
     );
 }
 
+/// End to end: the query the engine ships to a remote SERVICE endpoint carries
+/// the parent query's prologue, so a prefixed name in the SERVICE body means the
+/// same thing there as here. Without it the remote fails with
+/// `Undefined prefix 'ex'` (the local-only lowering tests in
+/// `fluree-db-sparql::lower` cover both failure modes in detail; this one pins
+/// the executor call site).
+#[tokio::test]
+async fn sparql_service_remote_query_carries_query_prologue() {
+    assert_index_defaults();
+    let mut fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let mock = Arc::new(fluree_db_api::remote_service::MockRemoteService::new());
+    mock.register_response(
+        "acme",
+        "customers:main",
+        json!({
+            "head": {"vars": ["name"]},
+            "results": {"bindings": [{"name": {"type": "literal", "value": "Alice"}}]}
+        }),
+    );
+    fluree.set_remote_service(mock.clone());
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        BASE <http://base.example/>
+        SELECT ?name
+        WHERE {
+          SERVICE <fluree:remote:acme/customers:main> {
+            ?s ex:name ?name .
+          }
+        }
+    ";
+    support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("Remote SERVICE should succeed with mock");
+
+    let sent = mock.last_sparql().expect("mock should have been called");
+    assert!(
+        sent.contains("PREFIX ex: <http://example.org/>"),
+        "shipped sub-query must declare ex:, got: {sent}"
+    );
+    assert!(
+        sent.contains("BASE <http://base.example/>"),
+        "shipped sub-query must declare the base, got: {sent}"
+    );
+    assert!(
+        sent.contains("ex:name"),
+        "body must ship verbatim, got: {sent}"
+    );
+    // The prologue has to precede the query form to be legal SPARQL.
+    assert!(
+        sent.find("PREFIX ex:") < sent.find("SELECT"),
+        "prologue must precede SELECT, got: {sent}"
+    );
+}
+
 #[tokio::test]
 async fn sparql_service_remote_unknown_connection_errors() {
     assert_index_defaults();
