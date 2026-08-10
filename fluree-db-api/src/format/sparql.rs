@@ -1196,6 +1196,133 @@ mod tests {
         assert_parity(&r, &c);
     }
 
+    // ------------------------------------------------------------------
+    // Issue #45: the W3C profile emits absolute IRIs and keeps datatypes.
+    // ------------------------------------------------------------------
+
+    /// A context declaring `ex:` (as a `PREFIX ex:` prologue lowers to) plus a
+    /// `@base` — the two things that shortened `uri` cells on main.
+    fn prefixed_context() -> crate::ParsedContext {
+        crate::ParsedContext::parse(
+            None,
+            &json!({ "ex": "http://example.org/", "@base": "http://base.example/" }),
+        )
+        .unwrap()
+    }
+
+    fn w3c_compactor(ctx: &crate::ParsedContext) -> IriCompactor {
+        IriCompactor::new(std::sync::Arc::new(make_test_namespaces()), ctx).with_absolute_iris(true)
+    }
+
+    fn make_test_namespaces() -> HashMap<u16, String> {
+        let mut m = HashMap::new();
+        m.insert(2, "http://www.w3.org/2001/XMLSchema#".to_string());
+        m.insert(100, "http://example.org/".to_string());
+        m.insert(101, "http://base.example/".to_string());
+        m
+    }
+
+    /// Every node-reference binding kind renders the absolute IRI under the W3C
+    /// profile, through BOTH the DOM and the streaming entry point. `?based` is
+    /// the `@base` case: on main a `BASE`-only prologue produced a bare relative
+    /// reference, which SRJ cannot express at all.
+    #[test]
+    fn w3c_profile_emits_absolute_iris_for_every_node_binding() {
+        let ctx = prefixed_context();
+        let c = w3c_compactor(&ctx);
+        let r = make_result(
+            &["?sid", "?match", "?raw", "?based"],
+            vec![vec![
+                Binding::sid(Sid::new(100, "s2")),
+                Binding::IriMatch {
+                    iri: std::sync::Arc::from("http://example.org/s3"),
+                    primary_sid: Sid::new(100, "s3"),
+                    ledger_alias: std::sync::Arc::from("test:main"),
+                },
+                Binding::iri("http://example.org/s4"),
+                Binding::sid(Sid::new(101, "thing")),
+            ]],
+        );
+
+        let dom = serde_json::to_string(&format(&r, &c, &FormatterConfig::sparql_json()).unwrap())
+            .unwrap();
+        let streamed = format_string(&r, &c, &FormatterConfig::sparql_json()).unwrap();
+        assert_eq!(dom, streamed, "DOM and streaming must agree");
+
+        for want in [
+            "http://example.org/s2",
+            "http://example.org/s3",
+            "http://example.org/s4",
+            "http://base.example/thing",
+        ] {
+            assert!(dom.contains(want), "missing {want} in {dom}");
+        }
+        for forbidden in [r#""ex:s2""#, r#""ex:s3""#, r#""ex:s4""#, r#""thing""#] {
+            assert!(!dom.contains(forbidden), "leaked {forbidden} in {dom}");
+        }
+    }
+
+    /// The same bindings under the Fluree display profile still compact — so the
+    /// test above is measuring the flag, not the absence of a usable context.
+    #[test]
+    fn display_profile_still_compacts_node_bindings() {
+        let ctx = prefixed_context();
+        let c = IriCompactor::new(std::sync::Arc::new(make_test_namespaces()), &ctx);
+        let r = make_result(
+            &["?sid", "?based"],
+            vec![vec![
+                Binding::sid(Sid::new(100, "s2")),
+                Binding::sid(Sid::new(101, "thing")),
+            ]],
+        );
+        assert_parity(&r, &c);
+        let dom = serde_json::to_string(&format(&r, &c, &FormatterConfig::sparql_json()).unwrap())
+            .unwrap();
+        assert!(dom.contains(r#""ex:s2""#), "{dom}");
+        assert!(dom.contains(r#""value":"thing""#), "{dom}");
+    }
+
+    /// Issue #45 (b): a string-backed literal carrying an "inferable" datatype —
+    /// what `STRDT("2", xsd:integer)` produces — must keep its `datatype` in the
+    /// W3C profile. Dropping it makes the cell denote `"2"^^xsd:string`, a
+    /// different RDF term. `xsd:string` itself stays bare (a simple literal).
+    #[test]
+    fn w3c_profile_keeps_datatype_on_string_backed_literals() {
+        let ctx = crate::ParsedContext::default();
+        let c = w3c_compactor(&ctx);
+        let r = make_result(
+            &["?i", "?b", "?d", "?s"],
+            vec![vec![
+                Binding::lit(FlakeValue::String("2".into()), Sid::new(2, "integer")),
+                Binding::lit(FlakeValue::String("true".into()), Sid::new(2, "boolean")),
+                Binding::lit(FlakeValue::String("2".into()), Sid::new(2, "decimal")),
+                Binding::lit(FlakeValue::String("hi".into()), Sid::new(2, "string")),
+            ]],
+        );
+
+        let dom = format(&r, &c, &FormatterConfig::sparql_json()).unwrap();
+        let streamed = format_string(&r, &c, &FormatterConfig::sparql_json()).unwrap();
+        assert_eq!(serde_json::to_string(&dom).unwrap(), streamed);
+
+        let row = &dom["results"]["bindings"][0];
+        for (var, dt) in [("i", "integer"), ("b", "boolean"), ("d", "decimal")] {
+            assert_eq!(
+                row[var]["datatype"],
+                json!(format!("http://www.w3.org/2001/XMLSchema#{dt}")),
+                "xsd:{dt} lost its datatype: {row}"
+            );
+        }
+        assert!(
+            row["s"]["datatype"].is_null(),
+            "xsd:string stays bare: {row}"
+        );
+
+        // The display profile keeps today's looser behavior.
+        let display = IriCompactor::new(std::sync::Arc::new(make_test_namespaces()), &ctx);
+        let loose = format(&r, &display, &FormatterConfig::sparql_json()).unwrap();
+        assert!(loose["results"]["bindings"][0]["i"]["datatype"].is_null());
+    }
+
     #[test]
     fn test_format_binding_double_special_values() {
         let compactor = make_test_compactor();
