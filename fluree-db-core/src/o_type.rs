@@ -90,7 +90,10 @@ impl OType {
     pub const XSD_DOUBLE: Self = Self(0x0010);
     /// `xsd:float`
     pub const XSD_FLOAT: Self = Self(0x0011);
-    /// `xsd:decimal` (inline f64 — overflow goes to NumBig arena via `NUM_BIG_OVERFLOW`).
+    /// `xsd:decimal`. Reserved: the indexer routes **every** typed
+    /// `xsd:decimal` to the NumBig arena under [`Self::NUM_BIG_OVERFLOW`]
+    /// (`resolver.rs`, `RawObject::DecimalStr` — there is no inline branch), so
+    /// no stored row carries this o_type.
     pub const XSD_DECIMAL: Self = Self(0x0012);
 
     // -- Temporal (various order-preserving encodings in o_key) --
@@ -189,6 +192,30 @@ impl OType {
     #[inline]
     pub const fn payload(self) -> u16 {
         self.0 & 0x3FFF
+    }
+
+    /// Whether `(o_type, o_key)` identifies an object term **graph-wide**.
+    ///
+    /// For almost every o_type it does: `o_key` is an inline value, a subject
+    /// dictionary id, or a handle into a graph-scoped arena, so two rows share
+    /// an `(o_type, o_key)` pair iff they carry the same object term.
+    ///
+    /// [`Self::NUM_BIG_OVERFLOW`] is the exception, and it is the whole reason
+    /// this predicate exists. Its `o_key` is a handle into a **per-predicate**
+    /// arena (`fluree-db-binary-index`, `arena::numbig` — "Per-predicate
+    /// equality-only arena") whose handles are allocated from 0 within each
+    /// `(g_id, p_id)`. The first big value under one predicate and the first
+    /// under another are both handle `0`, so the pair is an identity only once
+    /// `p_id` is fixed. Every `xsd:decimal` lands there unconditionally, as does
+    /// any `xsd:integer` too large for `i64`.
+    ///
+    /// Call this before using an `(o_type, o_key)` prefix as an object identity
+    /// in any whole-graph structure — a distinct count, a group key, a dedup
+    /// set. Per-predicate consumers are unaffected: their key already carries
+    /// the `p_id` that scopes the handle.
+    #[inline]
+    pub const fn o_key_is_globally_identifying(self) -> bool {
+        self.0 != Self::NUM_BIG_OVERFLOW.0
     }
 
     // ── Constructors ───────────────────────────────────────────────────
