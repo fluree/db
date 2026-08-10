@@ -1898,7 +1898,7 @@ mem:fact-01kv6sahj5se39hv5hkmjytznz a mem:Fact ;
     mem:rationale "Serial writes (summed S3 round-trips) blew the 15-min Lambda cap on a real 21 GB/74k-artifact DBLP restore; user chose the parallelize-writes fix. Sequential-stream-read ceiling is still unaddressed." .
 
 mem:fact-01kzemcff3b773aq7yckej9dhk a mem:Fact ;
-    mem:content "Local-filesystem Iceberg support (branch feature/iceberg-file-storage, commit 15ca56807, E2E-verified against a real pyiceberg table): Direct table_location accepts file:///, file:/, bare absolute paths. FileIcebergStorage; IcebergStorageBackend enum (S3|File) across api scan surface/session caches/lazy path; version-hint fallback lists metadata/ (new list_files trait method). GOTCHA the E2E test caught: Direct location validation exists in TWO places — fluree_db_iceberg::config AND fluree-db-api graph_source/config.rs validate() — both must accept a new scheme. Unconditional CI test it_iceberg_local_fs (committed pyiceberg fixture; FLUREE_LOCAL_ICEBERG_TABLE only overrides the table) + fixture writer scripts/local/write_local_iceberg_table.py cover query, incremental window, pinned read, typed SnapshotNotFound. Local locations are FAIL-CLOSED behind FLUREE_ICEBERG_LOCAL_ROOTS (local_guard.rs): unset refuses at config validation, and set confines every resolved path to those roots." ;
+    mem:content "Local-filesystem Iceberg support (commit 15ca56807, E2E-verified against a real pyiceberg table): Direct table_location accepts file:///, file:/, and bare absolute paths. Adds FileIcebergStorage and an IcebergStorageBackend enum (S3|File) threaded through the api scan surface, session caches, and lazy path; the version-hint fallback lists metadata/ via a new list_files trait method. GOTCHA the E2E test caught: Direct location validation lives in TWO places — fluree_db_iceberg::config and fluree-db-api graph_source/config.rs validate() — and both must accept a new scheme." ;
     mem:tag "direct-mode" ;
     mem:tag "file-storage" ;
     mem:tag "graph-sources" ;
@@ -1908,6 +1908,20 @@ mem:fact-01kzemcff3b773aq7yckej9dhk a mem:Fact ;
     mem:artifactRef "fluree-db-api/src/graph_source/r2rml.rs" ;
     mem:artifactRef "fluree-db-iceberg/src/catalog/direct.rs" ;
     mem:artifactRef "fluree-db-iceberg/src/io/file_storage.rs" ;
+    mem:branch "feature/iceberg-file-storage" ;
+    mem:createdAt "2026-08-07T17:29:55.939416+00:00"^^xsd:dateTime .
+
+mem:fact-01kzemcff3hh6573jjp7k5wyb9 a mem:Fact ;
+    mem:content "Local-filesystem Iceberg locations are FAIL-CLOSED behind FLUREE_ICEBERG_LOCAL_ROOTS (fluree-db-iceberg/src/local_guard.rs): unset refuses the location at config validation, and when set every resolved path is confined to those roots. Coverage is the unconditional CI test it_iceberg_local_fs against a committed pyiceberg fixture (FLUREE_LOCAL_ICEBERG_TABLE only overrides which table is used) plus the fixture writer scripts/local/write_local_iceberg_table.py; together they cover query, incremental window, pinned read, and typed SnapshotNotFound." ;
+    mem:tag "fail-closed" ;
+    mem:tag "iceberg" ;
+    mem:tag "local-storage" ;
+    mem:tag "security" ;
+    mem:tag "testing" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_iceberg_local_fs.rs" ;
+    mem:artifactRef "fluree-db-iceberg/src/local_guard.rs" ;
+    mem:artifactRef "scripts/local/write_local_iceberg_table.py" ;
     mem:branch "feature/iceberg-file-storage" ;
     mem:createdAt "2026-08-07T17:29:55.939416+00:00"^^xsd:dateTime .
 
