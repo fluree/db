@@ -889,28 +889,55 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 (load_response, Arc::new(IcebergStorageBackend::S3(storage)))
             }
             CatalogConfig::Direct { table_location } => {
-                // Backend by location scheme: a `file://` / absolute-path table
-                // reads the local filesystem directly (catalog-less local
-                // tables) and skips the S3 client build entirely — no
-                // credential-chain resolution (env → ~/.aws → IMDS network
-                // probes) for a table that never touches an object store.
-                let storage: Arc<IcebergStorageBackend> =
-                    if FileIcebergStorage::is_local_location(table_location) {
-                        Arc::new(IcebergStorageBackend::File(FileIcebergStorage::new()))
-                    } else {
-                        Arc::new(IcebergStorageBackend::S3(
-                            S3IcebergStorage::from_default_chain(
-                                iceberg_config.io.s3_region.as_deref(),
-                                iceberg_config.io.s3_endpoint.as_deref(),
-                                iceberg_config.io.s3_path_style,
-                            )
-                            .await
-                            .map_err(|e| {
-                                QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                            })?,
-                        ))
-                    };
-                direct_location = Some(table_location.clone());
+                // Warehouse-root resolution — the same step the query path
+                // (`load_table_context`) performs: when `table_location` is a
+                // catalog-less multi-table ROOT, resolve THIS table's own
+                // directory beneath it. Without this, pin resolution
+                // (`current_snapshot_id`) and materialize scans read
+                // `{root}/metadata/` and fail on any multi-table copy the
+                // query path handles fine.
+                //
+                // A location whose leaf directory is NAMED AFTER the table
+                // returns unchanged (that is the classifier — not "is this one
+                // table"), so those sources are byte-identical. A single-table
+                // location whose directory is named something else is treated
+                // as a root here, exactly as the query path has always treated
+                // it, so nothing that queries successfully today changes.
+                let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
+                    graph_source_id,
+                    &table_id.namespace,
+                    &table_id.table,
+                );
+                let effective_location = self
+                    .resolve_direct_table_location(
+                        table_location,
+                        &table_id,
+                        &lt_key,
+                        &iceberg_config,
+                    )
+                    .await?;
+                let table_location = &effective_location;
+                // The RESOLVED table dir is what the relocation remap compares
+                // against the metadata's own `location` — a warehouse root would
+                // never match it. Mirrors the query path's ordering.
+                direct_location = Some(effective_location.clone());
+
+                // Storage through the session, which dispatches on the location
+                // scheme (a `file://` / absolute-path table reads the filesystem
+                // directly, skipping the S3 client build and its credential-chain
+                // resolution). Going through the session rather than building a
+                // client here means the warehouse-root branch above — which
+                // already built one to LIST the root — hands its client over
+                // instead of having it constructed and discarded.
+                let storage = direct_session_storage(
+                    &self.session,
+                    &lt_key,
+                    table_location,
+                    iceberg_config.io.s3_region.as_deref(),
+                    iceberg_config.io.s3_endpoint.as_deref(),
+                    iceberg_config.io.s3_path_style,
+                )
+                .await?;
                 let cache = self.fluree.r2rml_cache();
                 let load_response = if let Some(metadata_location) =
                     cache.get_direct_metadata_location(table_location).await
