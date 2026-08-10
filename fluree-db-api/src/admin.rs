@@ -384,14 +384,17 @@ mod validate_absolute_iri_tests {
     }
 }
 
-/// Parse a `drop_ledger` input.
+/// Parse the input to an operation that acts on a whole ledger.
 ///
 /// Accepted forms:
-/// - `"mydb"`: whole-ledger drop. Returns `"mydb"`.
+/// - `"mydb"`: names the whole ledger. Returns `"mydb"`.
 /// - Any branch-qualified id (`"mydb:main"`, `"mydb:dev"`, …) is rejected
-///   with `ApiError::Http(400)`. `:main` is not special: callers passing
-///   the suffix likely expected branch-level semantics, so they're routed
-///   to `drop_branch` with the same error shape as a non-default suffix.
+///   with `ApiError::Http(400)`. `:main` is not special: a caller passing
+///   the suffix likely expected branch-level semantics, and silently
+///   widening that to every branch is the surprise worth refusing.
+///
+/// `operation` selects the rejection message, so each caller explains what
+/// *it* offers instead — see [`WholeLedgerOperation`].
 fn parse_whole_ledger_input(input: &str, operation: WholeLedgerOperation) -> Result<String> {
     use fluree_db_core::ledger_id::split_ledger_id;
 
