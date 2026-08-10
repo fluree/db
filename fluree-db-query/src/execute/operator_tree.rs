@@ -1777,20 +1777,18 @@ fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> 
 
     match query.patterns.as_slice() {
         [Pattern::Triple(tp)] => {
-            let pred = extract_bound_predicate(&tp.p)?;
-            let Term::Var(o_var) = &tp.o else {
-                return None;
-            };
-            if sum_input != *o_var {
+            // Via the shared helper: the scan sums the predicate's whole object
+            // column, so it is entitled to the pattern only when the subject is
+            // a free variable distinct from the object (and there is no
+            // datatype constraint to honour).
+            let (_s_var, pred, o_var) = validate_simple_triple(tp)?;
+            if sum_input != o_var {
                 return None;
             }
             Some((pred, SumExprI64::Identity, agg.output_var))
         }
         [Pattern::Triple(tp), Pattern::Bind { var, expr }] => {
-            let pred = extract_bound_predicate(&tp.p)?;
-            let Term::Var(o_var) = &tp.o else {
-                return None;
-            };
+            let (_s_var, pred, o_var) = validate_simple_triple(tp)?;
 
             // Bind must define the aggregate input var, and SUM must use it.
             if sum_input != *var {
@@ -1800,7 +1798,7 @@ fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> 
             let scalar = match expr {
                 crate::ir::Expression::Call { func, args }
                     if args.len() == 1
-                        && matches!(&args[0], crate::ir::Expression::Var(v) if v == o_var) =>
+                        && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var) =>
                 {
                     match func {
                         crate::ir::Function::Year => {
@@ -1824,8 +1822,8 @@ fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> 
                 crate::ir::Expression::Call { func, args }
                     if *func == crate::ir::Function::Add
                         && args.len() == 2
-                        && matches!(&args[0], crate::ir::Expression::Var(v) if v == o_var)
-                        && matches!(&args[1], crate::ir::Expression::Var(v) if v == o_var) =>
+                        && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
+                        && matches!(&args[1], crate::ir::Expression::Var(v) if *v == o_var) =>
                 {
                     SumExprI64::AddSelf
                 }
@@ -1864,12 +1862,12 @@ fn detect_sum_numeric_compare_as_count(
     if sum_input != *var {
         return None;
     }
-    let pred = extract_bound_predicate(&tp.p)?;
-    let Term::Var(o_var) = &tp.o else {
-        return None;
-    };
+    // Same contract as `detect_fused_scan_sum_i64`: the directory-skipping
+    // count spans the whole predicate, so a constant subject (or a repeated
+    // variable) would silently widen the question to the whole ledger.
+    let (_s_var, pred, o_var) = validate_simple_triple(tp)?;
     let (cmp_var, op, threshold) = extract_simple_numeric_compare_threshold(expr)?;
-    if cmp_var != *o_var {
+    if cmp_var != o_var {
         return None;
     }
     Some((pred, op, threshold, agg.output_var))
@@ -1919,9 +1917,15 @@ fn detect_count_blank_node_subjects(query: &Query) -> Option<VarId> {
         _ => return None,
     };
     let Ref::Var(sv) = &tp.s else { return None };
-    let Ref::Var(_pv) = &tp.p else { return None };
-    let Term::Var(_ov) = &tp.o else { return None };
+    let Ref::Var(pv) = &tp.p else { return None };
+    let Term::Var(ov) = &tp.o else { return None };
     if tp.dtc.is_some() {
+        return None;
+    }
+    // Same contract as `validate_simple_triple`, restated here because this
+    // detector admits a variable predicate: the blank-node subject count reads
+    // whole-permutation metadata and cannot honour a repeated variable.
+    if sv == pv || sv == ov || pv == ov {
         return None;
     }
 
@@ -4098,6 +4102,125 @@ mod tests {
         // A non-SUM aggregate over the same shape must be rejected.
         let q_count = make_query(AggregateFn::Count(synth));
         assert_eq!(detect_sum_numeric_compare_as_count(&q_count), None);
+    }
+
+    /// The directory-skipping count spans the whole predicate, so it may only
+    /// serve a free, distinct subject variable. A constant subject would turn
+    /// "how many of this entity's scores exceed K" into the ledger-wide answer;
+    /// a repeated variable drops the pattern's equality join. No integration
+    /// fixture discriminates these (the shapes are rare and the blank-node
+    /// sibling needs blank nodes in the data), so they are pinned here.
+    #[test]
+    fn sum_numeric_compare_declines_non_free_subject() {
+        let s = VarId(0);
+        let o = VarId(1);
+        let synth = VarId(2);
+        let out = VarId(3);
+        let pred = Ref::Sid(Sid::new(100, "score"));
+
+        let make_query = |subject: Ref, object: Term| Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![out]),
+            patterns: vec![
+                Pattern::Triple(TriplePattern::new(subject, pred.clone(), object.clone())),
+                Pattern::Bind {
+                    var: synth,
+                    expr: crate::ir::Expression::gt(
+                        crate::ir::Expression::Var(match &object {
+                            Term::Var(v) => *v,
+                            _ => unreachable!("object is always a var in this test"),
+                        }),
+                        crate::ir::Expression::Const(crate::ir::FlakeValue::Long(0)),
+                    ),
+                },
+            ],
+            reasoning: ReasoningConfig::default(),
+            include_system_facts: false,
+            cypher_vocab: None,
+            grouping: Some(Grouping::Implicit {
+                aggregation: Aggregation {
+                    aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
+                        crate::ir::AggregateSpec {
+                            function: AggregateFn::Sum(synth, InputSemantics::List),
+                            output_var: out,
+                        },
+                    ])
+                    .unwrap(),
+                    binds: Vec::new(),
+                },
+                having: None,
+            }),
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+        };
+
+        // Baseline: a free subject var still takes the fast path.
+        let free = make_query(Ref::Var(s), Term::Var(o));
+        assert!(detect_sum_numeric_compare_as_count(&free).is_some());
+
+        let const_subject = make_query(Ref::Sid(Sid::new(100, "n1")), Term::Var(o));
+        assert_eq!(detect_sum_numeric_compare_as_count(&const_subject), None);
+
+        let self_loop = make_query(Ref::Var(o), Term::Var(o));
+        assert_eq!(detect_sum_numeric_compare_as_count(&self_loop), None);
+    }
+
+    /// `COUNT(?x) WHERE { ?x ?p ?x FILTER(isBlank(?x)) }` counts self-loops on
+    /// blank-node subjects, not every triple with a blank-node subject.
+    #[test]
+    fn count_blank_node_subjects_declines_repeated_variable() {
+        let s = VarId(0);
+        let p = VarId(1);
+        let o = VarId(2);
+        let out = VarId(3);
+
+        let make_query = |subject: VarId, object: VarId| Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![out]),
+            patterns: vec![
+                Pattern::Triple(TriplePattern::new(
+                    Ref::Var(subject),
+                    Ref::Var(p),
+                    Term::Var(object),
+                )),
+                Pattern::Filter(crate::ir::Expression::Call {
+                    func: crate::ir::Function::IsBlank,
+                    args: vec![crate::ir::Expression::Var(subject)],
+                }),
+            ],
+            reasoning: ReasoningConfig::default(),
+            include_system_facts: false,
+            cypher_vocab: None,
+            grouping: Some(Grouping::Implicit {
+                aggregation: Aggregation {
+                    aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
+                        crate::ir::AggregateSpec {
+                            function: AggregateFn::Count(subject),
+                            output_var: out,
+                        },
+                    ])
+                    .unwrap(),
+                    binds: Vec::new(),
+                },
+                having: None,
+            }),
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+        };
+
+        assert_eq!(
+            detect_count_blank_node_subjects(&make_query(s, o)),
+            Some(out)
+        );
+        assert_eq!(detect_count_blank_node_subjects(&make_query(s, s)), None);
     }
 
     #[test]

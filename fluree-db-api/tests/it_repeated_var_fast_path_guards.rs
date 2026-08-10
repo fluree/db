@@ -51,11 +51,14 @@ ex:n4 a ex:C .
 "#;
 
 /// Every fast-path site that answers from per-predicate or whole-permutation
-/// metadata, and therefore may not serve a repeated-variable pattern. Names are
-/// the `FastPathOperator` labels the engine stamps.
+/// metadata, and therefore may serve only a triple whose subject and object are
+/// distinct free variables. Names are the `FastPathOperator` labels the engine
+/// stamps.
 const GUARDED_SITES: &[&str] = &[
     "COUNT rows",
+    "COUNT rows numeric compare",
     "COUNT(DISTINCT)",
+    "COUNT blank nodes",
     "triples COUNT",
     "distinct subject COUNT",
     "AVG numeric",
@@ -160,6 +163,48 @@ fn cases() -> Vec<Case> {
             expected: "=generic",
             routing: NoGuardedSite,
         },
+        Case {
+            name: "SUM(?x) {?x score ?x}",
+            sparql: "SELECT (SUM(?x) AS ?n) WHERE { ?x <http://ex/score> ?x }",
+            expected: "=generic",
+            routing: NoGuardedSite,
+        },
+        // ---- CONSTANT SUBJECT. `detect_fused_scan_sum_i64` inspected only the
+        // predicate and object, so it also fired on a bound subject and summed
+        // the predicate across the whole ledger — "total spend for this
+        // customer" answering with everyone's. The AVG / MIN-MAX / COUNT
+        // siblings route through `validate_simple_triple` and were always
+        // correct here, which is why only the SUM rows were wrong.
+        Case {
+            name: "SUM(?v) {<n1> score ?v} (constant subject)",
+            sparql: "SELECT (SUM(?v) AS ?n) WHERE { <http://ex/n1> <http://ex/score> ?v }",
+            expected: "n=10",
+            routing: NoGuardedSite,
+        },
+        Case {
+            name: "SUM(?v) {<n2> score ?v} (constant subject)",
+            sparql: "SELECT (SUM(?v) AS ?n) WHERE { <http://ex/n2> <http://ex/score> ?v }",
+            expected: "n=20",
+            routing: NoGuardedSite,
+        },
+        Case {
+            name: "SUM(ABS(?v)) {<n1> score ?v} (constant subject, BIND arm)",
+            sparql: "SELECT (SUM(ABS(?v)) AS ?n) WHERE { <http://ex/n1> <http://ex/score> ?v }",
+            expected: "n=10",
+            routing: NoGuardedSite,
+        },
+        Case {
+            name: "AVG(?v) {<n1> score ?v} (constant subject)",
+            sparql: "SELECT (AVG(?v) AS ?n) WHERE { <http://ex/n1> <http://ex/score> ?v }",
+            expected: "n=10",
+            routing: NoGuardedSite,
+        },
+        Case {
+            name: "COUNT(*) {<n1> score ?v} (constant subject)",
+            sparql: "SELECT (COUNT(*) AS ?n) WHERE { <http://ex/n1> <http://ex/score> ?v }",
+            expected: "n=1",
+            routing: NoGuardedSite,
+        },
         // ---- shapes that were already correct via unrelated gates and must
         // stay correct (the fix must not perturb them).
         Case {
@@ -226,6 +271,18 @@ fn cases() -> Vec<Case> {
             sparql: "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o }",
             expected: "n=4",
             routing: MustFire("distinct subject COUNT"),
+        },
+        Case {
+            name: "CTRL SUM(?o) {?s score ?o}",
+            sparql: "SELECT (SUM(?o) AS ?n) WHERE { ?s <http://ex/score> ?o }",
+            expected: "n=30",
+            routing: MustFire("SUM(?o)"),
+        },
+        Case {
+            name: "CTRL SUM(ABS(?o)) {?s score ?o}",
+            sparql: "SELECT (SUM(ABS(?o)) AS ?n) WHERE { ?s <http://ex/score> ?o }",
+            expected: "n=30",
+            routing: MustFire("SUM(ABS)"),
         },
     ]
 }
@@ -371,8 +428,8 @@ async fn repeated_variable_patterns_decline_the_aggregate_fast_paths() {
                     .collect();
                 if !bad.is_empty() {
                     failures.push(format!(
-                        "{}: metadata fast path {bad:?} proceeded on a \
-                         repeated-variable pattern",
+                        "{}: metadata fast path {bad:?} proceeded on a pattern it \
+                         is not entitled to answer",
                         c.name
                     ));
                 }
