@@ -811,6 +811,70 @@ mod tests {
         }
     }
 
+    fn batch_rows(batch: &ColumnBatch) -> Vec<(u64, u64, u32)> {
+        (0..batch.row_count)
+            .map(|i| (batch.s_id.get(i), batch.o_key.get(i), batch.t.get(i)))
+            .collect()
+    }
+
+    /// Latest-state rows of a leaf as `(s_id, o_key, t)`, in stored order.
+    fn live_rows(leaf_bytes: &[u8]) -> Vec<(u64, u64, u32)> {
+        let header = decode_leaf_header_v3(leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(leaf_bytes, &header).unwrap();
+        dir.entries
+            .iter()
+            .filter(|e| e.row_count > 0)
+            .flat_map(|e| {
+                let batch = load_leaflet_columns(
+                    leaf_bytes,
+                    e,
+                    dir.payload_base,
+                    &ColumnProjection::all(),
+                    header.order,
+                )
+                .unwrap();
+                batch_rows(&batch)
+            })
+            .collect()
+    }
+
+    /// Rows visible at `to_t` after history replay, as `(s_id, o_key, t)`.
+    fn replayed_rows(leaf_bytes: &[u8], sidecar: Option<&[u8]>, to_t: i64) -> Vec<(u64, u64, u32)> {
+        use fluree_db_binary_index::read::replay::replay_leaflet_at_t;
+        let header = decode_leaf_header_v3(leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(leaf_bytes, &header).unwrap();
+        let mut out = Vec::new();
+        for e in &dir.entries {
+            let batch = if e.row_count == 0 {
+                ColumnBatch::empty()
+            } else {
+                load_leaflet_columns(
+                    leaf_bytes,
+                    e,
+                    dir.payload_base,
+                    &ColumnProjection::all(),
+                    header.order,
+                )
+                .unwrap()
+            };
+            match replay_leaflet_at_t(&batch, e, sidecar, to_t, header.order).unwrap() {
+                Some(replayed) => out.extend(batch_rows(&replayed)),
+                None => out.extend(batch_rows(&batch)),
+            }
+        }
+        out
+    }
+
+    /// Every history entry across every leaflet of a leaf.
+    fn all_history(leaf_bytes: &[u8], sidecar: Option<&[u8]>) -> Vec<HistEntryV2> {
+        let header = decode_leaf_header_v3(leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(leaf_bytes, &header).unwrap();
+        dir.entries
+            .iter()
+            .flat_map(|e| load_existing_history(e, sidecar).unwrap())
+            .collect()
+    }
+
     /// Build a V3 leaf from records using LeafWriter.
     fn build_test_leaf(records: &[RunRecordV2], order: RunSortOrder) -> (Vec<u8>, Option<Vec<u8>>) {
         let mut writer = LeafWriter::new(order, 100, 10000, 1);
@@ -1101,6 +1165,119 @@ mod tests {
             .expect("merging novelty into an emptied-by-retract leaflet must not fail");
         assert_eq!(gen2.leaves.len(), 1);
         assert_eq!(gen2.leaves[0].info.total_rows, 1);
+
+        // The re-inserted row must round-trip through the re-encoded leaflet.
+        let gen2_bytes = &gen2.leaves[0].info.leaf_bytes;
+        let gen2_sidecar = gen2.leaves[0].info.sidecar_bytes.clone();
+        assert_eq!(
+            live_rows(gen2_bytes),
+            vec![(150, ObjKey::encode_i64(15).as_u64(), 9)]
+        );
+
+        // Generation 1's retraction history must survive the generation 2 merge,
+        // or time travel through the emptied window silently loses facts.
+        // A retraction files both the superseded assert and the retract itself.
+        let h1 = all_history(empty_leaf_bytes, empty_sidecar.as_deref());
+        let mut h1_events: Vec<(u64, u32, u8)> =
+            h1.iter().map(|e| (e.s_id.as_u64(), e.t, e.op)).collect();
+        h1_events.sort_unstable();
+        assert_eq!(
+            h1_events,
+            vec![(100, 1, 1), (100, 5, 0), (200, 1, 1), (200, 5, 0)],
+            "gen1 must record both assert and retract for each row"
+        );
+        let h2 = all_history(gen2_bytes, gen2_sidecar.as_deref());
+        for e in &h1 {
+            assert!(
+                h2.iter()
+                    .any(|x| x.s_id == e.s_id && x.t == e.t && x.op == e.op),
+                "gen1 history entry {e:?} lost in gen2 sidecar"
+            );
+        }
+
+        // Time travel to t=1 must reconstruct the original pre-retraction state.
+        assert_eq!(
+            replayed_rows(gen2_bytes, gen2_sidecar.as_deref(), 1),
+            vec![
+                (100, ObjKey::encode_i64(10).as_u64(), 1),
+                (200, ObjKey::encode_i64(20).as_u64(), 1),
+            ]
+        );
+        // ...and at t=5 (post-retract, pre-reinsert) the leaflet is empty.
+        assert!(replayed_rows(gen2_bytes, gen2_sidecar.as_deref(), 5).is_empty());
+    }
+
+    /// Companion to the above with the emptied leaflet in the MIDDLE of a leaf:
+    /// key ranges collapse when a repopulated leaflet's span shrinks, so the
+    /// merged leaf must still be globally ordered.
+    #[test]
+    fn test_reinsert_into_emptied_middle_leaflet_preserves_order() {
+        // 6 rows at leaflet_target_rows=2 => 3 leaflets: [10,20] [30,40] [50,60].
+        let records = vec![
+            rec2(10, 1, 10, 1),
+            rec2(20, 1, 20, 1),
+            rec2(30, 1, 30, 1),
+            rec2(40, 1, 40, 1),
+            rec2(50, 1, 50, 1),
+            rec2(60, 1, 60, 1),
+        ];
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 2, 10000, 1);
+        writer.set_skip_history(true);
+        for rec in &records {
+            writer.push_record(*rec).unwrap();
+        }
+        let leaves = writer.finish().unwrap();
+        assert_eq!(leaves.len(), 1);
+        let (leaf_bytes, sidecar) = (
+            leaves[0].leaf_bytes.clone(),
+            leaves[0].sidecar_bytes.clone(),
+        );
+
+        // Empty the middle leaflet.
+        let retracts = vec![rec2(30, 1, 30, 5), rec2(40, 1, 40, 5)];
+        let ops = vec![0u8, 0];
+        let input = LeafUpdateInput {
+            leaf_bytes: &leaf_bytes,
+            novelty: &retracts,
+            novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
+            order: RunSortOrder::Spot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 2,
+            leaf_target_rows: 10000,
+            sidecar_bytes: sidecar.as_deref(),
+        };
+        let gen1 = update_leaf(&input).unwrap();
+        assert_eq!(gen1.leaves.len(), 1);
+        assert_eq!(gen1.leaves[0].info.total_rows, 4);
+
+        // Re-insert into the emptied middle range.
+        let novelty = vec![rec2(35, 1, 35, 9)];
+        let ops = vec![1u8];
+        let input = LeafUpdateInput {
+            leaf_bytes: &gen1.leaves[0].info.leaf_bytes,
+            novelty: &novelty,
+            novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
+            order: RunSortOrder::Spot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 2,
+            leaf_target_rows: 10000,
+            sidecar_bytes: gen1.leaves[0].info.sidecar_bytes.as_deref(),
+        };
+        let gen2 = update_leaf(&input)
+            .expect("merging novelty into an emptied middle leaflet must not fail");
+        assert_eq!(gen2.leaves.len(), 1);
+
+        let s_ids: Vec<u64> = live_rows(&gen2.leaves[0].info.leaf_bytes)
+            .into_iter()
+            .map(|(s, _, _)| s)
+            .collect();
+        assert_eq!(s_ids, vec![10, 20, 35, 50, 60]);
     }
 
     /// Regression: when a leaflet splits into multiple chunks, history entries
