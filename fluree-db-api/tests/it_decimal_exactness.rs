@@ -220,7 +220,10 @@ async fn sparql_decimal_constant_matches_stored_decimal() {
     let sparql_json = result
         .to_sparql_json(&ledger.snapshot)
         .expect("to_sparql_json");
-    assert_eq!(binding_values(&sparql_json, "s"), vec!["ex:a"]);
+    assert_eq!(
+        binding_values(&sparql_json, "s"),
+        vec!["http://example.org/a"]
+    );
 
     // FILTER equality with a decimal constant.
     let query = r"
@@ -233,7 +236,10 @@ async fn sparql_decimal_constant_matches_stored_decimal() {
     let sparql_json = result
         .to_sparql_json(&ledger.snapshot)
         .expect("to_sparql_json");
-    assert_eq!(binding_values(&sparql_json, "s"), vec!["ex:b"]);
+    assert_eq!(
+        binding_values(&sparql_json, "s"),
+        vec!["http://example.org/b"]
+    );
 }
 
 #[tokio::test]
@@ -264,7 +270,10 @@ async fn jsonld_number_decimal_matches_sparql_constant_across_paths() {
     let sparql_json = result
         .to_sparql_json(&ledger.snapshot)
         .expect("to_sparql_json");
-    assert_eq!(binding_values(&sparql_json, "s"), vec!["ex:item"]);
+    assert_eq!(
+        binding_values(&sparql_json, "s"),
+        vec!["http://example.org/item"]
+    );
 
     // SPARQL DELETE DATA retracts the JSON-LD-ingested fact.
     let result = run_sparql_update(
@@ -394,7 +403,10 @@ async fn integer_beyond_i64_round_trips_exactly() {
     let sparql_json = result
         .to_sparql_json(&ledger.snapshot)
         .expect("to_sparql_json");
-    assert_eq!(binding_values(&sparql_json, "s"), vec!["ex:item"]);
+    assert_eq!(
+        binding_values(&sparql_json, "s"),
+        vec!["http://example.org/item"]
+    );
 
     // Typed lexical form via SPARQL UPDATE round-trips and is queryable by
     // the typed constant (both previously degraded through i64 paths).
@@ -429,7 +441,7 @@ async fn integer_beyond_i64_round_trips_exactly() {
     subjects.sort();
     assert_eq!(
         subjects,
-        vec!["ex:item", "ex:typed"],
+        vec!["http://example.org/item", "http://example.org/typed"],
         "typed xsd:integer constant must match both bare- and typed-ingested values"
     );
 
@@ -455,7 +467,7 @@ async fn integer_beyond_i64_round_trips_exactly() {
     subjects.sort();
     assert_eq!(
         subjects,
-        vec!["ex:item", "ex:typed"],
+        vec!["http://example.org/item", "http://example.org/typed"],
         "typed VALUES constant must join against stored values"
     );
 }
@@ -738,7 +750,7 @@ async fn scale_variant_decimal_retracts_indexed_fact() {
                 .expect("to_sparql_json");
             assert_eq!(
                 binding_values(&sparql_json, "s"),
-                vec!["ex:item"],
+                vec!["http://example.org/item"],
                 "1.5 constant must match indexed 1.50"
             );
 

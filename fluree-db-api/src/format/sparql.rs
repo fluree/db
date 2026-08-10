@@ -18,7 +18,7 @@
 //! - Disaggregation: `Binding::Grouped` explodes into multiple rows (cartesian product)
 
 use super::config::FormatterConfig;
-use super::datatype::is_inferable_datatype;
+use super::datatype::omit_datatype_for_string_literal;
 use super::iri::IriCompactor;
 use super::json_write::{push_json_string, push_value};
 use super::{materialize, FormatError, Result};
@@ -328,10 +328,11 @@ fn write_cell(
 /// Write the `{"type":...,"value":...}` term object for a (non-omitted) binding.
 fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> Result<()> {
     match binding {
-        Binding::Sid { sid, .. } => write_node(out, &compactor.compact_id_sid(sid)?),
-        Binding::IriMatch { iri, .. } => write_node(out, &compactor.compact_id_iri(iri)),
+        Binding::Sid { sid, .. } => write_node(out, &compactor.render_id_sid(sid)?),
+        Binding::IriMatch { iri, .. } => write_node(out, &compactor.render_id_iri(iri)),
         // Raw graph-source IRI: CURIE-compacted for sparql_json of a graph-source
-        // result so virtual output matches native (F9); otherwise emitted verbatim.
+        // result so virtual output matches native (F9); otherwise emitted verbatim
+        // — which is also the absolute form the W3C profile requires.
         Binding::Iri(iri) => {
             if compactor.compacts_graph_source_iris() {
                 write_node(out, &compactor.compact_id_iri(iri));
@@ -341,7 +342,13 @@ fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> 
         }
         Binding::Lit { val, dtc, .. } => {
             let dt_iri = compactor.decode_sid(dtc.datatype())?;
-            write_literal(out, val, dtc.lang_tag(), &dt_iri)?;
+            write_literal(
+                out,
+                val,
+                dtc.lang_tag(),
+                &dt_iri,
+                compactor.emits_absolute_iris(),
+            )?;
         }
         Binding::Grouped(_) => {
             return Err(FormatError::InvalidBinding(
@@ -380,6 +387,7 @@ fn write_literal(
     val: &FlakeValue,
     lang: Option<&str>,
     dt_iri: &str,
+    w3c_strict: bool,
 ) -> Result<()> {
     match val {
         FlakeValue::String(s) => {
@@ -388,7 +396,7 @@ fn write_literal(
             if let Some(lang) = lang {
                 out.push_str(r#","xml:lang":"#);
                 push_json_string(out, lang);
-            } else if !is_inferable_datatype(dt_iri) {
+            } else if !omit_datatype_for_string_literal(dt_iri, w3c_strict) {
                 out.push_str(r#","datatype":"#);
                 push_json_string(out, dt_iri);
             }
@@ -457,10 +465,11 @@ fn format_binding(
 
         // Reference (IRI or blank node)
         Binding::Sid { sid, .. } => {
-            // SPARQL JSON output uses compact IRIs where possible (not full IRIs).
-            // A `uri` value names a node, so it's an `@id`-position identifier:
-            // compact via `@base` + explicit prefixes, never `@vocab` (issue #1280).
-            let iri = compactor.compact_id_sid(sid)?;
+            // A `uri` value names a node, so it's an `@id`-position identifier.
+            // Under the W3C profile it is the absolute IRI (issue #45); under the
+            // Fluree display profile it compacts via `@base` + explicit prefixes,
+            // never `@vocab` (issue #1280).
+            let iri = compactor.render_id_sid(sid)?;
             // Check if it's a blank node (starts with _:)
             if iri.starts_with("_:") {
                 Ok(Some(json!({
@@ -475,9 +484,9 @@ fn format_binding(
             }
         }
 
-        // IriMatch: use canonical IRI, then compact (multi-ledger mode)
+        // IriMatch: canonical IRI, rendered for the output profile (multi-ledger mode)
         Binding::IriMatch { iri, .. } => {
-            let compacted = compactor.compact_id_iri(iri);
+            let compacted = compactor.render_id_iri(iri);
             if compacted.starts_with("_:") {
                 Ok(Some(json!({
                     "type": "bnode",
@@ -530,14 +539,17 @@ fn format_binding(
                             "value": s,
                             "xml:lang": lang_tag
                         })))
-                    } else if is_inferable_datatype(&dt_iri) {
-                        // Inferable type - omit datatype
+                    } else if omit_datatype_for_string_literal(
+                        &dt_iri,
+                        compactor.emits_absolute_iris(),
+                    ) {
+                        // Omittable - a bare value denotes exactly this term
                         Ok(Some(json!({
                             "type": "literal",
                             "value": s
                         })))
                     } else {
-                        // Non-inferable type - include datatype
+                        // Everything else carries its datatype
                         Ok(Some(json!({
                             "type": "literal",
                             "value": s,

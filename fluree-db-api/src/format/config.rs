@@ -173,6 +173,28 @@ pub struct FormatterConfig {
 
     /// Additional context for AgentJson formatting
     pub agent_json_context: Option<AgentJsonContext>,
+
+    /// Serialize in the strict W3C result-format profile.
+    ///
+    /// Named for its headline effect: a node reference is written as the
+    /// **absolute** IRI, never a CURIE and never a `@base`-relative reference.
+    /// The W3C result serializations carry no prefix map and no `@base` slot, so
+    /// a compacted IRI in one of them is lossy — the consumer has no way to
+    /// recover the term (SPARQL Results JSON §3.2.2, and the CSV/TSV spec, all
+    /// define the value as the absolute IRI).
+    ///
+    /// The same switch tightens the `datatype` rule for string-backed literals:
+    /// only `xsd:string` may be omitted, because these formats encode every
+    /// value as text and nothing about the datatype is recoverable from the
+    /// serialized form. See `datatype::omit_datatype_for_string_literal`.
+    ///
+    /// True for [`Self::sparql_json`], [`Self::csv`] and [`Self::tsv`]; false for
+    /// the JSON-LD-flavored formats (JSON-LD, TypedJson, AgentJson, CypherJson,
+    /// NDJSON), whose consumers receive the `@context` or are a human reading a
+    /// terminal — that compaction is intentional and governed by #1466. Call
+    /// [`Self::with_compact_iris`] to opt a W3C format back into compaction; the
+    /// CLI display paths do exactly that.
+    pub absolute_iris: bool,
 }
 
 impl FormatterConfig {
@@ -185,6 +207,7 @@ impl FormatterConfig {
     pub fn sparql_json() -> Self {
         Self {
             format: OutputFormat::SparqlJson,
+            absolute_iris: true,
             ..Default::default()
         }
     }
@@ -217,6 +240,7 @@ impl FormatterConfig {
     pub fn tsv() -> Self {
         Self {
             format: OutputFormat::Tsv,
+            absolute_iris: true,
             ..Default::default()
         }
     }
@@ -225,6 +249,7 @@ impl FormatterConfig {
     pub fn csv() -> Self {
         Self {
             format: OutputFormat::Csv,
+            absolute_iris: true,
             ..Default::default()
         }
     }
@@ -270,6 +295,19 @@ impl FormatterConfig {
     /// Set AgentJson context (SPARQL text, FROM count, ISO timestamp)
     pub fn with_agent_json_context(mut self, context: AgentJsonContext) -> Self {
         self.agent_json_context = Some(context);
+        self
+    }
+
+    /// Opt a W3C result format back into `@context` / PREFIX IRI compaction.
+    ///
+    /// Clears [`absolute_iris`](Self::absolute_iris), so `uri` values are
+    /// CURIE-compacted and the looser `is_inferable_datatype` omission applies.
+    /// This is the Fluree-flavored display profile that #1466 established for the
+    /// CLI, and the CLI is its only caller: on a wire format, compaction is
+    /// lossy. Use it only where the consumer also gets the prefix mappings — or
+    /// is a human reading a terminal.
+    pub fn with_compact_iris(mut self) -> Self {
+        self.absolute_iris = false;
         self
     }
 }

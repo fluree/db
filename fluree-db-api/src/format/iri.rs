@@ -10,6 +10,7 @@
 use fluree_db_core::Sid;
 use fluree_graph_json_ld::{ContextCompactor, ParsedContext};
 use fluree_vocab::namespaces;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -67,6 +68,23 @@ pub struct IriCompactor {
     /// formatter (JSON-LD/XML/typed/delimited) leaves it false and keeps raw
     /// graph-source IRIs (that consistency follow-up is register entry F16).
     compact_graph_source_iris: bool,
+
+    /// When true the writer is rendering one of the W3C result serializations
+    /// (SPARQL Results JSON / CSV / TSV), so every node reference must come out
+    /// as the absolute IRI: those formats carry no prefix map and no `@base` slot,
+    /// so a CURIE or a relative reference in one of them cannot be expanded back
+    /// by the consumer (issue #45).
+    ///
+    /// Carried on the compactor rather than passed alongside it because the
+    /// term-rendering helpers (`sparql::write_term`, `delimited::write_binding_cell`)
+    /// receive the compactor and nothing else — including on the NDJSON streaming
+    /// path, which has no `FormatterConfig` in scope.
+    ///
+    /// Defaults **false** (compact), matching every JSON-LD-flavored formatter.
+    /// [`crate::FormatterConfig::absolute_iris`] is what sets it and documents
+    /// where the boundary sits; it also governs the strict `datatype` rule for
+    /// string-backed literals.
+    absolute_iris: bool,
 }
 
 impl IriCompactor {
@@ -90,6 +108,7 @@ impl IriCompactor {
             // Lazily built on first display-compaction call — see field docs.
             fallback_prefixes: OnceLock::new(),
             compact_graph_source_iris: false,
+            absolute_iris: false,
         }
     }
 
@@ -108,6 +127,7 @@ impl IriCompactor {
             // Empty default context → lazy build yields no fallbacks (unchanged behavior).
             fallback_prefixes: OnceLock::new(),
             compact_graph_source_iris: false,
+            absolute_iris: false,
         }
     }
 
@@ -123,6 +143,65 @@ impl IriCompactor {
     /// graph-source `Binding::Iri` node references (see the field docs).
     pub fn compacts_graph_source_iris(&self) -> bool {
         self.compact_graph_source_iris
+    }
+
+    /// Select the strict W3C result-format profile: absolute IRIs, and the
+    /// tightened `datatype` rule for string-backed literals. Builder-style; see
+    /// the `absolute_iris` field docs and [`crate::FormatterConfig::absolute_iris`].
+    pub fn with_absolute_iris(mut self, enabled: bool) -> Self {
+        self.absolute_iris = enabled;
+        self
+    }
+
+    /// True when this render must emit absolute IRIs (a W3C result format).
+    pub fn emits_absolute_iris(&self) -> bool {
+        self.absolute_iris
+    }
+
+    /// Render a Sid as a node identifier **for the current output profile**.
+    ///
+    /// The `render_*` family is what result writers should call: it applies the
+    /// profile, where the `compact_*` family is the raw compaction mechanism and
+    /// always compacts. Under [`emits_absolute_iris`](Self::emits_absolute_iris)
+    /// this is [`decode_sid`](Self::decode_sid); otherwise it is
+    /// [`compact_id_sid`](Self::compact_id_sid).
+    pub fn render_id_sid(&self, sid: &Sid) -> Result<String> {
+        if self.absolute_iris {
+            self.decode_sid(sid)
+        } else {
+            self.compact_id_sid(sid)
+        }
+    }
+
+    /// Render an already-decoded IRI as a node identifier for the current
+    /// output profile. See [`render_id_sid`](Self::render_id_sid).
+    pub fn render_id_iri<'a>(&self, iri: &'a str) -> Cow<'a, str> {
+        if self.absolute_iris {
+            Cow::Borrowed(iri)
+        } else {
+            Cow::Owned(self.compact_id_iri(iri))
+        }
+    }
+
+    /// Render an IRI in a predicate / `@type` position for the current output
+    /// profile — the vocab-rules counterpart of
+    /// [`render_id_iri`](Self::render_id_iri), used by the delimited writers.
+    pub fn render_vocab_iri<'a>(&self, iri: &'a str) -> Cow<'a, str> {
+        if self.absolute_iris {
+            Cow::Borrowed(iri)
+        } else {
+            Cow::Owned(self.compact_vocab_iri(iri))
+        }
+    }
+
+    /// Render a Sid in a predicate / `@type` position for the current output
+    /// profile. See [`render_vocab_iri`](Self::render_vocab_iri).
+    pub fn render_vocab_sid(&self, sid: &Sid) -> Result<String> {
+        if self.absolute_iris {
+            self.decode_sid(sid)
+        } else {
+            self.compact_sid(sid)
+        }
     }
 
     /// Lazily-built auto-derived fallback prefixes (see the `fallback_prefixes` field).
