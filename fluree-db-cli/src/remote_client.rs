@@ -1962,18 +1962,54 @@ impl RemoteLedgerClient {
         ledger: &str,
     ) -> Result<fluree_db_api::wire::ReindexResponse, RemoteLedgerError> {
         let url = self.op_url_root("reindex");
+        self.post_ledger_op(&url, ledger, "reindex").await
+    }
+
+    /// Report which index artifacts a sweep would reclaim, without deleting.
+    ///
+    /// Shares `REINDEX_TIMEOUT`: planning walks every branch's index chain and
+    /// expands each root, so it scales with index size the same way a rebuild
+    /// does.
+    pub async fn sweep_plan(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::SweepPlanResponse, RemoteLedgerError> {
+        let url = self.op_url_root("sweep/plan");
+        self.post_ledger_op(&url, ledger, "sweep plan").await
+    }
+
+    /// Reclaim index artifacts that no index chain references.
+    pub async fn sweep(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::SweepResponse, RemoteLedgerError> {
+        let url = self.op_url_root("sweep");
+        self.post_ledger_op(&url, ledger, "sweep").await
+    }
+
+    /// POST a `{"ledger": ...}` body to an admin operation and decode the
+    /// response.
+    ///
+    /// Shares `REINDEX_TIMEOUT`: each of these walks or rebuilds the index,
+    /// so they scale with index size rather than request size.
+    async fn post_ledger_op<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        ledger: &str,
+        operation: &str,
+    ) -> Result<T, RemoteLedgerError> {
         let body = serde_json::json!({ "ledger": ledger });
         let raw = self
             .send_json_with_timeout(
                 reqwest::Method::POST,
-                &url,
+                url,
                 "application/json",
                 Some(RequestBody::Json(&body)),
                 Self::REINDEX_TIMEOUT,
             )
             .await?;
         serde_json::from_value(raw)
-            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("reindex response: {e}")))
+            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("{operation} response: {e}")))
     }
 
     // =========================================================================

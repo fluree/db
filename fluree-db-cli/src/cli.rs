@@ -1133,6 +1133,25 @@ pub enum Commands {
         remote: Option<String>,
     },
 
+    /// Reclaim index artifacts that no index chain references
+    ///
+    /// Deletes orphaned index blobs left behind by earlier reindexes and
+    /// index builds. Covers every branch of the ledger, because dictionary
+    /// blobs are shared across branches. Index builds are held off for the
+    /// duration.
+    Sweep {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Report what would be reclaimed without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
     /// Manage the Fluree HTTP server
     Server {
         #[command(subcommand)]
