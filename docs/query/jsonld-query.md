@@ -268,6 +268,27 @@ Use variables (starting with `?`) to match unknown values:
 }
 ```
 
+A variable can also stand in predicate position to enumerate all properties of
+a subject:
+
+```json
+{
+  "@id": "?person",
+  "?p": "?o"
+}
+```
+
+Variable-predicate scans return every stored triple, including data written
+with the Fluree vocabulary (`https://ns.flur.ee/db#`, e.g. stored
+`f:AccessPolicy` definitions). The one exception is the seven `f:reifies*`
+predicates — the internal storage encoding of edge annotations. They are
+system-written (user transactions cannot assert them), redundant with the
+edge and annotation content already in the results, and therefore hidden from
+variable-predicate scans. Pass `"opts": {"includeSystemFacts": true}` to
+surface them for debugging or inspection. Commit metadata (`f:t`, `f:address`,
+…) lives in the ledger's txn-meta graph, not the default graph, so it never
+appears in default-graph scans either way.
+
 ### Type Patterns
 
 Match entities by type:
@@ -551,6 +572,14 @@ Apply conditions to filter results:
   ]
 }
 ```
+
+Filter expressions use S-expression (prefix) syntax. SPARQL-style function
+calls — `contains(lcase(?name), "x")` — are rejected with a parse error rather
+than accepted; so is a filter that is a bare string or number constant, since
+it would match every row. To compare against a string literal that itself looks
+like a function call, quote it: `"(= ?v \"contains(x)\")"`. `bind` and `unwind`
+share the same expression language, so a call-shaped literal there needs the
+same quoting: `["bind", "?co", "\"Acme(Inc)\""]`.
 
 ### Bind Patterns
 

@@ -1897,6 +1897,20 @@ mem:fact-01kv6sahj5se39hv5hkmjytznz a mem:Fact ;
     mem:createdAt "2026-06-15T23:19:32.677756+00:00"^^xsd:dateTime ;
     mem:rationale "Serial writes (summed S3 round-trips) blew the 15-min Lambda cap on a real 21 GB/74k-artifact DBLP restore; user chose the parallelize-writes fix. Sequential-stream-read ceiling is still unaddressed." .
 
+mem:fact-01kzemcff3b773aq7yckej9dhk a mem:Fact ;
+    mem:content "Local-filesystem Iceberg support (branch feature/iceberg-file-storage, commit 15ca56807, E2E-verified against a real pyiceberg table): Direct table_location accepts file:///, file:/, bare absolute paths. FileIcebergStorage; IcebergStorageBackend enum (S3|File) across api scan surface/session caches/lazy path; version-hint fallback lists metadata/ (new list_files trait method). GOTCHA the E2E test caught: Direct location validation exists in TWO places — fluree_db_iceberg::config AND fluree-db-api graph_source/config.rs validate() — both must accept a new scheme. Unconditional CI test it_iceberg_local_fs (committed pyiceberg fixture; FLUREE_LOCAL_ICEBERG_TABLE only overrides the table) + fixture writer scripts/local/write_local_iceberg_table.py cover query, incremental window, pinned read, typed SnapshotNotFound. Local locations are FAIL-CLOSED behind FLUREE_ICEBERG_LOCAL_ROOTS (local_guard.rs): unset refuses at config validation, and set confines every resolved path to those roots." ;
+    mem:tag "direct-mode" ;
+    mem:tag "file-storage" ;
+    mem:tag "graph-sources" ;
+    mem:tag "iceberg" ;
+    mem:tag "local-storage" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/graph_source/r2rml.rs" ;
+    mem:artifactRef "fluree-db-iceberg/src/catalog/direct.rs" ;
+    mem:artifactRef "fluree-db-iceberg/src/io/file_storage.rs" ;
+    mem:branch "feature/iceberg-file-storage" ;
+    mem:createdAt "2026-08-07T17:29:55.939416+00:00"^^xsd:dateTime .
+
 mem:fact-01kjg3zmevnz6mdn53wkqn08p0 a mem:Fact ;
     mem:content "Fluree uses CIDv1 for all content-addressed blobs. Implementation in fluree-db-core/src/content_id.rs wrapping `cid` crate.\n\nFormat: CIDv1 = version(1) + multicodec + multihash(SHA2-256, 32 bytes). Multicodec values in private-use range 0x300000+: Commit(0x300001), Txn(0x300002), IndexRoot(0x300003), IndexBranch/Leaf, DictBlob, Garbage, LedgerConfig, StatsSketch, GraphSourceSnapshot, SpatialIndex.\n\nKey APIs: ContentId::new(kind, bytes) hashes with SHA-256; verify(bytes) re-hashes and compares (NOT valid for commit-v2 which excludes trailing hash+sig); digest_hex() returns 64-char hex; Display uses base32-lower multibase." ;
     mem:tag "architecture" ;
@@ -2559,6 +2573,21 @@ mem:constraint-01kyke812e1np5c9ag45ac7580 a mem:Constraint ;
     mem:createdAt "2026-07-28T04:03:09.006298+00:00"^^xsd:dateTime ;
     mem:rationale "Using required_aggregate_vars (rather than checking the projection directly) folds in projection, HAVING, post-binds and ORDER BY in one check — a post-bind whose EXPRESSION reads a non-key var still reads a grouped list, which a bind-output whitelist would miss. Regression tests need a fan-in fixture; the pinned grouped-list test has none and cannot catch dedup." .
 
+mem:fact-01kz9zn33sjc3rh7r9s2zr825w a mem:Fact ;
+    mem:content "Wildcard (?p) scan visibility narrowed to f:reifies* only (branch fix/wildcard-fluree-ns-visibility): removed the legacy default-graph hide of the whole FLUREE_DB namespace in binary_scan::is_internal_predicate and its two fast_whole_graph_agg mirrors (overlay flake walk + graph_has_scan_hidden_predicates). That hide was a fossil from before named graphs, when commit metadata lived in the main graph; today all commit meta routes to txn-meta g_id=1 (stamp_graph_on_commit_flakes on novelty side, emit_txn_meta g_id=1 in indexer), db:flakes has no writers, so the only thing it hid was user-authored f: data (policies) — and only post-index, since the novelty path never applied it. opts.includeSystemFacts still reveals f:reifies*." ;
+    mem:tag "binary-scan" ;
+    mem:tag "fluree-namespace" ;
+    mem:tag "system-facts" ;
+    mem:tag "visibility" ;
+    mem:tag "wildcard" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_query_wildcard_system_facts.rs" ;
+    mem:artifactRef "fluree-db-novelty/src/commit_flakes.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_whole_graph_agg.rs" ;
+    mem:branch "fix/wildcard-fluree-ns-visibility" ;
+    mem:createdAt "2026-08-05T22:10:40.377307+00:00"^^xsd:dateTime .
+
 mem:constraint-01kjte29y3cp8mae56xy6yfv2n a mem:Constraint ;
     mem:content "SPARQL↔JSON-LD Parity: both compile to the same IR (fluree-db-query/src/ir.rs) and share the entire execution engine. When adding SPARQL features: (1) shared IR changes already affect JSON-LD — verify JSON-LD tests pass, (2) if expressible in JSON-LD, add parallel tests, (3) execution path missing in JSON-LD lower → track follow-up. SPARQL tests live in it_query_sparql.rs (owned by the grp_query_sparql.rs target); JSON-LD tests in it_query_jsonld{,_basic,_compound}.rs (owned by grp_query.rs). Validate with `cd testsuite-sparql && make test` plus the owning grp targets." ;
     mem:tag "compliance" ;
@@ -2835,6 +2864,22 @@ mem:fact-01kye0e6kqs8q712xrcvdednee a mem:Fact ;
     mem:artifactRef "fluree-db-query/src/hash_join.rs" ;
     mem:branch "main" ;
     mem:createdAt "2026-07-26T01:25:39.063758+00:00"^^xsd:dateTime .
+
+mem:fact-01kz9wqdzzaeg1je28w1anhz60 a mem:Fact ;
+    mem:content "JSON-LD FILTER was fail-open for SPARQL-style spellings: parse_s_expression's atom fallback turned any non-paren string (e.g. `contains(lcase(?name), \"x\")`) into a string Const, and eval treats non-bool constants as truthy — the filter silently matched every row. Fixed with three guards: sparql_style_callee() rejects `ident(...)` at top level (quoted strings still parse as constants — BIND escape hatch); a variable in operator position errors with prefix-syntax guidance; reject_constant_bool_expr rejects bare non-bool Const at FILTER and HAVING sites only — bool consts, Vars, composite constant exprs like `(= 1 1)`, and BIND/UNWIND constants stay allowed. Test: jsonld_sparql_style_filter_spelling_errors." ;
+    mem:tag "fail-open" ;
+    mem:tag "filter" ;
+    mem:tag "jsonld-query" ;
+    mem:tag "parse" ;
+    mem:tag "sexpr" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_query_expression_semantics.rs" ;
+    mem:artifactRef "fluree-db-query/src/parse/filter_common.rs" ;
+    mem:artifactRef "fluree-db-query/src/parse/filter_sexpr.rs" ;
+    mem:artifactRef "fluree-db-query/src/parse/options.rs" ;
+    mem:artifactRef "fluree-db-query/src/parse/where_clause.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-05T21:19:31.327762+00:00"^^xsd:dateTime .
 
 mem:fact-01kzdve41rj841p1kgdkqkd32b a mem:Fact ;
     mem:content "PR #1422 (iceberg materialize tracking worker) as of 2026-08-07: rebased 0-behind main, CI green except infra-flake testsuite-sparql. Fixed at head: B1 MoR guard, B5 create race, B3 engine seam. Fixed locally (uncommitted, branch pr-1422-review): NEW-1 budget comment rewritten to measured flake/JSON ratios (kept /4 — worst ratio 2.5× leaves headroom); NEW-2 worker spawn gated on indexing_enabled (test worker_requires_local_indexing; durability tests now run indexing-enabled). Still open: B2 unbounded MaterializeAccum memory (two-pass or spill design needed), B4 rr:graphMap query-path parity (#1581 has vocab half), M-2 offline scan coverage decision (A/B/C), watermark contract vs #1529 stamp. Auth split #1567." ;

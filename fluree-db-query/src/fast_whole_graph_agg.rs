@@ -628,12 +628,10 @@ fn overlay_all_subjects_count(
             if declined {
                 return;
             }
-            // Mirror the pipeline's `?n ?p ?o` visibility: `f:reifies*` anywhere
-            // and the `f:` namespace in the default graph are invisible to the
-            // scan but present in SPOT — their subjects must not be counted.
-            if fluree_db_core::is_reserved_reifies_predicate(&flake.p)
-                || (g_id == 0 && flake.p.namespace_code == fluree_vocab::namespaces::FLUREE_DB)
-            {
+            // Mirror the pipeline's `?n ?p ?o` visibility: `f:reifies*` is
+            // invisible to the scan but present in SPOT — its subjects must
+            // not be counted.
+            if fluree_db_core::is_reserved_reifies_predicate(&flake.p) {
                 declined = true;
                 return;
             }
@@ -1063,8 +1061,7 @@ fn compute_task(
 }
 
 /// Whether the queried graph carries rows under any predicate the
-/// variable-predicate scan hides — `f:reifies*` in every graph, the broader
-/// `f:` namespace in the default graph (mirrors
+/// variable-predicate scan hides — `f:reifies*`, in every graph (mirrors
 /// `BinaryScanOperator::is_internal_predicate`). Such facts are invisible to
 /// the `?n ?p ?o` pipeline but present in the SPOT directories this fold
 /// reads, so their presence makes the fold inexact.
@@ -1076,9 +1073,9 @@ fn compute_task(
 ///   can silently pass on a graph that does carry hidden facts.
 /// - Each hidden candidate is confirmed by its **row count in the queried
 ///   graph** (`count_rows_for_predicate_psot`, directory-only): the
-///   dictionary is global across graphs, so commit-metadata `f:` predicates
-///   from the txn-meta graph are always present in it — bare membership
-///   would permanently decline every ledger.
+///   dictionary is global across graphs, so a `f:reifies*` predicate minted
+///   by annotations in another graph is always present in it — bare
+///   membership would permanently decline every annotated ledger.
 pub(crate) fn graph_has_scan_hidden_predicates(
     ctx: &crate::context::ExecutionContext<'_>,
     store: &BinaryIndexStore,
@@ -1088,9 +1085,9 @@ pub(crate) fn graph_has_scan_hidden_predicates(
             // Unresolvable dictionary entry — err toward declining.
             return Ok(true);
         };
-        let hidden = fluree_db_core::is_reserved_reifies_predicate(&sid)
-            || (ctx.binary_g_id == 0 && sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB);
-        if hidden && count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)? > 0 {
+        if fluree_db_core::is_reserved_reifies_predicate(&sid)
+            && count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)? > 0
+        {
             return Ok(true);
         }
     }

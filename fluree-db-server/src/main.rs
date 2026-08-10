@@ -38,6 +38,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: {e}");
     }
 
+    // 3. Publish the Iceberg local-table allowlist into the environment the
+    //    guard reads. Done here so a value that arrived from the config file
+    //    (rather than `FLUREE_ICEBERG_LOCAL_ROOTS` directly) reaches the guard,
+    //    and before any graph source is built — the allowlist is captured on
+    //    first use.
+    if let Some(ref roots) = config.iceberg_local_roots {
+        // SAFETY: single-threaded startup, before any storage or scan is built.
+        std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", roots);
+    }
+
     // Initialize telemetry (logging + optional tracing)
     let telemetry_config = TelemetryConfig::with_server_config(&config);
     init_logging(&telemetry_config);

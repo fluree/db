@@ -1246,10 +1246,16 @@ fn write_object<W: Write>(
             &n.to_string(),
             &resolve_datatype_iri(store, o_type).unwrap_or_else(|| xsd::LONG.to_string()),
         ),
-        FlakeValue::Double(f) => {
-            // W3C canonical xsd:double form (1.0E6; NaN/INF/-INF preserved)
-            write_typed_literal(w, &canonical_xsd_double(*f), xsd::DOUBLE)
-        }
+        FlakeValue::Double(f) => write_typed_literal(
+            // W3C canonical xsd:double form (1.0E6; NaN/INF/-INF preserved). Resolve
+            // the DECLARED datatype like the Long/BigInt/Decimal arms below rather
+            // than hardcoding xsd:double: a value stored as Double but declared under
+            // another datatype (e.g. xsd:float) must render its declared type, not be
+            // silently re-typed (CRITICAL-3 #1529 review).
+            w,
+            &canonical_xsd_double(*f),
+            &resolve_datatype_iri(store, o_type).unwrap_or_else(|| xsd::DOUBLE.to_string()),
+        ),
         FlakeValue::BigInt(n) => write_typed_literal(
             w,
             &n.to_string(),
