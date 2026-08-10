@@ -245,6 +245,28 @@ Pick that maximum depth deliberately and state it wherever the query is document
 
 For genuinely unbounded traversal, materialize the graph source into a native ledger first — see [Materializing a Native Twin](iceberg.md#materializing-a-native-twin). A native ledger evaluates all of these patterns normally.
 
+### Patterns Must Be Inside the GRAPH Block
+
+Patterns reach a graph source only inside a `GRAPH <gs_id> { … }` block. Fluree adds that block automatically when you address a graph source directly — but **not** to a query that already contains a `GRAPH` block of its own, since that is taken as explicit scoping. In a query that mixes the two, any triple pattern left at the top level has nothing to route it, and it returns **HTTP 400 `err:db/InvalidQuery`**:
+
+```sparql
+-- Refused: `?order ex:total ?total` is outside every GRAPH block
+SELECT ?total ?item FROM <warehouse-orders:main> WHERE {
+  ?order ex:total ?total .
+  GRAPH <warehouse-items:main> { ?order ex:item ?item }
+}
+
+-- Correct: every pattern is scoped
+SELECT ?total ?item FROM <warehouse-orders:main> WHERE {
+  GRAPH <warehouse-orders:main> { ?order ex:total ?total }
+  GRAPH <warehouse-items:main> { ?order ex:item ?item }
+}
+```
+
+Either move the pattern inside a `GRAPH` block naming the source it belongs to, or drop the explicit `GRAPH` block so the whole query is scoped automatically.
+
+One gap remains here: a top-level pattern inside `OPTIONAL`, `MINUS`, `UNION`, or `EXISTS` is **not** refused, because refusing it would reject queries that do return rows today. Such a block is evaluated against an empty index, so it matches nothing — a top-level `OPTIONAL` never binds, and a top-level `MINUS` excludes nothing. Scope those blocks with `GRAPH` as well.
+
 ### Search Indexes (BM25, Vector)
 
 Search indexes use the `f:graphSource` pattern:
