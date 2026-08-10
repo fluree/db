@@ -823,3 +823,70 @@ async fn unknown_ledger_streams_error_terminal_or_4xx() {
         resp.status()
     );
 }
+
+/// The streaming endpoint shares `ledger_scoped_sparql_dataset_spec` with
+/// `/query`, so it inherits the SPARQL §13.2 dataset semantics — and must
+/// surface the same advisory header on the one shape whose answer changed
+/// (azure-chat#50). Pre-fix this streamed 4 rows for the `GRAPH ?g` query
+/// (the ledger alias was a second named-graph key) and 1 row for the
+/// non-GRAPH query (the injected default graph).
+#[tokio::test]
+async fn sparql_from_named_dataset_semantics_stream() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:dsem").await;
+
+    let trig = "@prefix ex: <http://ex.org/> .\n\
+                ex:d1 ex:name \"D\" .\n\
+                <http://ex.org/g1> {\n\
+                  ex:s1 ex:name \"A\" .\n\
+                  ex:s2 ex:name \"B\" .\n\
+                }\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/upsert/strm:dsem")
+                .header("content-type", "application/trig")
+                .body(Body::from(trig))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trig upsert");
+
+    // GRAPH ?g over the one declared graph: one row per triple, no warning.
+    let resp = stream_sparql(
+        &app,
+        "strm:dsem",
+        "PREFIX ex: <http://ex.org/>\n\
+         SELECT ?g ?n FROM NAMED <http://ex.org/g1> WHERE { GRAPH ?g { ?s ex:name ?n } }",
+        None,
+    )
+    .await;
+    assert!(resp.headers().get("x-fdb-warning").is_none());
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 2);
+
+    // FROM NAMED with no FROM: empty default graph, and say so on the wire.
+    let resp = stream_sparql(
+        &app,
+        "strm:dsem",
+        "PREFIX ex: <http://ex.org/>\n\
+         SELECT ?n FROM NAMED <http://ex.org/g1> WHERE { ?s ex:name ?n }",
+        None,
+    )
+    .await;
+    let warning = resp
+        .headers()
+        .get("x-fdb-warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("streaming path must warn too");
+    assert!(warning.contains("FROM NAMED"), "{warning}");
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 0);
+}
