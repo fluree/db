@@ -42,11 +42,27 @@ Fluree exposes two query styles over HTTP:
 
 If the request body tries to target a different ledger than the one in the URL, the server rejects it with a "Ledger mismatch" error.
 
-#### `FROM NAMED` with no `FROM` (changed in 4.1.4)
+#### Named graphs with no default graph (changed in 4.1.4)
 
-A SPARQL dataset clause defines the query's dataset exhaustively (SPARQL 1.1 §13.2): the default graph is the union of the `FROM` clauses, so `FROM NAMED` alone leaves it **empty** and patterns written outside `GRAPH { ... }` match nothing. The embedded Rust API has always behaved this way; before 4.1.4 the HTTP ledger endpoint instead substituted the ledger's default graph, so the same query returned different answers on the two surfaces. The HTTP endpoint now follows §13.2 as well.
+A dataset clause defines the query's dataset exhaustively (SPARQL 1.1 §13.2): the default graph is the union of the `FROM` clauses, so `FROM NAMED` alone leaves it **empty** and patterns written outside `GRAPH { ... }` match nothing. The embedded Rust API has always behaved this way; before 4.1.4 the HTTP endpoints instead substituted a ledger's default graph, so the same query returned different answers depending on which surface you used. The HTTP endpoints now follow §13.2 as well.
 
-To read the ledger's default graph alongside a named graph, name it explicitly:
+This applies equally to the JSON-LD form: `fromNamed` with no `from` leaves the default graph empty, and patterns outside `["graph", ...]` match nothing. The two spellings below are equivalent, and now return the same result on every endpoint:
+
+```sparql
+SELECT ?name
+FROM NAMED <http://example.org/ns/archive>
+WHERE { ?person ex:name ?name }          # matches nothing — empty default graph
+```
+
+```json
+{
+  "fromNamed": { "archive": { "@id": "mydb:main", "@graph": "http://example.org/ns/archive" } },
+  "select": ["?name"],
+  "where": { "@id": "?person", "ex:name": "?name" }
+}
+```
+
+To read a default graph alongside a named graph, name it explicitly with `FROM` / `from`:
 
 ```sparql
 SELECT ?name ?archived
@@ -58,7 +74,9 @@ WHERE {
 }
 ```
 
-A query with **no** dataset clause at all is unaffected — it reads the ledger's default graph as before. When a request does combine `FROM NAMED`-only with a pattern outside `GRAPH { ... }`, the response carries an `x-fdb-warning` header explaining why those patterns matched nothing; the status is still `200` and the body is the (correct, possibly empty) result.
+A query with **no** dataset clause at all is unaffected — it reads the endpoint's ledger default graph as before. When a request does combine named-graph-only with a pattern outside `GRAPH { ... }` / `["graph", ...]`, the response carries an `x-fdb-warning` header explaining why those patterns matched nothing; the status is still `200` and the body is the (correct, possibly empty) result. This holds on the ledger-scoped and connection-scoped `/query` routes and on both streaming routes.
+
+On the **connection-scoped** route this also removes a sharper edge: previously a `fromNamed`-only body had one of its entries chosen as the default graph, so a pattern outside `["graph", ...]` silently read one arbitrarily-selected graph's triples and returned them with a `200`.
 
 ### Txn metadata named graph (`#txn-meta`)
 
