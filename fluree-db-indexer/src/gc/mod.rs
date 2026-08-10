@@ -14,6 +14,19 @@
 //! 3. **On-demand cleanup**: Walk the prev-index chain, identify eligible garbage,
 //!    and release CAS artifacts via `ContentStore::release`
 //!
+//! ## Division of labour with the sweep
+//!
+//! The collector releases only **branch-local** artifacts — roots, leaves,
+//! branch manifests, sidecars. Dictionary blobs live in the ledger-wide
+//! `@shared/dicts/` namespace, so a branch's manifest can name one a sibling
+//! branch still references; the collector walks one branch's chain and holds
+//! no exclusion over the others, so it cannot prove such a blob unreferenced.
+//!
+//! Shared blobs are left for [`plan_sweep`], which unions the reachable set
+//! across every branch while holding them all excluded. A dictionary a
+//! collected root uniquely referenced becomes unreachable when that root is
+//! released, and the next sweep reclaims it.
+//!
 //! ## Garbage Record Format
 //!
 //! Garbage records are CAS-written JSON containing sorted/deduped CID strings
@@ -34,9 +47,13 @@
 
 pub(crate) mod collector;
 mod record;
+mod sweep;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use collector::clean_garbage;
 pub use record::GarbageRecord;
+pub use sweep::{execute_sweep, plan_sweep, BranchIndexHead, SweepPlan, SweepResult};
 
 use crate::error::Result;
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
@@ -74,8 +91,11 @@ pub struct CleanGarbageResult {
 
 /// Write a garbage record to storage.
 ///
-/// The caller must ensure `garbage_cid_strings` is non-empty; this function
-/// does not handle the empty case (callers guard with `if !cids.is_empty()`).
+/// An empty `garbage_cid_strings` is valid and records that the root replaced
+/// nothing. Callers write the record unconditionally: the collector stops its
+/// chain walk at the first root with no manifest, so an omitted record and an
+/// empty one are not equivalent.
+///
 /// The CID strings are sorted and deduplicated before writing.
 /// Includes a wall-clock `created_at_ms` timestamp for time-based GC retention.
 ///

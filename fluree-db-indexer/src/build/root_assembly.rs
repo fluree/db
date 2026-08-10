@@ -102,145 +102,76 @@ fn find_ns_mismatch(root_ns: &BTreeMap<u16, String>, commit_ns: &BTreeMap<u16, S
     "tables differ (no specific mismatch found)".to_string()
 }
 
-/// Context for linking the GC chain to a previous index root.
+/// Write `garbage_cids` as this root's garbage manifest and attach it.
 ///
-/// Used by both pipelines, but computed differently:
-/// - **Rebuild**: loads the old root from CAS, computes `all_cas_ids()` set
-///   difference to find garbage CIDs.
-/// - **Incremental**: `IncrementalRootBuilder` tracks replaced CIDs explicitly.
-// Kept for: shared root finalization for both rebuild and incremental pipelines.
-// Use when: rebuild.rs Phase F is refactored to use encode_and_write_root().
-pub(crate) struct GarbageContext {
-    /// CIDs that should be recorded as garbage (replaced by this new root).
-    pub garbage_cids: Vec<ContentId>,
-    /// Previous root linkage (for GC chain traversal).
-    pub prev_index: Option<BinaryPrevIndexRef>,
-}
-
-/// Encode an `IndexRoot`, attach garbage/prev_index, write to CAS,
-/// and return an `IndexResult`.
-///
-/// This is the shared "last mile" for both rebuild and incremental pipelines.
-// Kept for: shared root finalization for both rebuild and incremental pipelines.
-// Use when: rebuild.rs Phase F is refactored to use this shared helper.
-#[expect(dead_code)]
-pub(crate) async fn encode_and_write_root(
+/// Always writes, even when the set is empty: an empty manifest records that
+/// the root replaced nothing, which a root with no manifest cannot express.
+/// The collector stops its oldest-first walk at the first absent manifest, so
+/// a publisher that skipped the write would strand every newer version.
+pub(crate) async fn attach_garbage_manifest(
     content_store: &dyn ContentStore,
+    root: &mut IndexRoot,
     ledger_id: &str,
-    mut root: IndexRoot,
-    garbage_ctx: Option<GarbageContext>,
-    result_stats: IndexStats,
-) -> Result<IndexResult> {
-    // Attach garbage manifest and prev_index if provided.
-    if let Some(ctx) = garbage_ctx {
-        if let Some(prev) = ctx.prev_index {
-            root.prev_index = Some(prev);
-        }
-
-        if !ctx.garbage_cids.is_empty() {
-            let garbage_strings: Vec<String> = ctx
-                .garbage_cids
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            let cid =
-                gc::write_garbage_record(content_store, ledger_id, root.index_t, garbage_strings)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            root.garbage = Some(BinaryGarbageRef { id: cid });
-
-            tracing::info!(
-                garbage_count = ctx.garbage_cids.len(),
-                "GC chain: garbage record written"
-            );
-        }
-    }
-
-    tracing::info!(
-        index_t = root.index_t,
-        default_orders = root.default_graph_orders.len(),
-        named_graphs = root.named_graphs.len(),
-        "encoding and writing FIR6 root to CAS"
-    );
-
-    // Encode and write root.
-    let root_bytes = root.encode();
-    let root_id = content_store
-        .put(ContentKind::IndexRoot, &root_bytes)
+    garbage_cids: &[ContentId],
+) -> Result<()> {
+    let garbage_strings: Vec<String> = garbage_cids
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    let cid = gc::write_garbage_record(content_store, ledger_id, root.index_t, garbage_strings)
         .await
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+    root.garbage = Some(BinaryGarbageRef { id: cid });
 
     tracing::info!(
-        %root_id,
-        index_t = root.index_t,
-        root_bytes = root_bytes.len(),
-        "index root published"
+        garbage_count = garbage_cids.len(),
+        "GC chain: garbage record written"
     );
-
-    Ok(IndexResult {
-        root_id,
-        index_t: root.index_t,
-        ledger_id: ledger_id.to_string(),
-        stats: IndexStats {
-            total_bytes: root_bytes.len(),
-            ..result_stats
-        },
-        // Outer entry point fills fuel from the tracker tally.
-        fuel: None,
-    })
+    Ok(())
 }
 
-/// Load the previous index root and return its sealed annotation arena, if
-/// any. Best-effort: any load/decode failure degrades to `None` (the caller
-/// stays in scan-fallback rather than failing the rebuild).
-async fn load_prev_annotation_index(
-    content_store: &dyn fluree_db_core::storage::ContentStore,
+/// Load and decode the previous index root.
+///
+/// Best-effort: any load/decode failure degrades to `None`. The annotation
+/// arm then stays in scan-fallback, and the garbage manifest is omitted
+/// rather than written empty, instead of failing the rebuild.
+async fn load_prev_root(
+    content_store: &dyn ContentStore,
     prev_root_id: &ContentId,
-) -> Option<fluree_db_core::AnnotationIndexRoot> {
+) -> Option<IndexRoot> {
     let prev_bytes = content_store.get(prev_root_id).await.ok()?;
-    let prev_root = IndexRoot::decode(&prev_bytes).ok()?;
-    prev_root.annotation_index
+    IndexRoot::decode(&prev_bytes).ok()
 }
 
-/// Compute garbage CIDs by diffing the previous root's reachable CAS set
-/// against the new root's reachable CAS set.
+/// The CIDs `new_root` supersedes: everything the prior root reached that
+/// this one no longer does.
 ///
 /// "Reachable" includes leaves behind named-graph and annotation branch
 /// manifests via `collect_root_cas_ids_expanded`. Diffing only the direct
 /// CAS refs (`all_cas_ids()`) would silently leak those leaves on every
 /// reindex.
-// Kept for: shared GC chain computation for both rebuild and incremental pipelines.
-// Use when: rebuild.rs Phase F.7 is refactored to use this shared helper.
-#[expect(dead_code)]
-pub(crate) async fn compute_garbage_from_prev_root(
-    content_store: &dyn fluree_db_core::storage::ContentStore,
+///
+/// Returns `None` when either root cannot be read or expanded. Callers must
+/// keep that distinct from an empty set: "superseded nothing" and "could not
+/// determine" are different claims, and recording the first after a full
+/// rebuild would let GC release the prior root while leaving behind every
+/// blob it referenced. The collector defers an absent manifest to the sweep.
+async fn superseded_cids(
+    content_store: &dyn ContentStore,
     new_root: &IndexRoot,
-    prev_root_id: &ContentId,
-) -> Option<GarbageContext> {
-    let prev_bytes = content_store.get(prev_root_id).await.ok()?;
-    let prev_root = IndexRoot::decode(&prev_bytes).ok()?;
-
-    let prev_t = prev_root.index_t;
+    prev_root: &IndexRoot,
+) -> Option<Vec<ContentId>> {
     // Strict expansion: a partial new-root set would misclassify
     // still-reachable leaves as garbage; a partial prev-root set would
-    // leave replaced blobs unreleased. Either way silently — propagate
-    // the error so the caller can decide whether to skip publishing
-    // garbage rather than write a corrupt manifest.
-    let old_ids = fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, &prev_root)
+    // leave replaced blobs unreleased. Either way silently — so a failure
+    // here means publishing no manifest rather than a corrupt one.
+    let old_ids = fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, prev_root)
         .await
         .ok()?;
     let new_ids = fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, new_root)
         .await
         .ok()?;
-    let garbage_cids: Vec<ContentId> = old_ids.difference(&new_ids).cloned().collect();
-
-    Some(GarbageContext {
-        garbage_cids,
-        prev_index: Some(BinaryPrevIndexRef {
-            t: prev_t,
-            id: prev_root_id.clone(),
-        }),
-    })
+    Some(old_ids.difference(&new_ids).cloned().collect())
 }
 
 // ============================================================================
@@ -296,11 +227,16 @@ pub(crate) struct Fir6Inputs {
     ///   from this state because the indexer has no way to
     ///   recover the missing history.
     pub attachment_events: Option<crate::config::AttachmentEventCoverage>,
-    /// The previous index root's CID (`NsRecord.index_head_id`), when one
-    /// exists. Lets the `Augment` arena arm recover the base arena's event
-    /// history from the prior root — without it a full rebuild under
-    /// `Augment` coverage silently drops a previously-sealed arena.
-    pub prev_index_root_id: Option<ContentId>,
+    /// The index version this root supersedes — the prior head root's CID and
+    /// `index_t` (`NsRecord`'s `index_head_id` and `index_t`) — when one
+    /// exists.
+    ///
+    /// Serves two purposes. It becomes the published root's `prev_index` link,
+    /// which GC and drop walk to enumerate superseded artifacts. It also lets
+    /// the `Augment` arena arm recover the base arena's event history from the
+    /// prior root — without it a full rebuild under `Augment` coverage
+    /// silently drops a previously-sealed arena.
+    pub prev_index: Option<BinaryPrevIndexRef>,
 }
 
 /// Encode an `IndexRoot` (FIR6), write to CAS, and return an `IndexResult`.
@@ -309,11 +245,12 @@ pub(crate) struct Fir6Inputs {
 /// `IndexRoot`, encodes it, writes to CAS with `ContentKind::IndexRoot`,
 /// and derives the CID.
 ///
-/// `gc_ctx` is `None` for this milestone (V3 GC chain is deferred).
+/// The published root links [`Fir6Inputs::prev_index`] and carries a garbage
+/// manifest naming what that version superseded, so it participates in the GC
+/// chain like any incremental build.
 pub(crate) async fn encode_and_write_root_v6(
     content_store: &dyn ContentStore,
     inputs: Fir6Inputs,
-    gc_ctx: Option<GarbageContext>,
     result_stats: IndexStats,
 ) -> Result<IndexResult> {
     reconcile_ns_at_publish(
@@ -321,6 +258,13 @@ pub(crate) async fn encode_and_write_root_v6(
         &inputs.commit_derived_ns,
         inputs.index_t,
     )?;
+
+    // Loaded once and shared: the annotation arm reads its sealed arena and
+    // the garbage manifest diffs against its reachable set.
+    let prev_root = match inputs.prev_index.as_ref() {
+        Some(prev) => load_prev_root(content_store, &prev.id).await,
+        None => None,
+    };
 
     // Convert DictRefs for root assembly.
     let dr = inputs.uploaded_dicts.dict_refs;
@@ -467,10 +411,9 @@ pub(crate) async fn encode_and_write_root_v6(
             // full reindex under `Augment` coverage silently drops a
             // previously-sealed arena (and the sticky bit then blocks the
             // bootstrap scan from ever resealing).
-            let prev_arena = match inputs.prev_index_root_id.as_ref() {
-                Some(prev_id) => load_prev_annotation_index(content_store, prev_id).await,
-                None => None,
-            };
+            let prev_arena = prev_root
+                .as_ref()
+                .and_then(|prev| prev.annotation_index.clone());
             match prev_arena {
                 Some(prev) => {
                     let reader =
@@ -558,33 +501,33 @@ pub(crate) async fn encode_and_write_root_v6(
         root.had_annotation_arena = true;
     }
 
-    // Attach garbage manifest and prev_index if provided.
-    if let Some(ctx) = gc_ctx {
-        if let Some(prev) = ctx.prev_index {
-            root.prev_index = Some(prev);
-        }
+    // GC and drop both enumerate superseded artifacts by walking the
+    // prev-index chain, so a root published without this link orphans every
+    // earlier version and the blobs only those versions reference.
+    root.prev_index = inputs.prev_index.clone();
 
-        if !ctx.garbage_cids.is_empty() {
-            let garbage_strings: Vec<String> = ctx
-                .garbage_cids
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            let cid = gc::write_garbage_record(
-                content_store,
-                &inputs.ledger_id,
-                inputs.index_t,
-                garbage_strings,
-            )
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            root.garbage = Some(BinaryGarbageRef { id: cid });
+    // A rebuild replaces the whole prior index, so no upstream stage can name
+    // what it superseded; diff it here, where the assembled root is available.
+    //
+    // "No prior index" and "prior index unreadable" must stay distinct. The
+    // first genuinely supersedes nothing, so an empty manifest is accurate.
+    // The second is unknown, and recording it as empty would let GC release
+    // the prior root while leaving behind every blob it referenced.
+    let garbage_cids = match (inputs.prev_index.as_ref(), prev_root.as_ref()) {
+        (None, _) => Some(Vec::new()),
+        (Some(_), Some(prev)) => superseded_cids(content_store, &root, prev).await,
+        (Some(_), None) => None,
+    };
 
-            tracing::info!(
-                garbage_count = ctx.garbage_cids.len(),
-                "GC chain: garbage record written"
-            );
+    match garbage_cids {
+        Some(cids) => {
+            attach_garbage_manifest(content_store, &mut root, &inputs.ledger_id, &cids).await?;
         }
+        None => tracing::warn!(
+            index_t = root.index_t,
+            "could not determine which artifacts the prior root superseded; \
+             publishing without a garbage manifest"
+        ),
     }
 
     tracing::info!(
