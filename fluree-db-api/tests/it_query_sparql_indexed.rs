@@ -9322,3 +9322,182 @@ async fn indexed_exists_graph_var_decodes_encoded_bindings() {
         })
         .await;
 }
+
+// =============================================================================
+// VALUES-bound subject through an rdf:type anchor (issue #51)
+// =============================================================================
+
+/// `VALUES ?s { <iri> } . ?s a ex:Thing ; ex:name ?n` on an indexed ledger.
+///
+/// The planner used to defer a VALUES that preceded a star block, which left
+/// `?s` unbound when the star was planned: the bound-object `rdf:type` triple
+/// won the driver race, the whole `ex:Thing` extent was drained, and the VALUES
+/// discarded all but the matching subject. Seeding the VALUES instead makes the
+/// cost a function of the VALUES arity rather than the class size.
+///
+/// These assertions are on *results*, not latency — the plan-shape assertions
+/// live in `fluree-db-query`'s `test_connected_values_seeds_type_anchored_star`.
+/// The corpus gives `ex:name` a second class (`ex:Other`) so the anchor is not
+/// redundant and cannot be elided; `ex:Other` subjects in the VALUES set must
+/// still be excluded by it.
+#[tokio::test]
+async fn indexed_values_bound_subject_through_type_anchor() {
+    /// `ex:Thing` count. Large enough that a class-extent scan is visible in the
+    /// latency print, small enough to stay cheap in CI.
+    const THINGS: usize = 5_000;
+    /// `ex:Other` subjects, which carry `ex:name` but not `@type ex:Thing`.
+    const OTHERS: usize = 500;
+
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-values-type-anchor:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 50_000_000,
+            };
+            let mut graph: Vec<serde_json::Value> = (0..THINGS)
+                .map(|i| {
+                    json!({
+                        "@id": format!("ex:thing{i}"),
+                        "@type": "ex:Thing",
+                        "ex:name": format!("name{i}")
+                    })
+                })
+                .collect();
+            graph.extend((0..OTHERS).map(|i| {
+                json!({
+                    "@id": format!("ex:other{i}"),
+                    "@type": "ex:Other",
+                    "ex:name": format!("othername{i}")
+                })
+            }));
+            let insert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": graph
+            });
+
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            /// Sorted `?n` bindings, with the elapsed wall time for human eyes.
+            async fn names(
+                fluree: &fluree_db_api::Fluree,
+                view: &fluree_db_api::GraphDb,
+                label: &str,
+                sparql: &str,
+            ) -> Vec<String> {
+                let t0 = std::time::Instant::now();
+                let result = fluree
+                    .query(view, QueryInput::Sparql(sparql))
+                    .await
+                    .unwrap_or_else(|e| panic!("{label} query: {e}"));
+                let elapsed = t0.elapsed();
+                let json = result
+                    .to_sparql_json(&view.snapshot)
+                    .expect("sparql results json");
+                let mut names: Vec<String> = json["results"]["bindings"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{label}: bindings array in {json}"))
+                    .iter()
+                    .map(|b| b["n"]["value"].as_str().expect("?n binding").to_string())
+                    .collect();
+                names.sort();
+                println!("  [{label}] {elapsed:?}  rows={}", names.len());
+                names
+            }
+
+            let target = THINGS / 2;
+
+            // The shape under test: VALUES feeds the star's subject.
+            let seeded = names(
+                &fluree,
+                &view,
+                "values + type anchor",
+                &format!(
+                    "PREFIX ex: <http://example.org/ns/>
+                     SELECT ?s ?n
+                     WHERE {{ VALUES ?s {{ ex:thing{target} }} ?s a ex:Thing ; ex:name ?n }}"
+                ),
+            )
+            .await;
+
+            // Control: the same query with the IRI written inline.
+            let inlined = names(
+                &fluree,
+                &view,
+                "iri inlined         ",
+                &format!(
+                    "PREFIX ex: <http://example.org/ns/>
+                     SELECT ?n WHERE {{ ex:thing{target} a ex:Thing ; ex:name ?n }}"
+                ),
+            )
+            .await;
+
+            // Control: the same VALUES with the type anchor dropped.
+            let unanchored = names(
+                &fluree,
+                &view,
+                "values, no anchor   ",
+                &format!(
+                    "PREFIX ex: <http://example.org/ns/>
+                     SELECT ?s ?n WHERE {{ VALUES ?s {{ ex:thing{target} }} ?s ex:name ?n }}"
+                ),
+            )
+            .await;
+
+            let expected = vec![format!("name{target}")];
+            assert_eq!(seeded, expected, "VALUES + type anchor");
+            assert_eq!(inlined, expected, "IRI inlined control");
+            assert_eq!(unanchored, expected, "no-anchor control");
+
+            // Multi-row VALUES: the seeded plan must still apply the anchor, so
+            // the two ex:Other rows drop out even though they carry ex:name.
+            let mixed = names(
+                &fluree,
+                &view,
+                "values arity 5      ",
+                "PREFIX ex: <http://example.org/ns/>
+                 SELECT ?s ?n
+                 WHERE {
+                   VALUES ?s { ex:thing1 ex:other1 ex:thing2 ex:other2 ex:missing }
+                   ?s a ex:Thing ; ex:name ?n
+                 }",
+            )
+            .await;
+            assert_eq!(
+                mixed,
+                vec!["name1".to_string(), "name2".to_string()],
+                "the anchor must exclude ex:Other subjects and the absent IRI"
+            );
+        })
+        .await;
+}

@@ -1044,6 +1044,20 @@ fn apply_values(
     operator
 }
 
+/// Does any VALUES pattern bind a variable that the triples also mention?
+///
+/// Answers whether the VALUES can seed the triples. A connected VALUES constrains
+/// them; a disconnected one only multiplies rows.
+fn values_feed_triples(values: &[ValuesPattern], triples: &[TriplePattern]) -> bool {
+    let triple_vars: HashSet<VarId> = triples
+        .iter()
+        .flat_map(TriplePattern::referenced_vars)
+        .collect();
+    values
+        .iter()
+        .any(|vp| vp.vars.iter().any(|v| triple_vars.contains(v)))
+}
+
 /// Partition filters into those eligible for inline evaluation and those still waiting.
 ///
 /// Filters consumed by pushdown are silently dropped. Filters whose required
@@ -1931,10 +1945,19 @@ pub fn build_where_operators_seeded_with_needed(
                     // Preserve property-join eligibility when a top-level VALUES precedes
                     // a pure star block. Wrapping VALUES first seeds the schema/operator and
                     // prevents `build_triple_operators()` from taking the property-join path.
+                    //
+                    // Only defer a VALUES that is *disconnected* from the star (e.g. a pinned
+                    // vector-search query vector): seeding it would build a cartesian product
+                    // and cost a profitable fusion. A VALUES that shares a variable with the
+                    // star is a guaranteed producer with exact cardinality, and seeding it
+                    // lets `build_scan_or_join()` pick a bound-driven lane — batched-subject
+                    // -exists, MembershipJoin, or HashJoin — instead of draining the whole
+                    // class or predicate extent and filtering afterwards.
                     let values_after_triples = operator.is_none()
                         && !block.values.is_empty()
                         && block.triples.len() >= 2
-                        && is_property_join(&block.triples);
+                        && is_property_join(&block.triples)
+                        && !values_feed_triples(&block.values, &block.triples);
 
                     // The deferred VALUES wrapper joins on its vars AFTER the triple
                     // operators run, so those vars must survive schema pruning even
@@ -3260,6 +3283,94 @@ mod tests {
         assert!(
             schema.contains(&VarId(9)),
             "expected VALUES var (?queryVec) to appear in schema"
+        );
+    }
+
+    /// Operator names of a linear plan, root first.
+    fn plan_ops(node: &crate::plan_node::PlanNode) -> Vec<&str> {
+        let mut ops = vec![node.op.as_str()];
+        for edge in &node.children {
+            ops.extend(plan_ops(&edge.node));
+        }
+        ops
+    }
+
+    /// Regression (#51): a VALUES sharing a variable with the star must seed it.
+    ///
+    /// Deferring it left `?s` unbound when the star was planned, so the driver
+    /// race picked the bound-object `rdf:type` triple and drained the entire
+    /// class extent, only for the deferred VALUES to discard all but one row —
+    /// O(|:Thing|) work for an O(1) lookup. Seeding puts the bound subject at
+    /// the base of the plan, where the join lanes can probe for it directly.
+    #[test]
+    fn test_connected_values_seeds_type_anchored_star() {
+        use crate::binding::Binding;
+
+        // VALUES ?s { <ex:thing1> } . ?s a <ex:Thing> ; <ex:name> ?n
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(0)],
+                rows: vec![vec![Binding::iri("ex:thing1")]],
+            },
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from("ex:Thing")),
+            )),
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        assert_eq!(
+            ops,
+            vec![
+                "NestedLoopJoinOperator",
+                "NestedLoopJoinOperator",
+                "ValuesOperator",
+                "EmptyOperator",
+            ],
+            "expected the VALUES to seed the star from the base of the plan"
+        );
+    }
+
+    /// Companion to `test_connected_values_seeds_type_anchored_star`: the
+    /// disjointness gate must not disturb a VALUES the star cannot consume.
+    ///
+    /// Same vector-search shape as
+    /// `test_values_does_not_block_property_join_schema_order`, asserted on the
+    /// operator tree rather than on schema order: seeding `?queryVec` here would
+    /// only cross-product the star, so the VALUES stays at the root.
+    #[test]
+    fn test_disconnected_values_stays_deferred_above_star() {
+        use crate::binding::Binding;
+
+        // VALUES ?queryVec { 0 } . ?article :date ?date ; :vec ?vec ; :title ?title
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(9)],
+                rows: vec![vec![Binding::lit(FlakeValue::Long(0), Sid::new(2, "long"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "date", VarId(1))),
+            Pattern::Triple(make_pattern(VarId(0), "vec", VarId(2))),
+            Pattern::Triple(make_pattern(VarId(0), "title", VarId(3))),
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        assert_eq!(
+            ops.first(),
+            Some(&"ValuesOperator"),
+            "disconnected VALUES must stay above the star, not seed it: {ops:?}"
+        );
+        assert_eq!(
+            ops.last(),
+            Some(&"DatasetOperator"),
+            "the star should still drive its own scan: {ops:?}"
         );
     }
 
