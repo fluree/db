@@ -122,6 +122,40 @@ impl DataSetDb {
             .any(|g| !g.is_root())
     }
 
+    /// The policy-enforcement state a request against this dataset executes
+    /// under, aggregated over every graph it can read.
+    ///
+    /// `enforced` if any graph carries a non-root policy; `denies_all_data`
+    /// only if *every* graph does and none of them grants a view, since one
+    /// readable graph is enough to return data. `None` when no graph is
+    /// enforced. See [`GraphDb::policy_enforcement`] for why this discloses
+    /// nothing about the data.
+    pub fn policy_enforcement(&self) -> Option<fluree_db_core::PolicyEnforcement> {
+        let mut acc: Option<fluree_db_core::PolicyEnforcement> = None;
+        for graph in self.default.iter().chain(self.named.values()) {
+            match graph.policy_enforcement() {
+                Some(state) => {
+                    let denies_all_data =
+                        acc.as_ref().is_none_or(|a| a.denies_all_data) && state.denies_all_data;
+                    acc = Some(fluree_db_core::PolicyEnforcement {
+                        enforced: true,
+                        denies_all_data,
+                    });
+                }
+                // An unenforced graph can return data, so it clears the
+                // whole-dataset deny bit without clearing `enforced`.
+                None => {
+                    if let Some(a) = acc.as_mut() {
+                        a.denies_all_data = false;
+                    } else {
+                        acc = Some(fluree_db_core::PolicyEnforcement::default());
+                    }
+                }
+            }
+        }
+        acc.filter(|a| a.enforced)
+    }
+
     /// Get a "primary" graph view for parsing/formatting.
     ///
     /// Primary selection behavior:

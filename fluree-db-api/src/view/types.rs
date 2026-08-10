@@ -750,6 +750,27 @@ impl GraphDb {
             None => true,
         }
     }
+
+    /// The policy-enforcement state a request against this view executes under,
+    /// or `None` when the view is unenforced (no policy attached, or root).
+    ///
+    /// Derived entirely from the request's policy inputs and the ledger's
+    /// policy configuration, both already resolved when the view was built.
+    /// It reads nothing from the data and nothing from the query, so reporting
+    /// it cannot disclose whether any particular flake exists.
+    pub fn policy_enforcement(&self) -> Option<fluree_db_core::PolicyEnforcement> {
+        let wrapper = self.policy.as_ref()?.wrapper();
+        if wrapper.is_root() {
+            return None;
+        }
+        Some(fluree_db_core::PolicyEnforcement {
+            enforced: true,
+            // Mirrors the deny path in `policy_builder`: an empty view set with
+            // no permissive default denies every non-schema flake up front, in
+            // `evaluate::allow_view_flake`, before any policy runs.
+            denies_all_data: wrapper.view().restrictions.is_empty() && !wrapper.default_allow(),
+        })
+    }
 }
 
 // ============================================================================

@@ -2400,6 +2400,9 @@ mod tests {
             time: Some("12.34ms".to_string()),
             fuel: Some(1.5),
             policy: Some(policy),
+            // Read-path-only: never set on a transaction tally and deliberately
+            // absent from the recorded wire mirror (see `RecordedTally`).
+            policy_enforcement: None,
             reasoning: Some(ReasoningTally {
                 capped: true,
                 capped_reason: Some("budget".to_string()),
@@ -2477,6 +2480,7 @@ mod tests {
             time: None,
             fuel: Some(1.0),
             policy: None,
+            policy_enforcement: None,
             reasoning: Some(ReasoningTally {
                 capped: false,
                 capped_reason: None,
@@ -2759,6 +2763,7 @@ mod tests {
                 );
                 m
             }),
+            policy_enforcement: None,
             reasoning: Some(original_reasoning),
         };
         let original_transact = TransactApplied {
@@ -2804,11 +2809,15 @@ mod tests {
             time: rt_time,
             fuel: rt_fuel,
             policy: rt_policy,
+            policy_enforcement: rt_policy_enforcement,
             reasoning: rt_reasoning,
         } = rt_tally.expect("tally Some on round-trip");
         assert_eq!(rt_time, original_tally.time);
         assert_eq!(rt_fuel, original_tally.fuel);
         assert_eq!(rt_policy, original_tally.policy);
+        // Not carried by the recorded mirror: a replicated transaction never
+        // has a read-path enforcement record to carry.
+        assert_eq!(rt_policy_enforcement, None);
 
         let ReasoningTally {
             capped: rt_capped,

@@ -1142,6 +1142,7 @@ mod tests {
                     time: Some("12.34ms".into()),
                     fuel: Some(0.0),
                     policy: Some(policy),
+                    policy_enforcement: None,
                     reasoning: None,
                 }),
                 receipt: None,
