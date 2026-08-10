@@ -4,6 +4,38 @@ use crate::format::FormatError;
 use thiserror::Error;
 
 // ============================================================================
+// Fan-out outcome tally
+// ============================================================================
+
+/// Per-target outcome counts for one fan-out materialize window.
+///
+/// The unit of materialize work is the TARGET, not the poll. A single job resolves to
+/// N target ledgers and each can independently commit, defer on novelty backpressure,
+/// or fail — so any counter measured in polls is measuring the wrong thing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TargetTally {
+    /// Targets that committed (or had nothing to do and are up to date).
+    pub ok: usize,
+    /// Targets deferred by novelty backpressure. Self-heals on the next poll.
+    pub deferred: usize,
+    /// Targets that errored.
+    pub failed: usize,
+}
+
+impl TargetTally {
+    /// Total targets attempted in the window.
+    pub fn total(&self) -> usize {
+        self.ok + self.deferred + self.failed
+    }
+
+    /// True when every target reached the same successful outcome — the only case in
+    /// which the shared watermark may advance.
+    pub fn is_complete(&self) -> bool {
+        self.deferred == 0 && self.failed == 0
+    }
+}
+
+// ============================================================================
 // Builder errors
 // ============================================================================
 
@@ -216,6 +248,40 @@ pub enum ApiError {
     #[error("Invalid configuration: {0}")]
     Config(String),
 
+    /// A materialize pass's subject accumulator outgrew its memory budget.
+    ///
+    /// A pre-OOM circuit breaker, not an allocator meter: the bytes are
+    /// ESTIMATED (string lengths + JSON value sizes + flat per-entry overhead)
+    /// as rows accumulate, and the pass aborts BEFORE any commit — no retract
+    /// has run, no target ledger is touched, the watermark is un-advanced, so
+    /// the failure leaves everything exactly as the last successful poll did.
+    /// The previous behavior was the kernel OOM-killing the whole server with
+    /// no log line (measured: 21.4 GiB resident on a 735k-row full re-read,
+    /// killed every 4-6 minutes, watermark never advancing).
+    ///
+    /// This failure is DETERMINISTIC: the same window fails identically on the
+    /// next poll. Levers, in order: an incremental window this large usually
+    /// means the poll interval is too long — shorten it so windows stay small;
+    /// a FULL read this large has no window to shrink — raise
+    /// `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; 0 disables the
+    /// gate) for a scheduled off-peak sync until streaming finalization lands.
+    #[error(
+        "materialize window for table '{table}' needs ~{estimated_bytes} B of accumulator \
+         memory ({distinct_subjects} distinct subjects) against a budget of {budget_bytes} B; \
+         nothing was committed. Shorten the poll interval (smaller windows) or raise \
+         FLUREE_MATERIALIZE_MEMORY_BUDGET_MB (0 disables)"
+    )]
+    MaterializeMemoryBudget {
+        /// Source table whose window overflowed the accumulator.
+        table: String,
+        /// Estimated resident bytes of the accumulator at abort.
+        estimated_bytes: usize,
+        /// The configured budget in bytes.
+        budget_bytes: usize,
+        /// Distinct (target, graph, subject) keys accumulated at abort.
+        distinct_subjects: usize,
+    },
+
     /// Unresolved `owl:imports` in the reasoning schema closure.
     ///
     /// Produced when a graph reachable from `f:schemaSource` declares
@@ -249,6 +315,59 @@ pub enum ApiError {
     /// Ledger already exists
     #[error("Ledger already exists: {0}")]
     LedgerExists(String),
+
+    /// Materialization deferred by novelty backpressure — NOT a failure.
+    ///
+    /// The target ledger's novelty is at its ceiling, and only the indexer can drain
+    /// it. Deliberately a distinct variant rather than an `Internal` string so callers
+    /// can treat it as "retry next poll" instead of logging a fault: the materialize
+    /// worker polls every 30-57 s, which is the correct backoff.
+    ///
+    /// Waiting in-process instead of deferring caused a production deadlock — the
+    /// worker holds what the indexer needs to publish, so the wait guaranteed the
+    /// condition could not clear. See `transact_chunks_with_backpressure`.
+    // NOT "(will retry)". Whether anything retries depends on the CALLER: the
+    // materialize worker re-polls every 30-57 s, but a one-shot HTTP
+    // /iceberg/materialize does not — so promising a retry misinformed an operator who
+    // invoked it by hand and reasonably read it as "in progress".
+    #[error(
+        "Materialization deferred: novelty at capacity, {remaining} items pending. Nothing was \
+         applied for the deferred target. The tracking worker retries automatically; a one-shot \
+         /iceberg/materialize call must be re-issued."
+    )]
+    NoveltyDeferred {
+        /// Items not applied in this window; they are re-derived on the next poll.
+        remaining: usize,
+    },
+
+    /// A fan-out window where the targets did not all reach the same outcome.
+    ///
+    /// One materialize job resolves to N target ledgers, each an independent commit
+    /// domain. Partial application is therefore the NORMAL case, not an exception, and
+    /// reporting it as a single scalar outcome loses the only number that matters:
+    /// how many targets actually progressed.
+    ///
+    /// This is still an `Err` because the shared watermark is held back whenever any
+    /// target is behind, so the window is NOT complete and a caller must re-poll. The
+    /// tally rides along so the caller can account for the targets that did commit.
+    ///
+    /// Concretely: a production poll with 21 of 22 targets committing surfaced as one
+    /// `NoveltyDeferred`, so the worker recorded zero commits and one deferral. Read off
+    /// the stats, a healthy window was indistinguishable from a total stall — and it was
+    /// diagnosed as one.
+    #[error(
+        "Materialization applied {} of {} targets ({} deferred, {} failed); the watermark is held \
+         back so the window is retried. Most serious outcome: {detail}",
+        tally.ok, tally.total(), tally.deferred, tally.failed
+    )]
+    MaterializePartial {
+        /// Per-target outcome counts for this window.
+        tally: TargetTally,
+        /// The most serious single outcome — a failure if any target failed, else a
+        /// deferral. Failure outranks deferral because a deferral self-heals on the
+        /// next poll and a failure usually needs attention.
+        detail: String,
+    },
 
     /// Internal errors (ledger_info, etc.)
     #[error("Internal error: {0}")]
@@ -361,6 +480,20 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Per-target tally when this error came from a fan-out materialize window.
+    ///
+    /// Exists so a caller can credit the targets that DID commit without matching on the
+    /// variant. The absence of any such accessor is what made the previous behaviour
+    /// invisible: a partial window arrived as `NoveltyDeferred { remaining }`, which has
+    /// nowhere to put "21 targets succeeded", so the information was not so much lost as
+    /// unrepresentable.
+    pub fn target_tally(&self) -> Option<TargetTally> {
+        match self {
+            ApiError::MaterializePartial { tally, .. } => Some(*tally),
+            _ => None,
+        }
+    }
+
     /// Check if this error represents a "not found" condition.
     ///
     /// Matches both `ApiError::NotFound` and `ApiError::Ledger(LedgerError::NotFound)`.
@@ -467,7 +600,11 @@ impl ApiError {
             ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
             ApiError::LedgerExists(_) => 409,
             ApiError::ReindexConflict { .. } => 409,
-            ApiError::IndexTimeout(_) => 504,  // Gateway Timeout
+            ApiError::IndexTimeout(_) => 504, // Gateway Timeout
+            // 503 + retryable: novelty is at capacity and only the indexer can clear
+            // it. Not the caller's fault (no 4xx) and not a fault at all (no 500) —
+            // the correct client behaviour is to try again shortly.
+            ApiError::NoveltyDeferred { .. } => 503,
             ApiError::IndexingDisabled => 400, // Bad Request
             ApiError::Indexer(e) => {
                 use fluree_db_indexer::IndexerError;
@@ -592,5 +729,84 @@ mod tests {
             ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
             400
         );
+    }
+
+    #[test]
+    fn tally_totals_and_completeness() {
+        let all_good = TargetTally {
+            ok: 22,
+            deferred: 0,
+            failed: 0,
+        };
+        assert_eq!(all_good.total(), 22);
+        assert!(all_good.is_complete());
+
+        // One target behind is enough to hold the shared watermark back.
+        for behind in [
+            TargetTally {
+                ok: 21,
+                deferred: 1,
+                failed: 0,
+            },
+            TargetTally {
+                ok: 21,
+                deferred: 0,
+                failed: 1,
+            },
+        ] {
+            assert_eq!(behind.total(), 22);
+            assert!(
+                !behind.is_complete(),
+                "a target that did not commit must block watermark advance: {behind:?}"
+            );
+        }
+    }
+
+    /// The regression this variant exists for. Reproduces the exact production window:
+    /// 21 of 22 targets committed, one did not.
+    ///
+    /// This test CANNOT be written against the previous behaviour — that path returned
+    /// `NoveltyDeferred { remaining }` / `Internal(String)`, neither of which has a field
+    /// capable of holding "21 targets succeeded". The count was unrepresentable, so the
+    /// worker scored the window as zero commits and the deployment was diagnosed as
+    /// stalled while 21 ledgers were in fact being written every poll.
+    #[test]
+    fn a_partial_window_reports_the_targets_that_succeeded() {
+        let tally = TargetTally {
+            ok: 21,
+            deferred: 1,
+            failed: 0,
+        };
+        let e = ApiError::MaterializePartial {
+            tally,
+            detail: "novelty at capacity, 3088 items pending".into(),
+        };
+
+        assert_eq!(
+            e.target_tally().map(|t| t.ok),
+            Some(21),
+            "the 21 committed targets must be recoverable from the error itself"
+        );
+
+        // The operator-facing message must lead with the ratio, because "deferred" alone
+        // is what read as a total stall.
+        let msg = e.to_string();
+        assert!(
+            msg.contains("21 of 22"),
+            "message must state the ratio, got: {msg}"
+        );
+        assert!(msg.contains("1 deferred"), "got: {msg}");
+        assert!(
+            msg.contains("watermark is held back"),
+            "message must say the window will be retried, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn target_tally_is_none_for_unrelated_errors() {
+        assert!(ApiError::NoveltyDeferred { remaining: 5 }
+            .target_tally()
+            .is_none());
+        assert!(ApiError::Internal("boom".into()).target_tally().is_none());
     }
 }

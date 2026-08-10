@@ -336,10 +336,18 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
                 drop_status = gs_status,
                 "graph source dropped"
             );
+            // Same convention as the ledger path above: report the count only
+            // when a hard drop actually removed artifacts.
+            let files_deleted = if gs_report.files_deleted > 0 {
+                Some(gs_report.files_deleted)
+            } else {
+                None
+            };
+
             return Ok(Json(DropResponse {
                 ledger_id: format!("{}:{}", gs_report.name, gs_report.branch),
                 status: gs_status.to_string(),
-                files_deleted: None,
+                files_deleted,
                 branches_dropped: Vec::new(),
                 warnings: gs_report.warnings,
             }));
@@ -432,6 +440,13 @@ pub struct ListEntry {
     #[serde(rename = "type")]
     pub entry_type: String,
     pub t: i64,
+    /// Source ledger aliases this graph source is derived from. Empty for
+    /// ledger entries, which are nobody's derivative.
+    ///
+    /// Carried here so a client can pair an index against its source's `t` —
+    /// the staleness check behind `fluree bm25 list` — from this one response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<String>,
 }
 
 /// List all ledgers and graph sources
@@ -463,6 +478,7 @@ pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec
             branch: r.branch.clone(),
             entry_type: "Ledger".to_string(),
             t: r.commit_t,
+            dependencies: Vec::new(),
         });
     }
 
@@ -475,6 +491,7 @@ pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec
             branch: gs.branch.clone(),
             entry_type: fluree_db_api::ledger_info::graph_source_type_label(&gs.source_type),
             t: gs.index_t,
+            dependencies: gs.dependencies.clone(),
         });
     }
 

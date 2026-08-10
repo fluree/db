@@ -44,6 +44,75 @@ pub struct IcebergGsConfig {
     /// R2RML mapping source (format-agnostic, used in Phase 3)
     #[serde(default)]
     pub mapping: Option<MappingSource>,
+    /// Optional tombstone/delete convention. When set, materialization
+    /// classifies each source row as live or a delete (tombstone) and retracts
+    /// tombstoned subjects from the target ledger. Absent => additive (no
+    /// retraction), which is the legacy behavior.
+    #[serde(default)]
+    pub delete: Option<DeleteConvention>,
+    /// Optional ordering column for latest-by-key materialization. When set, the
+    /// rows of each subject within a refresh window are ordered by this column
+    /// (numeric/timestamp columns compare by value; others lexicographically) and
+    /// the **latest** row defines the subject — a whole-subject replace that
+    /// clears fields dropped in the newer revision, matching a
+    /// `ROW_NUMBER() … ORDER BY <col> DESC` latest-by-key view. Absent => the
+    /// last row in scan order wins and live revisions are merged per predicate
+    /// (legacy behavior; fields cleared in a later revision are NOT removed).
+    #[serde(default)]
+    pub order_by: Option<String>,
+}
+
+/// Declares how a delete is encoded in the source table's append log so the
+/// materializer can recognize "tombstone" rows and retract those subjects.
+///
+/// Append-only CDC sinks model a delete as an ordinary appended row carrying a
+/// marker. A row is a tombstone when the value of `column` is one of
+/// `deleted_values`. A `null` entry in `deleted_values` matches a NULL `column`
+/// value — the Debezium null-payload convention (used when the table has no
+/// explicit op column). Examples:
+/// - `{ column: "_op", deleted_values: ["d", "delete"] }` — value-match op column.
+/// - `{ column: "type", deleted_values: [null] }` — null-payload delete.
+/// - `{ column: "_op", deleted_values: ["d", null] }` — either.
+///
+/// The subject IRI of a tombstone row is derived by the SAME R2RML subject
+/// materializer as a live row, so the retracted IRI matches what was asserted.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct DeleteConvention {
+    /// Source column inspected to classify a row as a tombstone.
+    pub column: String,
+    /// Column values that mark a row as a delete (tombstone). A `null` element
+    /// matches a NULL `column` value (null-payload delete). Must be non-empty.
+    #[serde(default)]
+    pub deleted_values: Vec<Option<String>>,
+}
+
+impl DeleteConvention {
+    /// Validate the convention is usable: a column is named and at least one
+    /// delete value (possibly `null`) is declared.
+    pub fn validate(&self) -> Result<()> {
+        if self.column.trim().is_empty() {
+            return Err(IcebergError::Config(
+                "delete.column is required".to_string(),
+            ));
+        }
+        if self.deleted_values.is_empty() {
+            return Err(IcebergError::Config(
+                "delete.deleted_values must list at least one value (use null for a \
+                 null-payload delete)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Classify one row by its marker-column value (already converted to its
+    /// string form, or `None` when the column is null for that row): `true` if
+    /// that value — including `None` for a null — is in `deleted_values`.
+    pub fn is_tombstone(&self, column_value: Option<&str>) -> bool {
+        self.deleted_values
+            .iter()
+            .any(|d| d.as_deref() == column_value)
+    }
 }
 
 impl IcebergGsConfig {
@@ -132,6 +201,10 @@ impl IcebergGsConfig {
                     ));
                 }
             }
+        }
+
+        if let Some(delete) = &self.delete {
+            delete.validate()?;
         }
 
         Ok(())
@@ -510,6 +583,8 @@ mod tests {
             table: TableConfig::Identifier("ns.table".to_string()),
             io: IoConfig::default(),
             mapping: None,
+            delete: None,
+            order_by: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -523,6 +598,8 @@ mod tests {
             table: TableConfig::Identifier("invalid".to_string()),
             io: IoConfig::default(),
             mapping: None,
+            delete: None,
+            order_by: None,
         };
         assert!(config.validate().is_err());
     }
@@ -539,6 +616,8 @@ mod tests {
                 ..Default::default()
             },
             mapping: None,
+            delete: None,
+            order_by: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -555,6 +634,8 @@ mod tests {
                 ..Default::default()
             },
             mapping: None,
+            delete: None,
+            order_by: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -571,6 +652,8 @@ mod tests {
                 ..Default::default()
             },
             mapping: None,
+            delete: None,
+            order_by: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -578,6 +661,82 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Vended credentials"));
+    }
+
+    // ── Delete convention ──
+
+    fn dv(values: &[Option<&str>]) -> Vec<Option<String>> {
+        values
+            .iter()
+            .map(|v| v.map(std::string::ToString::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn test_delete_convention_validate() {
+        // value-match
+        assert!(DeleteConvention {
+            column: "_op".to_string(),
+            deleted_values: dv(&[Some("d"), Some("delete")]),
+        }
+        .validate()
+        .is_ok());
+        // null-payload (null entry)
+        assert!(DeleteConvention {
+            column: "type".to_string(),
+            deleted_values: dv(&[None]),
+        }
+        .validate()
+        .is_ok());
+        // empty column rejected
+        assert!(DeleteConvention {
+            column: String::new(),
+            deleted_values: dv(&[Some("d")]),
+        }
+        .validate()
+        .is_err());
+        // no delete values rejected
+        assert!(DeleteConvention {
+            column: "_op".to_string(),
+            deleted_values: vec![],
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn test_delete_convention_is_tombstone() {
+        let value = DeleteConvention {
+            column: "_op".to_string(),
+            deleted_values: dv(&[Some("d")]),
+        };
+        assert!(value.is_tombstone(Some("d")));
+        assert!(!value.is_tombstone(Some("c")));
+        assert!(!value.is_tombstone(None)); // null is NOT a delete unless listed
+
+        let null = DeleteConvention {
+            column: "type".to_string(),
+            deleted_values: dv(&[None]),
+        };
+        assert!(null.is_tombstone(None)); // null payload => tombstone
+        assert!(!null.is_tombstone(Some("Profile")));
+
+        // both: a value OR null marks a delete
+        let both = DeleteConvention {
+            column: "_op".to_string(),
+            deleted_values: dv(&[Some("d"), None]),
+        };
+        assert!(both.is_tombstone(Some("d")));
+        assert!(both.is_tombstone(None));
+        assert!(!both.is_tombstone(Some("u")));
+    }
+
+    #[test]
+    fn test_delete_convention_serde_default_absent() {
+        // A config without `delete` deserializes with delete == None (backward compat).
+        let json = r#"{"catalog":{"type":"direct","table_location":"s3://b/w/ns/t"},"table":""}"#;
+        let cfg = IcebergGsConfig::from_json(json).unwrap();
+        assert!(cfg.delete.is_none());
     }
 
     // ── Roundtrip serialization ──
@@ -594,6 +753,8 @@ mod tests {
             table: TableConfig::Identifier("ns.table".to_string()),
             io: IoConfig::default(),
             mapping: None,
+            delete: None,
+            order_by: None,
         };
 
         let json = original.to_json().unwrap();
@@ -612,6 +773,8 @@ mod tests {
                 ..Default::default()
             },
             mapping: None,
+            delete: None,
+            order_by: None,
         };
 
         let json = original.to_json().unwrap();

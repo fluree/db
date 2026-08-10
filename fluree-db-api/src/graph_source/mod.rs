@@ -31,9 +31,6 @@
 //! .with_k1(1.2)   // Optional: term frequency saturation
 //! .with_b(0.75);  // Optional: document length normalization
 //!
-//! // Validate before creating
-//! config.validate()?;
-//!
 //! let result = fluree.create_full_text_index(config).await?;
 //! println!("Created index with {} documents at t={}", result.doc_count, result.index_t);
 //! ```
@@ -141,6 +138,9 @@ mod iceberg_validate;
 #[cfg(feature = "iceberg")]
 mod ephemeral;
 
+#[cfg(feature = "iceberg")]
+mod r2rml_materialize;
+
 // Re-export configuration types
 pub use config::Bm25CreateConfig;
 
@@ -216,5 +216,8 @@ pub use provider::FlureeIndexProvider;
 
 #[cfg(feature = "iceberg")]
 pub use r2rml::FlureeR2rmlProvider;
+
+#[cfg(feature = "iceberg")]
+pub use r2rml_materialize::{MaterializeResult, PersistedMaterializeJob};
 
 // Helper functions are used internally by bm25.rs via direct module path

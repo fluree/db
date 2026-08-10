@@ -192,6 +192,17 @@ pub const POLICY_VIOLATION: &str = "err:policy/PolicyViolation";
 // System Errors (system)
 // =============================================================================
 
+/// Materialization deferred by novelty backpressure — retryable, not a fault.
+/// Distinct from INTERNAL so a client can branch on "try again shortly" rather than
+/// treating normal capacity pressure as a server defect.
+pub const NOVELTY_DEFERRED: &str = "err:db/NoveltyDeferred";
+
+/// A fan-out materialize window in which some target ledgers succeeded and at least one
+/// FAILED. Distinct from NOVELTY_DEFERRED (which is pure capacity, and retryable on its
+/// own) and from INTERNAL (which implies nothing was accomplished) — here some targets
+/// hold new data while the window as a whole will be retried.
+pub const MATERIALIZE_PARTIAL: &str = "err:db/MaterializePartial";
+
 /// Internal server error (catch-all)
 pub const INTERNAL: &str = "err:system/InternalError";
 

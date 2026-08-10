@@ -410,6 +410,12 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_INDEXING_ENABLED", default_value_t = server_defaults::DEFAULT_INDEXING_ENABLED)]
     pub indexing_enabled: bool,
 
+    /// Keep BM25 full-text indexes current automatically, syncing each one when
+    /// its source ledger commits. Off by default; without it an index only
+    /// advances when something calls `POST /v1/fluree/bm25/sync`.
+    #[arg(long, env = "FLUREE_BM25_AUTO_SYNC", default_value_t = server_defaults::DEFAULT_BM25_AUTO_SYNC)]
+    pub bm25_auto_sync: bool,
+
     /// Novelty size (bytes) that triggers background reindexing (soft threshold)
     #[arg(long, env = "FLUREE_REINDEX_MIN_BYTES", default_value_t = server_defaults::DEFAULT_REINDEX_MIN_BYTES)]
     pub reindex_min_bytes: usize,
@@ -809,6 +815,7 @@ impl Default for ServerConfig {
             connection_config: None,
             cors_enabled: server_defaults::DEFAULT_CORS_ENABLED,
             indexing_enabled: server_defaults::DEFAULT_INDEXING_ENABLED,
+            bm25_auto_sync: server_defaults::DEFAULT_BM25_AUTO_SYNC,
             reindex_min_bytes: server_defaults::DEFAULT_REINDEX_MIN_BYTES,
             reindex_max_bytes: None,
             cache_max_mb: None,

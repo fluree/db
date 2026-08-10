@@ -2,6 +2,7 @@
 
 mod admin;
 pub(crate) mod admin_auth;
+mod bm25;
 mod commits;
 mod context;
 mod events;
@@ -86,6 +87,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/rebase", post(ledger::rebase))
         .route("/merge", post(ledger::merge))
         .route("/revert", post(ledger::revert))
+        // BM25 full-text index creation and sync. Both publish through
+        // `GraphSourcePublisher`, which under Raft proposes
+        // `PublishGraphSource` / `PublishGraphSourceIndex` — so they have to
+        // originate on the leader. Listing, inspection, and drop reuse the
+        // graph-source fallbacks in `/ledgers`, `/info`, and `/drop`.
+        .route("/bm25/create", post(bm25::bm25_create))
+        .route("/bm25/sync", post(bm25::bm25_sync))
         // Wholesale .flpack restore: creates a new ledger from a trusted
         // archive. Writes prebuilt index artifacts, so admin-gated.
         .route("/import/*ledger", post(import::import_ledger_tail))
@@ -99,8 +107,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         );
 
     #[cfg(feature = "iceberg")]
-    let v1_admin_protected_writes =
-        v1_admin_protected_writes.route("/iceberg/map", post(iceberg::iceberg_map));
+    let v1_admin_protected_writes = v1_admin_protected_writes
+        .route("/iceberg/map", post(iceberg::iceberg_map))
+        .route("/iceberg/materialize", post(iceberg::iceberg_materialize))
+        .route("/iceberg/track", post(iceberg::iceberg_track))
+        .route("/iceberg/untrack", post(iceberg::iceberg_untrack));
 
     // Admin auth runs BEFORE leader-forward. Axum runs the
     // last-applied layer outermost, so `require_admin_token`
@@ -162,6 +173,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/iceberg/r2rml/validate",
             post(iceberg::iceberg_r2rml_validate),
         );
+    // Materialization tracking-worker status — reads this node's worker state.
+    #[cfg(feature = "iceberg")]
+    let v1_admin_protected_reads =
+        v1_admin_protected_reads.route("/iceberg/tracking", get(iceberg::iceberg_tracking_status));
 
     let v1_admin_protected_reads = v1_admin_protected_reads
         .layer(middleware::from_fn_with_state(
