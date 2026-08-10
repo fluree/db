@@ -770,3 +770,96 @@ async fn sparql_construct_duplicate_rows_mint_distinct_blanks() {
          template blanks — per-row, not per-distinct-binding: {out:#}"
     );
 }
+
+// =============================================================================
+// RDF set semantics for CONSTRUCT / DESCRIBE results
+// =============================================================================
+//
+// A CONSTRUCT result is an RDF graph, so triple identity is the full
+// `(s, p, o)` tuple and the result is a SET union of the instantiated
+// templates (SPARQL 1.1 §16.2). Both graph serializations are pinned here so
+// they cannot drift apart on that rule.
+
+/// Seed the two-predicate fixture. `same_value` selects the shape where one
+/// literal is shared by both predicates, or the distinct-value control.
+async fn seed_shared_object(
+    ledger_id: &str,
+    same_value: bool,
+) -> (fluree_db_api::Fluree, LedgerState) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let (v1, v2) = if same_value {
+        ("same", "same")
+    } else {
+        ("alpha", "beta")
+    };
+    let tx = json!({
+        "@graph": [{
+            "@id": "http://ex/s",
+            "http://ex/p1": v1,
+            "http://ex/p2": v2
+        }]
+    });
+    let committed = fluree.insert(ledger0, &tx).await.expect("insert fixture");
+    (fluree, committed.ledger)
+}
+
+/// Count object values across every `@graph` node, excluding `@id`/`@context`.
+fn count_graph_values(v: &JsonValue) -> usize {
+    let count_node = |o: &Map<String, JsonValue>| -> usize {
+        o.iter()
+            .filter(|(k, _)| k.as_str() != "@id" && k.as_str() != "@context")
+            .map(|(_, val)| match val {
+                JsonValue::Array(a) => a.len(),
+                _ => 1,
+            })
+            .sum()
+    };
+    match v.get("@graph").and_then(JsonValue::as_array) {
+        Some(graph) => graph
+            .iter()
+            .filter_map(JsonValue::as_object)
+            .map(count_node)
+            .sum(),
+        None => v.as_object().map_or(0, count_node),
+    }
+}
+
+const CONSTRUCT_ALL: &str = "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }";
+
+/// A constant template instantiated once per solution row yields the SAME
+/// triple N times; the result graph holds it once. Asserted in BOTH graph
+/// serializations — the JSON-LD formatter's value dedupe used to be the only
+/// thing collapsing it, which left RDF/XML emitting the duplicate.
+#[tokio::test]
+async fn sparql_construct_repeated_triple_collapses_in_both_serializations() {
+    // Two solution rows x one constant template triple.
+    let (fluree, ledger) = seed_shared_object("it/construct:repeat", false).await;
+    let db = support::graphdb_from_ledger(&ledger);
+    let sparql = "CONSTRUCT { <http://ex/s> <http://ex/pc> \"dup\" } WHERE { ?s ?p ?o }";
+
+    let jsonld = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(
+        count_graph_values(&jsonld),
+        1,
+        "JSON-LD collapses the repeated triple: {jsonld:#}"
+    );
+
+    let rdfxml = db
+        .query(&fluree)
+        .sparql(sparql)
+        .format(fluree_db_api::FormatterConfig::rdf_xml())
+        .execute_formatted_string()
+        .await
+        .expect("RDF/XML must execute");
+    assert_eq!(
+        rdfxml.matches("<ns0:pc>").count(),
+        1,
+        "RDF/XML applies the same set semantics: {rdfxml}"
+    );
+}
