@@ -588,6 +588,150 @@ mod tests {
         );
     }
 
+    /// Storage that reports an address as present but fails to read it — the
+    /// shape of a transient backend failure, which `MemoryStorage` alone
+    /// cannot produce because `exists` and `read_bytes` consult one map.
+    #[derive(Debug, Clone)]
+    struct FailsToReadOne {
+        inner: MemoryStorage,
+        address: String,
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::StorageRead for FailsToReadOne {
+        async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
+            if address == self.address {
+                return Err(fluree_db_core::error::Error::storage("transient failure"));
+            }
+            self.inner.read_bytes(address).await
+        }
+
+        async fn exists(&self, address: &str) -> fluree_db_core::Result<bool> {
+            self.inner.exists(address).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> fluree_db_core::Result<Vec<String>> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::StorageWrite for FailsToReadOne {
+        async fn write_bytes(&self, address: &str, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.write_bytes(address, bytes).await
+        }
+
+        async fn delete(&self, address: &str) -> fluree_db_core::Result<()> {
+            self.inner.delete(address).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::ContentAddressedWrite for FailsToReadOne {
+        async fn content_write_bytes_with_hash(
+            &self,
+            kind: ContentKind,
+            ledger_id: &str,
+            content_hash_hex: &str,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<fluree_db_core::ContentWriteResult> {
+            self.inner
+                .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+                .await
+        }
+    }
+
+    impl fluree_db_core::StorageMethod for FailsToReadOne {
+        fn storage_method(&self) -> &str {
+            self.inner.storage_method()
+        }
+    }
+
+    /// A root that still exists but cannot be read is not a chain ending. If
+    /// the walk stopped there, the live set would be short by every root
+    /// beyond it, and the difference would be reported as orphans and deleted.
+    #[tokio::test]
+    async fn a_root_that_exists_but_fails_to_read_aborts_the_plan() {
+        let inner = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let roots = write_chain(&inner, MAIN, 3, &dict).await;
+
+        let storage = FailsToReadOne {
+            address: candidate_addresses("memory", MAIN, &roots[1])[0].clone(),
+            inner,
+        };
+
+        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())])).await;
+
+        assert!(
+            result.is_err(),
+            "a readable-but-failing root must abort, not truncate the live set"
+        );
+    }
+
+    /// A prior GC truncates the chain from the oldest end, leaving the
+    /// retained boundary's `prev_index` pointing at a root that no longer
+    /// exists. That is the normal steady state of any collected ledger, so the
+    /// walk must end there rather than fail — otherwise a sweep could never
+    /// run on the ledgers it exists for.
+    #[tokio::test]
+    async fn a_chain_truncated_by_prior_gc_still_plans() {
+        let storage = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let (_, dict_addr) = cid_and_addr_for(
+            MAIN,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"live-dict",
+        );
+        storage.write_bytes(&dict_addr, b"dict").await.unwrap();
+        let roots = write_chain(&storage, MAIN, 3, &dict).await;
+
+        // Simulate a prior GC having released the oldest root.
+        let oldest = candidate_addresses("memory", MAIN, &roots[0]);
+        storage.delete(&oldest[0]).await.unwrap();
+
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]))
+            .await
+            .expect("a collected chain still plans");
+
+        assert!(
+            !plan
+                .orphans
+                .contains(&candidate_addresses("memory", MAIN, &roots[1])[0]),
+            "roots still reachable above the truncation stay live"
+        );
+        assert!(
+            !plan.orphans.contains(&dict_addr),
+            "the dictionary the chain references stays live"
+        );
+    }
+
+    /// A root that exists but cannot be decoded is not a chain ending. Ending
+    /// there would shorten the live set, and every artifact beyond it would be
+    /// reported as an orphan and deleted.
+    #[tokio::test]
+    async fn an_unreadable_mid_chain_root_aborts_the_plan() {
+        let storage = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let roots = write_chain(&storage, MAIN, 3, &dict).await;
+
+        // Corrupt the middle root in place: still present, no longer decodable.
+        let middle = candidate_addresses("memory", MAIN, &roots[1]);
+        storage
+            .write_bytes(&middle[0], b"not a FIR6 root")
+            .await
+            .unwrap();
+
+        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())])).await;
+
+        assert!(
+            result.is_err(),
+            "planning must fail rather than treat the roots beyond it as orphaned"
+        );
+    }
+
     /// An incomplete live set would classify live artifacts as orphans, so a
     /// root that cannot be read aborts planning rather than degrading.
     #[tokio::test]

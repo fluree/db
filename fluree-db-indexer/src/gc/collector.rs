@@ -373,9 +373,15 @@ pub async fn clean_garbage(
 ///
 /// Returns entries in order from newest to oldest.
 ///
-/// **Tolerant behavior**: If a prev_index link cannot be loaded (e.g., it was
-/// released by prior GC), the walk stops gracefully at that point rather than
-/// returning an error. This ensures GC is idempotent.
+/// **Tolerant behavior**: if a prev_index link points at a root that no longer
+/// exists — the normal result of a prior GC truncating the chain — the walk
+/// stops gracefully there rather than returning an error, which is what makes
+/// GC idempotent.
+///
+/// A root that *does* exist but cannot be read propagates the error instead.
+/// Returning a short chain would be indistinguishable from a genuinely short
+/// one, and callers that decide which artifacts are unreferenced would treat
+/// everything past the unreadable root as garbage.
 pub(crate) async fn walk_prev_index_chain_cs(
     store: &dyn ContentStore,
     current_root_id: &ContentId,
@@ -416,9 +422,21 @@ pub(crate) async fn walk_prev_index_chain_cs_cached(
                 if chain.is_empty() {
                     return Err(e);
                 }
+                // A *released* root is the normal end of a walk: GC truncates
+                // the chain from the oldest end, leaving the retained
+                // boundary's prev_index dangling. Any other read failure is
+                // not an ending — it is a root whose contents could not be
+                // seen, and a caller deciding what is unreferenced would treat
+                // everything beyond it as garbage. Distinguish by existence,
+                // since the disk-cache path stringifies the error and loses
+                // its kind. If existence cannot be established either, treat
+                // the root as present and propagate.
+                if store.has(&current_id).await.unwrap_or(true) {
+                    return Err(e);
+                }
                 tracing::debug!(
                     root_id = %current_id,
-                    "prev_index not found, chain ends here (prior GC)"
+                    "prev_index released by prior GC, chain ends here"
                 );
                 break;
             }
