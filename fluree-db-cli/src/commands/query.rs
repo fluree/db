@@ -69,7 +69,11 @@ impl TrackingFlags {
 
     /// Build the HTTP request headers that map 1:1 to the flag set.
     /// Empty when no tracking was requested.
-    fn as_request_headers(&self) -> Vec<(&'static str, String)> {
+    ///
+    /// Public so the seam against the server's `fluree-*` header parser can be
+    /// tested from one place — this producer and that consumer drifted apart
+    /// once already (`fluree-track-policy` went unparsed).
+    pub fn as_request_headers(&self) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();
         if !self.any() {
             return out;
@@ -99,10 +103,15 @@ impl TrackingFlags {
 /// Append fuel/time/policy fields from a tracked response to the existing
 /// row/time footer. `metrics` is `(track_fuel, track_time, track_policy)` —
 /// only requested fields are shown, even if the server returned more.
+///
+/// `enforcement` covers the case per-policy counts cannot: a request that ran
+/// under a policy context where nothing executed. Without it, `--track-policy`
+/// prints nothing at all for the fail-closed case.
 fn format_tally_suffix(
     fuel: Option<f64>,
     time: Option<&str>,
     policy: Option<&std::collections::HashMap<String, fluree_db_api::PolicyStats>>,
+    enforcement: Option<&fluree_db_api::PolicyEnforcement>,
     metrics: (bool, bool, bool),
 ) -> String {
     let (want_fuel, want_time, want_policy) = metrics;
@@ -118,11 +127,22 @@ fn format_tally_suffix(
         }
     }
     if want_policy {
-        if let Some(p) = policy {
-            if !p.is_empty() {
+        match policy.filter(|p| !p.is_empty()) {
+            Some(p) => {
                 let total_exec: u64 = p.values().map(|s| s.executed).sum();
                 let total_allowed: u64 = p.values().map(|s| s.allowed).sum();
                 parts.push(format!("policy {total_allowed}/{total_exec}"));
+            }
+            // No policy ran. Say whether that was because none applied under an
+            // active policy context, or because there was no policy at all.
+            None => {
+                if let Some(state) = enforcement.filter(|e| e.enforced) {
+                    if state.denies_all_data {
+                        parts.push("policy enforced (grants no data)".to_string());
+                    } else {
+                        parts.push("policy enforced (none ran)".to_string());
+                    }
+                }
             }
         }
     }
@@ -779,7 +799,10 @@ pub async fn run(
                     >(v.clone())
                     .ok()
                 });
-                (inner, Some((fuel, time, policy)))
+                let enforcement = envelope.get("policy_enforcement").and_then(|v| {
+                    serde_json::from_value::<fluree_db_api::PolicyEnforcement>(v.clone()).ok()
+                });
+                (inner, Some((fuel, time, policy, enforcement)))
             } else {
                 (result, None)
             };
@@ -808,9 +831,14 @@ pub async fn run(
             let output =
                 output::format_result(&result, output_format, query_format, effective_limit)?;
             println!("{}", output.text);
-            if let Some((fuel, time, policy)) = tracked_tally {
-                let tally_suffix =
-                    format_tally_suffix(fuel, time.as_deref(), policy.as_ref(), tracking_metrics);
+            if let Some((fuel, time, policy, enforcement)) = tracked_tally {
+                let tally_suffix = format_tally_suffix(
+                    fuel,
+                    time.as_deref(),
+                    policy.as_ref(),
+                    enforcement.as_ref(),
+                    tracking_metrics,
+                );
                 let time_str = format_duration(elapsed);
                 let total = output.total_rows;
                 match effective_limit {
@@ -914,6 +942,7 @@ pub async fn run(
                     response.fuel,
                     response.time.as_deref(),
                     response.policy.as_ref(),
+                    response.policy_enforcement.as_ref(),
                     tracking_metrics,
                 );
                 eprintln!(
@@ -1923,12 +1952,64 @@ async fn connection_query_local(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_time_suffix_preserving_fragment, base_ledger_id, inject_sparql_from_before_where,
-        json_path_display_format, jsonld_from_targets, query_targets_foreign_source,
-        reject_graph_source_unsupported,
+        attach_time_suffix_preserving_fragment, base_ledger_id, format_tally_suffix,
+        inject_sparql_from_before_where, json_path_display_format, jsonld_from_targets,
+        query_targets_foreign_source, reject_graph_source_unsupported,
     };
     use crate::detect::QueryFormat;
     use crate::output::OutputFormatKind;
+    use fluree_db_api::{PolicyEnforcement, PolicyStats};
+
+    const POLICY_ONLY: (bool, bool, bool) = (false, false, true);
+
+    #[test]
+    fn policy_footer_reports_counts_when_policies_ran() {
+        let stats = std::collections::HashMap::from([(
+            "ex:pol".to_string(),
+            PolicyStats {
+                executed: 10,
+                allowed: 8,
+            },
+        )]);
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&stats), None, POLICY_ONLY),
+            ", policy 8/10"
+        );
+    }
+
+    /// The case that used to print nothing: enforcement was active but no
+    /// policy executed, so the counts are empty.
+    #[test]
+    fn policy_footer_reports_enforcement_when_no_policy_ran() {
+        let empty = std::collections::HashMap::new();
+        let deny_all = PolicyEnforcement {
+            enforced: true,
+            denies_all_data: true,
+        };
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&empty), Some(&deny_all), POLICY_ONLY),
+            ", policy enforced (grants no data)"
+        );
+
+        let some_grants = PolicyEnforcement {
+            enforced: true,
+            denies_all_data: false,
+        };
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&empty), Some(&some_grants), POLICY_ONLY),
+            ", policy enforced (none ran)"
+        );
+    }
+
+    /// An unenforced request has nothing to report, and must not gain a footer.
+    #[test]
+    fn policy_footer_silent_when_unenforced() {
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&empty), None, POLICY_ONLY),
+            ""
+        );
+    }
 
     #[test]
     fn attach_time_suffix_preserves_fragment() {
