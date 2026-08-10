@@ -173,6 +173,14 @@ impl Bm25WorkerState {
         let graph_source_id = canonical_alias(graph_source_id);
         let deps_set: HashSet<String> = dependencies.iter().map(|d| canonical_alias(d)).collect();
 
+        // Clear the old reverse edges first. Overwriting the forward entry
+        // alone would leave any ledger dropped from `dependencies` still
+        // pointing here, so its commits would keep queueing a sync of an index
+        // that no longer reads it, and `watched_ledgers` would report a ledger
+        // nobody watches. Reachable through the `auto_register` arm, which
+        // re-registers on every config republish.
+        self.unregister_graph_source(&graph_source_id);
+
         // Update forward map
         self.gs_to_ledgers
             .insert(graph_source_id.clone(), deps_set.clone());
@@ -814,6 +822,71 @@ mod tests {
         assert_eq!(
             state.graph_sources_for_ledger("ledger1:main"),
             vec!["a:b:c"]
+        );
+    }
+
+    /// A config republish that repoints an index at a different source ledger
+    /// must not leave the old one triggering syncs.
+    #[test]
+    fn re_registering_replaces_stale_dependency_edges() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+        state.register_graph_source("search:main", &["ledger2:main".to_string()]);
+
+        assert!(
+            state.graph_sources_for_ledger("ledger1:main").is_empty(),
+            "the dropped dependency must stop triggering syncs"
+        );
+        assert_eq!(
+            state.watched_ledgers(),
+            vec!["ledger2:main"],
+            "and must stop being reported as watched"
+        );
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger2:main"),
+            vec!["search:main"]
+        );
+        assert_eq!(
+            state.stats().registered_graph_sources,
+            1,
+            "re-registering is not a second registration"
+        );
+    }
+
+    /// Narrowing a dependency set must drop only the removed ledger.
+    #[test]
+    fn re_registering_keeps_the_dependencies_that_remain() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source(
+            "search:main",
+            &["ledger1:main".to_string(), "ledger2:main".to_string()],
+        );
+        state.register_graph_source("search:main", &["ledger2:main".to_string()]);
+
+        assert!(state.graph_sources_for_ledger("ledger1:main").is_empty());
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger2:main"),
+            vec!["search:main"],
+            "a dependency that survived the republish must still trigger syncs"
+        );
+    }
+
+    /// Re-registering one index must not disturb another that shares a ledger.
+    #[test]
+    fn re_registering_leaves_a_co_dependent_index_alone() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+        state.register_graph_source("titles:main", &["ledger1:main".to_string()]);
+
+        state.register_graph_source("search:main", &["ledger2:main".to_string()]);
+
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger1:main"),
+            vec!["titles:main"],
+            "the other index must keep its edge to the shared ledger"
         );
     }
 
