@@ -47,7 +47,7 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
         // through to the plain-string atom fallback and become a truthy
         // constant — silently a no-op in FILTER. Reject it loudly instead.
         if let Some(callee) = sparql_style_callee(s) {
-            return Err(sparql_call_syntax_error(callee));
+            return Err(sparql_call_syntax_error(callee, s));
         }
         // Could be a simple value
         return parse_s_expression_atom(s);
@@ -124,21 +124,28 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
 /// If `s` is spelled like a SPARQL function call — an identifier immediately
 /// followed by `(` — return the identifier. Quoted strings never match, so
 /// `"\"contains(x)\""` remains expressible as a string literal.
+///
+/// The identifier charset covers the kebab-case spellings `lower_function_name`
+/// accepts (`is-iri`, `str-dt`, `not-in`, ...) and prefixed names like
+/// `geof:distance`. Fully-expanded IRI callees (`http://…/distance(?a ?b)`)
+/// still slip through: `/` and `#` are too common in ordinary unquoted strings
+/// to treat as identifier characters.
 fn sparql_style_callee(s: &str) -> Option<&str> {
     let open = s.find('(')?;
     let callee = &s[..open];
     let is_ident = !callee.is_empty()
         && callee
             .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '.'));
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'));
     is_ident.then_some(callee)
 }
 
-fn sparql_call_syntax_error(callee: &str) -> ParseError {
+fn sparql_call_syntax_error(callee: &str, expr: &str) -> ParseError {
     ParseError::InvalidFilter(format!(
         "'{callee}(...)' looks like SPARQL function-call syntax, which is not supported \
          in JSON-LD expressions; use S-expression syntax instead, \
-         e.g. (contains (lcase ?name) \"fred\")"
+         e.g. (contains (lcase ?name) \"fred\"). \
+         If you meant a literal string (in a bind, say), wrap it in double quotes: \"{expr}\""
     ))
 }
 
@@ -643,6 +650,28 @@ mod tests {
 
         let err = parse_s_expression(r#"strStarts(?name, "A")"#).unwrap_err();
         assert!(err.to_string().contains("SPARQL function-call syntax"));
+    }
+
+    #[test]
+    fn test_sparql_style_call_rejected_for_kebab_names() {
+        // `lower_function_name` accepts kebab spellings, so the callee charset
+        // must include '-' or these stay fail-open constants.
+        for expr in ["is-iri(?x)", "is-blank(?x)", "str-dt(?v, ?dt)"] {
+            let err = parse_s_expression(expr).unwrap_err();
+            assert!(
+                err.to_string().contains("SPARQL function-call syntax"),
+                "{expr} was not rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sparql_call_error_suggests_quoting() {
+        // The check also fires in value contexts (bind/unwind), where the user
+        // may have meant a literal like `Acme(Inc)` — point them at quoting.
+        let err = parse_s_expression("Acme(Inc)").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(r#"double quotes: "Acme(Inc)""#), "got: {msg}");
     }
 
     #[test]
