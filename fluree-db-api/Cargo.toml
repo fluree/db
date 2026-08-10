@@ -165,6 +165,13 @@ name = "it_iceberg_local_fs"
 path = "tests/it_iceberg_local_fs.rs"
 required-features = ["iceberg", "native"]
 
+# Standalone for the same reason: catalog-less WAREHOUSE-ROOT resolution through
+# every Direct entry point, against the committed fixture's parent directory.
+[[test]]
+name = "it_iceberg_warehouse_root"
+path = "tests/it_iceberg_warehouse_root.rs"
+required-features = ["iceberg", "native"]
+
 [[test]]
 name = "grp_index"
 path = "tests/grp_index.rs"
