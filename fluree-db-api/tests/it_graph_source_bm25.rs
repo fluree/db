@@ -1274,3 +1274,226 @@ async fn bm25_embedded_search_via_tracked_dataset_path() {
         "expected both rust docs via the tracked dataset path; got: {rendered}"
     );
 }
+
+/// Count files under the graph-sources storage segment.
+fn graph_source_blob_count(storage_path: &str) -> usize {
+    fn walk(dir: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| {
+                if e.path().is_dir() {
+                    walk(&e.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    walk(&std::path::Path::new(storage_path).join(STORAGE_SEGMENT_GRAPH_SOURCES))
+}
+
+/// Overwrite a graph source's BM25 manifest with bytes that are not valid JSON,
+/// so loading it fails to deserialize. Returns how many blobs were rewritten.
+///
+/// The manifest is published as a `ContentKind::IndexRoot`, so it lives under
+/// `<graph source>/index/roots/*.fir6` rather than in the graph-sources segment
+/// alongside the snapshots it references.
+fn corrupt_bm25_manifest(storage_path: &str, graph_source_name: &str) -> usize {
+    fn walk(dir: &std::path::Path, graph_source_name: &str) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| {
+                let path = e.path();
+                if path.is_dir() {
+                    return walk(&path, graph_source_name);
+                }
+                let manifest = path.extension().is_some_and(|ext| ext == "fir6")
+                    && path.to_string_lossy().contains(graph_source_name);
+                if manifest {
+                    std::fs::write(&path, b"{ not json").map_or(0, |()| 1)
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    walk(std::path::Path::new(storage_path), graph_source_name)
+}
+
+/// The generic `drop_graph_source` — what `POST /drop` and `fluree drop` reach
+/// — must sweep BM25 snapshot blobs in `Hard` mode, not just retract the
+/// nameservice record. It used to delete only Iceberg mapping blobs, so a BM25
+/// index dropped this way left every snapshot on disk with no way to reach it.
+#[tokio::test]
+async fn drop_graph_source_deletes_bm25_snapshots() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let storage_path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&storage_path)
+        .build()
+        .expect("build file fluree");
+
+    let ledger_id = "bm25/hard-drop:main";
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Systems programming" }
+        ]
+    });
+    fluree.insert(ledger, &tx).await.expect("insert");
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("hard-drop-search", ledger_id, query))
+        .await
+        .expect("create index");
+    assert!(created.index_id.is_some(), "expected a persisted snapshot");
+
+    let before = graph_source_blob_count(&storage_path);
+    assert!(before > 0, "index should have written blobs");
+
+    let report = fluree
+        .drop_graph_source("hard-drop-search", None, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop graph source");
+
+    assert!(
+        report.files_deleted >= 1,
+        "hard drop should report deleted snapshots, got {}: {:?}",
+        report.files_deleted,
+        report.warnings
+    );
+    assert!(
+        graph_source_blob_count(&storage_path) < before,
+        "hard drop must remove snapshot blobs from storage (was {before})"
+    );
+}
+
+/// Drop is the recovery action for a wedged graph source, so it has to work
+/// even when the snapshot sweep cannot. The manifest load used to propagate
+/// with `?`, returning before the retract below it — so a BM25 index whose
+/// manifest blob was unreadable could not be dropped at all through
+/// `POST /drop`, which is the one path an operator has left at that point.
+#[tokio::test]
+async fn drop_graph_source_retracts_when_the_bm25_manifest_is_unreadable() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let storage_path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&storage_path)
+        .build()
+        .expect("build file fluree");
+
+    let ledger_id = "bm25/wedged-drop:main";
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" }
+        ]
+    });
+    fluree.insert(ledger, &tx).await.expect("insert");
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("wedged-search", ledger_id, query))
+        .await
+        .expect("create index");
+    assert!(created.index_id.is_some(), "expected a persisted snapshot");
+
+    assert!(
+        corrupt_bm25_manifest(&storage_path, "wedged-search") > 0,
+        "test needs the manifest blob to corrupt"
+    );
+
+    let report = fluree
+        .drop_graph_source("wedged-search", None, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop must still succeed when the manifest cannot be read");
+
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("manifest unreadable")),
+        "the skipped sweep should be reported as a warning, got: {:?}",
+        report.warnings
+    );
+    assert!(
+        fluree.sync_bm25_index("wedged-search:main").await.is_err(),
+        "the index must be retracted despite the sweep being skipped"
+    );
+}
+
+/// Every sync entrypoint must refuse a dropped index. `sync_bm25_index_to`
+/// used to skip the retraction check its siblings made, so a pinned sync wrote
+/// a fresh snapshot for a graph source whose snapshots had just been deleted,
+/// putting a dropped index back to serving results.
+#[tokio::test]
+async fn bm25_sync_refuses_a_retracted_index() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/retracted:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Original document one" }]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+    let source_t = ledger1.t();
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("retracted-test", ledger_id, query))
+        .await
+        .unwrap();
+
+    let dropped = fluree
+        .drop_full_text_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(!dropped.was_already_retracted);
+
+    let head_sync = fluree.sync_bm25_index(&created.graph_source_id).await;
+    assert!(
+        head_sync.is_err(),
+        "head sync must refuse a retracted index"
+    );
+
+    let pinned_sync = fluree
+        .sync_bm25_index_to(&created.graph_source_id, source_t, None)
+        .await;
+    assert!(
+        pinned_sync.is_err(),
+        "pinned sync must refuse a retracted index too, got: {:?}",
+        pinned_sync.map(|r| r.new_watermark)
+    );
+
+    let resync = fluree.resync_bm25_index(&created.graph_source_id).await;
+    assert!(resync.is_err(), "resync must refuse a retracted index");
+}

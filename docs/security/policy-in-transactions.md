@@ -171,7 +171,7 @@ Combined with `default-allow: true` (or a permissive default `f:modify` policy),
   "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
   "f:required": true,
   "f:action": [{"@id": "f:modify"}],
-  "f:query": "{\"where\": {\"@id\": \"?$identity\", \"http://example.org/user\": {\"@id\": \"?$user\"}}, \"$where\": {\"@id\": \"?$this\", \"http://example.org/owner\": {\"@id\": \"?$user\"}}}"
+  "f:query": "{\"where\": [{\"@id\": \"?$identity\", \"http://example.org/user\": {\"@id\": \"?user\"}}, {\"@id\": \"?$this\", \"http://example.org/owner\": {\"@id\": \"?user\"}}]}"
 }
 ```
 

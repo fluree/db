@@ -270,6 +270,17 @@ async fn try_discover_and_login(
                 config.endpoint = RemoteEndpoint::Http { base_url: api };
             }
 
+            // Recurring half of the min-version handshake: `remote add` warns
+            // once at add time, but a stack can raise its floor later — login
+            // is the natural repeat touchpoint.
+            if let Some(ref min) = discovered.cli_min_version {
+                if let Some(warning) =
+                    super::remote::cli_min_version_warning(env!("CARGO_PKG_VERSION"), min)
+                {
+                    eprintln!("  {} {}", "warn:".yellow().bold(), warning);
+                }
+            }
+
             // If discovery provides OIDC config, run the device flow.
             if let Some(discovered_auth) = discovered.auth {
                 if discovered_auth.auth_type.as_ref() == Some(&RemoteAuthType::OidcDevice) {

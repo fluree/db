@@ -1,10 +1,10 @@
 //! OAuth2 client credentials flow authentication.
 
+use crate::auth::token::CachedToken;
 use crate::auth::{CatalogAuth, SendCatalogAuth};
 use crate::error::{IcebergError, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
-use rand::Rng;
+use chrono::{Duration, Utc};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::Instrument;
@@ -32,42 +32,8 @@ impl std::fmt::Debug for OAuth2Config {
     }
 }
 
-/// Cached token with expiration.
-#[derive(Clone)]
-struct CachedToken {
-    access_token: String,
-    token_type: String,
-    expires_at: DateTime<Utc>,
-}
-
-/// Redacting `Debug`: the `access_token` is a live bearer credential.
-impl std::fmt::Debug for CachedToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedToken")
-            .field("access_token", &"***")
-            .field("token_type", &self.token_type)
-            .field("expires_at", &self.expires_at)
-            .finish()
-    }
-}
-
-impl CachedToken {
-    /// Check if token is expired or will expire within buffer period.
-    ///
-    /// Uses a 30-second base buffer plus 0-5s jitter to avoid thundering herds.
-    fn is_expired(&self) -> bool {
-        let jitter = rand::thread_rng().gen_range(0..5);
-        let buffer = Duration::seconds(30 + jitter);
-        Utc::now() + buffer >= self.expires_at
-    }
-
-    /// Get the authorization header value.
-    fn authorization_header(&self) -> String {
-        // Use token_type from response (don't hardcode "Bearer")
-        format!("{} {}", self.token_type, self.access_token)
-    }
-}
-
+// `CachedToken` (with its redacting Debug + jittered expiry) is shared across the
+// refreshing auth providers — see `crate::auth::token` (imported above).
 /// OAuth2 client credentials authentication.
 ///
 /// Handles token acquisition and automatic refresh before expiration.

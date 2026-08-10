@@ -1617,28 +1617,28 @@ GET /ledgers
 
 **Response:**
 
+A flat array of ledgers and graph sources. Retracted entries are omitted.
+
 ```json
-{
-  "ledgers": [
-    {
-      "ledger_id": "mydb:main",
-      "branch": "main",
-      "commit_t": 5,
-      "index_t": 5,
-      "created": "2024-01-22T10:00:00.000Z",
-      "last_updated": "2024-01-22T10:30:00.000Z"
-    },
-    {
-      "ledger_id": "mydb:dev",
-      "branch": "dev",
-      "commit_t": 3,
-      "index_t": 2,
-      "created": "2024-01-22T11:00:00.000Z",
-      "last_updated": "2024-01-22T11:15:00.000Z"
-    }
-  ]
-}
+[
+  {"name": "mydb", "branch": "main", "type": "Ledger", "t": 5},
+  {"name": "mydb", "branch": "dev", "type": "Ledger", "t": 3},
+  {"name": "docsearch", "branch": "main", "type": "BM25", "t": 5,
+   "dependencies": ["mydb:main"]},
+  {"name": "warehouse", "branch": "main", "type": "Iceberg", "t": 0,
+   "dependencies": ["mydb:main"]}
+]
 ```
+
+| Field | Description |
+|-------|-------------|
+| `name` | Ledger or graph-source name, without the branch |
+| `branch` | Branch name |
+| `type` | `Ledger`, or the graph-source family: `BM25`, `Vector`, `Geo`, `R2RML`, `Iceberg` |
+| `t` | Commit `t` for a ledger; the index watermark for a graph source |
+| `dependencies` | Source ledger aliases a graph source derives from. Omitted for ledgers. |
+
+`dependencies` is what lets a client pair a graph source against its source's `t` from this one response — the staleness check behind `fluree bm25 list`. A dependency alias may omit the branch, in which case `main` is implied.
 
 **Example:**
 
@@ -2711,11 +2711,11 @@ Server-Sent Events (SSE) stream of nameservice changes for ledgers and graph sou
 
 ## Graph Source Endpoints
 
-> **Note:** HTTP endpoints for BM25 and vector index lifecycle management (create, sync, drop) are not yet implemented in the server. BM25 and vector indexes are currently managed via the Rust API (`Bm25CreateConfig`, `create_full_text_index`, `sync_bm25_index`, `drop_full_text_index`). See [BM25 Full-Text Search](../indexing-and-search/bm25.md) and [Vector Search](../indexing-and-search/vector-search.md) for API usage.
+> **Note:** BM25 indexes are created and synced over HTTP via the endpoints below. Vector index lifecycle management has no HTTP endpoint yet and is still managed via the Rust API (`VectorCreateConfig`, `create_vector_index`) — see [Vector Search](../indexing-and-search/vector-search.md).
 >
 > BM25 search **is** available in queries via the `f:graphSource` / `f:searchText` pattern in where clauses — see the query documentation for details.
 
-Graph source metadata can be discovered via `GET /ledgers` or `GET /info/{graph-source-id}`.
+Graph source metadata can be discovered via `GET /ledgers` or `GET /info/{graph-source-id}`. Dropping a graph source of any type — BM25, vector, or Iceberg — goes through the shared `POST /drop`, so only creation and sync need family-specific endpoints.
 
 ### POST {api_base_url}/iceberg/map
 
@@ -2766,11 +2766,16 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `r2rml` | string | Inline R2RML mapping (Turtle/JSON-LD). Omit to auto-generate a direct mapping. |
 | `r2rml_type` | string | Media type of `r2rml` (`text/turtle`, `application/ld+json`) |
 | `branch` | string | Branch name (default: `main`) |
-| `auth_bearer` | string | Bearer token for catalog auth |
-| `oauth2_*` | string | OAuth2 client-credentials flow for the catalog |
+| `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h) |
+| `oauth2_*` | string | OAuth2 client-credentials flow for the catalog (refreshes) |
+| `auth_google_metadata` | bool | Use the GCE/GKE metadata server (Workload Identity) for catalog auth, minting + auto-refreshing tokens — for Google Iceberg REST catalogs (BigLake). Overrides `auth_bearer`. Only works when running on GCP. |
+| `auth_google_scopes` | string | Optional OAuth scopes for `auth_google_metadata` (default `cloud-platform`) |
 | `warehouse` | string | Warehouse identifier |
 | `no_vended_credentials` | bool | Disable vended credentials |
 | `s3_region`, `s3_endpoint`, `s3_path_style` | | S3 overrides for `direct` mode |
+| `order_by` | string | Latest-by-key ordering column for materialization (int/date/timestamp) |
+| `delete_column` | string | Column that marks a row as a delete (tombstone) during materialization |
+| `delete_values` | (string\|null)[] | Values of `delete_column` that mean "deleted"; a `null` entry matches a NULL column (null-payload delete). Required when `delete_column` is set. |
 
 **Response:**
 
@@ -2794,6 +2799,195 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
+### POST {api_base_url}/bm25/create
+
+Create a BM25 full-text search index over a ledger. Admin-protected — requires the admin Bearer token when an admin token is configured. Runs the index build synchronously and returns when the snapshot is committed; for a large corpus it may run for some time, so configure your HTTP client timeout accordingly. In peer mode, the request is forwarded to the transaction server.
+
+**URL:**
+```
+POST {api_base_url}/bm25/create
+```
+
+For the standalone server and Docker image defaults, this is:
+
+```bash
+POST http://localhost:8090/v1/fluree/bm25/create
+```
+
+**Request Body:**
+
+```json
+{
+  "name": "docsearch",
+  "ledger": "docs:main",
+  "branch": "main",
+  "query": {
+    "@context": { "ex": "http://example.org/" },
+    "where": [{ "@id": "?x", "@type": "ex:Doc", "ex:title": "?t" }],
+    "select": { "?x": ["@id", "ex:title"] }
+  },
+  "k1": 1.2,
+  "b": 0.75
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Graph-source name for the index, no `:` (required). The alias is `<name>:<branch>`. |
+| `ledger` | string | Source ledger alias to index (required) |
+| `query` | object | Indexing query (FQL / JSON-LD) selecting the documents and text properties to index (required). Must select `@id`. |
+| `branch` | string | Branch for the index graph source (default: `main`) |
+| `k1` | number | Term-frequency saturation (default: `1.2`) |
+| `b` | number | Document-length normalization, `0..=1` (default: `0.75`) |
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "docsearch:main",
+  "doc_count": 2,
+  "term_count": 37,
+  "index_t": 3,
+  "index_id": "…"
+}
+```
+
+**Status Codes:**
+- `201 Created` — index created
+- `400 Bad Request` — invalid config (empty or `:`-bearing name, non-positive `k1`, `b` outside `0..=1`, query with no `select`), or an index already exists at that alias
+- `401/403` — admin auth required
+- `404 Not Found` — source ledger does not exist
+
+See also the CLI equivalent: [fluree bm25 create](../cli/bm25.md#fluree-bm25-create).
+
+### POST {api_base_url}/bm25/sync
+
+Bring a BM25 index up to date with its source ledger. Incremental where possible — only re-indexing the subjects changed since the index's stored watermark — falling back to a full rebuild when it must. A no-op when the index is already current. Admin-protected, synchronous, and forwarded to the transaction server in peer mode, like `create` above.
+
+**URL:**
+```
+POST {api_base_url}/bm25/sync
+POST {api_base_url}/bm25/sync?t={t}
+```
+
+**Query Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `t` | integer | Source-ledger commit `t` to sync **through**. Omit to sync through the source's current head. Must be `>= 1`. |
+
+**Request Body:**
+
+```json
+{
+  "index": "docsearch:main"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `index` | string | Index graph-source alias to sync (required) |
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "docsearch:main",
+  "upserted": 1,
+  "removed": 0,
+  "affected_subjects": 1,
+  "old_watermark": 3,
+  "new_watermark": 4,
+  "was_full_resync": false
+}
+```
+
+An already-current index returns `200` with `upserted`/`removed` of `0` and an unchanged watermark.
+
+**Status Codes:**
+- `200 OK` — sync completed (including the no-op case)
+- `400 Bad Request` — `t` is unparseable or less than `1`
+- `401/403` — admin auth required
+- `404 Not Found` — no such index
+- `500 Internal Server Error` — two request errors land here today; see the note below
+
+Two errors that are the caller's fault currently come back as `500` with `"@type": "err:system/InternalError"`: syncing an index that has been dropped (`Cannot sync retracted graph source: …`), and asking for a `t` beyond the source ledger's head (`Target t=… is beyond current head t=…`). Neither succeeds on retry. Until the mapping is corrected to 4xx, match on the message before deciding whether to retry a `500` from this endpoint.
+
+By default the server does not sync on commit, so an index only advances when something calls this endpoint — run it from a maintenance job, using `fluree bm25 list --stale` to enumerate the indexes whose source has moved past their watermark. Starting the server with `--bm25-auto-sync` (env `FLUREE_BM25_AUTO_SYNC`, or `indexing.bm25_auto_sync` in the config file) instead keeps every index current automatically, syncing each one when its source ledger commits.
+
+See also the CLI equivalent: [fluree bm25 sync](../cli/bm25.md#fluree-bm25-sync).
+
+### POST {api_base_url}/iceberg/materialize
+
+Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-`(source, target, table)` watermark persisted in a shared `fluree_materialize_state:main` ledger, or fully with `force_full`. `target` may be a template that fans out into one ledger per partition (see the field table). Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
+
+**Request Body:**
+
+```json
+{ "source": "orders:main", "target": "orders-native:main", "force_full": false }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | string | Source graph source id to read (required) |
+| `target` | string | Target native ledger to write (required; created if absent). May be a **template** with `{column}` placeholders (e.g. `orders_{tenant_id}_{user_id}:main`) resolved per source row, fanning the job out into one native ledger per partition value. A placeholder-free value is a single target (unchanged). |
+| `force_full` | bool | Ignore the watermark and re-read the whole table (default `false`) |
+
+**Response:**
+
+```json
+{
+  "source": "orders:main",
+  "target": "orders-native:main",
+  "from_snapshot_id": null,
+  "to_snapshot_id": 5648190075564901028,
+  "incremental": false,
+  "committed": true,
+  "rows_read": 1200,
+  "subjects_upserted": 1200,
+  "subjects_retracted": 0
+}
+```
+
+`committed: false` means a no-delta poll (nothing changed since the watermark). `from_snapshot_id`/`to_snapshot_id` are populated for single-table mappings (multi-table watermarks live per `(source, target, table)` in the shared `fluree_materialize_state:main` state ledger, not in the target).
+
+**Status Codes:** `200 OK`; `400` invalid request / config; `401/403` admin auth; `500` scan or commit failure.
+
+### POST {api_base_url}/iceberg/track
+
+Register a `source → target` materialization job with the in-process tracking worker, run an immediate first sync, and keep the target fresh on a timer. Admin-protected; `iceberg` feature only.
+
+**Request Body:**
+
+```json
+{ "source": "orders:main", "target": "orders-native:main", "poll_interval_secs": 300 }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | string | Graph-source id to read. Required. |
+| `target` | string | Native ledger to keep materialized. Required. May be a **template** with `{column}` placeholders (e.g. `orders_{tenant_id}_{user_id}:main`), fanning the job out into one native ledger per partition value. |
+| `poll_interval_secs` | number | This job's own re-sync cadence, in seconds. Optional — defaults to the worker's configured interval (30s). Must be > 0. Each tracked job runs on its own timer. |
+
+**Response:** `{ "source", "target", "tracked": true, "poll_interval_secs": 300, "tracked_jobs": 1, "initial": { …materialize response… } }`
+
+Tracked jobs are persisted in the `fluree_materialize_state:main` state ledger alongside the watermarks and restored when the worker starts, so a restart resumes tracking by itself — incrementally, from the watermark. The worker runs on write nodes only.
+
+### POST {api_base_url}/iceberg/untrack
+
+Stop tracking a `source → target` pair (already-materialized data is left in place). Body: `{ "source", "target" }`. Response: `{ "source", "target", "removed": true, "tracked_jobs": 0 }`.
+
+### GET {api_base_url}/iceberg/tracking
+
+List the tracking worker's jobs and cumulative stats.
+
+```json
+{
+  "running": true,
+  "jobs": [ { "source": "orders:main", "target": "orders-native:main", "poll_interval_secs": 300 } ],
+  "stats": { "polls": 12, "syncs_committed": 1, "syncs_noop": 11, "syncs_failed": 0, "tracked_jobs": 1 }
+}
+```
 ## Admin Endpoints
 
 ### POST /reindex

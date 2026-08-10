@@ -610,10 +610,38 @@ Notes:
   treats WHERE-pattern labels as variables; accepting `_:fdb-` ids as
   constants is a deliberate Fluree extension (the same one Virtuoso's
   `nodeID://` refs and Jena's `<_:label>` syntax provide).
-- Some stable ids minted by bulk import embed `:` characters (e.g.
-  `_:fdb-lubm:main-1-genid10`). These are addressable from JSON-LD, but the
-  SPARQL grammar does not allow `:` inside blank-node labels, so such ids
-  cannot be written in SPARQL syntax.
+- Bulk import mints the same way, into the same reserved space, with the same
+  editability. Its ids carry a document scope — `_:fdb-d<14 chars>-<label>`,
+  where the scope identifies the source file and `<label>` is the label as
+  written in it (`_:fdb-d1t3k9x0abcdef-genid10`). They are `[0-9a-z-]` only,
+  so they are writable in SPARQL, Turtle and JSON-LD without escaping.
+- Ledgers imported by Fluree **4.1.4 or earlier** hold the older import format, which
+  embedded the ledger id and therefore `:` and `/` (`_:fdb-lubm:main-1-genid10`).
+  Those ids are still addressable from JSON-LD, but the SPARQL grammar does
+  not allow `:` inside a blank-node label, so they cannot be written in SPARQL
+  syntax. Re-importing the source produces ids in the current format. There is
+  no mixed-format ledger: import requires a fresh ledger, so a ledger's import
+  ids are all of one format.
+- To find out which document an import id came from, look it up in the
+  ledger's `txn-meta` graph. Each source document contributes one triple whose
+  subject is its scope — the first 19 characters of the id, `_:fdb-` plus the
+  14-character scope:
+
+  ```sparql
+  SELECT ?source WHERE {
+    GRAPH <urn:fluree:my/ledger:main#txn-meta> {
+      _:fdb-d1t3k9x0abcdef <https://ns.flur.ee/db#importSource> ?source
+    }
+  }
+  ```
+
+  `--skolem-namespace` on `fluree create --from` controls the other half of
+  the id: by default the ledger id salts the mint, so two ledgers loaded from
+  one source tree hold different blank nodes; passing the same namespace to
+  both makes them mint identical ids instead. See
+  [Blank nodes](../cli/create.md#blank-nodes) for what counts as a document —
+  in particular for `.jsonl`/`.ndjson`, where a `@context` switch ends one
+  document and starts the next.
 
 ## Error Handling
 

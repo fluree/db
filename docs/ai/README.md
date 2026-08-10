@@ -22,9 +22,9 @@ Fluree exposes Model Context Protocol in two distinct places:
 
   → [MCP endpoint configuration](../operations/configuration.md#mcp-endpoint)
 
-- **CLI `fluree mcp serve`** — a stdio MCP server for IDE agents, exposing the Fluree Memory tools (`memory_add`, `memory_recall`, `memory_update`, `memory_forget`, `memory_status`) plus `kg_query` for raw SPARQL over the memory graph.
+- **CLI `fluree mcp serve`** — a stdio MCP server for IDE agents with two selectable toolsets: `docs` (`docs_search`, `docs_get`, `docs_examples`, `docs_tree` — ranked search and retrieval over this documentation, embedded in the binary and therefore version-exact for the build you run) and `memory` (`memory_add`, `memory_recall`, `memory_update`, `memory_forget`, `memory_status`, plus `kg_query` for raw SPARQL over the memory graph). `fluree mcp init` registers it with Claude Code, Cursor, VS Code, Windsurf, or Zed.
 
-  → [`fluree mcp`](../cli/mcp.md) · [Memory: MCP server](../memory/concepts/mcp.md)
+  → [`fluree mcp`](../cli/mcp.md) · [Claude Code and the CLI](claude-code.md) · [Memory: MCP server](../memory/concepts/mcp.md)
 
 ### Fluree Memory — persistent project memory for coding agents
 
@@ -34,7 +34,7 @@ Long-term, searchable memory for tools like Claude Code, Cursor, and VS Code Cop
 
 ### Vector and full-text search — the retrieval substrate
 
-HNSW vector similarity and BM25 full-text search live *inside* the query engine, so semantic and keyword retrieval participate in the same joins, filters, and aggregations as the rest of your graph patterns — no separate vector store or search service to operate. This is the substrate for graph-aware RAG: retrieve by similarity, then traverse the graph from the hits.
+Vector similarity and BM25 full-text search live *inside* the query engine, so semantic and keyword retrieval participate in the same joins, filters, and aggregations as the rest of your graph patterns — no separate vector store or search service to operate. This is the substrate for graph-aware RAG: retrieve by similarity, then traverse the graph from the hits. (The inline similarity functions — `dotProduct`, `cosineSimilarity`, `euclideanDistance` — are available in every build; the HNSW vector *index* is behind the `vector` cargo feature, which standard release binaries do not enable.)
 
 → [Vector search](../indexing-and-search/vector-search.md) · [BM25](../indexing-and-search/bm25.md) · [Cookbook: full-text and vector search](../guides/cookbook-search.md)
 

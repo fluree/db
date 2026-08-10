@@ -120,6 +120,8 @@ sysinfo = { workspace = true, optional = true }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tempfile = "3.19"
+# it_import_low_fd: the re-exec'd child lowers RLIMIT_NOFILE on itself.
+libc = "0.2"
 mimalloc.workspace = true
 fs2 = "0.4"
 # Used by import tests to produce .gz / .zst fixtures inline.
@@ -146,6 +148,12 @@ path = "tests/grp_graphsource.rs"
 [[test]]
 name = "grp_import"
 path = "tests/grp_import.rs"
+
+# Standalone (NOT in grp_import): re-execs itself and lowers RLIMIT_NOFILE
+# hard+soft in the child, which must not share a process with other tests.
+[[test]]
+name = "it_import_low_fd"
+path = "tests/it_import_low_fd.rs"
 
 [[test]]
 name = "grp_index"

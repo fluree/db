@@ -102,6 +102,16 @@ pub struct AppState {
     /// Aborted on drop so the `Arc<LeafletCache>` doesn't outlive the server.
     cache_stats_handle: Option<tokio::task::JoinHandle<()>>,
 
+    /// Handle to the R2RML/Iceberg materialization tracking worker for
+    /// registering `source → target` jobs. `None` on peer-mode nodes (which
+    /// forward writes) or when the worker failed to start.
+    #[cfg(feature = "iceberg")]
+    pub materialize_worker: Option<fluree_db_api::MaterializeWorkerHandle>,
+
+    /// Join handle for the materialization worker task; aborted on drop.
+    #[cfg(feature = "iceberg")]
+    materialize_worker_task: Option<tokio::task::JoinHandle<()>>,
+
     /// Registry of in-flight negotiated-upload import jobs (reference impl of
     /// the presigned `.flpack` upload flow). Empty/unused unless
     /// `config.import_presign_enabled`.
@@ -271,6 +281,29 @@ impl AppState {
         #[cfg(feature = "aws")]
         let storage_vend_scope = resolve_storage_vend_scope(&config);
 
+        // Spawn the R2RML/Iceberg materialization tracking worker on write
+        // nodes that index locally. Peers forward writes elsewhere, so they
+        // don't run it. Nodes with `indexing_enabled = false` (external-indexer
+        // mode) don't either: the materializer's chunked commits rely on the
+        // LOCAL indexer draining novelty between chunks (see the txn-budget
+        // comment in `r2rml_materialize.rs`) — with `.without_indexing()`
+        // nothing drains, novelty only grows, and any sync bigger than the
+        // ceiling parks on backpressure until it fails. `POST /iceberg/track`
+        // on such a node returns the "worker is not running" error. (In Raft
+        // mode the worker currently runs on every qualifying node and writes
+        // directly via `Fluree::upsert`; gating it to the leader is a follow-up
+        // — single-node and peer deployments are correct today.)
+        #[cfg(feature = "iceberg")]
+        let (materialize_worker, materialize_worker_task) =
+            if config.server_role != ServerRole::Peer && config.indexing_enabled {
+                let worker = fluree_db_api::MaterializeTrackingWorker::new(Arc::clone(&fluree));
+                let handle = worker.handle();
+                let task = tokio::spawn(worker.run());
+                (Some(handle), Some(task))
+            } else {
+                (None, None)
+            };
+
         Ok(Self {
             fluree,
             config,
@@ -289,6 +322,10 @@ impl AppState {
             query_refresh_last_checked: DashMap::new(),
             serving_posture_cache: DashMap::new(),
             cache_stats_handle: Some(cache_stats_handle),
+            #[cfg(feature = "iceberg")]
+            materialize_worker,
+            #[cfg(feature = "iceberg")]
+            materialize_worker_task,
             import_jobs: Arc::new(crate::import_jobs::ImportJobs::default()),
             #[cfg(feature = "aws")]
             storage_vend_scope,
@@ -354,6 +391,10 @@ impl Drop for AppState {
     fn drop(&mut self) {
         if let Some(handle) = self.cache_stats_handle.take() {
             handle.abort();
+        }
+        #[cfg(feature = "iceberg")]
+        if let Some(task) = self.materialize_worker_task.take() {
+            task.abort();
         }
     }
 }

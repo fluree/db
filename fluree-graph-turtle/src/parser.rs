@@ -37,9 +37,12 @@ pub struct Parser<'a, 'input, S> {
     iri_term_cache: FxHashMap<Arc<str>, TermId>,
     /// Cache of prefixed name span text -> TermId.
     ///
-    /// Keyed by the raw span text (e.g., `"ex:name"` or `"ex:"`), which uniquely
-    /// identifies the expanded IRI for a given prefix mapping. Handles both
-    /// PrefixedName and PrefixedNameNs tokens in one cache.
+    /// Keyed by the raw span text (e.g., `"ex:name"` or `"ex:"`) — which
+    /// identifies the expanded IRI only WHILE the prefix mapping is stable.
+    /// A `@prefix` redefinition changes what a cached span means, so
+    /// [`Parser::bind_prefix`] clears this cache on any rebinding; every
+    /// prefix write must go through it. Handles both PrefixedName and
+    /// PrefixedNameNs tokens in one cache.
     prefixed_term_cache: FxHashMap<Arc<str>, TermId>,
     /// Cache hit/miss counters (recorded on `turtle_parse_events` span).
     iri_cache_hits: u64,
@@ -367,8 +370,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
     /// Look up a prefixed name (PrefixedName or PrefixedNameNs) by span text.
     ///
-    /// The span text (e.g., `"ex:name"` or `"ex:"`) uniquely identifies the
-    /// expanded IRI for the current prefix mappings, so it serves as the cache key.
+    /// The span text (e.g., `"ex:name"` or `"ex:"`) identifies the expanded
+    /// IRI **for the prefix bindings in force**, so it serves as the cache key
+    /// only as long as those bindings hold. [`Self::bind_prefix`] is what
+    /// keeps that true.
     fn resolve_prefixed_term(&mut self, start: u32, end: u32) -> Result<TermId> {
         let span = self.span_text(start, end);
         if let Some(&id) = self.prefixed_term_cache.get(span) {
@@ -557,7 +562,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         // Register prefix
         self.sink_on_prefix(&prefix, &namespace);
-        self.prefixes.insert(prefix, namespace);
+        self.bind_prefix(prefix, namespace);
 
         // Consume trailing dot (required for @prefix, not for PREFIX)
         if !is_sparql_style {
@@ -565,6 +570,93 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         }
 
         Ok(())
+    }
+
+    /// Bind a prefix, discarding cached expansions if this REBINDS it.
+    ///
+    /// Turtle lets a prefix be redeclared part-way through a document, and
+    /// every prefixed name after the redeclaration means something new.
+    /// `prefixed_term_cache` is keyed by span text (`ex:name`), which
+    /// identifies an IRI only relative to the binding that was in force when
+    /// the entry was made — so without this, the second `ex:name` in
+    ///
+    /// ```turtle
+    /// @prefix e: <http://a/> .   e:x <http://p/> "1" .
+    /// @prefix e: <http://b/> .   e:x <http://p/> "2" .
+    /// ```
+    ///
+    /// resolves from the cache to `<http://a/x>`. Both statements land on one
+    /// subject, the redeclaration does nothing, and no error is raised
+    /// anywhere: the document says one thing and the graph holds another.
+    ///
+    /// Only a rebind to a *different* namespace clears. Redeclaring the same
+    /// binding leaves every cached expansion correct, and it is the common
+    /// case rather than a curiosity — chunked import prepends the file's
+    /// prefix block to every chunk over a pre-seeded map, so the parser sees
+    /// each prefix declared twice by construction. Clearing there would cost
+    /// hit rate on the hot path for nothing.
+    ///
+    /// The cost on the path that matters is nil: one extra hash lookup per
+    /// prefix *directive*, of which a document has a handful, against a cache
+    /// consulted once per prefixed *name*, of which it has millions.
+    ///
+    /// # The comparison is on meaning, not spelling
+    ///
+    /// `namespace` arrives already resolved — `parse_prefix_directive` runs
+    /// `resolve_iri` before calling this — so `prefixes` holds resolved IRIs
+    /// and this compares what the two declarations MEAN. Both directions of
+    /// that are load-bearing, and neither is obvious:
+    ///
+    /// - Same spelling, different meaning. `@prefix e: <a/>` under
+    ///   `@base <http://x/>` and again under `@base <http://y/>` is the same
+    ///   text naming two different namespaces. Comparing raw text would find
+    ///   them equal and skip a clear that is required.
+    /// - Different spelling, same meaning. `<http://x/a/>` and `<a/>` under
+    ///   `@base <http://x/>` name one namespace. Comparing raw text would
+    ///   clear a cache that was entirely correct.
+    ///
+    /// So storing the resolved form is not an incidental convenience of the
+    /// directive parser; it is what makes this comparison the right one. Both
+    /// cases are pinned in `tests/prefix_redefinition_adversarial.rs` (A1 and
+    /// A2) — they need a moving `@base`, which the other file never varies.
+    fn bind_prefix(&mut self, prefix: String, namespace: String) {
+        let rebinds = self
+            .prefixes
+            .get(&prefix)
+            .is_some_and(|current| *current != namespace);
+        self.prefixes.insert(prefix, namespace);
+        if rebinds {
+            // Coarse on purpose: a rebind invalidates only that prefix's
+            // entries, but finding them means scanning every key, so we drop
+            // them all. A rebind is rare enough that paying O(cache) once
+            // beats making the common path cleverer.
+            //
+            // To be exact about the trade, since "scanning every key" could be
+            // read as the reason: `retain` scans every key too, so the cost is
+            // the same order either way. What a `retain` would buy is keeping
+            // OTHER prefixes warm after a rebind; what it costs is a predicate
+            // that has to be right — the keys are span texts like `ex:name`,
+            // so the obvious `k.starts_with(prefix)` evicts `ex:name` when `e`
+            // rebinds, and the correct form has to compare up to the colon.
+            // Simplicity over post-rebind hit rate, not cost over cost.
+            self.prefixed_term_cache.clear();
+        }
+    }
+
+    /// Test-only: parse, then report `(prefixed_cache_hits, prefixed_cache_misses)`.
+    ///
+    /// The "only if it rebinds" in [`Self::bind_prefix`] is invisible in parser
+    /// output — clearing on a same-binding redeclaration yields identical
+    /// triples, just colder, because `iri_term_cache` absorbs the repeated
+    /// work before it can reach the sink. Without a view of the counters,
+    /// nothing stops a later simplification from clearing unconditionally and
+    /// quietly costing hit rate on every chunk of every import.
+    #[cfg(test)]
+    fn parse_reporting_cache(mut self) -> Result<(u64, u64)> {
+        while !self.is_at_end() {
+            self.parse_statement()?;
+        }
+        Ok((self.prefixed_cache_hits, self.prefixed_cache_misses))
     }
 
     /// Parse @base or BASE directive.
@@ -1457,7 +1549,15 @@ pub fn parse_with_prefixes_base_options<S: GraphSink>(
     if !prefixes.is_empty() {
         parser.prefixes.reserve(prefixes.len());
         for (prefix, namespace) in prefixes {
-            parser.prefixes.insert(prefix.clone(), namespace.clone());
+            // Through bind_prefix, not a raw insert: on an empty cache the
+            // invalidation is a no-op, but this is the entry point chunked
+            // import uses, and any future change that seeds AFTER names have
+            // been cached ("re-seed after the prelude", "top up between
+            // chunks") would reintroduce the stale-cache bug this parser
+            // guards against — with no test able to see it, because seeding
+            // normally happens before anything is cached. Routing it here
+            // makes the invariant structural instead of conventional.
+            parser.bind_prefix(prefix.clone(), namespace.clone());
         }
     }
     parser.parse()
@@ -1467,6 +1567,48 @@ pub fn parse_with_prefixes_base_options<S: GraphSink>(
 mod tests {
     use super::*;
     use fluree_graph_ir::{Graph, GraphCollectorSink, Term};
+
+    /// Counts for a document whose only prefixed names are two `e:x`.
+    fn prefixed_cache_counts(doc: &str) -> (u64, u64) {
+        let mut sink = GraphCollectorSink::new();
+        Parser::new(doc, &mut sink)
+            .unwrap()
+            .parse_reporting_cache()
+            .unwrap()
+    }
+
+    /// Redeclaring the SAME binding must leave the expansion cache warm.
+    ///
+    /// This is the shape chunked import produces on every chunk, and it is the
+    /// reason `bind_prefix` clears only on a real rebinding. No output pins it:
+    /// the triples are identical either way.
+    #[test]
+    fn a_same_binding_redeclaration_keeps_the_cache_warm() {
+        let doc = "@prefix e: <http://a/> .\n\
+                   e:x <http://p/> \"1\" .\n\
+                   @prefix e: <http://a/> .\n\
+                   e:x <http://p/> \"2\" .\n";
+        assert_eq!(
+            prefixed_cache_counts(doc),
+            (1, 1),
+            "same-binding redeclaration must NOT clear the expansion cache"
+        );
+    }
+
+    /// A real rebinding must drop the cached expansion — the correctness half,
+    /// pinned at the cache rather than only through the emitted triples.
+    #[test]
+    fn a_rebinding_drops_the_cached_expansion() {
+        let doc = "@prefix e: <http://a/> .\n\
+                   e:x <http://p/> \"1\" .\n\
+                   @prefix e: <http://b/> .\n\
+                   e:x <http://p/> \"2\" .\n";
+        assert_eq!(
+            prefixed_cache_counts(doc),
+            (0, 2),
+            "a rebinding MUST clear the expansion cache"
+        );
+    }
 
     fn parse_to_graph(input: &str) -> Result<Graph> {
         let mut sink = GraphCollectorSink::new();

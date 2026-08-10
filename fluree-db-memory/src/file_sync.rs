@@ -16,7 +16,7 @@ use tracing::debug;
 ///
 /// Bump this when the canonical Turtle format, predicate set, or `@fulltext`
 /// injection rules change — forces a rebuild even if files haven't changed.
-const SCHEMA_VERSION_SALT: &str = "MEMORY_SCHEMA_V1";
+const SCHEMA_VERSION_SALT: &str = "MEMORY_SCHEMA_V2";
 
 /// Maximum payload size (bytes) per transact batch during rebuild.
 const MAX_BATCH_BYTES: usize = 512 * 1024; // 512 KB

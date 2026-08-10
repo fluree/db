@@ -391,6 +391,82 @@ pub async fn openapi_spec() -> Result<Json<serde_json::Value>> {
                     }
                 }
             },
+            "/v1/fluree/bm25/create": {
+                "post": {
+                    "summary": "Create a BM25 full-text search index over a ledger",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {
+                                            "type": "string",
+                                            "description": "Graph-source name for the index (no ':'); the alias is <name>:<branch>"
+                                        },
+                                        "ledger": {
+                                            "type": "string",
+                                            "description": "Source ledger alias to index"
+                                        },
+                                        "branch": {
+                                            "type": "string",
+                                            "description": "Branch for the index graph source (default \"main\")"
+                                        },
+                                        "query": {
+                                            "type": "object",
+                                            "description": "Indexing query (FQL / JSON-LD) selecting the documents and text properties to index; must select @id"
+                                        },
+                                        "k1": {
+                                            "type": "number",
+                                            "description": "Term-frequency saturation (default 1.2)"
+                                        },
+                                        "b": {
+                                            "type": "number",
+                                            "description": "Document-length normalization, 0..=1 (default 0.75)"
+                                        }
+                                    },
+                                    "required": ["name", "ledger", "query"]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/v1/fluree/bm25/sync": {
+                "post": {
+                    "summary": "Sync a BM25 full-text index",
+                    "description": "Syncs through the source ledger's head, or through `t` when supplied",
+                    "parameters": [
+                        {
+                            "name": "t",
+                            "in": "query",
+                            "required": false,
+                            "description": "Source-ledger commit t to sync through. Omit to sync through the source's current head.",
+                            "schema": {
+                                "type": "integer",
+                                "format": "int64",
+                                "minimum": 1
+                            }
+                        }
+                    ],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "index": {
+                                            "type": "string",
+                                            "description": "Index graph-source alias to sync (e.g. \"docsearch:main\")"
+                                        }
+                                    },
+                                    "required": ["index"]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "/v1/fluree/query": {
                 "post": {
                     "summary": "Execute a query",

@@ -986,13 +986,20 @@ pub fn gs_record_to_jsonld(record: &GraphSourceRecord) -> JsonValue {
 // Graph-source config secret redaction (defense-in-depth)
 // ============================================================================
 
-/// Object keys whose values are secrets and must never reach a client. Matched
-/// case-insensitively anywhere in a stored graph-source config JSON tree. This
-/// mirrors the redacting `Debug` impls added at the config secret leaves
-/// (`ConfigValue`, `OAuth2Config`, bearer/vended) for the *serialized* form.
+/// Object keys whose values are secrets and must never reach a client.
+/// A key is secret when its lowercased name matches this list EXACTLY, or
+/// ends in one of the credential-family suffixes `_token` / `_secret` /
+/// `_password` — so an `id_token`, `access_token`, or `bearer_token` added
+/// to some config later is redacted by default instead of leaking until
+/// someone extends the list. Applies at every depth of a stored config JSON
+/// tree. This mirrors the redacting `Debug` impls added at the config secret
+/// leaves (`ConfigValue`, `OAuth2Config`, bearer/vended) for the
+/// *serialized* form.
 ///
 /// NOTE: `client_id`, `catalog uri`, `warehouse`, `scope`, and `audience` are
-/// intentionally NOT secret (they identify, not authenticate) and are preserved.
+/// intentionally NOT secret (they identify, not authenticate) and are
+/// preserved — none of them carry a credential-family suffix, and endpoint
+/// keys like `token_url` don't either.
 const SECRET_CONFIG_KEYS: &[&str] = &[
     "client_secret",
     "token",
@@ -1003,11 +1010,19 @@ const SECRET_CONFIG_KEYS: &[&str] = &[
     "secret_access_key",
     "session_token",
     "default_val",
+    // OAuth refresh tokens (the CLI's `.fluree/config.toml` stores one per
+    // remote under `remotes.auth.refresh_token`; `fluree config list` redacts
+    // through this same list). Covered by the `_token` suffix rule too; kept
+    // for explicitness.
+    "refresh_token",
 ];
 
 fn is_secret_config_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     SECRET_CONFIG_KEYS.iter().any(|s| *s == lower)
+        || lower.ends_with("_token")
+        || lower.ends_with("_secret")
+        || lower.ends_with("_password")
 }
 
 /// True iff `v` is EXACTLY `{"secret_ref": "<string>"}` — the wire shape of
@@ -2527,6 +2542,57 @@ impl<'a> LedgerInfoBuilder<'a> {
 mod tests {
     use super::*;
 
+    /// Pins redaction of every secret-bearing key the CLI writes into
+    /// `.fluree/config.toml` (`RemoteAuth` in fluree-db-nameservice-sync) —
+    /// that struct and `SECRET_CONFIG_KEYS` live in different crates with
+    /// nothing else tying them together, so this test is the tie: a new
+    /// credential field on `RemoteAuth` must be added to the list AND here,
+    /// or `fluree config list` leaks it on the next release.
+    #[test]
+    fn redacts_every_cli_config_credential_key() {
+        let mut config = serde_json::json!({
+            "remotes": [{
+                "name": "origin",
+                "auth": {
+                    "type": "oidc_device",
+                    "token": "live-access-token",
+                    "refresh_token": "live-refresh-token",
+                    "issuer": "https://stack.example",
+                    "client_id": "cli-client"
+                }
+            }]
+        });
+        assert!(redact_json_secrets(&mut config));
+        let rendered = config.to_string();
+        assert!(!rendered.contains("live-access-token"));
+        assert!(!rendered.contains("live-refresh-token"));
+        // Identifying (non-authenticating) fields survive.
+        assert!(rendered.contains("https://stack.example"));
+        assert!(rendered.contains("cli-client"));
+        assert!(rendered.contains("[redacted]"));
+    }
+
+    /// The credential-family suffix rule: token-ish keys nobody thought to
+    /// enumerate must redact by default, while identifying keys that merely
+    /// *mention* tokens (endpoints) survive.
+    #[test]
+    fn credential_family_suffixes_redact_by_default() {
+        let mut config = serde_json::json!({
+            "id_token": "leak-1",
+            "access_token": "leak-2",
+            "bearer_token": "leak-3",
+            "api_secret": "leak-4",
+            "admin_password": "leak-5",
+            "token_url": "https://idp.example/oauth2/token"
+        });
+        assert!(redact_json_secrets(&mut config));
+        let rendered = config.to_string();
+        for leak in ["leak-1", "leak-2", "leak-3", "leak-4", "leak-5"] {
+            assert!(!rendered.contains(leak), "{leak} survived redaction");
+        }
+        assert!(rendered.contains("https://idp.example/oauth2/token"));
+    }
+
     /// T1.2 routing predicate — the empty-shell gate that decides native
     /// full-stats vs the metadata-only graph-source path. Covers the team-lead's
     /// (a)/(b)/(e) cases as a truth table (the wiring in `execute` then does the
@@ -3251,6 +3317,8 @@ mod tests {
             table: TableConfig::Identifier("ns.t".to_string()),
             io: IoConfig::default(),
             mapping: None,
+            delete: None,
+            order_by: None,
         };
 
         let stored = cfg.to_json().unwrap();
@@ -3338,6 +3406,13 @@ mod tests {
                 scope: None,
                 audience: None,
             },
+            // Metadata-server auth carries no secret (tokens are fetched at
+            // runtime), so there is nothing to redact — but the canary below
+            // still requires it to be covered.
+            AuthConfig::GoogleMetadata {
+                scopes: None,
+                metadata_url: None,
+            },
         ];
 
         // Exhaustiveness canary — NO wildcard arm. A new AuthConfig variant
@@ -3347,7 +3422,8 @@ mod tests {
             match auth {
                 AuthConfig::None
                 | AuthConfig::Bearer { .. }
-                | AuthConfig::OAuth2ClientCredentials { .. } => {}
+                | AuthConfig::OAuth2ClientCredentials { .. }
+                | AuthConfig::GoogleMetadata { .. } => {}
             }
         }
 
@@ -3362,6 +3438,8 @@ mod tests {
                 table: TableConfig::Identifier("ns.t".to_string()),
                 io: IoConfig::default(),
                 mapping: None,
+                delete: None,
+                order_by: None,
             };
             let stored = cfg.to_json().unwrap();
             let redacted = redact_graph_source_config(&stored);

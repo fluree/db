@@ -319,6 +319,16 @@ pub enum Commands {
         #[arg(long, default_value_t = 0)]
         parallelism: usize,
 
+        /// Namespace that salts the blank-node ids this import mints.
+        /// Defaults to the ledger id, so importing one source tree into two
+        /// ledgers gives them disjoint blank nodes. Pass the same value to
+        /// both to make them mint IDENTICAL ids instead — for a
+        /// rebuild-and-diff, a sharded load of one logical dataset, or a
+        /// staging/production pair you want to compare node-for-node.
+        /// Any string; two imports match iff they agree on it.
+        #[arg(long)]
+        skolem_namespace: Option<String>,
+
         /// Records per leaflet in index files. Default: 25000.
         /// Larger values produce fewer, bigger leaflets (less I/O, more memory per read).
         #[arg(long, default_value_t = 25_000)]
@@ -402,13 +412,13 @@ pub enum Commands {
 
     /// Create, list, sync, or drop BM25 full-text search indexes (graph sources).
     ///
-    /// BM25 index creation has no HTTP endpoint today — it is a Rust-API-only
-    /// operation (`Bm25CreateConfig` + `create_full_text_index`). These commands
-    /// expose it: they run in-process against local storage (no server
-    /// round-trip), so they work under `docker exec` against a running server's
-    /// data directory. Querying the resulting index is done either through the
-    /// standalone `fluree-search-httpd` service (`POST /v1/search`) or, embedded,
-    /// via an FQL `f:searchText` query.
+    /// These commands run against a server when one is reachable — `--remote
+    /// <name>` picks a configured remote, and otherwise a locally-running server
+    /// is used automatically. Pass `--direct` to force in-process execution
+    /// against local storage, which also works under `docker exec` against a
+    /// running server's data directory. Querying the resulting index is done
+    /// either through the standalone `fluree-search-httpd` service
+    /// (`POST /v1/search`) or, embedded, via an FQL `f:searchText` query.
     ///
     /// Examples:
     ///   fluree bm25 create --name silver-search --ledger silver:main -f index-query.json
@@ -968,6 +978,21 @@ pub enum Commands {
         shell: clap_complete::Shell,
     },
 
+    /// Emit a machine-readable manifest of this binary's CLI surface (JSON)
+    ///
+    /// Hidden machine plumbing: generated from the clap definitions (command
+    /// paths, flags, value enums, positionals, compiled features — no help
+    /// text), published as a release asset, and consumed by CI in dependent
+    /// repos to validate the `fluree ...` strings they ship. Named without a
+    /// `__` prefix because clap_complete's bash generator uses `__` as its
+    /// command-path separator and panics on such names.
+    #[command(hide = true)]
+    Manifest {
+        /// Write to a file instead of stdout
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+    },
+
     /// Manage JWS tokens for authentication
     Token {
         #[command(subcommand)]
@@ -1299,6 +1324,10 @@ pub enum Bm25Action {
         /// BM25 b (document-length normalization, 0..=1). Default 0.75.
         #[arg(long)]
         b: Option<f64>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Drop (retract) a BM25 full-text index and delete its snapshots.
@@ -1310,6 +1339,10 @@ pub enum Bm25Action {
         /// Required flag to confirm deletion
         #[arg(long)]
         force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Sync a BM25 full-text index up to its source ledger's latest state.
@@ -1318,13 +1351,20 @@ pub enum Bm25Action {
     /// the index's stored watermark — falling back to a full rebuild if needed.
     /// A no-op when the index is already current. Run this from a maintenance
     /// job (once per index) to keep search fresh as the source ledger is
-    /// materialized/updated; it runs in-process against local storage, so it
-    /// works under `docker exec` against a running server's data directory
-    /// (same as `create`/`drop`).
+    /// materialized/updated — or start the server with `--bm25-auto-sync` to
+    /// have it sync on every source commit.
     Sync {
         /// Index graph-source alias to sync (e.g. "silver-search:main").
         #[arg(long)]
         index: String,
+
+        /// Sync through this source-ledger `t` instead of the source's head.
+        #[arg(long)]
+        t: Option<i64>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// List BM25 full-text indexes with their source ledger and staleness.
@@ -1339,6 +1379,10 @@ pub enum Bm25Action {
         /// Print only stale indexes, one alias per line (script-friendly).
         #[arg(long)]
         stale: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 
@@ -2067,6 +2111,31 @@ pub enum MemoryAction {
     /// Show memory store status
     Status,
 
+    /// Audit the memory store against the hygiene rubric
+    ///
+    /// Flags effort narration, unportable paths, over-cap content, bad tags,
+    /// refs that no longer resolve or whose files changed after the memory did,
+    /// and files this branch changed that no memory covers. Read-only — act on
+    /// the findings with `update`, `forget`, and `add`.
+    ///
+    /// Examples:
+    ///   fluree memory audit
+    ///   fluree memory audit --base develop
+    ///   fluree memory audit --all --format json
+    Audit {
+        /// Audit every memory instead of just this branch's
+        #[arg(long)]
+        all: bool,
+
+        /// Base ref the branch is compared against
+        #[arg(long, default_value = fluree_db_memory::DEFAULT_BASE_REF)]
+        base: String,
+
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
     /// Export all memories as JSON
     Export,
 
@@ -2392,7 +2461,14 @@ pub enum ConfigAction {
     },
 
     /// List all configuration values
-    List,
+    ///
+    /// Credential values (tokens, refresh tokens, client secrets) print as
+    /// `[redacted]`; pass `--reveal` to print them in the clear.
+    List {
+        /// Print credential values in the clear instead of `[redacted]`
+        #[arg(long)]
+        reveal: bool,
+    },
 
     /// Set origin configuration for a ledger (content origins for CID-based fetch)
     SetOrigins {
@@ -2694,7 +2770,7 @@ pub enum AuthAction {
     /// composes into .env files and shell substitution:
     /// `FLUREE_TOKEN=$(fluree auth token --remote prod)`. Warns on stderr
     /// if the token is expired. The refresh token is never printed; use
-    /// `fluree config list` only if you truly need the raw config.
+    /// `fluree config list --reveal` only if you truly need the raw config.
     Token {
         /// Remote name (defaults to only configured remote)
         #[arg(long)]

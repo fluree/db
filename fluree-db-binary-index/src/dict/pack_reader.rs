@@ -1,4 +1,4 @@
-//! Multi-pack reader with mmap support for forward dictionary packs.
+//! Multi-pack reader for forward dictionary packs.
 //!
 //! `ForwardPackReader` manages one or more `FPK1` packs and routes lookups
 //! to the correct pack via binary search on ID ranges.
@@ -56,7 +56,7 @@ enum LoadedBacking {
 
 struct LazyLoaded {
     meta: ParsedPackMeta,
-    mmap: memmap2::Mmap,
+    backing: LoadedBacking,
 }
 
 impl LoadedBacking {
@@ -70,7 +70,7 @@ impl LoadedBacking {
 
 impl PackHandle {
     /// Get pre-parsed metadata and raw bytes. For lazy packs, triggers
-    /// fetch + cache + mmap + parse on first call (subsequent calls return cached).
+    /// fetch + cache + load + parse on first call (subsequent calls return cached).
     fn ensure_loaded(&self, ctx: Option<&LoadContext>) -> io::Result<(&ParsedPackMeta, &[u8])> {
         match &self.inner {
             PackInner::Loaded { meta, backing } => Ok((meta, backing.bytes())),
@@ -83,7 +83,7 @@ impl PackHandle {
                 let lazy = loaded.get_or_try_init(|| {
                     fetch_and_load(self.first_id, self.last_id, pack_cid, cache_path, ctx)
                 })?;
-                Ok((&lazy.meta, lazy.mmap.as_ref()))
+                Ok((&lazy.meta, lazy.backing.bytes()))
             }
         }
     }
@@ -117,9 +117,14 @@ impl ForwardPackReader {
     /// Load packs from CAS. Does not perform remote fetches.
     ///
     /// For each `PackBranchEntry`:
-    /// 1. If `cs.resolve_local_path(&cid)` returns a path → mmap + validate → `Loaded`.
-    /// 2. Else if cache file exists → mmap + validate → `Loaded`.
-    /// 3. Else → `Lazy` handle (fetched + cached + mmapped on first lookup).
+    /// 1. If `cs.resolve_local_path(&cid)` returns a path → load + validate → `Loaded`.
+    /// 2. Else if cache file exists → load + validate → `Loaded`.
+    /// 3. Else → `Lazy` handle (fetched + cached + loaded on first lookup).
+    ///
+    /// "Load" is `read()` for small packs and `mmap` for large ones — see
+    /// [`DEFAULT_MMAP_MIN_BYTES`]. This path is eager over EVERY pack in the
+    /// routing table, so it is where a mapping-per-pack becomes a hard cap on
+    /// how many ledgers a process can hold open at once.
     ///
     /// Loaded packs are validated: ID range must match the routing entry, and
     /// `kind`/`ns_code` must match `expected_kind`/`expected_ns_code`. Lazy packs
@@ -147,30 +152,24 @@ impl ForwardPackReader {
             let local_path = cs.resolve_local_path(&entry.pack_cid);
 
             if let Some(path) = local_path {
-                // Local CAS path — mmap directly.
-                let mmap = mmap_file(&path)?;
-                let meta = parse_pack_meta(mmap.as_ref())?;
+                // Local CAS path.
+                let backing = load_pack_backing(&path)?;
+                let meta = parse_pack_meta(backing.bytes())?;
                 validate_meta(&meta, entry, expected_kind, expected_ns_code)?;
                 packs.push(PackHandle {
                     first_id: entry.first_id,
                     last_id: entry.last_id,
-                    inner: PackInner::Loaded {
-                        meta,
-                        backing: LoadedBacking::Mmap(mmap),
-                    },
+                    inner: PackInner::Loaded { meta, backing },
                 });
             } else if cache_path.exists() {
-                // Cached on disk — mmap.
-                let mmap = mmap_file(&cache_path)?;
-                let meta = parse_pack_meta(mmap.as_ref())?;
+                // Cached on disk.
+                let backing = load_pack_backing(&cache_path)?;
+                let meta = parse_pack_meta(backing.bytes())?;
                 validate_meta(&meta, entry, expected_kind, expected_ns_code)?;
                 packs.push(PackHandle {
                     first_id: entry.first_id,
                     last_id: entry.last_id,
-                    inner: PackInner::Loaded {
-                        meta,
-                        backing: LoadedBacking::Mmap(mmap),
-                    },
+                    inner: PackInner::Loaded { meta, backing },
                 });
             } else {
                 // Remote — defer to lazy fetch on first lookup.
@@ -403,16 +402,16 @@ fn fetch_and_load(
 ) -> io::Result<LazyLoaded> {
     // Fast paths: check if something appeared since construction.
     if let Some(path) = ctx.cs.resolve_local_path(pack_cid) {
-        let mmap = mmap_file(&path)?;
-        let meta = parse_pack_meta(mmap.as_ref())?;
+        let backing = load_pack_backing(&path)?;
+        let meta = parse_pack_meta(backing.bytes())?;
         validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
-        return Ok(LazyLoaded { meta, mmap });
+        return Ok(LazyLoaded { meta, backing });
     }
     if cache_path.exists() {
-        let mmap = mmap_file(cache_path)?;
-        let meta = parse_pack_meta(mmap.as_ref())?;
+        let backing = load_pack_backing(cache_path)?;
+        let meta = parse_pack_meta(backing.bytes())?;
         validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
-        return Ok(LazyLoaded { meta, mmap });
+        return Ok(LazyLoaded { meta, backing });
     }
 
     // Remote fetch: bridge the sync lookup to the async CAS get via the shared
@@ -456,14 +455,18 @@ fn fetch_and_load(
         io::Error::other(format!("lazy pack fetch: {e}"))
     })?;
 
-    // Write to cache, then mmap the cache file (no heap duplication).
+    // Write to cache, then re-open it. Re-opening rather than keeping `bytes`
+    // is deliberate: `load_pack_backing` is the single place that decides
+    // read-vs-mmap, so a large pack still ends up mapped (no heap duplication)
+    // and a small one still ends up on the heap, without duplicating the
+    // threshold logic here.
     atomic_write_to_cache(cache_path, &bytes)?;
     drop(bytes);
 
-    let mmap = mmap_file(cache_path)?;
-    let meta = parse_pack_meta(mmap.as_ref())?;
+    let backing = load_pack_backing(cache_path)?;
+    let meta = parse_pack_meta(backing.bytes())?;
     validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
-    Ok(LazyLoaded { meta, mmap })
+    Ok(LazyLoaded { meta, backing })
 }
 
 /// Validate metadata for a lazily loaded pack (same checks as eager, but using
@@ -508,15 +511,73 @@ fn validate_lazy_meta(
 // Helpers
 // ============================================================================
 
-fn mmap_file(path: &Path) -> io::Result<memmap2::Mmap> {
+/// Packs at or below this many bytes are `read()` into the heap instead of
+/// being mapped. Override with `FLUREE_DICT_PACK_MMAP_MIN_BYTES`; 0 restores
+/// the old always-mmap behaviour.
+///
+/// **A mapping is a scarcer resource than the bytes it exposes.** Every mmap
+/// costs a VMA, and a process is hard-capped at `vm.max_map_count` (65,530 by
+/// default) *regardless of how much memory is free* — past it `mmap` returns
+/// ENOMEM, which surfaces here as "failed to load binary index: Cannot allocate
+/// memory (os error 12)" on a host with gigabytes idle. That is not a
+/// theoretical limit: dict packs are per-ID-range and never compacted, so a
+/// ledger's routing table grows without bound. Measured on one deployment,
+/// 23 ledgers held **103,426 packs** and the process carried **47,336
+/// mappings** against the 65,530 cap — every ledger load pushing it closer, and
+/// raising the container's memory limit doing nothing at all because bytes were
+/// never the constraint.
+///
+/// The size split works because pack sizes are extremely skewed: on that same
+/// deployment **91% of packs were under 4 KiB and 99.8% of the mapped ones were
+/// under 64 KiB, holding 30 MB between them.** Mapping a 113-byte file (the
+/// median!) spends a VMA and a whole page of address space to expose less than
+/// a cache line's worth of useful data. So this trades ~30 MB of heap for
+/// ~47,000 mappings, and the large packs that actually justify demand paging —
+/// 5,728 files holding 12.1 of the 12.5 GiB — still get mapped.
+const DEFAULT_MMAP_MIN_BYTES: u64 = 64 * 1024;
+
+fn mmap_min_bytes() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FLUREE_DICT_PACK_MMAP_MIN_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MMAP_MIN_BYTES)
+    })
+}
+
+/// Open a pack: heap-read when small, mmap when large. See
+/// [`DEFAULT_MMAP_MIN_BYTES`] for why the small case is the important one.
+fn load_pack_backing(path: &Path) -> io::Result<LoadedBacking> {
     let file = std::fs::File::open(path).map_err(|e| {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!("open pack file {}: {}", path.display(), e),
         )
     })?;
+
+    // A failed `metadata()` falls through to mmap rather than erroring: the
+    // threshold is an optimisation, so losing the size must not lose the read.
+    let small = match file.metadata() {
+        Ok(meta) => meta.len() <= mmap_min_bytes(),
+        Err(_) => false,
+    };
+
+    if small {
+        // `read_to_end` on a fresh Vec, not `fs::read`, so the already-open
+        // handle is reused and the path is not resolved twice (a GC/promotion
+        // unlink between the two would turn a live pack into NotFound).
+        let mut bytes = Vec::new();
+        {
+            use std::io::Read;
+            let mut file = file;
+            file.read_to_end(&mut bytes)?;
+        }
+        return Ok(LoadedBacking::InMemory(Arc::from(bytes)));
+    }
+
     // SAFETY: The file is an immutable CAS artifact, not concurrently modified.
-    unsafe { memmap2::Mmap::map(&file) }
+    Ok(LoadedBacking::Mmap(unsafe { memmap2::Mmap::map(&file)? }))
 }
 
 /// Page size used to stride `touch_pages`. 4 KiB is the smallest common page
@@ -804,5 +865,78 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    /// A small pack must be read onto the heap, not mapped — the whole point of
+    /// [`DEFAULT_MMAP_MIN_BYTES`]. Asserting on the backing VARIANT rather than
+    /// on lookups is deliberate: lookups pass either way, which is exactly why
+    /// the mapping leak went unnoticed for months. This is the only assertion
+    /// that can fail if someone reverts to always-mmap.
+    #[test]
+    fn small_packs_are_read_not_mapped() {
+        let bytes = make_pack_bytes(0, 10);
+        assert!(
+            (bytes.len() as u64) <= DEFAULT_MMAP_MIN_BYTES,
+            "fixture must be under the threshold to exercise the read path, got {} bytes",
+            bytes.len()
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("fluree_test_small_pack_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("small.fpk");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let backing = load_pack_backing(&path).unwrap();
+        assert!(
+            matches!(backing, LoadedBacking::InMemory(_)),
+            "a {}-byte pack must not consume a VMA",
+            bytes.len()
+        );
+        // The bytes must survive the trip, or we have traded a mapping for a bug.
+        assert_eq!(backing.bytes(), bytes.as_slice());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Above the threshold we still map: large packs are where demand paging
+    /// actually pays, and this pins that the split is a split and not a
+    /// wholesale move to heap reads (which would pull GiB-sized packs into RAM).
+    #[test]
+    fn large_packs_are_still_mapped() {
+        let dir =
+            std::env::temp_dir().join(format!("fluree_test_large_pack_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("large.fpk");
+        // Content is irrelevant here — load_pack_backing does not parse.
+        std::fs::write(&path, vec![0u8; (DEFAULT_MMAP_MIN_BYTES + 1) as usize]).unwrap();
+
+        let backing = load_pack_backing(&path).unwrap();
+        assert!(
+            matches!(backing, LoadedBacking::Mmap(_)),
+            "packs over the threshold should still be mapped"
+        );
+        assert_eq!(backing.bytes().len(), (DEFAULT_MMAP_MIN_BYTES + 1) as usize);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boundary is inclusive (`<=`), so a pack exactly at the threshold is
+    /// read. Pinned because an off-by-one here silently changes which side of
+    /// the split the most common pack size lands on.
+    #[test]
+    fn threshold_boundary_is_inclusive() {
+        let dir =
+            std::env::temp_dir().join(format!("fluree_test_edge_pack_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("edge.fpk");
+        std::fs::write(&path, vec![0u8; DEFAULT_MMAP_MIN_BYTES as usize]).unwrap();
+
+        assert!(matches!(
+            load_pack_backing(&path).unwrap(),
+            LoadedBacking::InMemory(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

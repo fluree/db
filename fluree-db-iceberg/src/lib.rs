@@ -83,7 +83,9 @@ pub(crate) fn env_switch_enabled(name: &str) -> bool {
 }
 
 // Re-export commonly used types
-pub use config::{CatalogConfig, IcebergGsConfig, IoConfig, MappingSource, TableConfig};
+pub use config::{
+    CatalogConfig, DeleteConvention, IcebergGsConfig, IoConfig, MappingSource, TableConfig,
+};
 pub use config_value::{ConfigValue, SecretResolveError, SecretResolver};
 pub use error::{IcebergError, Result};
 pub use mor_guard::{
