@@ -28,6 +28,7 @@ use super::ast::{
     UnresolvedOptions, UnresolvedSortDirection, UnresolvedSortSpec,
 };
 use super::error::{ParseError, Result};
+use super::filter_common;
 use super::filter_sexpr;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -289,28 +290,6 @@ pub fn parse_group_by(obj: &serde_json::Map<String, JsonValue>) -> Result<Vec<Ar
     }
 }
 
-/// Parse having from JSON
-///
-/// HAVING filters results after aggregation (similar to SQL HAVING).
-///
-/// # Example
-///
-/// ```json
-/// {
-///   "groupBy": ["?category"],
-///   "having": [">=", ["count", "?item"], 5]
-/// }
-/// ```
-///
-/// Note: This function requires `parse_filter_expr` from the parent module.
-/// It returns `None` if no "having" key is present.
-pub fn parse_having(
-    obj: &serde_json::Map<String, JsonValue>,
-    parse_filter_expr: impl Fn(&JsonValue) -> Result<UnresolvedExpression>,
-) -> Result<Option<UnresolvedExpression>> {
-    obj.get("having").map(parse_filter_expr).transpose()
-}
-
 /// Parse HAVING and extract aggregate specs from S-expression forms.
 ///
 /// Compatibility:
@@ -331,6 +310,7 @@ fn parse_having_with_aggregates(
         }
         other => parse_filter_expr(other)?,
     };
+    filter_common::reject_constant_bool_expr(&raw_expr, "having")?;
 
     let mut aggregates: Vec<UnresolvedAggregateSpec> = Vec::new();
     let mut counter: usize = 0;
@@ -703,21 +683,5 @@ mod tests {
         let json_val = json!({"depth": -1});
         let obj = json_val.as_object().unwrap();
         assert!(parse_depth(obj).is_err());
-    }
-
-    #[test]
-    fn test_parse_having() {
-        let json_val = json!({"having": [">", "?count", 5]});
-        let obj = json_val.as_object().unwrap();
-        let dummy_filter = |_: &JsonValue| -> Result<UnresolvedExpression> {
-            Ok(UnresolvedExpression::boolean(true))
-        };
-        let result = parse_having(obj, dummy_filter).unwrap();
-        assert!(result.is_some());
-
-        let json_val2 = json!({});
-        let obj2 = json_val2.as_object().unwrap();
-        let result = parse_having(obj2, dummy_filter).unwrap();
-        assert!(result.is_none());
     }
 }
