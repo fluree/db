@@ -44,7 +44,7 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
         .grouping
         .iter()
         .flat_map(Grouping::aggregates)
-        .any(|spec| matches!(spec.function, AggregateFn::CountDistinctAll))
+        .any(|spec| matches!(spec.function, AggregateFn::CountDistinctAll(_)))
     {
         return None;
     }

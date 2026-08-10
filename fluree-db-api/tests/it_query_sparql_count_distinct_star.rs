@@ -170,6 +170,101 @@ async fn sparql_count_distinct_star_traditional_path() {
     );
 }
 
+/// Two `ex:a/ex:b` routes from `ex:s` to `ex:o` through different middle nodes.
+/// The two solutions agree on `(?s, ?o)` and differ only in the path-join
+/// variable the lowerer synthesized.
+async fn seed_two_paths(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:s", "ex:a": [{"@id": "ex:x1"}, {"@id": "ex:x2"}]},
+            {"@id": "ex:x1", "ex:b": {"@id": "ex:o"}},
+            {"@id": "ex:x2", "ex:b": {"@id": "ex:o"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+/// `*` is the solution mapping, and SPARQL projects the lowerer's property-path
+/// join variable (`?__ppN`) out of it. Two routes give two solutions that are
+/// identical on `(?s, ?o)`, so the answer is 1 — counting the raw executor row
+/// would say 2. `COUNT(*)` still sees both, which is what makes this a
+/// discriminator rather than a tautology.
+#[tokio::test]
+async fn sparql_count_distinct_star_ignores_property_path_join_var() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_two_paths(&fluree, "sparql/cds-path:main").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT (COUNT(*) AS ?all) (COUNT(DISTINCT *) AS ?distinct)
+        WHERE { ?s ex:a/ex:b ?o }";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("COUNT(DISTINCT *) over a property path")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[2, 1]])));
+}
+
+/// Same divergence on the traditional grouping path, which reconstructs the
+/// group's solutions from its `Grouped` columns rather than hashing rows.
+#[tokio::test]
+async fn sparql_count_distinct_star_ignores_path_join_var_traditional_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_two_paths(&fluree, "sparql/cds-path-trad:main").await;
+
+    let query = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s (COUNT(DISTINCT *) AS ?distinct) (GROUP_CONCAT(?nm; SEPARATOR="|") AS ?g)
+        WHERE { ?s ex:a/ex:b ?o . OPTIONAL { ?o ex:name ?nm } } GROUP BY ?s"#;
+
+    let db = graphdb_from_ledger(&ledger);
+    let physical = fluree
+        .explain_sparql(&db, query)
+        .await
+        .expect("explain_sparql")["plan"]["physical"]
+        .clone();
+    assert!(
+        physical_contains_op(&physical, "AggregateOperator")
+            && !physical_contains_op(&physical, "GroupAggregateOperator"),
+        "expected the traditional grouping pair, got: {physical}"
+    );
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("COUNT(DISTINCT *) over a property path, traditional path")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:s", 1, null]]))
+    );
+}
+
+/// Blank-node variables are non-distinguished (SPARQL §4.1.4) and likewise
+/// outside the solution mapping: `ex:s` reaches two objects through `ex:a`, but
+/// the only visible variable is `?s`, so there is one distinct solution.
+#[tokio::test]
+async fn sparql_count_distinct_star_ignores_blank_node_var() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_two_paths(&fluree, "sparql/cds-bnode:main").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT (COUNT(*) AS ?all) (COUNT(DISTINCT *) AS ?distinct)
+        WHERE { ?s ex:a _:mid }";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("COUNT(DISTINCT *) with a blank-node variable")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[2, 1]])));
+}
+
 /// HAVING over `COUNT(DISTINCT *)`, and the plain `COUNT(*)` control alongside
 /// it, so the two no-input aggregates cannot be confused for one another.
 #[tokio::test]

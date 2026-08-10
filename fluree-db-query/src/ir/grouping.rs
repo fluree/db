@@ -39,10 +39,19 @@ pub enum AggregateFn {
     /// `COUNT(*)` — count all rows in a group regardless of values.
     CountAll,
     /// `COUNT(DISTINCT *)` — count the *distinct solutions* in a group
-    /// (SPARQL 1.1 §18.5.1.1). Unlike every other variant this reads the whole
-    /// row rather than one column, so it carries no input variable and the
-    /// group operators compose its key from every upstream column.
-    CountDistinctAll,
+    /// (SPARQL 1.1 §18.5.1.1). Unlike every other variant this reads a whole
+    /// row rather than one column, so it carries no input variable.
+    ///
+    /// The payload is the query's **user-visible** variables, in registration
+    /// order. `*` denotes the solution mapping, and SPARQL projects
+    /// lowering-internal variables out of it — property-path join variables
+    /// (`?__ppN`) and non-distinguished blank-node variables (§4.1.4) among
+    /// them. Composing distinctness over the raw upstream row would let those
+    /// split solutions that the spec considers identical, so the group
+    /// operators intersect this list with their input schema and read only
+    /// those columns. Variables from other scopes (or SELECT aliases, which
+    /// never reach the pre-grouping row) drop out in that intersection.
+    CountDistinctAll(Vec<VarId>),
     /// `COUNT(DISTINCT ?x)` — count distinct non-Unbound values. Separate
     /// variant because its streaming state uses a `HashSet` rather than a
     /// counter.
@@ -82,7 +91,7 @@ impl AggregateFn {
     /// only for [`Self::CountAll`].
     pub fn input_var(&self) -> Option<VarId> {
         match self {
-            Self::CountAll | Self::CountDistinctAll => None,
+            Self::CountAll | Self::CountDistinctAll(_) => None,
             Self::Count(v)
             | Self::CountDistinct(v)
             | Self::Sum(v, _)
@@ -107,7 +116,7 @@ impl AggregateFn {
         matches!(
             self,
             Self::CountDistinct(_)
-                | Self::CountDistinctAll
+                | Self::CountDistinctAll(_)
                 | Self::Sum(_, InputSemantics::Set)
                 | Self::Avg(_, InputSemantics::Set)
                 | Self::Median(_, InputSemantics::Set)
@@ -144,7 +153,7 @@ impl AggregateFn {
             // dead variables* before deduping — and dropping a column changes
             // which rows are distinct. Classified false so the whole-row read
             // always sees the full solution.
-            Self::CountDistinctAll => false,
+            Self::CountDistinctAll(_) => false,
             Self::CountDistinct(_)
             | Self::Sum(..)
             | Self::Avg(..)
@@ -166,7 +175,7 @@ impl AggregateFn {
             }
         };
         match self {
-            Self::CountAll | Self::CountDistinctAll => {}
+            Self::CountAll | Self::CountDistinctAll(_) => {}
             Self::Count(v)
             | Self::CountDistinct(v)
             | Self::Sum(v, _)

@@ -56,6 +56,9 @@ pub struct AggregateOperator {
     group_size_col: Option<usize>,
     /// Number of columns from child schema (before extra additions)
     child_col_count: usize,
+    /// Child columns each `COUNT(DISTINCT *)` composes its solution from,
+    /// parallel to `aggregates`; `None` for every other aggregate.
+    row_distinct_cols: Vec<Option<Vec<usize>>>,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
     /// Graph view for materializing encoded bindings before value-folding
@@ -128,6 +131,19 @@ impl AggregateOperator {
 
         let schema: Arc<[VarId]> = Arc::from(output_vars.into_boxed_slice());
 
+        // Resolve each COUNT(DISTINCT *)'s visible variables to child columns.
+        let row_distinct_cols: Vec<Option<Vec<usize>>> = aggregates
+            .iter()
+            .map(|spec| match &spec.function {
+                AggregateFn::CountDistinctAll(vars) => Some(
+                    vars.iter()
+                        .filter_map(|v| child_schema.iter().position(|sv| sv == v))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+
         Self {
             child,
             aggregates,
@@ -137,6 +153,7 @@ impl AggregateOperator {
             extra_specs,
             group_size_col,
             child_col_count,
+            row_distinct_cols,
             out_schema: None,
             graph_view: None,
         }
@@ -255,14 +272,18 @@ impl Operator for AggregateOperator {
                             })
                             .collect(),
                         // COUNT(DISTINCT *): the number of distinct solutions in
-                        // the group, composed across every child column.
-                        None if matches!(spec.function, AggregateFn::CountDistinctAll) => (0
-                            ..batch.len())
-                            .map(|row_idx| {
-                                let n = distinct_group_rows(&batch, row_idx, self.child_col_count);
-                                Binding::lit(FlakeValue::Long(n), xsd_integer())
-                            })
-                            .collect(),
+                        // the group, composed across the user-visible columns.
+                        None if self.row_distinct_cols[*agg_idx].is_some() => {
+                            let cols = self.row_distinct_cols[*agg_idx]
+                                .as_deref()
+                                .unwrap_or_default();
+                            (0..batch.len())
+                                .map(|row_idx| {
+                                    let n = distinct_group_rows(&batch, row_idx, cols);
+                                    Binding::lit(FlakeValue::Long(n), xsd_integer())
+                                })
+                                .collect()
+                        }
                         None => {
                             let sizes = group_sizes.get_or_insert_with(|| {
                                 (0..batch.len())
@@ -424,7 +445,7 @@ impl AggregateFn {
             // `AggregateOperator` computes it from every child column instead
             // (see `distinct_group_rows`). Assert in debug so a future wiring
             // change is caught rather than silently answering Unbound.
-            Self::CountDistinctAll => {
+            Self::CountDistinctAll(_) => {
                 debug_assert!(
                     false,
                     "COUNT(DISTINCT *) must be computed over the whole row, not one column"
@@ -763,9 +784,13 @@ fn agg_count_all(values: &[Binding]) -> Binding {
 /// cannot change which solutions are distinct — and a group with no grouped
 /// column at all is a set of rows agreeing on every column, i.e. exactly one
 /// distinct solution.
-fn distinct_group_rows(batch: &Batch, row_idx: usize, child_col_count: usize) -> i64 {
-    let grouped: Vec<&[Binding]> = (0..child_col_count)
-        .filter_map(|col_idx| match batch.get_by_col(row_idx, col_idx) {
+///
+/// `cols` restricts the reconstruction to the user-visible columns, matching
+/// what `*` denotes; see [`AggregateFn::CountDistinctAll`].
+fn distinct_group_rows(batch: &Batch, row_idx: usize, cols: &[usize]) -> i64 {
+    let grouped: Vec<&[Binding]> = cols
+        .iter()
+        .filter_map(|&col_idx| match batch.get_by_col(row_idx, col_idx) {
             Binding::Grouped(values) => Some(values.as_slice()),
             _ => None,
         })

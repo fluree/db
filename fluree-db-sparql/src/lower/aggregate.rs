@@ -231,7 +231,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             // row, so neither carries an input variable.
             (AggregateFunction::Count, None) => {
                 if *distinct {
-                    AggregateFn::CountDistinctAll
+                    // `*` is the solution mapping, so distinctness ranges over
+                    // the user-visible variables — not the lowering-internal
+                    // ones (`?__ppN`, `_:b`) that also sit in the executor's
+                    // row. The WHERE clause is lowered before the solution
+                    // modifiers, so every variable it binds is registered by now.
+                    AggregateFn::CountDistinctAll(self.user_visible_vars())
                 } else {
                     AggregateFn::CountAll
                 }
