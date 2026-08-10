@@ -492,11 +492,28 @@ decided from sizes and ID ranges alone, which is why no compaction state is
 carried in the root. Sizes come from an in-cycle memo, local file metadata, or
 a 40-byte header range read — never a full fetch.
 
-Work per cycle is bounded two ways: 64 MiB of merge input, and a cap on packs
-sized and fetched. The byte budget alone does not bound *request* count, since
-a backlog of 113-byte packs consumes almost none of it while still issuing a
-probe and a GET per pack; the object cap lets a large backlog drain over
+Each stream's **tail is examined first and unconditionally**, because that is
+where new packs land and so what keeps the table bounded. Only then are older
+regions swept for inherited fragmentation. Sweeping head-first instead lets a
+table larger than the scan budget hide its own tail: the budget is spent
+walking mature packs, the newest packs are never reached, and growth becomes
+unbounded again for exactly the largest dictionaries.
+
+Compaction also runs for streams that received **no novelty** this cycle. An
+active stream keeps itself tidy, but one that goes quiet — or whose work was
+cut short when a budget ran out — would otherwise keep its fragmentation
+forever while its packs are still loaded with the index. Coverage rotates with
+`index_t`, so a ledger with more streams than one cycle can service still
+reaches all of them over time without persisting a cursor.
+
+Work per cycle is bounded two ways, both shared across every stream: 64 MiB of
+merge input, and a count of storage operations. The byte budget alone does not
+bound *requests* — a backlog of 113-byte packs consumes almost none of it while
+still costing a probe and a GET per pack — and a per-stream counter would be
+multiplied by the namespace count. Every probe and fetch that reaches storage
+is charged against one cycle-wide budget, so a large backlog drains over
 several cycles instead of stalling one publish behind thousands of round trips.
+Probes and fetches issue concurrently.
 
 Superseded packs are diffed out of the routing table by
 `IncrementalRootBuilder::set_dict_refs` and land in the garbage manifest, so

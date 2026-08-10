@@ -230,3 +230,113 @@ async fn incremental_cycles_compact_the_forward_pack_tail() {
         })
         .await;
 }
+
+/// A namespace that stops receiving writes still has its packs loaded with the
+/// index, so maintenance must reach it: compaction runs for streams selected
+/// independently of this cycle's novelty, within the shared budget.
+#[tokio::test(flavor = "current_thread")]
+async fn a_namespace_that_goes_quiet_stays_bounded_and_readable() {
+    let storage = MemoryStorage::new();
+    let nameservice = MemoryNameService::new();
+
+    let mut fluree: Fluree = Fluree::new(
+        ConnectionConfig::memory(),
+        storage.clone(),
+        NameServiceMode::ReadWrite(Arc::new(nameservice.clone())),
+    );
+
+    let indexer_cfg = IndexerConfig::small()
+        .with_incremental_enabled(true)
+        .with_incremental_max_commits(10_000);
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree_db_core::StorageBackend::Managed(Arc::new(storage.clone())),
+        Arc::new(nameservice.clone()),
+        indexer_cfg,
+    );
+    fluree.set_indexing_mode(IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/fwd-pack-quiet-ns:main";
+            let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+
+            // Both namespaces active for the first few cycles, then `alt` goes
+            // permanently quiet while `ex` keeps writing.
+            const QUIET_AFTER: usize = 4;
+            const TOTAL: usize = 16;
+
+            let mut last_root = None;
+            for cycle in 0..TOTAL {
+                let mut nodes = vec![json!({
+                    "@id": format!("ex:cycle{cycle}"),
+                    "ex:label": format!("ex label {cycle}")
+                })];
+                if cycle < QUIET_AFTER {
+                    nodes.push(json!({
+                        "@id": format!("alt:cycle{cycle}"),
+                        "ex:label": format!("alt label {cycle}")
+                    }));
+                }
+
+                let tx = json!({
+                    "@context": {
+                        "ex": "http://example.org/",
+                        "alt": "http://alternate.example/"
+                    },
+                    "@graph": nodes
+                });
+
+                let r = fluree.insert(ledger, &tx).await.expect("insert");
+                ledger = r.ledger;
+                last_root = fluree
+                    .trigger_index(ledger_id, TriggerIndexOptions::default())
+                    .await
+                    .expect("trigger_index")
+                    .root_id;
+            }
+
+            let cs = fluree.content_store(ledger_id);
+            let root = fluree_db_binary_index::format::index_root::IndexRoot::decode(
+                &cs.get(&last_root.expect("root id"))
+                    .await
+                    .expect("root bytes"),
+            )
+            .expect("decode root");
+
+            // No stream — quiet or active — accumulates a pack per build.
+            for (ns_code, packs) in &root.dict_refs.forward_packs.subject_fwd_ns_packs {
+                assert!(
+                    packs.len() < TOTAL,
+                    "subject ns={ns_code} holds {} packs after {TOTAL} cycles",
+                    packs.len()
+                );
+            }
+
+            // The quiet namespace's values must still resolve; maintenance
+            // rewriting its packs must not lose anything.
+            let db = fluree.db(ledger_id).await.expect("db view");
+            let q = json!({
+                "@context": { "ex": "http://example.org/" },
+                "select": ["?s", "?l"],
+                "where": { "@id": "?s", "ex:label": "?l" }
+            });
+            let res = fluree.query(&db, &q).await.expect("label query");
+            let rows = res.to_jsonld(&db.snapshot).expect("format jsonld");
+            let text = serde_json::to_string(&rows).expect("serialize rows");
+
+            for cycle in 0..QUIET_AFTER {
+                assert!(
+                    text.contains(&format!("alt label {cycle}")),
+                    "quiet-namespace value for cycle {cycle} did not survive"
+                );
+            }
+            for cycle in 0..TOTAL {
+                assert!(
+                    text.contains(&format!("ex label {cycle}")),
+                    "active-namespace value for cycle {cycle} did not survive"
+                );
+            }
+        })
+        .await;
+}
