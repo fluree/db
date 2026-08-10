@@ -970,7 +970,9 @@ fn parse_graph_sources(
 /// ```
 ///
 /// Keys become the `source_alias`. The `@id` field is required (ledger reference).
-/// The `@graph` field is optional (graph selector — "default", "txn-meta", or IRI).
+/// The graph selector is optional ("default", "txn-meta", or a graph IRI) and may
+/// be spelled `@graph` or `graph` — the `from` single-source form reads the same
+/// two spellings, so neither form silently ignores the other's.
 fn parse_named_graph_object(
     obj: &serde_json::Map<String, JsonValue>,
 ) -> Result<Vec<GraphSource>, DatasetParseError> {
@@ -1014,21 +1016,8 @@ fn parse_named_graph_object(
             }
         }
 
-        // Parse graph selector from @graph
-        if let Some(graph_val) = entry.get("@graph") {
-            if identifier.contains("#txn-meta") {
-                return Err(DatasetParseError::AmbiguousGraphSelector(
-                    raw_identifier.to_string(),
-                ));
-            }
-            if let Some(graph_str) = graph_val.as_str() {
-                source.graph_selector = Some(GraphSelector::from_str(graph_str));
-            } else {
-                return Err(DatasetParseError::InvalidGraphSource(
-                    "'@graph' must be a string ('default', 'txn-meta', or a graph IRI)".to_string(),
-                ));
-            }
-        }
+        // Parse graph selector (`@graph` or `graph`)
+        source.graph_selector = parse_graph_selector_field(entry, &identifier, raw_identifier)?;
 
         // Parse policy override
         if let Some(policy_val) = entry.get("policy") {
@@ -1040,6 +1029,41 @@ fn parse_named_graph_object(
     Ok(sources)
 }
 
+/// Read a source object's graph selector, accepting either spelling.
+///
+/// The `fromNamed` object form historically read only `@graph` while the
+/// `from` single-source form read only `graph`. Writing the other form's
+/// spelling was not an error — the key was silently ignored and the source
+/// resolved to the whole ledger, so the query returned a plausible wrong
+/// answer with a 200. Both forms now accept both spellings.
+fn parse_graph_selector_field(
+    obj: &serde_json::Map<String, JsonValue>,
+    identifier: &str,
+    raw_identifier: &str,
+) -> Result<Option<GraphSelector>, DatasetParseError> {
+    let (key, graph_val) = match obj.get("@graph") {
+        Some(v) => ("@graph", v),
+        None => match obj.get("graph") {
+            Some(v) => ("graph", v),
+            None => return Ok(None),
+        },
+    };
+
+    // Ambiguity: the identifier already selected a graph via #txn-meta.
+    if identifier.contains("#txn-meta") {
+        return Err(DatasetParseError::AmbiguousGraphSelector(
+            raw_identifier.to_string(),
+        ));
+    }
+
+    let graph_str = graph_val.as_str().ok_or_else(|| {
+        DatasetParseError::InvalidGraphSource(format!(
+            "'{key}' must be a string ('default', 'txn-meta', or a graph IRI)"
+        ))
+    })?;
+    Ok(Some(GraphSelector::from_str(graph_str)))
+}
+
 /// Parse a single graph source from a JSON value
 ///
 /// Accepts:
@@ -1048,7 +1072,7 @@ fn parse_named_graph_object(
 ///   - `@id` / `id`: ledger reference (required)
 ///   - `t` / `at`: time specification
 ///   - `alias`: dataset-local alias (optional)
-///   - `graph`: graph selector - "default", "txn-meta", or IRI string (optional)
+///   - `graph` / `@graph`: graph selector - "default", "txn-meta", or IRI string (optional)
 ///   - `policy`: per-source policy override (optional)
 fn parse_single_graph_source(
     val: &JsonValue,
@@ -1110,24 +1134,8 @@ fn parse_single_graph_source(
                 }
             }
 
-            // Parse graph selector
-            if let Some(graph_val) = obj.get("graph") {
-                // Check for ambiguity: identifier has #txn-meta AND graph field provided
-                if identifier.contains("#txn-meta") {
-                    return Err(DatasetParseError::AmbiguousGraphSelector(
-                        raw_identifier.to_string(),
-                    ));
-                }
-
-                if let Some(graph_str) = graph_val.as_str() {
-                    source.graph_selector = Some(GraphSelector::from_str(graph_str));
-                } else {
-                    return Err(DatasetParseError::InvalidGraphSource(
-                        "'graph' must be a string ('default', 'txn-meta', or a graph IRI)"
-                            .to_string(),
-                    ));
-                }
-            }
+            // Parse graph selector (`graph` or `@graph`)
+            source.graph_selector = parse_graph_selector_field(obj, &identifier, raw_identifier)?;
 
             // Parse policy override
             if let Some(policy_val) = obj.get("policy") {
@@ -2560,5 +2568,106 @@ mod tests {
     fn test_sparql_dataset_ledger_ids_parse_error() {
         let result = sparql_dataset_ledger_ids("NOT VALID SPARQL }{}{");
         assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Graph-selector spelling. `fromNamed` entries once read only `@graph`
+    // and `from` source objects only `graph`; the other spelling was silently
+    // ignored and the source resolved to the whole ledger, so the query
+    // returned a wrong answer with no error. Both forms take both spellings.
+    // ---------------------------------------------------------------------
+
+    fn named_selector(query: &JsonValue, alias: &str) -> Option<GraphSelector> {
+        let (spec, _) = DatasetSpec::from_query_json(query).expect("parses");
+        spec.named_graphs
+            .iter()
+            .find(|s| s.source_alias.as_deref() == Some(alias))
+            .expect("named source present")
+            .graph_selector
+            .clone()
+    }
+
+    fn default_selector(query: &JsonValue) -> Option<GraphSelector> {
+        let (spec, _) = DatasetSpec::from_query_json(query).expect("parses");
+        spec.default_graphs[0].graph_selector.clone()
+    }
+
+    #[test]
+    fn from_named_entry_accepts_either_graph_spelling() {
+        let with_at = json!({
+            "fromNamed": {"g": {"@id": "db:main", "@graph": "http://ex.org/g1"}},
+            "select": ["?s"]
+        });
+        let without_at = json!({
+            "fromNamed": {"g": {"@id": "db:main", "graph": "http://ex.org/g1"}},
+            "select": ["?s"]
+        });
+
+        assert!(matches!(
+            named_selector(&with_at, "g"),
+            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+        ));
+        // Previously `None` — silently the whole ledger.
+        assert!(matches!(
+            named_selector(&without_at, "g"),
+            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+        ));
+        assert_eq!(
+            named_selector(&with_at, "g"),
+            named_selector(&without_at, "g")
+        );
+    }
+
+    #[test]
+    fn from_source_object_accepts_either_graph_spelling() {
+        let with_bare = json!({
+            "from": {"@id": "db:main", "graph": "http://ex.org/g1"},
+            "select": ["?s"]
+        });
+        let with_at = json!({
+            "from": {"@id": "db:main", "@graph": "http://ex.org/g1"},
+            "select": ["?s"]
+        });
+
+        assert!(matches!(
+            default_selector(&with_bare),
+            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+        ));
+        // Previously `None` — silently the whole ledger.
+        assert!(matches!(
+            default_selector(&with_at),
+            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+        ));
+        assert_eq!(default_selector(&with_bare), default_selector(&with_at));
+    }
+
+    #[test]
+    fn graph_selector_keeps_txn_meta_ambiguity_check_for_both_spellings() {
+        for key in ["graph", "@graph"] {
+            let query = json!({
+                "from": {"@id": "db:main#txn-meta", key: "http://ex.org/g1"},
+                "select": ["?s"]
+            });
+            assert!(
+                matches!(
+                    DatasetSpec::from_query_json(&query),
+                    Err(DatasetParseError::AmbiguousGraphSelector(_))
+                ),
+                "#txn-meta + '{key}' must stay ambiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_selector_rejects_non_string_under_both_spellings() {
+        for key in ["graph", "@graph"] {
+            let query = json!({
+                "from": {"@id": "db:main", key: 7},
+                "select": ["?s"]
+            });
+            let err = DatasetSpec::from_query_json(&query).expect_err("must reject");
+            let msg = err.to_string();
+            assert!(msg.contains(key), "error should name the key used: {msg}");
+        }
     }
 }

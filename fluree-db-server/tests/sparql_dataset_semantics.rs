@@ -671,3 +671,50 @@ async fn connection_jsonld_two_from_named_entries_resolve_by_alias() {
         "the ledger id must not appear as a graph name: {all}"
     );
 }
+
+/// Defect 10: the graph selector inside a `fromNamed` entry is accepted under
+/// either spelling. `fromNamed` once read only `@graph` while the `from`
+/// single-source form read only `graph`, and the wrong key was *silently
+/// ignored* — the entry resolved to the whole ledger, so this query used to
+/// return the default graph's "D" alongside g1's rows instead of erroring.
+#[tokio::test]
+async fn jsonld_from_named_accepts_either_graph_selector_spelling() {
+    let (_tmp, app) = seeded_app().await;
+
+    let ask = |key: &'static str| {
+        let app = app.clone();
+        async move {
+            let (status, _warning, json) = jsonld(
+                &app,
+                serde_json::json!({
+                    "@context": {"ex": "http://ex.org/"},
+                    "fromNamed": {"g1": {"@id": LEDGER, key: G1}},
+                    "select": ["?n"],
+                    "where": [["graph", "g1", {"@id": "?s", "ex:name": "?n"}]]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            let mut names: Vec<String> = rows(&json)
+                .iter()
+                .map(|r| serde_json::to_string(r).expect("row json"))
+                .collect();
+            names.sort();
+            names
+        }
+    };
+
+    let with_at = ask("@graph").await;
+    let without_at = ask("graph").await;
+
+    // g1 holds exactly "A" and "B"; the ledger's default-graph "D" is not in it.
+    assert_eq!(with_at.len(), 2, "@graph selector: {with_at:?}");
+    assert_eq!(
+        without_at, with_at,
+        "both spellings must select the same graph"
+    );
+    assert!(
+        !with_at.iter().any(|r| r.contains("\"D\"")),
+        "the whole ledger must not be selected: {with_at:?}"
+    );
+}
