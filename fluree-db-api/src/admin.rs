@@ -392,7 +392,7 @@ mod validate_absolute_iri_tests {
 ///   with `ApiError::Http(400)`. `:main` is not special: callers passing
 ///   the suffix likely expected branch-level semantics, so they're routed
 ///   to `drop_branch` with the same error shape as a non-default suffix.
-fn parse_whole_ledger_input(input: &str) -> Result<String> {
+fn parse_whole_ledger_input(input: &str, operation: WholeLedgerOperation) -> Result<String> {
     use fluree_db_core::ledger_id::split_ledger_id;
 
     let bad_input = |msg: String| ApiError::Http {
@@ -412,10 +412,36 @@ fn parse_whole_ledger_input(input: &str) -> Result<String> {
     // No branch suffix is accepted — including the default-name suffix —
     // so callers can't be surprised by `drop_ledger("mydb:main")` quietly
     // removing every other branch alongside main.
-    Err(bad_input(format!(
-        "drop_ledger drops the whole ledger and does not accept a branch suffix '{branch}'. \
-         Pass \"{name}\" to drop the whole ledger, or use drop_branch(\"{name}\", \"{branch}\") to drop a single branch."
-    )))
+    Err(bad_input(operation.branch_suffix_message(&name, &branch)))
+}
+
+/// An operation that acts on a whole ledger and so refuses a branch suffix.
+///
+/// Named rather than a bare string so each operation's rejection tells the
+/// caller what *that* operation offers — pointing a `sweep` caller at
+/// `drop_branch` would be worse than unhelpful on a destructive surface.
+#[derive(Clone, Copy)]
+enum WholeLedgerOperation {
+    Drop,
+    Sweep,
+}
+
+impl WholeLedgerOperation {
+    fn branch_suffix_message(self, name: &str, branch: &str) -> String {
+        match self {
+            Self::Drop => format!(
+                "drop_ledger drops the whole ledger and does not accept a branch suffix \
+                 '{branch}'. Pass \"{name}\" to drop the whole ledger, or use \
+                 drop_branch(\"{name}\", \"{branch}\") to drop a single branch."
+            ),
+            Self::Sweep => format!(
+                "a sweep covers every branch of a ledger and does not accept a branch \
+                 suffix '{branch}' — dictionary blobs are shared across branches, so \
+                 reclaiming them is only safe with all of them accounted for. Pass \
+                 \"{name}\" to sweep the whole ledger."
+            ),
+        }
+    }
 }
 
 /// Sort branches so children come before their parents (leaf-first).
@@ -526,7 +552,7 @@ impl crate::Fluree {
     /// (Lambda, etc.) **MUST** check `NsRecord.retracted` before indexing
     /// and before publishing to prevent recreating files after drop.
     pub async fn drop_ledger(&self, ledger_id: &str, mode: DropMode) -> Result<DropReport> {
-        let ledger_name = parse_whole_ledger_input(ledger_id)?;
+        let ledger_name = parse_whole_ledger_input(ledger_id, WholeLedgerOperation::Drop)?;
         info!(ledger_name = %ledger_name, mode = ?mode, "Dropping whole ledger");
 
         let mut report = DropReport {
@@ -2028,6 +2054,10 @@ impl crate::Fluree {
 
         // Holds are per-branch, so a ledger-wide sweep must hold them all.
         // Guards release on drop, so an early return frees whatever was taken.
+        // `Disabled` leaves `guards` empty and the sweep runs unexcluded. That
+        // is safe only because no in-process indexer exists to race it; an
+        // external one is not covered here either way, which is the
+        // single-process caveat documented on `MaintenanceGuard`.
         let mut guards = Vec::with_capacity(records.len());
         if let IndexingMode::Background(handle) = &self.indexing_mode {
             for record in &records {
@@ -2071,7 +2101,7 @@ impl crate::Fluree {
     pub async fn plan_index_sweep(&self, ledger_name: &str) -> Result<SweepPlan> {
         // Reject a branch-qualified alias rather than silently sweeping the
         // whole ledger: a sweep is ledger-wide because dict blobs are shared.
-        let ledger_name = parse_whole_ledger_input(ledger_name)?;
+        let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
         let storage = self.sweepable_storage()?;
         let (_guards, branches) = self.hold_ledger_for_maintenance(&ledger_name).await?;
         Ok(plan_sweep(&storage, &ledger_name, &branches).await?)
@@ -2085,7 +2115,7 @@ impl crate::Fluree {
     pub async fn sweep_index_storage(&self, ledger_name: &str) -> Result<SweepResult> {
         // Reject a branch-qualified alias rather than silently sweeping the
         // whole ledger: a sweep is ledger-wide because dict blobs are shared.
-        let ledger_name = parse_whole_ledger_input(ledger_name)?;
+        let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
         let storage = self.sweepable_storage()?;
         let (_guards, branches) = self.hold_ledger_for_maintenance(&ledger_name).await?;
 
