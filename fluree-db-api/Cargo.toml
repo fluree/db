@@ -218,6 +218,11 @@ path = "tests/grp_transact.rs"
 name = "it_count_datatype_pin"
 path = "tests/it_count_datatype_pin.rs"
 
+# Own binary: asserts fast-path routing via process-scoped tracing capture.
+[[test]]
+name = "it_exists_semijoin_correlation"
+path = "tests/it_exists_semijoin_correlation.rs"
+
 [[test]]
 name = "it_cyclic_bgp_novelty_pred"
 path = "tests/it_cyclic_bgp_novelty_pred.rs"
