@@ -491,7 +491,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::FlureeHeaders;
+    use super::{FlureeHeaders, JsonValue};
     use axum::http::HeaderMap;
 
     #[test]
@@ -512,5 +512,65 @@ mod tests {
         let err = FlureeHeaders::from_headers(&headers).unwrap_err();
 
         assert!(err.to_string().contains("fluree-min-t"));
+    }
+
+    fn default_allow_for(value: Option<&str>) -> Option<bool> {
+        let mut headers = HeaderMap::new();
+        if let Some(v) = value {
+            headers.insert(FlureeHeaders::DEFAULT_ALLOW, v.parse().unwrap());
+        }
+        FlureeHeaders::from_headers(&headers).unwrap().default_allow
+    }
+
+    /// The header is tri-state: absent leaves the ledger's `f:defaultAllow`
+    /// free to apply, present is an override in whichever direction it names.
+    #[test]
+    fn default_allow_header_is_tri_state() {
+        assert_eq!(default_allow_for(None), None);
+        assert_eq!(default_allow_for(Some("true")), Some(true));
+        assert_eq!(default_allow_for(Some("1")), Some(true));
+        assert_eq!(default_allow_for(Some("")), Some(true));
+        assert_eq!(default_allow_for(Some("false")), Some(false));
+        assert_eq!(
+            default_allow_for(Some("nonsense")),
+            Some(false),
+            "unrecognized values fail closed rather than reading as absent"
+        );
+    }
+
+    /// Header injection carries the caller's explicit `false` into body opts, so
+    /// it stays distinguishable from "never said" downstream.
+    #[test]
+    fn injects_explicit_default_allow_into_opts() {
+        for (header, expected) in [("true", true), ("false", false)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(FlureeHeaders::DEFAULT_ALLOW, header.parse().unwrap());
+            let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+            let mut opts = serde_json::Map::new();
+            parsed.inject_into_opts(&mut opts);
+
+            assert_eq!(opts.get("default-allow"), Some(&JsonValue::Bool(expected)));
+        }
+
+        // Absent header injects nothing at all.
+        let parsed = FlureeHeaders::from_headers(&HeaderMap::new()).unwrap();
+        let mut opts = serde_json::Map::new();
+        parsed.inject_into_opts(&mut opts);
+        assert!(!opts.contains_key("default-allow"));
+    }
+
+    /// Body opts still win over headers.
+    #[test]
+    fn body_opts_default_allow_beats_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::DEFAULT_ALLOW, "true".parse().unwrap());
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        let mut opts = serde_json::Map::new();
+        opts.insert("default-allow".to_string(), JsonValue::Bool(false));
+        parsed.inject_into_opts(&mut opts);
+
+        assert_eq!(opts.get("default-allow"), Some(&JsonValue::Bool(false)));
     }
 }

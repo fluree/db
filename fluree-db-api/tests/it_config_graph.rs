@@ -3260,3 +3260,196 @@ async fn reasoning_modes_collection_of_iris_engages() {
     )
     .await;
 }
+
+// =============================================================================
+// Test 20: ledger-configured f:defaultAllow reaches identity-carrying requests
+// =============================================================================
+
+/// Seed two named subjects and (optionally) a policy config declaring
+/// `f:defaultAllow <value>`. Returns the ledger id.
+async fn seed_default_allow_ledger(
+    fluree: &support::MemoryFluree,
+    ledger_id: &str,
+    configured_default_allow: Option<bool>,
+) {
+    let ledger = genesis_ledger(fluree, ledger_id);
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice"},
+                    {"@id": "ex:bob", "@type": "ex:User", "ex:name": "Bob"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+
+    let Some(default_allow) = configured_default_allow else {
+        return;
+    };
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:policyDefaults <urn:config:policy> .
+            <urn:config:policy> f:defaultAllow {default_allow} .
+        }}
+    "
+    );
+
+    fluree
+        .stage_owned(result.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+}
+
+/// Run `SELECT ?name WHERE { ?s ex:name ?name }` with the given `opts` and
+/// return the names visible to that request.
+async fn visible_names(
+    fluree: &support::MemoryFluree,
+    ledger_id: &str,
+    opts: serde_json::Value,
+) -> Vec<String> {
+    let mut query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": ledger_id,
+        "select": "?name",
+        "where": {"@id": "?s", "ex:name": "?name"}
+    });
+    if !opts.is_null() {
+        query["opts"] = opts;
+    }
+
+    let result = fluree.query_connection(&query).await.expect("query");
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let jsonld = result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld");
+
+    let mut names: Vec<String> = jsonld
+        .as_array()
+        .expect("array result")
+        .iter()
+        .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The operator scenario: a ledger configured `f:defaultAllow true` must apply
+/// to a request that carries nothing but an identity.
+///
+/// Before `GovernanceOptions::default_allow` became tri-state this returned
+/// nothing: `merge_policy_opts` treats any request with policy inputs as an
+/// override, and a bare `bool` made the derive-default `false` indistinguishable
+/// from "the caller never said," so config's `true` was silently discarded and
+/// the identity fell through to default-deny.
+#[tokio::test]
+async fn config_default_allow_true_applies_to_identity_only_request() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-default-allow-identity:main";
+    seed_default_allow_ledger(&fluree, ledger_id, Some(true)).await;
+
+    let names = visible_names(
+        &fluree,
+        ledger_id,
+        json!({"identity": "did:key:z6MkUnknownIdentity"}),
+    )
+    .await;
+
+    assert_eq!(
+        names,
+        vec!["Alice".to_string(), "Bob".to_string()],
+        "config's f:defaultAllow true must govern an identity-only request"
+    );
+}
+
+/// A request that names `default-allow` explicitly still wins over config —
+/// in both directions.
+#[tokio::test]
+async fn request_default_allow_overrides_config_both_ways() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Config says allow; request explicitly says deny → deny wins.
+    let open_ledger = "it/config-default-allow-request-false:main";
+    seed_default_allow_ledger(&fluree, open_ledger, Some(true)).await;
+    let names = visible_names(
+        &fluree,
+        open_ledger,
+        json!({"identity": "did:key:z6MkUnknownIdentity", "default-allow": false}),
+    )
+    .await;
+    assert!(
+        names.is_empty(),
+        "explicit request default-allow:false must override config true; got: {names:?}"
+    );
+
+    // Config says deny; request explicitly says allow → allow wins (the config
+    // here uses the default OverrideControl::AllowAll).
+    let closed_ledger = "it/config-default-allow-request-true:main";
+    seed_default_allow_ledger(&fluree, closed_ledger, Some(false)).await;
+    let names = visible_names(
+        &fluree,
+        closed_ledger,
+        json!({"identity": "did:key:z6MkUnknownIdentity", "default-allow": true}),
+    )
+    .await;
+    assert_eq!(
+        names,
+        vec!["Alice".to_string(), "Bob".to_string()],
+        "explicit request default-allow:true must override config false"
+    );
+}
+
+/// Unchanged posture: with no ledger config at all, an identity-only request is
+/// still fail-closed. This is the same pin as the server-side
+/// `identity_without_policy_class_default_allow_false_denies_all`, asserted at
+/// the API layer so the tri-state change can't quietly widen the default.
+#[tokio::test]
+async fn identity_only_without_config_still_denies_all() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-default-allow-no-config:main";
+    seed_default_allow_ledger(&fluree, ledger_id, None).await;
+
+    let names = visible_names(
+        &fluree,
+        ledger_id,
+        json!({"identity": "did:key:z6MkUnknownIdentity"}),
+    )
+    .await;
+
+    assert!(
+        names.is_empty(),
+        "no config + identity only must stay fail-closed; got: {names:?}"
+    );
+}
+
+/// Unchanged posture: an anonymous request is wholly unenforced, so a ledger's
+/// configured `f:defaultAllow false` does not close it.
+///
+/// `has_any_policy_inputs()` is false for an anonymous request, so
+/// `apply_source_or_global_policy` never calls `wrap_policy` and no
+/// `PolicyContext` — and therefore no config default — is ever built. Pinned
+/// here as current behavior, not endorsed: see the note in the branch report.
+#[tokio::test]
+async fn anonymous_request_unenforced_despite_config_default_allow_false() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-default-allow-anonymous:main";
+    seed_default_allow_ledger(&fluree, ledger_id, Some(false)).await;
+
+    let names = visible_names(&fluree, ledger_id, serde_json::Value::Null).await;
+
+    assert_eq!(
+        names,
+        vec!["Alice".to_string(), "Bob".to_string()],
+        "anonymous requests remain unenforced regardless of config default-allow"
+    );
+}

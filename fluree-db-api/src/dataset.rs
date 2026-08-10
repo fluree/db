@@ -2590,4 +2590,72 @@ mod tests {
         let result = sparql_dataset_ledger_ids("NOT VALID SPARQL }{}{");
         assert!(result.is_err());
     }
+
+    // --- GovernanceOptions::default_allow tri-state parsing ---
+
+    fn parse_default_allow(query: &JsonValue) -> Option<bool> {
+        GovernanceOptions::from_json(query).unwrap().default_allow
+    }
+
+    /// An absent key must stay `None` so the ledger's `f:defaultAllow` can fill
+    /// it — collapsing it to `false` here is what silently discarded config.
+    #[test]
+    fn default_allow_absent_parses_as_unset() {
+        assert_eq!(parse_default_allow(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_default_allow(&serde_json::json!({"opts": {}})),
+            None,
+            "an opts object with no default-allow key"
+        );
+        assert_eq!(
+            parse_default_allow(&serde_json::json!({"opts": {"identity": "did:key:alice"}})),
+            None,
+            "carrying an identity is not a statement about default-allow"
+        );
+    }
+
+    #[test]
+    fn default_allow_explicit_values_parse_as_set() {
+        for key in ["default-allow", "default_allow", "defaultAllow"] {
+            assert_eq!(
+                parse_default_allow(&serde_json::json!({"opts": {key: false}})),
+                Some(false),
+                "{key} = false"
+            );
+            assert_eq!(
+                parse_default_allow(&serde_json::json!({"opts": {key: true}})),
+                Some(true),
+                "{key} = true"
+            );
+        }
+    }
+
+    /// Non-boolean values are ignored rather than coerced, which leaves the
+    /// field unset (the pre-existing `as_bool` behavior, now visible as `None`).
+    #[test]
+    fn default_allow_non_boolean_stays_unset() {
+        assert_eq!(
+            parse_default_allow(&serde_json::json!({"opts": {"default-allow": "true"}})),
+            None
+        );
+        assert_eq!(
+            parse_default_allow(&serde_json::json!({"opts": {"default-allow": null}})),
+            None
+        );
+    }
+
+    #[test]
+    fn effective_default_allow_is_fail_closed_when_unset() {
+        assert!(!GovernanceOptions::default().effective_default_allow());
+        assert!(!GovernanceOptions {
+            default_allow: Some(false),
+            ..Default::default()
+        }
+        .effective_default_allow());
+        assert!(GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        }
+        .effective_default_allow());
+    }
 }

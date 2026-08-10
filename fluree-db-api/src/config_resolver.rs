@@ -2349,6 +2349,159 @@ mod tests {
         );
     }
 
+    // --- merge_policy_opts: the tri-state default_allow ---
+    //
+    // Every test above supplies an explicit `default_allow`, so none of them can
+    // see the case the tri-state exists for: a request that carries policy
+    // inputs but says nothing about default-allow.
+
+    /// The headline case. An identity-only request used to short-circuit the
+    /// merge entirely, so config's `f:defaultAllow true` never applied.
+    #[test]
+    fn config_default_allow_fills_unset_request() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts, None);
+        assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
+        assert_eq!(
+            merged.default_allow,
+            Some(true),
+            "config default-allow must fill a request that never named it"
+        );
+    }
+
+    /// An explicit request value wins over config in both directions, even
+    /// though override control is `AllowAll`.
+    #[test]
+    fn explicit_request_default_allow_wins_over_config() {
+        let open_config = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let deny = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&open_config, &deny, None).default_allow,
+            Some(false)
+        );
+
+        let closed_config = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let allow = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&closed_config, &allow, None).default_allow,
+            Some(true)
+        );
+    }
+
+    /// Unset on both sides stays unset, and resolves fail-closed.
+    #[test]
+    fn unset_on_both_sides_resolves_fail_closed() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: None,
+                policy_class: Some(vec!["ex:SomePolicy".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts, None);
+        assert_eq!(merged.default_allow, None);
+        assert!(
+            !merged.effective_default_allow(),
+            "nobody configured a default → deny"
+        );
+    }
+
+    /// A config that configures no policy at all leaves the request untouched.
+    #[test]
+    fn no_config_policy_leaves_default_allow_unset() {
+        let resolved = ResolvedConfig::default();
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts, None).default_allow,
+            None
+        );
+    }
+
+    /// `Some(false)` is the fail-closed value, not a request to switch
+    /// enforcement on: it must not make an otherwise-anonymous request count as
+    /// carrying policy inputs. Only `Some(true)` does, matching the bare-bool
+    /// behavior this replaced.
+    #[test]
+    fn only_explicit_true_counts_as_a_policy_input() {
+        let unset = GovernanceOptions::default();
+        assert!(!unset.has_any_policy_inputs());
+
+        let explicit_false = GovernanceOptions {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert!(!explicit_false.has_any_policy_inputs());
+
+        let explicit_true = GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert!(explicit_true.has_any_policy_inputs());
+    }
+
+    /// An anonymous request carries no policy inputs, so it lands on the
+    /// config-defaults path — where an explicit `Some(false)` from the request
+    /// is still overwritten by config, as before.
+    #[test]
+    fn config_overwrites_explicit_false_on_the_no_policy_input_path() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts, None).default_allow,
+            Some(true)
+        );
+    }
+
     // --- merge_reasoning ---
 
     #[test]
