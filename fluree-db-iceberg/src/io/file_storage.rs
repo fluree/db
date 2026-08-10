@@ -17,6 +17,7 @@
 
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,17 +33,33 @@ use crate::io::storage::{IcebergStorage, SendIcebergStorage};
 /// [`Self::with_remap`]) for tables that were copied or moved. `Clone` is
 /// required by the Parquet reader, which clones the storage into per-range
 /// read tasks — trivially cheap here.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FileIcebergStorage {
     /// `(from_prefix, to_root)`: file references starting with `from_prefix`
     /// (as the manifests wrote them — possibly an `s3://` URI) resolve under
     /// `to_root` instead. `None` = paths resolve as written.
     remap: Option<(String, String)>,
+    /// Directories this storage may read under, captured once at construction
+    /// from [`crate::local_guard::LOCAL_ROOTS_ENV`]. **Empty means read
+    /// nothing** — local tables are fail-closed, so a storage built while the
+    /// allowlist is unset refuses every path rather than reading the filesystem
+    /// unconfined. Holding the roots here keeps the per-read path free of
+    /// global state.
+    roots: Arc<[PathBuf]>,
+}
+
+impl Default for FileIcebergStorage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FileIcebergStorage {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            remap: None,
+            roots: configured_roots(),
+        }
     }
 
     /// A storage whose reads remap the location prefix `from` (the table root
@@ -61,6 +78,18 @@ impl FileIcebergStorage {
         let to = to.into().trim_end_matches('/').to_string();
         Self {
             remap: Some((from, to)),
+            roots: configured_roots(),
+        }
+    }
+
+    /// A storage confined to an explicit allowlist instead of the process
+    /// environment — lets tests exercise real reads (and real refusals) without
+    /// mutating shared process state or racing other tests.
+    #[cfg(test)]
+    fn with_roots(roots: Vec<PathBuf>) -> Self {
+        Self {
+            remap: None,
+            roots: crate::local_guard::expand_roots(roots.into_iter()).into(),
         }
     }
 
@@ -84,60 +113,32 @@ impl FileIcebergStorage {
 
     /// Whether `location` addresses the local filesystem: a `file://` URI or a
     /// bare absolute path. The dispatch predicate used when choosing a storage
-    /// backend for a `Direct` table location.
+    /// backend for a `Direct` table location — pure syntax, carrying no
+    /// permission decision (see [`crate::local_guard`]).
     pub fn is_local_location(location: &str) -> bool {
-        location.starts_with("file://") || location.starts_with('/')
+        crate::local_guard::is_local_location(location)
     }
 
-    /// Resolve a metadata/data-file reference to a local path.
+    /// Resolve a metadata/data-file reference to a local path, confined to the
+    /// operator's allowlist ([`crate::local_guard::LOCAL_ROOTS_ENV`]).
     ///
-    /// Accepts `file:///abs/path` (pyiceberg's local-warehouse form,
-    /// including the `file:/abs/path` single-slash variant some writers emit)
-    /// and bare absolute paths. Object-store URIs are rejected by name — the
-    /// usual cause is a table copied from S3 whose manifests still reference
-    /// the original bucket.
-    fn resolve(path: &str) -> Result<PathBuf> {
-        if let Some(rest) = path.strip_prefix("file://") {
-            // `file:///abs` → `/abs`; `file://host/abs` is not supported (no
-            // remote hosts), but `file://` + `/abs` parses as empty host + path.
-            if let Some(p) = rest.strip_prefix('/') {
-                // Guard the `file:////`-ish degenerate forms down to one root slash.
-                return Ok(PathBuf::from(format!("/{}", p.trim_start_matches('/'))));
-            }
-            return Err(IcebergError::storage(format!(
-                "Unsupported file:// URI (expected file:///absolute/path): {path}"
-            )));
-        }
-        if let Some(rest) = path.strip_prefix("file:/") {
-            // Single-slash variant: `file:/abs/path`.
-            return Ok(PathBuf::from(format!("/{rest}")));
-        }
-        if path.starts_with('/') {
-            return Ok(PathBuf::from(path));
-        }
-        if path.starts_with("s3://") || path.starts_with("s3a://") || path.starts_with("gs://") {
-            return Err(IcebergError::storage(format!(
-                "Local file storage cannot read an object-store URI: {path}. This usually \
-                 means the table was copied from an object store and its manifests still \
-                 reference the original location; local reads need the table written with \
-                 local paths"
-            )));
-        }
-        Err(IcebergError::storage(format!(
-            "Local file storage requires a file:// URI or an absolute path, got: {path}"
-        )))
+    /// Every read and listing goes through here, so a manifest reference that
+    /// climbs out of the table directory is refused rather than followed —
+    /// manifest content is only as trustworthy as whoever supplied the table.
+    fn resolve(&self, path: &str) -> Result<PathBuf> {
+        crate::local_guard::resolve_local_path_within(path, &self.roots)
     }
 
-    async fn read_impl(path: &str) -> Result<Bytes> {
-        let p = Self::resolve(path)?;
+    async fn read_impl(&self, path: &str) -> Result<Bytes> {
+        let p = self.resolve(path)?;
         let bytes = tokio::fs::read(&p)
             .await
             .map_err(|e| storage_io_err("read", &p, &e))?;
         Ok(Bytes::from(bytes))
     }
 
-    async fn read_range_impl(path: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
-        let p = Self::resolve(path)?;
+    async fn read_range_impl(&self, path: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        let p = self.resolve(path)?;
         let mut file = tokio::fs::File::open(&p)
             .await
             .map_err(|e| storage_io_err("open", &p, &e))?;
@@ -155,16 +156,16 @@ impl FileIcebergStorage {
         Ok(Bytes::from(buf))
     }
 
-    async fn file_size_impl(path: &str) -> Result<u64> {
-        let p = Self::resolve(path)?;
+    async fn file_size_impl(&self, path: &str) -> Result<u64> {
+        let p = self.resolve(path)?;
         let meta = tokio::fs::metadata(&p)
             .await
             .map_err(|e| storage_io_err("stat", &p, &e))?;
         Ok(meta.len())
     }
 
-    async fn list_files_impl(prefix: &str) -> Result<Vec<String>> {
-        let dir = Self::resolve(prefix)?;
+    async fn list_files_impl(&self, prefix: &str) -> Result<Vec<String>> {
+        let dir = self.resolve(prefix)?;
         let mut entries = tokio::fs::read_dir(&dir)
             .await
             .map_err(|e| storage_io_err("list", &dir, &e))?;
@@ -186,8 +187,8 @@ impl FileIcebergStorage {
         Ok(names)
     }
 
-    async fn list_dir_impl(prefix: &str) -> Result<Vec<String>> {
-        let dir = Self::resolve(prefix)?;
+    async fn list_dir_impl(&self, prefix: &str) -> Result<Vec<String>> {
+        let dir = self.resolve(prefix)?;
         let mut entries = tokio::fs::read_dir(&dir)
             .await
             .map_err(|e| storage_io_err("list", &dir, &e))?;
@@ -210,6 +211,12 @@ impl FileIcebergStorage {
     }
 }
 
+/// The operator's allowlist as an `Arc<[PathBuf]>`, or empty when local tables
+/// are disabled (the default). Shared by every storage this process builds.
+fn configured_roots() -> Arc<[PathBuf]> {
+    crate::local_guard::local_roots().unwrap_or(&[]).into()
+}
+
 fn storage_io_err(op: &str, path: &Path, e: &std::io::Error) -> IcebergError {
     IcebergError::storage(format!("Failed to {op} {}: {e}", path.display()))
 }
@@ -217,42 +224,42 @@ fn storage_io_err(op: &str, path: &Path, e: &std::io::Error) -> IcebergError {
 #[async_trait(?Send)]
 impl IcebergStorage for FileIcebergStorage {
     async fn read(&self, path: &str) -> Result<Bytes> {
-        Self::read_impl(&self.apply_remap(path)).await
+        self.read_impl(&self.apply_remap(path)).await
     }
 
     async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
-        Self::read_range_impl(&self.apply_remap(path), range).await
+        self.read_range_impl(&self.apply_remap(path), range).await
     }
 
     async fn file_size(&self, path: &str) -> Result<u64> {
-        Self::file_size_impl(&self.apply_remap(path)).await
+        self.file_size_impl(&self.apply_remap(path)).await
     }
 
     async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
-        Self::list_files_impl(&self.apply_remap(prefix)).await
+        self.list_files_impl(&self.apply_remap(prefix)).await
     }
 }
 
 #[async_trait]
 impl SendIcebergStorage for FileIcebergStorage {
     async fn read(&self, path: &str) -> Result<Bytes> {
-        Self::read_impl(&self.apply_remap(path)).await
+        self.read_impl(&self.apply_remap(path)).await
     }
 
     async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
-        Self::read_range_impl(&self.apply_remap(path), range).await
+        self.read_range_impl(&self.apply_remap(path), range).await
     }
 
     async fn file_size(&self, path: &str) -> Result<u64> {
-        Self::file_size_impl(&self.apply_remap(path)).await
+        self.file_size_impl(&self.apply_remap(path)).await
     }
 
     async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
-        Self::list_dir_impl(&self.apply_remap(prefix)).await
+        self.list_dir_impl(&self.apply_remap(prefix)).await
     }
 
     async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
-        Self::list_files_impl(&self.apply_remap(prefix)).await
+        self.list_files_impl(&self.apply_remap(prefix)).await
     }
 }
 
@@ -295,30 +302,61 @@ mod tests {
 
     #[test]
     fn resolve_accepts_file_uris_and_absolute_paths() {
+        // `/tmp/t` does not exist, so resolution stays lexical — which is the
+        // case that matters here (form parsing, not canonicalization).
+        let s = FileIcebergStorage::with_roots(vec![PathBuf::from("/tmp")]);
         assert_eq!(
-            FileIcebergStorage::resolve("file:///tmp/t/metadata/v1.json").unwrap(),
+            s.resolve("file:///tmp/t/metadata/v1.json").unwrap(),
             PathBuf::from("/tmp/t/metadata/v1.json")
         );
         assert_eq!(
-            FileIcebergStorage::resolve("file:/tmp/t/x").unwrap(),
+            s.resolve("file:/tmp/t/x").unwrap(),
             PathBuf::from("/tmp/t/x")
         );
-        assert_eq!(
-            FileIcebergStorage::resolve("/tmp/t/x").unwrap(),
-            PathBuf::from("/tmp/t/x")
-        );
+        assert_eq!(s.resolve("/tmp/t/x").unwrap(), PathBuf::from("/tmp/t/x"));
         // An object-store URI names the copied-table cause in its error.
-        let err = FileIcebergStorage::resolve("s3://bucket/t/x").unwrap_err();
+        let err = s.resolve("s3://bucket/t/x").unwrap_err();
         assert!(err.to_string().contains("copied from an object store"));
         // Relative paths are rejected (metadata must carry absolute locations).
-        assert!(FileIcebergStorage::resolve("relative/path").is_err());
+        assert!(s.resolve("relative/path").is_err());
+    }
+
+    #[test]
+    fn resolve_refuses_paths_outside_the_allowlist() {
+        let s = FileIcebergStorage::with_roots(vec![PathBuf::from("/tmp/wh")]);
+        // Inside the root: fine.
+        assert!(s.resolve("/tmp/wh/people/metadata/v1.json").is_ok());
+        // Traversal out of the root — the manifest-supplied escape this guards.
+        let err = s
+            .resolve("/tmp/wh/people/../../../etc/passwd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside every directory allowed"), "{err}");
+        assert!(err.contains(crate::local_guard::LOCAL_ROOTS_ENV), "{err}");
+        // A sibling sharing a name prefix is not inside the root.
+        assert!(s.resolve("/tmp/wh2/people/x").is_err());
+        // Plain outside path.
+        assert!(s.resolve("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn storage_with_no_allowlist_reads_nothing() {
+        // Fail-closed: a storage built while `FLUREE_ICEBERG_LOCAL_ROOTS` is
+        // unset refuses every path rather than reading unconfined.
+        let s = FileIcebergStorage::with_roots(Vec::new());
+        let err = s.resolve("/tmp/wh/people").unwrap_err().to_string();
+        assert!(err.contains("are disabled"), "{err}");
+        assert!(err.contains(crate::local_guard::LOCAL_ROOTS_ENV), "{err}");
     }
 
     #[tokio::test]
     async fn read_range_and_size_behave_like_an_object_store() {
         let tmp = std::env::temp_dir().join(format!("fluree-file-storage-{}", std::process::id()));
         write_tree(&tmp);
-        let storage = FileIcebergStorage::new();
+        // Confine to the fixture's own directory rather than the process env, so
+        // this exercises real reads without depending on (or racing) the
+        // allowlist other tests see.
+        let storage = FileIcebergStorage::with_roots(vec![tmp.clone()]);
         let path = format!("file://{}", tmp.join("metadata/a.txt").display());
 
         let all = SendIcebergStorage::read(&storage, &path).await.unwrap();

@@ -189,6 +189,12 @@ with pyiceberg or Spark against a local warehouse). No catalog service, no
 object store, no AWS credential resolution: the table is read straight from
 disk. Ideal for local development and test datasets.
 
+> **Local tables are opt-in.** Reading the local filesystem is **disabled by
+> default**: a Direct `table_location` that is a `file://` URI or an absolute
+> path is refused unless the operator has named the directories that may be
+> read, via `FLUREE_ICEBERG_LOCAL_ROOTS` (or `iceberg_local_roots` in the config
+> file). See [Enabling local tables](#enabling-local-tables) below.
+
 ```json
 {
   "catalog": {
@@ -199,6 +205,61 @@ disk. Ideal for local development and test datasets.
   "io": { "vended_credentials": false }
 }
 ```
+
+**Enabling local tables**
+
+`FLUREE_ICEBERG_LOCAL_ROOTS` is a colon-separated list of absolute directories,
+in the style of `PATH`:
+
+```bash
+export FLUREE_ICEBERG_LOCAL_ROOTS=/data/warehouse:/srv/lake
+fluree server run --storage-path .fluree/storage
+```
+
+or in `.fluree/config.toml`:
+
+```toml
+[server]
+iceberg_local_roots = "/data/warehouse:/srv/lake"
+```
+
+or in `.fluree/config.jsonld`:
+
+```json
+{
+  "@context": { "@vocab": "https://ns.flur.ee/config#" },
+  "server": {
+    "iceberg_local_roots": "/data/warehouse:/srv/lake"
+  }
+}
+```
+
+The allowlist does two jobs:
+
+1. **It enables local locations at all.** Unset, `table_location: "/data/wh/t"`
+   is refused when the graph source is created, with an error naming the switch.
+   Relative entries in the list are ignored, and a list that parses to nothing
+   is the same as unset.
+2. **It confines every path that is read.** Iceberg manifests reference data
+   files by absolute URI, and that metadata is only as trustworthy as whoever
+   supplied the table directory. Every resolved path — the table location,
+   metadata, manifests, and data files — must land under one of the roots, so a
+   reference such as `.../table/../../../etc/passwd` is refused rather than
+   followed. Containment is checked both textually and against the path's
+   canonical form, so a symlink out of a root does not escape it either.
+
+`FLUREE_ICEBERG_LOCAL_ROOTS=/` allows the whole filesystem. That is a deliberate
+choice for a single-tenant workstation, and a poor one for a shared deployment:
+any caller who can create a graph source can then point it at any directory the
+process can read.
+
+**Why it is off by default.** Fluree is embedded by services that forward
+caller-supplied `table_location` values from their own APIs. Before local
+support existed, this crate rejected everything that was not `s3://`, so those
+services inherited a scheme check they never had to write. Defaulting local
+access to on would have removed that protection silently on a version bump —
+so the capability ships closed, and an operator turns it on for the directories
+they intend to expose.
 
 **Copied and moved tables work with zero configuration.** Iceberg metadata
 references data files by absolute URI, so a table copied down from an object
@@ -212,7 +273,7 @@ whose manifests reference files *outside* its own root is not remapped.)
 
 **Direct mode requirements:**
 
-- `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`), a `file://` URI, or an absolute local path, pointing to the table root directory.
+- `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`), a `file://` URI, or an absolute local path, pointing to the table root directory. Local paths additionally require `FLUREE_ICEBERG_LOCAL_ROOTS` to name a directory containing them (see [Enabling local tables](#enabling-local-tables)).
 - The table must contain a `metadata/` subdirectory with the current `.metadata.json` file, and (for S3 locations) `version-hint.text` — the current metadata filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
 - Direct mode uses ambient AWS credentials (IAM roles, env vars, `~/.aws/credentials`) for S3 locations. It does **not** support vended credentials. Local locations use no credentials at all.
 

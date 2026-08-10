@@ -191,14 +191,17 @@ impl IcebergGsConfig {
                 // `file:///abs/path` (and the `file:/abs` single-slash variant) or a
                 // bare absolute path: a catalog-less LOCAL table, read from the
                 // filesystem with no object store or catalog service involved.
-                let is_local =
-                    table_location.starts_with("file:/") || table_location.starts_with('/');
+                let is_local = crate::local_guard::is_local_location(table_location);
                 if !is_object_store && !is_local {
                     return Err(IcebergError::Config(format!(
                         "Direct catalog table_location must be an S3 URI (s3:// or s3a://), a \
                          file:// URI, or an absolute local path, got: {table_location}"
                     )));
                 }
+                // Local locations are fail-closed: permitted only under an
+                // operator-allowlisted root. Refuse at creation rather than
+                // letting a disallowed path surface as a storage error later.
+                crate::local_guard::ensure_local_location_allowed(table_location)?;
                 // Validate table identifier can be derived from table_location
                 self.table_identifier()?;
                 // Vended credentials are not supported with Direct catalog
@@ -656,9 +659,12 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_direct_accepts_local_locations() {
+    fn test_validate_direct_local_locations_are_fail_closed() {
         // Catalog-less local tables: file:// URIs and bare absolute paths are
-        // valid Direct locations (read from the local filesystem, no S3).
+        // recognized Direct locations, but reading the local filesystem is
+        // opt-in — without `FLUREE_ICEBERG_LOCAL_ROOTS` the config is refused
+        // with a message that names the switch, rather than accepted here and
+        // failing confusingly at the first scan.
         for loc in [
             "file:///data/warehouse/ns/table",
             "file:/data/warehouse/ns/table",
@@ -675,11 +681,22 @@ mod tests {
                 delete: None,
                 order_by: None,
             };
-            config.validate().unwrap_or_else(|e| {
-                panic!("local location {loc} must validate, got: {e}");
-            });
+            if crate::local_guard::local_roots().is_none() {
+                let err = config
+                    .validate()
+                    .expect_err("local location must be refused while the allowlist is unset")
+                    .to_string();
+                assert!(
+                    err.contains(crate::local_guard::LOCAL_ROOTS_ENV),
+                    "refusal must name the switch that enables local tables: {err}"
+                );
+                assert!(
+                    !err.contains("must be an S3 URI"),
+                    "the location is recognized as local, not rejected as malformed: {err}"
+                );
+            }
             // The table identifier derives from the path's last two segments,
-            // same as S3 locations.
+            // same as S3 locations — independent of the allowlist.
             let id = config.table_identifier().unwrap();
             assert_eq!(id.namespace, "ns");
             assert_eq!(id.table, "table");

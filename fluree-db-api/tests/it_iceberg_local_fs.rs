@@ -22,6 +22,12 @@
 //!
 //! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the fixture to
 //! run against any table with the same shape.
+//!
+//! Local tables are fail-closed behind `FLUREE_ICEBERG_LOCAL_ROOTS` (see
+//! `fluree_db_iceberg::local_guard`), so the test sets that allowlist to the
+//! table's own directory before touching the stack — which also keeps it
+//! honest: a read that escaped the table directory would be refused here just
+//! as it would in a deployment.
 
 #![cfg(all(feature = "iceberg", feature = "native"))]
 
@@ -64,9 +70,18 @@ fn table_location() -> String {
     )
 }
 
+/// Allowlist the table's own directory, as a deployment would. Must run before
+/// anything builds Iceberg storage — the guard captures the roots on first use.
+fn allow_table_root(location: &str) {
+    let root = location.strip_prefix("file://").unwrap_or(location);
+    // SAFETY: set at the top of the test, before any storage or scan is built.
+    std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", root);
+}
+
 #[tokio::test]
 async fn local_table_end_to_end() {
     let location = table_location();
+    allow_table_root(&location);
     let fluree = FlureeBuilder::memory().build_memory();
 
     // 1. Register the graph source: Direct mode, file:// location, inline
@@ -192,6 +207,23 @@ async fn local_table_end_to_end() {
         }) => {}
         Err(other) => panic!("expected typed SnapshotNotFound, got: {other}"),
     }
+
+    // A local location OUTSIDE the allowlist is refused when the graph source is
+    // CREATED — the operator is told which switch governs it, rather than the
+    // path being read and its directory listing surfacing in a later error.
+    // Asserted in this test rather than its own so the allowlist is already
+    // installed and no second process/env write can race it.
+    let outside = R2rmlCreateConfig::new_direct("etc-probe", "/etc", PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    let err = fluree
+        .create_r2rml_graph_source(outside)
+        .await
+        .expect_err("a local location outside the allowlist must be refused")
+        .to_string();
+    assert!(
+        err.contains("FLUREE_ICEBERG_LOCAL_ROOTS"),
+        "refusal must name the switch that governs local tables: {err}"
+    );
 
     eprintln!("local iceberg end-to-end: all assertions passed");
 }

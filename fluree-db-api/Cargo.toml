@@ -155,8 +155,11 @@ path = "tests/grp_import.rs"
 name = "it_import_low_fd"
 path = "tests/it_import_low_fd.rs"
 
-# Standalone, env-gated: end-to-end over a REAL local Iceberg table
-# (FLUREE_LOCAL_ICEBERG_TABLE=file:///...). Skips cleanly when unset.
+# Standalone: end-to-end over a REAL local Iceberg table. Runs unconditionally
+# in CI against the committed fixture (tests/fixtures/iceberg/silver/people);
+# it sets FLUREE_ICEBERG_LOCAL_ROOTS itself, and FLUREE_LOCAL_ICEBERG_TABLE
+# optionally points it at a different table. Standalone because it writes
+# process env, which must not race other tests.
 [[test]]
 name = "it_iceberg_local_fs"
 path = "tests/it_iceberg_local_fs.rs"
