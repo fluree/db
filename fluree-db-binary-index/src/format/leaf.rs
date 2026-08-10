@@ -82,6 +82,40 @@ pub struct LeafInfo {
 
 // ── Writer ─────────────────────────────────────────────────────────────
 
+/// The value a leaflet holds constant for a given sort order. POST/PSOT
+/// leaflets are predicate-homogeneous and OPST leaflets are type-homogeneous;
+/// SPOT leaflets are unsegmented, so every row shares the one key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegmentKey {
+    Predicate(u32),
+    OType(u16),
+    Unsegmented,
+}
+
+impl SegmentKey {
+    fn of(order: RunSortOrder, p_id: u32, o_type: u16) -> Self {
+        match order {
+            RunSortOrder::Post | RunSortOrder::Psot => Self::Predicate(p_id),
+            RunSortOrder::Opst => Self::OType(o_type),
+            RunSortOrder::Spot => Self::Unsegmented,
+        }
+    }
+}
+
+/// The routing identity of a history entry, as a record. `t` and `g_id` are
+/// carried for completeness; neither appears in an ordered routing key.
+fn record_from_history(entry: &HistEntryV2) -> RunRecordV2 {
+    RunRecordV2 {
+        s_id: entry.s_id,
+        o_key: entry.o_key,
+        p_id: entry.p_id,
+        t: entry.t,
+        o_i: entry.o_i,
+        o_type: entry.o_type,
+        g_id: 0,
+    }
+}
+
 /// V3 leaf writer — segmentation-aware, columnar, sidecar-producing.
 pub struct LeafWriter {
     order: RunSortOrder,
@@ -179,6 +213,22 @@ impl LeafWriter {
             self.flush_leaf_if_target_reached()?;
         }
 
+        // Anything still pending belongs to a segment that ended without ever
+        // materializing a row — every one of its facts was retracted. Give each
+        // such segment its own zero-row leaflet before this record's leaflet
+        // claims the entries. Must precede the `leaf_first_record` assignment:
+        // those segments sort below this record, so they set the leaf's low
+        // routing bound when they open the leaf.
+        self.flush_history_only_segments(Some(&record))?;
+
+        // This record's transition entries (and those of any preceding
+        // non-materialized facts in the same gap) belong to the leaflet that
+        // holds this record — the current one, post any segment-boundary flush.
+        // Committed before the leaf's routing keys are taken from `record`,
+        // since those entries sort at or below it and so set the leaf's low
+        // bound when they open it.
+        self.commit_all_pending();
+
         // Track first record of the leaf.
         if self.leaf_first_record.is_none() {
             self.leaf_first_record = Some(record);
@@ -194,11 +244,6 @@ impl LeafWriter {
             }
             RunSortOrder::Spot => {}
         }
-
-        // This record's transition entries (and those of any preceding
-        // non-materialized facts in the same gap) belong to the leaflet that
-        // holds this record — the current one, post any segment-boundary flush.
-        self.commit_all_pending();
 
         self.record_buf.push(record);
         self.last_record = Some(record);
@@ -237,6 +282,27 @@ impl LeafWriter {
             self.sidecar_builder.start_leaflet();
             self.current_segment_started = true;
         }
+        // A fact whose final state is absent materializes no row, so nothing
+        // else widens the leaf's routing keys to cover it — and branch-level
+        // leaf selection drops a leaf whose range stops short of the key being
+        // probed, which is how a fully-retracted subject becomes unreadable at
+        // a historical `t`. Entries are committed in build order, so taking the
+        // latest unconditionally keeps the leaf's bounds monotonic.
+        let rec = record_from_history(&entry);
+        debug_assert!(
+            self.last_record.is_none_or(|last| {
+                let (mut prev, mut next) = ([0u8; ORDERED_KEY_V2_SIZE], [0u8; ORDERED_KEY_V2_SIZE]);
+                write_ordered_key_v2(self.order, &last, &mut prev);
+                write_ordered_key_v2(self.order, &rec, &mut next);
+                prev <= next
+            }),
+            "history entries must be committed in build order — an out-of-order \
+             entry would push the leaf's last routing key backwards"
+        );
+        if self.leaf_first_record.is_none() {
+            self.leaf_first_record = Some(rec);
+        }
+        self.last_record = Some(rec);
         self.sidecar_builder.push_entry(entry);
     }
 
@@ -296,16 +362,127 @@ impl LeafWriter {
     /// Consume the writer, flushing any remaining data, and return all
     /// produced leaves.
     pub fn finish(mut self) -> io::Result<Vec<LeafInfo>> {
-        // Trailing history (a non-materialized fact at the tail of the order)
-        // belongs to the final leaflet — commit it before the closing flush.
-        self.commit_all_pending();
         if !self.record_buf.is_empty() {
+            // Trailing history matching the buffered segment (a non-materialized
+            // fact at the tail of the order) belongs to the final leaflet —
+            // commit it before the closing flush.
+            self.commit_pending_for_current_segment();
             self.flush_leaflet()?;
         }
+        // Whatever is still pending has no leaflet left to live in: the tail of
+        // the order is made up of segments every one of whose facts was
+        // retracted. Each gets its own zero-row leaflet.
+        self.flush_history_only_segments(None)?;
         if !self.encoded_leaflets.is_empty() {
             self.flush_leaf()?;
         }
         Ok(self.completed_leaves)
+    }
+
+    /// Emit a zero-row leaflet, plus its sidecar segment, for every pending
+    /// segment that no record will ever open a leaflet for.
+    ///
+    /// A predicate whose rows have all been retracted contributes no winning
+    /// row to a rebuild, so segmentation never opens a leaflet for it and its
+    /// transitions would otherwise be filed under a neighbouring predicate's
+    /// leaflet — where a predicate-keyed reader skips them by `p_const` and
+    /// reports a silent zero at every historical `t`. Emitting the empty
+    /// leaflet restores the same shape the incremental writer preserves when a
+    /// merge empties an existing leaflet (`row_count == 0` with `history_*`
+    /// intact), which the reader already knows how to replay.
+    ///
+    /// `next` is the record about to be buffered, or `None` at `finish`.
+    /// Entries in its segment stay pending so they land in its leaflet.
+    ///
+    /// Callers must have no buffered records and no open sidecar segment, so
+    /// the emitted leaflet and its segment stay index-aligned.
+    fn flush_history_only_segments(&mut self, next: Option<&RunRecordV2>) -> io::Result<()> {
+        if self.pending_history.is_empty() {
+            return Ok(());
+        }
+        let order = self.order;
+        let next_seg = next.map(|r| SegmentKey::of(order, r.p_id, r.o_type));
+
+        let pending = std::mem::take(&mut self.pending_history);
+        let mut retained = Vec::new();
+        let mut group: Vec<HistEntryV2> = Vec::new();
+        let mut group_seg: Option<SegmentKey> = None;
+
+        // Entries arrive in the build's sort order, so a segment's entries are
+        // contiguous and the segment matching `next` (if any) comes last.
+        for entry in pending {
+            let seg = SegmentKey::of(order, entry.p_id, entry.o_type);
+            if next_seg == Some(seg) {
+                retained.push(entry);
+                continue;
+            }
+            if group_seg != Some(seg) && !group.is_empty() {
+                self.emit_history_only_leaflet(&group)?;
+                group.clear();
+            }
+            group_seg = Some(seg);
+            group.push(entry);
+        }
+        if !group.is_empty() {
+            self.emit_history_only_leaflet(&group)?;
+        }
+
+        self.pending_history = retained;
+        Ok(())
+    }
+
+    /// Append one zero-row leaflet holding `entries` as its history segment.
+    fn emit_history_only_leaflet(&mut self, entries: &[HistEntryV2]) -> io::Result<()> {
+        debug_assert!(
+            self.record_buf.is_empty() && !self.current_segment_started,
+            "history-only leaflet must not interleave with a leaflet still being \
+             accumulated — its sidecar segment would take that leaflet's index"
+        );
+        let Some(first) = entries.first().map(record_from_history) else {
+            return Ok(());
+        };
+        let last = record_from_history(entries.last().expect("non-empty"));
+
+        let mut first_key = [0u8; ORDERED_KEY_V2_SIZE];
+        let mut last_key = [0u8; ORDERED_KEY_V2_SIZE];
+        write_ordered_key_v2(self.order, &first, &mut first_key);
+        write_ordered_key_v2(self.order, &last, &mut last_key);
+
+        // Segment first, so its index matches the leaflet pushed just below.
+        self.sidecar_builder.start_leaflet();
+        for entry in entries {
+            self.sidecar_builder.push_entry(*entry);
+        }
+
+        let homogeneous_o_type = entries
+            .iter()
+            .all(|e| e.o_type == first.o_type)
+            .then_some(first.o_type);
+        self.encoded_leaflets.push(EncodedLeaflet {
+            row_count: 0,
+            lead_group_count: 0,
+            first_key,
+            last_key,
+            p_const: match self.order {
+                RunSortOrder::Post | RunSortOrder::Psot => Some(first.p_id),
+                RunSortOrder::Opst | RunSortOrder::Spot => None,
+            },
+            o_type_const: match self.order {
+                RunSortOrder::Opst => Some(first.o_type),
+                _ => homogeneous_o_type,
+            },
+            flags: 0,
+            column_refs: Vec::new(),
+            payload: Vec::new(),
+        });
+
+        // The leaf's routing keys must span this segment or branch-level leaf
+        // selection never opens the leaf that holds it.
+        if self.leaf_first_record.is_none() {
+            self.leaf_first_record = Some(first);
+        }
+        self.last_record = Some(last);
+        Ok(())
     }
 
     // ── Segmentation ───────────────────────────────────────────────────
@@ -955,5 +1132,176 @@ mod tests {
         dir.iter()
             .map(|e| 80 + e.column_refs.len() * COLUMN_BLOCK_REF_SIZE + 20)
             .sum()
+    }
+
+    fn hist(s_id: u64, p_id: u32, o_key: u64, t: u32, op: u8) -> HistEntryV2 {
+        HistEntryV2 {
+            s_id: SubjectId(s_id),
+            p_id,
+            o_type: OType::XSD_STRING.as_u16(),
+            o_key,
+            o_i: LIST_INDEX_NONE,
+            t,
+            op,
+        }
+    }
+
+    /// Read back each leaflet's sidecar entries, by directory index.
+    fn segments_of(leaf: &LeafInfo) -> Vec<Vec<HistEntryV2>> {
+        let header = decode_leaf_header_v3(&leaf.leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3(&leaf.leaf_bytes, &header).unwrap();
+        let bytes = leaf.sidecar_bytes.as_ref().expect("sidecar");
+        dir.iter()
+            .map(|e| {
+                if e.history_len == 0 {
+                    return Vec::new();
+                }
+                let seg = HistorySegmentRef {
+                    offset: e.history_offset,
+                    len: e.history_len,
+                    min_t: e.history_min_t,
+                    max_t: e.history_max_t,
+                };
+                super::super::history_sidecar::decode_history_segment(bytes, &seg).unwrap()
+            })
+            .collect()
+    }
+
+    /// A predicate whose facts were all retracted materializes no row, so
+    /// segmentation never opens a leaflet for it. Without one, its history is
+    /// filed under the next predicate's leaflet and a predicate-keyed reader
+    /// skips it by `p_const` — the full-rebuild time-travel hole. The writer
+    /// must emit a zero-row leaflet carrying that predicate's `p_const` and
+    /// its own sidecar segment.
+    #[test]
+    fn fully_retracted_predicate_gets_its_own_zero_row_leaflet() {
+        let mut writer = LeafWriter::new(RunSortOrder::Psot, 100, 1000, 1);
+
+        // p_id=1: one live row (its assert transition is history too).
+        writer.push_history_entry(hist(1, 1, 10, 1, 1));
+        writer
+            .push_record(make_rec(1, 1, OType::XSD_STRING.as_u16(), 10, 1))
+            .unwrap();
+
+        // p_id=2: asserted at t=1, retracted at t=2 — nothing survives.
+        writer.push_history_entry(hist(1, 2, 20, 1, 1));
+        writer.push_history_entry(hist(1, 2, 20, 2, 0));
+        writer.push_history_entry(hist(2, 2, 21, 1, 1));
+        writer.push_history_entry(hist(2, 2, 21, 2, 0));
+
+        // p_id=3: one live row.
+        writer.push_history_entry(hist(1, 3, 30, 1, 1));
+        writer
+            .push_record(make_rec(1, 3, OType::XSD_STRING.as_u16(), 30, 1))
+            .unwrap();
+
+        let leaves = writer.finish().unwrap();
+        assert_eq!(leaves.len(), 1);
+        let leaf = &leaves[0];
+        assert_eq!(leaf.total_rows, 2, "only p_id 1 and 3 have live rows");
+
+        let header = decode_leaf_header_v3(&leaf.leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3(&leaf.leaf_bytes, &header).unwrap();
+        assert_eq!(
+            dir.iter().map(|e| e.p_const).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)],
+            "the fully-retracted predicate must still have a partition"
+        );
+        assert_eq!(dir[1].row_count, 0, "and it must carry no live rows");
+        assert!(
+            dir[1].history_len > 0 && dir[1].history_max_t == 2,
+            "the zero-row leaflet must carry its own history segment"
+        );
+
+        // The segment holds exactly p_id=2's four transitions, and only those.
+        let segs = segments_of(leaf);
+        assert_eq!(segs.len(), 3);
+        assert!(
+            segs[1].iter().all(|e| e.p_id == 2) && segs[1].len() == 4,
+            "got {:?}",
+            segs[1]
+        );
+        assert!(
+            segs[0].iter().all(|e| e.p_id == 1) && segs[2].iter().all(|e| e.p_id == 3),
+            "no retracted predicate's history may leak into a neighbour"
+        );
+    }
+
+    /// Same shape at the tail of the order, where no following record exists
+    /// to trigger the emission. Previously `finish` committed these entries to
+    /// a sidecar segment past the last leaflet, where nothing referenced them.
+    #[test]
+    fn trailing_fully_retracted_predicate_is_not_dropped() {
+        let mut writer = LeafWriter::new(RunSortOrder::Psot, 100, 1000, 1);
+
+        writer.push_history_entry(hist(1, 1, 10, 1, 1));
+        writer
+            .push_record(make_rec(1, 1, OType::XSD_STRING.as_u16(), 10, 1))
+            .unwrap();
+
+        writer.push_history_entry(hist(1, 9, 90, 1, 1));
+        writer.push_history_entry(hist(1, 9, 90, 2, 0));
+
+        let leaves = writer.finish().unwrap();
+        let leaf = &leaves[0];
+        let header = decode_leaf_header_v3(&leaf.leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3(&leaf.leaf_bytes, &header).unwrap();
+        assert_eq!(
+            dir.iter().map(|e| e.p_const).collect::<Vec<_>>(),
+            vec![Some(1), Some(9)]
+        );
+        assert_eq!(dir[1].row_count, 0);
+        let segs = segments_of(leaf);
+        assert_eq!(segs[1].len(), 2, "trailing history must stay reachable");
+
+        // The leaf's routing range must cover the trailing partition, or
+        // branch-level leaf selection never opens this leaf for p_id=9.
+        assert_eq!(leaf.last_key.p_id, 9);
+    }
+
+    /// Bounded emission: a predicate that only ever had retracts of facts it
+    /// never asserted nets to nothing and produces no history, so it must not
+    /// leave a partition behind.
+    #[test]
+    fn predicates_without_history_get_no_partition() {
+        let mut writer = LeafWriter::new(RunSortOrder::Psot, 100, 1000, 1);
+        for p in [1u32, 2] {
+            writer.push_history_entry(hist(1, p, 10, 1, 1));
+            writer
+                .push_record(make_rec(1, p, OType::XSD_STRING.as_u16(), 10, 1))
+                .unwrap();
+        }
+        let leaves = writer.finish().unwrap();
+        let header = decode_leaf_header_v3(&leaves[0].leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3(&leaves[0].leaf_bytes, &header).unwrap();
+        assert_eq!(dir.len(), 2, "no empty partitions for predicates with no history");
+    }
+
+    /// SPOT is unsegmented, so a fully-retracted subject rides along in the
+    /// leaflet holding the next subject's rows — except at the tail, where
+    /// there is no next subject. Pin that the tail case keeps its history.
+    #[test]
+    fn trailing_fully_retracted_subject_is_not_dropped_in_spot() {
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 100, 1000, 1);
+
+        writer.push_history_entry(hist(1, 1, 10, 1, 1));
+        writer
+            .push_record(make_rec(1, 1, OType::XSD_STRING.as_u16(), 10, 1))
+            .unwrap();
+
+        writer.push_history_entry(hist(2, 1, 20, 1, 1));
+        writer.push_history_entry(hist(2, 1, 20, 2, 0));
+
+        let leaves = writer.finish().unwrap();
+        let leaf = &leaves[0];
+        let segs = segments_of(leaf);
+        let all: Vec<_> = segs.iter().flatten().collect();
+        assert_eq!(all.len(), 3, "every transition must be reachable from a leaflet");
+        assert_eq!(
+            leaf.last_key.s_id,
+            SubjectId(2),
+            "the leaf's routing range must span the retracted subject, or \
+             branch-level leaf selection never opens the leaf that holds it"
+        );
     }
 }
