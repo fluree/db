@@ -56,10 +56,22 @@ pub(crate) fn maybe_wrap_for_graph_source(db: &GraphDb, parsed: &mut fluree_db_q
 /// match only — as HTTP 200. This check makes the refusal independent of the
 /// query's `GRAPH` structure.
 ///
+/// A plain triple stranded out there is refused too, by
+/// [`unroutable_top_level_error`]. It is scoped deliberately to triples in
+/// *conjunctive* top-level position, where an empty match provably zeroes the
+/// whole result and no query can be returning correct rows today. It does not
+/// descend into `OPTIONAL`, `MINUS`, `UNION`, or `EXISTS` bodies: those degrade
+/// rather than zero (a vacuous `OPTIONAL` still emits its left side, a vacuous
+/// `MINUS` excludes nothing), and a `UNION` branch may carry a nested `GRAPH`
+/// block that routes and contributes real rows — so refusing there would reject
+/// queries that answer today. Those shapes stay silently degraded pending the
+/// routing work; see the graph-source docs.
+///
 /// Call it *after* the wrap: everything the wrap moved into the graph scope is
 /// then already covered by the rewrite guard, so a query with no `GRAPH` block
 /// of its own keeps refusing on exactly the route it refuses on today, with the
-/// same message.
+/// same message. It also means a surviving top-level triple is itself proof the
+/// wrap declined — no separate flag needed.
 pub(crate) fn guard_graph_source_patterns(
     db: &GraphDb,
     parsed: &fluree_db_query::ir::Query,
@@ -68,11 +80,43 @@ pub(crate) fn guard_graph_source_patterns(
         return Ok(());
     };
     let unsupported = fluree_db_query::r2rml::unsupported_outside_graph_scopes(&parsed.patterns);
-    if unsupported.is_empty() {
-        return Ok(());
+    if !unsupported.is_empty() {
+        return Err(ApiError::Query(
+            fluree_db_query::r2rml::unsupported_subscope_error(gs_id, &unsupported),
+        ));
     }
-    Err(ApiError::Query(
-        fluree_db_query::r2rml::unsupported_subscope_error(gs_id, &unsupported),
+    let unroutable = parsed
+        .patterns
+        .iter()
+        .filter(|p| matches!(p, Pattern::Triple(_)))
+        .count();
+    if unroutable > 0 {
+        return Err(ApiError::Query(unroutable_top_level_error(
+            gs_id, unroutable,
+        )));
+    }
+    Ok(())
+}
+
+/// The refusal for a triple pattern the wrap left stranded at the top level of a
+/// graph-source query.
+///
+/// Unlike the property-path family this is *lowerable* — it would convert to an
+/// R2RML scan perfectly well — but only inside a `GRAPH` scope, and on this plan
+/// it is not in one. "Lowerable in principle" is no comfort to a user whose
+/// pattern will not be lowered on the plan actually running, so it refuses for
+/// the same reason: it would otherwise read the graph source's empty native
+/// index and return no rows as a success. The wording names the workaround
+/// rather than the internals, because both fixes are entirely in the user's
+/// hands.
+fn unroutable_top_level_error(gs_id: &str, count: usize) -> fluree_db_query::QueryError {
+    fluree_db_query::QueryError::InvalidQuery(format!(
+        "graph source '{gs_id}' cannot evaluate {count} top-level triple pattern(s) in this \
+         query. Patterns reach a graph source only inside a `GRAPH <{gs_id}>` block; Fluree \
+         adds that block automatically, but not to a query that already contains a GRAPH \
+         block of its own — so these patterns would read an empty index and silently return \
+         no rows. Move them inside a `GRAPH <{gs_id}>` block, or drop the explicit GRAPH \
+         block so the whole query is scoped to the graph source."
     ))
 }
 
@@ -1838,6 +1882,57 @@ mod graph_source_guard_tests {
         assert!(
             msg.contains(SCAN_MARKER),
             "a fixed-length pattern must reach the R2RML scan, not a guard: {msg}"
+        );
+    }
+
+    /// A plain triple stranded at the top level by the same bypass is refused
+    /// too. It is lowerable in principle, but not on this plan — nothing routes
+    /// it to the provider, so it reads the empty genesis index and zeroes the
+    /// whole conjunction. Verified before implementing: it returns HTTP 200 with
+    /// 0 rows today.
+    #[tokio::test]
+    async fn top_level_triple_beside_an_explicit_graph_block_is_refused() {
+        let msg = query_err(&format!(
+            "SELECT ?o WHERE {{ <{N1}> <{EDGE_PRED}> ?o . \
+             GRAPH <{GS_ID}> {{ ?a <{EDGE_PRED}> ?c }} }}"
+        ))
+        .await;
+        assert!(
+            msg.contains("top-level triple pattern") && msg.contains("Move them inside"),
+            "expected the unroutable-top-level refusal naming the workaround, got: {msg}"
+        );
+    }
+
+    /// Scope guard: the refusal is for *conjunctive* top-level triples only. A
+    /// vacuous `OPTIONAL` still emits its left side, so refusing it would reject
+    /// a query that returns rows today — those stay out of scope until the
+    /// patterns can actually be routed.
+    #[tokio::test]
+    async fn a_top_level_optional_beside_a_graph_block_is_not_refused() {
+        let msg = query_err(&format!(
+            "SELECT ?o WHERE {{ GRAPH <{GS_ID}> {{ <{N1}> <{EDGE_PRED}> ?o }} \
+             OPTIONAL {{ ?o <{EDGE_PRED}> ?x }} }}"
+        ))
+        .await;
+        assert!(
+            msg.contains(SCAN_MARKER),
+            "an OPTIONAL body must not be refused — the GRAPH block still scans: {msg}"
+        );
+    }
+
+    /// Scope guard: patterns that never read this view's index — `VALUES`,
+    /// `BIND`, `FILTER`, and the search adapters, which carry their own graph
+    /// source and route independently — must survive at the top level.
+    #[tokio::test]
+    async fn top_level_values_beside_a_graph_block_is_not_refused() {
+        let msg = query_err(&format!(
+            "SELECT ?o ?v WHERE {{ VALUES ?v {{ 1 }} \
+             GRAPH <{GS_ID}> {{ <{N1}> <{EDGE_PRED}> ?o }} }}"
+        ))
+        .await;
+        assert!(
+            msg.contains(SCAN_MARKER),
+            "VALUES reads no index and must not be refused: {msg}"
         );
     }
 
