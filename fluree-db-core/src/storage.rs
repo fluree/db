@@ -667,8 +667,19 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
                 "CID verification failed: provided CID {id} does not match bytes"
             )));
         }
-        let address = self.cid_to_address(id)?;
-        self.storage.write_bytes(&address, bytes).await
+        let kind = id.content_kind().ok_or_else(|| {
+            crate::error::Error::storage(format!("unknown codec {} in CID {}", id.codec(), id))
+        })?;
+        // Same address `cid_to_address` derives — both go through
+        // `content_address` with this kind — but routed so the write *decides*
+        // its durability from the content kind rather than inheriting the
+        // instance default. Today's callers are all commits and txns, which
+        // land on the same answer either way; a path that ingests index blobs
+        // by CID would silently start fsyncing them.
+        self.storage
+            .content_write_bytes_with_hash(kind, &self.ledger_id, &id.digest_hex(), bytes)
+            .await?;
+        Ok(())
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
