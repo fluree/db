@@ -406,6 +406,16 @@ pub struct IcebergCreateConfig {
     /// Table identifier (e.g., "openflights.airlines"). Empty for Direct mode
     /// (derived from the table location).
     pub table_identifier: String,
+
+    /// Optional tombstone/delete convention for materialization (which source
+    /// column + value(s)/null mark a row as a delete). `None` => additive
+    /// materialization (no retraction). Not a connection concern, so it lives on
+    /// the create config rather than the reusable `IcebergConnectionConfig`.
+    pub delete_convention: Option<fluree_db_iceberg::DeleteConvention>,
+
+    /// Optional ordering column for latest-by-key materialization (e.g. an event
+    /// timestamp or offset). `None` => last-in-scan-order wins.
+    pub order_by: Option<String>,
 }
 
 /// The reusable Iceberg connection block — catalog access + IO, with **no**
@@ -512,6 +522,24 @@ impl IcebergConnectionConfig {
             };
         } else {
             tracing::warn!("with_auth_bearer_token_ref has no effect in Direct catalog mode");
+        }
+        self
+    }
+
+    /// Set Google metadata-server authentication (REST mode only).
+    ///
+    /// Mints and refreshes short-lived Google OAuth tokens from the GCE/GKE
+    /// metadata server (Workload Identity) — for Google Iceberg REST catalogs
+    /// (BigLake), where a static bearer expires after ~1h. `scopes` is optional
+    /// (defaults to cloud-platform).
+    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
+        if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
+            rest.auth = fluree_db_iceberg::auth::AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url: None,
+            };
+        } else {
+            tracing::warn!("with_auth_google_metadata has no effect in Direct catalog mode");
         }
         self
     }
@@ -697,6 +725,8 @@ impl IcebergCreateConfig {
             branch: None,
             connection: IcebergConnectionConfig::rest(catalog_uri),
             table_identifier: table_identifier.into(),
+            delete_convention: None,
+            order_by: None,
         }
     }
 
@@ -707,6 +737,8 @@ impl IcebergCreateConfig {
             branch: None,
             connection: IcebergConnectionConfig::direct(table_location),
             table_identifier: String::new(),
+            delete_convention: None,
+            order_by: None,
         }
     }
 
@@ -719,6 +751,13 @@ impl IcebergCreateConfig {
     /// Set bearer token authentication (REST mode only).
     pub fn with_auth_bearer(mut self, token: impl Into<String>) -> Self {
         self.connection = self.connection.with_auth_bearer(token);
+        self
+    }
+
+    /// Use the GCE/GKE metadata server for refreshable Google catalog auth
+    /// (REST mode only). See [`IcebergConnectionConfig::with_auth_google_metadata`].
+    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
+        self.connection = self.connection.with_auth_google_metadata(scopes);
         self
     }
 
@@ -807,6 +846,21 @@ impl IcebergCreateConfig {
         self
     }
 
+    /// Set the tombstone/delete convention used during materialization.
+    pub fn with_delete_convention(
+        mut self,
+        convention: fluree_db_iceberg::DeleteConvention,
+    ) -> Self {
+        self.delete_convention = Some(convention);
+        self
+    }
+
+    /// Set the ordering column for latest-by-key materialization.
+    pub fn with_order_by(mut self, column: impl Into<String>) -> Self {
+        self.order_by = Some(column.into());
+        self
+    }
+
     /// Get the effective branch name.
     pub fn effective_branch(&self) -> &str {
         self.branch.as_deref().unwrap_or(DEFAULT_BRANCH)
@@ -859,6 +913,8 @@ impl IcebergCreateConfig {
                 table: TableConfig::Identifier(self.table_identifier.clone()),
                 io: self.connection.io.clone(),
                 mapping: None,
+                delete: self.delete_convention.clone(),
+                order_by: self.order_by.clone(),
             },
             CatalogMode::Direct { table_location } => {
                 // Direct never uses vended credentials, regardless of the io flag.
@@ -869,6 +925,8 @@ impl IcebergCreateConfig {
                     table: TableConfig::Identifier(String::new()),
                     io,
                     mapping: None,
+                    delete: self.delete_convention.clone(),
+                    order_by: self.order_by.clone(),
                 }
             }
         }
@@ -911,6 +969,14 @@ impl IcebergCreateConfig {
                     )));
                 }
             }
+        }
+
+        // Validate the tombstone/delete convention at creation time rather than
+        // deferring to the first materialize scan.
+        if let Some(delete) = &self.delete_convention {
+            delete
+                .validate()
+                .map_err(|e| crate::ApiError::config(format!("Invalid delete convention: {e}")))?;
         }
 
         Ok(())
@@ -1018,6 +1084,13 @@ impl R2rmlCreateConfig {
         self
     }
 
+    /// Set Google metadata-server authentication (GKE Workload Identity), with
+    /// automatic token refresh. See [`IcebergCreateConfig::with_auth_google_metadata`].
+    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
+        self.iceberg = self.iceberg.with_auth_google_metadata(scopes);
+        self
+    }
+
     /// Set OAuth2 client credentials authentication.
     pub fn with_auth_oauth2(
         mut self,
@@ -1106,6 +1179,21 @@ impl R2rmlCreateConfig {
     /// Enable path-style S3 URLs.
     pub fn with_s3_path_style(mut self, enabled: bool) -> Self {
         self.iceberg = self.iceberg.with_s3_path_style(enabled);
+        self
+    }
+
+    /// Set the tombstone/delete convention used during materialization.
+    pub fn with_delete_convention(
+        mut self,
+        convention: fluree_db_iceberg::DeleteConvention,
+    ) -> Self {
+        self.iceberg = self.iceberg.with_delete_convention(convention);
+        self
+    }
+
+    /// Set the ordering column for latest-by-key materialization.
+    pub fn with_order_by(mut self, column: impl Into<String>) -> Self {
+        self.iceberg = self.iceberg.with_order_by(column);
         self
     }
 

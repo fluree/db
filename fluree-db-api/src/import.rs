@@ -99,7 +99,15 @@ pub enum ImportPhase {
 pub type ProgressFn = Arc<dyn Fn(ImportPhase) + Send + Sync>;
 
 /// Configuration for the bulk import pipeline.
+///
+/// `#[non_exhaustive]` (#1529 review, minor): this struct gained a `pub(crate)`
+/// field (`virtual_source`), so external crates can no longer build it with a
+/// struct literal. Marking it non-exhaustive makes that contract explicit — a
+/// clearer compile error than a bare E0451 — and reserves the right to add fields
+/// without a breaking change. Construct it via [`ImportConfig::default`] + the
+/// builder setters; in-crate literals are unaffected.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ImportConfig {
     /// Number of parallel TTL parse threads. `0` = auto: the machine's logical
     /// cores, capped so peak parse memory fits the budget (see
@@ -338,6 +346,14 @@ impl ImportConfig {
         } else {
             2
         }
+    }
+
+    /// Effective file-descriptor budget for this import: the live soft
+    /// `RLIMIT_NOFILE` (read fresh, so it reflects the pipeline's best-effort
+    /// raise) minus a reserve, overridable via `FLUREE_FD_BUDGET`. The index
+    /// build plans every fan-in/fan-out stage within it.
+    pub fn effective_fd_budget(&self) -> fluree_db_core::fd_limit::FdBudget {
+        fluree_db_core::fd_limit::FdBudget::detect()
     }
 
     /// Effective coalesce threshold (number of small files above which the local
@@ -627,6 +643,26 @@ pub enum ImportError {
     /// tokio runtime. Its producer drives an async scan via `Handle::block_on`
     /// off a dedicated thread, which deadlocks on a current-thread runtime.
     UnsupportedRuntime(String),
+    /// The process open-file limit was exhausted (or is demonstrably too low)
+    /// during an import phase with a per-chunk descriptor cost, such as the
+    /// dictionary merge. Carries the observed limit and the remedy.
+    FdLimit(String),
+}
+
+/// Wrap an index-build I/O failure, upgrading descriptor exhaustion
+/// (`EMFILE`/`ENFILE`) into an actionable message carrying the observed limit.
+fn index_build_error(e: &std::io::Error) -> ImportError {
+    if fluree_db_core::fd_limit::is_fd_exhaustion(e) {
+        let soft = fluree_db_core::fd_limit::nofile_limits()
+            .map_or_else(|| "unknown".to_string(), |l| l.soft.to_string());
+        ImportError::IndexBuild(format!(
+            "{e}. The process open-file limit (currently {soft}) was exhausted \
+             despite descriptor budgeting; raise it (`ulimit -n <n>`, or \
+             launchd/systemd LimitNOFILE) or lower import parallelism"
+        ))
+    } else {
+        ImportError::IndexBuild(e.to_string())
+    }
 }
 
 impl std::fmt::Display for ImportError {
@@ -649,6 +685,7 @@ impl std::fmt::Display for ImportError {
                 e.limit_fuel()
             ),
             Self::UnsupportedRuntime(msg) => write!(f, "unsupported runtime: {msg}"),
+            Self::FdLimit(msg) => write!(f, "open-file limit: {msg}"),
         }
     }
 }
@@ -3402,6 +3439,36 @@ where
     let span = tracing::debug_span!("bulk_import", alias = %alias);
 
     async {
+        // ---- FD preflight ----
+        // Best-effort raise (idempotent — covers library embedders that never
+        // ran a CLI/server entry point), then warn early on low limits. The
+        // warnings read the OBSERVED kernel limit, deliberately not
+        // `effective_fd_budget()`: the FLUREE_FD_BUDGET override shapes how
+        // the build *plans*, but only the real limit describes the
+        // environment. No hard refusal here — a small single-chunk import
+        // can succeed at limits the worst multi-chunk phase could not, so
+        // refusing on a fixed floor would regress imports that used to work;
+        // if exhaustion does happen, the EMFILE errors now carry the
+        // observed limit and the remedy.
+        let fd_raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
+        fluree_db_core::fd_limit::log_raise_outcome(&fd_raise);
+        if let Some(limits) = fluree_db_core::fd_limit::nofile_limits() {
+            if limits.soft < 96 {
+                tracing::warn!(
+                    soft = limits.soft,
+                    "open-file limit is very low; small imports may succeed but \
+                     multi-chunk imports are likely to exhaust it — raise it with \
+                     `ulimit -n <n>` or launchd/systemd LimitNOFILE"
+                );
+            } else if limits.soft < 256 {
+                tracing::warn!(
+                    soft = limits.soft,
+                    "open-file limit is low; import will conserve descriptors \
+                     (bounded scatter pool, cascaded merges)"
+                );
+            }
+        }
+
         // ---- Log effective settings and resolve chunk source ----
         config.log_effective_settings();
 
@@ -5626,9 +5693,60 @@ where
     use fluree_db_indexer::run_index::vocab_merge;
 
     // Phase B can use more CPU: subject, string, and language merges are independent.
-    // Run them concurrently to better utilize cores while this phase is otherwise I/O-bound.
+    // Run them concurrently to better utilize cores while this phase is otherwise I/O-bound —
+    // unless the FD budget can't cover the concurrent peak. Each merge holds
+    // one reader per chunk, the subject/string merges additionally hold one
+    // remap writer per chunk, plus a handful of output streams: ~5 descriptors
+    // per chunk when all three run at once, ~2 per chunk serialized. This was
+    // the import's first unbudgeted EMFILE site on multi-chunk imports at low
+    // limits — before the index build even starts.
     let run_dir_path = run_dir.to_path_buf();
     let remap_dir_path = remap_dir.to_path_buf();
+
+    let vocab_chunks = sorted_commit_infos.len();
+    let vocab_concurrent_peak = 5 * vocab_chunks + 16;
+    let vocab_serial_peak = 2 * vocab_chunks + 8;
+    let fd_available = config.effective_fd_budget().available();
+    let vocab_merge_serial = fd_available < vocab_concurrent_peak;
+    if vocab_merge_serial {
+        tracing::info!(
+            chunks = vocab_chunks,
+            fd_available,
+            vocab_concurrent_peak,
+            "serializing dictionary merges to fit fd budget"
+        );
+        // Warn against the KERNEL limit, not the plan: a deliberately
+        // shrunken FLUREE_FD_BUDGET plan can serialize the merges while the
+        // real limit still fits them comfortably.
+        let kernel_headroom = fluree_db_core::fd_limit::nofile_limits().map_or(fd_available, |l| {
+            fluree_db_core::fd_limit::FdBudget::from_soft(l.soft).available()
+        });
+        if kernel_headroom < vocab_serial_peak {
+            tracing::warn!(
+                chunks = vocab_chunks,
+                kernel_headroom,
+                vocab_serial_peak,
+                "dictionary merge may exceed the open-file limit even serialized; \
+                 raise the limit or import fewer/larger chunks"
+            );
+        }
+    }
+
+    /// Map a vocab-merge failure, upgrading descriptor exhaustion into the
+    /// actionable open-file-limit error.
+    fn vocab_merge_error(e: std::io::Error) -> ImportError {
+        if fluree_db_core::fd_limit::is_fd_exhaustion(&e) {
+            let soft = fluree_db_core::fd_limit::nofile_limits()
+                .map_or_else(|| "unknown".to_string(), |l| l.soft.to_string());
+            ImportError::FdLimit(format!(
+                "{e} during dictionary merge; the process open-file limit (currently \
+                 {soft}) is too low for this many import chunks — raise it \
+                 (`ulimit -n <n>`, LimitNOFILE) or use fewer/larger chunks"
+            ))
+        } else {
+            ImportError::Io(e)
+        }
+    }
 
     let subj_vocab_paths_for_task = subject_vocab_paths.clone();
     let chunk_ids_for_subj = chunk_ids.clone();
@@ -5647,6 +5765,17 @@ where
             namespace_codes_for_subj.as_ref(),
         )
     });
+    // Serial mode: drain each merge before spawning the next, so only one
+    // merge's per-chunk descriptors are live at a time.
+    let (subj_stats_serial, subj_handle) = if vocab_merge_serial {
+        let stats = subj_handle
+            .await
+            .map_err(|e| ImportError::RunGeneration(format!("subject vocab merge panicked: {e}")))?
+            .map_err(vocab_merge_error)?;
+        (Some(stats), None)
+    } else {
+        (None, Some(subj_handle))
+    };
 
     let str_vocab_paths_for_task = string_vocab_paths.clone();
     let chunk_ids_for_str = chunk_ids.clone();
@@ -5662,6 +5791,15 @@ where
             &run_dir_for_str,
         )
     });
+    let (str_stats_serial, str_handle) = if vocab_merge_serial {
+        let stats = str_handle
+            .await
+            .map_err(|e| ImportError::RunGeneration(format!("string vocab merge panicked: {e}")))?
+            .map_err(vocab_merge_error)?;
+        (Some(stats), None)
+    } else {
+        (None, Some(str_handle))
+    };
 
     let lang_vocab_paths_for_task = lang_vocab_paths.clone();
     let lang_span = merge_parent_span;
@@ -5670,14 +5808,22 @@ where
         fluree_db_indexer::run_index::build_lang_remap_from_vocabs(&lang_vocab_paths_for_task)
     });
 
-    let subj_stats = subj_handle
-        .await
-        .map_err(|e| ImportError::RunGeneration(format!("subject vocab merge panicked: {e}")))?
-        .map_err(ImportError::Io)?;
-    let str_stats = str_handle
-        .await
-        .map_err(|e| ImportError::RunGeneration(format!("string vocab merge panicked: {e}")))?
-        .map_err(ImportError::Io)?;
+    let subj_stats = match (subj_stats_serial, subj_handle) {
+        (Some(stats), _) => stats,
+        (None, Some(handle)) => handle
+            .await
+            .map_err(|e| ImportError::RunGeneration(format!("subject vocab merge panicked: {e}")))?
+            .map_err(vocab_merge_error)?,
+        (None, None) => unreachable!("serial mode stores stats, concurrent mode stores handle"),
+    };
+    let str_stats = match (str_stats_serial, str_handle) {
+        (Some(stats), _) => stats,
+        (None, Some(handle)) => handle
+            .await
+            .map_err(|e| ImportError::RunGeneration(format!("string vocab merge panicked: {e}")))?
+            .map_err(vocab_merge_error)?,
+        (None, None) => unreachable!("serial mode stores stats, concurrent mode stores handle"),
+    };
     let (unified_lang_dict, lang_remaps) = lang_handle
         .await
         .map_err(|e| ImportError::RunGeneration(format!("language vocab merge panicked: {e}")))?
@@ -6070,6 +6216,11 @@ where
                 let v3_runs_g0 = v3_run_dir.join("v3_runs_g0");
                 let v3_runs_g1 = v3_run_dir.join("v3_runs_g1");
 
+                // One FD budget for every graph's build in this import: the
+                // builds are sequential and plan against the same process
+                // limit (post best-effort raise at startup/preflight).
+                let fd_budget = fluree_db_core::fd_limit::FdBudget::detect();
+
                 let cfg_g0 = fluree_db_indexer::BuildConfig {
                     run_dir: v3_runs_g0,
                     index_dir: v3_index_dir.clone(),
@@ -6079,12 +6230,12 @@ where
                     zstd_level: 1,
                     run_budget_bytes: v3_run_budget,
                     worker_count: v3_worker_count,
+                    fd_budget,
                     remap_progress: Some(v3_remap_counter),
                     build_progress: Some(v3_build_counter),
                     stage_marker: Some(v3_stage_marker),
                 };
-                std::fs::create_dir_all(&cfg_g0.run_dir)
-                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                std::fs::create_dir_all(&cfg_g0.run_dir).map_err(|e| index_build_error(&e))?;
 
                 let (g0_result, mut spot_class_stats) =
                     fluree_db_indexer::build_indexes_from_commits(
@@ -6092,7 +6243,7 @@ where
                         &cfg_g0,
                         stats_hook.as_mut(),
                     )
-                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    .map_err(|e| index_build_error(&e))?;
 
                 // Meta chunk is always the last chunk when present. We build
                 // it BEFORE stats finalize and share the IdStatsHook so the
@@ -6108,12 +6259,12 @@ where
                         zstd_level: 1,
                         run_budget_bytes: v3_run_budget,
                         worker_count: 1,
+                        fd_budget,
                         remap_progress: None,
                         build_progress: None,
                         stage_marker: None,
                     };
-                    std::fs::create_dir_all(&cfg_g1.run_dir)
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    std::fs::create_dir_all(&cfg_g1.run_dir).map_err(|e| index_build_error(&e))?;
 
                     Some(
                         fluree_db_indexer::build_indexes_from_commits(
@@ -6121,7 +6272,7 @@ where
                             &cfg_g1,
                             stats_hook.as_mut(),
                         )
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?,
+                        .map_err(|e| index_build_error(&e))?,
                     )
                 } else {
                     None
@@ -6145,12 +6296,12 @@ where
                         zstd_level: 1,
                         run_budget_bytes: v3_run_budget,
                         worker_count: 1,
+                        fd_budget,
                         remap_progress: None,
                         build_progress: None,
                         stage_marker: None,
                     };
-                    std::fs::create_dir_all(&cfg_ng.run_dir)
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    std::fs::create_dir_all(&cfg_ng.run_dir).map_err(|e| index_build_error(&e))?;
 
                     // Fold this named graph's per-class SPOT stats into the
                     // default-graph accumulator. All `SpotClassStats` maps are
@@ -6165,7 +6316,7 @@ where
                         &cfg_ng,
                         stats_hook.as_mut(),
                     )
-                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    .map_err(|e| index_build_error(&e))?;
                     if let Some(ng) = ng_spot {
                         match &mut spot_class_stats {
                             Some(acc) => acc.merge(ng),
@@ -6306,8 +6457,7 @@ where
                     let stage = stage_marker.load(std::sync::atomic::Ordering::Relaxed);
                     emit_index_progress(stage, &mut current_stage, &mut stage_start);
                     break result
-                        .map_err(|e| ImportError::IndexBuild(format!("build task panicked: {e}")))?
-                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                        .map_err(|e| ImportError::IndexBuild(format!("build task panicked: {e}")))??;
                 }
                 () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                     let stage = stage_marker.load(std::sync::atomic::Ordering::Relaxed);

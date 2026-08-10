@@ -2,7 +2,7 @@
 
 Manage authentication tokens for remote servers. Tokens are stored in `.fluree/config.toml` as part of the remote configuration.
 
-Token values reach stdout only through the explicit `auth token` subcommand, which prints exactly one access token for scripting. The `status` command shows token presence, expiry, and identity only, and refresh tokens are never printed by any command.
+Token values reach stdout only through the explicit `auth token` subcommand, which prints exactly one access token for scripting. The `status` command shows token presence, expiry, and identity only. Refresh tokens are never printed except by the explicit raw-config escape hatch `fluree config list --reveal` (plain `config list` masks all credentials as `[redacted]`).
 
 ## Subcommands
 

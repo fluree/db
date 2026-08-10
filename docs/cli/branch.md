@@ -349,6 +349,40 @@ Merged 'dev' into 'main' (fast-forward to t=8, 3 commits copied).
 Merged 'dev' into 'main' (t=9, 3 commits copied, 1 conflicts).
 ```
 
+### fluree branch revert
+
+Revert one or more commits by writing a **new** commit that undoes them — history is never rewritten, so earlier states stay reachable with `--at`.
+
+```bash
+fluree branch revert <COMMITS>...
+fluree branch revert --from <COMMIT> --to <COMMIT>
+```
+
+Accepts either positional commit references (cherry-pick style, one or several) or a git-style range. Each commit reference may be a `t:N` transaction number, a hex digest prefix, or a full commit ID — the same forms `branch create --at` accepts.
+
+| Option | Description |
+|--------|-------------|
+| `<COMMITS>...` | Commits to revert (mutually exclusive with `--from`/`--to`) |
+| `--from <COMMIT>` | Range start (exclusive); requires `--to` |
+| `--to <COMMIT>` | Range end (inclusive); requires `--from` |
+| `--branch <BRANCH>` | Branch the revert commit is written to (defaults to the active branch) |
+| `--strategy <STRATEGY>` | Conflict resolution: `abort` (default), `take-source`, `take-branch` |
+| `--preview` | Show what the revert would do — resolved commit list, conflict count, whether the strategy would proceed — without writing a commit |
+| `--json` | With `--preview`: emit the raw JSON `RevertPreview` instead of a summary |
+| `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
+| `--remote <REMOTE>` | Execute against a remote server (by remote name) |
+
+```bash
+# Undo a single commit by transaction number
+fluree branch revert t:42
+
+# Cherry-pick two commits out
+fluree branch revert t:42 t:47
+
+# Revert a range, previewing conflicts first
+fluree branch revert --from t:40 --to t:45 --preview
+```
+
 ## See Also
 
 - [create](create.md) - Create a new ledger
