@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_iceberg::error::{IcebergError, Result as IcebergResult};
-use fluree_db_iceberg::io::{S3IcebergStorage, SendIcebergStorage};
+use fluree_db_iceberg::io::{IcebergStorageBackend, SendIcebergStorage};
 use tokio::sync::OnceCell;
 
 /// A boxed, `Send + Sync` async builder that performs the deferred loadTable GET
@@ -53,8 +53,10 @@ impl<S> Clone for LazyStorage<'_, S> {
     }
 }
 
-/// The production alias: a lazily-built [`S3IcebergStorage`].
-pub(crate) type LazyS3Storage<'a> = LazyStorage<'a, S3IcebergStorage>;
+/// The production alias: a lazily-built [`IcebergStorageBackend`] (S3 on this
+/// deferred REST-loadTable path — local-file tables never defer, their storage
+/// build is free).
+pub(crate) type LazyS3Storage<'a> = LazyStorage<'a, IcebergStorageBackend>;
 
 impl<'a, S> LazyStorage<'a, S> {
     /// Deferred: `builder` runs at most once, on the first read (if any).

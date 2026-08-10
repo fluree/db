@@ -189,10 +189,11 @@ pub struct MaterializeResult {
 /// watermark hold-back, transaction chunking, stale-base retry, novelty deferral.
 ///
 /// It does **NOT** cover the real provider's scan (`stream_scan_tasks`, `ScanChoice`, the
-/// incremental snapshot window), because a fake bypasses that code by construction. Making
-/// that path testable offline needs a storage seam
-/// (`prepare_iceberg_scan` returns a concrete `Arc<S3IcebergStorage>`) plus a minimal
-/// Iceberg table fixture — a separate, larger change.
+/// incremental snapshot window), because a fake bypasses that code by construction. The
+/// storage seam for offline coverage now exists (`prepare_iceberg_scan` returns an
+/// [`IcebergStorageBackend`](fluree_db_iceberg::io::IcebergStorageBackend), whose `File`
+/// variant reads a local table), and `fluree-db-api/tests/it_iceberg_local_fs.rs` drives
+/// the real scan against a committed pyiceberg fixture.
 #[async_trait::async_trait]
 pub trait MaterializeSource: Send + Sync {
     /// The compiled R2RML mapping for `graph_source_id`.
