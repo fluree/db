@@ -18,6 +18,18 @@ pub const DEFAULT_TARGET_PAGE_BYTES: usize = 512 * 1024;
 /// S3 has no special latency tier here, and a 16 MiB fetch breaks even with
 /// roughly six sequential 512 KiB page misses. It also bounds the work of one
 /// compaction merge, which rewrites at most this many bytes.
+///
+/// The trade runs both ways, and the direction that pushes this constant back
+/// DOWN is the sparse cold lookup. The read path whole-fetches a pack
+/// (`pack_reader.rs` gets the CID, caches it, then mmaps) rather than reading a
+/// byte range, so a first cold touch of any single ID costs the whole pack. A
+/// reader resolving a handful of scattered IDs against a cold cache therefore
+/// moves strictly more bytes after a run of small packs is merged than before.
+/// Anything doing real dictionary work wins — total bytes are conserved and
+/// round trips drop sharply — but a deployment whose cache does not survive
+/// between invocations (per-container caches on Lambda, discarded on every cold
+/// start) sits on the losing side and is the workload to measure before raising
+/// this.
 pub const DEFAULT_TARGET_PACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// A single pack artifact produced by the builder, ready for CAS upload.

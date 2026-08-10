@@ -218,11 +218,22 @@ pub struct PackCompaction {
 /// backlog sitting *behind* it becomes permanently unreachable. Scanning for a
 /// run lets that older fragmentation be repaired in place.
 ///
-/// `scan_from` skips positions already known not to start a qualifying run.
-/// Replacing a run with its (larger) merge output cannot make an earlier start
-/// qualify — the run would be shorter and its size spread wider — so a caller
-/// merging repeatedly can carry the previous `start` forward and keep the whole
-/// drain linear instead of rescanning the table on every merge.
+/// `scan_from` skips positions already known not to start a qualifying run. It
+/// exists for the repeated-merge drain simulation in this module's tests, which
+/// carries the previous `start` forward so a whole-table drain stays linear
+/// instead of rescanning per merge. **The production driver passes `0`**
+/// (`fluree-db-indexer`'s `compact_window`): its windows are bounded to a few
+/// hundred entries, so rescanning one costs a few thousand comparisons against
+/// a request budget that dominates by orders of magnitude, and starting fresh
+/// each time is the simpler thing to be sure of.
+///
+/// Carrying `start` forward is NOT unconditionally safe, so wiring it into the
+/// driver would need more than passing `plan.start`: replacing a run with its
+/// larger merge output can make an *earlier* start qualify that did not before.
+/// With sizes `[5 MiB, 1 MiB × 8]` the run at index 1 merges to 8 MiB, and only
+/// then does `[5 MiB, 8 MiB]` qualify at index 0 — the ratio is inside
+/// `MAX_SIZE_RATIO` and the total clears the near-target share. The driver
+/// re-finds this because it rescans from 0; a naive carry-forward would skip it.
 pub fn plan_compaction(
     refs: &[PackBranchEntry],
     sizes: &[u64],

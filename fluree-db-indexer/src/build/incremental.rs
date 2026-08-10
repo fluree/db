@@ -4175,11 +4175,27 @@ impl CompactionBudget {
         }
     }
 
-    /// Reserve up to `n` operations, returning how many were granted.
+    /// Reserve up to `n` operations, returning how many were granted. For work
+    /// that can proceed on a partial grant, such as probing pack sizes until the
+    /// budget runs out.
     fn take_requests(&mut self, n: usize) -> usize {
         let granted = n.min(self.requests);
         self.requests -= granted;
         granted
+    }
+
+    /// Reserve exactly `n` operations, or nothing at all.
+    ///
+    /// A merge is indivisible — it either fetches every input pack or does not
+    /// happen — so a partial grant must leave the budget untouched for whatever
+    /// smaller work comes next, rather than being spent on a merge that then
+    /// declines to run.
+    fn reserve_requests(&mut self, n: usize) -> bool {
+        if self.requests < n {
+            return false;
+        }
+        self.requests -= n;
+        true
     }
 }
 
@@ -4375,7 +4391,7 @@ async fn compact_window(
     }
 
     let input_packs = merge_end - merge_start;
-    if budget.take_requests(input_packs) < input_packs {
+    if !budget.reserve_requests(input_packs) {
         tracing::debug!(
             stream = stream_label,
             input_packs,

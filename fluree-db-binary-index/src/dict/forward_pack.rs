@@ -1240,6 +1240,53 @@ mod tests {
         );
     }
 
+    /// The structural check: a header whose declared span disagrees with what
+    /// its pages actually cover must be rejected rather than merged.
+    ///
+    /// `encode_forward_pack` validates contiguity on every write, so no legally
+    /// written pack can reach this — it only fires on a corrupt or truncated
+    /// object. That is exactly why it is worth pinning: without it, a header
+    /// that lies about its span yields a merged pack whose routing entry claims
+    /// IDs it holds no values for, and a lookup for one of those IDs lands in
+    /// the wrong page. Corruption that presents as wrong answers rather than a
+    /// read error is the hardest kind to trace back.
+    #[test]
+    fn concat_rejects_a_header_that_misdeclares_its_span() {
+        let page = 1024 * 1024;
+
+        // Baseline: these two merge cleanly. Both mangles below target the LAST
+        // pack, whose end no following pack is checked against — so the
+        // adjacency rule cannot reach them and only this guard can.
+        let good = packs_for(&[(0, 10), (10, 15)], KIND_STRING_FWD, 0, page);
+        assert!(concat(&good).is_ok(), "unmangled inputs must merge");
+
+        // `last_id` (header bytes 16..24) bumped by one: the header claims one
+        // more id than its pages carry.
+        let mut over = good.clone();
+        let bumped = u64::from_le_bytes(over[1][16..24].try_into().unwrap()) + 1;
+        over[1][16..24].copy_from_slice(&bumped.to_le_bytes());
+        let err = concat(&over)
+            .map(|_| ())
+            .expect_err("over-declared span must be rejected");
+        assert!(
+            err.to_string().contains("ids but header declares"),
+            "error names the span disagreement: {err}"
+        );
+
+        // Span left honest, but the first page directory entry no longer starts
+        // where the header says the pack does — the second half of the guard.
+        // The directory sits at `page_dir_offset` (header bytes 28..36), and its
+        // first entry opens with `page_first_id`.
+        let mut shifted = good.clone();
+        let dir_at = u64::from_le_bytes(shifted[1][28..36].try_into().unwrap()) as usize;
+        let page_first = u64::from_le_bytes(shifted[1][dir_at..dir_at + 8].try_into().unwrap()) + 1;
+        shifted[1][dir_at..dir_at + 8].copy_from_slice(&page_first.to_le_bytes());
+        assert!(
+            concat(&shifted).is_err(),
+            "a pack whose first page does not start at first_id must be rejected"
+        );
+    }
+
     #[test]
     fn header_derived_length_matches_actual_bytes() {
         // The size probe reads 40 bytes and must agree with the object length,
