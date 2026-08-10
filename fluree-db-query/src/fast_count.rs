@@ -1100,11 +1100,17 @@ pub fn count_distinct_position_operator(
                     "COUNT(DISTINCT) predicates",
                 ),
                 // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
-                // Distinct objects = lead bytes [0..10].
-                DistinctPosition::Objects => (
-                    count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Opst, 10)?,
-                    "COUNT(DISTINCT) objects",
-                ),
+                // Distinct objects = lead bytes [0..10] — which excludes p_id,
+                // and so is not an object identity for a NumBig arena handle.
+                // Declines to the general pipeline for a graph holding any
+                // decimal or overflow integer.
+                DistinctPosition::Objects => {
+                    let Some(count) = count_distinct_object_lead_groups(store, ctx.binary_g_id)?
+                    else {
+                        return Ok(None);
+                    };
+                    (count, "COUNT(DISTINCT) objects")
+                }
             };
             let count_i64 = count_to_i64(count, overflow_label)?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
@@ -1141,6 +1147,10 @@ struct LeadGroupPartial {
     count: u64,
     first_lead: Vec<u8>,
     last_lead: Vec<u8>,
+    /// Some leaflet in this chunk can hold an object key that is not a
+    /// graph-wide identity, so `count` is not a distinct-object count. Only
+    /// ever set for the OPST object walk.
+    non_identifying: bool,
 }
 
 /// Count distinct lead groups across all leaflets in a given sort order.
@@ -1160,8 +1170,48 @@ pub(crate) fn count_distinct_lead_groups(
     order: RunSortOrder,
     lead_len: usize,
 ) -> Result<u64> {
+    Ok(count_distinct_lead_groups_inner(store, g_id, order, lead_len, false)?.unwrap_or(0))
+}
+
+/// Whole-graph distinct **objects** from OPST leaflet directories, or `None`
+/// when the graph holds an object whose `(o_type, o_key)` lead is not a
+/// graph-wide identity.
+///
+/// The 10-byte OPST lead is `o_type(2) + o_key(8)` and stops immediately before
+/// `p_id` (bytes `[14..18]`). For a `NUM_BIG_OVERFLOW` row that lead is a
+/// per-predicate arena handle, so the first big value under one predicate and
+/// the first under another share a lead and collapse into one group — see
+/// [`OType::o_key_is_globally_identifying`]. Because handles are allocated from
+/// 0 within each predicate, the result would be the *max* over predicates of
+/// their distinct big-value counts rather than the size of the union: a silent
+/// undercount, never an over-report.
+///
+/// Rather than special-case the NumBig slice (which needs `p_id` payload reads
+/// and arena loads), decline the whole count to the general pipeline. Ledgers
+/// with no decimals and no overflow integers — the overwhelming majority — keep
+/// the fast path, paying one extra 2-byte comparison per directory entry.
+///
+/// The per-predicate distinct-object count is unaffected and stays on its fast
+/// path: its 14-byte POST lead starts with `p_id`, which scopes the handle
+/// correctly. So is the distinct-subject count, whose SPOT lead is `s_id`.
+pub(crate) fn count_distinct_object_lead_groups(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+) -> Result<Option<u64>> {
+    count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, 10, true)
+}
+
+/// Returns `None` iff `require_identifying_o_key` and some leaflet's key range
+/// covers a `NUM_BIG_OVERFLOW` row.
+fn count_distinct_lead_groups_inner(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    order: RunSortOrder,
+    lead_len: usize,
+    require_identifying_o_key: bool,
+) -> Result<Option<u64>> {
     let Some(branch) = store.branch_for_order(g_id, order) else {
-        return Ok(0);
+        return Ok(Some(0));
     };
 
     let map = |chunk: &[LeafEntry]| -> Result<Option<LeadGroupPartial>> {
@@ -1169,6 +1219,7 @@ pub(crate) fn count_distinct_lead_groups(
             count: 0,
             first_lead: Vec::new(),
             last_lead: Vec::new(),
+            non_identifying: false,
         };
         for leaf_entry in chunk {
             let dir = store
@@ -1187,6 +1238,13 @@ pub(crate) fn count_distinct_lead_groups(
                     QueryError::execution("leaflet key shorter than expected lead_len")
                 })?;
 
+                // `o_type` is the leading big-endian u16 of an OPST key, so the
+                // entry's own `[first, last]` interval says whether the leaflet
+                // can hold a non-identifying object key — no payload read.
+                if require_identifying_o_key && leaflet_may_hold_non_identifying_o_key(entry) {
+                    partial.non_identifying = true;
+                }
+
                 partial.count += u64::from(entry.lead_group_count);
                 if !partial.last_lead.is_empty() && partial.last_lead == lead_first {
                     partial.count = partial.count.saturating_sub(1);
@@ -1202,11 +1260,20 @@ pub(crate) fn count_distinct_lead_groups(
     };
 
     let combine = |left: LeadGroupPartial, right: LeadGroupPartial| -> LeadGroupPartial {
+        // Fold the flag before the empty-side short-circuits: an all-empty
+        // chunk still carries a verdict from its (skipped) sibling.
+        let non_identifying = left.non_identifying || right.non_identifying;
         if right.first_lead.is_empty() {
-            return left;
+            return LeadGroupPartial {
+                non_identifying,
+                ..left
+            };
         }
         if left.first_lead.is_empty() {
-            return right;
+            return LeadGroupPartial {
+                non_identifying,
+                ..right
+            };
         }
         let seam_dedup = u64::from(left.last_lead == right.first_lead);
         LeadGroupPartial {
@@ -1216,12 +1283,40 @@ pub(crate) fn count_distinct_lead_groups(
                 .saturating_sub(seam_dedup),
             first_lead: left.first_lead,
             last_lead: right.last_lead,
+            non_identifying,
         }
     };
 
     let parallel = branch.leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
     let result = parallel_leaf_chunk_reduce(&branch.leaves, parallel, map, combine)?;
-    Ok(result.map_or(0, |p| p.count))
+    Ok(match result {
+        Some(p) if p.non_identifying => None,
+        Some(p) => Some(p.count),
+        None => Some(0),
+    })
+}
+
+/// Whether an OPST leaflet's key range can cover an object key that is not a
+/// graph-wide identity.
+///
+/// OPST keys lead with a big-endian `o_type`, so the directory entry's
+/// `[first_key[0..2], last_key[0..2]]` interval bounds every `o_type` in the
+/// leaflet without opening a column. Leaflets are segmented type-homogeneously
+/// today (`leaflet.rs` asserts it), which makes the interval a point — the
+/// interval form costs nothing extra and stays correct if that ever changes.
+fn leaflet_may_hold_non_identifying_o_key(
+    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
+) -> bool {
+    let o_type_at = |k: &[u8]| -> u16 {
+        u16::from_be_bytes([
+            k.first().copied().unwrap_or(0),
+            k.get(1).copied().unwrap_or(0),
+        ])
+    };
+    let lo = o_type_at(&entry.first_key);
+    let hi = o_type_at(&entry.last_key);
+    let non_identifying = fluree_db_core::OType::NUM_BIG_OVERFLOW.as_u16();
+    lo <= non_identifying && non_identifying <= hi
 }
 
 /// Per-chunk partial for the per-predicate distinct-object count: the same
