@@ -41,6 +41,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -562,13 +563,40 @@ impl Bm25MaintenanceWorker {
                                 next_flush = Some(Instant::now() + Duration::from_millis(self.config.debounce_ms));
                             }
                         }
-                        Err(e) => {
-                            // Broadcast channel lagged or closed
-                            warn!(error = %e, "Event channel error, resubscribing");
-                            subscription = self
-                                .fluree
-                                .event_bus()
-                                .subscribe(fluree_db_nameservice::SubscriptionScope::All);
+                        Err(RecvError::Lagged(skipped)) => {
+                            // Keep this receiver. `Lagged` has already moved it
+                            // to the oldest event still in the ring, so it is
+                            // positioned to deliver everything that survived;
+                            // resubscribing would jump to the tail instead and
+                            // throw that remainder away on top of the `skipped`
+                            // the channel already dropped.
+                            //
+                            // The evicted commits are gone either way, so the
+                            // indexes they would have queued stay stale until
+                            // their next commit.
+                            warn!(
+                                skipped,
+                                "BM25 maintenance worker lagged on the event bus; \
+                                 those commits will not queue a sync"
+                            );
+                        }
+                        Err(RecvError::Closed) => {
+                            // The bus lives on the `Fluree` we hold an `Arc` to,
+                            // so this only happens at teardown. Resubscribing
+                            // would return `Closed` again immediately and spin
+                            // this loop at full tilt.
+                            //
+                            // Drain first, for the same reason the stop path
+                            // does: an abandoned sync can leave a snapshot in
+                            // storage that no manifest points at.
+                            info!(
+                                draining = in_flight.len(),
+                                "Event bus closed; BM25 maintenance worker exiting"
+                            );
+                            while let Some((graph_source_id, res)) = in_flight.next().await {
+                                log_sync_failure(&graph_source_id, res);
+                            }
+                            break;
                         }
                     }
                 }
