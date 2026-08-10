@@ -1131,3 +1131,54 @@ async fn rebuild_cost_of_retracted_partitions() {
     println!("leaves:      {}", result.stats.leaf_count);
     println!("total_bytes: {}", result.stats.total_bytes);
 }
+
+/// Degenerate edge: every fact in the ledger is retracted, so no order has a
+/// single live row and every leaflet the rebuild emits is a zero-row one.
+/// The leaf and branch assembly must still produce a routable index, and the
+/// whole t=1 state must remain readable.
+#[tokio::test]
+async fn time_travel_after_everything_is_retracted() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tt-all-gone:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let tx1 = json!({"@context": ctx(), "@graph": [
+        {"@id": "ns:Invoice/inv-00", "@type": "ns:Invoice", "ns:status": "paid"},
+        {"@id": "ns:Invoice/inv-01", "@type": "ns:Invoice", "ns:status": "paid"},
+    ]});
+    let _ = fluree.insert(ledger0, &tx1).await.expect("tx1");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let l1 = fluree.ledger(ledger_id).await.expect("reload after t=1");
+
+    let tx2 = json!({
+        "@context": ctx(),
+        "where": {"@id": "?s", "?p": "?o"},
+        "delete": {"@id": "?s", "?p": "?o"}
+    });
+    let _ = fluree.update(l1, &tx2).await.expect("tx2");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.ledger(ledger_id).await.expect("reload after t=2");
+
+    let q_t1 = format!(
+        r#"PREFIX ns: <http://example.org/ns#>
+          SELECT ?inv FROM <{ledger_id}@t:1>
+          WHERE {{ ?inv ns:status "paid" }}"#
+    );
+    assert_eq!(
+        run_row_count(&fluree, &q_t1).await,
+        2,
+        "t=1 state survives an empty index"
+    );
+
+    let q_t2 = format!(
+        r#"PREFIX ns: <http://example.org/ns#>
+          SELECT ?inv FROM <{ledger_id}@t:2>
+          WHERE {{ ?inv ns:status "paid" }}"#
+    );
+    assert_eq!(
+        run_row_count(&fluree, &q_t2).await,
+        0,
+        "nothing left at t=2"
+    );
+}
