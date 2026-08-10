@@ -24,7 +24,8 @@ use serde_json::Value as JsonValue;
 /// in `GRAPH <gs_id> { ... }` so the R2RML provider handles them.
 ///
 /// Skips wrapping if the query already contains a top-level GRAPH pattern
-/// (the user explicitly scoped it).
+/// (the user explicitly scoped it). Whatever is left outside a `GRAPH` scope
+/// after this runs is covered by [`guard_graph_source_patterns`].
 pub(crate) fn maybe_wrap_for_graph_source(db: &GraphDb, parsed: &mut fluree_db_query::ir::Query) {
     if let Some(ref gs_id) = db.graph_source_id {
         let has_graph_pattern = parsed
@@ -38,6 +39,67 @@ pub(crate) fn maybe_wrap_for_graph_source(db: &GraphDb, parsed: &mut fluree_db_q
                 patterns: inner,
             }];
         }
+    }
+}
+
+/// Refuse the patterns a graph source cannot evaluate, on the route where the
+/// per-scope guard inside `GraphOperator` can never see them.
+///
+/// A graph-source view is a `LedgerSnapshot::genesis` — zero flakes — because
+/// its data lives behind a provider that only the `GRAPH <gs_id>` execution path
+/// consults. `maybe_wrap_for_graph_source` puts the query on that path, but it
+/// bails out for the *whole* query when the user wrote any `GRAPH` block of
+/// their own, leaving the remaining top-level patterns to read the empty native
+/// index. Property paths, shortest paths, and subqueries are the patterns the
+/// R2RML rewrite cannot lower, so out there they answer with silently-wrong
+/// results — `p+` with nothing at all, `p*`/`p?` with the zero-length identity
+/// match only — as HTTP 200. This check makes the refusal independent of the
+/// query's `GRAPH` structure.
+///
+/// Call it *after* the wrap: everything the wrap moved into the graph scope is
+/// then already covered by the rewrite guard, so a query with no `GRAPH` block
+/// of its own keeps refusing on exactly the route it refuses on today, with the
+/// same message.
+pub(crate) fn guard_graph_source_patterns(
+    db: &GraphDb,
+    parsed: &fluree_db_query::ir::Query,
+) -> Result<()> {
+    let Some(gs_id) = db.graph_source_id.as_deref() else {
+        return Ok(());
+    };
+    let unsupported = fluree_db_query::r2rml::unsupported_outside_graph_scopes(&parsed.patterns);
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::Query(
+        fluree_db_query::r2rml::unsupported_subscope_error(gs_id, &unsupported),
+    ))
+}
+
+/// [`guard_graph_source_patterns`] for a dataset query, applied through the
+/// primary view.
+///
+/// Gated on *every* default graph being a graph source. A dataset that mixes a
+/// graph source with a native ledger (`from: ["sales:main", "warehouse-gs"]`)
+/// evaluates its top-level patterns over the union of both, so a property path
+/// out there has a real index to traverse and refusing it would reject a query
+/// that works. With no native member in the union there is no such index, and
+/// the single-view reasoning applies unchanged.
+pub(crate) fn guard_dataset_graph_source_patterns(
+    dataset: &DataSetDb,
+    parsed: &fluree_db_query::ir::Query,
+) -> Result<()> {
+    if dataset.default.is_empty()
+        || dataset
+            .default
+            .iter()
+            .any(|view| view.graph_source_id.is_none())
+    {
+        return Ok(());
+    }
+    match dataset.primary() {
+        Some(primary) => guard_graph_source_patterns(primary, parsed),
+        None => Ok(()),
     }
 }
 
@@ -142,8 +204,10 @@ impl Fluree {
         };
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
-        // 1b. Auto-wrap for graph source context
+        // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         maybe_wrap_for_graph_source(db, &mut parsed);
+        guard_graph_source_patterns(db, &parsed)?;
 
         // 2. Build executable with optional reasoning override
         let plan_start = std::time::Instant::now();
@@ -209,6 +273,7 @@ impl Fluree {
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
         maybe_wrap_for_graph_source(db, &mut parsed);
+        guard_graph_source_patterns(db, &parsed)?;
 
         self.execute_cypher_ir(db, vars, parsed, parse_ms).await
     }
@@ -229,6 +294,7 @@ impl Fluree {
             db.policy_enforcer().map(|e| &**e),
         )?;
         maybe_wrap_for_graph_source(db, &mut parsed);
+        guard_graph_source_patterns(db, &parsed)?;
         self.execute_cypher_ir(db, vars, parsed, 0.0).await
     }
 
@@ -292,6 +358,7 @@ impl Fluree {
         }
 
         maybe_wrap_for_graph_source(db, &mut parsed);
+        guard_graph_source_patterns(db, &parsed)?;
         self.execute_cypher_ir(db, vars, parsed, 0.0).await
     }
 
@@ -384,8 +451,10 @@ impl Fluree {
             }
         };
 
-        // 1b. Auto-wrap for graph source context
+        // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         maybe_wrap_for_graph_source(db, &mut parsed);
+        guard_graph_source_patterns(db, &parsed)?;
 
         // 2. Build executable with optional reasoning override
         let executable = self.build_executable_for_view(db, &parsed).await?;
@@ -561,8 +630,12 @@ impl Fluree {
             }
         };
 
-        // Auto-wrap for graph source context
+        // Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         maybe_wrap_for_graph_source(db, &mut parsed);
+        guard_graph_source_patterns(db, &parsed).map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+        })?;
 
         // Build executable with reasoning.
         //
@@ -719,8 +792,12 @@ impl Fluree {
             }
         };
 
-        // Auto-wrap for graph source context
+        // Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         maybe_wrap_for_graph_source(db, &mut parsed);
+        guard_graph_source_patterns(db, &parsed).map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+        })?;
 
         let executable = self
             .build_executable_for_view(db, &parsed)
@@ -1573,5 +1650,221 @@ mod tests {
         let db = fluree.db_at_t("testdb:main", 1).await.unwrap();
         let result = fluree.query(&db, &query).await.unwrap();
         assert!(!result.batches.is_empty());
+    }
+}
+
+/// End-to-end routing coverage for the graph-source pattern guard.
+///
+/// The rewrite-level unit test in `fluree-db-query` (`rewrite.rs`,
+/// `non_lowered_subscopes_are_flagged_unsupported`) exercises the rewriter in
+/// isolation and would keep passing if the routing that feeds it broke — which
+/// is exactly how the `GRAPH`-block bypass survived. These drive the real query
+/// entry point against a real graph-source view instead, so the four routes a
+/// query can take to a graph source stay pinned together: with the auto-wrap,
+/// with the user's own `GRAPH` block, with both, and with neither pattern kind
+/// involved.
+#[cfg(test)]
+mod graph_source_guard_tests {
+    use crate::view::GraphDb;
+    use crate::{FlureeBuilder, QueryExecutionOptions};
+    use async_trait::async_trait;
+    use fluree_db_query::r2rml::{
+        ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter, ScanTopK,
+    };
+    use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+    use std::sync::Arc;
+
+    const GS_ID: &str = "fs3repro:main";
+    const NS_CODE: u16 = 9_999;
+    const NS_IRI: &str = "http://fs3.example/";
+    const EDGE_PRED: &str = "http://fs3.example/vocab#edge";
+    const N1: &str = "http://fs3.example/node/n1";
+
+    /// Marker the stub errors with, so a test can prove a pattern reached the
+    /// R2RML scan layer rather than being refused on the way there.
+    const SCAN_MARKER: &str = "GSGUARD-SCAN-REACHED";
+
+    /// Reports a mapping for the graph source — all the rewrite decision needs —
+    /// and fails loudly if anything gets as far as scanning a table.
+    #[derive(Debug)]
+    struct StubProvider {
+        mapping: Arc<CompiledR2rmlMapping>,
+    }
+
+    impl StubProvider {
+        fn new() -> Self {
+            use fluree_db_r2rml::mapping::{
+                ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+            };
+            let tm = TriplesMap::new("#Edge", "fs3.edge")
+                .with_subject_template("http://fs3.example/node/{src}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant(EDGE_PRED),
+                    object_map: ObjectMap::column("dst"),
+                });
+            Self {
+                mapping: Arc::new(CompiledR2rmlMapping::new(vec![tm])),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl R2rmlProvider for StubProvider {
+        async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
+            true
+        }
+
+        async fn compiled_mapping(
+            &self,
+            _graph_source_id: &str,
+            _as_of_t: Option<i64>,
+        ) -> fluree_db_query::Result<Arc<CompiledR2rmlMapping>> {
+            Ok(Arc::clone(&self.mapping))
+        }
+    }
+
+    #[async_trait]
+    impl R2rmlTableProvider for StubProvider {
+        async fn scan_table(
+            &self,
+            _graph_source_id: &str,
+            _table_name: &str,
+            _projection: &[String],
+            _filters: &[ScanFilter],
+            _topk: Option<&ScanTopK>,
+            _as_of_t: Option<i64>,
+        ) -> fluree_db_query::Result<ColumnBatchStream> {
+            Err(fluree_db_query::QueryError::Internal(
+                SCAN_MARKER.to_string(),
+            ))
+        }
+    }
+
+    /// The view `resolve_graph_source` hands back for a registered graph source:
+    /// a genesis (zero-flake) snapshot named for the source and tagged with its
+    /// id, with the fixture's namespace registered so IRIs encode. Built the
+    /// same way here so no nameservice registration (and no `iceberg` feature)
+    /// is needed to exercise the routing.
+    fn graph_source_view() -> GraphDb {
+        let mut snapshot = fluree_db_core::LedgerSnapshot::genesis(GS_ID);
+        snapshot
+            .insert_namespace_code(NS_CODE, NS_IRI.to_string())
+            .expect("namespace registration");
+        let state =
+            fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
+        let mut db = GraphDb::from_ledger_state(&state);
+        db.graph_source_id = Some(GS_ID.into());
+        db
+    }
+
+    /// Run `sparql` against a graph-source view through the R2RML query entry
+    /// point, returning the error message (every arm here ends in an error: a
+    /// refusal, or the stub's scan marker).
+    async fn query_err(sparql: &str) -> String {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let db = graph_source_view();
+        let stub = StubProvider::new();
+        fluree
+            .query_view_with_r2rml_options(
+                &db,
+                sparql,
+                &stub,
+                &stub,
+                QueryExecutionOptions::default(),
+            )
+            .await
+            .expect_err("every arm of this matrix ends in an error")
+            .to_string()
+    }
+
+    fn assert_refused(msg: &str, context: &str) {
+        assert!(
+            msg.contains("property path") && msg.contains("cannot be evaluated"),
+            "{context}: expected the unsupported-pattern refusal, got: {msg}"
+        );
+    }
+
+    /// The bypass. A quantifier at the top level next to the user's own `GRAPH`
+    /// block: the auto-wrap declines the whole query, so nothing routes the path
+    /// to `GraphOperator` and its guard never sees it. Before the pre-execution
+    /// check this returned HTTP 200 with zero rows.
+    #[tokio::test]
+    async fn quantifier_beside_an_explicit_graph_block_is_refused() {
+        for label in ["+", "*", "?"] {
+            let msg = query_err(&format!(
+                "SELECT ?o WHERE {{ <{N1}> <{EDGE_PRED}>{label} ?o . \
+                 GRAPH <{GS_ID}> {{ ?a <{EDGE_PRED}> ?c }} }}"
+            ))
+            .await;
+            assert_refused(&msg, &format!("`edge{label}` beside a GRAPH block"));
+        }
+    }
+
+    /// The route that already worked, unchanged: with no `GRAPH` block of its
+    /// own the query is auto-wrapped, and the rewrite guard refuses it inside
+    /// the scope. Pinned so the pre-execution check cannot quietly become the
+    /// only thing holding this up.
+    #[tokio::test]
+    async fn quantifier_with_no_graph_block_is_still_refused() {
+        for label in ["+", "*", "?"] {
+            let msg = query_err(&format!(
+                "SELECT ?o WHERE {{ <{N1}> <{EDGE_PRED}>{label} ?o }}"
+            ))
+            .await;
+            assert_refused(&msg, &format!("bare `edge{label}`"));
+        }
+    }
+
+    /// Also unchanged: a quantifier the user scoped into a `GRAPH` block itself.
+    #[tokio::test]
+    async fn quantifier_inside_an_explicit_graph_block_is_still_refused() {
+        let msg = query_err(&format!(
+            "SELECT ?o WHERE {{ GRAPH <{GS_ID}> {{ <{N1}> <{EDGE_PRED}>+ ?o }} }}"
+        ))
+        .await;
+        assert_refused(&msg, "`edge+` inside a GRAPH block");
+    }
+
+    /// No over-refusal: a fixed-length pattern in a legitimately scoped `GRAPH`
+    /// block still lowers to an R2RML scan and reaches the provider. This is the
+    /// contrast the original reporter measured, and the property the guard must
+    /// not break.
+    #[tokio::test]
+    async fn fixed_length_pattern_in_a_graph_block_still_reaches_the_provider() {
+        let msg = query_err(&format!(
+            "SELECT ?o WHERE {{ GRAPH <{GS_ID}> {{ <{N1}> <{EDGE_PRED}> ?o }} }}"
+        ))
+        .await;
+        assert!(
+            msg.contains(SCAN_MARKER),
+            "a fixed-length pattern must reach the R2RML scan, not a guard: {msg}"
+        );
+    }
+
+    /// The guard is gated on the view being a graph source. A native ledger has
+    /// a real index, so its property paths must keep executing — including on
+    /// the plain `query` path, which shares the check.
+    #[tokio::test]
+    async fn a_native_ledger_still_evaluates_property_paths() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = fluree.create_ledger("pathdb").await.unwrap();
+        let txn = serde_json::json!({
+            "insert": [
+                {"@id": "http://example.org/n1", "http://example.org/edge": {"@id": "http://example.org/n2"}},
+                {"@id": "http://example.org/n2", "http://example.org/edge": {"@id": "http://example.org/n3"}}
+            ]
+        });
+        let _ledger = fluree.update(ledger, &txn).await.unwrap().ledger;
+
+        let db = fluree.db("pathdb:main").await.unwrap();
+        let result = fluree
+            .query(
+                &db,
+                "SELECT ?o WHERE { <http://example.org/n1> <http://example.org/edge>+ ?o }",
+            )
+            .await
+            .expect("a native ledger must still evaluate `edge+`");
+        let rows: usize = result.batches.iter().map(fluree_db_query::Batch::len).sum();
+        assert_eq!(rows, 2, "`edge+` from n1 reaches n2 and n3");
     }
 }

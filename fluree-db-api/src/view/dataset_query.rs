@@ -164,8 +164,10 @@ impl Fluree {
             }
         };
 
-        // 1b. Auto-wrap for graph source context
+        // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        super::query::guard_dataset_graph_source_patterns(dataset, &parsed)?;
 
         // 2. Build executable with optional reasoning override from primary view
         let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
@@ -263,8 +265,10 @@ impl Fluree {
             }
         };
 
-        // 1b. Auto-wrap for graph source context
+        // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        super::query::guard_dataset_graph_source_patterns(dataset, &parsed)?;
 
         // 2. Build executable with optional reasoning override from primary view
         let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
@@ -384,10 +388,14 @@ impl Fluree {
             }
         };
 
-        // Auto-wrap for graph source context
+        // Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         if let Some(primary) = dataset.primary() {
             super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
         }
+        super::query::guard_dataset_graph_source_patterns(dataset, &parsed).map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+        })?;
 
         // Build executable
         let executable = self
@@ -496,10 +504,14 @@ impl Fluree {
             }
         };
 
-        // Auto-wrap for graph source context
+        // Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         if let Some(primary) = dataset.primary() {
             super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
         }
+        super::query::guard_dataset_graph_source_patterns(dataset, &parsed).map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+        })?;
 
         let executable = self
             .build_executable_for_dataset(dataset, &parsed)

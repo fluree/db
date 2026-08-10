@@ -104,6 +104,7 @@ impl Fluree {
         };
 
         super::query::maybe_wrap_for_graph_source(db, &mut parsed);
+        super::query::guard_graph_source_patterns(db, &parsed)?;
 
         ensure_streamable(&parsed.output)?;
 
@@ -321,6 +322,7 @@ impl Fluree {
         };
 
         super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        super::query::guard_dataset_graph_source_patterns(dataset, &parsed)?;
         ensure_streamable(&parsed.output)?;
 
         let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
