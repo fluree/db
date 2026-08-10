@@ -229,6 +229,12 @@ path = "tests/it_exists_semijoin_correlation.rs"
 name = "it_repeated_var_fast_path_guards"
 path = "tests/it_repeated_var_fast_path_guards.rs"
 
+# Own binary: toggles the process-global fast-path kill switch AND asserts
+# fast-path routing, so it must not share a process with either.
+[[test]]
+name = "it_distinct_object_numbig_gate"
+path = "tests/it_distinct_object_numbig_gate.rs"
+
 [[test]]
 name = "it_cyclic_bgp_novelty_pred"
 path = "tests/it_cyclic_bgp_novelty_pred.rs"
