@@ -1074,13 +1074,36 @@ async fn rebuild_cost_of_retracted_partitions() {
     use std::time::Instant;
 
     assert_index_defaults();
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "tt-rebuild-cost:main";
-    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let store_path = tmp.path().to_str().unwrap();
+    let fluree = FlureeBuilder::file(store_path).build().expect("build");
+    let ledger_id = "cost/rebuild:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
 
     const SUBJECTS: usize = 200;
     const PREDICATES: usize = 60;
     const RETRACTED: usize = 50;
+    const REPS: u32 = 5;
+
+    /// Total bytes of every file under `dir`, recursively.
+    fn dir_bytes(dir: &std::path::Path) -> u64 {
+        let mut total = 0;
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    total += meta.len();
+                }
+            }
+        }
+        total
+    }
 
     let mut subjects = Vec::with_capacity(SUBJECTS);
     for s in 0..SUBJECTS {
@@ -1093,9 +1116,9 @@ async fn rebuild_cost_of_retracted_partitions() {
         subjects.push(JsonValue::Object(node));
     }
     let tx1 = json!({"@context": ctx(), "@graph": subjects});
-    let _ = fluree.insert(ledger0, &tx1).await.expect("tx1");
+    let r1 = fluree.insert(ledger0, &tx1).await.expect("tx1");
 
-    let mut ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let mut ledger = r1.ledger;
     for p in 0..RETRACTED {
         let tx = json!({
             "@context": ctx(),
@@ -1105,31 +1128,63 @@ async fn rebuild_cost_of_retracted_partitions() {
         ledger = fluree.update(ledger, &tx).await.expect("retract").ledger;
     }
 
+    // Commits only from here on: the delta across a rebuild is exactly the
+    // index artifacts it writes (leaves, sidecars, branches, root).
+    let before = dir_bytes(tmp.path());
     let record = fluree
         .nameservice()
         .lookup(ledger_id)
         .await
         .expect("lookup")
         .expect("record");
-    let start = Instant::now();
-    let result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
-        ledger_id,
-        &record,
-        fluree_db_indexer::IndexerConfig::default(),
-    )
-    .await
-    .expect("rebuild");
-    let elapsed = start.elapsed();
+
+    let mut times = Vec::with_capacity(REPS as usize);
+    let mut result = None;
+    let mut after_first = 0u64;
+    let mut roots = Vec::with_capacity(REPS as usize);
+    for rep in 0..REPS {
+        let start = Instant::now();
+        let r = fluree_db_indexer::rebuild_index_from_commits(
+            fluree.content_store(ledger_id),
+            ledger_id,
+            &record,
+            fluree_db_indexer::IndexerConfig::default(),
+        )
+        .await
+        .expect("rebuild");
+        times.push(start.elapsed());
+        roots.push(r.root_id.to_string());
+        result = Some(r);
+        if rep == 0 {
+            after_first = dir_bytes(tmp.path());
+        }
+    }
+    // A reproducible rebuild is content-addressed to the same bytes, so
+    // repeating it must not grow the store. Report both so a divergence
+    // between the two numbers shows up as nondeterminism rather than size.
+    let one_index_bytes = after_first - before;
+    let all_reps_bytes = dir_bytes(tmp.path()) - before;
+    times.sort_unstable();
+    let result = result.expect("at least one rebuild");
+    let distinct_roots = roots
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
 
     println!(
         "\n--- rebuild cost ({SUBJECTS} subjects x {PREDICATES} predicates, \
-         {RETRACTED} fully retracted) ---"
+         {RETRACTED} fully retracted, {REPS} reps) ---"
     );
-    println!("elapsed:     {:.3} s", elapsed.as_secs_f64());
-    println!("flakes:      {}", result.stats.flake_count);
-    println!("leaves:      {}", result.stats.leaf_count);
-    println!("total_bytes: {}", result.stats.total_bytes);
+    println!(
+        "median:         {:.3} s",
+        times[times.len() / 2].as_secs_f64()
+    );
+    println!("min:            {:.3} s", times[0].as_secs_f64());
+    println!("flakes:         {}", result.stats.flake_count);
+    println!("leaves:         {}", result.stats.leaf_count);
+    println!("one_index_bytes: {one_index_bytes}");
+    println!("all_reps_bytes:  {all_reps_bytes}");
+    println!("distinct_roots:  {distinct_roots} of {REPS}");
 }
 
 /// Degenerate edge: every fact in the ledger is retracted, so no order has a
