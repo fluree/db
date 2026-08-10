@@ -79,11 +79,24 @@ pub(crate) fn extract_bound_predicate(p: &Ref) -> Option<Ref> {
 
 /// Validate a triple pattern as `?s <bound_pred> ?o` with no datatype constraint.
 /// Returns `(subject_var, bound_predicate, object_var)`.
+///
+/// **Contract: `?s` and `?o` are distinct variables.** A repeated variable
+/// (`{ ?x <p> ?x }`) carries an implicit equality join that the metadata-backed
+/// fast paths cannot express — they answer from per-predicate index metadata
+/// and never compare the subject to the object — so it is declined here and
+/// left to the general pipeline. Callers may rely on distinctness; a detector
+/// that destructures a triple itself instead of calling this helper must
+/// re-establish it (see `detect_count_distinct_position` and
+/// `detect_count_triples`, which admit a variable predicate and so check all
+/// three positions pairwise).
 pub(crate) fn validate_simple_triple(tp: &TriplePattern) -> Option<(VarId, Ref, VarId)> {
     let Ref::Var(sv) = &tp.s else { return None };
     let pred = extract_bound_predicate(&tp.p)?;
     let Term::Var(ov) = &tp.o else { return None };
     if tp.dtc.is_some() {
+        return None;
+    }
+    if sv == ov {
         return None;
     }
     Some((*sv, pred, *ov))
@@ -1973,8 +1986,11 @@ fn detect_count_literal_objects(query: &Query) -> Option<VarId> {
 /// Detect `SELECT (COUNT(DISTINCT ?v) AS ?c) WHERE { ?s ?p ?o }` and resolve
 /// which triple position `?v` binds. All three positions must be variables (the
 /// fast paths read whole-permutation metadata), matching the prior three
-/// separate detectors exactly. Priority on positional ambiguity (e.g. `?x ?p ?x`)
-/// is subjects → predicates → objects, preserving the old dispatch order.
+/// separate detectors exactly, and all three must be *distinct* — a repeated
+/// variable is an equality join over the triple that whole-permutation metadata
+/// cannot answer, so it belongs to the general pipeline
+/// (see `validate_simple_triple`, which this detector cannot use because it
+/// admits a variable predicate).
 fn detect_count_distinct_position(query: &Query) -> Option<(DistinctPosition, VarId)> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
@@ -1991,6 +2007,9 @@ fn detect_count_distinct_position(query: &Query) -> Option<(DistinctPosition, Va
     if tp.dtc.is_some() {
         return None;
     }
+    if sv == pv || sv == ov || pv == ov {
+        return None;
+    }
 
     let position = if in_var == *sv {
         DistinctPosition::Subjects
@@ -2005,6 +2024,9 @@ fn detect_count_distinct_position(query: &Query) -> Option<(DistinctPosition, Va
     Some((position, out_var))
 }
 
+/// Detect `SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }`, answered from the
+/// whole-permutation triple count. All three positions must be distinct
+/// variables — `{ ?x ?p ?x }` counts self-loops, not triples.
 fn detect_count_triples(query: &Query) -> Option<VarId> {
     let (input_var, out_var) = detect_count_aggregate(query)?;
 
@@ -2019,6 +2041,9 @@ fn detect_count_triples(query: &Query) -> Option<VarId> {
     let Ref::Var(pv) = &tp.p else { return None };
     let Term::Var(ov) = &tp.o else { return None };
     if tp.dtc.is_some() {
+        return None;
+    }
+    if sv == pv || sv == ov || pv == ov {
         return None;
     }
 
