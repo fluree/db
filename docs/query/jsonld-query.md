@@ -552,6 +552,14 @@ Apply conditions to filter results:
 }
 ```
 
+Filter expressions use S-expression (prefix) syntax. SPARQL-style function
+calls — `contains(lcase(?name), "x")` — are rejected with a parse error rather
+than accepted; so is a filter that is a bare string or number constant, since
+it would match every row. To compare against a string literal that itself looks
+like a function call, quote it: `"(= ?v \"contains(x)\")"`. `bind` and `unwind`
+share the same expression language, so a call-shaped literal there needs the
+same quoting: `["bind", "?co", "\"Acme(Inc)\""]`.
+
 ### Bind Patterns
 
 Compute values and bind to variables:

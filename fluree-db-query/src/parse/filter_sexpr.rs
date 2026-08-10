@@ -43,6 +43,12 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
 
     // Must start with (
     if !s.starts_with('(') || !s.ends_with(')') {
+        // A SPARQL-style call like `contains(lcase(?name), "x")` would fall
+        // through to the plain-string atom fallback and become a truthy
+        // constant — silently a no-op in FILTER. Reject it loudly instead.
+        if let Some(callee) = sparql_style_callee(s) {
+            return Err(sparql_call_syntax_error(callee, s));
+        }
         // Could be a simple value
         return parse_s_expression_atom(s);
     }
@@ -52,6 +58,17 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
 
     // Find the operator (first token)
     let (op, rest) = sexpr_tokenize::split_first_token(inner)?;
+
+    // `(contains(lcase(?name), "x"))` tokenizes into nested lists that put a
+    // variable in operator position; diagnose the real cause instead of
+    // failing later with "Unknown function: ?name".
+    if op.starts_with('?') {
+        return Err(ParseError::InvalidFilter(format!(
+            "variable '{op}' cannot appear in operator position; expressions use \
+             S-expression (prefix) syntax, e.g. (> ?age 18) or (contains (lcase ?name) \"fred\")"
+        )));
+    }
+
     let op_lower = op.to_lowercase();
 
     if op_lower.as_str() == "in" || op_lower.as_str() == "not-in" || op_lower.as_str() == "notin" {
@@ -102,6 +119,34 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
             args,
         }),
     }
+}
+
+/// If `s` is spelled like a SPARQL function call — an identifier immediately
+/// followed by `(` — return the identifier. Quoted strings never match, so
+/// `"\"contains(x)\""` remains expressible as a string literal.
+///
+/// The identifier charset covers the kebab-case spellings `lower_function_name`
+/// accepts (`is-iri`, `str-dt`, `not-in`, ...) and prefixed names like
+/// `geof:distance`. Fully-expanded IRI callees (`http://…/distance(?a ?b)`)
+/// still slip through: `/` and `#` are too common in ordinary unquoted strings
+/// to treat as identifier characters.
+fn sparql_style_callee(s: &str) -> Option<&str> {
+    let open = s.find('(')?;
+    let callee = &s[..open];
+    let is_ident = !callee.is_empty()
+        && callee
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'));
+    is_ident.then_some(callee)
+}
+
+fn sparql_call_syntax_error(callee: &str, expr: &str) -> ParseError {
+    ParseError::InvalidFilter(format!(
+        "'{callee}(...)' looks like SPARQL function-call syntax, which is not supported \
+         in JSON-LD expressions; use S-expression syntax instead, \
+         e.g. (contains (lcase ?name) \"fred\"). \
+         If you meant a literal string (in a bind, say), wrap it in double quotes: \"{expr}\""
+    ))
 }
 
 /// Byte index just past the closing quote of the string literal at the start
@@ -593,6 +638,61 @@ mod tests {
         // Unrecognized escapes are preserved verbatim
         assert_eq!(unescape_string(r"a\nb"), r"a\nb");
         assert_eq!(unescape_string("plain"), "plain");
+    }
+
+    #[test]
+    fn test_sparql_style_call_rejected() {
+        // Regression: this spelling used to parse as a plain-string constant,
+        // which is truthy — the filter silently matched every row (fail-open).
+        let err = parse_s_expression(r#"contains(lcase(?name), "zzz")"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("SPARQL function-call syntax"), "got: {msg}");
+
+        let err = parse_s_expression(r#"strStarts(?name, "A")"#).unwrap_err();
+        assert!(err.to_string().contains("SPARQL function-call syntax"));
+    }
+
+    #[test]
+    fn test_sparql_style_call_rejected_for_kebab_names() {
+        // `lower_function_name` accepts kebab spellings, so the callee charset
+        // must include '-' or these stay fail-open constants.
+        for expr in ["is-iri(?x)", "is-blank(?x)", "str-dt(?v, ?dt)"] {
+            let err = parse_s_expression(expr).unwrap_err();
+            assert!(
+                err.to_string().contains("SPARQL function-call syntax"),
+                "{expr} was not rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sparql_call_error_suggests_quoting() {
+        // The check also fires in value contexts (bind/unwind), where the user
+        // may have meant a literal like `Acme(Inc)` — point them at quoting.
+        let err = parse_s_expression("Acme(Inc)").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(r#"double quotes: "Acme(Inc)""#), "got: {msg}");
+    }
+
+    #[test]
+    fn test_parenthesized_sparql_style_call_rejected() {
+        // Wrapped in parens the tokenizer walks into the call and ends up with
+        // `?name` in operator position; the error must diagnose that, not
+        // report "Unknown function: ?name" at lowering.
+        let err = parse_s_expression(r#"(contains(lcase(?name), "gustavo"))"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("operator position"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_quoted_string_atom_still_parses() {
+        // Escape hatch: a quoted literal that merely looks like a call is
+        // still expressible as a constant (used by BIND).
+        let expr = parse_s_expression(r#""contains(x)""#).unwrap();
+        match expr {
+            UnresolvedExpression::Const(_) => {}
+            other => panic!("expected string constant, got {other:?}"),
+        }
     }
 
     #[test]
