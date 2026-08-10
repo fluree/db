@@ -569,7 +569,12 @@ where
                     let ledger_name = &path[..slash_pos];
                     let branch = path[slash_pos + 1..].trim_end_matches(".json");
 
-                    if let Ok(Some(record)) = self.load_record(ledger_name, branch).await {
+                    // A read failure must not silently shrink the result:
+                    // callers that decide what to delete treat a missing
+                    // branch as one with nothing to protect. `Ok(None)` is a
+                    // legitimate skip (graph-source record, or a branch
+                    // dropped since the key listing).
+                    if let Some(record) = self.load_record(ledger_name, branch).await? {
                         records.push(record);
                     }
                 }
