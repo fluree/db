@@ -1093,6 +1093,15 @@ struct Resolved {
     minmax_encoder: Option<LiteralEncoder>,
 }
 
+/// A built keep-min dim map: FK/parent join key → the parent's group-key values.
+/// `Arc`d so ref group keys resolving to the SAME dim on the SAME parent join cols
+/// (e.g. shipTo/billTo → Customer) share one built map, not two (id=3717398042).
+type SharedDimMap = Arc<std::collections::HashMap<Vec<String>, Vec<GKey>>>;
+
+/// Cache of built [`SharedDimMap`]s keyed by (parent TM IRI, parent join cols), so
+/// the second ref group key to a dim reuses the first's scan + map.
+type DimMapCache = std::collections::HashMap<(String, Vec<String>), SharedDimMap>;
+
 /// PR-6 fact⋈dim group-key resolver, built once at `open` by scanning the small
 /// dimension(s). Maps a fact FK key (the stringified `fact_fk_cols` values, in
 /// the RefObjectMap's join order) to the GROUP BY key tuple; an absent key means
@@ -1108,7 +1117,7 @@ struct GroupKeyResolver {
     /// Customer) share ONE built map instead of scanning + holding it twice
     /// (id=3717398042). Sound to share because the map is a constraint-free keep-min
     /// parent-key → IRI lookup fully determined by (parent TM, parent cols).
-    map: Arc<std::collections::HashMap<Vec<String>, Vec<GKey>>>,
+    map: SharedDimMap,
 }
 
 /// P3 (multi-fact branching-star join, crt_join_reorder class): one FK branch off
@@ -2548,10 +2557,7 @@ impl FusedR2rmlAggregateOperator {
         // — its contents depend only on (parent TM, parent cols), never on the fact-side
         // FK. Cache the built map by that pair and share it (Arc) so the second key reuses
         // the first's scan + map instead of re-scanning the dim and holding a duplicate.
-        let mut dim_map_cache: std::collections::HashMap<
-            (String, Vec<String>),
-            Arc<std::collections::HashMap<Vec<String>, Vec<GKey>>>,
-        > = std::collections::HashMap::new();
+        let mut dim_map_cache: DimMapCache = DimMapCache::new();
         for (fk_child_cols, parent_cols, parent_tm_iri) in ref_group_keys {
             let cache_key = (parent_tm_iri.clone(), parent_cols.clone());
             if let Some(shared) = dim_map_cache.get(&cache_key) {
