@@ -38,6 +38,11 @@ pub enum AggregateFn {
     Count(VarId),
     /// `COUNT(*)` — count all rows in a group regardless of values.
     CountAll,
+    /// `COUNT(DISTINCT *)` — count the *distinct solutions* in a group
+    /// (SPARQL 1.1 §18.5.1.1). Unlike every other variant this reads the whole
+    /// row rather than one column, so it carries no input variable and the
+    /// group operators compose its key from every upstream column.
+    CountDistinctAll,
     /// `COUNT(DISTINCT ?x)` — count distinct non-Unbound values. Separate
     /// variant because its streaming state uses a `HashSet` rather than a
     /// counter.
@@ -77,7 +82,7 @@ impl AggregateFn {
     /// only for [`Self::CountAll`].
     pub fn input_var(&self) -> Option<VarId> {
         match self {
-            Self::CountAll => None,
+            Self::CountAll | Self::CountDistinctAll => None,
             Self::Count(v)
             | Self::CountDistinct(v)
             | Self::Sum(v, _)
@@ -102,6 +107,7 @@ impl AggregateFn {
         matches!(
             self,
             Self::CountDistinct(_)
+                | Self::CountDistinctAll
                 | Self::Sum(_, InputSemantics::Set)
                 | Self::Avg(_, InputSemantics::Set)
                 | Self::Median(_, InputSemantics::Set)
@@ -133,6 +139,12 @@ impl AggregateFn {
         match self {
             Self::Min(_) | Self::Max(_) | Self::Sample(_) => true,
             Self::CountAll | Self::Count(_) => false,
+            // Counting distinct solutions is insensitive to duplicate rows in
+            // principle, but the optimization this gates also *projects away
+            // dead variables* before deduping — and dropping a column changes
+            // which rows are distinct. Classified false so the whole-row read
+            // always sees the full solution.
+            Self::CountDistinctAll => false,
             Self::CountDistinct(_)
             | Self::Sum(..)
             | Self::Avg(..)
@@ -154,7 +166,7 @@ impl AggregateFn {
             }
         };
         match self {
-            Self::CountAll => {}
+            Self::CountAll | Self::CountDistinctAll => {}
             Self::Count(v)
             | Self::CountDistinct(v)
             | Self::Sum(v, _)

@@ -254,6 +254,15 @@ impl Operator for AggregateOperator {
                                 )
                             })
                             .collect(),
+                        // COUNT(DISTINCT *): the number of distinct solutions in
+                        // the group, composed across every child column.
+                        None if matches!(spec.function, AggregateFn::CountDistinctAll) => (0
+                            ..batch.len())
+                            .map(|row_idx| {
+                                let n = distinct_group_rows(&batch, row_idx, self.child_col_count);
+                                Binding::lit(FlakeValue::Long(n), xsd_integer())
+                            })
+                            .collect(),
                         None => {
                             let sizes = group_sizes.get_or_insert_with(|| {
                                 (0..batch.len())
@@ -410,6 +419,18 @@ impl AggregateFn {
         match self {
             Self::Count(_) => agg_count(values),
             Self::CountAll => agg_count_all(values),
+            // Unreachable by construction: `CountDistinctAll` has no input
+            // variable, so it never gets a column and never reaches `apply`.
+            // `AggregateOperator` computes it from every child column instead
+            // (see `distinct_group_rows`). Assert in debug so a future wiring
+            // change is caught rather than silently answering Unbound.
+            Self::CountDistinctAll => {
+                debug_assert!(
+                    false,
+                    "COUNT(DISTINCT *) must be computed over the whole row, not one column"
+                );
+                Binding::Unbound
+            }
             Self::CountDistinct(_) => agg_count_distinct(values),
             Self::Sum { .. } => agg_sum(values),
             Self::Avg { .. } => agg_avg(values),
@@ -733,6 +754,32 @@ fn agg_count_all(values: &[Binding]) -> Binding {
 }
 
 /// COUNT(DISTINCT) - count distinct non-Unbound values
+/// Number of distinct solutions in one group of a `GroupByOperator` output row.
+///
+/// `GroupByOperator` emits one row per group: key columns carry the single key
+/// value, every other column carries `Grouped(Vec<Binding>)` with one entry per
+/// solution in the group. Zipping the grouped columns index-wise reconstructs
+/// the group's solutions. Key columns are constant within a group, so they
+/// cannot change which solutions are distinct — and a group with no grouped
+/// column at all is a set of rows agreeing on every column, i.e. exactly one
+/// distinct solution.
+fn distinct_group_rows(batch: &Batch, row_idx: usize, child_col_count: usize) -> i64 {
+    let grouped: Vec<&[Binding]> = (0..child_col_count)
+        .filter_map(|col_idx| match batch.get_by_col(row_idx, col_idx) {
+            Binding::Grouped(values) => Some(values.as_slice()),
+            _ => None,
+        })
+        .collect();
+    let Some(group_size) = grouped.iter().map(|col| col.len()).min() else {
+        return 1;
+    };
+    let mut seen: HashSet<Vec<&Binding>> = HashSet::with_capacity(group_size);
+    for i in 0..group_size {
+        seen.insert(grouped.iter().map(|col| &col[i]).collect());
+    }
+    seen.len() as i64
+}
+
 fn agg_count_distinct(values: &[Binding]) -> Binding {
     let distinct: HashSet<_> = values
         .iter()

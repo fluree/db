@@ -5,7 +5,7 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::ir::{Grouping, Pattern, Query};
+use crate::ir::{AggregateFn, Grouping, Pattern, Query};
 use crate::var_registry::VarId;
 use std::collections::HashSet;
 
@@ -36,6 +36,19 @@ pub struct VariableDeps {
 /// - Empty select list (no explicit projection)
 /// - `Construct` without a template
 pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
+    // `COUNT(DISTINCT *)` counts distinct SOLUTIONS, so it reads every column of
+    // the pre-grouping row. It reports no input variable, so the backward walk
+    // below cannot see that dependency — trimming a column would silently
+    // collapse solutions that differ only in it. Disable trimming outright.
+    if query
+        .grouping
+        .iter()
+        .flat_map(Grouping::aggregates)
+        .any(|spec| matches!(spec.function, AggregateFn::CountDistinctAll))
+    {
+        return None;
+    }
+
     // ---- backward walk ----
 
     // Seed deps from the query output requirements.

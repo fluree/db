@@ -15,6 +15,8 @@ mod it_query_sparql;
 mod it_query_sparql_agg_over_group_key;
 #[path = "it_query_sparql_annotations.rs"]
 mod it_query_sparql_annotations;
+#[path = "it_query_sparql_count_distinct_star.rs"]
+mod it_query_sparql_count_distinct_star;
 #[path = "it_query_sparql_parse_errors.rs"]
 mod it_query_sparql_parse_errors;
 #[path = "it_query_sparql_path_literal_object.rs"]

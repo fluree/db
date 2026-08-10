@@ -78,6 +78,8 @@ enum AggState {
     Count { n: u64 },
     /// COUNT(DISTINCT) - HashSet of seen values
     CountDistinct { seen: HashSet<GroupKeyOwned> },
+    /// COUNT(DISTINCT *) - HashSet of seen whole solutions
+    CountDistinctAll { seen: HashSet<Vec<GroupKeyOwned>> },
     /// SUM - exact-when-possible numeric accumulator with type promotion
     /// (xsd:integer → xsd:decimal → xsd:double). `poisoned` records a bound
     /// non-numeric member, which makes the whole aggregate a type error.
@@ -224,6 +226,9 @@ impl AggState {
             AggregateFn::CountDistinct(_) => AggState::CountDistinct {
                 seen: HashSet::new(),
             },
+            AggregateFn::CountDistinctAll => AggState::CountDistinctAll {
+                seen: HashSet::new(),
+            },
             AggregateFn::Sum { .. } => AggState::Sum {
                 acc: crate::aggregate::NumericAcc::new(),
                 poisoned: false,
@@ -260,6 +265,9 @@ impl AggState {
                     *n += 1;
                 }
             }
+            // Whole-row state: fed by `update_distinct_row`, never by a single
+            // column (COUNT(DISTINCT *) has no input variable).
+            AggState::CountDistinctAll { .. } => {}
             AggState::CountDistinct { seen } => {
                 if !matches!(binding, Binding::Unbound | Binding::Poisoned) {
                     // Convert binding to owned group key for HashSet,
@@ -350,11 +358,23 @@ impl AggState {
         }
     }
 
+    /// Update with a whole composed solution (`COUNT(DISTINCT *)`).
+    fn update_distinct_row(&mut self, row: &[GroupKeyOwned]) {
+        if let AggState::CountDistinctAll { seen } = self {
+            if !seen.contains(row) {
+                seen.insert(row.to_vec());
+            }
+        }
+    }
+
     /// Finalize the aggregate state into a result binding
     fn finalize(self, func: &AggregateFn) -> Binding {
         match self {
             AggState::Count { n } => Binding::lit(FlakeValue::Long(n as i64), Sid::xsd_integer()),
             AggState::CountDistinct { seen } => {
+                Binding::lit(FlakeValue::Long(seen.len() as i64), Sid::xsd_integer())
+            }
+            AggState::CountDistinctAll { seen } => {
                 Binding::lit(FlakeValue::Long(seen.len() as i64), Sid::xsd_integer())
             }
             AggState::Sum { acc, poisoned } => {
@@ -668,6 +688,12 @@ pub struct GroupAggregateOperator {
     graph_view: Option<BinaryGraphView>,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
+    /// Number of columns in the child (pre-grouping) batch.
+    child_col_count: usize,
+    /// Whether any aggregate is `COUNT(DISTINCT *)`, which reads the whole
+    /// child row rather than one column. Gates the per-row row-key composition
+    /// so ordinary grouping does no extra work.
+    has_row_distinct: bool,
 }
 
 enum GroupEmitIter {
@@ -712,6 +738,10 @@ impl GroupAggregateOperator {
 
         let schema: Arc<[VarId]> = Arc::from(output_vars.into_boxed_slice());
 
+        let has_row_distinct = agg_specs
+            .iter()
+            .any(|s| matches!(s.function, AggregateFn::CountDistinctAll));
+
         Self {
             child,
             in_schema: schema,
@@ -724,6 +754,8 @@ impl GroupAggregateOperator {
             emit_iter: None,
             graph_view,
             out_schema: None,
+            child_col_count: child_schema.len(),
+            has_row_distinct,
         }
     }
 
@@ -746,6 +778,7 @@ impl GroupAggregateOperator {
             AggregateFn::Count(_)
             | AggregateFn::CountAll
             | AggregateFn::CountDistinct(_)
+            | AggregateFn::CountDistinctAll
             | AggregateFn::Min(_)
             | AggregateFn::Max(_)
             | AggregateFn::Sample(_) => true,
@@ -772,6 +805,20 @@ impl GroupAggregateOperator {
             })
             .collect();
         CompositeGroupKey(keys)
+    }
+
+    /// Compose a whole solution into a hashable key, for `COUNT(DISTINCT *)`.
+    ///
+    /// Every upstream column participates, normalized the same way group keys
+    /// are so a mixed encoded/decoded stream does not double-count.
+    fn extract_row_key(&self, batch: &Batch, row_idx: usize) -> Vec<GroupKeyOwned> {
+        let store = self.graph_view.as_ref().map(BinaryGraphView::store);
+        (0..self.child_col_count)
+            .map(|col_idx| {
+                let binding = batch.get_by_col(row_idx, col_idx);
+                binding_to_group_key_normalized(binding, store, self.graph_view.as_ref())
+            })
+            .collect()
     }
 
     /// Extract original bindings for group key columns (for output)
@@ -910,6 +957,12 @@ impl Operator for GroupAggregateOperator {
                                 });
                             }
 
+                            // COUNT(DISTINCT *) reads the whole solution, so
+                            // compose it before the group state is borrowed.
+                            let row_key = self
+                                .has_row_distinct
+                                .then(|| self.extract_row_key(&batch, row_idx));
+
                             // Update aggregate states for current group.
                             let gv_ref = self.graph_view.as_ref();
                             let group_state = current_state
@@ -921,10 +974,20 @@ impl Operator for GroupAggregateOperator {
                                         let binding = batch.get_by_col(row_idx, col_idx);
                                         group_state.agg_states[agg_idx].update(binding, gv_ref);
                                     }
-                                    None => {
+                                    None => match &row_key {
+                                        // COUNT(DISTINCT *) - count distinct solutions
+                                        Some(row)
+                                            if matches!(
+                                                spec.function,
+                                                AggregateFn::CountDistinctAll
+                                            ) =>
+                                        {
+                                            group_state.agg_states[agg_idx]
+                                                .update_distinct_row(row);
+                                        }
                                         // COUNT(*) - count all rows
-                                        group_state.agg_states[agg_idx].update_count_all();
-                                    }
+                                        _ => group_state.agg_states[agg_idx].update_count_all(),
+                                    },
                                 }
                             }
                         }
@@ -984,6 +1047,12 @@ impl Operator for GroupAggregateOperator {
                         // Extract key bindings BEFORE the mutable borrow to avoid borrow conflict
                         let key_bindings = self.extract_key_bindings(&batch, row_idx);
 
+                        // COUNT(DISTINCT *) reads the whole solution, so compose
+                        // it here too — before the group state is borrowed.
+                        let row_key = self
+                            .has_row_distinct
+                            .then(|| self.extract_row_key(&batch, row_idx));
+
                         // Pre-compute aggregate states initialization
                         let agg_specs_ref = &self.agg_specs;
 
@@ -1005,10 +1074,19 @@ impl Operator for GroupAggregateOperator {
                                     let binding = batch.get_by_col(row_idx, col_idx);
                                     group_state.agg_states[agg_idx].update(binding, gv_ref);
                                 }
-                                None => {
+                                None => match &row_key {
+                                    // COUNT(DISTINCT *) - count distinct solutions
+                                    Some(row)
+                                        if matches!(
+                                            spec.function,
+                                            AggregateFn::CountDistinctAll
+                                        ) =>
+                                    {
+                                        group_state.agg_states[agg_idx].update_distinct_row(row);
+                                    }
                                     // COUNT(*) - count all rows
-                                    group_state.agg_states[agg_idx].update_count_all();
-                                }
+                                    _ => group_state.agg_states[agg_idx].update_count_all(),
+                                },
                             }
                         }
                     }

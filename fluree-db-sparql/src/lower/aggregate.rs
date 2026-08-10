@@ -226,12 +226,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             InputSemantics::List
         };
         let function = match (function, input_var) {
-            // COUNT(*) — DISTINCT * is not meaningful for COUNT.
+            // COUNT(*) counts solutions in the group; COUNT(DISTINCT *) counts
+            // the DISTINCT solutions (SPARQL 1.1 §18.5.1.1). Both read the whole
+            // row, so neither carries an input variable.
             (AggregateFunction::Count, None) => {
                 if *distinct {
-                    return Err(LowerError::not_implemented("COUNT(DISTINCT *)", *span));
+                    AggregateFn::CountDistinctAll
+                } else {
+                    AggregateFn::CountAll
                 }
-                AggregateFn::CountAll
             }
             // Every non-COUNT aggregate needs an input variable. The caller
             // is responsible for ensuring `expr` is `Some(_)`; reaching this
