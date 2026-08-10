@@ -1403,9 +1403,11 @@ pub async fn explain_ledger(
         // explain bug the CLI was working around with a hard refusal.
         if requires_dataset_features(&query_json) {
             // Ensure the dataset has a default-graph entry pointing at this
-            // ledger if the body omitted `from`. Mirrors execute_query's
-            // dataset routing.
-            if query_json.get("from").is_none() {
+            // ledger if the body named no dataset at all. Mirrors
+            // execute_query's dataset routing, including its `fromNamed`
+            // carve-out — otherwise explain would plan a default graph the
+            // query itself does not have.
+            if needs_default_graph_injection(&query_json) {
                 if let Some(obj) = query_json.as_object_mut() {
                     obj.insert(
                         "from".to_string(),
@@ -2457,6 +2459,82 @@ pub(crate) fn dataset_semantics_warning_headers(
         ),
     );
     headers
+}
+
+/// Whether a JSON-LD query body needs this endpoint's ledger injected as its
+/// default graph.
+///
+/// Only when the body names no dataset at all. `fromNamed` without `from` is a
+/// dataset clause that deliberately leaves the default graph empty (§13.2);
+/// injecting there used to give the ledger endpoint a different answer than its
+/// own SPARQL surface, and on the connection endpoint it promoted whichever
+/// `fromNamed` entry `get_ledger_id` happened to pick into the default graph.
+/// Mirrors the guard the connection streaming path already uses.
+pub(crate) fn needs_default_graph_injection(query: &JsonValue) -> bool {
+    query.get("from").is_none()
+        && query.get("fromNamed").is_none()
+        && query.get("from-named").is_none()
+}
+
+/// The JSON-LD counterpart of [`dataset_semantics_warning_headers`]: warn when
+/// a `fromNamed`-only body also carries patterns outside `["graph", ...]`,
+/// which the empty default graph now matches with nothing.
+pub(crate) fn jsonld_dataset_semantics_warning_headers(query: &JsonValue) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if query.get("from").is_some() {
+        return headers;
+    }
+    if query.get("fromNamed").is_none() && query.get("from-named").is_none() {
+        return headers;
+    }
+    let reads_default_graph = query
+        .get("where")
+        .is_some_and(jsonld_where_reads_default_graph);
+    if !reads_default_graph {
+        return headers;
+    }
+    headers.insert(
+        axum::http::HeaderName::from_static(X_FDB_WARNING),
+        axum::http::HeaderValue::from_static(
+            "fromNamed without from leaves the default graph empty (SPARQL 1.1 13.2); \
+             patterns outside [\"graph\", ...] match nothing. Add a \"from\" to query the \
+             ledger's default graph.",
+        ),
+    );
+    headers
+}
+
+/// Whether a JSON-LD `where` value matches against the default graph — i.e. it
+/// has a node pattern reached without passing through a `["graph", ...]` form.
+///
+/// `graph` re-scopes to a named graph and `query` is a sub-SELECT carrying its
+/// own `where`; the remaining keywords either bind no triples (`filter`,
+/// `bind`, `values`, `unwind`) or wrap patterns that are walked through.
+fn jsonld_where_reads_default_graph(where_val: &JsonValue) -> bool {
+    match where_val {
+        // A bare pattern object is a default-graph node pattern.
+        JsonValue::Object(_) => true,
+        JsonValue::Array(items) => {
+            // `["keyword", ...]` is one clause; anything else is a pattern list.
+            match items.first().and_then(JsonValue::as_str) {
+                Some(kw) => match kw.to_lowercase().as_str() {
+                    "graph" => false,
+                    // A sub-SELECT's own `where` is evaluated against the same
+                    // dataset, so recurse into it rather than through the form.
+                    "query" => items
+                        .get(1)
+                        .and_then(|q| q.get("where"))
+                        .is_some_and(jsonld_where_reads_default_graph),
+                    "filter" | "bind" | "values" | "unwind" => false,
+                    // optional / union / minus / exists / not-exists /
+                    // shortestpath: walk the operand patterns.
+                    _ => items[1..].iter().any(jsonld_where_reads_default_graph),
+                },
+                None => items.iter().any(jsonld_where_reads_default_graph),
+            }
+        }
+        _ => false,
+    }
 }
 
 /// The top-level WHERE pattern of a query, if it has one.
@@ -3703,7 +3781,11 @@ async fn execute_history_query(
 /// - Graph selectors (from object with graph field)
 /// - Dataset-local aliases for GRAPH patterns
 ///
-/// If the query doesn't have a `from` key, the ledger ID from the URL path is injected.
+/// A query that names NO dataset at all gets this ledger as its default graph,
+/// so `POST /:ledger/query` with a bare `select`/`where` still works. A query
+/// that DOES carry a dataset clause defines its own dataset exhaustively —
+/// `fromNamed` alone means an empty default graph (SPARQL 1.1 §13.2), the same
+/// answer the SPARQL surface gives for `FROM NAMED` with no `FROM`.
 async fn execute_dataset_query(
     state: &AppState,
     ledger_id: &str,
@@ -3713,13 +3795,13 @@ async fn execute_dataset_query(
     // Clone the query so we can potentially inject the `from` key
     let mut query = query_json.clone();
 
-    // If query doesn't have a `from` key, inject the ledger ID from the URL path
-    // This allows users to POST to /:ledger/query with just `{ "fromNamed": {...}, ... }`
-    if query.get("from").is_none() {
+    if needs_default_graph_injection(&query) {
         if let Some(obj) = query.as_object_mut() {
             obj.insert("from".to_string(), JsonValue::String(ledger_id.to_string()));
         }
     }
+    // Computed after injection so a body that got a default graph never warns.
+    let warn_headers = jsonld_dataset_semantics_warning_headers(&query);
 
     maybe_refresh_query_ledgers(state, collect_refreshable_jsonld_ledgers(&query)).await;
 
@@ -3753,7 +3835,8 @@ async fn execute_dataset_query(
         if let Some(fuel) = tally.fuel {
             span.record("tracker_fuel", fuel);
         }
-        let headers = tracking_headers(&tally);
+        let mut headers = tracking_headers(&tally);
+        headers.extend(warn_headers);
         let response =
             fluree_db_api::TrackedQueryResponse::success(outcome.data, Some(tally.clone()));
         tracing::info!(
@@ -3770,7 +3853,7 @@ async fn execute_dataset_query(
             query_kind = "dataset",
             result_count = outcome.data.as_array().map(std::vec::Vec::len).unwrap_or(0)
         );
-        Ok((HeaderMap::new(), Json(outcome.data)).into_response())
+        Ok((warn_headers, Json(outcome.data)).into_response())
     }
 }
 
