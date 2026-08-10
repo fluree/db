@@ -1280,6 +1280,69 @@ mod tests {
         assert_eq!(s_ids, vec![10, 20, 35, 50, 60]);
     }
 
+    /// Companion to `test_update_after_retract_all_reinserts_into_empty_leaflet`
+    /// with generation one produced by the REBUILD writer rather than an
+    /// incremental merge.
+    ///
+    /// A full rebuild preserves a fully-retracted predicate's partition as a
+    /// zero-row leaflet so time travel can still reach its history. That
+    /// leaflet carries no column blocks, exactly like
+    /// `empty_encoded_leaflet_with_keys`, so the next incremental routing
+    /// novelty back into it depends on the same `row_count == 0` guard.
+    #[test]
+    fn test_update_into_rebuild_emitted_empty_partition() {
+        // Generation 1, rebuild-side: p_id=1 keeps a live row, p_id=2 is
+        // fully retracted and survives only as a zero-row partition.
+        let mut writer = LeafWriter::new(RunSortOrder::Psot, 100, 10000, 1);
+        writer.push_record(rec2(100, 1, 10, 1)).unwrap();
+        for (t, op) in [(1u32, 1u8), (5, 0)] {
+            writer.push_history_entry(HistEntryV2 {
+                s_id: SubjectId(100),
+                p_id: 2,
+                o_type: OType::XSD_INTEGER.as_u16(),
+                o_key: ObjKey::encode_i64(20).as_u64(),
+                o_i: OI_NONE,
+                t,
+                op,
+            });
+        }
+        let leaves = writer.finish().unwrap();
+        assert_eq!(leaves.len(), 1);
+        let leaf = &leaves[0];
+        assert_eq!(leaf.total_rows, 1, "only p_id=1 has a live row");
+
+        let header = decode_leaf_header_v3(&leaf.leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(&leaf.leaf_bytes, &header).unwrap();
+        assert_eq!(
+            dir.entries.iter().map(|e| e.p_const).collect::<Vec<_>>(),
+            vec![Some(1), Some(2)],
+            "the rebuild must preserve the fully-retracted predicate's partition"
+        );
+        assert_eq!(dir.entries[1].row_count, 0);
+        assert!(dir.entries[1].column_refs.is_empty(), "no column blocks");
+
+        // Generation 2: re-assert p_id=2, routing novelty into that partition.
+        let novelty = vec![rec2(100, 2, 20, 9)];
+        let ops = vec![1u8];
+        let input = LeafUpdateInput {
+            leaf_bytes: &leaf.leaf_bytes,
+            novelty: &novelty,
+            novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
+            order: RunSortOrder::Psot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 10000,
+            sidecar_bytes: leaf.sidecar_bytes.as_deref(),
+        };
+        let gen2 = update_leaf(&input)
+            .expect("merging novelty into a rebuild-emitted empty partition must not fail");
+        assert_eq!(gen2.leaves.len(), 1);
+        assert_eq!(gen2.leaves[0].info.total_rows, 2);
+    }
+
     /// Regression: when a leaflet splits into multiple chunks, history entries
     /// must be partitioned to the correct chunk (not all in chunk 0).
     /// Retracting the lowest and highest existing facts produces entries

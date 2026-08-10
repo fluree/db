@@ -1275,3 +1275,59 @@ async fn history_range_over_fully_retracted_predicate() {
         "5 asserts at t=1 and 5 retracts at t=2; got {rows:#?}"
     );
 }
+
+/// End-to-end flow across all three generations: rebuild, retract-all
+/// rebuild, then an incremental index on top of the preserved zero-row
+/// partition. Historical reads at each `t` must stay correct throughout.
+///
+/// The storage-level version of this seam — where a rebuild-emitted
+/// zero-row partition is merged into directly — is pinned deterministically
+/// by `test_update_into_rebuild_emitted_empty_partition` in the indexer.
+/// This test does not by itself reach `merge_and_encode_leaflet`: it passes
+/// with or without that function's `row_count == 0` guard, so treat it as
+/// flow coverage rather than as the guard's regression test.
+#[tokio::test]
+async fn incremental_merges_into_a_rebuilt_zero_row_partition() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tt-rebuild-then-incremental:main";
+
+    // t=1 and t=2: the full-rebuild fixture, leaving ns:legacyFlag with a
+    // preserved but zero-row partition in the published index.
+    let _ledger = seed_fully_retracted_ledger(&fluree, ledger_id).await;
+    let l2 = fluree.ledger(ledger_id).await.expect("reload after t=2");
+
+    // t=3: re-assert the predicate on two invoices, then index INCREMENTALLY
+    // so novelty routes back into the rebuild's zero-row partition.
+    let tx3 = json!({"@context": ctx(), "@graph": [
+        {"@id": "ns:Invoice/inv-0000", "ns:legacyFlag": "true"},
+        {"@id": "ns:Invoice/inv-0001", "ns:legacyFlag": "true"},
+    ]});
+    let _ = fluree.insert(l2, &tx3).await.expect("tx3");
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    fluree.ledger(ledger_id).await.expect("reload after t=3");
+
+    let flags_at = |t: u32| {
+        format!(
+            r#"PREFIX ns: <http://example.org/ns#>
+              SELECT ?inv FROM <{ledger_id}@t:{t}>
+              WHERE {{ ?inv ns:legacyFlag "true" }}"#
+        )
+    };
+
+    assert_eq!(
+        run_row_count(&fluree, &flags_at(1)).await,
+        5,
+        "t=1 still replays from the preserved partition"
+    );
+    assert_eq!(
+        run_row_count(&fluree, &flags_at(2)).await,
+        0,
+        "t=2 is still the fully-retracted state"
+    );
+    assert_eq!(
+        run_row_count(&fluree, &flags_at(3)).await,
+        2,
+        "t=3 sees the two re-asserted flags"
+    );
+}
