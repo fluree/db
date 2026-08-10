@@ -14,7 +14,7 @@ use crate::support;
 use fluree_db_api::tx::IndexingMode;
 use fluree_db_api::{Fluree, IndexerConfig, NameServiceMode, TriggerIndexOptions};
 use fluree_db_connection::config::ConnectionConfig;
-use fluree_db_core::{ContentId, ContentStore, MemoryStorage};
+use fluree_db_core::{ContentId, ContentStore, MemoryStorage, StorageRead};
 use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
 use std::sync::Arc;
@@ -150,7 +150,55 @@ async fn incremental_cycles_compact_the_forward_pack_tail() {
                 "compacted-away packs never reached a garbage manifest — they would leak"
             );
 
-            // 4. Every id still resolves through the compacted dictionary. A
+            // 4. Every dictionary object ever written is either referenced by
+            //    some root or recorded as garbage. A pack created and consumed
+            //    inside one cycle is in neither the base root nor the published
+            //    one, so the routing-table diff cannot see it — without explicit
+            //    accounting it would sit in the store forever, referenced by
+            //    nothing and collectable by nothing.
+            let mut accounted: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for root_cid in &roots {
+                let root = decode(&cs.get(root_cid).await.expect("root bytes"));
+                accounted.extend(root.all_cas_ids().iter().map(ContentId::digest_hex));
+                let Some(garbage_ref) = root.garbage.as_ref() else {
+                    continue;
+                };
+                let bytes = cs.get(&garbage_ref.id).await.expect("garbage bytes");
+                let record: fluree_db_indexer::GarbageRecord =
+                    serde_json::from_slice(&bytes).expect("parse garbage record");
+                for entry in &record.garbage {
+                    if let Ok(cid) = entry.parse::<ContentId>() {
+                        accounted.insert(cid.digest_hex());
+                    }
+                }
+            }
+
+            let stored: Vec<String> = storage
+                .list_prefix("")
+                .await
+                .expect("list storage")
+                .into_iter()
+                .filter(|addr| addr.contains("/dicts/"))
+                .collect();
+            assert!(!stored.is_empty(), "expected dictionary objects on disk");
+
+            let orphans: Vec<&String> = stored
+                .iter()
+                .filter(|addr| {
+                    let file = addr.rsplit('/').next().unwrap_or_default();
+                    let digest = file.split('.').next().unwrap_or_default();
+                    !accounted.contains(digest)
+                })
+                .collect();
+            assert!(
+                orphans.is_empty(),
+                "{} dictionary objects are referenced by no root and recorded as no garbage: {:?}",
+                orphans.len(),
+                orphans
+            );
+
+            // 5. Every id still resolves through the compacted dictionary. A
             //    mis-rebased page offset or a lost routing entry shows up here
             //    and nowhere else.
             let db = fluree.db(ledger_id).await.expect("db view");

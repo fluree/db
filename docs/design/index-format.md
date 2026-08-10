@@ -467,26 +467,45 @@ be sized from its 40-byte header alone — a range read, not a full fetch.
 `{first_id, last_id, pack_cid}` per pack. Ranges must be ascending and
 non-overlapping; gaps between packs are legal.
 
-#### Forward pack tail compaction
+#### Forward pack compaction
 
 Each incremental build appends at least one pack per dict stream it touched,
 including a small trailing pack for a handful of new entries. Left alone that
 grows the routing table once per build forever — unbounded objects, unbounded
 mappings, and a root that grows on every publish.
 
-So after appending, the indexer merges the **tail** of each touched stream:
-the longest contiguous suffix that fits the 16 MiB target and whose members are
-either all small (≤ 64 KiB) or within a 4× size ratio of each other, requiring
-either 8 packs or a group already at half the target. Merging preserves input
-pages verbatim, rebasing their offsets — no dictionary value is decoded. Work
-is capped at 64 MiB of input per index cycle.
+So after appending, the indexer merges qualifying **runs** in each touched
+stream: scanning left to right for the longest contiguous run that fits the
+16 MiB target and whose members are either all small (≤ 64 KiB) or within a 4×
+size ratio of each other, requiring either 8 packs or a group already at half
+the target. Merging preserves input pages verbatim, rebasing their offsets —
+no dictionary value is decoded.
+
+Runs rather than suffixes, because a merge output is larger than the packs
+around it. Anchoring candidates at the newest pack means that once a merge
+lands, every later candidate contains it, it fails the size ratio against its
+smaller neighbours, and any fragmentation *behind* it is unreachable forever —
+which would leave a table inherited from before compaction permanently stuck.
 
 Nothing records which packs were previously compacted: the rule is scale-free,
 decided from sizes and ID ranges alone, which is why no compaction state is
-carried in the root. Superseded packs are diffed out of the routing table by
+carried in the root. Sizes come from an in-cycle memo, local file metadata, or
+a 40-byte header range read — never a full fetch.
+
+Work per cycle is bounded two ways: 64 MiB of merge input, and a cap on packs
+sized and fetched. The byte budget alone does not bound *request* count, since
+a backlog of 113-byte packs consumes almost none of it while still issuing a
+probe and a GET per pack; the object cap lets a large backlog drain over
+several cycles instead of stalling one publish behind thousands of round trips.
+
+Superseded packs are diffed out of the routing table by
 `IncrementalRootBuilder::set_dict_refs` and land in the garbage manifest, so
 they are reclaimed by the normal retention-aware GC — older roots keep
-referencing them until those roots age out.
+referencing them until those roots age out. Packs *created and consumed inside
+one cycle* — a freshly appended pack that compaction immediately absorbed, or a
+cascade's own intermediate output — appear in neither the base root nor the
+published one, so that diff cannot see them; the indexer records those
+explicitly as garbage instead.
 
 #### Reverse dict leaf (`DLR1`)
 

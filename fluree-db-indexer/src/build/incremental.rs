@@ -988,6 +988,9 @@ pub async fn incremental_index(
 
         let mut compaction_budget = COMPACTION_BUDGET_BYTES;
         let mut pack_sizes = PackSizeCache::new();
+        // Every pack CID this cycle uploads, so any that compaction consumes
+        // before publication can be garbaged explicitly.
+        let mut uploaded_pack_cids: Vec<ContentId> = Vec::new();
 
         // String forward packs.
         // Invariant: new_strings is sorted by string_id ascending (enforced by resolver).
@@ -1018,6 +1021,7 @@ pub async fn incremental_index(
                     .await
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
                 pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
+                uploaded_pack_cids.push(pack_cid.clone());
                 updated_refs.push(PackBranchEntry {
                     first_id: pack.first_id,
                     last_id: pack.last_id,
@@ -1025,15 +1029,17 @@ pub async fn incremental_index(
                 });
             }
 
-            compact_forward_pack_tail(
-                content_store.as_ref(),
-                kind,
-                &mut updated_refs,
-                &mut pack_sizes,
-                &mut compaction_budget,
-                "string",
-            )
-            .await?;
+            uploaded_pack_cids.extend(
+                compact_forward_packs(
+                    content_store.as_ref(),
+                    kind,
+                    &mut updated_refs,
+                    &mut pack_sizes,
+                    &mut compaction_budget,
+                    "string",
+                )
+                .await?,
+            );
 
             let total_packs = updated_refs.len();
             new_dict_refs.forward_packs.string_fwd_packs = updated_refs;
@@ -1104,6 +1110,7 @@ pub async fn incremental_index(
                         .await
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
                     pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
+                    uploaded_pack_cids.push(pack_cid.clone());
                     updated_refs.push(PackBranchEntry {
                         first_id: pack.first_id,
                         last_id: pack.last_id,
@@ -1111,15 +1118,17 @@ pub async fn incremental_index(
                     });
                 }
 
-                compact_forward_pack_tail(
-                    content_store.as_ref(),
-                    kind,
-                    &mut updated_refs,
-                    &mut pack_sizes,
-                    &mut compaction_budget,
-                    &format!("subject ns={ns_code}"),
-                )
-                .await?;
+                uploaded_pack_cids.extend(
+                    compact_forward_packs(
+                        content_store.as_ref(),
+                        kind,
+                        &mut updated_refs,
+                        &mut pack_sizes,
+                        &mut compaction_budget,
+                        &format!("subject ns={ns_code}"),
+                    )
+                    .await?,
+                );
 
                 let total_packs = updated_refs.len();
 
@@ -1146,6 +1155,21 @@ pub async fn incremental_index(
                     "V6 Phase 3: subject forward packs updated"
                 );
             }
+        }
+
+        // Packs created and consumed within this cycle are referenced by no
+        // root, so the base-vs-new diff in `set_dict_refs` cannot see them.
+        let transient = unreferenced_uploads(
+            &uploaded_pack_cids,
+            &new_dict_refs.forward_packs,
+            &base_root.dict_refs.forward_packs,
+        );
+        if !transient.is_empty() {
+            tracing::debug!(
+                count = transient.len(),
+                "V6 Phase 3: forward packs created and compacted within one cycle"
+            );
+            root_builder.add_replaced_cids(transient);
         }
     }
 
@@ -4022,55 +4046,75 @@ async fn pack_encoded_size(
     Some(size)
 }
 
-/// Merge the tail of one forward-dictionary stream in place, repeatedly, while
-/// the tail still qualifies and the cycle budget holds.
+/// Packs one index cycle may size and fetch per forward-dictionary stream.
 ///
-/// Replaced packs are simply dropped from `refs`; `IncrementalRootBuilder::
-/// set_dict_refs` diffs the old and new routing tables and records everything
-/// that disappeared as garbage, so this needs no GC path of its own.
+/// The byte budget alone does not bound *request* count: a backlog of
+/// 113-byte packs consumes almost none of it while issuing a header probe and
+/// a full GET per pack. On S3 that is thousands of round trips holding up the
+/// publish, so cap the objects touched and let a large backlog drain across
+/// several cycles instead of stalling one.
+const COMPACTION_MAX_PACKS_PER_CYCLE: usize = 1024;
+
+/// Concurrent fetches of merge inputs. They are independent objects, so
+/// serializing them would make a merge cost `run_length` round trips.
+const COMPACTION_FETCH_CONCURRENCY: usize = 16;
+
+/// Merge qualifying runs in one forward-dictionary stream in place, repeatedly,
+/// while runs still qualify and the cycle budgets hold.
+///
+/// Returns the CIDs of packs this call uploaded, whether or not they survived
+/// into `refs` — a cascade rewrites its own intermediate output, and the caller
+/// must account for anything that did not survive (see `unreferenced_uploads`).
 ///
 /// Compaction never fails a build. A pack whose size cannot be probed, or which
 /// cannot be fetched, just makes its stream ineligible this cycle. A *structural*
 /// failure is different — a merge that produced a malformed or mis-ranged pack
 /// means the inputs were not what the routing table claimed, so that propagates.
-async fn compact_forward_pack_tail(
+async fn compact_forward_packs(
     content_store: &dyn ContentStore,
     kind: ContentKind,
     refs: &mut Vec<fluree_db_binary_index::PackBranchEntry>,
     cache: &mut PackSizeCache,
     budget: &mut u64,
     stream_label: &str,
-) -> Result<()> {
+) -> Result<Vec<ContentId>> {
     use fluree_db_binary_index::dict::forward_pack::concat_forward_packs;
-    use fluree_db_binary_index::dict::incremental::{
-        plan_tail_compaction, COMPACTION_MAX_OUTPUT_BYTES, COMPACTION_MAX_WINDOW,
-    };
+    use fluree_db_binary_index::dict::incremental::{plan_compaction, COMPACTION_MAX_OUTPUT_BYTES};
+
+    let mut uploaded: Vec<ContentId> = Vec::new();
+    let mut packs_left = COMPACTION_MAX_PACKS_PER_CYCLE;
+    // Positions before the last merge cannot newly qualify, so the scan
+    // resumes rather than restarting — otherwise draining a large backlog is
+    // quadratic in the routing table.
+    let mut scan_from = 0usize;
 
     loop {
-        if refs.len() < 2 || *budget == 0 {
-            return Ok(());
+        if refs.len() < 2 || *budget == 0 || packs_left < 2 || scan_from + 1 >= refs.len() {
+            return Ok(uploaded);
         }
 
-        // Size the tail window, newest first. A pack that cannot be sized ends
-        // the window: only the suffix behind it is a merge candidate.
-        let window_start = refs.len().saturating_sub(COMPACTION_MAX_WINDOW);
-        let mut sizes: Vec<u64> = Vec::with_capacity(refs.len() - window_start);
-        let mut sized_start = refs.len();
-        for idx in (window_start..refs.len()).rev() {
-            match pack_encoded_size(content_store, &refs[idx].pack_cid, cache).await {
-                Some(size) => {
-                    sizes.push(size);
-                    sized_start = idx;
-                }
+        // Size a bounded window at the scan position. Starting from the head
+        // is what lets an existing backlog be repaired; once it drains below
+        // the cap the whole table is covered and the tail compacts as usual.
+        let window_end = refs.len().min(scan_from + packs_left);
+        let mut sizes: Vec<u64> = Vec::with_capacity(window_end - scan_from);
+        for entry in &refs[scan_from..window_end] {
+            match pack_encoded_size(content_store, &entry.pack_cid, cache).await {
+                Some(size) => sizes.push(size),
+                // A pack that cannot be sized truncates the candidate region
+                // rather than failing the build.
                 None => break,
             }
         }
-        sizes.reverse();
 
-        let Some(plan) =
-            plan_tail_compaction(&refs[sized_start..], &sizes, COMPACTION_MAX_OUTPUT_BYTES)
-        else {
-            return Ok(());
+        let window = &refs[scan_from..scan_from + sizes.len()];
+        let Some(plan) = plan_compaction(window, &sizes, COMPACTION_MAX_OUTPUT_BYTES, 0) else {
+            return Ok(uploaded);
+        };
+        let plan = fluree_db_binary_index::dict::incremental::PackCompaction {
+            start: scan_from + plan.start,
+            end: scan_from + plan.end,
+            ..plan
         };
 
         if plan.input_bytes > *budget {
@@ -4078,28 +4122,39 @@ async fn compact_forward_pack_tail(
                 stream = stream_label,
                 input_bytes = plan.input_bytes,
                 budget_remaining = *budget,
-                "forward pack compaction deferred: cycle budget exhausted"
+                "forward pack compaction deferred: cycle byte budget exhausted"
             );
-            return Ok(());
+            return Ok(uploaded);
         }
 
-        let merge_from = sized_start + plan.start;
         let started = Instant::now();
+        let input_packs = plan.end - plan.start;
 
-        let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(refs.len() - merge_from);
-        for entry in &refs[merge_from..] {
-            match content_store.get(&entry.pack_cid).await {
-                Ok(b) => bytes.push(b),
-                Err(e) => {
-                    tracing::debug!(
-                        stream = stream_label,
-                        error = %e,
-                        "forward pack compaction skipped: input fetch failed"
-                    );
-                    return Ok(());
-                }
+        let input_cids: Vec<ContentId> = refs[plan.start..plan.end]
+            .iter()
+            .map(|e| e.pack_cid.clone())
+            .collect();
+        let fetches: Vec<_> = input_cids
+            .iter()
+            .map(|cid| content_store.get(cid))
+            .collect();
+        let fetched: std::result::Result<Vec<Vec<u8>>, fluree_db_core::error::Error> =
+            stream::iter(fetches)
+                .buffered(COMPACTION_FETCH_CONCURRENCY)
+                .try_collect()
+                .await;
+
+        let bytes = match fetched {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(
+                    stream = stream_label,
+                    error = %e,
+                    "forward pack compaction skipped: input fetch failed"
+                );
+                return Ok(uploaded);
             }
-        }
+        };
 
         let borrowed: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
         let merged = concat_forward_packs(&borrowed).map_err(|e| {
@@ -4107,37 +4162,72 @@ async fn compact_forward_pack_tail(
         })?;
         drop(bytes);
 
-        let input_packs = refs.len() - merge_from;
         let output_bytes = merged.len() as u64;
-        let first_id = refs[merge_from].first_id;
-        let last_id = refs[refs.len() - 1].last_id;
+        let first_id = refs[plan.start].first_id;
+        let last_id = refs[plan.end - 1].last_id;
 
         let pack_cid = content_store
             .put(kind, &merged)
             .await
             .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
+        uploaded.push(pack_cid.clone());
         cache.insert(pack_cid.clone(), output_bytes);
-        refs.truncate(merge_from);
-        refs.push(fluree_db_binary_index::PackBranchEntry {
-            first_id,
-            last_id,
-            pack_cid,
-        });
+        refs.splice(
+            plan.start..plan.end,
+            [fluree_db_binary_index::PackBranchEntry {
+                first_id,
+                last_id,
+                pack_cid,
+            }],
+        );
 
         *budget = budget.saturating_sub(plan.input_bytes);
+        packs_left = packs_left.saturating_sub(input_packs);
+        scan_from = plan.start;
 
         tracing::debug!(
             stream = stream_label,
             input_packs,
             input_bytes = plan.input_bytes,
             output_bytes,
+            merged_at = plan.start,
             packs_remaining = refs.len(),
             budget_remaining = *budget,
+            packs_left,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "forward pack tail compacted"
+            "forward packs compacted"
         );
     }
+}
+
+/// Uploads from this cycle that no longer appear in the published routing
+/// tables, and were not inherited from the base root.
+///
+/// `set_dict_refs` records garbage by diffing the base root against the new
+/// one, which cannot see a pack that was created *and* consumed inside a single
+/// cycle — a freshly appended pack that compaction immediately absorbed, or a
+/// cascade's own intermediate output. Those are referenced by no root at all,
+/// so without this they would sit in the store forever.
+fn unreferenced_uploads(
+    uploaded: &[ContentId],
+    live: &fluree_db_binary_index::DictPackRefs,
+    base: &fluree_db_binary_index::DictPackRefs,
+) -> Vec<ContentId> {
+    let referenced: std::collections::HashSet<&ContentId> = live
+        .string_fwd_packs
+        .iter()
+        .chain(live.subject_fwd_ns_packs.iter().flat_map(|(_, v)| v.iter()))
+        .chain(base.string_fwd_packs.iter())
+        .chain(base.subject_fwd_ns_packs.iter().flat_map(|(_, v)| v.iter()))
+        .map(|e| &e.pack_cid)
+        .collect();
+
+    uploaded
+        .iter()
+        .filter(|cid| !referenced.contains(cid))
+        .cloned()
+        .collect()
 }
 
 /// Upload ONE leaf (+ its sidecar) under a single permit from the global

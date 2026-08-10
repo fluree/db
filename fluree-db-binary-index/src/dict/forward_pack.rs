@@ -5,7 +5,7 @@
 //! enabling O(1) value lookup via an offsets-of-next layout.
 //!
 //! Packs are append-only per index build and merged back down by
-//! [`concat_forward_packs`]; see `dict::incremental::plan_tail_compaction`.
+//! [`concat_forward_packs`]; see `dict::incremental::plan_compaction`.
 //!
 //! ## Pack wire format (`FPK1`)
 //!
