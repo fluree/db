@@ -29,7 +29,7 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
 use num_bigint::BigInt;
 use num_traits::{Signed, Zero};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
@@ -225,6 +225,8 @@ impl Operator for AggregateOperator {
 
             let num_cols = self.in_schema.len();
             let mut output_columns: Vec<Vec<Binding>> = Vec::with_capacity(num_cols);
+            // Namespace table for expanding IRI-valued GROUP_CONCAT members.
+            let namespaces = ctx.active_snapshot.namespaces();
             ctx.check_cancelled()?;
 
             // Process child columns (regular aggregates and pass-through)
@@ -239,7 +241,12 @@ impl Operator for AggregateOperator {
                         Some(agg_idx) => {
                             // This column needs aggregation
                             let spec = &self.aggregates[agg_idx];
-                            apply_aggregate(&spec.function, input_binding, self.graph_view.as_ref())
+                            apply_aggregate(
+                                &spec.function,
+                                input_binding,
+                                self.graph_view.as_ref(),
+                                Some(namespaces),
+                            )
                         }
                         None => {
                             // Pass through unchanged
@@ -268,6 +275,7 @@ impl Operator for AggregateOperator {
                                     &spec.function,
                                     input_binding,
                                     self.graph_view.as_ref(),
+                                    Some(namespaces),
                                 )
                             })
                             .collect(),
@@ -344,10 +352,14 @@ impl Operator for AggregateOperator {
 ///
 /// Count variants and the numeric accumulator handle encoded bindings
 /// natively, so they skip the decode.
+///
+/// GROUP_CONCAT additionally needs IRI-valued bindings expanded to their IRI
+/// string (`namespaces`); see [`group_concat_expand_iris`].
 fn apply_aggregate(
     func: &AggregateFn,
     binding: &Binding,
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+    namespaces: Option<&HashMap<u16, String>>,
 ) -> Binding {
     let needs_decoded_values = matches!(
         func,
@@ -370,7 +382,23 @@ fn apply_aggregate(
                 .iter()
                 .map(|b| crate::group_aggregate::materialize_encoded(b, gv))
                 .collect();
+            // Decoding turns an encoded ref into `Binding::Sid`, which
+            // GROUP_CONCAT still cannot read — expand those too.
+            let decoded = match func {
+                AggregateFn::GroupConcat { .. } => group_concat_expand_iris(&decoded, namespaces),
+                _ => decoded,
+            };
             return func.apply(&Binding::Grouped(decoded));
+        }
+    }
+    // No graph view (memory ledgers): bindings arrive already decoded, but an
+    // IRI-valued one is still a `Sid`/`IriMatch`/`Iri` that GROUP_CONCAT drops.
+    if matches!(func, AggregateFn::GroupConcat { .. }) {
+        if let Binding::Grouped(values) = binding {
+            if values.iter().any(is_iri_binding) {
+                let expanded = group_concat_expand_iris(values, namespaces);
+                return func.apply(&Binding::Grouped(expanded));
+            }
         }
     }
     // SUM/AVG accumulate inline NUM_INT/NUM_F64 encodings natively, but
@@ -775,6 +803,49 @@ fn agg_count_all(values: &[Binding]) -> Binding {
 }
 
 /// COUNT(DISTINCT) - count distinct non-Unbound values
+/// Whether a binding denotes an IRI (any of the three representations).
+fn is_iri_binding(b: &Binding) -> bool {
+    matches!(
+        b,
+        Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_)
+    )
+}
+
+/// Expand IRI-valued bindings to `xsd:string` literals holding the full IRI,
+/// leaving everything else untouched.
+///
+/// `agg_group_concat` reads only `Binding::Lit`, so an IRI-valued group member
+/// was silently skipped: an all-IRI group concatenated nothing and returned
+/// Unbound (rendered `null`), and a mixed group dropped its IRI members from
+/// the result. Expanding here matches what `STR()` already does for the same
+/// term (`eval::string::eval_str`), so `GROUP_CONCAT(?s)` and
+/// `GROUP_CONCAT(STR(?s))` agree.
+///
+/// A `Sid` whose namespace code is missing from `namespaces` cannot be
+/// expanded; it stays as-is and is skipped downstream, exactly as before.
+fn group_concat_expand_iris(
+    values: &[Binding],
+    namespaces: Option<&HashMap<u16, String>>,
+) -> Vec<Binding> {
+    values
+        .iter()
+        .map(|b| {
+            let iri: Option<String> = match b {
+                Binding::Sid { sid, .. } => namespaces
+                    .and_then(|ns| ns.get(&sid.namespace_code))
+                    .map(|prefix| format!("{prefix}{}", sid.name)),
+                Binding::IriMatch { iri, .. } => Some(iri.to_string()),
+                Binding::Iri(iri) => Some(iri.to_string()),
+                _ => None,
+            };
+            match iri {
+                Some(iri) => Binding::lit(FlakeValue::String(iri), xsd_string()),
+                None => b.clone(),
+            }
+        })
+        .collect()
+}
+
 /// Number of distinct solutions in one group of a `GroupByOperator` output row.
 ///
 /// `GroupByOperator` emits one row per group: key columns carry the single key
