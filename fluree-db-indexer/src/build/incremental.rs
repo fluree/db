@@ -986,7 +986,11 @@ pub async fn incremental_index(
         };
         use fluree_db_binary_index::PackBranchEntry;
 
-        let mut compaction_budget = CompactionBudget::new();
+        let mut compaction_budget = if compaction_enabled() {
+            CompactionBudget::new()
+        } else {
+            CompactionBudget::disabled()
+        };
         let mut pack_sizes = PackSizeCache::new();
         // Every pack CID this cycle uploads, so any that compaction consumes
         // before publication can be garbaged explicitly.
@@ -4125,6 +4129,26 @@ impl Default for CompactionSpans {
     }
 }
 
+/// Whether forward pack compaction runs at all.
+///
+/// Compaction rewrites and re-uploads dictionary data during an index build, so
+/// a deployment needs a way to stop it without a rollback — the same reason
+/// `FLUREE_DICT_PACK_MMAP_MIN_BYTES` exists. Off means packs are appended and
+/// never merged, which is the pre-compaction behaviour exactly.
+///
+/// Defaults to on; only `0`, `false`, `off`, or `no` disable it. Read once per
+/// process — set it at startup, not per build.
+fn compaction_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_DICT_COMPACTION") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
 /// Cycle-wide compaction allowance, shared by every forward-dictionary stream.
 struct CompactionBudget {
     bytes: u64,
@@ -4141,6 +4165,14 @@ impl CompactionBudget {
 
     fn exhausted(&self) -> bool {
         self.bytes == 0 || self.requests == 0
+    }
+
+    /// A budget that permits nothing, so every compaction site is a no-op.
+    fn disabled() -> Self {
+        Self {
+            bytes: 0,
+            requests: 0,
+        }
     }
 
     /// Reserve up to `n` operations, returning how many were granted.
@@ -4850,6 +4882,35 @@ mod compaction_tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_budget_merges_nothing() {
+        // The off-switch has to be a true no-op: packs are appended and never
+        // merged, exactly as before compaction existed.
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+        let mut refs = table_with_unmergeable_prefix(&store, 0, 20).await;
+        let before = refs.clone();
+
+        let uploaded = compact_forward_packs(
+            &store,
+            dict_kind(),
+            &mut refs,
+            &mut PackSizeCache::new(),
+            &mut CompactionBudget::disabled(),
+            CompactionSpans::default(),
+            "test",
+        )
+        .await
+        .expect("compaction");
+
+        assert!(uploaded.is_empty(), "a disabled budget must upload nothing");
+        assert_eq!(refs.len(), before.len(), "routing table must be untouched");
+        assert!(refs
+            .iter()
+            .zip(&before)
+            .all(|(a, b)| a.pack_cid == b.pack_cid));
     }
 
     #[tokio::test]
