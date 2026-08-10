@@ -863,3 +863,133 @@ async fn sparql_construct_repeated_triple_collapses_in_both_serializations() {
         "RDF/XML applies the same set semantics: {rdfxml}"
     );
 }
+
+/// One subject, one literal, two predicates: two distinct RDF triples. The
+/// JSON-LD formatter's object dedupe once tracked seen values per SUBJECT and
+/// dropped the second. The SELECT row path is the oracle.
+#[tokio::test]
+async fn sparql_construct_shared_object_across_predicates_novelty() {
+    let (fluree, ledger) = seed_shared_object("it/construct:shared-obj", true).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let rows = support::query_sparql(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("select");
+    let row_count: usize = rows.batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(row_count, 2, "SELECT oracle sees both triples");
+
+    let out = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "same literal under p1 and p2 are distinct triples: {out:#}"
+    );
+}
+
+/// Same assertion on the indexed read path: the binary index feeds a different
+/// scan operator, and the reported reproduction reindexed before querying.
+#[tokio::test]
+async fn sparql_construct_shared_object_across_predicates_indexed() {
+    let ledger_id = "it/construct:shared-obj-idx";
+    let (fluree, _ledger) = seed_shared_object(ledger_id, true).await;
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let out = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "indexed lane must agree with novelty: {out:#}"
+    );
+}
+
+/// Control: distinct objects were never affected. Guards against a "fix" that
+/// simply disables deduplication.
+#[tokio::test]
+async fn sparql_construct_distinct_objects_across_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:distinct-obj", false).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let out = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(count_graph_values(&out), 2, "control: {out:#}");
+}
+
+/// DESCRIBE lowers to the same `QueryOutput::Construct`, so it shares the
+/// result-graph contract.
+#[tokio::test]
+async fn sparql_describe_shared_object_across_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:describe-obj", true).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let out = db
+        .query(&fluree)
+        .sparql("DESCRIBE <http://ex/s>")
+        .execute_formatted()
+        .await
+        .expect("DESCRIBE must execute");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "DESCRIBE must emit both triples: {out:#}"
+    );
+}
+
+/// Three-surface parity: the FQL `construct` form shares the same formatter and
+/// must agree with the SPARQL surface.
+#[tokio::test]
+async fn fql_construct_shared_object_across_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:fql-obj", true).await;
+
+    let query = json!({
+        "where": [{"@id": "?s", "?p": "?o"}],
+        "construct": [{"@id": "?s", "?p": "?o"}]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("FQL construct must execute");
+    let out = result
+        .to_jsonld_async(support::graphdb_from_ledger(&ledger).as_graph_db_ref())
+        .await
+        .expect("format");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "FQL construct must agree with SPARQL: {out:#}"
+    );
+}
+
+/// RDF/XML must carry both predicates for the shared-object shape. Pins the
+/// serializer that was already correct, so the dedupe-scope change cannot
+/// over-correct it into the JSON-LD failure mode.
+#[tokio::test]
+async fn sparql_construct_shared_object_rdfxml_keeps_both_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:shared-obj-xml", true).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let rdfxml = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .format(fluree_db_api::FormatterConfig::rdf_xml())
+        .execute_formatted_string()
+        .await
+        .expect("RDF/XML must execute");
+    assert!(
+        rdfxml.contains("p1") && rdfxml.contains("p2"),
+        "RDF/XML must carry both predicates: {rdfxml}"
+    );
+}

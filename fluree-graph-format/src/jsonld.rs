@@ -353,10 +353,13 @@ impl SubjectData {
         let mut node = Map::new();
         node.insert("@id".to_string(), JsonValue::String(self.id.clone()));
 
-        // Track seen values for deduplication
-        let mut seen_values: HashSet<String> = HashSet::new();
-
         for (pred_iri, triples) in self.predicates {
+            // Track seen objects for deduplication, scoped to THIS predicate.
+            // RDF triple identity is (s, p, o), so the same object reached
+            // through a different predicate is a different triple and must
+            // still be emitted; a subject-wide set would drop it.
+            let mut seen_values: HashSet<String> = HashSet::new();
+
             // Check if this predicate is a list (any triple has list_index)
             let is_list = triples.iter().any(|(idx, _)| idx.is_some());
 
