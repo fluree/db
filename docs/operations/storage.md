@@ -375,6 +375,13 @@ intend to keep.
 > measured here at ~4 ms versus ~0.08 ms. Local development on macOS may want
 > `FLUREE_STORAGE_FSYNC=0`; it is not representative of Linux production cost.
 
+Because the staged file is moved into place, each write gives the destination a
+new inode. Ownership, permissions, ACLs and hard links applied to a *path* are
+therefore dropped on the next write to that path — set them on the containing
+directory instead. This is immaterial for content-addressed blobs, which are
+written once and never rewritten, but it applies to the paths that are updated
+in place: nameservice head refs and ledger config.
+
 Configuration details: [Connection config (JSON-LD)](../reference/connection-config-jsonld.md#durability)
 and [Configuration](configuration.md).
 
