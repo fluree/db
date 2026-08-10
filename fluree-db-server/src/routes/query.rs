@@ -677,9 +677,14 @@ pub async fn query(
             .await;
         }
 
+        // Parse once and reuse across the format branches below (#1473): the
+        // agent-json and plain paths both need the AST, and the advisory header
+        // is derived from the same parse rather than a third one.
+        let parsed = fluree_db_sparql::parse_sparql(&sparql);
+        let warn_headers = sparql_dataset_warning_headers(parsed.ast.as_ref());
+
         // AgentJson: connection-scoped SPARQL with agent-optimized envelope
         if headers.wants_agent_json() {
-            let parsed = fluree_db_sparql::parse_sparql(&sparql);
             // AgentJson is a solution-table envelope; a CONSTRUCT/DESCRIBE graph
             // has no such form, so reject rather than mislabel a JSON-LD graph
             // as AgentJson (issue #1274).
@@ -736,6 +741,7 @@ pub async fn query(
                             reasoning: r.reasoning.clone(),
                         };
                         let mut resp_headers = tracking_headers(&tally);
+                        resp_headers.extend(warn_headers);
                         resp_headers.insert(
                             axum::http::header::CONTENT_TYPE,
                             content_type.parse().expect("content-type parses"),
@@ -771,7 +777,7 @@ pub async fn query(
             return match result {
                 Ok(json) => {
                     tracing::info!(status = "success", query_kind = "sparql", format = "agent-json");
-                    Ok(([(axum::http::header::CONTENT_TYPE, content_type)], Json(json)).into_response())
+                    Ok((warn_headers, [(axum::http::header::CONTENT_TYPE, content_type)], Json(json)).into_response())
                 }
                 Err(e) => {
                     let server_error = ServerError::Api(e);
@@ -811,7 +817,8 @@ pub async fn query(
                 policy: response.policy.clone(),
                 reasoning: response.reasoning.clone(),
             };
-            let resp_headers = tracking_headers(&tally);
+            let mut resp_headers = tracking_headers(&tally);
+            resp_headers.extend(warn_headers);
             tracing::info!(
                 status = "success",
                 query_kind = "sparql",
@@ -822,7 +829,6 @@ pub async fn query(
             return Ok((resp_headers, Json(response)).into_response());
         }
 
-        let parsed = fluree_db_sparql::parse_sparql(&sparql);
         let (fmt_config, content_type) =
             sparql_json_response_format(parsed.ast.as_ref(), &headers);
         match state
@@ -840,7 +846,7 @@ pub async fn query(
                     query_kind = "sparql",
                     result_count = result.as_array().map(std::vec::Vec::len).unwrap_or(0)
                 );
-                Ok(([(axum::http::header::CONTENT_TYPE, content_type)], Json(result)).into_response())
+                Ok((warn_headers, [(axum::http::header::CONTENT_TYPE, content_type)], Json(result)).into_response())
             }
             Err(e) => {
                 let server_error = ServerError::Api(e);
@@ -2459,6 +2465,26 @@ pub(crate) fn dataset_semantics_warning_headers(
         ),
     );
     headers
+}
+
+/// [`dataset_semantics_warning_headers`] for a whole AST, pulling the dataset
+/// clause out itself. Used where the caller has an AST but no separate clause
+/// (the connection-scoped SPARQL route).
+pub(crate) fn sparql_dataset_warning_headers(
+    ast: Option<&fluree_db_sparql::SparqlAst>,
+) -> HeaderMap {
+    use fluree_db_sparql::ast::QueryBody;
+    let clause = ast.and_then(|a| match &a.body {
+        QueryBody::Select(q) => q.dataset.as_ref(),
+        QueryBody::Construct(q) => q.dataset.as_ref(),
+        QueryBody::Ask(q) => q.dataset.as_ref(),
+        QueryBody::Describe(q) => q.dataset.as_ref(),
+        QueryBody::Update(_) => None,
+    });
+    match clause {
+        Some(dc) => dataset_semantics_warning_headers(dc, ast),
+        None => HeaderMap::new(),
+    }
 }
 
 /// Whether a JSON-LD query body needs this endpoint's ledger injected as its

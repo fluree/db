@@ -340,3 +340,334 @@ async fn graph_var_without_dataset_clause_enumerates_user_graphs_only() {
     graphs.sort_unstable();
     assert_eq!(graphs, vec![G1, G2], "{json}");
 }
+
+// ===========================================================================
+// JSON-LD `fromNamed`, and cross-language parity
+//
+// The same dataset question asked in JSON-LD must get the same answer. Before
+// this branch it did not: `execute_dataset_query` injected the endpoint's
+// ledger as `from` whenever the body carried `fromNamed` but no `from`, so
+// JSON-LD kept the default-graph fallback that SPARQL had just lost. On the
+// connection endpoint the injected ledger was whichever `fromNamed` entry
+// `get_ledger_id` picked first, which silently made one named graph the
+// default graph.
+// ===========================================================================
+
+/// POST a JSON-LD body to the ledger route.
+async fn jsonld(app: &axum::Router, body: JsonValue) -> (StatusCode, Option<String>, JsonValue) {
+    post_jsonld(app, &format!("/v1/fluree/query/{LEDGER}"), body).await
+}
+
+/// POST a JSON-LD body to the connection route (no path ledger).
+async fn jsonld_connection(
+    app: &axum::Router,
+    body: JsonValue,
+) -> (StatusCode, Option<String>, JsonValue) {
+    post_jsonld(app, "/v1/fluree/query", body).await
+}
+
+async fn post_jsonld(
+    app: &axum::Router,
+    uri: &str,
+    body: JsonValue,
+) -> (StatusCode, Option<String>, JsonValue) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let warning = resp
+        .headers()
+        .get("x-fdb-warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: JsonValue = serde_json::from_slice(&bytes).expect("valid JSON response");
+    (status, warning, json)
+}
+
+/// POST SPARQL to the connection route (no path ledger).
+async fn sparql_connection(
+    app: &axum::Router,
+    sparql: &str,
+) -> (StatusCode, Option<String>, JsonValue) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let warning = resp
+        .headers()
+        .get("x-fdb-warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: JsonValue = serde_json::from_slice(&bytes).expect("valid JSON response");
+    (status, warning, json)
+}
+
+/// JSON-LD SELECT returns a bare array of rows.
+fn rows(json: &JsonValue) -> &Vec<JsonValue> {
+    json.as_array()
+        .unwrap_or_else(|| panic!("expected a JSON-LD row array, got {json}"))
+}
+
+/// Ledger endpoint, JSON-LD: `fromNamed` with no `from` leaves the default
+/// graph empty, so a pattern outside `["graph", ...]` matches nothing — and
+/// says so on the wire. Pre-branch this returned the ledger's "D" triple.
+#[tokio::test]
+async fn jsonld_from_named_only_has_empty_default_graph_and_warns() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (status, warning, json) = jsonld(
+        &app,
+        serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "fromNamed": {"g1": {"@id": LEDGER, "@graph": G1}},
+            "select": ["?n"],
+            "where": {"@id": "?s", "ex:name": "?n"}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(
+        rows(&json).is_empty(),
+        "default graph must be empty: {json}"
+    );
+    let warning = warning.expect("fromNamed-only with a non-graph pattern must warn");
+    assert!(
+        warning.contains("fromNamed") && warning.contains("default graph"),
+        "unhelpful warning: {warning}"
+    );
+}
+
+/// The `["graph", ...]` half still resolves under the same body, and a body
+/// whose every pattern is inside `graph` draws no warning.
+#[tokio::test]
+async fn jsonld_from_named_graph_pattern_resolves_without_warning() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (status, warning, json) = jsonld(
+        &app,
+        serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "fromNamed": {"g1": {"@id": LEDGER, "@graph": G1}},
+            "select": ["?n"],
+            "where": [["graph", "g1", {"@id": "?s", "ex:name": "?n"}]]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(rows(&json).len(), 2, "g1 carries two names: {json}");
+    assert!(warning.is_none(), "{warning:?}");
+}
+
+/// A JSON-LD body with no dataset clause at all still reads the ledger's
+/// default graph — the injection is preserved for exactly that case.
+#[tokio::test]
+async fn jsonld_no_dataset_clause_still_reads_ledger_default_graph() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (status, warning, json) = jsonld(
+        &app,
+        serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "select": ["?n"],
+            "where": {"@id": "?s", "ex:name": "?n"}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(rows(&json).len(), 1, "the default-graph triple: {json}");
+    assert!(warning.is_none(), "{warning:?}");
+}
+
+/// Naming the default graph explicitly is the migration path, and it silences
+/// the warning.
+#[tokio::test]
+async fn jsonld_explicit_from_plus_from_named_reads_both() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (status, warning, json) = jsonld(
+        &app,
+        serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "from": {"@id": LEDGER, "graph": "default"},
+            "fromNamed": {"g1": {"@id": LEDGER, "@graph": G1}},
+            "select": ["?n"],
+            "where": {"@id": "?s", "ex:name": "?n"}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(rows(&json).len(), 1, "{json}");
+    assert!(warning.is_none(), "{warning:?}");
+}
+
+/// PARITY, ledger endpoint: byte-equivalent JSON-LD and SPARQL forms of the
+/// same `fromNamed`-only question must agree — both on the rows and on whether
+/// a warning fires. This is the assertion that would have caught the branch
+/// shipping the SPARQL half alone.
+#[tokio::test]
+async fn ledger_endpoint_jsonld_and_sparql_agree_on_from_named_only() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (sparql_status, sparql_warning, sparql_json) = query(
+        &app,
+        r"PREFIX ex: <http://ex.org/>
+          SELECT ?n
+          FROM NAMED <http://ex.org/g1>
+          WHERE { ?s ex:name ?n }",
+    )
+    .await;
+    let (jsonld_status, jsonld_warning, jsonld_json) = jsonld(
+        &app,
+        serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "fromNamed": {"g1": {"@id": LEDGER, "@graph": G1}},
+            "select": ["?n"],
+            "where": {"@id": "?s", "ex:name": "?n"}
+        }),
+    )
+    .await;
+
+    assert_eq!(sparql_status, jsonld_status);
+    assert_eq!(
+        bindings(&sparql_json).len(),
+        rows(&jsonld_json).len(),
+        "row counts must match: sparql={sparql_json} jsonld={jsonld_json}"
+    );
+    assert!(bindings(&sparql_json).is_empty());
+    assert_eq!(
+        sparql_warning.is_some(),
+        jsonld_warning.is_some(),
+        "both surfaces must warn, or neither: {sparql_warning:?} vs {jsonld_warning:?}"
+    );
+}
+
+/// PARITY, connection endpoint: the same `fromNamed`-only question with no
+/// path ledger. Kept genuinely like-for-like — on the connection endpoint a
+/// clause IRI names a LEDGER, so the SPARQL and JSON-LD forms both declare the
+/// whole ledger as their one named graph.
+#[tokio::test]
+async fn connection_endpoint_jsonld_and_sparql_agree_on_from_named_only() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (sparql_status, sparql_warning, sparql_json) = sparql_connection(
+        &app,
+        r"PREFIX ex: <http://ex.org/>
+          SELECT ?n
+          FROM NAMED <dsem:main>
+          WHERE { ?s ex:name ?n }",
+    )
+    .await;
+    let (jsonld_status, jsonld_warning, jsonld_json) = jsonld_connection(
+        &app,
+        serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "fromNamed": {"a": {"@id": LEDGER}},
+            "select": ["?n"],
+            "where": {"@id": "?s", "ex:name": "?n"}
+        }),
+    )
+    .await;
+
+    assert_eq!(sparql_status, StatusCode::OK, "{sparql_json}");
+    assert_eq!(jsonld_status, StatusCode::OK, "{jsonld_json}");
+    assert!(
+        bindings(&sparql_json).is_empty(),
+        "connection SPARQL was already correct: {sparql_json}"
+    );
+    assert!(
+        rows(&jsonld_json).is_empty(),
+        "JSON-LD must now agree with it: {jsonld_json}"
+    );
+    assert_eq!(
+        sparql_warning.is_some(),
+        jsonld_warning.is_some(),
+        "both surfaces must warn, or neither: {sparql_warning:?} vs {jsonld_warning:?}"
+    );
+    assert!(jsonld_warning.is_some(), "the JSON-LD form must warn");
+}
+
+/// Connection endpoint, the 2+ `fromNamed`-entry case specifically: previously
+/// `get_ledger_id` picked the first entry and `execute_dataset_query` injected
+/// it as `from`, so a pattern outside `["graph", ...]` silently read one
+/// arbitrarily-chosen graph's triples and returned them under a 200. No entry
+/// may be promoted to the default graph.
+#[tokio::test]
+async fn connection_jsonld_two_from_named_entries_promote_no_default_graph() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (status, warning, json) = jsonld_connection(
+        &app,
+        serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "fromNamed": {
+                "g1": {"@id": LEDGER, "@graph": G1},
+                "g2": {"@id": LEDGER, "@graph": G2}
+            },
+            "select": ["?n"],
+            "where": {"@id": "?s", "ex:name": "?n"}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(
+        rows(&json).is_empty(),
+        "no fromNamed entry may become the default graph: {json}"
+    );
+    assert!(warning.is_some(), "must warn");
+}
+
+/// Connection endpoint, JSON-LD: the named halves of that same two-entry body
+/// still resolve, each under the alias the caller chose, with no doubling.
+#[tokio::test]
+async fn connection_jsonld_two_from_named_entries_resolve_by_alias() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (status, _warning, json) = jsonld_connection(
+        &app,
+        serde_json::json!({
+            "@context": {"ex": "http://ex.org/"},
+            "fromNamed": {
+                "g1": {"@id": LEDGER, "@graph": G1},
+                "g2": {"@id": LEDGER, "@graph": G2}
+            },
+            "select": ["?g", "?n"],
+            "where": [["graph", "?g", {"@id": "?s", "ex:name": "?n"}]]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    // g1 has two names, g2 one — three solutions over exactly two graph names.
+    assert_eq!(rows(&json).len(), 3, "{json}");
+    let all = serde_json::to_string(&json).expect("json");
+    assert!(all.contains("\"g1\"") && all.contains("\"g2\""));
+    assert!(
+        !all.contains(LEDGER),
+        "the ledger id must not appear as a graph name: {all}"
+    );
+}

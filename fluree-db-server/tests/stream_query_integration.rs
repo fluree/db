@@ -890,3 +890,83 @@ async fn sparql_from_named_dataset_semantics_stream() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 0);
 }
+
+/// The streaming endpoints share the dataset-clause semantics of `/query` for
+/// JSON-LD too: a `fromNamed`-only body keeps its empty default graph on both
+/// the ledger-scoped and connection-scoped forms, and carries the advisory
+/// header. Pre-branch both streamed the ledger's default-graph row instead.
+#[tokio::test]
+async fn jsonld_from_named_dataset_semantics_stream() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:jdsem").await;
+
+    let trig = "@prefix ex: <http://ex.org/> .\n\
+                ex:d1 ex:name \"D\" .\n\
+                <http://ex.org/g1> {\n\
+                  ex:s1 ex:name \"A\" .\n\
+                }\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/upsert/strm:jdsem")
+                .header("content-type", "application/trig")
+                .body(Body::from(trig))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trig upsert");
+
+    let body = json!({
+        "@context": {"ex": "http://ex.org/"},
+        "fromNamed": {"g1": {"@id": "strm:jdsem", "@graph": "http://ex.org/g1"}},
+        "select": ["?n"],
+        "where": {"@id": "?s", "ex:name": "?n"}
+    });
+
+    // Ledger-scoped streaming form.
+    let resp = stream_jsonld(&app, "strm:jdsem", &body).await;
+    let warning = resp
+        .headers()
+        .get("x-fdb-warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("ledger-scoped streaming must warn");
+    assert!(warning.contains("fromNamed"), "{warning}");
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        records.iter().filter(|r| r["type"] == "row").count(),
+        0,
+        "empty default graph streams no rows"
+    );
+
+    // Connection-scoped streaming form (no path ledger).
+    let resp = stream_jsonld_connection(&app, &body).await;
+    let warning = resp
+        .headers()
+        .get("x-fdb-warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("connection streaming must warn too");
+    assert!(warning.contains("fromNamed"), "{warning}");
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 0);
+
+    // The named half still streams, and draws no warning.
+    let graph_body = json!({
+        "@context": {"ex": "http://ex.org/"},
+        "fromNamed": {"g1": {"@id": "strm:jdsem", "@graph": "http://ex.org/g1"}},
+        "select": ["?n"],
+        "where": [["graph", "g1", {"@id": "?s", "ex:name": "?n"}]]
+    });
+    let resp = stream_jsonld(&app, "strm:jdsem", &graph_body).await;
+    assert!(resp.headers().get("x-fdb-warning").is_none());
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 1);
+}
