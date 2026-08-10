@@ -150,7 +150,8 @@ impl IcebergGsConfig {
         if let CatalogConfig::Direct { table_location } = &self.catalog {
             let path = table_location
                 .trim_start_matches("s3://")
-                .trim_start_matches("s3a://");
+                .trim_start_matches("s3a://")
+                .trim_start_matches("file://");
             let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
             if segments.len() >= 3 {
                 // segments[0] = bucket, segments[1..n-2] = warehouse path,
@@ -185,11 +186,22 @@ impl IcebergGsConfig {
                         "catalog.table_location is required".to_string(),
                     ));
                 }
-                if !table_location.starts_with("s3://") && !table_location.starts_with("s3a://") {
+                let is_object_store =
+                    table_location.starts_with("s3://") || table_location.starts_with("s3a://");
+                // `file:///abs/path` (and the `file:/abs` single-slash variant) or a
+                // bare absolute path: a catalog-less LOCAL table, read from the
+                // filesystem with no object store or catalog service involved.
+                let is_local = crate::local_guard::is_local_location(table_location);
+                if !is_object_store && !is_local {
                     return Err(IcebergError::Config(format!(
-                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), got: {table_location}"
+                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), a \
+                         file:// URI, or an absolute local path, got: {table_location}"
                     )));
                 }
+                // Local locations are fail-closed: permitted only under an
+                // operator-allowlisted root. Refuse at creation rather than
+                // letting a disallowed path surface as a storage error later.
+                crate::local_guard::ensure_local_location_allowed(table_location)?;
                 // Validate table identifier can be derived from table_location
                 self.table_identifier()?;
                 // Vended credentials are not supported with Direct catalog
@@ -243,11 +255,15 @@ pub enum CatalogConfig {
 
     /// Metadata location is already known (e.g., from iceberg-rust commit).
     /// The engine reads `version-hint.text` from the metadata directory
-    /// to resolve the current metadata file.
+    /// to resolve the current metadata file, falling back to a
+    /// metadata-directory listing on backends that support it (local
+    /// filesystem).
     Direct {
-        /// S3 prefix for the table root directory.
-        /// Must contain a `metadata/` subdirectory with Iceberg metadata files.
-        /// Example: "s3://bucket/warehouse/my_namespace/my_table"
+        /// Table root directory: an S3 prefix
+        /// (`s3://bucket/warehouse/my_namespace/my_table`) or a LOCAL path
+        /// (`file:///data/warehouse/ns/table` or a bare absolute path) for
+        /// catalog-less tables on the local filesystem. Must contain a
+        /// `metadata/` subdirectory with Iceberg metadata files.
         table_location: String,
     },
 }
@@ -640,6 +656,65 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("S3 URI"));
+    }
+
+    #[test]
+    fn test_validate_direct_local_locations_are_fail_closed() {
+        // Catalog-less local tables: file:// URIs and bare absolute paths are
+        // recognized Direct locations, but reading the local filesystem is
+        // opt-in — without `FLUREE_ICEBERG_LOCAL_ROOTS` the config is refused
+        // with a message that names the switch, rather than accepted here and
+        // failing confusingly at the first scan.
+        for loc in [
+            "file:///data/warehouse/ns/table",
+            "file:/data/warehouse/ns/table",
+            "/data/warehouse/ns/table",
+        ] {
+            let config = IcebergGsConfig {
+                catalog: CatalogConfig::direct(loc),
+                table: TableConfig::Identifier(String::new()),
+                io: IoConfig {
+                    vended_credentials: false,
+                    ..Default::default()
+                },
+                mapping: None,
+                delete: None,
+                order_by: None,
+            };
+            if crate::local_guard::local_roots().is_none() {
+                let err = config
+                    .validate()
+                    .expect_err("local location must be refused while the allowlist is unset")
+                    .to_string();
+                assert!(
+                    err.contains(crate::local_guard::LOCAL_ROOTS_ENV),
+                    "refusal must name the switch that enables local tables: {err}"
+                );
+                assert!(
+                    !err.contains("must be an S3 URI"),
+                    "the location is recognized as local, not rejected as malformed: {err}"
+                );
+            }
+            // The table identifier derives from the path's last two segments,
+            // same as S3 locations — independent of the allowlist.
+            let id = config.table_identifier().unwrap();
+            assert_eq!(id.namespace, "ns");
+            assert_eq!(id.table, "table");
+        }
+
+        // Relative paths are still rejected.
+        let config = IcebergGsConfig {
+            catalog: CatalogConfig::direct("relative/path/table"),
+            table: TableConfig::Identifier(String::new()),
+            io: IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+            mapping: None,
+            delete: None,
+            order_by: None,
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

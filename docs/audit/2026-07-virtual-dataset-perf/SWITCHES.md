@@ -21,8 +21,11 @@ else, including empty, reads as ON. This is the shared `env_switch_enabled`
 switches are read **once** and cached for the process (`OnceLock`) — set them in the
 environment before launch, not mid-run. **The sole exceptions** are noted per row:
 `FLUREE_ICEBERG_ALLOW_MOR_DELETES` is an inverted-polarity *escape hatch* read fresh
-on each call (its default-OFF is the SAFE state), and the numeric/TTL knobs are
-values, not booleans.
+on each call (its default-OFF is the SAFE state), the three fused-aggregate switches
+(`FLUREE_FUSED_VECTOR_FOLD` / `FLUREE_FUSED_R2RML_OUTPUT_BOUND` /
+`FLUREE_FUSED_R2RML_MULTIFACT`) are read at fused-operator **construction** (per
+query) into operator fields rather than a process `OnceLock` (id=3717339910; still
+"set at launch" in practice), and the numeric/TTL knobs are values, not booleans.
 
 ## 1. R2RML rewrite / operator levers
 
@@ -30,6 +33,9 @@ values, not booleans.
 |---|---|---|---|---|
 | `FLUREE_FUSED_R2RML_AGG` | on | Fuse a single-table `GROUP BY`/aggregate into one manifest-driven scan (Σ from record counts where sound) instead of materializing the star. **Widened in-place** by #1514 (string keys, Q2 lang/IRI decline, O1/O2 guards) and by #1522 items 9/9b (MIN/MAX fold + filtered-COUNT constraint application) — OFF reverts ALL of these, back to per-row materialize + generic aggregate. | Per-row materialize + generic aggregate (incl. MIN/MAX & filtered-COUNT). | baseline (#1450) |
 | `FLUREE_FUSED_R2RML_AGG_JOIN` | on | Extend the fused aggregate across a linear fact→dim FK join (rollup); declines on branch/merge/cycle/composite-FK/dup-join-key. Gates the E2 + W4-2 join widenings too. | Unfused join then aggregate. | PR-6 (#1490) |
+| `FLUREE_FUSED_VECTOR_FOLD` | on | **N1** vectorized GROUP BY fold: a borrowed-key dense-id dict (`HashTable`) in place of a `HashMap<Vec<GKey>, Vec<Acc>>` that clones a fresh owned key every row. Read at operator construction (per query). | Byte-identical owned-key `HashMap` fold. | #1582 |
+| `FLUREE_FUSED_R2RML_OUTPUT_BOUND` | on | Emit a GROUP BY rollup in bounded chunks (≤8192 groups/batch) across `next_batch` calls so a high-cardinality result never fully materializes at once. Read at operator construction (per query). | Single-batch emission (same rows). NB: a bare `LIMIT` with no `ORDER BY` can return a different prefix on vs off — group order is unspecified. | #1582 |
+| `FLUREE_FUSED_R2RML_MULTIFACT` | on | **P3** fused multi-fact branching-star join (one GROUP-KEY branch + one SEMI-JOIN branch, keep-min-then-filter membership) — the crt_join_reorder class. Read at operator construction (per query). | Decline the branching star to the generic pipeline (pre-P3, byte-identical). | #1582 |
 | `FLUREE_R2RML_SHARED_PREDICATE_FUSION` | on | **E1** shared-predicate class collapse: when strong fusion fails, still collapse a separate class scan into the star for a base predicate SHARED across disjoint-subject classes (the `ex:category` round-2 fix). | Falls through to the weaker pre-E1 `class_prune_hint` (star + separate class scan, still correct). Distinct from `CRAWL_CLASS_FUSION`. | E1 #1514, **retro-switched by this PR** |
 | `FLUREE_R2RML_STAR_TM_PRUNE` | on | Prune bound-subject TriplesMaps a star cannot reach (detail-view over-scan 16→3 tables). | Scan every candidate TriplesMap. | PR-3 (#1484) |
 | `FLUREE_R2RML_REF_TARGET_PRUNE` | on | Propagate a `RefObjectMap`'s target class to prune downstream shared-predicate resolution (q031 fan-out 7→2 loadTables). Declines unless every binding source of the var is provably that one ref. | Resolve the shared predicate against all mapping dims. | F20 (#1502) |
@@ -57,6 +63,7 @@ values, not booleans.
 | `FLUREE_ICEBERG_NUMERIC_STATS` | on | Extend row-group pruning to double + FLBA-decimal column stats (q019 cold 38.8s→4.0s). NaN bound ⇒ keep (F15 over-prune guard). | No numeric row-group pruning. | PR-7 (#1494) |
 | `FLUREE_ICEBERG_TIMESTAMP_STATS` | on | `xsd:dateTime` predicates prune at the **manifest** level (frame-matched tz-aware↔`timestamptz`, naive↔`timestamp`). No row-group arm (Parquet INT64 logical-unit ambiguity). | Timestamp predicates never reach pruning; in-engine FILTER authoritative. | #1522 item 10 |
 | `FLUREE_ICEBERG_FOOTER_FROM_CACHE` | on | Parse the Parquet footer from already-fetched whole-file bytes instead of a separate footer round-trip (~190ms/file). Whole-file tiers only (disk hit / ≤32MB). | Footer-first round-trip on every file. Byte-identical. | PR-2 Lever A (#1482) |
+| `FLUREE_ARROW_DIRECT_DECODE` | on | **N2** build a `Column` DIRECTLY from an Arrow array, skipping the per-cell `Vec<Option<ColumnValue>>` intermediate the two-hop `arrow_column_to_values` + `build_columns_from_values` path allocates. | Byte-identical two-hop decode. | #1582 |
 | `FLUREE_ICEBERG_ROWGROUP_PARALLELISM` | on | Decode a single-/few-file table's surviving row groups across N blocking tasks (uses idle cores). Declines for a single row group or when a sequential read would skip groups. | Sequential row-group decode. Byte-identical. | C4 (#1514) |
 | `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` | on | Fetch a scan's coalesced byte ranges CONCURRENTLY via `read_ranges` (order-preserving `buffered`, both storage impls). | Sequential range GETs. Byte-identical. | #1522 item 12 |
 | `FLUREE_ICEBERG_SCAN_CONCURRENCY` | `min(cores, files, 32)` | Scan-side decode concurrency ceiling. PR-2 **raised the default 8→32**; an explicit override is uncapped and never lowers a prior default. | — (a value; default was 8 pre-PR-2). | PR-2 Lever B (#1482) |
