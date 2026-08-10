@@ -230,6 +230,69 @@ Two phases: load the policy set once per request; apply it to each touched flake
 
 For complex deployments, the [explain plan](../query/explain.md) shows whether a query is dominated by policy filtering and which policies contribute.
 
+## Detecting that policy was applied
+
+Filtering itself is invisible by design: a policy-filtered result and a
+genuinely empty result look the same, and no response field reports how many
+flakes were withheld. That is deliberate — a "rows were suppressed" indicator
+would be a data-dependent oracle, answerable per query and searchable with
+filters, which is exactly what row-level enforcement exists to prevent.
+
+What a caller *can* ask for is whether policy governed the request. Turn on
+policy tracking — `"opts": {"meta": {"policy": true}}` in a JSON-LD body, or
+the `fluree-track-policy: true` request header on any endpoint (SPARQL bodies
+have no `opts` to carry it) — and the response gains two siblings:
+
+```json
+{
+  "status": 200,
+  "result": [],
+  "policy": {},
+  "policy_enforcement": { "enforced": true, "denies_all_data": true }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `policy` | Per-policy counters, `{policy-id: {executed, allowed}}`. A policy appears only once it actually runs, so this map is **empty whenever no policy ran** — which happens both when nothing is enforced and when enforcement grants nothing. |
+| `policy_enforcement.enforced` | The request executed under a non-root policy context. The field is **absent entirely** when it did not, so its presence alone answers "was this request enforced?" |
+| `policy_enforcement.denies_all_data` | The effective view-policy set is empty and `default-allow` is false: under this request's policy configuration, **no data flake could have been returned**. |
+
+The same values ride the `x-fdb-policy` (base64 JSON) and
+`x-fdb-policy-enforcement` (plain JSON) response headers, which is how you read
+them for CSV, TSV, and other formats whose body has no room for a tally.
+
+Both `policy_enforcement` bits are computed from the request's policy inputs
+and the ledger's policy configuration before execution. They do not depend on
+the data or on the query, so they are identical for every query a caller issues
+under the same policy context and cannot be used to probe for the existence of
+any particular row.
+
+**What `denies_all_data` does not say.** It does not mean the result is empty.
+Schema flakes — `rdf:type` with a schema-class object, `rdfs:subClassOf`,
+`rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range` — bypass policy entirely, so
+a query over the ontology still returns rows under a total data denial. Read it
+as "no *data* flake could have been returned", not "nothing was returned".
+
+**Reading an empty result.** With tracking on:
+
+- `policy_enforcement` absent → the request was unenforced. An empty result is
+  an empty result.
+- `enforced: true`, `denies_all_data: true` → the caller's policy configuration
+  grants no view of the data at all. This is the common misconfiguration:
+  supplying an identity that has no `f:policyClass` assignments, on a ledger
+  with no `f:defaultAllow true`. Anonymous requests to the same ledger see
+  everything, so authenticating appears to *lose* data.
+- `enforced: true`, `denies_all_data: false`, `policy` non-empty → policies ran.
+  Compare `allowed` against `executed` to see how selective they were.
+- `enforced: true`, `denies_all_data: false`, `policy` empty → enforcement was
+  active but no policy was ever consulted for this query's flakes. Most often
+  the query touched only properties no policy targets, and the request's
+  `default-allow` decided the outcome.
+
+For a positive control, run the same query with and without the identity, or
+against a subject you know the identity may read.
+
 ## Testing policies from the CLI
 
 The `fluree` CLI supports policy-enforced queries so you can verify that the policies you've configured filter results as expected — without writing any client code.

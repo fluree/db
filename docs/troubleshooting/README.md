@@ -197,21 +197,27 @@ See [Common Errors](common-errors.md) for complete error code reference.
 Runtime log-level changes are not currently exposed through the standalone HTTP
 API; restart with the desired `--log-level` or `RUST_LOG`.
 
-### Enable Query Tracing
+### Track Execution Metrics
+
+Ask for time, fuel, and policy metrics with the `fluree-track-*` request
+headers (or `opts.meta` in a JSON-LD body):
 
 ```bash
-curl -X POST http://localhost:8090/v1/fluree/query \
-  -H "X-Fluree-Trace: true" \
+curl -X POST http://localhost:8090/v1/fluree/query/mydb \
+  -H "fluree-track-meta: true" \
   -d '{...}'
 ```
 
-### Enable Policy Tracing
+The response carries `time`, `fuel`, `policy`, and `policy_enforcement` as
+top-level siblings, and the same values on `x-fdb-*` response headers. See
+[Tracking and Fuel](../query/tracking-and-fuel.md).
 
-```bash
-curl -X POST http://localhost:8090/v1/fluree/query \
-  -H "X-Fluree-Policy-Trace: true" \
-  -d '{...}'
-```
+### Check Whether Policy Filtered a Query
+
+`fluree-track-policy: true` reports which policies ran and whether policy
+governed the request at all — the way to tell an empty result set from a
+denied one. See
+[Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
 
 ### Get Query Plan
 

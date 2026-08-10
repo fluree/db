@@ -41,6 +41,25 @@ Tracking provides:
 - **time**: Query execution duration (formatted as "12.34ms")
 - **fuel**: Total cost as a decimal value (rounded to 3 places)
 - **policy**: Policy evaluation statistics (`{policy-id: {executed: N, allowed: M}}`)
+- **policy_enforcement**: Whether policy governed the request at all (`{enforced, denies_all_data}`), present only when it did
+
+`policy` and `policy_enforcement` are not only performance statistics — they
+are the authorization-visibility signal. Policy filtering is otherwise
+invisible: a filtered query returns HTTP 200 with the disallowed flakes simply
+absent.
+
+`policy` alone cannot carry that signal, because a policy is counted only once
+it actually executes. An empty map therefore means one of three different
+things: no policy context was built (an anonymous request), a policy context
+was built but grants nothing so every flake is denied before any policy runs,
+or the query touched only flakes no policy targets. `policy_enforcement`
+separates them — it is absent for the first, `denies_all_data: true` for the
+second, and `denies_all_data: false` for the third.
+
+Both `policy_enforcement` fields are derived from the request's policy inputs
+and the ledger's policy configuration, never from the data or the query. See
+[Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied)
+for how to read them against an empty result set.
 
 ## Fuel Limits
 
@@ -155,11 +174,21 @@ When tracking is enabled, the response includes tracking information as top-leve
       "executed": 10,
       "allowed": 8
     }
+  },
+  "policy_enforcement": {
+    "enforced": true,
+    "denies_all_data": false
   }
 }
 ```
 
 The `fuel` value is decimal with up to 3 places of precision. The HTTP `x-fdb-fuel` response header carries the same value.
+
+`policy_enforcement` is present only when a non-root policy context governed
+the request; a request with no policy inputs omits it entirely. It also rides
+the `x-fdb-policy-enforcement` response header as plain JSON (alongside
+`x-fdb-policy`, which carries the counters base64-encoded), so formats without
+a JSON body — CSV, TSV, SPARQL Results XML — can still read it.
 
 When a reasoning mode ran (e.g. `"reasoning": "owl2rl"`), tracked responses
 also include a top-level `reasoning` block describing the OWL2-RL
