@@ -219,6 +219,32 @@ SELECT ?s ?p ?o FROM <execution-log:main> WHERE { ?s ?p ?o } LIMIT 10
 
 Iceberg graph sources use R2RML mappings to define how table rows become RDF triples. See [Iceberg / Parquet](iceberg.md) and [R2RML](r2rml.md) for details.
 
+### Query Patterns a Graph Source Cannot Evaluate
+
+A graph source has no native RDF index. Its triples are materialized per query from the backing table or index, which is enough for triple patterns but not for the constructs that need an index to walk. Three of them are refused rather than answered:
+
+- **Property-path quantifiers** — `p+`, `p*`, `p?`, and any quantified combination such as `^p+`, `(a|b)+`, or `(a/b)+`
+- **`shortestPath` / `allShortestPaths`**
+- **Subqueries** — a nested SPARQL `SELECT`, or a JSON-LD sub-`select`
+
+A query using one against a graph source returns **HTTP 400 `err:db/InvalidQuery`**, naming the pattern kind. The refusal is deliberate: these patterns would otherwise read the graph source's empty native index and return a wrong answer as a success — nothing at all for `p+`, and the starting node alone for `p*` and `p?`. Unquantified alternation (`a|b`) and inverse (`^p`) are unaffected; they lower to ordinary triple patterns and run normally.
+
+**Workaround: bounded fixed-length paths.** Sequence paths do lower to table scans, so a traversal whose maximum depth you know can be written as a union of explicit hops:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+SELECT ?boss FROM <warehouse-hr:main> WHERE {
+  { ex:emp1 ex:manager ?boss }
+  UNION { ex:emp1 ex:manager/ex:manager ?boss }
+  UNION { ex:emp1 ex:manager/ex:manager/ex:manager ?boss }
+}
+```
+
+Pick that maximum depth deliberately and state it wherever the query is documented: results are silently incomplete beyond the depth you enumerate, and nothing in the response marks the truncation.
+
+For genuinely unbounded traversal, materialize the graph source into a native ledger first — see [Materializing a Native Twin](iceberg.md#materializing-a-native-twin). A native ledger evaluates all of these patterns normally.
+
 ### Search Indexes (BM25, Vector)
 
 Search indexes use the `f:graphSource` pattern:
