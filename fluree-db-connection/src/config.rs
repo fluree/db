@@ -3,6 +3,7 @@
 use crate::error::{ConnectionError, Result};
 use crate::graph::ConfigGraph;
 use crate::vocab;
+use fluree_db_core::Durability;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -133,6 +134,9 @@ pub struct StorageConfig {
     pub aes256_key: Option<Arc<str>>,
     /// Optional address identifier
     pub address_identifier: Option<Arc<str>>,
+    /// Optional durability mode for file storage. `None` leaves the choice to
+    /// `FLUREE_STORAGE_FSYNC` and the built-in default.
+    pub durability: Option<Durability>,
 }
 
 impl Default for StorageConfig {
@@ -143,6 +147,7 @@ impl Default for StorageConfig {
             path: None,
             aes256_key: None,
             address_identifier: None,
+            durability: None,
         }
     }
 }
@@ -224,6 +229,7 @@ impl ConnectionConfig {
                 path: Some(base_path.into()),
                 aes256_key: None,
                 address_identifier: None,
+                durability: None,
             },
             ..Default::default()
         }
@@ -415,18 +421,28 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
             path: None,
             aes256_key: None,
             address_identifier,
+            durability: None,
         });
     }
 
     if node.get(vocab::FIELD_FILE_PATH).is_some() {
         let path = resolve_string(graph, node, vocab::FIELD_FILE_PATH).map(Arc::from);
         let aes256_key = resolve_string(graph, node, vocab::FIELD_AES256_KEY).map(Arc::from);
+        let durability = match resolve_string(graph, node, vocab::FIELD_DURABILITY) {
+            None => None,
+            Some(v) => Some(Durability::from_mode_name(&v).ok_or_else(|| {
+                ConnectionError::invalid_config(format!(
+                    "Unknown storage durability '{v}': expected 'sync' or 'page-cache'"
+                ))
+            })?),
+        };
         return Ok(StorageConfig {
             id: get_id(node),
             storage_type: StorageType::File,
             path,
             aes256_key,
             address_identifier,
+            durability,
         });
     }
 
@@ -437,6 +453,7 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
         path: None,
         aes256_key: None,
         address_identifier,
+        durability: None,
     })
 }
 
@@ -756,6 +773,7 @@ impl StorageConfig {
             path: None,
             aes256_key: None,
             address_identifier: None,
+            durability: None,
         };
 
         for (key, value) in obj {
@@ -783,6 +801,16 @@ impl StorageConfig {
                     if let Some(s) = value.as_str() {
                         config.address_identifier = Some(Arc::from(s));
                     }
+                }
+                "durability" => {
+                    let s = value.as_str().ok_or_else(|| {
+                        ConnectionError::invalid_config("Storage durability must be a string")
+                    })?;
+                    config.durability = Some(Durability::from_mode_name(s).ok_or_else(|| {
+                        ConnectionError::invalid_config(format!(
+                            "Unknown storage durability '{s}': expected 'sync' or 'page-cache'"
+                        ))
+                    })?);
                 }
                 _ => {
                     // For unsupported types, we allow unknown fields
@@ -1284,5 +1312,64 @@ mod tests {
             addr_ids.get("store-3").unwrap().path.as_deref(),
             Some("/data/store3")
         );
+    }
+    #[test]
+    fn storage_durability_parses_from_json_ld() {
+        let json = json!({
+            "@context": {"@vocab": "https://ns.flur.ee/system#"},
+            "@id": "c",
+            "@type": "Connection",
+            "indexStorage": {
+                "@type": "Storage",
+                "filePath": "/data/fluree",
+                "durability": "page-cache"
+            }
+        });
+        let config = ConnectionConfig::from_json_ld(&json).expect("parse");
+        assert_eq!(config.index_storage.durability, Some(Durability::PageCache));
+    }
+
+    /// Omitting the property must not silently pick a mode — that is what
+    /// leaves the environment variable and the built-in default in charge.
+    #[test]
+    fn storage_durability_absent_stays_unset() {
+        let json = json!({
+            "@context": {"@vocab": "https://ns.flur.ee/system#"},
+            "@id": "c",
+            "@type": "Connection",
+            "indexStorage": {"@type": "Storage", "filePath": "/data/fluree"}
+        });
+        let config = ConnectionConfig::from_json_ld(&json).expect("parse");
+        assert_eq!(config.index_storage.durability, None);
+    }
+
+    /// A typo must fail loudly rather than quietly downgrade durability.
+    #[test]
+    fn storage_durability_rejects_an_unknown_mode() {
+        let json = json!({
+            "@context": {"@vocab": "https://ns.flur.ee/system#"},
+            "@id": "c",
+            "@type": "Connection",
+            "indexStorage": {
+                "@type": "Storage",
+                "filePath": "/data/fluree",
+                "durability": "eventually"
+            }
+        });
+        let err = ConnectionConfig::from_json_ld(&json).expect_err("should reject");
+        assert!(err.to_string().contains("eventually"), "{err}");
+    }
+
+    #[test]
+    fn storage_durability_parses_from_flat_config() {
+        let json = json!({"type": "File", "path": "/data/fluree", "durability": "sync"});
+        let config = StorageConfig::from_json(&json).expect("parse");
+        assert_eq!(config.durability, Some(Durability::Sync));
+    }
+
+    #[test]
+    fn storage_durability_flat_config_rejects_an_unknown_mode() {
+        let json = json!({"type": "File", "path": "/d", "durability": "maybe"});
+        assert!(StorageConfig::from_json(&json).is_err());
     }
 }

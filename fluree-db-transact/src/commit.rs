@@ -769,6 +769,11 @@ impl StagedCommit {
     /// On publish failure, the raw-txn blob uploaded during
     /// [`build_commit`] is released — that CID is no longer referenced
     /// by any durable commit record.
+    ///
+    /// Durability of the blob and the head ref is the content store's and
+    /// nameservice's to provide: S3 acknowledges after replication, and the
+    /// local file backend flushes to the device unless
+    /// `FLUREE_STORAGE_FSYNC` is disabled (`fluree_db_core::Durability`).
     pub async fn apply<C, N>(
         self,
         content_store: &C,
