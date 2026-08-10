@@ -32,6 +32,52 @@ pub const DEFAULT_TARGET_PAGE_BYTES: usize = 512 * 1024;
 /// this.
 pub const DEFAULT_TARGET_PACK_BYTES: usize = 16 * 1024 * 1024;
 
+/// Pack count a freshly built stream aims to stay under.
+///
+/// A quarter of the `u16` routing-table cap, so a rebuild leaves room for the
+/// incremental packs that accumulate before the next one.
+pub const SAFE_PACK_COUNT: u64 = 16_384;
+
+/// Target pack size for a stream holding `total_dict_bytes`, doubling from
+/// [`DEFAULT_TARGET_PACK_BYTES`] only once a fixed target could no longer keep
+/// the routing table under [`SAFE_PACK_COUNT`].
+///
+/// The routing table is `u16`-counted, so a stream cut at a fixed 16 MiB hits a
+/// hard wall around a terabyte of dictionary — packs stop fitting and the ledger
+/// cannot publish. Scaling the target removes the wall: pack count is bounded by
+/// construction at any data size, and the ledgers that pay for larger packs are
+/// exactly the ones where per-pack overhead amortizes best.
+///
+/// **The floor is the point.** This returns exactly `DEFAULT_TARGET_PACK_BYTES`
+/// until a stream passes `SAFE_PACK_COUNT × 16 MiB` (256 GiB), so an ordinary
+/// ledger's packs are cut identically to before — no behaviour change, nothing
+/// to roll out. Doubling (rather than tracking size continuously) keeps the
+/// target stable as a dictionary grows: it changes once per doubling instead of
+/// drifting every build.
+///
+/// Compaction deliberately does NOT follow this target; it stays at
+/// `COMPACTION_MAX_OUTPUT_BYTES`. Raising the merge ceiling would make every
+/// already-compacted pack eligible to merge with its neighbours again — eight
+/// adjacent 16 MiB packs are size-comparable and would qualify under a larger
+/// ceiling — so every byte of every dictionary in the fleet would be rewritten
+/// `log_8(new / old)` times for no benefit to any ledger that is not near the
+/// wall. Packs larger than the merge ceiling are simply inert to compaction
+/// (there is no split operation), and a stream that does drift back over the cap
+/// aborts to a rebuild, which re-cuts it at this target. Rebuild is the
+/// pressure valve; compaction is left alone.
+pub fn pack_target_bytes(total_dict_bytes: u64) -> usize {
+    let mut target = DEFAULT_TARGET_PACK_BYTES;
+    // Exponential, so this runs a handful of times even for absurd inputs; the
+    // guard is against overflow rather than against looping.
+    while total_dict_bytes / (target as u64) > SAFE_PACK_COUNT {
+        match target.checked_mul(2) {
+            Some(doubled) => target = doubled,
+            None => break,
+        }
+    }
+    target
+}
+
 /// A single pack artifact produced by the builder, ready for CAS upload.
 #[derive(Debug)]
 pub struct PackArtifact {
@@ -137,6 +183,97 @@ fn build_packs_from_contiguous(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn the_floor_holds_for_every_ordinary_dictionary() {
+        // This is the property that makes the rule safe to ship: an existing
+        // ledger's packs must be cut exactly as before, so no fleet-wide
+        // re-cutting or re-merging is triggered by deploying it.
+        for bytes in [
+            0,
+            1,
+            MIB,
+            100 * MIB,
+            GIB,
+            100 * GIB,
+            // Right at the threshold: 16 MiB x SAFE_PACK_COUNT = 256 GiB.
+            SAFE_PACK_COUNT * DEFAULT_TARGET_PACK_BYTES as u64,
+        ] {
+            assert_eq!(
+                pack_target_bytes(bytes),
+                DEFAULT_TARGET_PACK_BYTES,
+                "{bytes} bytes must still cut at the default target"
+            );
+        }
+    }
+
+    #[test]
+    fn the_target_doubles_only_past_the_threshold() {
+        // The step lands where a whole extra pack would be needed, not at the
+        // exact byte: the rule compares `total / target` against the safe count,
+        // so the last partial pack does not push a stream into the next tier.
+        let threshold = SAFE_PACK_COUNT * DEFAULT_TARGET_PACK_BYTES as u64;
+        assert_eq!(
+            pack_target_bytes(threshold + DEFAULT_TARGET_PACK_BYTES as u64 - 1),
+            DEFAULT_TARGET_PACK_BYTES,
+            "a partial pack past the threshold stays in the default tier"
+        );
+        assert_eq!(
+            pack_target_bytes(threshold + DEFAULT_TARGET_PACK_BYTES as u64),
+            DEFAULT_TARGET_PACK_BYTES * 2,
+            "one whole pack past the threshold steps up exactly one tier"
+        );
+        assert_eq!(
+            pack_target_bytes(2 * threshold),
+            DEFAULT_TARGET_PACK_BYTES * 2,
+            "a doubled dictionary sits in the doubled tier, not a third one"
+        );
+        assert_eq!(
+            pack_target_bytes(4 * threshold),
+            DEFAULT_TARGET_PACK_BYTES * 4
+        );
+    }
+
+    #[test]
+    fn the_pack_count_stays_bounded_at_any_size() {
+        // The whole purpose: a fixed target walls out around a terabyte, and
+        // this must not, however large the dictionary gets.
+        for bytes in [256 * GIB, 1024 * GIB, 64 * 1024 * GIB, u64::MAX / 2] {
+            let target = pack_target_bytes(bytes) as u64;
+            let packs = bytes / target;
+            assert!(
+                packs <= SAFE_PACK_COUNT,
+                "{bytes} bytes at target {target} yields {packs} packs, over the safe count"
+            );
+            assert!(
+                packs < u16::MAX as u64,
+                "and must stay under the u16 routing-table cap"
+            );
+        }
+    }
+
+    #[test]
+    fn the_target_never_shrinks_as_a_dictionary_grows() {
+        // Monotonicity is what keeps a growing ledger from oscillating between
+        // tiers and re-cutting its packs on every rebuild.
+        let mut previous = 0usize;
+        let mut bytes = MIB;
+        while bytes < u64::MAX / 4 {
+            let target = pack_target_bytes(bytes);
+            assert!(target >= previous, "target shrank at {bytes} bytes");
+            assert!(target >= DEFAULT_TARGET_PACK_BYTES);
+            previous = target;
+            bytes *= 2;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

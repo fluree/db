@@ -319,13 +319,17 @@ where
 {
     use fluree_db_binary_index::dict::forward_pack::KIND_SUBJECT_FWD;
     use fluree_db_binary_index::dict::pack_builder::{
-        DEFAULT_TARGET_PACK_BYTES, DEFAULT_TARGET_PAGE_BYTES,
+        pack_target_bytes, DEFAULT_TARGET_PAGE_BYTES,
     };
     use fluree_db_core::{ContentKind, DictKind};
 
     let kind = ContentKind::DictBlob {
         dict: DictKind::SubjectForward,
     };
+    // Sized from the whole subject buffer rather than per namespace: the cap
+    // applies per namespace, so using the larger total only ever errs toward
+    // fewer packs, and a small namespace produces one pack either way.
+    let target_pack_bytes = pack_target_bytes(fwd.len() as u64);
 
     let mut subject_fwd_ns_packs: Vec<(u16, Vec<PackBranchEntry>)> = Vec::new();
     let mut current_ns: Option<u16> = None;
@@ -369,7 +373,7 @@ where
         current_pack_est += suffix.len() + 4;
         current_entries.push((local_id, suffix));
 
-        if current_pack_est >= DEFAULT_TARGET_PACK_BYTES {
+        if current_pack_est >= target_pack_bytes {
             let (bytes, first_id, last_id) = build_forward_pack_artifact(
                 &current_entries,
                 KIND_SUBJECT_FWD,
@@ -556,13 +560,18 @@ where
 {
     use fluree_db_binary_index::dict::forward_pack::KIND_STRING_FWD;
     use fluree_db_binary_index::dict::pack_builder::{
-        DEFAULT_TARGET_PACK_BYTES, DEFAULT_TARGET_PAGE_BYTES,
+        pack_target_bytes, DEFAULT_TARGET_PAGE_BYTES,
     };
     use fluree_db_core::{ContentKind, DictKind};
 
     let kind = ContentKind::DictBlob {
         dict: DictKind::StringForward,
     };
+    // `fwd` is the whole forward-value buffer, so the stream's size is known
+    // before the first cut. Stays at the 16 MiB default until the dictionary is
+    // large enough that a fixed target would run the routing table into its
+    // u16 cap.
+    let target_pack_bytes = pack_target_bytes(fwd.len() as u64);
     let mut pack_refs = Vec::new();
     let mut entries: Vec<(u64, &[u8])> = Vec::new();
     let mut pack_est = 0usize;
@@ -572,7 +581,7 @@ where
         pack_est += bytes.len() + 4;
         entries.push((entry.id, bytes));
 
-        if pack_est >= DEFAULT_TARGET_PACK_BYTES {
+        if pack_est >= target_pack_bytes {
             let (bytes, first_id, last_id) = build_forward_pack_artifact(
                 &entries,
                 KIND_STRING_FWD,

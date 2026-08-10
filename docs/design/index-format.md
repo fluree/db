@@ -524,6 +524,33 @@ cascade's own intermediate output — appear in neither the base root nor the
 published one, so that diff cannot see them; the indexer records those
 explicitly as garbage instead.
 
+The routing table is `u16`-counted on the wire, so a stream cut at a fixed
+16 MiB would hit a hard wall around a terabyte of dictionary: packs stop fitting
+and the ledger cannot publish at all. Two things prevent that.
+
+A build **cuts packs at a target that scales with the stream** once a fixed one
+could no longer keep the count under a quarter of the cap — 16 MiB until the
+dictionary passes 256 GiB, then doubling. Below that threshold the target is
+exactly what it always was, so an ordinary ledger's packs are cut identically
+and nothing is re-written by deploying the rule. Doubling rather than tracking
+size continuously keeps the target stable as a dictionary grows.
+
+**Compaction deliberately does not follow that target.** Raising the merge
+ceiling would make every already-compacted pack eligible again — eight adjacent
+16 MiB packs are size-comparable and would qualify under a larger ceiling — so
+every byte of every dictionary would be rewritten `log_8(new / old)` times for
+no benefit to any ledger that is not near the wall. Packs above the merge
+ceiling are simply inert to compaction; there is no split operation, which is
+also why *lowering* the target is free while raising it is not.
+
+If a table does reach the cap anyway, the incremental build **aborts to a full
+rebuild** rather than failing to encode. The encoder refuses to truncate a
+count, since a truncated routing table reads back cleanly having lost ID ranges;
+but that refusal comes at the end of a build, after compaction has already
+uploaded its merged packs, so on its own it would discard that progress every
+cycle and never recover. A rebuild re-cuts the whole stream by size and is the
+only operation that shrinks the table outright.
+
 #### Reverse dict leaf (`DLR1`)
 
 ```text
