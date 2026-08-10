@@ -30,6 +30,7 @@
 //! ```
 
 use crate::{ApiError, Result};
+use fluree_db_core::ledger_id::normalize_ledger_id;
 use fluree_db_nameservice::{GraphSourcePublisher, NameServiceEvent, NameServiceLookup};
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -46,6 +47,27 @@ use tracing::{debug, error, info, warn};
 /// `Send` so [`Bm25MaintenanceWorker::run`] can be driven by a multi-threaded
 /// executor via `tokio::spawn`.
 type SyncFuture<'a> = Pin<Box<dyn Future<Output = (String, Result<()>)> + Send + 'a>>;
+
+/// Canonicalize a ledger / graph-source alias to `name:branch`.
+///
+/// Aliases reach this worker in two spellings. `LedgerCommitPublished` always
+/// carries the canonical `name:branch`, but a graph source's stored
+/// `dependencies` are whatever the creator passed: `create_bm25_index` records
+/// `Bm25CreateConfig::ledger` verbatim, and a bare `name` means `name:main` to
+/// the rest of Fluree. Registering under the raw spelling therefore files an
+/// index created with `ledger: "docs"` under `docs`, while every commit event
+/// for it says `docs:main` — the reverse lookup misses and that index silently
+/// never auto-syncs.
+///
+/// Normalizing every key into and out of the maps closes that, and makes the
+/// two spellings one registration rather than two. Unparseable aliases are
+/// passed through unchanged so a malformed id still matches itself.
+///
+/// The same hazard is already handled one layer up, in the CLI's
+/// `resolve_source_t`, which tries the stored alias and then `{alias}:main`.
+fn canonical_alias(alias: &str) -> String {
+    normalize_ledger_id(alias).unwrap_or_else(|_| alias.to_string())
+}
 
 /// Log a sync that ended in an error.
 ///
@@ -145,18 +167,19 @@ impl Bm25WorkerState {
 
     /// Register a graph source with its dependencies.
     pub fn register_graph_source(&mut self, graph_source_id: &str, dependencies: &[String]) {
-        let deps_set: HashSet<String> = dependencies.iter().cloned().collect();
+        let graph_source_id = canonical_alias(graph_source_id);
+        let deps_set: HashSet<String> = dependencies.iter().map(|d| canonical_alias(d)).collect();
 
         // Update forward map
         self.gs_to_ledgers
-            .insert(graph_source_id.to_string(), deps_set.clone());
+            .insert(graph_source_id.clone(), deps_set.clone());
 
         // Update reverse map
         for ledger in &deps_set {
             self.ledger_to_graph_sources
                 .entry(ledger.clone())
                 .or_default()
-                .insert(graph_source_id.to_string());
+                .insert(graph_source_id.clone());
         }
 
         self.stats.registered_graph_sources = self.gs_to_ledgers.len();
@@ -169,11 +192,12 @@ impl Bm25WorkerState {
 
     /// Unregister a graph source.
     pub fn unregister_graph_source(&mut self, graph_source_id: &str) {
-        if let Some(ledgers) = self.gs_to_ledgers.remove(graph_source_id) {
+        let graph_source_id = canonical_alias(graph_source_id);
+        if let Some(ledgers) = self.gs_to_ledgers.remove(&graph_source_id) {
             // Remove from reverse map
             for ledger in ledgers {
                 if let Some(graph_sources) = self.ledger_to_graph_sources.get_mut(&ledger) {
-                    graph_sources.remove(graph_source_id);
+                    graph_sources.remove(&graph_source_id);
                     if graph_sources.is_empty() {
                         self.ledger_to_graph_sources.remove(&ledger);
                     }
@@ -190,7 +214,7 @@ impl Bm25WorkerState {
     /// Get graph sources that depend on a ledger.
     pub fn graph_sources_for_ledger(&self, ledger_id: &str) -> Vec<String> {
         self.ledger_to_graph_sources
-            .get(ledger_id)
+            .get(&canonical_alias(ledger_id))
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
     }
@@ -683,6 +707,80 @@ mod tests {
         // ledger3 triggers only gs2
         let graph_sources = state.graph_sources_for_ledger("ledger3:main");
         assert_eq!(graph_sources, vec!["gs2:main"]);
+    }
+
+    /// `create_bm25_index` stores `Bm25CreateConfig::ledger` verbatim, so a
+    /// branchless dependency is a real record shape — and commit events always
+    /// spell the ledger canonically. Before normalization the reverse lookup
+    /// missed and such an index never auto-synced.
+    #[test]
+    fn a_branchless_dependency_is_woken_by_its_canonical_commit_event() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search:main", &["ledger1".to_string()]);
+
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger1:main"),
+            vec!["search:main"],
+            "a bare `name` dependency must be woken by `name:main` commits"
+        );
+        assert_eq!(state.watched_ledgers(), vec!["ledger1:main"]);
+    }
+
+    /// The start-up pass registers under the record's canonical id while an
+    /// operator may name the index bare. Both spellings must be one entry, or
+    /// the index is registered twice and synced twice per commit.
+    #[test]
+    fn a_branchless_graph_source_id_is_the_same_registration() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search", &["ledger1:main".to_string()]);
+        state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+
+        assert_eq!(
+            state.registered_graph_sources(),
+            vec!["search:main"],
+            "the two spellings must be one registration, not two"
+        );
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger1:main"),
+            vec!["search:main"],
+            "and one entry in the reverse map, so one sync per commit"
+        );
+    }
+
+    /// Unregistering by the other spelling has to find it, or `untrack docs`
+    /// silently leaves `docs:main` registered.
+    #[test]
+    fn unregistering_by_the_branchless_spelling_finds_the_registration() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+        state.unregister_graph_source("search");
+
+        assert!(
+            state.registered_graph_sources().is_empty(),
+            "untrack by the bare name must find the canonical registration"
+        );
+        assert!(
+            state.watched_ledgers().is_empty(),
+            "and must take its reverse edge with it"
+        );
+    }
+
+    /// An id `normalize_ledger_id` cannot parse must still match itself rather
+    /// than being dropped on the floor.
+    #[test]
+    fn an_unparseable_alias_still_matches_itself() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("a:b:c", &["ledger1:main".to_string()]);
+
+        assert_eq!(state.registered_graph_sources(), vec!["a:b:c"]);
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger1:main"),
+            vec!["a:b:c"]
+        );
     }
 
     #[test]
