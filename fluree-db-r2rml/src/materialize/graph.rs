@@ -193,7 +193,12 @@ fn escape_literal(value: &str) -> String {
 ///
 /// Returns an error for a join with no conditions (a cross-product ref), which
 /// the bulk materializer refuses rather than explode.
-fn canonical_join(rom: &RefObjectMap) -> R2rmlResult<(Vec<String>, Vec<String>)> {
+///
+/// Exported (MAJOR-1, #1529 review) so the VIRTUAL query path builds its parent
+/// lookup index and probes it through the SAME canonicalization the enumerator
+/// uses — otherwise a multi-column FK whose child-declared order disagrees with
+/// its parent-sorted order transposes the probe key and silently drops edges.
+pub fn canonical_join(rom: &RefObjectMap) -> R2rmlResult<(Vec<String>, Vec<String>)> {
     if rom.join_conditions.is_empty() {
         return Err(R2rmlError::Materialization(format!(
             "RefObjectMap referencing parent '{}' has no join conditions; \
@@ -218,7 +223,14 @@ type KeyToSubject = HashMap<Vec<String>, RdfTerm>;
 
 /// A comparable ordering key for a parent SUBJECT term. Parent subjects are IRIs
 /// (occasionally blank nodes); the inner string gives a total lexicographic order.
-fn subject_sort_key(term: &RdfTerm) -> &str {
+///
+/// Exported (id=3717339907) so the VIRTUAL query path's fused keep-min uses the SAME
+/// comparator this crate's `parent_key_insert_keep_min` uses — otherwise the fused
+/// semi-join could pick a different parent row than the generic chained inner join on a
+/// duplicate intermediate key. Reused directly at the RdfTerm keep-min sites; the P2a
+/// IRI-string site compares the pure-IRI subjects it already extracted, which for
+/// `RdfTerm::Iri` is exactly this function's inner-string ordering.
+pub fn subject_sort_key(term: &RdfTerm) -> &str {
     match term {
         RdfTerm::Iri(s) | RdfTerm::BlankNode(s) => s,
         RdfTerm::Literal { value, .. } => value,
@@ -410,6 +422,18 @@ impl ParentIndexSet {
         let mut ambiguous_this_batch: Vec<Vec<String>> = Vec::new();
         {
             let entry = self.index.entry(tm.iri.clone()).or_default();
+            // MAJOR-4 (#1529 review): create each canonical col-set's map ONCE (one
+            // column-name Vec clone per set), then probe it by borrow in the row loop
+            // — the old `entry.entry(cols.clone())` cloned that Vec on EVERY row.
+            // id=3717339921: this leaves a PRESENT-but-EMPTY inner map when a col-set
+            // yields no key, where the old per-row code left the entry ABSENT. Safe by
+            // construction: no consumer distinguishes the two — `resolve` chains
+            // `.get(cols)?.get(key)` (an empty map returns `None` on `.get(key)`, same as
+            // an absent col-set short-circuiting the `?`), `merge_from` `.extend`s (a
+            // no-op on empty), and `estimated_bytes` counts 0 for an empty map.
+            for cols in &col_sets {
+                entry.entry(cols.clone()).or_default();
+            }
             for row in 0..batch.num_rows {
                 let subject = match materialize_subject_from_batch(&tm.subject_map, batch, row)? {
                     Some(s) => s,
@@ -417,9 +441,17 @@ impl ParentIndexSet {
                 };
                 for cols in &col_sets {
                     if let Some(key) = get_join_key_from_batch(cols, batch, row) {
-                        let map = entry.entry(cols.clone()).or_default();
-                        if parent_key_insert_keep_min(map, key.clone(), subject.clone()) {
-                            ambiguous_this_batch.push(key);
+                        let map = entry
+                            .get_mut(cols.as_slice())
+                            .expect("col-set map pre-created above");
+                        // Pass the key by value (no per-row clone). On the RARE
+                        // distinct-subject collision, re-read it from the batch for
+                        // the ambiguity record — so the key Vec is only rebuilt on a
+                        // genuine duplicate, not on every row.
+                        if parent_key_insert_keep_min(map, key, subject.clone()) {
+                            if let Some(dup) = get_join_key_from_batch(cols, batch, row) {
+                                ambiguous_this_batch.push(dup);
+                            }
                         }
                     }
                 }

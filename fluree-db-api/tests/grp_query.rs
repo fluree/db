@@ -53,3 +53,5 @@ mod it_query_reverse;
 mod it_query_typed_json;
 #[path = "it_query_vocab_id_compaction.rs"]
 mod it_query_vocab_id_compaction;
+#[path = "it_query_wildcard_system_facts.rs"]
+mod it_query_wildcard_system_facts;
