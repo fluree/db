@@ -201,25 +201,32 @@ impl Bm25WorkerState {
         );
     }
 
-    /// Unregister a graph source.
-    pub fn unregister_graph_source(&mut self, graph_source_id: &str) {
+    /// Unregister a graph source. Returns whether it had been registered.
+    pub fn unregister_graph_source(&mut self, graph_source_id: &str) -> bool {
         let graph_source_id = canonical_alias(graph_source_id);
-        if let Some(ledgers) = self.gs_to_ledgers.remove(&graph_source_id) {
-            // Remove from reverse map
-            for ledger in ledgers {
-                if let Some(graph_sources) = self.ledger_to_graph_sources.get_mut(&ledger) {
-                    graph_sources.remove(&graph_source_id);
-                    if graph_sources.is_empty() {
-                        self.ledger_to_graph_sources.remove(&ledger);
+        let was_registered = match self.gs_to_ledgers.remove(&graph_source_id) {
+            Some(ledgers) => {
+                // Remove from reverse map
+                for ledger in ledgers {
+                    if let Some(graph_sources) = self.ledger_to_graph_sources.get_mut(&ledger) {
+                        graph_sources.remove(&graph_source_id);
+                        if graph_sources.is_empty() {
+                            self.ledger_to_graph_sources.remove(&ledger);
+                        }
                     }
                 }
+                true
             }
-        }
+            None => false,
+        };
         self.stats.registered_graph_sources = self.gs_to_ledgers.len();
-        debug!(
-            graph_source_id,
-            "Unregistered graph source from maintenance"
-        );
+        if was_registered {
+            debug!(
+                graph_source_id,
+                "Unregistered graph source from maintenance"
+            );
+        }
+        was_registered
     }
 
     /// Get graph sources that depend on a ledger.
@@ -304,9 +311,10 @@ impl Bm25WorkerHandle {
             .register_graph_source(graph_source_id, dependencies);
     }
 
-    /// Unregister a graph source from automatic maintenance.
-    pub fn unregister_graph_source(&self, graph_source_id: &str) {
-        self.state.lock().unregister_graph_source(graph_source_id);
+    /// Unregister a graph source from automatic maintenance. Returns whether
+    /// it had been registered. The index itself is left untouched.
+    pub fn unregister_graph_source(&self, graph_source_id: &str) -> bool {
+        self.state.lock().unregister_graph_source(graph_source_id)
     }
 
     /// Get current worker statistics.
@@ -423,9 +431,13 @@ impl Bm25MaintenanceWorker {
                 vec![]
             }
             NameServiceEvent::GraphSourceRetracted { graph_source_id } => {
-                // Unregister retracted graph source
-                self.state.lock().unregister_graph_source(graph_source_id);
-                info!(graph_source = %graph_source_id, "Unregistered retracted graph source");
+                // The event carries no `source_type`, so this fires for every
+                // retraction in the system — vector, R2RML, Iceberg included.
+                // Log only when one of ours actually went away, or the line is
+                // mostly noise about graph sources this worker never held.
+                if self.state.lock().unregister_graph_source(graph_source_id) {
+                    info!(graph_source = %graph_source_id, "Unregistered retracted graph source");
+                }
                 vec![]
             }
             _ => vec![], // Other events don't trigger sync
@@ -822,6 +834,29 @@ mod tests {
         assert_eq!(
             state.graph_sources_for_ledger("ledger1:main"),
             vec!["a:b:c"]
+        );
+    }
+
+    /// The retract event carries no `source_type`, so it fires for every graph
+    /// source in the deployment. The return value is what lets the caller tell
+    /// a real removal from one this worker never held.
+    #[test]
+    fn unregister_reports_whether_anything_was_removed() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+
+        assert!(
+            state.unregister_graph_source("search:main"),
+            "removing a registered index reports true"
+        );
+        assert!(
+            !state.unregister_graph_source("search:main"),
+            "removing it twice reports false the second time"
+        );
+        assert!(
+            !state.unregister_graph_source("never-registered:main"),
+            "an index this worker never held reports false"
         );
     }
 
