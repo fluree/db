@@ -16,6 +16,41 @@ use crate::error::{IndexerError, Result};
 use crate::gc;
 use crate::{IndexResult, IndexStats};
 
+/// Abort an incremental build whose forward-pack routing table is too large to
+/// encode, so the caller falls back to a full rebuild instead of panicking in
+/// [`IndexRoot::encode`].
+///
+/// Pack counts are `u16` on the wire. `encode()` panics rather than truncating
+/// (a truncated table reads back cleanly having lost ID ranges), which is right
+/// for paths with nowhere else to go — but it is the wrong outcome here.
+/// `encode()` runs at the END of the build, after compaction has already
+/// uploaded its merged packs, so a panic discards the routing-table progress
+/// compaction just made and the next cycle starts from the same oversized base
+/// root. With a per-cycle compaction budget, a table far enough over the cap can
+/// never shrink its way back under: every cycle re-does the work, panics, and
+/// leaks the packs it uploaded (their garbage record lives in the root that is
+/// never published).
+///
+/// Returning [`IndexerError::IncrementalAbort`] instead routes into the existing
+/// fallback in `index_ledger`, and a full rebuild genuinely cures this: the
+/// rebuild path re-cuts packs by SIZE from `id = 0`
+/// (`upload_dicts::build_string_forward_packs`), so a table of many small packs
+/// accumulated over many incremental builds collapses to `bytes / pack target`.
+///
+/// It does NOT cure a table that is large because the DATA is large — roughly a
+/// terabyte of dictionary in one stream, where a rebuild produces the same count
+/// — but that needs a wider wire field, not a different build path.
+pub(crate) fn ensure_pack_counts_encodable(root: &IndexRoot) -> Result<()> {
+    match root.dict_refs.forward_packs.wire_count_overflow() {
+        None => Ok(()),
+        Some((what, len)) => Err(IndexerError::IncrementalAbort(format!(
+            "{what} forward pack count {len} exceeds the u16 wire limit of {}; \
+             falling back to a full rebuild, which re-cuts packs by size",
+            fluree_db_binary_index::format::wire_helpers::PACK_COUNT_WIRE_MAX,
+        ))),
+    }
+}
+
 /// Validate that an index root's materialized namespace table matches the
 /// commit-derived table exactly. A mismatch indicates an indexer or publisher
 /// bug — fail fast rather than silently diverging.
@@ -541,6 +576,87 @@ mod tests {
 
     fn hash(pairs: &[(u16, &str)]) -> HashMap<u16, String> {
         pairs.iter().map(|&(c, p)| (c, p.to_string())).collect()
+    }
+
+    /// A root carrying `string_packs` string forward pack refs and nothing else
+    /// of interest — enough to exercise the pre-encode wire-count check.
+    fn root_with_string_packs(string_packs: usize) -> IndexRoot {
+        use fluree_db_binary_index::format::wire_helpers::{DictPackRefs, PackBranchEntry};
+        use fluree_db_binary_index::DictTreeRefs;
+        use fluree_db_core::{ContentId, ContentKind};
+
+        let cid = ContentId::new(ContentKind::IndexLeaf, b"dummy");
+        let tree = DictTreeRefs {
+            branch: cid.clone(),
+            leaves: Vec::new(),
+        };
+        IndexRoot {
+            ledger_id: "test:main".to_string(),
+            index_t: 1,
+            base_t: 0,
+            subject_id_encoding: fluree_db_core::SubjectIdEncoding::Narrow,
+            namespace_codes: BTreeMap::new(),
+            predicate_sids: Vec::new(),
+            graph_iris: Vec::new(),
+            datatype_iris: Vec::new(),
+            language_tags: Vec::new(),
+            dict_refs: DictRefs {
+                forward_packs: DictPackRefs {
+                    string_fwd_packs: (0..string_packs)
+                        .map(|i| PackBranchEntry {
+                            first_id: i as u64,
+                            last_id: i as u64,
+                            pack_cid: cid.clone(),
+                        })
+                        .collect(),
+                    subject_fwd_ns_packs: Vec::new(),
+                },
+                subject_reverse: tree.clone(),
+                string_reverse: tree,
+            },
+            subject_watermarks: Vec::new(),
+            string_watermark: 0,
+            lex_sorted_string_ids: false,
+            total_commit_size: 0,
+            total_asserts: 0,
+            total_retracts: 0,
+            graph_arenas: Vec::new(),
+            default_graph_orders: Vec::new(),
+            named_graphs: Vec::new(),
+            stats: None,
+            schema: None,
+            prev_index: None,
+            garbage: None,
+            sketch_ref: None,
+            has_annotations: false,
+            had_annotation_arena: false,
+            annotation_index: None,
+            o_type_table: IndexRoot::build_o_type_table(&[], &[]),
+            ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
+        }
+    }
+
+    /// An oversized routing table must abort the incremental build with the
+    /// variant `index_ledger` falls back on, NOT reach `encode()`'s panic —
+    /// that panic discards the compaction progress made earlier in the same
+    /// build, so the ledger can never shrink its way back under the cap.
+    #[test]
+    fn oversized_pack_table_aborts_to_full_rebuild() {
+        use fluree_db_binary_index::format::wire_helpers::PACK_COUNT_WIRE_MAX;
+
+        // At the limit the root still encodes, so the check must not fire.
+        ensure_pack_counts_encodable(&root_with_string_packs(PACK_COUNT_WIRE_MAX))
+            .expect("a table at exactly the wire limit must still publish");
+
+        let err = ensure_pack_counts_encodable(&root_with_string_packs(PACK_COUNT_WIRE_MAX + 1))
+            .expect_err("one past the limit must abort");
+        assert!(
+            matches!(err, IndexerError::IncrementalAbort(_)),
+            "must be the variant index_ledger falls back on, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("u16 wire limit"), "{msg}");
+        assert!(msg.contains("full rebuild"), "names the recovery: {msg}");
     }
 
     #[test]

@@ -19,8 +19,8 @@ A binary index build produces:
   - each leaf contains multiple **leaflets** (groups of independently compressed per-column blocks)
 - **Shared dictionary artifacts**:
   - small dictionaries (predicates, graphs, datatypes, languages) embedded in the **index root** (CAS) and/or persisted as flat files in local builds
-  - large dictionaries (subjects, strings) stored as **CoW single-level B-tree-like trees**
-    (a branch manifest `DTB1` + multiple leaf blobs `DLF1`/`DLR1`)
+  - large dictionaries (subjects, strings): reverse as **CoW single-level B-tree-like trees**
+    (a branch manifest `DTB1` + `DLR1` leaf blobs), forward as ID-range-routed **`FPK1` packs**
 - **Manifests / roots** that describe how to load the above either from a local directory layout
   or from the content store via `IndexRoot` (FIR6 binary format, CID-based).
 
@@ -51,7 +51,8 @@ Fact indexes exist in up to four sort orders (see `RunSortOrder`):
 - **Branch manifest**: maps key ranges to leaf files; used for routing.
 - **Column block**: a separately compressed single-column section inside a leaflet.
 - **History sidecar**: a separate CAS object holding a leaf's time-travel transition log.
-- **Dictionary tree**: a `DTB1` branch + `DLF1`/`DLR1` leaves for large keyspaces (subjects/strings).
+- **Dictionary tree**: a `DTB1` branch + `DLR1` leaves, holding the reverse (value → ID) direction for large keyspaces (subjects/strings).
+- **Forward pack**: an `FPK1` blob holding a contiguous ID range of a forward (ID → value) dictionary, routed from the index root.
 - **ContentId**: a CIDv1 value that uniquely identifies a content-addressed artifact by its hash and type. See [ContentId and ContentStore](content-id-and-contentstore.md).
 
 ## Physical layout (local build output)
@@ -117,7 +118,8 @@ At a high level the root contains:
   - `datatype_iris[]` (dt_id → datatype IRI)
   - `language_tags[]` (lang_id-1 → tag string; `lang_id = index + 1`, 0 = "no tag")
 - **Dictionary ContentIds** (CAS artifacts):
-  - tree blobs: subject/string forward & reverse (`DTB1` branch + `DLF1`/`DLR1` leaves)
+  - tree blobs: subject/string reverse (`DTB1` branch + `DLR1` leaves)
+  - forward packs: subject (per namespace) & string (`FPK1`), routed by ID range
   - optional per-predicate numbig arenas
   - optional per-predicate vector arenas (manifest + shards)
 - **Default graph routing** (inline leaf entries per sort order)
@@ -406,14 +408,16 @@ lens:    [u32] × count
 
 The forward file itself is a raw concatenation of bytes; access is via `(offset,len)` from the index.
 
-### Large dictionaries as CoW trees (`DTB1` + leaf blobs)
+### Large dictionaries
 
-Subjects and strings are large enough that we represent them as single-level CoW trees:
+Subjects and strings are large enough to need their own artifacts, and the two
+directions use different structures:
 
-- **Branch**: `DTB1` mapping key ranges to leaf ContentIds
-- **Leaves**:
-  - forward leaf (`DLF1`): numeric ID → value bytes
-  - reverse leaf (`DLR1`): key bytes → numeric ID
+- **Reverse** (value → ID) is a single-level **CoW tree**: a `DTB1` branch
+  mapping key ranges to `DLR1` leaf ContentIds. An incremental update rewrites
+  only the leaves whose key range it touches; untouched leaves keep their CIDs.
+- **Forward** (ID → value) is a set of **`FPK1` packs** routed by ID range
+  directly from the index root — not a tree. See below.
 
 #### Dictionary branch (`DTB1`)
 
@@ -432,15 +436,120 @@ Subjects and strings are large enough that we represent them as single-level CoW
 Keys are treated as raw bytes and compared lexicographically. For forward trees keyed by numeric ID,
 the branch uses **8-byte big-endian** keys (so lexical order matches numeric order).
 
-#### Forward dict leaf (`DLF1`)
+#### Forward dict pack (`FPK1`)
+
+Forward dictionaries are paged packs, each covering a contiguous ID range:
 
 ```text
-[magic: 4B "DLF1"]
-[entry_count: u32]
-[offset_table: u32 × entry_count]
-[data section]
-  entry := [id: u64 LE] [value_len: u32] [value_bytes]
+Header (40 bytes):
+  [magic: 4B "FPK1"] [version: u8=1] [kind: u8] [ns_code: u16 LE]
+  [first_id: u64 LE] [last_id: u64 LE]
+  [page_count: u32 LE] [page_dir_offset: u64 LE] [reserved: u32=0]
+
+Pages (concatenated):
+  page := [entry_count: u32 LE] [offsets: u32 LE × (entry_count+1)] [value bytes]
+
+Page directory (at page_dir_offset, 20 bytes per entry):
+  [page_first_id: u64 LE] [entry_count: u32 LE]
+  [page_offset: u32 LE] [page_len: u32 LE]
 ```
+
+IDs within a page are contiguous, so a lookup binary-searches the page
+directory and then indexes directly: `value = data[offsets[local]..offsets[local+1]]`.
+`kind` is `0` for the single global string stream and `1` for subject packs,
+which are per-namespace (`ns_code`). Targets are **512 KiB** per page and
+**16 MiB** per pack.
+
+Because the encoded length is `page_dir_offset + page_count * 20`, a pack can
+be sized from its 40-byte header alone — a range read, not a full fetch.
+
+**Routing** lives inline in the index root (`DictPackRefs`), as
+`{first_id, last_id, pack_cid}` per pack. Ranges must be ascending and
+non-overlapping; gaps between packs are legal.
+
+#### Forward pack compaction
+
+Each incremental build appends at least one pack per dict stream it touched,
+including a small trailing pack for a handful of new entries. Left alone that
+grows the routing table once per build forever — unbounded objects, unbounded
+mappings, and a root that grows on every publish.
+
+So after appending, the indexer merges qualifying **runs** in each touched
+stream: scanning left to right for the longest contiguous run that fits the
+16 MiB target and whose members are either all small (≤ 64 KiB) or within a 4×
+size ratio of each other, requiring either 8 packs or a group already at half
+the target. Merging preserves input pages verbatim, rebasing their offsets —
+no dictionary value is decoded.
+
+Runs rather than suffixes, because a merge output is larger than the packs
+around it. Anchoring candidates at the newest pack means that once a merge
+lands, every later candidate contains it, it fails the size ratio against its
+smaller neighbours, and any fragmentation *behind* it is unreachable forever —
+which would leave a table inherited from before compaction permanently stuck.
+
+Nothing records which packs were previously compacted: the rule is scale-free,
+decided from sizes and ID ranges alone, which is why no compaction state is
+carried in the root. Sizes come from an in-cycle memo, local file metadata, or
+a 40-byte header range read — never a full fetch.
+
+Each stream's **tail is examined first and unconditionally**, because that is
+where new packs land and so what keeps the table bounded. Only then are older
+regions swept for inherited fragmentation. Sweeping head-first instead lets a
+table larger than the scan budget hide its own tail: the budget is spent
+walking mature packs, the newest packs are never reached, and growth becomes
+unbounded again for exactly the largest dictionaries.
+
+Compaction also runs for streams that received **no novelty** this cycle. An
+active stream keeps itself tidy, but one that goes quiet — or whose work was
+cut short when a budget ran out — would otherwise keep its fragmentation
+forever while its packs are still loaded with the index. Coverage rotates with
+`index_t`, so a ledger with more streams than one cycle can service still
+reaches all of them over time without persisting a cursor.
+
+Work per cycle is bounded two ways, both shared across every stream: 64 MiB of
+merge input, and a count of storage operations. The byte budget alone does not
+bound *requests* — a backlog of 113-byte packs consumes almost none of it while
+still costing a probe and a GET per pack — and a per-stream counter would be
+multiplied by the namespace count. Every probe and fetch that reaches storage
+is charged against one cycle-wide budget, so a large backlog drains over
+several cycles instead of stalling one publish behind thousands of round trips.
+Probes and fetches issue concurrently.
+
+Superseded packs are diffed out of the routing table by
+`IncrementalRootBuilder::set_dict_refs` and land in the garbage manifest, so
+they are reclaimed by the normal retention-aware GC — older roots keep
+referencing them until those roots age out. Packs *created and consumed inside
+one cycle* — a freshly appended pack that compaction immediately absorbed, or a
+cascade's own intermediate output — appear in neither the base root nor the
+published one, so that diff cannot see them; the indexer records those
+explicitly as garbage instead.
+
+The routing table is `u16`-counted on the wire, so a stream cut at a fixed
+16 MiB would hit a hard wall around a terabyte of dictionary: packs stop fitting
+and the ledger cannot publish at all. Two things prevent that.
+
+A build **cuts packs at a target that scales with the stream** once a fixed one
+could no longer keep the count under a quarter of the cap — 16 MiB until the
+dictionary passes 256 GiB, then doubling. Below that threshold the target is
+exactly what it always was, so an ordinary ledger's packs are cut identically
+and nothing is re-written by deploying the rule. Doubling rather than tracking
+size continuously keeps the target stable as a dictionary grows.
+
+**Compaction deliberately does not follow that target.** Raising the merge
+ceiling would make every already-compacted pack eligible again — eight adjacent
+16 MiB packs are size-comparable and would qualify under a larger ceiling — so
+every byte of every dictionary would be rewritten `log_8(new / old)` times for
+no benefit to any ledger that is not near the wall. Packs above the merge
+ceiling are simply inert to compaction; there is no split operation, which is
+also why *lowering* the target is free while raising it is not.
+
+If a table does reach the cap anyway, the incremental build **aborts to a full
+rebuild** rather than failing to encode. The encoder refuses to truncate a
+count, since a truncated routing table reads back cleanly having lost ID ranges;
+but that refusal comes at the end of a build, after compaction has already
+uploaded its merged packs, so on its own it would discard that progress every
+cycle and never recover. A rebuild re-cuts the whole stream by size and is the
+only operation that shrinks the table outright.
 
 #### Reverse dict leaf (`DLR1`)
 
@@ -481,7 +590,8 @@ The `u16` big-endian prefix ensures that lexicographic byte comparisons match lo
   - leaf: magic `FLI3`, version `1`
 - Dictionary tree artifacts:
   - branch: magic `DTB1`
-  - leaves: magic `DLF1` / `DLR1`
+  - reverse leaves: magic `DLR1`
+  - forward packs: magic `FPK1`
 - Small dict blobs: magic `FRD1`
 
 When adding new fields, prefer:
