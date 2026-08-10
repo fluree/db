@@ -459,7 +459,11 @@ async fn assert_fully_retracted_shapes(strategy: IndexStrategy, ledger_id: &str)
         r#"{prefix} SELECT ?inv FROM <{ledger_id}@t:1>
            WHERE {{ ?inv ns:legacyFlag "true" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q).await, 5, "{ctx}: single triple, bound object");
+    assert_eq!(
+        run_row_count(&fluree, &q).await,
+        5,
+        "{ctx}: single triple, bound object"
+    );
 
     // 2. Single triple, var object — and the value must be the real one.
     let q = format!(
@@ -479,28 +483,44 @@ async fn assert_fully_retracted_shapes(strategy: IndexStrategy, ledger_id: &str)
         r#"{prefix} SELECT (COUNT(?inv) AS ?n) FROM <{ledger_id}@t:1>
            WHERE {{ ?inv ns:legacyFlag "true" }}"#
     );
-    assert_eq!(run_count_sparql(&fluree, &q).await, 5, "{ctx}: COUNT over single triple");
+    assert_eq!(
+        run_count_sparql(&fluree, &q).await,
+        5,
+        "{ctx}: COUNT over single triple"
+    );
 
     // 4. Type-anchored 2-star (the property-join lane).
     let q = format!(
         r#"{prefix} SELECT ?inv FROM <{ledger_id}@t:1>
            WHERE {{ ?inv a ns:Invoice ; ns:legacyFlag "true" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q).await, 5, "{ctx}: type-anchored 2-star");
+    assert_eq!(
+        run_row_count(&fluree, &q).await,
+        5,
+        "{ctx}: type-anchored 2-star"
+    );
 
     // 5. Same 2-star plus a null FILTER.
     let q = format!(
         r#"{prefix} SELECT ?inv FROM <{ledger_id}@t:1>
            WHERE {{ ?inv a ns:Invoice ; ns:legacyFlag "true" . FILTER(isIRI(?inv)) }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q).await, 5, "{ctx}: 2-star + null FILTER");
+    assert_eq!(
+        run_row_count(&fluree, &q).await,
+        5,
+        "{ctx}: 2-star + null FILTER"
+    );
 
     // 6. Flag-first 2-star.
     let q = format!(
         r#"{prefix} SELECT ?inv FROM <{ledger_id}@t:1>
            WHERE {{ ?inv ns:legacyFlag "true" ; ns:status "paid" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q).await, 5, "{ctx}: flag-first 2-star");
+    assert_eq!(
+        run_row_count(&fluree, &q).await,
+        5,
+        "{ctx}: flag-first 2-star"
+    );
 
     // 7. OPTIONAL — the worst presentation: pre-fix this returned 5 rows with
     //    ?f unbound, which reads as a truthful "the flag did not exist at t=1".
@@ -531,14 +551,22 @@ async fn assert_fully_retracted_shapes(strategy: IndexStrategy, ledger_id: &str)
         r#"{prefix} SELECT ?inv FROM <{ledger_id}@t:1>
            WHERE {{ ?inv ns:status "paid" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q).await, 5, "{ctx}: live-predicate control");
+    assert_eq!(
+        run_row_count(&fluree, &q).await,
+        5,
+        "{ctx}: live-predicate control"
+    );
 
     // 10. Current state: the predicate really is gone at t=2.
     let q = format!(
         r#"{prefix} SELECT ?inv FROM <{ledger_id}@t:2>
            WHERE {{ ?inv ns:legacyFlag "true" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q).await, 0, "{ctx}: current state must be empty");
+    assert_eq!(
+        run_row_count(&fluree, &q).await,
+        0,
+        "{ctx}: current state must be empty"
+    );
 
     // 11. Latest (no @t) must also stay empty — the preserved zero-row
     //     partition must never resurrect rows outside a replay.
@@ -546,7 +574,11 @@ async fn assert_fully_retracted_shapes(strategy: IndexStrategy, ledger_id: &str)
         r#"{prefix} SELECT ?inv FROM <{ledger_id}>
            WHERE {{ ?inv ns:legacyFlag "true" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q).await, 0, "{ctx}: latest must be empty");
+    assert_eq!(
+        run_row_count(&fluree, &q).await,
+        0,
+        "{ctx}: latest must be empty"
+    );
 }
 
 #[tokio::test]
@@ -582,14 +614,22 @@ async fn time_travel_fully_retracted_membership_join_sized() {
           SELECT ?inv FROM <{ledger_id}@t:1>
           WHERE {{ ?inv a ns:Invoice ; ns:legacyFlag "true" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q).await, 300, "membership-join lane at t=1");
+    assert_eq!(
+        run_row_count(&fluree, &q).await,
+        300,
+        "membership-join lane at t=1"
+    );
 
     let q_plain = format!(
         r#"PREFIX ns: <http://example.org/ns#>
           SELECT ?inv FROM <{ledger_id}@t:1>
           WHERE {{ ?inv ns:legacyFlag "true" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q_plain).await, 300, "plain scan at t=1");
+    assert_eq!(
+        run_row_count(&fluree, &q_plain).await,
+        300,
+        "plain scan at t=1"
+    );
 }
 
 /// Partial retraction bounds the blast radius: when only some of a
@@ -634,14 +674,22 @@ async fn time_travel_partially_retracted_predicate_respects_t() {
           SELECT ?inv FROM <{ledger_id}@t:1>
           WHERE {{ ?inv ns:legacyFlag "true" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q_t1).await, 5, "all 5 carried the flag at t=1");
+    assert_eq!(
+        run_row_count(&fluree, &q_t1).await,
+        5,
+        "all 5 carried the flag at t=1"
+    );
 
     let q_t2 = format!(
         r#"PREFIX ns: <http://example.org/ns#>
           SELECT ?inv FROM <{ledger_id}@t:2>
           WHERE {{ ?inv ns:legacyFlag "true" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q_t2).await, 3, "3 still carry the flag at t=2");
+    assert_eq!(
+        run_row_count(&fluree, &q_t2).await,
+        3,
+        "3 still carry the flag at t=2"
+    );
 }
 
 /// Remediation story for indexes already damaged by an older binary: a
@@ -666,7 +714,10 @@ async fn repeat_full_rebuild_restores_retracted_history() {
     // A second reindex over the already-published index — the user-facing
     // remediation for a ledger indexed by an older binary.
     support::rebuild_and_publish_index(&fluree, ledger_id).await;
-    fluree.ledger(ledger_id).await.expect("reload after reindex");
+    fluree
+        .ledger(ledger_id)
+        .await
+        .expect("reload after reindex");
     assert_eq!(run_row_count(&fluree, &q).await, 5, "reindex again");
 
     let q_t2 = format!(
@@ -674,7 +725,11 @@ async fn repeat_full_rebuild_restores_retracted_history() {
           SELECT ?inv FROM <{ledger_id}@t:2>
           WHERE {{ ?inv ns:legacyFlag "true" }}"#
     );
-    assert_eq!(run_row_count(&fluree, &q_t2).await, 0, "t=2 stays empty after reindex");
+    assert_eq!(
+        run_row_count(&fluree, &q_t2).await,
+        0,
+        "t=2 stays empty after reindex"
+    );
 }
 
 /// Microbench: compare latest vs historical batched-probe timing.
@@ -1002,4 +1057,77 @@ async fn time_travel_fully_retracted_subject_respects_t() {
           WHERE {{ <http://example.org/ns#Invoice/inv-04> ?p ?o }}"
     );
     assert_eq!(run_row_count(&fluree, &q_t2).await, 0, "gone at t=2");
+}
+
+/// Measurement: what preserving the zero-row partitions costs a rebuild.
+///
+/// Run with: `cargo test -p fluree-db-api --features native --test
+/// grp_query_history -- --ignored --nocapture rebuild_cost_of_retracted`.
+///
+/// 200 subjects carry 60 predicates each; 50 of the 60 are then retracted
+/// outright, so the rebuild must emit 50 zero-row partitions per
+/// predicate-keyed order. Reports the same numbers on either side of the
+/// fix so the delta is the emission's cost and nothing else.
+#[tokio::test]
+#[ignore]
+async fn rebuild_cost_of_retracted_partitions() {
+    use std::time::Instant;
+
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tt-rebuild-cost:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    const SUBJECTS: usize = 200;
+    const PREDICATES: usize = 60;
+    const RETRACTED: usize = 50;
+
+    let mut subjects = Vec::with_capacity(SUBJECTS);
+    for s in 0..SUBJECTS {
+        let mut node = serde_json::Map::new();
+        node.insert("@id".into(), json!(format!("ns:Thing/s-{s:04}")));
+        node.insert("@type".into(), json!("ns:Thing"));
+        for p in 0..PREDICATES {
+            node.insert(format!("ns:p{p:03}"), json!(format!("v-{s}-{p}")));
+        }
+        subjects.push(JsonValue::Object(node));
+    }
+    let tx1 = json!({"@context": ctx(), "@graph": subjects});
+    let _ = fluree.insert(ledger0, &tx1).await.expect("tx1");
+
+    let mut ledger = fluree.ledger(ledger_id).await.expect("reload");
+    for p in 0..RETRACTED {
+        let tx = json!({
+            "@context": ctx(),
+            "where": {"@id": "?s", format!("ns:p{p:03}"): "?o"},
+            "delete": {"@id": "?s", format!("ns:p{p:03}"): "?o"}
+        });
+        ledger = fluree.update(ledger, &tx).await.expect("retract").ledger;
+    }
+
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("lookup")
+        .expect("record");
+    let start = Instant::now();
+    let result = fluree_db_indexer::rebuild_index_from_commits(
+        fluree.content_store(ledger_id),
+        ledger_id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("rebuild");
+    let elapsed = start.elapsed();
+
+    println!(
+        "\n--- rebuild cost ({SUBJECTS} subjects x {PREDICATES} predicates, \
+         {RETRACTED} fully retracted) ---"
+    );
+    println!("elapsed:     {:.3} s", elapsed.as_secs_f64());
+    println!("flakes:      {}", result.stats.flake_count);
+    println!("leaves:      {}", result.stats.leaf_count);
+    println!("total_bytes: {}", result.stats.total_bytes);
 }

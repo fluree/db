@@ -40,7 +40,9 @@ use super::column_block::{ColumnBlockRef, COLUMN_BLOCK_REF_SIZE};
 use super::history_sidecar::{HistEntryV2, HistSidecarBuilder, HistorySegmentRef};
 use super::leaflet::{encode_leaflet, EncodedLeaflet};
 use super::run_record::RunSortOrder;
-use super::run_record_v2::{write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE};
+use super::run_record_v2::{
+    cmp_v2_for_order, write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
+};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -221,14 +223,6 @@ impl LeafWriter {
         // routing bound when they open the leaf.
         self.flush_history_only_segments(Some(&record))?;
 
-        // This record's transition entries (and those of any preceding
-        // non-materialized facts in the same gap) belong to the leaflet that
-        // holds this record — the current one, post any segment-boundary flush.
-        // Committed before the leaf's routing keys are taken from `record`,
-        // since those entries sort at or below it and so set the leaf's low
-        // bound when they open it.
-        self.commit_all_pending();
-
         // Track first record of the leaf.
         if self.leaf_first_record.is_none() {
             self.leaf_first_record = Some(record);
@@ -244,6 +238,11 @@ impl LeafWriter {
             }
             RunSortOrder::Spot => {}
         }
+
+        // This record's transition entries (and those of any preceding
+        // non-materialized facts in the same gap) belong to the leaflet that
+        // holds this record — the current one, post any segment-boundary flush.
+        self.commit_all_pending();
 
         self.record_buf.push(record);
         self.last_record = Some(record);
@@ -282,28 +281,32 @@ impl LeafWriter {
             self.sidecar_builder.start_leaflet();
             self.current_segment_started = true;
         }
-        // A fact whose final state is absent materializes no row, so nothing
-        // else widens the leaf's routing keys to cover it — and branch-level
-        // leaf selection drops a leaf whose range stops short of the key being
-        // probed, which is how a fully-retracted subject becomes unreadable at
-        // a historical `t`. Entries are committed in build order, so taking the
-        // latest unconditionally keeps the leaf's bounds monotonic.
-        let rec = record_from_history(&entry);
-        debug_assert!(
-            self.last_record.is_none_or(|last| {
-                let (mut prev, mut next) = ([0u8; ORDERED_KEY_V2_SIZE], [0u8; ORDERED_KEY_V2_SIZE]);
-                write_ordered_key_v2(self.order, &last, &mut prev);
-                write_ordered_key_v2(self.order, &rec, &mut next);
-                prev <= next
-            }),
-            "history entries must be committed in build order — an out-of-order \
-             entry would push the leaf's last routing key backwards"
-        );
-        if self.leaf_first_record.is_none() {
+        self.widen_leaf_bounds(record_from_history(&entry));
+        self.sidecar_builder.push_entry(entry);
+    }
+
+    /// Grow the leaf's routing key range to cover `rec`.
+    ///
+    /// A fact whose final state is absent materializes no row, so nothing else
+    /// widens the leaf's keys to cover it — and branch-level leaf selection
+    /// drops a leaf whose range stops short of the key being probed, which is
+    /// how a fully-retracted subject becomes unreadable at a historical `t`.
+    /// Widening is strict, so an entry sharing its own row's identity (the
+    /// common case) leaves that row as the routing key.
+    fn widen_leaf_bounds(&mut self, rec: RunRecordV2) {
+        let cmp = cmp_v2_for_order(self.order);
+        if self
+            .leaf_first_record
+            .is_none_or(|first| cmp(&rec, &first) == std::cmp::Ordering::Less)
+        {
             self.leaf_first_record = Some(rec);
         }
-        self.last_record = Some(rec);
-        self.sidecar_builder.push_entry(entry);
+        if self
+            .last_record
+            .is_none_or(|last| cmp(&rec, &last) == std::cmp::Ordering::Greater)
+        {
+            self.last_record = Some(rec);
+        }
     }
 
     /// Commit every buffered history entry to the current leaflet's segment.
@@ -478,10 +481,8 @@ impl LeafWriter {
 
         // The leaf's routing keys must span this segment or branch-level leaf
         // selection never opens the leaf that holds it.
-        if self.leaf_first_record.is_none() {
-            self.leaf_first_record = Some(first);
-        }
-        self.last_record = Some(last);
+        self.widen_leaf_bounds(first);
+        self.widen_leaf_bounds(last);
         Ok(())
     }
 
@@ -1274,7 +1275,11 @@ mod tests {
         let leaves = writer.finish().unwrap();
         let header = decode_leaf_header_v3(&leaves[0].leaf_bytes).unwrap();
         let dir = decode_leaf_dir_v3(&leaves[0].leaf_bytes, &header).unwrap();
-        assert_eq!(dir.len(), 2, "no empty partitions for predicates with no history");
+        assert_eq!(
+            dir.len(),
+            2,
+            "no empty partitions for predicates with no history"
+        );
     }
 
     /// SPOT is unsegmented, so a fully-retracted subject rides along in the
@@ -1296,7 +1301,11 @@ mod tests {
         let leaf = &leaves[0];
         let segs = segments_of(leaf);
         let all: Vec<_> = segs.iter().flatten().collect();
-        assert_eq!(all.len(), 3, "every transition must be reachable from a leaflet");
+        assert_eq!(
+            all.len(),
+            3,
+            "every transition must be reachable from a leaflet"
+        );
         assert_eq!(
             leaf.last_key.s_id,
             SubjectId(2),
