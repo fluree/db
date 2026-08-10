@@ -1182,3 +1182,41 @@ async fn time_travel_after_everything_is_retracted() {
         "nothing left at t=2"
     );
 }
+
+/// The history surface (`from`/`to` with `@t`/`@op` bindings) over the same
+/// fully-retracted predicate. It reads through `BinaryHistoryScanOperator`
+/// rather than a time-travel replay, but it enters through the same
+/// predicate-keyed order, so a dropped partition hides every event.
+#[tokio::test]
+async fn history_range_over_fully_retracted_predicate() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tt-history-surface:main";
+    let _ledger = seed_fully_retracted_ledger(&fluree, ledger_id).await;
+
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to": format!("{ledger_id}@t:latest"),
+        "select": ["?inv", "?t", "?op"],
+        "where": [{
+            "@id": "?inv",
+            "ns:legacyFlag": {"@value": "?v", "@t": "?t", "@op": "?op"}
+        }],
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&q)
+        .format(fluree_db_api::FormatterConfig::typed_json().with_normalize_arrays())
+        .execute_tracked()
+        .await
+        .expect("history range query");
+    let value = serde_json::to_value(&result.result).expect("serialize");
+    let rows = value.as_array().expect("rows array");
+
+    assert_eq!(
+        rows.len(),
+        10,
+        "5 asserts at t=1 and 5 retracts at t=2; got {rows:#?}"
+    );
+}
