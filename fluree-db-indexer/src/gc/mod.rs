@@ -14,6 +14,19 @@
 //! 3. **On-demand cleanup**: Walk the prev-index chain, identify eligible garbage,
 //!    and release CAS artifacts via `ContentStore::release`
 //!
+//! ## Division of labour with the sweep
+//!
+//! The collector releases only **branch-local** artifacts — roots, leaves,
+//! branch manifests, sidecars. Dictionary blobs live in the ledger-wide
+//! `@shared/dicts/` namespace, so a branch's manifest can name one a sibling
+//! branch still references; the collector walks one branch's chain and holds
+//! no exclusion over the others, so it cannot prove such a blob unreferenced.
+//!
+//! Shared blobs are left for [`plan_sweep`], which unions the reachable set
+//! across every branch while holding them all excluded. A dictionary a
+//! collected root uniquely referenced becomes unreachable when that root is
+//! released, and the next sweep reclaims it.
+//!
 //! ## Garbage Record Format
 //!
 //! Garbage records are CAS-written JSON containing sorted/deduped CID strings

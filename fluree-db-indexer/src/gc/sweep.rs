@@ -437,6 +437,52 @@ mod tests {
         assert!(plan.orphans.is_empty(), "nothing else is orphaned either");
     }
 
+    /// The collector defers shared dictionary blobs rather than releasing
+    /// them, because it cannot see sibling branches. The sweep is the other
+    /// half of that division: a dictionary no branch references is reclaimed
+    /// here, so the deferral completes rather than leaking (#1548).
+    #[tokio::test]
+    async fn a_dictionary_no_branch_references_is_reclaimed() {
+        let storage = MemoryStorage::new();
+        let live = dict_cid(b"live-dict");
+        let (_, live_addr) = cid_and_addr_for(
+            MAIN,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"live-dict",
+        );
+        storage.write_bytes(&live_addr, b"dict").await.unwrap();
+
+        // Superseded by an earlier build and left behind by the collector.
+        let (_, stranded_addr) = cid_and_addr_for(
+            MAIN,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"stranded-dict",
+        );
+        storage.write_bytes(&stranded_addr, b"dict").await.unwrap();
+
+        let roots = write_chain(&storage, MAIN, 2, &live).await;
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            plan.orphans,
+            vec![stranded_addr.clone()],
+            "exactly the unreferenced dictionary is reclaimable"
+        );
+
+        execute_sweep(&storage, &plan).await;
+        assert!(!storage.exists(&stranded_addr).await.unwrap());
+        assert!(
+            storage.exists(&live_addr).await.unwrap(),
+            "the referenced dictionary survives"
+        );
+    }
+
     /// On a ledger predating the `@shared` dict migration a live dict's only
     /// copy sits at the per-branch address, which reads still fall back to.
     /// The sweep must recognise it as the same blob.

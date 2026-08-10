@@ -12,6 +12,10 @@
 //! 3. Delete root N-1 itself (truncating the chain)
 //!
 //! This means GC operates on pairs: (newer root with manifest, older root to delete).
+//!
+//! Only branch-local artifacts are released here; dictionary blobs are shared
+//! across a ledger's branches and are deferred to the storage sweep. See
+//! [`partition_branch_local`] and the module docs on [`crate::gc`].
 
 use super::{parse_garbage_record, CleanGarbageConfig, CleanGarbageResult};
 use super::{DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS};
@@ -50,6 +54,44 @@ fn parse_chain_fields(
     let prev_id = root.prev_index.as_ref().map(|p| p.id.clone());
     let garbage_id = root.garbage.as_ref().map(|g| g.id.clone());
     Ok((root.index_t, prev_id, garbage_id, root))
+}
+
+/// Split a garbage manifest's items into the branch-local CIDs this collector
+/// may release, returning them with a count of the shared ones it skipped.
+///
+/// Dictionary blobs live in the ledger-wide `@shared/dicts/` namespace, so a
+/// branch's manifest can name one that a sibling branch's index still
+/// references — content addressing makes identical dictionary content produce
+/// an identical CID, and a branch created from another starts out sharing it.
+/// This collector walks one branch's chain and holds no exclusion over the
+/// others, so it cannot establish that a shared blob is unreferenced.
+///
+/// Those blobs are left for the storage sweep, which unions the reachable set
+/// across every branch while holding them all excluded. See
+/// [`plan_sweep`](super::plan_sweep).
+fn partition_branch_local(garbage: &[String]) -> (Vec<ContentId>, usize) {
+    let mut branch_local = Vec::with_capacity(garbage.len());
+    let mut shared = 0;
+
+    for item in garbage {
+        match item.parse::<ContentId>() {
+            Ok(cid) if is_shared_across_branches(&cid) => shared += 1,
+            Ok(cid) => branch_local.push(cid),
+            Err(e) => tracing::warn!(
+                item,
+                error = %e,
+                "Skipping unrecognized garbage item (not a valid CID)"
+            ),
+        }
+    }
+
+    (branch_local, shared)
+}
+
+/// Whether `id` addresses a blob in the ledger-wide namespace shared by every
+/// branch, rather than one scoped to a single branch.
+fn is_shared_across_branches(id: &ContentId) -> bool {
+    id.codec() == fluree_db_core::CODEC_FLUREE_DICT_BLOB
 }
 
 /// Release every node listed in the garbage manifest at `garbage_id`.
@@ -111,21 +153,7 @@ async fn release_manifest_nodes(
         "GC releasing garbage record items"
     );
 
-    let cids: Vec<ContentId> = record
-        .garbage
-        .iter()
-        .filter_map(|item| match item.parse::<ContentId>() {
-            Ok(cid) => Some(cid),
-            Err(e) => {
-                tracing::warn!(
-                    item,
-                    error = %e,
-                    "Skipping unrecognized garbage item (not a valid CID)"
-                );
-                None
-            }
-        })
-        .collect();
+    let (cids, shared): (Vec<ContentId>, usize) = partition_branch_local(&record.garbage);
 
     // Each release is an independent storage round trip. Stepping over absent
     // manifests and untimestamped records means the first pass after this fix
@@ -154,6 +182,7 @@ async fn release_manifest_nodes(
         %garbage_id,
         released,
         elapsed_ms = release_started.elapsed().as_millis() as u64,
+        deferred_to_sweep = shared,
         "GC garbage record item release pass complete"
     );
 
@@ -1388,6 +1417,96 @@ mod tests {
         assert!(
             retained.len() <= 1 + max_old_indexes as usize,
             "retention keeps current + {max_old_indexes} old roots, but t={retained:?} survive"
+        );
+    }
+
+    /// A branch's manifest can name a dictionary blob a sibling branch still
+    /// references — dictionaries live in the ledger-wide `@shared/dicts/`
+    /// namespace, and content addressing makes identical content share a CID.
+    /// The collector walks one branch and holds no exclusion over the others,
+    /// so it must leave those for the sweep rather than release them (#1548).
+    #[tokio::test]
+    async fn shared_dictionary_blobs_are_left_for_the_sweep() {
+        use fluree_db_core::content_kind::DictKind;
+
+        let storage = MemoryStorage::new();
+        let aged_ts = current_timestamp_ms() - (60 * 60 * 1000);
+
+        let (root1, addr1) = cid_and_addr(ContentKind::IndexRoot, b"root1");
+        let (root2, addr2) = cid_and_addr(ContentKind::IndexRoot, b"root2");
+        let (root3, addr3) = cid_and_addr(ContentKind::IndexRoot, b"root3");
+        let (garb2, garb2_addr) = cid_and_addr(ContentKind::GarbageRecord, b"garb2");
+
+        // One branch-local leaf and one shared dictionary, both superseded.
+        let (leaf, leaf_addr) = cid_and_addr(ContentKind::IndexLeaf, b"superseded-leaf");
+        let (dict, dict_addr) = cid_and_addr(
+            ContentKind::DictBlob {
+                dict: DictKind::SubjectReverse,
+            },
+            b"superseded-dict",
+        );
+        storage.write_bytes(&leaf_addr, b"leaf").await.unwrap();
+        storage.write_bytes(&dict_addr, b"dict").await.unwrap();
+
+        storage
+            .write_bytes(&addr1, &minimal_fir6(1, None, None))
+            .await
+            .unwrap();
+        storage
+            .write_bytes(
+                &addr2,
+                &minimal_fir6(
+                    2,
+                    Some(BinaryPrevIndexRef {
+                        t: 1,
+                        id: root1.clone(),
+                    }),
+                    Some(BinaryGarbageRef { id: garb2.clone() }),
+                ),
+            )
+            .await
+            .unwrap();
+        storage
+            .write_bytes(
+                &addr3,
+                &minimal_fir6(
+                    3,
+                    Some(BinaryPrevIndexRef {
+                        t: 2,
+                        id: root2.clone(),
+                    }),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        storage
+            .write_bytes(
+                &garb2_addr,
+                format!(
+                    r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": ["{leaf}", "{dict}"], "created_at_ms": {aged_ts}}}"#
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let store = test_store(&storage);
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let result = clean_garbage(&store, &root3, config).await.unwrap();
+
+        assert_eq!(
+            result.nodes_deleted, 1,
+            "only the branch-local leaf is released"
+        );
+        assert!(!store.has(&leaf).await.unwrap(), "the leaf is reclaimed");
+        assert!(
+            store.has(&dict).await.unwrap(),
+            "the shared dictionary survives; a sibling branch may still reference it"
         );
     }
 
