@@ -9,6 +9,16 @@
 //! These tests drive the real server router in-process with the exact headers
 //! `TrackingFlags::as_request_headers` produces, so a rename or a dropped
 //! branch on either side fails here.
+//!
+//! **When this file runs.** `server` is a default feature of this crate, so a
+//! plain `cargo test -p fluree-db-cli` compiles and runs it, as does CI's
+//! `--all-features`. It vanishes — as a silently empty test binary, since a
+//! crate-level `cfg` leaves nothing to report — only under
+//! `--no-default-features` or a feature set that drops `server`. The whole
+//! point of the file is to catch drift between two crates, and a green run
+//! that never compiled it is not evidence the contract holds: if you are
+//! testing with a narrowed feature set, check that these test names appear in
+//! the output before concluding the seam is intact.
 
 #![cfg(feature = "server")]
 

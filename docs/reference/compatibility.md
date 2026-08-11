@@ -292,6 +292,40 @@ Current API version: v1
 X-Fluree-API-Version: 1
 ```
 
+### Behavior changes
+
+Response-shape changes within v1 that a client may need to account for.
+
+#### `fluree-track-policy` is now parsed by the server
+
+Previously the server recognised `fluree-track-meta`, `fluree-track-fuel`, and
+`fluree-track-time` but not `fluree-track-policy` — a request carrying only
+that header was not treated as tracked, and the server returned the plain
+untracked body. It is now parsed like its siblings, so **a request sending only
+`fluree-track-policy` receives the tracked envelope** (`{"status", "result",
+"policy", ...}`) where it previously received a bare result array.
+
+Nobody could have depended on the *tracked* shape for this header, since it was
+never honored. The affected case is a client that sends the header and parses a
+bare array — including any `fluree` CLI older than this release talking to a
+newer server, where `--track-policy` was a silent no-op. Two ways to adapt:
+
+- Read `result` when the body is an object and the body itself when it is an
+  array. This is what the CLI does, and it works against either server.
+- Or stop sending the header if you do not want the tally.
+
+`fluree-track-meta` behavior is unchanged; it has always implied policy
+tracking. See [Tracking and Fuel](../query/tracking-and-fuel.md).
+
+#### Tracked responses carry `policy_enforcement`
+
+Tracked responses gained an optional `policy_enforcement` sibling (and an
+`x-fdb-policy-enforcement` response header; on the NDJSON streaming endpoint,
+an optional field on the terminal `end` record). It is additive and present
+only when a non-root policy context governed the request, so clients that
+ignore unknown fields are unaffected. See
+[Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
+
 ## Supported Data Formats
 
 ### JSON-LD
