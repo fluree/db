@@ -1183,10 +1183,9 @@ const NUMBIG_EXACT_SITE: &str = "distinct object COUNT (numbig exact)";
 
 /// Row cap above which the exact branch declines to the general pipeline.
 ///
-/// This is a **memory** guard, not a latency one, and the distinction is
-/// measured rather than assumed. Timing the two lanes over synthetic ledgers
-/// (NumBig rows split across two predicates, plus a non-NumBig slice half its
-/// size) found no crossover at any size tried:
+/// **This is a rollout guard, not a crossover threshold.** Timing the two lanes
+/// over synthetic ledgers (NumBig rows split across two predicates, plus a
+/// non-NumBig slice half its size) found no crossover at any size tried:
 ///
 /// | NumBig rows | exact | general | ratio |
 /// |---|---|---|---|
@@ -1199,12 +1198,18 @@ const NUMBIG_EXACT_SITE: &str = "distinct object COUNT (numbig exact)";
 /// The advantage *grows* with the slice, which is structural rather than
 /// lucky: the general pipeline scans and materializes every object in the
 /// graph, while this branch pays payload reads for the NumBig slice only and
-/// still answers the rest from directory metadata. So there is no size at
-/// which declining is faster — only sizes at which the in-memory distinct set
-/// gets too big to be a responsible thing to build, which is what the cap is
-/// for. Set generously on that basis.
+/// still answers the rest from directory metadata.
 ///
-/// Overridable so the bench can sweep both sides of it.
+/// So declining is not the cheap option above the cap — it is strictly worse
+/// on both axes. The fallback builds a distinct set over *every* object in the
+/// graph rather than over the NumBig slice, so it costs more memory than
+/// proceeding would have, as well as more time. Nothing here is being
+/// protected by the cap except the rollout itself: this is a new read path
+/// (branch seek, payload decode, arena mapping) and the cap bounds how much of
+/// a graph it can be responsible for while it soaks. It is a removal
+/// candidate after a release in production, not a number to tune.
+///
+/// Overridable so the bench and the regression suite can sweep both sides.
 fn numbig_exact_max_rows() -> u64 {
     std::env::var("FLUREE_NUMBIG_EXACT_MAX_ROWS")
         .ok()
