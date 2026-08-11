@@ -65,19 +65,32 @@ pub struct R2rmlRewriteResult {
 /// drift between them. Kind names are deduplicated preserving first occurrence:
 /// two property paths in one scope read "property path", not "property path,
 /// property path".
-pub fn unsupported_subscope_error(graph_iri: &str, kinds: &[&str]) -> crate::error::QueryError {
+/// `graph_iris` names every graph source the refusal covers. `GraphOperator`
+/// always has exactly one (it is refusing inside one scope); the API-layer
+/// check can be guarding a dataset whose default graphs are several *different*
+/// sources, and naming only one of them would misdescribe the query.
+pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate::error::QueryError {
     let mut unique: Vec<&str> = Vec::with_capacity(kinds.len());
     for &kind in kinds {
         if !unique.contains(&kind) {
             unique.push(kind);
         }
     }
+    let (subject, verb) = if graph_iris.len() == 1 {
+        ("graph source", "contains")
+    } else {
+        ("graph sources", "contain")
+    };
+    let names = graph_iris
+        .iter()
+        .map(|iri| format!("'{iri}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     crate::error::QueryError::InvalidQuery(format!(
-        "graph source '{}' contains pattern(s) that cannot be evaluated over a \
+        "{subject} {names} {verb} pattern(s) that cannot be evaluated over a \
          virtual dataset (a graph source has no native index, so these would silently \
-         return no rows): {}. Rewrite them as fixed-length triple patterns \
-         (`p`, `p/p`, …), or run them against a native ledger.",
-        graph_iri,
+         return no rows): {}. Rewrite them as fixed-length steps between nodes, or run \
+         them against a native ledger.",
         unique.join(", ")
     ))
 }
@@ -2726,8 +2739,10 @@ mod tests {
     /// order is preserved.
     #[test]
     fn unsupported_subscope_error_dedups_kinds() {
-        let err =
-            unsupported_subscope_error("gs:main", &["property path", "property path", "subquery"]);
+        let err = unsupported_subscope_error(
+            &["gs:main"],
+            &["property path", "property path", "subquery"],
+        );
         let msg = err.to_string();
         assert_eq!(
             msg.matches("property path").count(),

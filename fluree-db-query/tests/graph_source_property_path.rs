@@ -360,7 +360,7 @@ async fn outside_a_graph_scope_the_pre_execution_scan_flags_every_quantifier() {
 /// graph source and the pattern kind.
 #[test]
 fn the_refusal_is_the_shared_unsupported_subscope_error() {
-    let err = unsupported_subscope_error(GS_ID, &["property path"]);
+    let err = unsupported_subscope_error(&[GS_ID], &["property path"]);
     assert!(
         matches!(err, fluree_db_query::QueryError::InvalidQuery(_)),
         "must be the 400-mapped variant, got: {err:?}"

@@ -75,14 +75,25 @@ pub(crate) fn maybe_wrap_for_graph_source(db: &GraphDb, parsed: &mut fluree_db_q
 pub(crate) fn guard_graph_source_patterns(
     db: &GraphDb,
     parsed: &fluree_db_query::ir::Query,
+    syntax: QuerySyntax,
 ) -> Result<()> {
     let Some(gs_id) = db.graph_source_id.as_deref() else {
         return Ok(());
     };
+    guard_graph_source_patterns_for(&[gs_id], parsed, syntax)
+}
+
+/// [`guard_graph_source_patterns`] over an explicit source list, so a dataset
+/// can name every graph source it is querying rather than just the primary's.
+fn guard_graph_source_patterns_for(
+    gs_ids: &[&str],
+    parsed: &fluree_db_query::ir::Query,
+    syntax: QuerySyntax,
+) -> Result<()> {
     let unsupported = fluree_db_query::r2rml::unsupported_outside_graph_scopes(&parsed.patterns);
     if !unsupported.is_empty() {
         return Err(ApiError::Query(
-            fluree_db_query::r2rml::unsupported_subscope_error(gs_id, &unsupported),
+            fluree_db_query::r2rml::unsupported_subscope_error(gs_ids, &unsupported),
         ));
     }
     let unroutable = parsed
@@ -92,36 +103,105 @@ pub(crate) fn guard_graph_source_patterns(
         .count();
     if unroutable > 0 {
         return Err(ApiError::Query(unroutable_top_level_error(
-            gs_id, unroutable,
+            gs_ids, unroutable, syntax,
         )));
     }
     Ok(())
+}
+
+/// Which surface a query arrived on, so a refusal can name a scoping construct
+/// the user could actually have typed.
+///
+/// The three surfaces spell graph scoping differently, and one of them cannot
+/// spell it at all — see [`unroutable_top_level_error`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum QuerySyntax {
+    Sparql,
+    JsonLd,
+    Cypher,
+}
+
+impl QuerySyntax {
+    pub(crate) fn of(input: &QueryInput<'_>) -> Self {
+        match input {
+            QueryInput::Sparql(_) => Self::Sparql,
+            QueryInput::JsonLd(_) => Self::JsonLd,
+        }
+    }
 }
 
 /// The refusal for a triple pattern the wrap left stranded at the top level of a
 /// graph-source query.
 ///
 /// Unlike the property-path family this is *lowerable* — it would convert to an
-/// R2RML scan perfectly well — but only inside a `GRAPH` scope, and on this plan
+/// R2RML scan perfectly well — but only inside a graph scope, and on this plan
 /// it is not in one. "Lowerable in principle" is no comfort to a user whose
 /// pattern will not be lowered on the plan actually running, so it refuses for
 /// the same reason: it would otherwise read the graph source's empty native
-/// index and return no rows as a success. The wording names the workaround
-/// rather than the internals, because both fixes are entirely in the user's
-/// hands.
-fn unroutable_top_level_error(gs_id: &str, count: usize) -> fluree_db_query::QueryError {
+/// index and return no rows as a success.
+///
+/// The wording names the workaround rather than the internals, because both
+/// fixes are entirely in the user's hands — which means it has to be spelled in
+/// the language the user is actually writing. SPARQL scopes with
+/// `GRAPH <iri> { … }` and JSON-LD with a `"graph"` object; telling a JSON-LD
+/// user to write SPARQL is the same defect as telling them nothing.
+///
+/// The `Cypher` arm is defensive, not reachable today: Cypher lowering emits no
+/// `Pattern::Graph`, so `maybe_wrap_for_graph_source` always wraps a Cypher
+/// query whole and never leaves a top-level triple behind (pinned by
+/// `cypher_over_a_graph_source_cannot_reach_the_graph_block_advice`). If Cypher
+/// ever gains a graph-scoping construct, this must stop claiming there is none.
+///
+/// With several sources in play the "drop the explicit block" escape is omitted
+/// deliberately: dropping it would scope the whole query to one source and
+/// silently drop the rest, which is not what the user asked for.
+fn unroutable_top_level_error(
+    gs_ids: &[&str],
+    count: usize,
+    syntax: QuerySyntax,
+) -> fluree_db_query::QueryError {
+    let names = gs_ids
+        .iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let subject = if gs_ids.len() == 1 {
+        format!("graph source {names}")
+    } else {
+        format!("graph sources {names}")
+    };
+    let scope_syntax = match syntax {
+        QuerySyntax::Sparql => "a `GRAPH <source> { … }` block",
+        QuerySyntax::JsonLd => "a `{\"graph\": \"source\", \"where\": [ … ]}` block",
+        QuerySyntax::Cypher => "a graph-scoping block",
+    };
+    let advice = match (syntax, gs_ids.len()) {
+        // Cypher has no way to scope a pattern to one graph, so there is no
+        // rewrite to suggest — only a different way to address the source.
+        (QuerySyntax::Cypher, _) => {
+            "Cypher has no graph-scoping syntax, so these patterns cannot be routed from a \
+             query that also addresses another graph — query the graph source on its own."
+                .to_string()
+        }
+        (_, 1) => format!(
+            "Move them inside {scope_syntax} naming {names}, or drop the explicit block so \
+             the whole query is scoped to the graph source."
+        ),
+        (_, _) => format!(
+            "Move each pattern inside {scope_syntax} naming the source it belongs to \
+             ({names}). Dropping the explicit block is not an option here: it would scope \
+             the whole query to one source and silently exclude the others."
+        ),
+    };
     fluree_db_query::QueryError::InvalidQuery(format!(
-        "graph source '{gs_id}' cannot evaluate {count} top-level triple pattern(s) in this \
-         query. Patterns reach a graph source only inside a `GRAPH <{gs_id}>` block; Fluree \
-         adds that block automatically, but not to a query that already contains a GRAPH \
-         block of its own — so these patterns would read an empty index and silently return \
-         no rows. Move them inside a `GRAPH <{gs_id}>` block, or drop the explicit GRAPH \
-         block so the whole query is scoped to the graph source."
+        "{subject} cannot evaluate {count} top-level triple pattern(s) in this query. \
+         Patterns reach a graph source only inside {scope_syntax}; Fluree adds that block \
+         automatically, but not to a query that already scopes a block of its own — so these \
+         patterns would read an empty index and silently return no rows. {advice}"
     ))
 }
 
-/// [`guard_graph_source_patterns`] for a dataset query, applied through the
-/// primary view.
+/// [`guard_graph_source_patterns`] for a dataset query.
 ///
 /// Gated on *every* default graph being a graph source. A dataset that mixes a
 /// graph source with a native ledger (`from: ["sales:main", "warehouse-gs"]`)
@@ -129,22 +209,44 @@ fn unroutable_top_level_error(gs_id: &str, count: usize) -> fluree_db_query::Que
 /// out there has a real index to traverse and refusing it would reject a query
 /// that works. With no native member in the union there is no such index, and
 /// the single-view reasoning applies unchanged.
+///
+/// Every default graph's source id is passed to the refusal, not just the
+/// primary's. The message tells the user where to move a stranded pattern, and
+/// a message naming one id out of several would be advice to silently exclude
+/// the rest.
+///
+/// # Empty default set
+///
+/// An empty `default` returns `Ok` — the query is not refused. This is the
+/// `fromNamed`-only shape, and post-#1631 (which stopped injecting the ledger as
+/// a default graph for such bodies) it is the *correct* answer rather than a gap
+/// in the gate. SPARQL §13.2 gives a `FROM NAMED`-only query an empty default
+/// graph, so its top-level patterns are supposed to match nothing: an empty
+/// result is the specified answer, not the silent-wrong one this guard exists to
+/// catch. Refusing here would reject a conformant query. Pinned by
+/// `a_named_only_body_leaves_the_default_graph_empty` and its end-to-end
+/// companion `a_named_only_graph_source_query_is_answered_not_refused`.
 pub(crate) fn guard_dataset_graph_source_patterns(
     dataset: &DataSetDb,
     parsed: &fluree_db_query::ir::Query,
+    syntax: QuerySyntax,
 ) -> Result<()> {
-    if dataset.default.is_empty()
-        || dataset
-            .default
-            .iter()
-            .any(|view| view.graph_source_id.is_none())
-    {
+    if dataset.default.is_empty() {
         return Ok(());
     }
-    match dataset.primary() {
-        Some(primary) => guard_graph_source_patterns(primary, parsed),
-        None => Ok(()),
+    let mut gs_ids = Vec::with_capacity(dataset.default.len());
+    for view in &dataset.default {
+        match view.graph_source_id.as_deref() {
+            Some(id) => {
+                if !gs_ids.contains(&id) {
+                    gs_ids.push(id);
+                }
+            }
+            // A native member can answer top-level patterns — see above.
+            None => return Ok(()),
+        }
     }
+    guard_graph_source_patterns_for(&gs_ids, parsed, syntax)
 }
 
 // ============================================================================
@@ -251,7 +353,7 @@ impl Fluree {
         // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
         // could not put on the provider's path.
         maybe_wrap_for_graph_source(db, &mut parsed);
-        guard_graph_source_patterns(db, &parsed)?;
+        guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input))?;
 
         // 2. Build executable with optional reasoning override
         let plan_start = std::time::Instant::now();
@@ -317,7 +419,7 @@ impl Fluree {
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
         maybe_wrap_for_graph_source(db, &mut parsed);
-        guard_graph_source_patterns(db, &parsed)?;
+        guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
 
         self.execute_cypher_ir(db, vars, parsed, parse_ms).await
     }
@@ -338,7 +440,7 @@ impl Fluree {
             db.policy_enforcer().map(|e| &**e),
         )?;
         maybe_wrap_for_graph_source(db, &mut parsed);
-        guard_graph_source_patterns(db, &parsed)?;
+        guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
         self.execute_cypher_ir(db, vars, parsed, 0.0).await
     }
 
@@ -402,7 +504,7 @@ impl Fluree {
         }
 
         maybe_wrap_for_graph_source(db, &mut parsed);
-        guard_graph_source_patterns(db, &parsed)?;
+        guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
         self.execute_cypher_ir(db, vars, parsed, 0.0).await
     }
 
@@ -498,7 +600,7 @@ impl Fluree {
         // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
         // could not put on the provider's path.
         maybe_wrap_for_graph_source(db, &mut parsed);
-        guard_graph_source_patterns(db, &parsed)?;
+        guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input))?;
 
         // 2. Build executable with optional reasoning override
         let executable = self.build_executable_for_view(db, &parsed).await?;
@@ -677,7 +779,7 @@ impl Fluree {
         // Auto-wrap for graph source context, then refuse whatever the wrap
         // could not put on the provider's path.
         maybe_wrap_for_graph_source(db, &mut parsed);
-        guard_graph_source_patterns(db, &parsed).map_err(|e| {
+        guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input)).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
         })?;
 
@@ -839,7 +941,7 @@ impl Fluree {
         // Auto-wrap for graph source context, then refuse whatever the wrap
         // could not put on the provider's path.
         maybe_wrap_for_graph_source(db, &mut parsed);
-        guard_graph_source_patterns(db, &parsed).map_err(|e| {
+        guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input)).map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
         })?;
 
@@ -1934,6 +2036,270 @@ mod graph_source_guard_tests {
             msg.contains(SCAN_MARKER),
             "VALUES reads no index and must not be refused: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The refusal has to be spelled in the language the user is writing
+    // -----------------------------------------------------------------------
+
+    /// SPARQL scopes with `GRAPH <iri> { … }`, so that is what a SPARQL user is
+    /// told to write.
+    #[tokio::test]
+    async fn a_sparql_refusal_names_sparql_scoping_syntax() {
+        let msg = query_err(&format!(
+            "SELECT ?o WHERE {{ <{N1}> <{EDGE_PRED}> ?o . \
+             GRAPH <{GS_ID}> {{ ?a <{EDGE_PRED}> ?c }} }}"
+        ))
+        .await;
+        assert!(
+            msg.contains("`GRAPH <source> { … }` block") && msg.contains(GS_ID),
+            "a SPARQL user must be shown SPARQL scoping syntax: {msg}"
+        );
+        assert!(
+            !msg.contains("\"graph\""),
+            "and must not be shown the JSON-LD form: {msg}"
+        );
+    }
+
+    /// JSON-LD scopes with a `"graph"` object, not a `GRAPH` keyword. Telling a
+    /// JSON-LD user to write SPARQL is the same defect as telling them nothing —
+    /// this is the reachable half of the review's query-language finding.
+    #[tokio::test]
+    async fn a_jsonld_refusal_names_jsonld_scoping_syntax() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let db = graph_source_view();
+        let stub = StubProvider::new();
+        let q = serde_json::json!({
+            "select": ["?o"],
+            "where": [
+                {"@id": N1, EDGE_PRED: "?o"},
+                ["graph", GS_ID, {"@id": "?a", EDGE_PRED: "?c"}]
+            ]
+        });
+        let msg = fluree
+            .query_view_with_r2rml_options(&db, &q, &stub, &stub, QueryExecutionOptions::default())
+            .await
+            .expect_err("the stranded top-level pattern is refused")
+            .to_string();
+        assert!(
+            msg.contains("\"graph\": \"source\"") && msg.contains("\"where\""),
+            "a JSON-LD user must be shown the JSON-LD scoping form: {msg}"
+        );
+        assert!(
+            !msg.contains("GRAPH <source>"),
+            "and must not be shown SPARQL syntax: {msg}"
+        );
+    }
+
+    /// The review asked whether a Cypher user can be told to write `GRAPH { }`,
+    /// which is not Cypher syntax. They cannot: Cypher lowering emits no
+    /// `Pattern::Graph`, so `maybe_wrap_for_graph_source` always wraps a Cypher
+    /// query whole and never strands a top-level pattern for the guard to find.
+    /// This pins that structurally — if Cypher ever gains a graph-scoping
+    /// construct, this test fails and the Cypher wording stops being hypothetical.
+    #[tokio::test]
+    async fn cypher_over_a_graph_source_cannot_reach_the_graph_block_advice() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let db = graph_source_view().with_default_context(Some(
+            serde_json::json!({"@vocab": "http://fs3.example/vocab#"}),
+        ));
+
+        for cypher in [
+            "MATCH (a)-[:edge]->(b) RETURN b",
+            // A variable-length pattern, which lowers to Pattern::PropertyPath —
+            // the kind the other guard refuses when it sits outside a scope.
+            "MATCH (a)-[:edge*1..3]->(b) RETURN b",
+        ] {
+            let result = fluree.query_cypher(&db, cypher).await;
+            let msg = match &result {
+                Ok(_) => String::new(),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                !msg.contains("cannot evaluate") && !msg.contains("Move them inside"),
+                "Cypher must not be handed graph-block advice for `{cypher}`: {msg}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dataset shapes
+    // -----------------------------------------------------------------------
+
+    /// A hand-built IR query: one stranded top-level triple beside a scoped
+    /// block. Built directly so the dataset gates can be exercised without
+    /// standing up a resolvable multi-source dataset.
+    fn stranded_query() -> fluree_db_query::ir::Query {
+        use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
+        use fluree_db_query::ir::{GraphName, Pattern, Query, QueryOutput};
+
+        let mut vars = fluree_db_query::VarRegistry::new();
+        let o = vars.get_or_insert("?o");
+        let mut query = Query::new(fluree_graph_json_ld::ParsedContext::default());
+        query.patterns = vec![
+            Pattern::Triple(TriplePattern::new(Ref::Var(o), Ref::Var(o), Term::Var(o))),
+            Pattern::Graph {
+                name: GraphName::Iri(GS_ID.into()),
+                patterns: vec![],
+            },
+        ];
+        query.output = QueryOutput::select_all(vec![o]);
+        query
+    }
+
+    fn graph_source_view_named(gs_id: &str) -> GraphDb {
+        let mut db = graph_source_view();
+        db.graph_source_id = Some(gs_id.into());
+        db
+    }
+
+    /// With several *different* sources in the default set, the refusal must
+    /// name all of them: "move it into `GRAPH <primary>`" would be advice to
+    /// silently exclude the rest.
+    #[test]
+    fn a_multi_source_dataset_refusal_names_every_source() {
+        let dataset = crate::view::DataSetDb::new()
+            .with_default(graph_source_view_named("warehouse-a:main"))
+            .with_default(graph_source_view_named("warehouse-b:main"));
+
+        let err = super::guard_dataset_graph_source_patterns(
+            &dataset,
+            &stranded_query(),
+            super::QuerySyntax::Sparql,
+        )
+        .expect_err("all defaults are graph sources, so the stranded triple is refused");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("warehouse-a:main") && msg.contains("warehouse-b:main"),
+            "every source in the default set must be named: {msg}"
+        );
+        assert!(
+            msg.contains("graph sources"),
+            "and the subject must be plural: {msg}"
+        );
+        assert!(
+            !msg.contains("drop the explicit block"),
+            "the drop-the-block escape must be withheld — it would scope the query to one \
+             source and exclude the others: {msg}"
+        );
+    }
+
+    /// A `fromNamed`-only dataset arrives with an empty default set — the shape
+    /// #1631 settled on when it stopped injecting the ledger as a default graph.
+    /// Returning `Ok` here is correct, not a gap: SPARQL §13.2 gives such a query
+    /// an empty default graph, so its top-level patterns are *supposed* to match
+    /// nothing. That empty result is the specified answer, and refusing it would
+    /// reject a conformant query — unlike the silent-empty this guard exists to
+    /// catch, which is an unroutable pattern over a source that does hold data.
+    ///
+    /// #1631 reached the same conclusion from the other side: rather than refuse
+    /// this shape it *warns* on it ("`fromNamed` without `from` leaves the
+    /// default graph empty"). Refusing here would have overridden that warning
+    /// with a 400 on a conformant query.
+    ///
+    /// Asserted where the semantics are actually decided — the dataset spec
+    /// parsed from a real `fromNamed`-only body — rather than assuming the
+    /// dataset shape it produces.
+    #[test]
+    fn a_named_only_body_leaves_the_default_graph_empty() {
+        let body = serde_json::json!({
+            "fromNamed": [GS_ID],
+            "select": ["?o"],
+            "where": [
+                {"@id": N1, EDGE_PRED: "?o"},
+                ["graph", GS_ID, {"@id": "?a", EDGE_PRED: "?c"}]
+            ]
+        });
+        let (spec, _) = crate::dataset::DatasetSpec::from_query_json(&body)
+            .expect("a fromNamed-only body parses");
+        assert!(
+            spec.default_graphs.is_empty(),
+            "fromNamed without from leaves the default graph empty (SPARQL 1.1 §13.2)"
+        );
+        assert_eq!(
+            spec.named_graphs.len(),
+            1,
+            "the source is a named graph only"
+        );
+
+        let dataset =
+            crate::view::DataSetDb::new().with_named(GS_ID, graph_source_view_named(GS_ID));
+        assert!(dataset.default.is_empty(), "which is this dataset shape");
+
+        super::guard_dataset_graph_source_patterns(
+            &dataset,
+            &stranded_query(),
+            super::QuerySyntax::JsonLd,
+        )
+        .expect("an empty default graph makes an empty result the spec answer, not a defect");
+    }
+
+    /// The same combination driven end-to-end through the real connection-query
+    /// path against a registered graph source: body → dataset spec → dataset →
+    /// guard → execution. The `where` clause deliberately mixes a stranded
+    /// top-level pattern with a `["graph", …]` block, the shape that suppresses
+    /// the auto-wrap and reaches the guard, so an accidental refusal would
+    /// surface here as an error rather than as an empty result.
+    #[tokio::test]
+    async fn a_named_only_graph_source_query_is_answered_not_refused() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = fluree.create_ledger("gsguard-src").await.unwrap();
+        let txn = serde_json::json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "insert": [{"@id": "ex:a1", "@type": "ex:Article", "ex:title": "Graph sources"}]
+        });
+        let _ledger = fluree.insert(ledger, &txn).await.unwrap().ledger;
+
+        // A BM25 source registers in the nameservice without the iceberg
+        // feature, so the dataset resolves a real graph-source view.
+        let index_query = serde_json::json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "where": [{"@id": "?x", "@type": "ex:Article"}],
+            "select": {"?x": ["@id", "ex:title"]}
+        });
+        let gs = fluree
+            .create_full_text_index(crate::Bm25CreateConfig::new(
+                "gsguard-search",
+                "gsguard-src:main",
+                index_query,
+            ))
+            .await
+            .expect("register the BM25 graph source");
+
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "fromNamed": [gs.graph_source_id],
+            "select": ["?title"],
+            "where": [
+                {"@id": "?s", "ex:title": "?title"},
+                ["graph", gs.graph_source_id, {"@id": "?x", "ex:title": "?t"}]
+            ]
+        });
+        let result = fluree.query_connection(&body).await;
+        assert!(
+            result.is_ok(),
+            "a fromNamed-only query must be answered (empty, per §13.2), not refused: {:?}",
+            result.err()
+        );
+    }
+
+    /// The complement: a native member in the default set means top-level
+    /// patterns have a real index to read, so nothing is refused.
+    #[test]
+    fn a_dataset_with_a_native_member_is_not_refused() {
+        let mut native = graph_source_view();
+        native.graph_source_id = None;
+        let dataset = crate::view::DataSetDb::new()
+            .with_default(graph_source_view_named("warehouse-a:main"))
+            .with_default(native);
+
+        super::guard_dataset_graph_source_patterns(
+            &dataset,
+            &stranded_query(),
+            super::QuerySyntax::Sparql,
+        )
+        .expect("a native default graph can answer top-level patterns");
     }
 
     /// The guard is gated on the view being a graph source. A native ledger has
