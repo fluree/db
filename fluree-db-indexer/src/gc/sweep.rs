@@ -34,7 +34,7 @@ use crate::error::{IndexerError, Result};
 use crate::gc::collector::walk_prev_index_chain_cs;
 use fluree_db_binary_index::ChainCasIds;
 use fluree_db_core::address_path::{ledger_id_to_path_prefix, shared_prefix_for_path};
-use fluree_db_core::storage::{candidate_addresses, content_store_for};
+use fluree_db_core::storage::{candidate_addresses, content_store_for, ContentStore};
 use fluree_db_core::{ContentId, Storage};
 use std::collections::HashSet;
 
@@ -42,6 +42,12 @@ use std::collections::HashSet;
 /// round trips, so a serial pass over a large backlog is almost entirely
 /// latency.
 const RELEASE_CONCURRENCY: usize = 32;
+
+/// Concurrent branch chain walks during planning. A chain is a sequence of
+/// dependent reads — each root names the next — so it cannot be walked in
+/// parallel with itself, but separate branches are independent chains and
+/// overlapping them costs the slowest branch rather than their sum.
+const BRANCH_WALK_CONCURRENCY: usize = 8;
 
 /// A branch's published index head, as the sweep needs it.
 ///
@@ -91,8 +97,14 @@ where
     S: Storage + Clone,
 {
     let method = storage.storage_method().to_string();
-    let live = live_addresses(storage, &method, branches).await?;
-    let scanned = swept_addresses(storage, &method, ledger_name, branches).await?;
+
+    // Walking the chains and listing the prefixes touch disjoint storage and
+    // neither informs the other, so planning waits for the slower of the two
+    // rather than their sum.
+    let (live, scanned) = futures::try_join!(
+        live_addresses(storage, &method, branches),
+        swept_addresses(storage, &method, ledger_name, branches),
+    )?;
 
     let mut orphans: Vec<String> = scanned.difference(&live).cloned().collect();
     orphans.sort();
@@ -180,50 +192,87 @@ async fn live_addresses<S>(
 where
     S: Storage + Clone,
 {
-    let mut live = HashSet::new();
+    use futures::stream::{StreamExt, TryStreamExt};
 
-    for branch in branches {
-        let Some(head) = branch.index_head_id.as_ref() else {
-            continue;
-        };
-        let store = content_store_for(storage.clone(), &branch.ledger_id);
+    let walks: Vec<_> = branches
+        .iter()
+        .map(|branch| branch_live_addresses(storage, method, branch))
+        .collect();
 
-        // Accumulate the whole chain into one set rather than expanding each
-        // root on its own: consecutive roots share nearly all of their branch
-        // manifests, and `ChainCasIds` reads each one once instead of once per
-        // root. Deduping at the CID level also keeps address derivation to one
-        // pass over the distinct refs rather than one per root.
-        let mut chain_ids = ChainCasIds::new();
-        for entry in walk_prev_index_chain_cs(&store, head).await? {
-            chain_ids.add_root(&store, &entry.root).await.map_err(|e| {
-                IndexerError::StorageRead(format!(
-                    "cannot expand index root at t={} for {}: {e}; refusing to sweep",
-                    entry.t, branch.ledger_id
-                ))
-            })?;
-            chain_ids.insert(entry.root_id);
-            if let Some(garbage_id) = entry.garbage_id {
-                chain_ids.insert(garbage_id);
-            }
-        }
-        let reachable = chain_ids.into_ids();
-
-        for id in &reachable {
-            // An unrecognised codec is fatal rather than skipped: the sweep
-            // cannot locate the blob, so it cannot establish that any address
-            // is safe to delete.
-            let addresses = candidate_addresses(method, &branch.ledger_id, id);
-            if addresses.is_empty() {
-                return Err(IndexerError::StorageRead(format!(
-                    "cannot locate CID {id} (unrecognised codec {}); refusing to sweep",
-                    id.codec()
-                )));
-            }
+    futures::stream::iter(walks)
+        .buffer_unordered(BRANCH_WALK_CONCURRENCY)
+        .try_fold(HashSet::new(), |mut live, addresses| async move {
             live.extend(addresses);
+            Ok(live)
+        })
+        .await
+}
+
+/// Every address one branch's index chain reaches.
+async fn branch_live_addresses<S>(
+    storage: &S,
+    method: &str,
+    branch: &BranchIndexHead,
+) -> Result<HashSet<String>>
+where
+    S: Storage + Clone,
+{
+    let Some(head) = branch.index_head_id.as_ref() else {
+        return Ok(HashSet::new());
+    };
+    let store = content_store_for(storage.clone(), &branch.ledger_id);
+    let reachable = chain_cas_ids(&store, head, &branch.ledger_id).await?;
+
+    let mut addresses = HashSet::new();
+    for id in &reachable {
+        // An unrecognised codec is fatal rather than skipped: the sweep
+        // cannot locate the blob, so it cannot establish that any address
+        // is safe to delete.
+        let candidates = candidate_addresses(method, &branch.ledger_id, id);
+        if candidates.is_empty() {
+            return Err(IndexerError::StorageRead(format!(
+                "cannot locate CID {id} (unrecognised codec {}); refusing to sweep",
+                id.codec()
+            )));
+        }
+        addresses.extend(candidates);
+    }
+
+    Ok(addresses)
+}
+
+/// Every CAS id one branch's chain references, from its head back to the
+/// oldest root the chain still reaches.
+///
+/// Accumulates the whole chain into one set rather than expanding each root on
+/// its own: consecutive roots share nearly all of their branch manifests, and
+/// [`ChainCasIds`] reads each one once instead of once per root. Deduping at
+/// the CID level also keeps address derivation to one pass over the distinct
+/// refs rather than one per root.
+async fn chain_cas_ids<C>(
+    store: &C,
+    head: &ContentId,
+    ledger_id: &str,
+) -> Result<HashSet<ContentId>>
+where
+    C: ContentStore,
+{
+    let mut chain_ids = ChainCasIds::new();
+
+    for entry in walk_prev_index_chain_cs(store, head).await? {
+        chain_ids.add_root(store, &entry.root).await.map_err(|e| {
+            IndexerError::StorageRead(format!(
+                "cannot expand index root at t={} for {ledger_id}: {e}; refusing to sweep",
+                entry.t
+            ))
+        })?;
+        chain_ids.insert(entry.root_id);
+        if let Some(garbage_id) = entry.garbage_id {
+            chain_ids.insert(garbage_id);
         }
     }
 
-    Ok(live)
+    Ok(chain_ids.into_ids())
 }
 
 /// Every address under the swept prefixes.
