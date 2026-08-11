@@ -111,9 +111,10 @@ async fn stream_query_connection_inner(
 
     let fluree = state.fluree.clone();
 
-    // Advisory headers attached to the 200 (empty except for the one dataset
-    // shape whose answer changed under §13.2 semantics).
-    let mut warn_headers = HeaderMap::new();
+    // Advisory headers attached to the 200 — empty unless the request names
+    // only named graphs and then matches outside them (see `X_FDB_WARNING`).
+    // Both branches below set it, so there is no default to fall back on.
+    let warn_headers;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
 
@@ -148,6 +149,14 @@ async fn stream_query_connection_inner(
 
         let min_t = collect_sparql_min_t_requirements(headers.min_t, &sparql, None)?;
         await_query_min_t_requirements(state.as_ref(), min_t).await?;
+
+        // `build_stream_dataset_for_sparql` resolves the dataset internally, so
+        // nothing here would otherwise look at the clause — leaving the one
+        // surface whose caller is least likely to notice a short result set as
+        // the only silent one.
+        warn_headers = crate::routes::query::sparql_dataset_warning_headers(
+            fluree_db_sparql::parse_sparql(&sparql).ast.as_ref(),
+        );
 
         let dataset = fluree
             .build_stream_dataset_for_sparql(&sparql, &fluree_db_api::GovernanceOptions::default())
@@ -264,8 +273,8 @@ async fn stream_query_inner(
     //  - Dataset: the connection/dataset path (policy, `from`/`fromNamed`,
     //    multi-ledger), which enforces per-request policy exactly like `/query`.
     let fluree = state.fluree.clone();
-    // Advisory headers attached to the 200 (empty for everything but the one
-    // dataset shape whose answer changed under §13.2 semantics).
+    // Advisory headers attached to the 200 — empty unless the request names
+    // only named graphs and then matches outside them (see `X_FDB_WARNING`).
     let mut warn_headers = HeaderMap::new();
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;

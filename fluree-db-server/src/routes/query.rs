@@ -2431,17 +2431,29 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
 
 /// Response header carrying a non-fatal advisory about how a request was
 /// interpreted. The response body is the normal (successful) result.
+///
+/// **This is a permanent advisory, not a migration aid, and has no sunset.**
+/// It describes a query *shape* whose §13.2 semantics reliably surprise people
+/// — naming only named graphs and then writing patterns outside them — which
+/// stays just as surprising once the 4.1.4 change is old news. The name is
+/// `warning` rather than `deprecation` for that reason: nothing here is going
+/// away, and a caller who writes that shape in 4.3 deserves the same nudge as
+/// one who wrote it during the upgrade. Clients must treat an unrecognized
+/// `x-fdb-warning` as informational and never as an error signal; the status is
+/// always the status the request earned on its own.
 pub(crate) const X_FDB_WARNING: &str = "x-fdb-warning";
 
-/// Headers to attach to a ledger-scoped SPARQL dataset response — empty unless
-/// the query is the one shape whose answer changed when this endpoint adopted
-/// §13.2 empty-default-graph semantics.
+/// Advisory headers for a SPARQL dataset response — empty unless the query
+/// names only named graphs while also matching against the default graph.
 ///
-/// `FROM NAMED <g>` with no `FROM` leaves the default graph empty, so patterns
-/// written outside `GRAPH { }` now match nothing. Before 4.1.4 this endpoint
-/// substituted the ledger's default graph for them. Such a query is almost
-/// always a mistake, but it fails by returning fewer (often zero) rows with a
-/// 200, so say so on the wire rather than leave the caller to guess.
+/// `FROM NAMED <g>` with no `FROM` leaves the default graph empty (§13.2), so
+/// patterns written outside `GRAPH { }` match nothing. That is correct and
+/// permanent behavior, not a transitional state: the advisory fires wherever
+/// the shape appears, including the connection-scoped route where §13.2 was
+/// already in force before 4.1.4 and nothing changed. What makes it worth
+/// saying on the wire is not that the answer *changed* but that this shape
+/// fails by returning fewer (often zero) rows under a 200, which is exactly
+/// the failure a caller is least likely to notice unaided.
 pub(crate) fn dataset_semantics_warning_headers(
     dc: &fluree_db_sparql::ast::DatasetClause,
     ast: Option<&fluree_db_sparql::SparqlAst>,
@@ -2460,8 +2472,8 @@ pub(crate) fn dataset_semantics_warning_headers(
         axum::http::HeaderName::from_static(X_FDB_WARNING),
         axum::http::HeaderValue::from_static(
             "FROM NAMED without FROM leaves the default graph empty (SPARQL 1.1 13.2); \
-             patterns outside GRAPH { } match nothing. Add a FROM clause to query the \
-             ledger's default graph.",
+             patterns outside GRAPH { } match nothing. Add a FROM clause to name a \
+             default graph.",
         ),
     );
     headers
@@ -2504,7 +2516,8 @@ pub(crate) fn needs_default_graph_injection(query: &JsonValue) -> bool {
 
 /// The JSON-LD counterpart of [`dataset_semantics_warning_headers`]: warn when
 /// a `fromNamed`-only body also carries patterns outside `["graph", ...]`,
-/// which the empty default graph now matches with nothing.
+/// which the empty default graph matches with nothing. Permanent advisory on
+/// the same terms — see [`X_FDB_WARNING`].
 pub(crate) fn jsonld_dataset_semantics_warning_headers(query: &JsonValue) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if query.get("from").is_some() {
@@ -2523,8 +2536,8 @@ pub(crate) fn jsonld_dataset_semantics_warning_headers(query: &JsonValue) -> Hea
         axum::http::HeaderName::from_static(X_FDB_WARNING),
         axum::http::HeaderValue::from_static(
             "fromNamed without from leaves the default graph empty (SPARQL 1.1 13.2); \
-             patterns outside [\"graph\", ...] match nothing. Add a \"from\" to query the \
-             ledger's default graph.",
+             patterns outside [\"graph\", ...] match nothing. Add a \"from\" to name a \
+             default graph.",
         ),
     );
     headers

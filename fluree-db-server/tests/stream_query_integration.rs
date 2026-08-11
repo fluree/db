@@ -970,3 +970,76 @@ async fn jsonld_from_named_dataset_semantics_stream() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 1);
 }
+
+/// PR #1631 review (stream_query.rs:115): the connection-scoped SPARQL
+/// streaming surface computed no advisory, so `FROM NAMED` with no `FROM`
+/// warned on `/v1/fluree/query` and on the ledger-scoped streaming route but
+/// was silent here — the surface where a caller is least likely to notice that
+/// a 200 carried fewer rows than they expected. All four SPARQL surfaces warn.
+#[tokio::test]
+async fn connection_sparql_from_named_only_warns_on_stream() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:cwarn").await;
+
+    let trig = "@prefix ex: <http://ex.org/> .\n\
+                ex:d1 ex:name \"D\" .\n\
+                <http://ex.org/g1> {\n\
+                  ex:s1 ex:name \"A\" .\n\
+                }\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/upsert/strm:cwarn")
+                .header("content-type", "application/trig")
+                .body(Body::from(trig))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trig upsert");
+
+    // FROM NAMED with no FROM, matching outside GRAPH: empty default graph.
+    let resp = stream_sparql_connection(
+        &app,
+        "PREFIX ex: <http://ex.org/>\n\
+         SELECT ?n FROM NAMED <strm:cwarn> WHERE { ?s ex:name ?n }",
+        None,
+    )
+    .await;
+    let warning = resp
+        .headers()
+        .get("x-fdb-warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("connection-scoped SPARQL streaming must warn too");
+    assert!(warning.contains("FROM NAMED"), "{warning}");
+    // Route-neutral phrasing: on this route a clause IRI names a ledger, so the
+    // advisory must not tell the caller about "the ledger's" default graph.
+    assert!(
+        !warning.contains("ledger's default graph"),
+        "advisory must read correctly on the connection route: {warning}"
+    );
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 0);
+
+    // Everything inside GRAPH: correct, and nothing to advise about. On this
+    // route a clause IRI names a LEDGER, which resolves to that ledger's
+    // default graph — so `?g` binds the one declared name and yields the "D"
+    // triple, not g1's contents. (Selecting a graph *within* a ledger is the
+    // ledger-scoped route's job.)
+    let resp = stream_sparql_connection(
+        &app,
+        "PREFIX ex: <http://ex.org/>\n\
+         SELECT ?n FROM NAMED <strm:cwarn> WHERE { GRAPH ?g { ?s ex:name ?n } }",
+        None,
+    )
+    .await;
+    assert!(resp.headers().get("x-fdb-warning").is_none());
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 1);
+}
