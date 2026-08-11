@@ -15,6 +15,11 @@ Reference for frequently encountered errors:
 - Storage issues
 - Indexing problems
 
+### [Missing results at a historical `t`](historical-results-missing.md)
+
+Historical reads that return empty for retracted properties or deleted
+entities, and the reindex that repairs them.
+
 ### [Debugging Queries](debugging-queries.md)
 
 Tools and techniques for query debugging:
@@ -307,6 +312,7 @@ Retain logs for historical analysis:
 ## Related Documentation
 
 - [Common Errors](common-errors.md) - Error reference
+- [Missing results at a historical `t`](historical-results-missing.md) - Historical reads after an old index build
 - [Debugging Queries](debugging-queries.md) - Query debugging
 - [API Errors](../api/errors.md) - HTTP error codes
 - [Operations](../operations/README.md) - Operational guides
