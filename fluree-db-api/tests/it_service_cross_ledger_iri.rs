@@ -149,9 +149,7 @@ async fn service_cross_ledger_iris_keep_their_own_prefix() {
     let ordered = fluree
         .query_dataset(
             &dataset,
-            &format!(
-                "SELECT ?s WHERE {{ SERVICE <{svc}> {{ ?s <{BETA}rank> ?r }} }} ORDER BY ?r"
-            ),
+            &format!("SELECT ?s WHERE {{ SERVICE <{svc}> {{ ?s <{BETA}rank> ?r }} }} ORDER BY ?r"),
         )
         .await
         .expect("ORDER BY over a SERVICE-bound IRI")
