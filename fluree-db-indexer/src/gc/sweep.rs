@@ -31,7 +31,7 @@
 //! of over-counting is only that reclamation waits for the next run.
 
 use crate::error::{IndexerError, Result};
-use crate::gc::collector::walk_prev_index_chain_cs_cached;
+use crate::gc::collector::PrevIndexChainWalk;
 use fluree_db_binary_index::ChainCasIds;
 use fluree_db_core::address_path::{ledger_id_to_path_prefix, shared_prefix_for_path};
 use fluree_db_core::storage::{candidate_addresses, content_store_for, ContentStore};
@@ -274,8 +274,11 @@ where
     C: ContentStore,
 {
     let mut chain_ids = ChainCasIds::new();
+    let mut walk = PrevIndexChainWalk::new(store, head, artifact_cache_dir);
 
-    for entry in walk_prev_index_chain_cs_cached(store, head, artifact_cache_dir).await? {
+    // One root at a time: only the CIDs outlive each step, so a long chain
+    // costs its distinct refs rather than every decoded root at once.
+    while let Some(entry) = walk.next_entry().await? {
         chain_ids.add_root(store, &entry.root).await.map_err(|e| {
             IndexerError::StorageRead(format!(
                 "cannot expand index root at t={} for {ledger_id}: {e}; refusing to sweep",
