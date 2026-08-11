@@ -348,7 +348,9 @@ pub use fluree_db_policy::{
 };
 
 // Re-export tracking types for query/transaction metrics
-pub use fluree_db_core::{FuelExceededError, PolicyStats, Tracker, TrackingOptions, TrackingTally};
+pub use fluree_db_core::{
+    FuelExceededError, PolicyEnforcement, PolicyStats, Tracker, TrackingOptions, TrackingTally,
+};
 
 /// Bundles the two R2RML provider references that always travel together.
 ///

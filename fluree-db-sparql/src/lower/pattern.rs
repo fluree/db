@@ -288,10 +288,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             src.get(span.start..span.end).map(std::sync::Arc::from)
         });
 
+        // The body slice stops at the SERVICE block's braces, so the PREFIX /
+        // BASE declarations its prefixed names and relative IRIs resolve under
+        // are NOT in it. Capture them alongside, or the remote sees a different
+        // query than the one the user wrote.
         let service = match source_body {
-            Some(body) => {
-                ServicePattern::with_source_body(silent, ir_endpoint, inner_patterns, body)
-            }
+            Some(body) => ServicePattern::with_source_body(
+                silent,
+                ir_endpoint,
+                inner_patterns,
+                body,
+                std::sync::Arc::from(self.render_prologue_sparql()),
+            ),
             None => ServicePattern::new(silent, ir_endpoint, inner_patterns),
         };
 

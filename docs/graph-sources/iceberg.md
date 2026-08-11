@@ -884,6 +884,18 @@ A failed gate drops the twin so nothing unverified stays announced. See the [`fl
    merge-on-read semantics (e.g. Athena `DELETE`, Flink/CDC upserts, Snowflake v3
    deletion vectors, or Snowflake v2 once `ENABLE_ICEBERG_MERGE_ON_READ` is on).
    See the switch below to override.
+5. **No transitive traversal (fail-closed):** Property-path quantifiers (`p+`,
+   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
+   `shortestPath`, and subqueries need a native index to walk and cannot be
+   evaluated over an Iceberg source. A query using one is **refused** with HTTP
+   400 `err:db/InvalidQuery` naming the pattern, rather than returning the empty
+   result it would otherwise produce as a success. Fixed-length patterns (`p`,
+   `p/p`, …) and unquantified `a|b` / `^p` scan the tables normally. Bound the
+   traversal to a known depth (see [Graph Sources Overview → Query Patterns a
+   Graph Source Cannot
+   Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate)) or
+   [materialize a native twin](#materializing-a-native-twin), which evaluates
+   all of them.
 
 ### Environment switches
 

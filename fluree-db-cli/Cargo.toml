@@ -127,6 +127,13 @@ parking_lot = "0.12"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# Drive the server's router in-process (behind the `server` feature) so the
+# tracking headers this CLI emits are tested against the parser that consumes
+# them, rather than each side being asserted in isolation.
+axum = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 # Used by `create --from` integration tests to produce .gz / .zst fixtures inline.
 flate2 = { workspace = true }
 zstd = { workspace = true }

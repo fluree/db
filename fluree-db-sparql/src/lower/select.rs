@@ -86,32 +86,36 @@ pub(super) struct LoweredModifiers {
 }
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
+    /// The registered variables a user can see, in registration order.
+    ///
+    /// This is what `*` denotes — both in `SELECT *` and in
+    /// `COUNT(DISTINCT *)`, which counts distinct solution *mappings* and so
+    /// must range over the same variables. Three categories are hidden:
+    /// - `?__*` — planner / aggregate / property-path synthetics.
+    /// - `?#*`  — annotation-reifier synthetics
+    ///   (see `annotation::INTERNAL_VAR_PREFIX`).
+    /// - `_:*`  — SPARQL blank-node variables. Per SPARQL §4.1.4 these are
+    ///   non-distinguished and not in SELECT scope, so they don't appear in
+    ///   `SELECT *` results. Hiding them here also covers blank-node-labelled
+    ///   reifiers (`~ _:ann`, `_:ann rdf:reifies …`).
+    ///
+    /// The registry spans the whole query, so this can name variables from
+    /// sibling or nested scopes; consumers intersect it with the scope they
+    /// actually operate on.
+    pub(super) fn user_visible_vars(&self) -> Vec<VarId> {
+        self.vars
+            .iter()
+            .filter(|(name, _)| {
+                !name.starts_with("?__") && !name.starts_with("?#") && !name.starts_with("_:")
+            })
+            .map(|(_, id)| id)
+            .collect()
+    }
+
     /// Lower SELECT clause to a list of VarIds.
     pub(super) fn lower_select_clause(&mut self, clause: &SelectClause) -> Result<Vec<VarId>> {
         match &clause.variables {
-            SelectVariables::Star => {
-                // SELECT * — return user-visible registered variables.
-                //
-                // Hide three categories:
-                // - `?__*` — planner / aggregate / property-path synthetics.
-                // - `?#*`  — annotation-reifier synthetics
-                //   (see `annotation::INTERNAL_VAR_PREFIX`).
-                // - `_:*`  — SPARQL blank-node variables. Per SPARQL §4.1.4
-                //   these are non-distinguished and not in SELECT scope, so
-                //   they don't appear in `SELECT *` results. Hiding them
-                //   here also covers blank-node-labelled reifiers
-                //   (`~ _:ann`, `_:ann rdf:reifies …`).
-                Ok(self
-                    .vars
-                    .iter()
-                    .filter(|(name, _)| {
-                        !name.starts_with("?__")
-                            && !name.starts_with("?#")
-                            && !name.starts_with("_:")
-                    })
-                    .map(|(_, id)| id)
-                    .collect())
-            }
+            SelectVariables::Star => Ok(self.user_visible_vars()),
             SelectVariables::Explicit(vars) => {
                 let mut result = Vec::with_capacity(vars.len());
                 for var in vars {

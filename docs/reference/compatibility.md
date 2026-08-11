@@ -87,6 +87,12 @@ Supported SPARQL features:
 
 **Expression error semantics:** A *dynamic value* error in a `SELECT`/`BIND`/`ORDER BY` expression (e.g. arithmetic on incompatible operand types) leaves that variable unbound for the solution and the query still returns the remaining rows (SPARQL 1.1 §18.5 `Extend`); the same error in a `FILTER` eliminates the solution (§17.2). *Structural* errors — a built-in called with the wrong arity, an unknown datatype IRI — describe a malformed query and are reported as a query error. (Transactions evaluate their `WHERE` clause in strict mode, so a computed value error fails the transaction rather than silently writing an unbound value.)
 
+**Dataset clauses (§13.2):** A `FROM` / `FROM NAMED` clause defines the query's dataset exhaustively — the default graph is the union of the `FROM` clauses, and `GRAPH ?g` ranges over exactly the `FROM NAMED` graphs. `FROM NAMED` with no `FROM` therefore gives an **empty default graph**. **Changed in 4.1.4:** the HTTP endpoints now implement this; earlier releases substituted a ledger's default graph, and separately enumerated the ledger alias as an extra named graph, which duplicated every `GRAPH ?g` solution. The embedded Rust API was already conformant, so this removes a divergence between surfaces rather than introducing one. The change covers all four HTTP query surfaces — ledger-scoped and connection-scoped `/query`, plus both streaming routes — and the JSON-LD `fromNamed` form follows the identical semantics, so byte-equivalent SPARQL and JSON-LD queries return the same result. A query with no dataset clause keeps its existing behavior. Requests that name only named graphs while also carrying patterns outside `GRAPH { ... }` / `["graph", ...]` receive an `x-fdb-warning` response header. See [Datasets and named graphs](../concepts/datasets-and-named-graphs.md#http-endpoints-and-default-graph-behavior).
+
+**`x-fdb-warning` is a permanent advisory, not a migration aid.** It has no sunset and no opt-out. It describes a query *shape* whose §13.2 semantics are perennially surprising — naming only named graphs and then matching outside them — so it fires on every query surface wherever that shape appears, including the connection-scoped route where §13.2 was already in force before 4.1.4 and no behavior changed. It is named `warning` rather than `deprecation` deliberately: nothing it points at is going away. The response body and status are unaffected — the status is always the one the request earned on its own — so clients should treat the header as informational and must not key error handling on its presence.
+
+**Graph selectors in dataset source objects (4.1.4):** A source object may narrow a source from a whole ledger to one named graph inside it. The selector is now accepted as either `graph` or `@graph` in **both** object forms — `fromNamed` entries and `from` / `to` source objects. Earlier releases read only `@graph` in `fromNamed` and only `graph` in `from`, and silently ignored the other spelling, so a source written with the wrong key resolved to the entire ledger and returned a wider result set with a `200` rather than an error. Queries that were relying on that silent widening will now see only the graph they named.
+
 **W3C Compliance Testing:** Fluree runs the official W3C SPARQL test suite via the `testsuite-sparql` crate. The suite automatically discovers and runs 700+ test cases from W3C manifest files. See the [compliance test guide](../contributing/sparql-compliance.md) for details.
 
 **Specification:** https://www.w3.org/TR/sparql11-query/
@@ -285,6 +291,40 @@ Current API version: v1
 ```http
 X-Fluree-API-Version: 1
 ```
+
+### Behavior changes
+
+Response-shape changes within v1 that a client may need to account for.
+
+#### `fluree-track-policy` is now parsed by the server
+
+Previously the server recognised `fluree-track-meta`, `fluree-track-fuel`, and
+`fluree-track-time` but not `fluree-track-policy` — a request carrying only
+that header was not treated as tracked, and the server returned the plain
+untracked body. It is now parsed like its siblings, so **a request sending only
+`fluree-track-policy` receives the tracked envelope** (`{"status", "result",
+"policy", ...}`) where it previously received a bare result array.
+
+Nobody could have depended on the *tracked* shape for this header, since it was
+never honored. The affected case is a client that sends the header and parses a
+bare array — including any `fluree` CLI older than this release talking to a
+newer server, where `--track-policy` was a silent no-op. Two ways to adapt:
+
+- Read `result` when the body is an object and the body itself when it is an
+  array. This is what the CLI does, and it works against either server.
+- Or stop sending the header if you do not want the tally.
+
+`fluree-track-meta` behavior is unchanged; it has always implied policy
+tracking. See [Tracking and Fuel](../query/tracking-and-fuel.md).
+
+#### Tracked responses carry `policy_enforcement`
+
+Tracked responses gained an optional `policy_enforcement` sibling (and an
+`x-fdb-policy-enforcement` response header; on the NDJSON streaming endpoint,
+an optional field on the terminal `end` record). It is additive and present
+only when a non-root policy context governed the request, so clients that
+ignore unknown fields are unaffected. See
+[Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
 
 ## Supported Data Formats
 

@@ -631,7 +631,7 @@ async fn cross_ledger_identity_with_config_policy_class_enforced_on_writes() {
     // config to always win set f:overrideControl accordingly.
     let opts = GovernanceOptions {
         identity: Some("http://example.org/ns/aliceIdentity".into()),
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let ctx = build_transact_policy_context(

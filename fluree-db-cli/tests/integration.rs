@@ -262,6 +262,58 @@ fn query_and_insert_accept_ledger_flag() {
         .stdout(predicate::str::contains("Carol"));
 }
 
+/// #1466 end to end: `--format json` on a SPARQL query prints the abbreviated
+/// IRI the query's own PREFIX declares. The W3C result writers emit absolute
+/// IRIs (#45); the CLI is a display surface and deliberately does not, so this
+/// pins the deviation against the real rendered bytes rather than the config.
+#[test]
+fn query_sparql_json_output_keeps_compact_iris() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "curiedb");
+
+    let assertion = fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "curiedb",
+            "--sparql",
+            "--format",
+            "json",
+            "-e",
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"Alice\" }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ex:alice"));
+    let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains("http://example.org/alice"),
+        "CLI json output should stay compacted, got: {stdout}"
+    );
+}
+
+/// Same contract for the delimited display formats.
+#[test]
+fn query_csv_output_keeps_compact_iris() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "curiecsv");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "curiecsv",
+            "--sparql",
+            "--format",
+            "csv",
+            "-e",
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"Alice\" }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ex:alice"));
+}
+
 #[test]
 fn query_ledger_flag_rejects_extra_positional() {
     let tmp = TempDir::new().unwrap();

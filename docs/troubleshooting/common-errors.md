@@ -289,12 +289,17 @@ WHERE {
 }
 ```
 
-**Test with policy trace:**
+**Check whether policy filtered the request:**
 ```bash
-curl -X POST http://localhost:8090/v1/fluree/query \
-  -H "X-Fluree-Policy-Trace: true" \
+curl -X POST http://localhost:8090/v1/fluree/query/mydb \
+  -H "fluree-track-policy: true" \
+  -H "Authorization: Bearer <token>" \
   -d '{...}'
 ```
+
+The response reports which policies ran (`policy`) and whether policy governed
+the request at all (`policy_enforcement`). See
+[Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
 
 **Check DID:**
 - Verify DID in signed request

@@ -94,7 +94,7 @@ async fn modify_policy_allows_own_property() {
             "?$identity".to_string(),
             json!({"@id": "http://example.org/ns/johnIdentity"}),
         )])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
 
@@ -215,7 +215,7 @@ async fn modify_policy_denies_other_property() {
             "?$identity".to_string(),
             json!({"@id": "http://example.org/ns/aliceIdentity"}),
         )])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
 
@@ -313,7 +313,7 @@ async fn view_only_policy_blocks_modify() {
     // Build policy context (no modify policies)
     let qc_opts = GovernanceOptions {
         policy: Some(policy),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
 
@@ -413,7 +413,7 @@ async fn modify_query_always_false_denies() {
     // Build policy context
     let qc_opts = GovernanceOptions {
         policy: Some(policy),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
 
@@ -533,7 +533,7 @@ async fn where_read_respects_view_policy() {
     }]);
     let qc_opts = GovernanceOptions {
         policy: Some(policy),
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
 
@@ -641,7 +641,7 @@ async fn turtle_insert_enforces_modify_policy() {
     }]);
     let qc_opts = GovernanceOptions {
         policy: Some(policy),
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let policy_ctx = policy_builder::build_policy_context_from_opts(
@@ -759,7 +759,7 @@ async fn identity_with_policy_class_selects_class_policies() {
     let qc_opts = GovernanceOptions {
         identity: Some("admin@fluree.local".to_string()),
         policy_class: Some(vec!["http://example.org/ns/LeadAppAccess".to_string()]),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let policy_ctx = policy_builder::build_policy_context_from_opts(
@@ -797,7 +797,7 @@ async fn identity_with_policy_class_selects_class_policies() {
     // identity-mode.
     let identity_only = GovernanceOptions {
         identity: Some("admin@fluree.local".to_string()),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let ledger = ledger_for_identity_only;
@@ -836,7 +836,7 @@ async fn identity_with_policy_class_selects_class_policies() {
     let qc_opts = GovernanceOptions {
         identity: Some("admin@fluree.local".to_string()),
         policy_class: Some(vec!["http://example.org/ns/LeadAppAccess".to_string()]),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let policy_ctx = policy_builder::build_policy_context_from_opts(
@@ -892,7 +892,7 @@ async fn onclass_modify_allows_never_used_property() {
             "f:action": "f:modify",
             "f:allow": true
         }])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let policy_ctx = policy_builder::build_policy_context_from_opts(
@@ -959,7 +959,7 @@ async fn onclass_modify_denies_exclusive_property_on_non_instance() {
             "f:action": "f:modify",
             "f:allow": true
         }])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let policy_ctx = policy_builder::build_policy_context_from_opts(

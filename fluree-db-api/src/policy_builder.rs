@@ -476,11 +476,16 @@ async fn build_policy_context_from_opts_inner(
     // when an application layer in front of the DB handles authorization and Fluree
     // just records the signed transaction for provenance. Callers who want fail-closed
     // behavior set `default_allow: false`.
+    //
+    // This is the resolution boundary for the tri-state opt: `opts` has already
+    // been through `merge_policy_opts` (so a `None` here means neither the
+    // request nor the ledger config named a default), and everything downstream
+    // of the wrapper sees a concrete bool.
     let wrapper = PolicyWrapper::new(
         view_set,
         modify_set,
         is_root,
-        opts.default_allow,
+        opts.effective_default_allow(),
         policy_values,
     );
 

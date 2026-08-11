@@ -122,6 +122,13 @@ struct ExistsSemijoinKey {
 /// Cached subject sets for simple correlated EXISTS patterns.
 ///
 /// The cache maps (subject_var, p_id) -> set of matching subject IDs (s_id).
+///
+/// The key deliberately omits the object position: a cache entry answers
+/// "does this subject have *any* object for this predicate". That is only the
+/// truth value of the EXISTS when the inner object is a genuinely free
+/// variable, so every producer and consumer of an entry must first establish
+/// that the object variable carries no binding — see the object-position gates
+/// in [`build_exists_semijoin_cache`] and [`try_eval_simple_exists_semijoin`].
 #[derive(Default)]
 struct ExistsSemijoinCache {
     subjects_by_key: FxHashMap<ExistsSemijoinKey, FxHashSet<u64>>,
@@ -131,7 +138,19 @@ fn allow_exists_semijoin_fast_path(ctx: &ExecutionContext<'_>) -> bool {
     fast_path_store(ctx).is_some()
 }
 
-fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref)>) {
+/// `fast-path outcome` site name for the EXISTS semijoin cache. This path has
+/// no `FastPathOperator` to stamp for it, so the cache build stamps its own
+/// verdict once per FILTER `open()`.
+const EXISTS_SEMIJOIN_SITE: &str = "exists_semijoin";
+
+/// Collect `(subject_var, predicate, object_var)` for every hoistable
+/// `EXISTS { ?s <p> ?o }` in `expr`.
+///
+/// The object variable is carried out so the caller can reject the pattern
+/// when that variable is correlated; `Term::is_bound()` below is a plan-time
+/// syntactic test ("is not a variable") and says nothing about whether the
+/// variable is bound at runtime.
+fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref, VarId)>) {
     match expr {
         Expression::Exists {
             patterns,
@@ -151,13 +170,13 @@ fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref)>) {
             if !tp.p_bound() {
                 return;
             }
-            if tp.o.is_bound() {
+            let Some(ov) = tp.o.as_var() else {
                 return;
-            }
+            };
             if tp.dtc.is_some() {
                 return;
             }
-            out.push((*sv, tp.p.clone()));
+            out.push((*sv, tp.p.clone(), ov));
         }
         Expression::Call { func: _, args } => {
             for a in args {
@@ -194,7 +213,7 @@ fn build_exists_semijoin_cache(
         return Ok(None);
     };
 
-    let mut exists_nodes: Vec<(VarId, Ref)> = Vec::new();
+    let mut exists_nodes: Vec<(VarId, Ref, VarId)> = Vec::new();
     collect_simple_exists_keys(expr, &mut exists_nodes);
     if exists_nodes.is_empty() {
         return Ok(None);
@@ -204,8 +223,23 @@ fn build_exists_semijoin_cache(
     let schema_vars: HashSet<VarId> = schema.iter().copied().collect();
 
     let mut cache = ExistsSemijoinCache::default();
-    for (sv, pred_ref) in exists_nodes {
+    for (sv, pred_ref, ov) in exists_nodes {
         if !schema_vars.contains(&sv) {
+            continue;
+        }
+        // An object var an outer pattern can bind makes this EXISTS ask about
+        // one specific object, which the subject-set key cannot express.
+        //
+        // This is deliberately more conservative than the per-row guard in
+        // `try_eval_simple_exists_semijoin`, which declines only rows where the
+        // var is actually bound: a var in the schema may still be unbound in a
+        // given row (an unmatched OPTIONAL), and those rows would take the
+        // semijoin. Cache-build time has no per-row bindings to consult, so the
+        // choice is between skipping the entry and speculatively paying a PSOT
+        // scan for rows that may all decline. Skipping is the better trade, and
+        // it costs only performance — the per-row guard is what keeps the
+        // answer right.
+        if schema_vars.contains(&ov) {
             continue;
         }
         let Some(pred_sid) = try_normalize_pred_sid(store, &pred_ref) else {
@@ -230,8 +264,18 @@ fn build_exists_semijoin_cache(
     }
 
     if cache.subjects_by_key.is_empty() {
+        crate::fast_path_outcome::stamp_fast_path(
+            EXISTS_SEMIJOIN_SITE,
+            crate::fast_path_outcome::FastPathOutcome::Fallback(
+                crate::fast_path_outcome::FastPathFallback::GateDeclined,
+            ),
+        );
         Ok(None)
     } else {
+        crate::fast_path_outcome::stamp_fast_path(
+            EXISTS_SEMIJOIN_SITE,
+            crate::fast_path_outcome::FastPathOutcome::Proceed,
+        );
         Ok(Some(cache))
     }
 }
@@ -423,7 +467,24 @@ fn try_eval_simple_exists_semijoin(
     if !tp.p_bound() {
         return Ok(None);
     }
-    if tp.o.is_bound() {
+    // `Term::is_bound()` is `!is_var()` — a plan-time syntactic test. It rejects
+    // a constant object but says nothing about a variable the current row has
+    // already bound, and the cache key carries no object at all, so a
+    // correlated object would silently be answered as "any object".
+    //
+    // Testing the row rather than the schema is not merely permissive, it is
+    // the correct reading: EXISTS substitutes only the bindings the row
+    // actually carries, so a variable left unbound by an unmatched OPTIONAL is
+    // a fresh free variable inside the subpattern. For those rows "does this
+    // subject have any object for this predicate" is exactly the question being
+    // asked, and the semijoin answers it.
+    let Some(object_var) = tp.o.as_var() else {
+        return Ok(None);
+    };
+    if batch
+        .get(row_idx, object_var)
+        .is_some_and(Binding::is_matchable)
+    {
         return Ok(None);
     }
     let Some(pred_sid) = try_normalize_pred_sid(store, &tp.p) else {
@@ -849,6 +910,40 @@ mod tests {
         ))];
         let schema = &[VarId(0), VarId(1)];
         assert!(is_uncorrelated_exists(&patterns, schema));
+    }
+
+    /// The semijoin key carries no object, so the object var has to travel out
+    /// of the collector for the caller to test it against the batch schema.
+    #[test]
+    fn simple_exists_key_carries_object_var() {
+        let expr = Expression::Exists {
+            patterns: vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "member")),
+                Term::Var(VarId(7)),
+            ))],
+            negated: true,
+        };
+        let mut out = Vec::new();
+        collect_simple_exists_keys(&expr, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, VarId(0));
+        assert_eq!(out[0].2, VarId(7));
+    }
+
+    #[test]
+    fn simple_exists_key_declines_constant_object() {
+        let expr = Expression::Exists {
+            patterns: vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "member")),
+                Term::Value(FlakeValue::Long(1)),
+            ))],
+            negated: true,
+        };
+        let mut out = Vec::new();
+        collect_simple_exists_keys(&expr, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]

@@ -88,6 +88,7 @@
 
 - [Design](design/README.md)
   - [Performance architecture](design/performance.md)
+  - [Row-returning multi-fact virtual joins (late-materialization corridor)](design/virtual-multifact-row-corridor.md)
   - [Query execution and overlay merge](design/query-execution.md)
   - [Auth contract (CLI ↔ Server)](design/auth-contract.md)
   - [Nameservice schema v2](design/nameservice-schema-v2.md)
@@ -225,6 +226,7 @@
 
 - [Troubleshooting](troubleshooting/README.md)
   - [Common errors](troubleshooting/common-errors.md)
+  - [Missing results at a historical `t`](troubleshooting/historical-results-missing.md)
   - [Debugging queries](troubleshooting/debugging-queries.md)
   - [Performance investigation with distributed tracing](troubleshooting/performance-tracing.md)
 

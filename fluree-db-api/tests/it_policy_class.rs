@@ -91,7 +91,7 @@ async fn policy_class_restricts_ssn_to_own_user() {
             "?$identity".to_string(),
             json!({"@id": "http://example.org/ns/aliceIdentity"}),
         )])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
 
@@ -198,7 +198,7 @@ async fn policy_class_allows_non_restricted_properties() {
             "?$identity".to_string(),
             json!({"@id": "http://example.org/ns/aliceIdentity"}),
         )])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
 
@@ -297,7 +297,7 @@ async fn policy_class_blocks_other_user_ssn_in_where() {
             "?$identity".to_string(),
             json!({"@id": "http://example.org/ns/aliceIdentity"}),
         )])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
 
@@ -400,7 +400,7 @@ async fn policy_class_positional_identity_unbound_fails_closed() {
     // Anonymous request: class selected, no identity provided.
     let anon_opts = GovernanceOptions {
         policy_class: Some(vec!["http://example.org/ns/EmployeePolicy".to_string()]),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let policy_ctx = policy_builder::build_policy_context_from_opts(

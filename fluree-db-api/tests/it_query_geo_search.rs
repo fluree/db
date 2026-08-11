@@ -948,7 +948,7 @@ async fn geo_search_enforces_view_policy_on_location_flake() {
             }]);
             let opts = GovernanceOptions {
                 policy: Some(policy),
-                default_allow: false,
+                default_allow: Some(false),
                 ..Default::default()
             };
             let policy_ctx = policy_builder::build_policy_context_from_opts(

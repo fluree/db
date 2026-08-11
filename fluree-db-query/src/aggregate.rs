@@ -29,7 +29,7 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
 use num_bigint::BigInt;
 use num_traits::{Signed, Zero};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
@@ -56,6 +56,9 @@ pub struct AggregateOperator {
     group_size_col: Option<usize>,
     /// Number of columns from child schema (before extra additions)
     child_col_count: usize,
+    /// Child columns each `COUNT(DISTINCT *)` composes its solution from,
+    /// parallel to `aggregates`; `None` for every other aggregate.
+    row_distinct_cols: Vec<Option<Vec<usize>>>,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
     /// Graph view for materializing encoded bindings before value-folding
@@ -128,6 +131,19 @@ impl AggregateOperator {
 
         let schema: Arc<[VarId]> = Arc::from(output_vars.into_boxed_slice());
 
+        // Resolve each COUNT(DISTINCT *)'s visible variables to child columns.
+        let row_distinct_cols: Vec<Option<Vec<usize>>> = aggregates
+            .iter()
+            .map(|spec| match &spec.function {
+                AggregateFn::CountDistinctAll(vars) => Some(
+                    vars.iter()
+                        .filter_map(|v| child_schema.iter().position(|sv| sv == v))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+
         Self {
             child,
             aggregates,
@@ -137,6 +153,7 @@ impl AggregateOperator {
             extra_specs,
             group_size_col,
             child_col_count,
+            row_distinct_cols,
             out_schema: None,
             graph_view: None,
         }
@@ -208,6 +225,8 @@ impl Operator for AggregateOperator {
 
             let num_cols = self.in_schema.len();
             let mut output_columns: Vec<Vec<Binding>> = Vec::with_capacity(num_cols);
+            // Namespace table for expanding IRI-valued GROUP_CONCAT members.
+            let namespaces = ctx.active_snapshot.namespaces();
             ctx.check_cancelled()?;
 
             // Process child columns (regular aggregates and pass-through)
@@ -222,7 +241,12 @@ impl Operator for AggregateOperator {
                         Some(agg_idx) => {
                             // This column needs aggregation
                             let spec = &self.aggregates[agg_idx];
-                            apply_aggregate(&spec.function, input_binding, self.graph_view.as_ref())
+                            apply_aggregate(
+                                &spec.function,
+                                input_binding,
+                                self.graph_view.as_ref(),
+                                Some(namespaces),
+                            )
                         }
                         None => {
                             // Pass through unchanged
@@ -251,9 +275,23 @@ impl Operator for AggregateOperator {
                                     &spec.function,
                                     input_binding,
                                     self.graph_view.as_ref(),
+                                    Some(namespaces),
                                 )
                             })
                             .collect(),
+                        // COUNT(DISTINCT *): the number of distinct solutions in
+                        // the group, composed across the user-visible columns.
+                        None if self.row_distinct_cols[*agg_idx].is_some() => {
+                            let cols = self.row_distinct_cols[*agg_idx]
+                                .as_deref()
+                                .unwrap_or_default();
+                            (0..batch.len())
+                                .map(|row_idx| {
+                                    let n = distinct_group_rows(&batch, row_idx, cols);
+                                    Binding::lit(FlakeValue::Long(n), xsd_integer())
+                                })
+                                .collect()
+                        }
                         None => {
                             let sizes = group_sizes.get_or_insert_with(|| {
                                 (0..batch.len())
@@ -314,10 +352,14 @@ impl Operator for AggregateOperator {
 ///
 /// Count variants and the numeric accumulator handle encoded bindings
 /// natively, so they skip the decode.
+///
+/// GROUP_CONCAT additionally needs IRI-valued bindings expanded to their IRI
+/// string (`namespaces`); see [`group_concat_expand_iris`].
 fn apply_aggregate(
     func: &AggregateFn,
     binding: &Binding,
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+    namespaces: Option<&HashMap<u16, String>>,
 ) -> Binding {
     let needs_decoded_values = matches!(
         func,
@@ -340,7 +382,23 @@ fn apply_aggregate(
                 .iter()
                 .map(|b| crate::group_aggregate::materialize_encoded(b, gv))
                 .collect();
+            // Decoding turns an encoded ref into `Binding::Sid`, which
+            // GROUP_CONCAT still cannot read — expand those too.
+            let decoded = match func {
+                AggregateFn::GroupConcat { .. } => group_concat_expand_iris(&decoded, namespaces),
+                _ => decoded,
+            };
             return func.apply(&Binding::Grouped(decoded));
+        }
+    }
+    // No graph view (memory ledgers): bindings arrive already decoded, but an
+    // IRI-valued one is still a `Sid`/`IriMatch`/`Iri` that GROUP_CONCAT drops.
+    if matches!(func, AggregateFn::GroupConcat { .. }) {
+        if let Binding::Grouped(values) = binding {
+            if values.iter().any(is_iri_binding) {
+                let expanded = group_concat_expand_iris(values, namespaces);
+                return func.apply(&Binding::Grouped(expanded));
+            }
         }
     }
     // SUM/AVG accumulate inline NUM_INT/NUM_F64 encodings natively, but
@@ -410,6 +468,18 @@ impl AggregateFn {
         match self {
             Self::Count(_) => agg_count(values),
             Self::CountAll => agg_count_all(values),
+            // Unreachable by construction: `CountDistinctAll` has no input
+            // variable, so it never gets a column and never reaches `apply`.
+            // `AggregateOperator` computes it from every child column instead
+            // (see `distinct_group_rows`). Assert in debug so a future wiring
+            // change is caught rather than silently answering Unbound.
+            Self::CountDistinctAll(_) => {
+                debug_assert!(
+                    false,
+                    "COUNT(DISTINCT *) must be computed over the whole row, not one column"
+                );
+                Binding::Unbound
+            }
             Self::CountDistinct(_) => agg_count_distinct(values),
             Self::Sum { .. } => agg_sum(values),
             Self::Avg { .. } => agg_avg(values),
@@ -733,6 +803,79 @@ fn agg_count_all(values: &[Binding]) -> Binding {
 }
 
 /// COUNT(DISTINCT) - count distinct non-Unbound values
+/// Whether a binding denotes an IRI (any of the three representations).
+fn is_iri_binding(b: &Binding) -> bool {
+    matches!(
+        b,
+        Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_)
+    )
+}
+
+/// Expand IRI-valued bindings to `xsd:string` literals holding the full IRI,
+/// leaving everything else untouched.
+///
+/// `agg_group_concat` reads only `Binding::Lit`, so an IRI-valued group member
+/// was silently skipped: an all-IRI group concatenated nothing and returned
+/// Unbound (rendered `null`), and a mixed group dropped its IRI members from
+/// the result. Expanding here matches what `STR()` already does for the same
+/// term (`eval::string::eval_str`), so `GROUP_CONCAT(?s)` and
+/// `GROUP_CONCAT(STR(?s))` agree.
+///
+/// A `Sid` whose namespace code is missing from `namespaces` cannot be
+/// expanded; it stays as-is and is skipped downstream, exactly as before.
+fn group_concat_expand_iris(
+    values: &[Binding],
+    namespaces: Option<&HashMap<u16, String>>,
+) -> Vec<Binding> {
+    values
+        .iter()
+        .map(|b| {
+            let iri: Option<String> = match b {
+                Binding::Sid { sid, .. } => namespaces
+                    .and_then(|ns| ns.get(&sid.namespace_code))
+                    .map(|prefix| format!("{prefix}{}", sid.name)),
+                Binding::IriMatch { iri, .. } => Some(iri.to_string()),
+                Binding::Iri(iri) => Some(iri.to_string()),
+                _ => None,
+            };
+            match iri {
+                Some(iri) => Binding::lit(FlakeValue::String(iri), xsd_string()),
+                None => b.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Number of distinct solutions in one group of a `GroupByOperator` output row.
+///
+/// `GroupByOperator` emits one row per group: key columns carry the single key
+/// value, every other column carries `Grouped(Vec<Binding>)` with one entry per
+/// solution in the group. Zipping the grouped columns index-wise reconstructs
+/// the group's solutions. Key columns are constant within a group, so they
+/// cannot change which solutions are distinct — and a group with no grouped
+/// column at all is a set of rows agreeing on every column, i.e. exactly one
+/// distinct solution.
+///
+/// `cols` restricts the reconstruction to the user-visible columns, matching
+/// what `*` denotes; see [`AggregateFn::CountDistinctAll`].
+fn distinct_group_rows(batch: &Batch, row_idx: usize, cols: &[usize]) -> i64 {
+    let grouped: Vec<&[Binding]> = cols
+        .iter()
+        .filter_map(|&col_idx| match batch.get_by_col(row_idx, col_idx) {
+            Binding::Grouped(values) => Some(values.as_slice()),
+            _ => None,
+        })
+        .collect();
+    let Some(group_size) = grouped.iter().map(|col| col.len()).min() else {
+        return 1;
+    };
+    let mut seen: HashSet<Vec<&Binding>> = HashSet::with_capacity(group_size);
+    for i in 0..group_size {
+        seen.insert(grouped.iter().map(|col| &col[i]).collect());
+    }
+    seen.len() as i64
+}
+
 fn agg_count_distinct(values: &[Binding]) -> Binding {
     let distinct: HashSet<_> = values
         .iter()

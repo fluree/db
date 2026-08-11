@@ -13,9 +13,9 @@ use crate::ast::path::{NegatedPredicate, PropertyPath as SparqlPropertyPath};
 use crate::ast::term::{ObjectTerm, SubjectTerm};
 use crate::span::SourceSpan;
 
-use fluree_db_core::FlakeValue;
+use fluree_db_core::{DatatypeConstraint, FlakeValue};
 use fluree_db_query::ir::path::PathStep;
-use fluree_db_query::ir::triple::{Ref, TriplePattern};
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::{Expression, Function, PathModifier, Pattern, PropertyPathPattern};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
@@ -28,6 +28,84 @@ use super::{LowerError, LoweringContext, Result};
 /// `(a|b)/(c|d)/(e|f)/...`.
 const MAX_SEQUENCE_EXPANSION: usize = 64;
 
+/// The object endpoint of a property path.
+///
+/// SPARQL 1.1 §19.8 reaches a path's object through `GraphNodePath`, which
+/// admits `RDFLiteral` / `NumericLiteral` / `BooleanLiteral`, so
+/// `?s ex:ofMaker/ex:name "Acme"` is an ordinary matchable shape. Most path
+/// arms only ever place the endpoint in the *object* slot of a
+/// `TriplePattern`, where a literal is representable; the arms that put it in
+/// subject or `PropertyPathPattern` position narrow it to a [`Ref`] themselves.
+/// Carrying it as a [`Term`] keeps the narrowing per-arm instead of up front.
+#[derive(Clone)]
+pub(super) struct PathObject {
+    term: Term,
+    /// Datatype / language constraint for a literal endpoint. Set only by the
+    /// annotation-block surface, whose objects pin the scan to their exact
+    /// datatype; the plain path surface leaves it `None` so a path's final hop
+    /// matches exactly like the equivalent hand-written triple pattern.
+    dtc: Option<DatatypeConstraint>,
+}
+
+impl PathObject {
+    pub(super) fn new(term: Term, dtc: Option<DatatypeConstraint>) -> Self {
+        Self { term, dtc }
+    }
+
+    /// The endpoint narrowed to a [`Ref`], or `None` when it is a literal.
+    fn to_ref(&self) -> Option<Ref> {
+        Ref::try_from(self.term.clone()).ok()
+    }
+
+    /// Build `s p <endpoint>`, carrying the endpoint's datatype constraint.
+    fn triple(&self, s: Ref, p: Ref) -> TriplePattern {
+        TriplePattern {
+            s,
+            p,
+            o: self.term.clone(),
+            dtc: self.dtc.clone(),
+        }
+    }
+}
+
+impl From<Ref> for PathObject {
+    fn from(r: Ref) -> Self {
+        Self {
+            term: r.into(),
+            dtc: None,
+        }
+    }
+}
+
+/// A pattern that matches nothing while keeping `vars` in scope.
+///
+/// RDF has no literal subjects, so a path arm that would place a literal in
+/// subject position can never match. SPARQL 1.1 asks for the empty solution
+/// sequence there, not an error; an empty `VALUES` gives exactly that and still
+/// declares the arm's variables so `SELECT *` projection is unchanged.
+fn never_matches(vars: impl IntoIterator<Item = VarId>) -> Pattern {
+    Pattern::Values {
+        vars: vars.into_iter().collect(),
+        rows: Vec::new(),
+    }
+}
+
+/// Narrow, deliberate divergence for path forms whose IR endpoints are typed
+/// [`Ref`] and so cannot hold a literal.
+///
+/// These shapes are legal SPARQL 1.1 — the message says so, because the
+/// alternative is a user reading `err:db/InvalidQuery` as "my query is wrong".
+fn literal_endpoint_unsupported(form: &str, example: &str, span: SourceSpan) -> LowerError {
+    LowerError::invalid_property_path(
+        format!(
+            "{form} with a literal object are not yet supported (e.g. `{example}`). This shape is \
+             legal SPARQL 1.1; the restriction is a Fluree limitation, not a spec rule. Rewrite it \
+             with a variable endpoint and a filter, e.g. `?s <path> ?o . FILTER(?o = <literal>)`."
+        ),
+        span,
+    )
+}
+
 impl<E: IriEncoder> LoweringContext<'_, E> {
     pub(super) fn lower_property_path(
         &mut self,
@@ -39,14 +117,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // Lower subject term (already a Ref, so no literal validation needed)
         let s = self.lower_subject(subject)?;
 
-        // Lower object term and convert to Ref (fails on literal values)
-        let o_term = self.lower_object(object)?;
-        let o = Ref::try_from(o_term).map_err(|_| {
-            LowerError::invalid_property_path(
-                "Property path object cannot be a literal value",
-                span,
-            )
-        })?;
+        // The object may legally be a literal (`?s ex:ofMaker/ex:name "Acme"`);
+        // arms that cannot represent one narrow it themselves.
+        let o = PathObject::new(self.lower_object(object)?, None);
 
         self.lower_path_dispatch(&s, path, &o, span)
     }
@@ -59,7 +132,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         s: &Ref,
         path: &SparqlPropertyPath,
-        o: &Ref,
+        o: &PathObject,
         span: SourceSpan,
     ) -> Result<Vec<Pattern>> {
         // Rewrite complex inverses (^(a/b), ^(a|b), ^(^x)) before dispatching.
@@ -87,6 +160,19 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // single modifier over the innermost path before extracting
                 // predicates. `inner` is consumed via `innermost` below.
                 let _ = inner;
+                // `PropertyPathPattern`'s endpoints are `Ref`s, so a literal
+                // endpoint cannot be represented. `?s ex:p+ "lit"` and
+                // `?s ex:p* "lit"` are both evaluable under SPARQL 1.1 (the
+                // latter via the zero-length path, which binds `?s` to the
+                // literal), so this is a divergence, not a spec restriction.
+                let Some(o) = o.to_ref() else {
+                    return Err(literal_endpoint_unsupported(
+                        "Transitive property paths (+, *, ?)",
+                        "?s ex:p+ \"lit\"",
+                        span,
+                    ));
+                };
+                let o = &o;
                 let ((zero, unbounded), innermost) = Self::collapse_modifiers(effective_path);
                 let modifier = match (unbounded, zero) {
                     (true, true) => PathModifier::ZeroOrMore,
@@ -147,6 +233,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 | SparqlPropertyPath::ZeroOrOne { path: tp_inner, .. } => {
                     // Both-constants is a reachability test (handled by the
                     // operator's both-Sid arm), not an error.
+                    let Some(o) = o.to_ref() else {
+                        return Err(literal_endpoint_unsupported(
+                            "Transitive property paths (+, *, ?)",
+                            "?s ^ex:p+ \"lit\"",
+                            span,
+                        ));
+                    };
                     let iri = self.extract_simple_predicate_iri(tp_inner, span)?;
                     let modifier = match inner.as_ref() {
                         SparqlPropertyPath::OneOrMore { .. } => PathModifier::OneOrMore,
@@ -166,8 +259,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 _ => {
                     let iri = self.extract_simple_predicate_iri(inner, span)?;
                     let p = Ref::Iri(Arc::from(iri.as_str()));
+                    // `?s ^ex:p "lit"` puts the literal in subject position:
+                    // zero solutions, not an error (W3C `syn-pp-in-collection`
+                    // writes exactly this as `[ ^:r "hello" ]`).
+                    let Some(o) = o.to_ref() else {
+                        return Ok(vec![never_matches(s.as_var())]);
+                    };
                     Ok(vec![Pattern::Triple(TriplePattern::new(
-                        o.clone(),
+                        o,
                         p,
                         s.clone().into(),
                     ))])
@@ -204,7 +303,17 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
             // Negated property set: `!iri`, `!(a|b)`, `!(^p)`, `!(a|^p)`.
             SparqlPropertyPath::NegatedSet { iris, .. } => {
-                self.lower_negated_set(s, iris, o, span)
+                // A negated set's inverse branch reverses subject and object,
+                // so the endpoint must be a `Ref` for the branch split to be
+                // expressible as written.
+                let Some(o) = o.to_ref() else {
+                    return Err(literal_endpoint_unsupported(
+                        "Negated property sets (!)",
+                        "?s !(ex:a) \"lit\"",
+                        span,
+                    ));
+                };
+                self.lower_negated_set(s, iris, &o, span)
             }
 
             // Grouped path - unwrap and recurse
@@ -366,7 +475,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         s: &Ref,
         steps: &[&SparqlPropertyPath],
-        o: &Ref,
+        o: &PathObject,
         span: SourceSpan,
     ) -> Result<Vec<Pattern>> {
         debug_assert!(
@@ -411,15 +520,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         for (i, step) in steps.iter().enumerate() {
             let is_last = i == steps.len() - 1;
-            let next = if is_last {
-                o.clone()
-            } else {
-                let var_name = format!("?__pp{}", self.pp_counter);
-                self.pp_counter += 1;
-                Ref::Var(self.vars.get_or_insert(&var_name))
-            };
+            if is_last {
+                // Only the final hop can carry a literal endpoint; the
+                // intermediate joins are always fresh variables.
+                patterns.push(self.lower_sequence_step_pattern(step, &prev, o, span)?);
+                break;
+            }
 
-            let pat = self.lower_sequence_step_pattern(step, &prev, &next, span)?;
+            let var_name = format!("?__pp{}", self.pp_counter);
+            self.pp_counter += 1;
+            let next = Ref::Var(self.vars.get_or_insert(&var_name));
+
+            let pat = self.lower_sequence_step_pattern(step, &prev, &next.clone().into(), span)?;
             patterns.push(pat);
 
             prev = next;
@@ -663,7 +775,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         s: &Ref,
         step_choices: &[Vec<&SparqlPropertyPath>],
-        o: &Ref,
+        o: &PathObject,
         span: SourceSpan,
     ) -> Result<Vec<Pattern>> {
         let combos = Self::cartesian_product_sparql(step_choices);
@@ -693,7 +805,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         s: &Ref,
         steps: &[&SparqlPropertyPath],
-        o: &Ref,
+        o: &PathObject,
         span: SourceSpan,
     ) -> Result<Vec<Pattern>> {
         let mut patterns = Vec::with_capacity(steps.len());
@@ -701,15 +813,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         for (i, step) in steps.iter().enumerate() {
             let is_last = i == steps.len() - 1;
-            let next = if is_last {
-                o.clone()
-            } else {
-                let var_name = format!("?__pp{}", self.pp_counter);
-                self.pp_counter += 1;
-                Ref::Var(self.vars.get_or_insert(&var_name))
-            };
+            if is_last {
+                patterns.push(self.lower_sequence_step_pattern(step, &prev, o, span)?);
+                break;
+            }
 
-            let pat = self.lower_sequence_step_pattern(step, &prev, &next, span)?;
+            let var_name = format!("?__pp{}", self.pp_counter);
+            self.pp_counter += 1;
+            let next = Ref::Var(self.vars.get_or_insert(&var_name));
+
+            let pat = self.lower_sequence_step_pattern(step, &prev, &next.clone().into(), span)?;
             patterns.push(pat);
 
             prev = next;
@@ -731,26 +844,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         step: &SparqlPropertyPath,
         prev: &Ref,
-        next: &Ref,
+        next: &PathObject,
         span: SourceSpan,
     ) -> Result<Pattern> {
         match step {
             SparqlPropertyPath::Iri(iri) => {
                 let expanded = self.expand_iri(iri)?;
                 let p = Ref::Iri(Arc::from(expanded.as_str()));
-                Ok(Pattern::Triple(TriplePattern::new(
-                    prev.clone(),
-                    p,
-                    next.clone().into(),
-                )))
+                Ok(Pattern::Triple(next.triple(prev.clone(), p)))
             }
             SparqlPropertyPath::A { .. } => {
                 let p = Ref::Iri(Arc::from(TYPE));
-                Ok(Pattern::Triple(TriplePattern::new(
-                    prev.clone(),
-                    p,
-                    next.clone().into(),
-                )))
+                Ok(Pattern::Triple(next.triple(prev.clone(), p)))
             }
             SparqlPropertyPath::Inverse { path: inner, .. } => {
                 match inner.as_ref() {
@@ -758,6 +863,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     | SparqlPropertyPath::ZeroOrMore { path: tp_inner, .. }
                     | SparqlPropertyPath::ZeroOrOne { path: tp_inner, .. } => {
                         // Inverse-transitive step: ^p+ / ^p* / ^p?
+                        let Some(next) = next.to_ref() else {
+                            return Err(literal_endpoint_unsupported(
+                                "Transitive property paths (+, *, ?)",
+                                "?s ex:a/^ex:p+ \"lit\"",
+                                span,
+                            ));
+                        };
                         if prev.is_bound() && next.is_bound() {
                             return Err(LowerError::invalid_property_path(
                                 "Property path requires at least one variable (cannot have both subject and object as constants)",
@@ -775,7 +887,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                             .encode_iri(&iri)
                             .ok_or_else(|| LowerError::unknown_namespace(&iri, span))?;
                         Ok(Pattern::PropertyPath(PropertyPathPattern::new(
-                            next.clone(),
+                            next,
                             predicate_sid,
                             modifier,
                             prev.clone(),
@@ -785,8 +897,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         // Simple inverse: ^p → Triple with s/o swapped
                         let iri = self.extract_simple_predicate_iri(inner, span)?;
                         let p = Ref::Iri(Arc::from(iri.as_str()));
+                        // A literal endpoint lands in subject position here —
+                        // no RDF triple has a literal subject, so the whole
+                        // chain matches nothing.
+                        let Some(next) = next.to_ref() else {
+                            return Ok(never_matches(prev.as_var()));
+                        };
                         Ok(Pattern::Triple(TriplePattern::new(
-                            next.clone(),
+                            next,
                             p,
                             prev.clone().into(),
                         )))
@@ -796,6 +914,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlPropertyPath::OneOrMore { path: inner, .. }
             | SparqlPropertyPath::ZeroOrMore { path: inner, .. }
             | SparqlPropertyPath::ZeroOrOne { path: inner, .. } => {
+                let Some(next) = next.to_ref() else {
+                    return Err(literal_endpoint_unsupported(
+                        "Transitive property paths (+, *, ?)",
+                        "?s ex:a/ex:p+ \"lit\"",
+                        span,
+                    ));
+                };
                 if prev.is_bound() && next.is_bound() {
                     return Err(LowerError::invalid_property_path(
                         "Property path requires at least one variable (cannot have both subject and object as constants)",
@@ -816,7 +941,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     prev.clone(),
                     predicate_sid,
                     modifier,
-                    next.clone(),
+                    next,
                 )))
             }
             other => Err(LowerError::invalid_property_path(
@@ -836,7 +961,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         step: &SparqlPropertyPath,
         s: &Ref,
-        o: &Ref,
+        o: &PathObject,
         span: SourceSpan,
     ) -> Result<Vec<Pattern>> {
         let pat = self.lower_sequence_step_pattern(step, s, o, span)?;
@@ -850,32 +975,29 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         leaf: &SparqlPropertyPath,
         s: &Ref,
-        o: &Ref,
+        o: &PathObject,
         span: SourceSpan,
     ) -> Result<Vec<Pattern>> {
         match leaf {
             SparqlPropertyPath::Iri(iri) => {
                 let expanded = self.expand_iri(iri)?;
                 let p = Ref::Iri(Arc::from(expanded.as_str()));
-                Ok(vec![Pattern::Triple(TriplePattern::new(
-                    s.clone(),
-                    p,
-                    o.clone().into(),
-                ))])
+                Ok(vec![Pattern::Triple(o.triple(s.clone(), p))])
             }
             SparqlPropertyPath::A { .. } => {
                 let p = Ref::Iri(Arc::from(TYPE));
-                Ok(vec![Pattern::Triple(TriplePattern::new(
-                    s.clone(),
-                    p,
-                    o.clone().into(),
-                ))])
+                Ok(vec![Pattern::Triple(o.triple(s.clone(), p))])
             }
             SparqlPropertyPath::Inverse { path: inner, .. } => {
                 let iri = self.extract_simple_predicate_iri(inner, span)?;
                 let p = Ref::Iri(Arc::from(iri.as_str()));
+                // Literal endpoint in subject position: this branch of the
+                // union contributes no solutions.
+                let Some(o) = o.to_ref() else {
+                    return Ok(vec![never_matches(s.as_var())]);
+                };
                 Ok(vec![Pattern::Triple(TriplePattern::new(
-                    o.clone(),
+                    o,
                     p,
                     s.clone().into(),
                 ))])

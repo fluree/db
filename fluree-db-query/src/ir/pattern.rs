@@ -250,6 +250,21 @@ pub struct ServicePattern {
     /// Used by `ServiceOperator` to send the body verbatim to remote endpoints
     /// without needing an IR-to-SPARQL serializer.
     pub source_body: Option<Arc<str>>,
+    /// The parent query's prologue, re-rendered as SPARQL, to prepend to the
+    /// outgoing sub-query.
+    ///
+    /// Because `source_body` is a verbatim slice of the SERVICE block, any
+    /// prefixed name or relative IRI in it is only meaningful under the parent
+    /// query's `PREFIX` / `BASE` declarations — which live outside that slice.
+    /// Shipping the body without them changes what the query means: a prefixed
+    /// name fails at the remote with "Undefined prefix", and a relative IRI
+    /// silently resolves against a different base and matches a different term.
+    ///
+    /// Rendered from the lowerer's already-resolved prefix map rather than
+    /// sliced out of the source, so relative `PREFIX` IRIs arrive base-resolved
+    /// and no literal in the body is ever rewritten. Empty string when the query
+    /// declared no prologue; `None` for JSON-LD originated queries.
+    pub source_prologue: Option<Arc<str>>,
 }
 
 impl ServicePattern {
@@ -260,22 +275,43 @@ impl ServicePattern {
             endpoint,
             patterns,
             source_body: None,
+            source_prologue: None,
         }
     }
 
-    /// Create a new SERVICE pattern with captured source body text
+    /// Create a new SERVICE pattern with captured source body text and the
+    /// prologue that body's prefixed names and relative IRIs resolve under.
+    ///
+    /// The two are captured together because the body is only interpretable
+    /// under that prologue — see [`source_prologue`](Self::source_prologue).
     pub fn with_source_body(
         silent: bool,
         endpoint: ServiceEndpoint,
         patterns: Vec<Pattern>,
         source_body: Arc<str>,
+        source_prologue: Arc<str>,
     ) -> Self {
         Self {
             silent,
             endpoint,
             patterns,
             source_body: Some(source_body),
+            source_prologue: Some(source_prologue),
         }
+    }
+
+    /// The complete SPARQL query text to send to a remote endpoint for this
+    /// SERVICE block, or `None` when no source body was captured.
+    ///
+    /// Prologue first, so the body's prefixed names and relative IRIs resolve
+    /// remotely to exactly the IRIs they resolve to locally. The body is wrapped
+    /// in braces unconditionally: `parse_group_graph_pattern` unwraps a
+    /// single-pattern group, so the slice may or may not carry its own, and
+    /// double braces are legal SPARQL.
+    pub fn remote_query_text(&self) -> Option<String> {
+        let body = self.source_body.as_deref()?;
+        let prologue = self.source_prologue.as_deref().unwrap_or("");
+        Some(format!("{prologue}SELECT * WHERE {{ {body} }}"))
     }
 
     /// Variables this service pattern adds to the row's binding set: the
