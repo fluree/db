@@ -770,3 +770,226 @@ async fn sparql_construct_duplicate_rows_mint_distinct_blanks() {
          template blanks — per-row, not per-distinct-binding: {out:#}"
     );
 }
+
+// =============================================================================
+// RDF set semantics for CONSTRUCT / DESCRIBE results
+// =============================================================================
+//
+// A CONSTRUCT result is an RDF graph, so triple identity is the full
+// `(s, p, o)` tuple and the result is a SET union of the instantiated
+// templates (SPARQL 1.1 §16.2). Both graph serializations are pinned here so
+// they cannot drift apart on that rule.
+
+/// Seed the two-predicate fixture. `same_value` selects the shape where one
+/// literal is shared by both predicates, or the distinct-value control.
+async fn seed_shared_object(
+    ledger_id: &str,
+    same_value: bool,
+) -> (fluree_db_api::Fluree, LedgerState) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let (v1, v2) = if same_value {
+        ("same", "same")
+    } else {
+        ("alpha", "beta")
+    };
+    let tx = json!({
+        "@graph": [{
+            "@id": "http://ex/s",
+            "http://ex/p1": v1,
+            "http://ex/p2": v2
+        }]
+    });
+    let committed = fluree.insert(ledger0, &tx).await.expect("insert fixture");
+    (fluree, committed.ledger)
+}
+
+/// Count object values across every `@graph` node, excluding `@id`/`@context`.
+fn count_graph_values(v: &JsonValue) -> usize {
+    let count_node = |o: &Map<String, JsonValue>| -> usize {
+        o.iter()
+            .filter(|(k, _)| k.as_str() != "@id" && k.as_str() != "@context")
+            .map(|(_, val)| match val {
+                JsonValue::Array(a) => a.len(),
+                _ => 1,
+            })
+            .sum()
+    };
+    match v.get("@graph").and_then(JsonValue::as_array) {
+        Some(graph) => graph
+            .iter()
+            .filter_map(JsonValue::as_object)
+            .map(count_node)
+            .sum(),
+        None => v.as_object().map_or(0, count_node),
+    }
+}
+
+const CONSTRUCT_ALL: &str = "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }";
+
+/// A constant template instantiated once per solution row yields the SAME
+/// triple N times; the result graph holds it once. Asserted in BOTH graph
+/// serializations — the JSON-LD formatter's value dedupe used to be the only
+/// thing collapsing it, which left RDF/XML emitting the duplicate.
+#[tokio::test]
+async fn sparql_construct_repeated_triple_collapses_in_both_serializations() {
+    // Two solution rows x one constant template triple.
+    let (fluree, ledger) = seed_shared_object("it/construct:repeat", false).await;
+    let db = support::graphdb_from_ledger(&ledger);
+    let sparql = "CONSTRUCT { <http://ex/s> <http://ex/pc> \"dup\" } WHERE { ?s ?p ?o }";
+
+    let jsonld = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(
+        count_graph_values(&jsonld),
+        1,
+        "JSON-LD collapses the repeated triple: {jsonld:#}"
+    );
+
+    let rdfxml = db
+        .query(&fluree)
+        .sparql(sparql)
+        .format(fluree_db_api::FormatterConfig::rdf_xml())
+        .execute_formatted_string()
+        .await
+        .expect("RDF/XML must execute");
+    assert_eq!(
+        rdfxml.matches("<ns0:pc>").count(),
+        1,
+        "RDF/XML applies the same set semantics: {rdfxml}"
+    );
+}
+
+/// One subject, one literal, two predicates: two distinct RDF triples. The
+/// JSON-LD formatter's object dedupe once tracked seen values per SUBJECT and
+/// dropped the second. The SELECT row path is the oracle.
+#[tokio::test]
+async fn sparql_construct_shared_object_across_predicates_novelty() {
+    let (fluree, ledger) = seed_shared_object("it/construct:shared-obj", true).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let rows = support::query_sparql(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("select");
+    let row_count: usize = rows.batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(row_count, 2, "SELECT oracle sees both triples");
+
+    let out = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "same literal under p1 and p2 are distinct triples: {out:#}"
+    );
+}
+
+/// Same assertion on the indexed read path: the binary index feeds a different
+/// scan operator, and the reported reproduction reindexed before querying.
+#[tokio::test]
+async fn sparql_construct_shared_object_across_predicates_indexed() {
+    let ledger_id = "it/construct:shared-obj-idx";
+    let (fluree, _ledger) = seed_shared_object(ledger_id, true).await;
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let out = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "indexed lane must agree with novelty: {out:#}"
+    );
+}
+
+/// Control: distinct objects were never affected. Guards against a "fix" that
+/// simply disables deduplication.
+#[tokio::test]
+async fn sparql_construct_distinct_objects_across_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:distinct-obj", false).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let out = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(count_graph_values(&out), 2, "control: {out:#}");
+}
+
+/// DESCRIBE lowers to the same `QueryOutput::Construct`, so it shares the
+/// result-graph contract.
+#[tokio::test]
+async fn sparql_describe_shared_object_across_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:describe-obj", true).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let out = db
+        .query(&fluree)
+        .sparql("DESCRIBE <http://ex/s>")
+        .execute_formatted()
+        .await
+        .expect("DESCRIBE must execute");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "DESCRIBE must emit both triples: {out:#}"
+    );
+}
+
+/// Three-surface parity: the FQL `construct` form shares the same formatter and
+/// must agree with the SPARQL surface.
+#[tokio::test]
+async fn fql_construct_shared_object_across_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:fql-obj", true).await;
+
+    let query = json!({
+        "where": [{"@id": "?s", "?p": "?o"}],
+        "construct": [{"@id": "?s", "?p": "?o"}]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("FQL construct must execute");
+    let out = result
+        .to_jsonld_async(support::graphdb_from_ledger(&ledger).as_graph_db_ref())
+        .await
+        .expect("format");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "FQL construct must agree with SPARQL: {out:#}"
+    );
+}
+
+/// RDF/XML must carry both predicates for the shared-object shape. Pins the
+/// serializer that was already correct, so the dedupe-scope change cannot
+/// over-correct it into the JSON-LD failure mode.
+#[tokio::test]
+async fn sparql_construct_shared_object_rdfxml_keeps_both_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:shared-obj-xml", true).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let rdfxml = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .format(fluree_db_api::FormatterConfig::rdf_xml())
+        .execute_formatted_string()
+        .await
+        .expect("RDF/XML must execute");
+    assert!(
+        rdfxml.contains("p1") && rdfxml.contains("p2"),
+        "RDF/XML must carry both predicates: {rdfxml}"
+    );
+}

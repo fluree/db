@@ -27,7 +27,10 @@ pub fn format(
     }
 
     let mut graph = instantiate_construct_graph(result, compactor)?;
-    graph.sort();
+    // Sort for deterministic output, and apply RDF set semantics — see the
+    // matching call in `construct::format`. Without the dedupe this serializer
+    // emitted a repeated triple once per contributing solution row.
+    graph.canonicalize();
     format_graph(&graph)
 }
 
