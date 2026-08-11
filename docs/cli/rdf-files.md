@@ -1,28 +1,36 @@
-# fluree rdf
+# RDF file tools
 
-RDF syntax tooling that never touches a ledger. `fluree rdf` reads files and
-reports on them — no `fluree init`, no ledger, no connection, no `.fluree/`
-directory anywhere on the path.
-
-```bash
-fluree rdf <verb> [<FILE>] [options]
-```
+Three verbs that never touch a ledger. They read files and report on them —
+no `fluree init`, no ledger, no connection, no `.fluree/` directory anywhere
+on the path.
 
 | Verb | Description |
 |------|-------------|
-| [`check`](check.md) | Parse a document and report syntax errors |
+| [`parse`](parse.md) | Parse a document and report syntax errors |
 | [`count`](count.md) | Count the statements in a document |
-| [`convert`](convert.md) | Convert between RDF syntaxes (not yet implemented) |
+| [`convert`](convert.md) | Convert between RDF syntaxes |
+
+This page is the shared half: input handling, syntax resolution, the flags all
+three take, profiling, memory, and exit codes. Each verb's own page covers what
+only it does.
+
+They are top-level commands rather than an `fluree rdf <verb>` group. Nothing
+else in the CLI converts or counts a file, so the group prefix bought
+disambiguation nobody needed and cost every invocation a word. `parse` was
+briefly called `check`; it was renamed because [`fluree validate`](validate.md)
+already has a file mode, and `check` beside it read as a shorter `validate` on
+a distinction nothing in `--help` could show. `check` still works as an
+undocumented alias.
 
 ## Input
 
 Every verb takes the same input handling.
 
 ```bash
-fluree rdf count dump.ttl            # a file
-fluree rdf count dump.nt.gz          # transparently decompressed
-cat dump.ttl | fluree rdf count      # stdin
-fluree rdf count - < dump.ttl        # stdin, named explicitly
+fluree count dump.ttl            # a file
+fluree count dump.nt.gz          # transparently decompressed
+cat dump.ttl | fluree count      # stdin
+fluree count - < dump.ttl        # stdin, named explicitly
 ```
 
 `.gz` and `.zst` inputs decompress transparently. gzip is decoded with a
@@ -43,20 +51,21 @@ wins:
 
 | Syntax | `--syntax` value | Extensions | Read | Write |
 |--------|------------------|------------|------|-------|
-| Turtle | `turtle` (`ttl`, `n3`) | `.ttl`, `.n3` | yes | not yet |
-| N-Triples | `ntriples` (`nt`) | `.nt` | yes | not yet |
-| N-Quads | `nquads` (`nq`) | `.nq` | not yet | not yet |
-| TriG | `trig` | `.trig` | not yet | not yet |
-| JSON-LD | `jsonld` (`json-ld`) | `.jsonld`, `.json` | not yet | not yet |
+| Turtle | `turtle` (`ttl`, `n3`) | `.ttl`, `.n3` | yes | yes |
+| N-Triples | `ntriples` (`nt`) | `.nt` | yes | yes |
+| N-Quads | `nquads` (`nq`) | `.nq` | yes | yes |
+| TriG | `trig` | `.trig` | yes | yes |
+| JSON-LD | `jsonld` (`json-ld`) | `.jsonld`, `.json` | not yet | yes |
 | RDF/XML | `rdfxml` (`xml`) | `.rdf`, `.owl` | not yet | not yet |
 | RDF/JSON | `rdfjson` | `.rj` | not yet | not yet |
 | Jelly | `jelly` | `.jelly` | not yet | not yet |
 
 N-Triples is a subset of the Turtle grammar and is read by the same parser,
-so it is not an approximation. The syntaxes marked "not yet" are named so
-that passing one produces a clear refusal naming what it is waiting on,
-rather than a parse error partway through a file that was sniffed as
-something else.
+so it is not an approximation. JSON-LD is currently write-only: `convert`
+can produce it but not read it, so a JSON-LD round trip is not yet possible.
+The cells marked "not yet" are named so that passing one produces a clear
+refusal naming what it is waiting on, rather than a parse error partway
+through a file that was sniffed as something else.
 
 Content sniffing distinguishes the XML, JSON, and Turtle families and
 deliberately does not try to tell Turtle from TriG, or N-Triples from
@@ -79,7 +88,7 @@ matters. Use `--syntax` for those.
 stays clean:
 
 ```bash
-fluree rdf count dump.ttl --time | tee counts.txt
+fluree count dump.ttl --time | tee counts.txt
 ```
 
 ## Profiling
@@ -90,7 +99,7 @@ because a space-separated optional value could not be told apart from the
 input filename.
 
 ```console
-$ fluree rdf count corpus.ttl --profile
+$ fluree count corpus.ttl --profile
   ┌──────────┬──────────────┬──────────────┐
   │ phase    │           ms │       % wall │
   ├──────────┼──────────────┼──────────────┤
@@ -154,10 +163,15 @@ corpus built to hide from it. `sink.relative_std_error_pct` bounds ordinary
 sampling error; nothing here bounds a deliberate one.
 
 `--profile=json` emits the same run as one JSON document on stderr, with
-`schema` set to `fluree.rdf.profile.v1`:
+`schema` set to `fluree.rdf.profile.v1`. The schema id is a stable contract
+token that scripts match on: it deliberately retains the historical `rdf`
+segment from before these commands were flattened, and it only changes when
+the document's *shape* changes (which would be a `.v2`), never to track a
+command rename. The `verb` field, by contrast, names the command as invoked
+and does follow the surface (`parse`, even via the `check` alias):
 
 ```bash
-fluree rdf count dump.ttl --profile=json --no-hash 2> run.json
+fluree count dump.ttl --profile=json --no-hash 2> run.json
 ```
 
 | Field | Meaning |

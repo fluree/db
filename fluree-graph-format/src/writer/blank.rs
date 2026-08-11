@@ -8,7 +8,7 @@
 //!
 //! The one exception is Fluree's own `_:fdb-…` stable-skolem labels, which are
 //! addressable identifiers rather than incidental syntax (#1432). Relabelling
-//! them would break `fluree export | fluree rdf convert`, so they pass
+//! them would break `fluree export | fluree convert`, so they pass
 //! through.
 
 use fluree_graph_ir::chars::is_blank_node_label;

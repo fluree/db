@@ -41,7 +41,7 @@ pub enum ProfileFormat {
 
 /// What the run was, as opposed to how long it took.
 pub struct RunContext {
-    /// The verb that ran (`check`, `count`, …).
+    /// The verb that ran, spelled as the user types it (`parse`, `count`, …).
     pub verb: &'static str,
     /// How the input is named in the report.
     pub input: String,
@@ -298,7 +298,7 @@ struct CountsInfo {
 #[derive(Serialize)]
 struct RatesInfo {
     /// Triples per second, over every emitted edge (triples, quads, list
-    /// items, reifiers) — the same quantity `fluree rdf count` prints.
+    /// items, reifiers) — the same quantity `fluree count` prints.
     triples_per_sec: f64,
     decoded_mib_per_sec: f64,
 }
@@ -505,7 +505,7 @@ impl ProfileReport {
 
     /// Render to stderr in the requested format.
     ///
-    /// Always stderr: `fluree rdf count big.ttl --profile | …` must keep
+    /// Always stderr: `fluree count big.ttl --profile | …` must keep
     /// delivering counts to the pipe, and a convert run must not have a
     /// profile table spliced into its Turtle.
     pub fn emit(&self, format: ProfileFormat) -> Result<(), serde_json::Error> {

@@ -55,11 +55,11 @@ fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 # ext→format table the server uses, instead of a divergent local copy (#1397).
 fluree-db-r2rml = { path = "../fluree-db-r2rml" }
 
-# `fluree rdf`: the RDF verbs parse and instrument directly against the light
+# `parse`/`count`/`convert`: the RDF file verbs parse and instrument directly against the light
 # graph crates rather than going through the ledger API — there is no ledger.
 fluree-graph-ir = { path = "../fluree-graph-ir" }
 fluree-graph-turtle = { path = "../fluree-graph-turtle" }
-# `fluree rdf convert`: the streaming writers the verb serializes through.
+# `fluree convert`: the streaming writers the verb serializes through.
 fluree-graph-format = { path = "../fluree-graph-format" }
 # `--profile`'s box table. Every dependency of this crate is already in the
 # CLI's graph, so sharing the renderer with the bench lane costs nothing and

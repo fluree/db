@@ -137,6 +137,7 @@ difference of two medians carries the noise of both.
   the genuinely unopposed measurements.
 - **Thread-scaling curve** is gate #1 in §6b and belongs with the parallel
   pipeline (W-parallel), not here.
-- **Our own cells** need `fluree rdf convert`, which lands with the writers. The
-  matrix already carries the column and the runner reports the gap explicitly
-  rather than showing an empty row.
+- **Our own cells** run `fluree convert` (top-level since the `rdf` group was
+  dissolved; older `.results/` artifacts record the `fluree rdf convert`
+  spelling that actually ran). The runner probes for it first and reports the
+  gap explicitly rather than showing an empty row.

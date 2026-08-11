@@ -1,4 +1,4 @@
-//! Getting bytes into the `fluree rdf` verbs: file or stdin, gzip or zstd or
+//! Getting bytes into the RDF file verbs: file or stdin, gzip or zstd or
 //! neither, with the phases the profiler needs kept apart.
 //!
 //! The existing [`crate::input::read_input`] is `read_to_string` with a source
@@ -39,7 +39,7 @@ impl RdfInput {
     /// Resolve the positional argument. Absent or `-` means stdin.
     ///
     /// Unlike [`crate::input::resolve_input`] there is no "stdin is a TTY, so
-    /// error" check here: `fluree rdf check` with no argument on a terminal
+    /// error" check here: `fluree parse` with no argument on a terminal
     /// should block on stdin exactly as `cat` does, which is what a user
     /// typing a document by hand expects and what a shell script that pipes
     /// in nothing gets anyway.
@@ -69,6 +69,20 @@ impl RdfInput {
     }
 }
 
+/// How many bytes the input is expected to hold, when that is knowable.
+///
+/// `None` for stdin and for anything that is not a regular file — a pipe has
+/// no length, and a character device's reported length is not a promise about
+/// how much it will produce. Only a regular file's size is used to size the
+/// buffer, which keeps a bogus length from turning into a bogus reservation.
+pub fn size_hint(input: &RdfInput) -> Option<u64> {
+    let RdfInput::File(path) = input else {
+        return None;
+    };
+    let meta = std::fs::metadata(path).ok()?;
+    meta.is_file().then_some(meta.len())
+}
+
 /// Open the input as a buffered byte stream, undecoded.
 ///
 /// Decompression is deliberately not layered on here: for a pipe the magic
@@ -95,16 +109,41 @@ pub fn open_reader(input: &RdfInput) -> CliResult<Box<dyn BufRead + Send>> {
 /// length check afterwards, so an oversized input is refused after reading
 /// 4 GiB instead of after allocating however much more was behind it.
 ///
+/// `expected` is the input's length when it has one; it is a sizing hint and
+/// never a promise. The `take` wrapper is what makes it necessary: it erases
+/// the `File` specialization `read_to_end` uses to reserve the buffer once,
+/// leaving the generic doubling path — which on a 280 MB document allocates a
+/// 512 MB buffer and peaks at 768 MB copying its way there. Reserving the real
+/// length costs two allocations and no copy. A file that grows past its own
+/// metadata still reads correctly; the `Vec` simply grows for the tail.
+///
 /// Time is attributed to [`Phase::Read`].
 pub fn read_all_guarded(
     reader: &mut dyn BufRead,
+    expected: Option<u64>,
     timings: &mut PhaseTimings,
     what: &str,
 ) -> CliResult<Vec<u8>> {
     const LIMIT: u64 = fluree_graph_turtle::error::MAX_INPUT_BYTES as u64;
 
     timings.enter(Phase::Read);
-    let mut buf = Vec::new();
+    // A file whose own metadata says it is too big is refused HERE, before a
+    // byte is read. The `take` below already guarantees the refusal, but it
+    // spends 4 GiB of reading and 4 GiB of buffer to reach it — on a file the
+    // caller could be told about immediately. The hint is not trusted for
+    // correctness: an input that lies small still hits the `take` cap and is
+    // refused there, which is why this is a short-circuit and not the check.
+    if hint_is_oversized(expected, LIMIT) {
+        timings.finish();
+        return Err(oversized(what, LIMIT));
+    }
+    // Clamped at the refusal limit for the same reason in the other direction:
+    // a length that is wrong — or a file that is sparse — must not turn into an
+    // allocation failure in place of the error message this function produces.
+    let mut buf = match expected {
+        Some(len) => Vec::with_capacity(len.min(LIMIT + 1) as usize),
+        None => Vec::new(),
+    };
     let read = reader
         .take(LIMIT + 1)
         .read_to_end(&mut buf)
@@ -112,14 +151,31 @@ pub fn read_all_guarded(
     timings.finish();
 
     if read as u64 > LIMIT {
-        return Err(CliError::Usage(format!(
-            "{what} is larger than {LIMIT} bytes, the most this path can parse in one \
-             pass (the parser addresses token spans with 32-bit offsets)\n  {} split the \
-             input, or wait for the chunked reader that lands with parallel conversion",
-            colored::Colorize::bold(colored::Colorize::cyan("help:")),
-        )));
+        return Err(oversized(what, LIMIT));
     }
     Ok(buf)
+}
+
+/// Whether a size hint already condemns the input.
+///
+/// Split out so the boundary can be tested without allocating it. The
+/// at-the-limit case is the one worth pinning, and exercising it through
+/// [`read_all_guarded`] reserves a real 4 GiB buffer to prove an inequality —
+/// survivable under overcommit, an abort inside a memory-capped CI container.
+fn hint_is_oversized(expected: Option<u64>, limit: u64) -> bool {
+    matches!(expected, Some(len) if len > limit)
+}
+
+/// The one refusal for an input past the parser's addressable limit, shared by
+/// the metadata short-circuit and the read that backs it up, so the two cannot
+/// drift into telling a user two different things about one condition.
+fn oversized(what: &str, limit: u64) -> CliError {
+    CliError::Usage(format!(
+        "{what} is larger than {limit} bytes, the most this path can parse in one \
+         pass (the parser addresses token spans with 32-bit offsets)\n  {} split the \
+         input, or wait for the chunked reader that lands with parallel conversion",
+        colored::Colorize::bold(colored::Colorize::cyan("help:")),
+    ))
 }
 
 /// Strip the compression layer and validate UTF-8, producing the text the
@@ -189,7 +245,7 @@ pub struct Decoded {
 pub fn read_decoded(input: &RdfInput, timings: &mut PhaseTimings) -> CliResult<Decoded> {
     let what = input.display();
     let mut reader = open_reader(input)?;
-    let raw = read_all_guarded(reader.as_mut(), timings, &what)?;
+    let raw = read_all_guarded(reader.as_mut(), size_hint(input), timings, &what)?;
     // The magic bytes are just the head of what was read — no separate peek.
     let compression = crate::rdf::syntax::resolve_compression(input.path(), &raw);
     let bytes_on_wire = raw.len() as u64;
@@ -384,6 +440,89 @@ mod tests {
             timings.elapsed(Phase::Decompress),
             std::time::Duration::ZERO
         );
+    }
+
+    #[test]
+    fn an_oversized_file_is_refused_from_its_metadata_not_after_reading_it() {
+        // The `take` cap refuses it either way; what the short-circuit saves is
+        // 4 GiB of reading and 4 GiB of buffer to reach a refusal the metadata
+        // already implied. Both paths must produce the SAME message, or a user
+        // gets a different explanation depending on which one fired.
+        const LIMIT: u64 = fluree_graph_turtle::error::MAX_INPUT_BYTES as u64;
+        let mut reader = std::io::Cursor::new(b"<a> <b> <c> .\n".as_slice());
+        let err = read_all_guarded(
+            &mut reader,
+            Some(LIMIT + 1),
+            &mut PhaseTimings::start(),
+            "huge.ttl",
+        )
+        .expect_err("a file claiming to be past the limit is refused");
+        assert!(err.to_string().contains("larger than"), "{err}");
+        assert!(err.to_string().contains("huge.ttl"), "{err}");
+    }
+
+    #[test]
+    fn the_limit_belongs_to_the_readable_side() {
+        // Through the predicate rather than a read: a hint exactly AT the limit
+        // makes the read reserve a real 4 GiB buffer to prove an inequality —
+        // survivable under overcommit, an abort in a memory-capped container,
+        // and either way four gigabytes spent on an off-by-one. The off-by-one
+        // is the whole risk, and it lives in the predicate.
+        const LIMIT: u64 = fluree_graph_turtle::error::MAX_INPUT_BYTES as u64;
+        assert!(!hint_is_oversized(None, LIMIT), "no hint condemns nothing");
+        assert!(!hint_is_oversized(Some(0), LIMIT));
+        assert!(
+            !hint_is_oversized(Some(LIMIT), LIMIT),
+            "exactly at the limit must be readable — it matches the take(LIMIT + 1) \
+             that backs it up, and a file of exactly that size is addressable"
+        );
+        assert!(
+            hint_is_oversized(Some(LIMIT + 1), LIMIT),
+            "one byte past the limit is the first refusal"
+        );
+        assert!(hint_is_oversized(Some(u64::MAX), LIMIT));
+    }
+
+    #[test]
+    fn the_size_hint_is_a_hint_and_never_a_promise() {
+        // Both directions of wrong, because the hint only sizes the buffer:
+        // too small and the `Vec` grows for the tail, too large and the extra
+        // capacity is never touched. Either way the bytes are all there.
+        let doc = "<a> <b> <c> .\n".repeat(1000);
+        for hint in [
+            None,
+            Some(0),
+            Some(1),
+            Some(doc.len() as u64),
+            Some(1 << 20),
+        ] {
+            let mut reader = std::io::Cursor::new(doc.as_bytes());
+            let out = read_all_guarded(&mut reader, hint, &mut PhaseTimings::start(), "test")
+                .expect("reads");
+            assert_eq!(out.len(), doc.len(), "hint {hint:?} changed what was read");
+            assert_eq!(out, doc.as_bytes(), "hint {hint:?} corrupted the read");
+        }
+    }
+
+    #[test]
+    fn only_a_regular_file_offers_a_size_hint() {
+        // Stdin is a pipe: no length to hint with, and a device's reported
+        // length is not a promise about what it will produce.
+        assert_eq!(size_hint(&RdfInput::Stdin), None);
+        assert_eq!(
+            size_hint(&RdfInput::File(PathBuf::from("/nonexistent"))),
+            None
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(size_hint(&RdfInput::File(dir.path().to_path_buf())), None);
+
+        let path = dir.path().join("input.ttl");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"<a> <b> <c> .\n")
+            .unwrap();
+        assert_eq!(size_hint(&RdfInput::File(path)), Some(14));
     }
 
     #[test]

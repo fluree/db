@@ -1,4 +1,7 @@
-//! `fluree rdf check` — parse a document and report what is wrong with it.
+//! `fluree parse` — parse a document and report what is wrong with it.
+//!
+//! The module keeps the `check` name the verb was introduced under; only the
+//! CLI surface was renamed, and `check` is still a hidden alias for `parse`.
 //!
 //! The verb exists because "does this file parse" is a question people ask of
 //! a corpus before they ask anything else, and answering it today means
@@ -52,7 +55,7 @@ struct CheckReport {
     diagnostics: Vec<Diagnostic>,
 }
 
-/// Run `fluree rdf check`.
+/// Run `fluree parse`.
 pub fn run(common: &RdfCommonArgs, format: CheckFormat, quiet: bool) -> CliResult<()> {
     let mut timings = PhaseTimings::start();
     let loaded = rdf::load(common, &mut timings)?;
@@ -87,7 +90,11 @@ pub fn run(common: &RdfCommonArgs, format: CheckFormat, quiet: bool) -> CliResul
         CheckFormat::Table => print_table(&loaded.input.display(), &diagnostics, ok, quiet),
     }
 
-    rdf::report_run(common, "check", &loaded, &outcome, &timings, wall)?;
+    // The verb as the user typed it, not the module it lives in: this string
+    // is the `verb` field of `--profile=json` and the header of the human
+    // table, and a report naming a command that is not in `--help` sends
+    // whoever is reading a baseline looking for one.
+    rdf::report_run(common, "parse", &loaded, &outcome, &timings, wall)?;
 
     if ok {
         Ok(())
@@ -98,7 +105,7 @@ pub fn run(common: &RdfCommonArgs, format: CheckFormat, quiet: bool) -> CliResul
 
 /// Human diagnostics, on **stderr**.
 ///
-/// riot puts parse errors on stderr and so does `fluree rdf count`; a `check`
+/// riot puts parse errors on stderr and so does `fluree count`; a `parse`
 /// that put them on stdout would be the one verb in the group whose failure
 /// output lands in a redirect. `--format json` still goes to stdout — that one
 /// is a document a script consumes, not a message.

@@ -1,17 +1,17 @@
-# fluree rdf check
+# fluree parse
 
 Parse an RDF document and report what is wrong with it. No ledger is
 involved: this is a parse and an exit code.
 
 ```bash
-fluree rdf check [<FILE>] [options]
+fluree parse [<FILE>] [options]
 ```
 
 ```bash
-fluree rdf check dump.ttl
-fluree rdf check dump.nt.gz
-cat dump.ttl | fluree rdf check --syntax turtle
-fluree rdf check dump.ttl --format json
+fluree parse dump.ttl
+fluree parse dump.nt.gz
+cat dump.ttl | fluree parse --syntax turtle
+fluree parse dump.ttl --format json
 ```
 
 ## Output
@@ -19,20 +19,20 @@ fluree rdf check dump.ttl --format json
 A clean document says so and exits 0:
 
 ```console
-$ fluree rdf check dump.ttl
+$ fluree parse dump.ttl
 ok: dump.ttl: no syntax errors
 ```
 
 A broken one points at the problem and exits 1:
 
 ```console
-$ fluree rdf check broken.ttl
+$ fluree parse broken.ttl
 error: broken.ttl:3:16: unexpected character '?'
   ex:bob ex:name ?? .
                  ^
 ```
 
-Both go to **stderr**, which is where `riot` and [`fluree rdf count`](count.md)
+Both go to **stderr**, which is where `riot` and [`fluree count`](count.md)
 put theirs — a `check` that wrote its diagnostics to stdout would be the one
 verb in the group whose failure output disappears into a redirect. Only
 `--format json` writes to stdout, because that one is a document a script
@@ -52,7 +52,7 @@ answer — which is what a loop over ten thousand files wants.
 | `--profile[=FORMAT]` | Per-phase timing breakdown (`human` or `json`) |
 | `--no-hash` | Skip the corpus SHA-256 in `--profile` output |
 
-See [the `rdf` overview](README.md) for input handling, syntax resolution,
+See [RDF file tools](rdf-files.md) for input handling, syntax resolution,
 and profiling, which are shared by every verb.
 
 ## JSON output

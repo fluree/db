@@ -121,6 +121,29 @@ pub struct ParserOptions {
     /// conformant, and the benchmark cell that compares against a validating
     /// reader validates too.
     pub validate: bool,
+    /// How many distinct terms this document is expected to hold, when the
+    /// caller knows. `None` means it does not, and the parser starts small.
+    ///
+    /// The term caches have to be sized by someone, and the cost of guessing
+    /// wrong changes sign around a million distinct terms. Below it, reserving
+    /// is pure waste: a length-derived estimate reserved ~210 MB of empty table
+    /// for a document holding 800K distinct terms. Above it, NOT reserving is
+    /// the waste: hashbrown grows by doubling, and the grow path holds the old
+    /// table and the new one at once, so the peak runs about 1.5× the final
+    /// table — measured at roughly +200 MiB per in-flight chunk at 2M distinct
+    /// terms, on the bulk-import path whose memory budget was calibrated when
+    /// the reservation was unconditional.
+    ///
+    /// So the estimate belongs to whoever actually has one. Bulk import knows
+    /// its chunk size and its corpus shape and passes a hint; `fluree convert`
+    /// is handed an arbitrary document and passes nothing, because a
+    /// document's LENGTH is not evidence about its distinct-term COUNT — one
+    /// subject with ten million properties and ten million subjects with one
+    /// each are the same byte count and differ by six orders of magnitude here.
+    ///
+    /// A hint is a hint: it is clamped (see the parser) and a wrong one costs
+    /// only what the old unconditional estimate cost.
+    pub distinct_terms_hint: Option<usize>,
 }
 
 impl ParserOptions {
@@ -139,6 +162,7 @@ impl ParserOptions {
             numerics: NumericStyle::PreserveLexical,
             dialect: Dialect::Turtle,
             validate: true,
+            distinct_terms_hint: None,
         }
     }
 
@@ -163,6 +187,15 @@ impl ParserOptions {
     /// Turn term validation on or off.
     pub fn with_validation(mut self, validate: bool) -> Self {
         self.validate = validate;
+        self
+    }
+
+    /// Tell the parser roughly how many distinct terms to expect.
+    ///
+    /// Only worth setting when the caller genuinely knows — see the field docs
+    /// for why the cost of guessing changes sign around a million terms.
+    pub fn with_distinct_terms_hint(mut self, distinct: usize) -> Self {
+        self.distinct_terms_hint = Some(distinct);
         self
     }
 }

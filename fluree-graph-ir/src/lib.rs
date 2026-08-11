@@ -65,7 +65,7 @@ pub use graph::Graph;
 pub use line_index::LineIndex;
 pub use quad::Quad;
 pub use sink::{
-    GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId, PROTOCOL_QUAD_EVENTS,
+    GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId, TermScope, PROTOCOL_QUAD_EVENTS,
 };
 pub use term::{BlankId, LiteralValue, Term};
 pub use timing::{

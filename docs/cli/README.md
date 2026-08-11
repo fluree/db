@@ -63,7 +63,6 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`query`](query.md) | Query a ledger |
 | [`multi-query`](multi-query.md) | Run multiple queries against a single consistent snapshot |
 | [`validate`](validate.md) | Validate data against SHACL shapes (report) |
-| [`rdf`](rdf/README.md) | RDF syntax tooling — check, count, convert files with no ledger |
 | [`model`](model.md) | Governance model tooling — access profiles, SHACL entity shapes, class hierarchy |
 | [`history`](history.md) | Show change history for an entity |
 | [`export`](export.md) | Export ledger data |
@@ -75,6 +74,27 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`iceberg`](iceberg.md) | Map and manage Iceberg tables as graph sources (map, list, info, drop) |
 | [`materialize`](materialize.md) | Build a native ledger twin from a virtual (Iceberg/R2RML) graph source |
 | [`bm25`](bm25.md) | Manage BM25 full-text search indexes (create, list, sync, drop) |
+
+### RDF File Tools
+
+These read a file and report on it. There is no ledger, no connection, and no
+`.fluree/` directory involved — they work anywhere, on anything you were sent.
+
+| Command | Description |
+|---------|-------------|
+| [`parse`](parse.md) | Parse an RDF file and report syntax errors |
+| [`count`](count.md) | Count the statements in an RDF file |
+| [`convert`](convert.md) | Convert an RDF file from one syntax to another |
+
+Input may be a path, `-`, or piped on stdin, and `.gz` / `.zst` inputs
+decompress transparently. See [RDF file tools](rdf-files.md) for the input
+handling, syntax resolution, shared flags, and profiling all three have in
+common.
+
+Two neighbours worth telling apart: [`validate`](validate.md) checks data
+against SHACL shapes (and has a file mode of its own), where `parse` only
+asks whether the syntax is well-formed; and [`export`](export.md) writes a
+ledger out as RDF, where `convert` reads a file that was already RDF.
 
 ### Remote Sync
 

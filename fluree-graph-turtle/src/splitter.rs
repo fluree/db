@@ -24,7 +24,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::{parse, tokenize, TokenKind};
+use crate::{parse, StreamingLexer, TokenKind};
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 
 // ============================================================================
@@ -157,12 +157,48 @@ pub fn extract_prefix_block_from_reader<R: Read>(
 
 /// Shared scan logic — extract the prefix/base directive block from a buffer
 /// of leading bytes. Returns `(prefix_text, data_start_byte_within_buf)`.
+///
+/// Only the first [`PREFIX_SCAN_SIZE`] bytes are examined, whatever the caller
+/// passes. The two file-based callers already read no more than that; the
+/// in-memory one handed over the whole document, so a 150 MB input was fully
+/// tokenized by the real Turtle lexer to find a 35-byte prefix block. That
+/// single line was 2.85 s of a 3.4 s parallel run — the entire Amdahl term
+/// behind the 2.29× ceiling — and it looked like a slow byte scanner because
+/// it was charged to the chunker.
+///
+/// Capping here rather than at the call site means a future caller cannot
+/// reintroduce it. A header longer than the cap is treated exactly as the
+/// file-based path already treats one: the directives past the cap are not
+/// recognised, chunking refuses with `PrefixAfterData`, and the run falls back
+/// to serial. Loud and correct, rather than silent and wrong.
 fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitError> {
+    let buf = &buf[..buf.len().min(PREFIX_SCAN_SIZE)];
     // Tokenize the header region. If it ends mid-token, tokenize() may error;
     // we try to find a safe truncation point by scanning backwards for a newline.
     let header_str = find_safe_header(buf);
 
-    let tokens = tokenize(header_str).map_err(|e| SplitError::Tokenize(e.to_string()))?;
+    // Pull tokens one at a time and stop at the first that is not part of a
+    // directive. The walk below already stopped there; it was just handed a
+    // fully materialized `Vec` first, so a header region that failed to lex
+    // ANYWHERE — including a megabyte past the last directive — took the whole
+    // document down with it.
+    //
+    // That is not a hypothetical failure mode, it is the common one. The cap
+    // below slices at a fixed offset and `find_safe_header` backs up to a
+    // newline, which lands inside any literal long enough to span the window:
+    // `ex:doc ex:body """…"""` running past 1 MB is a perfectly valid document
+    // whose header stops lexing mid-string. Every such document lost
+    // parallelism, and the reason string blamed the document rather than the
+    // scan. Pulling lazily means those bytes are never lexed, because the walk
+    // has already stopped at `ex:doc`.
+    //
+    // A lex error that survives this loop is therefore a real defect IN THE
+    // HEADER, which is what `SplitError::Tokenize` has always claimed to mean.
+    //
+    // `StreamingLexer::new` does not call `check_input_len` the way
+    // `Lexer::tokenize` does. Harmless under the cap above — a megabyte is
+    // nowhere near `u32::MAX` — but load-bearing on that cap staying put.
+    let mut lexer = StreamingLexer::new(header_str);
 
     // Walk tokens: collect prefix/base directives. Stop at the first token that
     // is not a directive, whitespace filler, or the terminating dot of a directive.
@@ -175,7 +211,10 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
     let mut sparql_directive = false;
     let mut saw_any_directive = false;
 
-    for tok in &tokens {
+    loop {
+        let tok = lexer
+            .next_token()
+            .map_err(|e| SplitError::Tokenize(e.to_string()))?;
         match tok.kind {
             TokenKind::KwPrefix | TokenKind::KwBase => {
                 in_directive = true;
@@ -276,7 +315,7 @@ const SCAN_BUF_SIZE: usize = 64 * 1024; // 64 KB
 const MAX_BOUNDARY_SEARCH: u64 = 64 * 1024 * 1024; // 64 MB
 
 /// Pending lookahead state carried across buffer boundaries.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Lookahead {
     /// A `.` was the last byte processed; waiting to see if next byte is
     /// whitespace/`#`/EOF to confirm a statement boundary.
@@ -312,14 +351,22 @@ pub fn next_statement_boundary(text: &str, from: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let from = from.min(bytes.len());
     let mut scanner = BoundaryScanner::new();
-    for (offset, &b) in bytes.iter().enumerate().skip(from) {
+    let mut offset = from;
+    while offset < bytes.len() {
+        let run = scanner.skip_len(&bytes[offset..]);
+        if run > 0 {
+            scanner.absorb(&bytes[offset..offset + run]);
+            offset += run;
+            continue;
+        }
         // A mid-file directive is not an error during resync — the caller is
         // already recovering, and refusing here would abort the recovery.
-        match scanner.feed(b, offset as u64) {
+        match scanner.feed(bytes[offset], offset as u64) {
             Ok(Some(boundary)) => return Some(boundary as usize),
             Ok(None) => {}
             Err(_) => {}
         }
+        offset += 1;
     }
     scanner.finish().map(|b| (b as usize).min(text.len()))
 }
@@ -355,14 +402,24 @@ pub fn chunk_in_memory(
     let mut ranges = Vec::new();
     let mut start = data_start;
 
-    for (offset, &b) in bytes.iter().enumerate().skip(data_start) {
-        if let Some(boundary) = scanner.feed(b, offset as u64)? {
+    let mut offset = data_start;
+    while offset < bytes.len() {
+        // Skip what cannot matter, one run at a time. `feed` still decides
+        // every byte that can.
+        let run = scanner.skip_len(&bytes[offset..]);
+        if run > 0 {
+            scanner.absorb(&bytes[offset..offset + run]);
+            offset += run;
+            continue;
+        }
+        if let Some(boundary) = scanner.feed(bytes[offset], offset as u64)? {
             let boundary = boundary as usize;
             if (boundary - start) as u64 >= target_bytes {
                 ranges.push(start..boundary);
                 start = boundary;
             }
         }
+        offset += 1;
     }
     // Everything after the last cut, terminator or not — the parser is the
     // authority on whether a trailing fragment is valid, not the chunker.
@@ -427,15 +484,21 @@ pub fn compute_chunk_boundaries(
 
         let chunk = &buf[..n];
 
-        for (i, &b) in chunk.iter().enumerate() {
-            let abs_pos = byte_pos + i as u64;
-
-            if let Some(boundary_pos) = scanner.feed(b, abs_pos)? {
+        let mut i = 0usize;
+        while i < chunk.len() {
+            let run = scanner.skip_len(&chunk[i..]);
+            if run > 0 {
+                scanner.absorb(&chunk[i..i + run]);
+                i += run;
+                continue;
+            }
+            if let Some(boundary_pos) = scanner.feed(chunk[i], byte_pos + i as u64)? {
                 if boundary_pos >= next_target {
                     boundaries.push(boundary_pos);
                     next_target = boundary_pos + chunk_size;
                 }
             }
+            i += 1;
         }
 
         byte_pos += n as u64;
@@ -533,6 +596,22 @@ fn is_noise_only_chunk(buf: &[u8]) -> bool {
 ///
 /// One scanner, one set of answers. `feed` returns the position just past a
 /// confirmed statement terminator, which is where a chunk may be cut.
+///
+/// # The fast path
+///
+/// Most bytes of a document cannot change anything: the body of a literal, the
+/// inside of an IRI, the text of a comment, the characters of a name. Feeding
+/// them one at a time cost 52 MB/s, which made this scan the whole ceiling on
+/// parallel conversion — it is single-threaded and runs before the first worker
+/// starts. [`skip_len`](BoundaryScanner::skip_len) reports how many bytes at
+/// the head of a slice provably cannot matter in the current state, and
+/// [`absorb`](BoundaryScanner::absorb) accounts for such a run in one step.
+///
+/// `feed` remains the only place scan semantics live. The fast path can only
+/// ever *skip*, never decide, and [`STOP`] enumerates the bytes each state must
+/// stop on — so the two paths cannot disagree about what a boundary is. A
+/// differential test drives both over every fixture and compares.
+#[derive(Clone, PartialEq)]
 struct BoundaryScanner {
     state: ScanState,
     lookahead: Lookahead,
@@ -541,6 +620,19 @@ struct BoundaryScanner {
 }
 
 impl BoundaryScanner {
+    /// A scanner sitting in `state` with nothing pending.
+    ///
+    /// That combination is precisely when [`skip_len`](Self::skip_len)
+    /// consults the [`STOP`] table — it returns 0 while any lookahead is
+    /// outstanding — so it is the only configuration the masks describe.
+    #[cfg(test)]
+    fn in_state(state: ScanState) -> Self {
+        Self {
+            state,
+            ..Self::new()
+        }
+    }
+
     fn new() -> Self {
         Self {
             state: ScanState::Normal,
@@ -636,6 +728,141 @@ impl BoundaryScanner {
     fn finish(&mut self) -> Option<u64> {
         self.lookahead.pending_dot.take().map(|dot| dot + 1)
     }
+
+    /// How many bytes at the head of `rest` cannot change the scan.
+    ///
+    /// Zero whenever the next byte might matter, which includes every state
+    /// carrying pending lookahead — a dot awaiting confirmation, a quote run
+    /// being counted, a directive keyword part-matched. In those states the
+    /// very next byte decides something, so there is nothing to skip and the
+    /// caller falls back to [`feed`](Self::feed).
+    ///
+    /// The returned run is safe to hand to [`absorb`](Self::absorb) and to
+    /// nothing else.
+    fn skip_len(&self, rest: &[u8]) -> usize {
+        // Pending lookahead means the next byte resolves it.
+        if self.lookahead.pending_dot.is_some()
+            || self.lookahead.pending_quotes > 0
+            || self.lookahead.pending_cr
+            || self.prefix_check.awaiting_delimiter
+            || self.prefix_check.candidates != 0
+        {
+            return 0;
+        }
+        let mask = match self.state {
+            ScanState::Normal => STOP_NORMAL,
+            ScanState::InShortDoubleString => STOP_SHORT_DOUBLE,
+            ScanState::InLongDoubleString => STOP_LONG_DOUBLE,
+            ScanState::InShortSingleString => STOP_SHORT_SINGLE,
+            ScanState::InLongSingleString => STOP_LONG_SINGLE,
+            ScanState::InIri => STOP_IRI,
+            ScanState::InComment => STOP_COMMENT,
+            // One byte, consumed unconditionally. Nothing to skip.
+            ScanState::InStringEscape { .. } => return 0,
+        };
+        let mut i = 0;
+        while i < rest.len() && STOP[rest[i] as usize] & mask == 0 {
+            i += 1;
+        }
+        i
+    }
+
+    /// Account for a run reported by [`skip_len`](Self::skip_len).
+    ///
+    /// Equivalent to feeding every byte of `run` and discarding the result,
+    /// which is exactly what the byte-at-a-time path would have done: none of
+    /// them is a delimiter, a quote, a dot, an IRI or comment terminator, or a
+    /// byte a directive keyword can start or continue with. All that survives
+    /// is that a token is now in progress and what the last byte was.
+    ///
+    /// Calling this with anything other than a run `skip_len` just returned is
+    /// a logic error and will silently corrupt the scan.
+    fn absorb(&mut self, run: &[u8]) {
+        debug_assert!(!run.is_empty(), "absorb of an empty run");
+        if self.state == ScanState::Normal {
+            self.prefix_check.at_token_start = false;
+            self.prefix_check.data_started = true;
+            self.prefix_check.match_pos = 0;
+        }
+        self.prev_byte = run.last().copied();
+    }
+}
+
+/// Bits in [`STOP`]: which scan states must stop on a given byte.
+const STOP_NORMAL: u8 = 1 << 0;
+const STOP_SHORT_DOUBLE: u8 = 1 << 1;
+const STOP_LONG_DOUBLE: u8 = 1 << 2;
+const STOP_SHORT_SINGLE: u8 = 1 << 3;
+const STOP_LONG_SINGLE: u8 = 1 << 4;
+const STOP_IRI: u8 = 1 << 5;
+const STOP_COMMENT: u8 = 1 << 6;
+
+/// For each byte, the states in which it may change something.
+///
+/// Derived from `advance_state` and `PrefixCheck::feed` — every byte either of
+/// them branches on is listed here for the states that branch on it. A byte
+/// absent from a state's set can only advance a token, which is what makes
+/// skipping it sound.
+static STOP: [u8; 256] = build_stop_table();
+
+const fn build_stop_table() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut mask = 0u8;
+        // Normal: the state machine's own triggers, every token delimiter (a
+        // delimiter reopens a directive position), and every byte a directive
+        // keyword can begin with — `@prefix`, `@base`, `PREFIX`, `BASE`, the
+        // last two case-insensitively.
+        if matches!(
+            b as u8,
+            b'"' | b'\''
+                | b'<'
+                | b'#'
+                | b'.'
+                | b';'
+                | b','
+                | b']'
+                | b')'
+                | b'>'
+                | b'\n'
+                | b'\r'
+                | b' '
+                | b'\t'
+                | b'@'
+                | b'P'
+                | b'p'
+                | b'B'
+                | b'b'
+        ) {
+            mask |= STOP_NORMAL;
+        }
+        // Short strings end at their quote, at a backslash, or at a line break
+        // (the scanner recovers rather than running to EOF on an unterminated
+        // one).
+        if matches!(b as u8, b'"' | b'\\' | b'\n' | b'\r') {
+            mask |= STOP_SHORT_DOUBLE;
+        }
+        if matches!(b as u8, b'\'' | b'\\' | b'\n' | b'\r') {
+            mask |= STOP_SHORT_SINGLE;
+        }
+        // Long strings span lines; only a quote run or an escape matters.
+        if matches!(b as u8, b'"' | b'\\') {
+            mask |= STOP_LONG_DOUBLE;
+        }
+        if matches!(b as u8, b'\'' | b'\\') {
+            mask |= STOP_LONG_SINGLE;
+        }
+        if b as u8 == b'>' {
+            mask |= STOP_IRI;
+        }
+        if matches!(b as u8, b'\n' | b'\r') {
+            mask |= STOP_COMMENT;
+        }
+        t[b] = mask;
+        b += 1;
+    }
+    t
 }
 
 /// Advance the scan state machine by one byte.
@@ -757,6 +984,7 @@ fn advance_state(
 ///
 /// We track whether we're at column 0 (or leading whitespace) and match
 /// against the keyword prefixes byte-by-byte.
+#[derive(Clone, PartialEq)]
 struct PrefixCheck {
     /// Whether any non-whitespace data byte has been seen.
     data_started: bool,
@@ -1922,6 +2150,342 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    // ---- the fast path against the byte-at-a-time path ----
+
+    /// Every boundary, and any refusal, from feeding one byte at a time.
+    fn scan_byte_at_a_time(text: &str) -> (Vec<u64>, Option<String>) {
+        let mut scanner = BoundaryScanner::new();
+        let mut out = Vec::new();
+        for (offset, &b) in text.as_bytes().iter().enumerate() {
+            match scanner.feed(b, offset as u64) {
+                Ok(Some(boundary)) => out.push(boundary),
+                Ok(None) => {}
+                Err(e) => return (out, Some(e.to_string())),
+            }
+        }
+        out.extend(scanner.finish());
+        (out, None)
+    }
+
+    /// The same, through `skip_len`/`absorb` wherever they apply.
+    fn scan_with_fast_path(text: &str) -> (Vec<u64>, Option<String>) {
+        let bytes = text.as_bytes();
+        let mut scanner = BoundaryScanner::new();
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let run = scanner.skip_len(&bytes[offset..]);
+            if run > 0 {
+                scanner.absorb(&bytes[offset..offset + run]);
+                offset += run;
+                continue;
+            }
+            match scanner.feed(bytes[offset], offset as u64) {
+                Ok(Some(boundary)) => out.push(boundary),
+                Ok(None) => {}
+                Err(e) => return (out, Some(e.to_string())),
+            }
+            offset += 1;
+        }
+        out.extend(scanner.finish());
+        (out, None)
+    }
+
+    /// Documents whose scanning must not change when bytes are skipped in runs.
+    ///
+    /// Every one of these is a case where a wrong skip set would be silently
+    /// wrong rather than loud: a boundary in the wrong place cuts a chunk
+    /// mid-statement, and a missed directive gives later chunks wrong IRIs.
+    const SKIP_FIXTURES: &[(&str, &str)] = &[
+        ("plain", "ex:a ex:p \"x\" .\nex:b ex:p \"y\" .\n"),
+        ("dot in a name", "ex:a.b ex:p ex:c.d .\n"),
+        ("dot in a literal", "ex:a ex:p \"one. two.\" .\n"),
+        ("dot in an iri", "<http://e/a.b> <http://e/p> \"x\" .\n"),
+        (
+            "dot in a comment",
+            "ex:a ex:p \"x\" . # a. comment.\nex:b ex:p \"y\" .\n",
+        ),
+        ("escaped quote", "ex:a ex:p \"say \\\" and . stay\" .\n"),
+        (
+            "escaped backslash",
+            "ex:a ex:p \"back \\\\\" .\nex:b ex:p \"y\" .\n",
+        ),
+        ("long string", "ex:a ex:p \"\"\"a . b\nc . d\"\"\" .\n"),
+        (
+            "long string with quotes",
+            "ex:a ex:p \"\"\"say \"hi\" . ok\"\"\" .\n",
+        ),
+        ("single quotes", "ex:a ex:p 'one. two' .\n"),
+        ("long single", "ex:a ex:p '''a . b\nc''' .\n"),
+        (
+            "unterminated short string",
+            "ex:a ex:p \"open\nex:b ex:p \"y\" .\n",
+        ),
+        ("crlf", "ex:a ex:p \"x\" .\r\nex:b ex:p \"y\" .\r\n"),
+        ("comment ending at eof", "ex:a ex:p \"x\" .\n# trailing"),
+        (
+            "directive mid-file",
+            "ex:a ex:p \"x\" .\n@prefix ex: <http://e2/> .\n",
+        ),
+        (
+            "directive tight after a dot",
+            "ex:a ex:p \"x\" .@prefix ex: <http://e2/> .\n",
+        ),
+        (
+            "sparql directive mid-file",
+            "ex:a ex:p \"x\" .\nPREFIX ex: <http://e2/>\n",
+        ),
+        (
+            "lowercase sparql directive",
+            "ex:a ex:p \"x\" .\nprefix ex: <http://e2/>\n",
+        ),
+        ("base mid-file", "ex:a ex:p \"x\" .\n@base <http://e2/> .\n"),
+        (
+            "keyword-shaped word",
+            "ex:a ex:p \"BASELINE prefixed\" .\nex:b ex:p \"y\" .\n",
+        ),
+        ("keyword-shaped name", "PREFIXED:a BASEd:p \"x\" .\n"),
+        ("utf-8 literal", "ex:a ex:p \"héllo wörld — ünicode\" .\n"),
+        (
+            "blank nodes",
+            "[] ex:p [ ex:q \"x\" ] .\nex:b ex:p ( \"1\" \"2\" ) .\n",
+        ),
+        ("no trailing newline", "ex:a ex:p \"x\" ."),
+        ("empty", ""),
+        // Both STOP_LONG masks were mutable with the whole suite green: no
+        // fixture put an escape inside a long string, so nothing noticed if
+        // the scanner stopped tracking backslashes there. A missed escape ends
+        // the literal early and the cut lands INSIDE it — on the scanner bulk
+        // import runs.
+        (
+            "escape before a long-single close",
+            "ex:a ex:p '''trailing backslash \\\\''' .\nex:b ex:p \"y\" .\n",
+        ),
+        (
+            "escape before a long-double close",
+            "ex:a ex:p \"\"\"trailing backslash \\\\\"\"\" .\nex:b ex:p \"y\" .\n",
+        ),
+        (
+            "escaped quote inside a long string",
+            "ex:a ex:p \"\"\"a \\\" b . c\"\"\" .\nex:b ex:p \"y\" .\n",
+        ),
+    ];
+
+    #[test]
+    fn only_the_header_region_is_tokenized() {
+        // The cap's observable contract. A document far larger than
+        // PREFIX_SCAN_SIZE must still find its prefix block and chunk, and it
+        // must do so without lexing the body — which is what made this scan
+        // 13x slower than the byte scan it was supposed to be.
+        let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+        while ttl.len() < PREFIX_SCAN_SIZE * 3 {
+            ttl.push_str("ex:s ex:p \"some literal padding to make this document large\" .\n");
+        }
+        let (prefix, ranges) = chunk_in_memory(&ttl, 512 * 1024).unwrap();
+        assert_eq!(prefix.trim(), "@prefix ex: <http://example.org/> .");
+        assert!(ranges.len() > 1, "a 3 MB document should chunk");
+        assert_eq!(ranges.first().unwrap().start, prefix.len());
+        assert_eq!(ranges.last().unwrap().end, ttl.len());
+    }
+
+    /// Adopted from review-scan's probe (`scanmut/zz_adversarial_scan.rs`).
+    ///
+    /// The cap had no regression guard: deleting the one line that applies it
+    /// left the whole suite green, because every other test's document is
+    /// smaller than the cap. This one is not, and it pins the property that
+    /// actually matters — the in-memory path and the file path must reach the
+    /// SAME verdict, rather than the in-memory one silently succeeding by
+    /// tokenizing the entire document.
+    #[test]
+    fn an_oversized_header_behaves_the_same_on_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = String::new();
+        let mut i = 0;
+        while doc.len() < PREFIX_SCAN_SIZE + 4096 {
+            doc.push_str(&format!("@prefix p{i}: <http://example.org/ns{i}/> .\n"));
+            i += 1;
+        }
+        doc.push_str("p0:a p0:p \"data\" .\n");
+
+        let path = dir.path().join("bigheader.ttl");
+        std::fs::write(&path, &doc).unwrap();
+
+        let (file_prefix, _) = extract_prefix_block(&path).expect("file path extracts a block");
+        assert!(
+            file_prefix.len() <= PREFIX_SCAN_SIZE,
+            "the file path read past the cap: {}",
+            file_prefix.len()
+        );
+        if let Ok((mem_prefix, _)) = chunk_in_memory(&doc, 8 * 1024 * 1024) {
+            assert_eq!(
+                mem_prefix.len(),
+                file_prefix.len(),
+                "in-memory prefix block differs from the file path's — the cap \
+                 is not being applied identically"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_region_with_no_line_break_does_not_panic() {
+        // find_safe_header falls back to the raw capped slice when there is no
+        // newline to cut at, which can hand `tokenize` a partial token. The
+        // contract is that the caller learns chunking is impossible — the CLI
+        // converts serially — not that anything panics or silently mis-cuts.
+        let mut ttl = String::from("@prefix ex: <http://example.org/> . ");
+        while ttl.len() < PREFIX_SCAN_SIZE + 1024 {
+            ttl.push_str("ex:s ex:p \"one very long single line with no breaks at all\" . ");
+        }
+        // A refusal is equally fine: the caller falls back to serial
+        // conversion. What must not happen is a panic, or ranges that lose
+        // bytes off the end of the document.
+        if let Ok((_, ranges)) = chunk_in_memory(&ttl, 256 * 1024) {
+            assert_eq!(ranges.last().unwrap().end, ttl.len(), "no bytes lost");
+        }
+    }
+
+    #[test]
+    fn the_fast_path_agrees_with_the_byte_at_a_time_path() {
+        for (name, doc) in SKIP_FIXTURES {
+            assert_eq!(
+                scan_with_fast_path(doc),
+                scan_byte_at_a_time(doc),
+                "{name}: skipping runs changed the scan"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fast_path_agrees_on_every_split_of_a_hostile_document() {
+        // Buffer boundaries are where a run gets cut in half, so a fast path
+        // that mishandles a partial run fails here and nowhere else. Every
+        // prefix of the document is scanned, which puts the cut at every byte.
+        let doc =
+            "ex:a ex:p \"\"\"a . b\"\"\" . # c.\nex:d ex:e 'f. g' .\n@prefix ex: <http://e/> .\n";
+        for cut in 0..=doc.len() {
+            if !doc.is_char_boundary(cut) {
+                continue;
+            }
+            let head = &doc[..cut];
+            assert_eq!(
+                scan_with_fast_path(head),
+                scan_byte_at_a_time(head),
+                "prefix of length {cut} scanned differently"
+            );
+        }
+    }
+
+    /// The six masks the literal test below only restates, checked against the
+    /// scanner itself.
+    ///
+    /// `STOP_NORMAL` is absent on purpose: it already has a derived test —
+    /// `a_skipped_run_never_contains_a_byte_the_scanner_branches_on` — and it
+    /// is the one state where "a field changed" is not the right question,
+    /// because `advance_state` feeds `prefix_check` there and `absorb`
+    /// replicates that for a skipped run. In the other six states neither
+    /// touches `prefix_check`, so any change beyond `prev_byte` is a decision
+    /// the fast path would have skipped past.
+    ///
+    /// `InStringEscape` has no mask and is not listed: `skip_len` returns 0 for
+    /// it unconditionally, since its one byte is consumed whatever it is.
+    ///
+    /// This is the test that catches a `feed` which starts branching on a byte
+    /// the table does not list — an `InIri` that also ends at `\n`, an
+    /// `InComment` that reacts to `\t`. Both leave the literal test green and
+    /// fork the fast and slow paths, which on a bulk import cuts a chunk inside
+    /// a literal.
+    #[test]
+    fn every_mask_matches_what_the_scanner_actually_branches_on() {
+        let states = [
+            (ScanState::InShortDoubleString, STOP_SHORT_DOUBLE),
+            (ScanState::InLongDoubleString, STOP_LONG_DOUBLE),
+            (ScanState::InShortSingleString, STOP_SHORT_SINGLE),
+            (ScanState::InLongSingleString, STOP_LONG_SINGLE),
+            (ScanState::InIri, STOP_IRI),
+            (ScanState::InComment, STOP_COMMENT),
+        ];
+
+        for (state, mask) in states {
+            for b in 0u8..=255 {
+                let before = BoundaryScanner::in_state(state);
+                let mut after = before.clone();
+                let produced = after.feed(b, 0);
+
+                // `prev_byte` is excluded because it changes on every byte by
+                // construction; it records what was seen, not what was decided.
+                let branched = after.state != before.state
+                    || after.lookahead != before.lookahead
+                    || after.prefix_check != before.prefix_check
+                    || !matches!(produced, Ok(None));
+
+                assert_eq!(
+                    STOP[b as usize] & mask != 0,
+                    branched,
+                    "{state:?}, byte {b:?} ({:?}): table says stop={}, the scanner \
+                     branched={branched}",
+                    b as char,
+                    STOP[b as usize] & mask != 0,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_mask_matches_what_its_state_branches_on() {
+        // The table has seven masks and the contract test covered one. The
+        // other six were guarded only by the differential fixtures, which is
+        // exactly where the missing long-string escape cases were — the two
+        // holes compound, and a mutable mask on the string states cuts a chunk
+        // INSIDE a literal on the scanner bulk import runs.
+        for b in 0u8..=255 {
+            let stops = |m: u8| STOP[b as usize] & m != 0;
+            assert_eq!(
+                stops(STOP_SHORT_DOUBLE),
+                matches!(b, b'"' | b'\\' | b'\n' | b'\r'),
+                "short double-quoted string, byte {b:?}"
+            );
+            assert_eq!(
+                stops(STOP_SHORT_SINGLE),
+                matches!(b, b'\'' | b'\\' | b'\n' | b'\r'),
+                "short single-quoted string, byte {b:?}"
+            );
+            assert_eq!(
+                stops(STOP_LONG_DOUBLE),
+                matches!(b, b'"' | b'\\'),
+                "long double-quoted string, byte {b:?}"
+            );
+            assert_eq!(
+                stops(STOP_LONG_SINGLE),
+                matches!(b, b'\'' | b'\\'),
+                "long single-quoted string, byte {b:?}"
+            );
+            assert_eq!(stops(STOP_IRI), b == b'>', "iri, byte {b:?}");
+            assert_eq!(
+                stops(STOP_COMMENT),
+                matches!(b, b'\n' | b'\r'),
+                "comment, byte {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_run_never_contains_a_byte_the_scanner_branches_on() {
+        // The table is the contract; this pins it against the two functions it
+        // was derived from, so adding a branch to either without adding the
+        // byte here fails rather than silently corrupting a scan.
+        for b in 0u8..=255 {
+            let stops_normal = STOP[b as usize] & STOP_NORMAL != 0;
+            let branched_on = matches!(b, b'"' | b'\'' | b'<' | b'#' | b'.')
+                || is_token_delimiter(b)
+                || KEYWORDS.iter().any(|kw| keyword_byte_matches(kw, 0, b));
+            assert_eq!(
+                stops_normal, branched_on,
+                "byte {b:?} ({:?}): table says stop={stops_normal}, the scanner branches={branched_on}",
+                b as char
+            );
+        }
     }
 
     // ---- extract_prefix_block tests ----

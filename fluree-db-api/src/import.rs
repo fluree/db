@@ -1168,7 +1168,21 @@ impl ChunkSource {
     /// Returns `Ok(Some((index, text)))` for each chunk, `Ok(None)` when done.
     /// The text includes the prefix block prepended to the raw bytes.
     /// Only valid for `Streaming` variant.
-    pub fn recv_next(&self) -> std::result::Result<Option<(usize, String)>, ImportError> {
+    ///
+    /// # `Ok(None)` means the source was read, not merely that it stopped
+    ///
+    /// The reader runs on its own thread and reports scan failures — a mid-file
+    /// `@prefix` redefinition, an I/O error part-way through — only through
+    /// [`StreamingTurtleReader::join`]. The channel closes either way, so
+    /// returning a bare `Ok(None)` would leave a caller unable to tell a
+    /// complete read from one that died at 10%, and importing the truncated
+    /// half would look like success.
+    ///
+    /// So end-of-stream joins the reader here and surfaces whatever it was
+    /// holding. `join` takes the thread handle, so joining twice is harmless
+    /// and a caller that keeps polling past the end keeps getting `Ok(None)`.
+    /// This is why the method takes `&mut self`.
+    pub fn recv_next(&mut self) -> std::result::Result<Option<(usize, String)>, ImportError> {
         match self {
             Self::Streaming(reader) => {
                 let payload = reader
@@ -1185,7 +1199,14 @@ impl ChunkSource {
                         })?;
                         Ok(Some((idx, data)))
                     }
-                    None => Ok(None),
+                    // The channel closed. That is either a finished read or a
+                    // dead reader, and only the join distinguishes them.
+                    None => {
+                        reader.join().map_err(|e| {
+                            ImportError::NoChunks(format!("streaming read failed: {e}"))
+                        })?;
+                        Ok(None)
+                    }
                 }
             }
             Self::Files(_) | Self::Remote(_) | Self::LocalRechunk(_) | Self::JsonLdStream(_) => {
@@ -7609,5 +7630,93 @@ mod resource_model_tests {
         assert_eq!(parallel[0].0, 0);
         assert_eq!(parallel[1].0, 1);
         assert_eq!(parallel[2].0, 2);
+    }
+}
+
+#[cfg(test)]
+mod streaming_source_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn fixture(dir: &tempfile::TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        f.flush().unwrap();
+        path
+    }
+
+    /// Drain a streaming source the way a caller would, reporting how it ended.
+    fn drain(source: &mut ChunkSource) -> std::result::Result<usize, ImportError> {
+        let mut chunks = 0;
+        while source.recv_next()?.is_some() {
+            chunks += 1;
+        }
+        Ok(chunks)
+    }
+
+    #[test]
+    fn a_clean_stream_ends_with_ok_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+        for i in 0..2_000 {
+            ttl.push_str(&format!("ex:s{i} ex:p \"v{i}\" .\n"));
+        }
+        let path = fixture(&dir, "clean.ttl", &ttl);
+
+        let reader =
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new(&path, 4 * 1024, 2, None)
+                .unwrap();
+        let mut source = ChunkSource::Streaming(reader);
+        let chunks = drain(&mut source).expect("a well-formed document drains cleanly");
+        assert!(chunks > 1, "expected several chunks, got {chunks}");
+    }
+
+    #[test]
+    fn a_reader_that_died_is_not_reported_as_a_finished_stream() {
+        // The hazard: the reader thread refuses a mid-file directive, the
+        // channel closes, and a caller reading until `Ok(None)` would import
+        // the chunks that arrived before the refusal and call it a success.
+        // Ending the stream joins the reader, so the refusal reaches the
+        // caller instead.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+        for i in 0..2_000 {
+            ttl.push_str(&format!("ex:s{i} ex:p \"v{i}\" .\n"));
+        }
+        ttl.push_str("@prefix ex: <http://second.example/> .\nex:z ex:p \"z\" .\n");
+        let path = fixture(&dir, "redefines.ttl", &ttl);
+
+        let reader =
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new(&path, 4 * 1024, 2, None)
+                .unwrap();
+        let mut source = ChunkSource::Streaming(reader);
+        let err = drain(&mut source).expect_err("a mid-file redefinition must reach the caller");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("streaming read failed"),
+            "the error must say the READ failed, not that there were no chunks: {msg}"
+        );
+    }
+
+    #[test]
+    fn polling_past_the_end_stays_quiet() {
+        // `join` takes the handle, so a second end-of-stream has nothing to
+        // report. A caller that keeps asking keeps getting `Ok(None)` rather
+        // than a spurious error the second time.
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture(
+            &dir,
+            "small.ttl",
+            "@prefix ex: <http://example.org/> .\nex:a ex:p \"1\" .\n",
+        );
+
+        let reader =
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new(&path, 4 * 1024, 1, None)
+                .unwrap();
+        let mut source = ChunkSource::Streaming(reader);
+        drain(&mut source).unwrap();
+        assert!(source.recv_next().unwrap().is_none());
+        assert!(source.recv_next().unwrap().is_none());
     }
 }

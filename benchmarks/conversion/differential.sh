@@ -26,6 +26,7 @@ set -euo pipefail
 
 require_bash 5 "EPOCHREALTIME (the measurement clock) is a bash 5 builtin"
 require_dot_decimal_clock
+bench_lock_acquire "differential"
 require_cmd jq
 ensure_dirs
 
@@ -41,11 +42,12 @@ input="$CORPORA_DIR/$CORPUS.ttl"
 
 # `convert` is the whole point of the differential, so its absence is a real
 # blocker rather than something to work around.
-if ! "$FLUREE_BIN" rdf convert "$input" --to ntriples >/dev/null 2>&1; then
-	die "fluree rdf convert is not available on this build.
+if ! "$FLUREE_BIN" convert "$input" --to ntriples >/dev/null 2>&1; then
+	die "fluree convert did not run on this build.
   The differential measures convert-minus-count; without convert there is
-  nothing to subtract from. This branch has check/count only — the writers
-  land with W-writers. Re-run once convert is present."
+  nothing to subtract from. Note the verb is top-level — \`fluree convert\`,
+  not \`fluree rdf convert\`, which was the spelling before the group was
+  dissolved. Re-run against a build that has it."
 fi
 
 samples() {
@@ -68,8 +70,8 @@ samples() {
 
 info "differential on $CORPUS ($RUNS runs each, first discarded)"
 
-convert_stats="$(samples "$FLUREE_BIN" rdf convert "$input" --to ntriples)"
-count_stats="$(samples "$FLUREE_BIN" rdf count "$input")"
+convert_stats="$(samples "$FLUREE_BIN" convert "$input" --to ntriples)"
+count_stats="$(samples "$FLUREE_BIN" count "$input")"
 
 convert_med=$(printf '%s' "$convert_stats" | jq -r '.median')
 count_med=$(printf '%s' "$count_stats" | jq -r '.median')
@@ -80,7 +82,7 @@ delta=$(awk -v a="$convert_med" -v b="$count_med" 'BEGIN{printf "%.6f", a-b}')
 combined_mad=$(awk -v a="$convert_mad" -v b="$count_mad" 'BEGIN{printf "%.6f", a+b}')
 trustworthy=$(awk -v d="$delta" -v m="$combined_mad" 'BEGIN{print (d > m) ? "true" : "false"}')
 
-statements=$("$FLUREE_BIN" rdf count --quiet "$input" 2>/dev/null | tr -dc '0-9')
+statements=$("$FLUREE_BIN" count --quiet "$input" 2>/dev/null | tr -dc '0-9')
 per_stmt_ns=0
 if [ -n "$statements" ] && [ "$statements" -gt 0 ]; then
 	per_stmt_ns=$(awk -v d="$delta" -v n="$statements" 'BEGIN{printf "%.1f", (d*1e9)/n}')

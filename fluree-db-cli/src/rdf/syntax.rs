@@ -1,4 +1,4 @@
-//! The one RDF syntax table the `fluree rdf` verbs resolve against.
+//! The one RDF syntax table the RDF file verbs resolve against.
 //!
 //! The CLI already had [`crate::detect::DataFormat`], but it names two things
 //! (Turtle, JSON-LD) because that is all `insert`/`upsert` can transact.
@@ -14,7 +14,7 @@
 use crate::error::{CliError, CliResult};
 use std::path::Path;
 
-/// An RDF serialization the `fluree rdf` verbs know the name of.
+/// An RDF serialization the RDF file verbs know the name of.
 ///
 /// Naming a syntax is not the same as supporting it — see
 /// [`RdfSyntax::read_support`]. Every variant here is on the roadmap; the ones
@@ -361,7 +361,7 @@ fn sniff(head: &[u8]) -> Option<RdfSyntax> {
     let trimmed = text.trim_start_matches('\u{feff}').trim_start();
     // An empty document is the empty graph in every syntax — there is nothing
     // to identify and nothing to get wrong. Refusing it would make
-    // `fluree rdf check < /dev/null` exit 2 while an empty `.ttl` file exits 0.
+    // `fluree parse < /dev/null` exit 2 while an empty `.ttl` file exits 0.
     if trimmed.is_empty() {
         return Some(RdfSyntax::Turtle);
     }

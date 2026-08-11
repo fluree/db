@@ -1,4 +1,4 @@
-//! `fluree rdf convert` — read one syntax, write another.
+//! `fluree convert` — read one syntax, write another.
 //!
 //! The whole verb is four moving parts, and three of them already existed:
 //! the input plumbing `check` and `count` use, the parser, the writers, and a
@@ -23,11 +23,58 @@ use crate::rdf::syntax::{split_compression, RdfSyntax};
 use crate::rdf::writer::{is_writable, AnyWriter};
 use crate::rdf::{self, destination, diagnostic, exit_document_invalid};
 use colored::Colorize;
-use fluree_graph_format::{BlankNodeLabels, PrefixMap, WriterConfig, WriterStats};
+use fluree_graph_format::{BlankNodeLabels, PrefixMap, WriterConfig};
 use fluree_graph_ir::{GraphSink, Phase, PhaseTimings, SinkError};
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
+
+/// Who may write prose to stderr, decided in one place.
+///
+/// There are two levels and collapsing them into one would be a regression.
+/// *Courtesy* lines — the ✓ summary, the fallback note — are exactly what `-q`
+/// exists to silence. *Diagnostics* — every skip, the swallow note, the closing
+/// warning — survive `-q` on purpose, because the one thing a script must not
+/// do is read a partial conversion as a whole one.
+///
+/// Both go quiet when stderr is carrying a `--profile=json` document. `2>
+/// run.json` is the bench lane's idiom, and one line of prose ahead of the JSON
+/// makes the file unparseable.
+///
+/// The emit goes *through* this type rather than each site spelling the
+/// predicate. It was spelled three different ways across six sites and one of
+/// them omitted the JSON term entirely, which put a `note:` line into every
+/// `2> run.json` of a document that could not be chunked. A rake that has been
+/// stepped on twice gets taken away rather than labelled: `eprintln!` should
+/// not appear anywhere else in this file.
+#[derive(Clone, Copy)]
+struct Prose {
+    quiet: bool,
+    stderr_is_a_document: bool,
+}
+
+impl Prose {
+    fn new(common: &RdfCommonArgs, quiet: bool) -> Self {
+        Self {
+            quiet,
+            stderr_is_a_document: common.profile == Some(crate::rdf::profile::ProfileFormat::Json),
+        }
+    }
+
+    /// A line the run offers as a kindness. `-q` silences it.
+    fn courtesy(self, args: std::fmt::Arguments<'_>) {
+        if !self.quiet && !self.stderr_is_a_document {
+            eprintln!("{args}");
+        }
+    }
+
+    /// A line a script must see even under `-q`.
+    fn diagnostic(self, args: std::fmt::Arguments<'_>) {
+        if !self.stderr_is_a_document {
+            eprintln!("{args}");
+        }
+    }
+}
 
 /// The output syntax when neither `--to` nor an output extension says.
 ///
@@ -56,7 +103,7 @@ pub struct ConvertArgs<'a> {
     pub continue_on_error: bool,
 }
 
-/// Run `fluree rdf convert`.
+/// Run `fluree convert`.
 pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliResult<()> {
     let target = resolve_output_syntax(args.to, args.output)?;
 
@@ -92,6 +139,7 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
         return Err(no_writer_error(target, args.to, args.output));
     }
 
+    let prose = Prose::new(common, quiet);
     let mut timings = PhaseTimings::start();
     let loaded = rdf::load(common, &mut timings)?;
     let prefixes = load_prefixes(args.prefixes)?;
@@ -120,6 +168,7 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     } else {
         ParallelPlan::decide(
             args.parallelism,
+            loaded.resolved.syntax,
             target,
             loaded.text.len(),
             config.blank_labels,
@@ -138,10 +187,17 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     // Plan §1.4 specifies the fallback; aborting was the wrong reading.
     let mut plan = plan;
     let chunked = plan.workers.and_then(|workers| {
-        match fluree_graph_turtle::splitter::chunk_in_memory(
+        // Its own lane. This is a whole-document single-threaded pass that runs
+        // before the first worker starts, so it is the parallel path's Amdahl
+        // term — and while it had no lane it landed in `unattributed_ns`, where
+        // it went unnoticed at 43% of the wall.
+        timings.enter(Phase::Chunk);
+        let split = fluree_graph_turtle::splitter::chunk_in_memory(
             &loaded.text,
             ParallelConfig::for_input(workers, loaded.text.len()).chunk_bytes,
-        ) {
+        );
+        timings.enter(Phase::Parse);
+        match split {
             Ok(split) => Some((workers, split)),
             Err(e) => {
                 plan = ParallelPlan::serial(match e {
@@ -150,13 +206,11 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
                     }
                     _ => "the input could not be split into chunks",
                 });
-                if !quiet {
-                    eprintln!(
-                        "{} {} — converting serially",
-                        "note:".cyan().bold(),
-                        plan.reason
-                    );
-                }
+                prose.courtesy(format_args!(
+                    "{} {} — converting serially",
+                    "note:".cyan().bold(),
+                    plan.reason
+                ));
                 None
             }
         }
@@ -230,7 +284,7 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
         .map_err(|e| CliError::Usage(format!("sink error: {e}")))?;
 
     if let Some(err) = &run.outcome.error {
-        report_parse_failure(&loaded, err, stats);
+        report_parse_failure(&loaded, err, stats.statements);
         rdf::report_run(common, "convert", &loaded, &run.outcome, &timings, wall)?;
         return Err(exit_document_invalid());
     }
@@ -251,19 +305,14 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     }
 
     // A summary on the way to a file is useful; the same line beside piped
-    // data is noise. And under `--profile=json` stderr is not a place for
-    // prose at all — `2> run.json` is the bench lane's idiom, and one ✓ line
-    // ahead of the document makes the file unparseable.
-    let stderr_is_a_document = common.profile == Some(crate::rdf::profile::ProfileFormat::Json);
-    if !quiet && !stderr_is_a_document {
-        if let Some(path) = args.output {
-            eprintln!(
-                "{} {} statements → {} ({target})",
-                "✓".green(),
-                stats.statements,
-                path.display(),
-            );
-        }
+    // data is noise.
+    if let Some(path) = args.output {
+        prose.courtesy(format_args!(
+            "{} {} statements → {} ({target})",
+            "✓".green(),
+            stats.statements,
+            path.display(),
+        ));
     }
     Ok(())
 }
@@ -298,7 +347,9 @@ fn run_parallel(
         &loaded.text,
         common.base.as_deref(),
         &mut out,
+        loaded.resolved.syntax,
         target,
+        rdf::verb_options(common.nocheck),
         writer_config,
         config,
         ranges,
@@ -347,18 +398,12 @@ fn run_parallel(
     flushed.map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
 
     if let Some(err) = &outcome.error {
-        let d = diagnostic::from_turtle_error(err, &loaded.text);
-        eprintln!(
-            "{} {}: {}",
-            "error:".red().bold(),
-            loaded.input.display(),
-            d.message
-        );
-        eprintln!(
-            "  wrote {} statement(s) before the document stopped parsing — the output is a \
-             prefix of the conversion, not the whole of it",
-            outcome.statements
-        );
+        // The same report the serial path gives, from the same function. It
+        // used to be a second copy that omitted the position, so one document
+        // failed with `file.ttl:120002:19:` at `--parallelism 1` and a bare
+        // `file.ttl:` at 8 — a difference in the diagnostic caused by a flag
+        // that is documented never to be a correctness decision.
+        report_parse_failure(loaded, err, outcome.statements);
         return Err(exit_document_invalid());
     }
 
@@ -388,16 +433,14 @@ fn run_parallel(
         rdf::count::print_timing(wall, outcome.statements, loaded.text.len() as u64);
     }
 
-    if !quiet && common.profile != Some(crate::rdf::profile::ProfileFormat::Json) {
-        if let Some(path) = args.output {
-            eprintln!(
-                "{} {} statements → {} ({target}, {workers} workers, {} chunks)",
-                "✓".green(),
-                outcome.statements,
-                path.display(),
-                outcome.chunks,
-            );
-        }
+    if let Some(path) = args.output {
+        Prose::new(common, quiet).courtesy(format_args!(
+            "{} {} statements → {} ({target}, {workers} workers, {} chunks)",
+            "✓".green(),
+            outcome.statements,
+            path.display(),
+            outcome.chunks,
+        ));
     }
     Ok(())
 }
@@ -440,8 +483,13 @@ fn run_recovering(
     let mut sink = crate::rdf::recover::PrefixRecorder::new(writer);
 
     timings.enter(Phase::Parse);
-    let recovery =
-        crate::rdf::recover::parse_recovering(&loaded.text, common.base.as_deref(), &mut sink);
+    let recovery = crate::rdf::recover::parse_recovering(
+        &loaded.text,
+        loaded.resolved.syntax,
+        common.base.as_deref(),
+        rdf::verb_options(common.nocheck),
+        &mut sink,
+    );
     timings.finish();
     let recovery = recovery?;
 
@@ -474,15 +522,36 @@ fn run_recovering(
     flushed.map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
     finished.map_err(|e| CliError::Usage(format!("sink error: {e}")))?;
 
-    // Every skip, in document order, before the summary — unless stderr is
-    // carrying a JSON document, in which case the count travels inside it.
-    let human_stderr = common.profile != Some(crate::rdf::profile::ProfileFormat::Json);
-    for d in recovery.skipped.iter().filter(|_| human_stderr) {
+    // Every skip, in document order, before the summary. A diagnostic rather
+    // than a courtesy: `-q` does not silence it, because a run that dropped
+    // statements must say so however quietly it was asked to work.
+    let prose = Prose::new(common, quiet);
+    for d in &recovery.skipped {
         let where_ = match (d.line, d.column) {
             (Some(line), Some(column)) => format!("{}:{line}:{column}", loaded.input.display()),
             _ => loaded.input.display(),
         };
-        eprintln!("{} {where_}: {}", "skipped:".yellow().bold(), d.message);
+        prose.diagnostic(format_args!(
+            "{} {where_}: {}",
+            "skipped:".yellow().bold(),
+            d.message
+        ));
+    }
+
+    // A resync that ran past the failing line consumed the statement after it
+    // without parsing, diagnosing or counting it. The count above cannot be
+    // corrected — nothing parsed those bytes, so nothing knows how many
+    // statements they held — but staying silent about it is what made a run
+    // that lost three statements report two, with stderr byte-identical to the
+    // honest case. Its own line, so the honest case stays byte-stable.
+    for s in &recovery.swallowed {
+        prose.diagnostic(format_args!(
+            "{} resync consumed {} more byte(s) and resumed at line {} — content \
+             there was never parsed, so it is not in the count above",
+            "note:".cyan().bold(),
+            s.bytes,
+            s.resume_line,
+        ));
     }
 
     // Recovery is exactly when profiling matters — resync re-parses from each
@@ -513,35 +582,28 @@ fn run_recovering(
     }
 
     if recovery.is_clean() {
-        if !quiet {
-            if let Some(path) = args.output {
-                eprintln!(
-                    "{} {} statements → {} ({target})",
-                    "✓".green(),
-                    stats.statements,
-                    path.display(),
-                );
-            }
+        if let Some(path) = args.output {
+            prose.courtesy(format_args!(
+                "{} {} statements → {} ({target})",
+                "✓".green(),
+                stats.statements,
+                path.display(),
+            ));
         }
         return Ok(());
     }
 
-    // riot semantics: skipping is not success. The summary goes to stderr even
-    // under --quiet, because the one thing a script must not do is read a
-    // partial conversion as a whole one.
-    if common.profile == Some(crate::rdf::profile::ProfileFormat::Json) {
-        // stderr is carrying a JSON document; the skip count is in the exit
-        // code and the diagnostics already went out before it.
-        return Err(exit_document_invalid());
-    }
-    eprintln!(
+    // riot semantics: skipping is not success. A diagnostic, so it survives
+    // `--quiet` — and under `--profile=json` it is the exit code and the JSON
+    // that carry the count instead.
+    prose.diagnostic(format_args!(
         "{} {} statement(s) skipped, {} written → {}",
         "warning:".yellow().bold(),
         recovery.skipped.len(),
         stats.statements,
         args.output
             .map_or_else(|| "stdout".to_string(), |p| p.display().to_string()),
-    );
+    ));
     Err(exit_document_invalid())
 }
 
@@ -570,13 +632,21 @@ impl ParallelPlan {
         }
     }
 
-    /// Decide, from the flag, the output syntax, the input size and the label
+    /// Decide, from the flag, both syntaxes, the input size and the label
     /// policy.
     ///
-    /// The policy is a parameter rather than a check at the call site so a
-    /// second call site cannot be added that forgets it.
+    /// Both syntaxes, because they answer different questions and conflating
+    /// them was a correctness bug: `target` decides whether the OUTPUT can be
+    /// produced as concatenable fragments, `source` decides whether the INPUT
+    /// can be cut at Turtle statement boundaries at all. Only `target` was
+    /// consulted, so a `.trig` or `.jsonld` input above the threshold was
+    /// chunked as though it were Turtle.
+    ///
+    /// The policy is likewise a parameter rather than a check at the call site
+    /// so a second call site cannot be added that forgets it.
     pub fn decide(
         parallelism: usize,
+        source: RdfSyntax,
         target: RdfSyntax,
         input_len: usize,
         labels: BlankNodeLabels,
@@ -609,6 +679,12 @@ impl ParallelPlan {
             return Self {
                 workers: None,
                 reason: "--bnode-policy preserve requires serial label fidelity",
+            };
+        }
+        if !crate::rdf::parallel::can_chunk_input(source) {
+            return Self {
+                workers: None,
+                reason: "input syntax cannot be cut at statement boundaries",
             };
         }
         if !crate::rdf::parallel::can_run_parallel(target) {
@@ -845,10 +921,33 @@ fn is_broken_pipe(
     in_parse || at_finish || at_flush
 }
 
+/// Report a parse failure that stopped the conversion, for either path.
+///
+/// Shared rather than written twice: `statements` is a count rather than the
+/// serial path's [`WriterStats`](fluree_graph_format::WriterStats) precisely so
+/// the parallel path — which has no single writer to ask — can call it, instead
+/// of keeping a near-copy that drifted apart at the position.
+///
+/// # The one prose in this file that does not go through [`Prose`]
+///
+/// Deliberately, and it is a lesser-evil rather than a clean case. On the
+/// serial path a failed parse prints this and then emits the profile, so
+/// `--profile=json 2> run.json` on an invalid document produces prose ahead of
+/// the JSON — the same unparseable-stderr defect `Prose` exists to prevent.
+///
+/// Routing it through `diagnostic()` would fix the file and break the user:
+/// [`ProfileReport`] has no field for a parse failure, so the JSON says
+/// nothing about why the run stopped, and suppressing this line would leave
+/// exit 1 with no explanation anywhere. An unparseable file beats an
+/// unexplained one.
+///
+/// The real fix is a diagnostic field in the profile schema, after which this
+/// becomes a `diagnostic()` call like the rest. Until then the exception is
+/// written down rather than left to be rediscovered.
 fn report_parse_failure(
     loaded: &rdf::Loaded,
     err: &fluree_graph_turtle::TurtleError,
-    stats: WriterStats,
+    statements: u64,
 ) {
     let d = diagnostic::from_turtle_error(err, &loaded.text);
     let where_ = match (d.line, d.column) {
@@ -857,9 +956,8 @@ fn report_parse_failure(
     };
     eprintln!("{} {where_}: {}", "error:".red().bold(), d.message);
     eprintln!(
-        "  wrote {} statement(s) before the document stopped parsing — the output is a \
-         prefix of the conversion, not the whole of it",
-        stats.statements
+        "  wrote {statements} statement(s) before the document stopped parsing — the output \
+         is a prefix of the conversion, not the whole of it"
     );
 }
 
@@ -972,10 +1070,22 @@ mod tests {
         // Everything else says parallel: eight workers, a line-based syntax, an
         // input well over the threshold.
         let big = 64 * 1024 * 1024;
-        let relabel = ParallelPlan::decide(8, RdfSyntax::NTriples, big, BlankNodeLabels::Relabel);
+        let relabel = ParallelPlan::decide(
+            8,
+            RdfSyntax::Turtle,
+            RdfSyntax::NTriples,
+            big,
+            BlankNodeLabels::Relabel,
+        );
         assert_eq!(relabel.workers, Some(8));
 
-        let preserve = ParallelPlan::decide(8, RdfSyntax::NTriples, big, BlankNodeLabels::Preserve);
+        let preserve = ParallelPlan::decide(
+            8,
+            RdfSyntax::Turtle,
+            RdfSyntax::NTriples,
+            big,
+            BlankNodeLabels::Preserve,
+        );
         assert_eq!(preserve.workers, None);
         assert!(
             preserve.reason.contains("preserve"),
