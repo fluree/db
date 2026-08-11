@@ -50,6 +50,13 @@ ex:n3 a ex:C ; ex:rel ex:n4 .
 ex:n4 a ex:C .
 "#;
 
+/// Two datatypes under one predicate, so a datatype constraint on the object
+/// selects a strict subset of the column: 10 of 30.
+const DTC_DATA: &str = r#"
+<http://ex/i1> <http://ex/amount> "10"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://ex/i2> <http://ex/amount> "20"^^<http://www.w3.org/2001/XMLSchema#positiveInteger> .
+"#;
+
 /// Every fast-path site that answers from per-predicate or whole-permutation
 /// metadata, and therefore may serve only a triple whose subject and object are
 /// distinct free variables. Names are the `FastPathOperator` labels the engine
@@ -309,11 +316,11 @@ impl Drop for FastPathGuard {
     }
 }
 
-async fn indexed_ledger(dir: &TempDir, name: &str) -> (fluree_db_api::Fluree, String) {
+async fn indexed_ledger(dir: &TempDir, name: &str, ttl: &str) -> (fluree_db_api::Fluree, String) {
     let data_dir = TempDir::new().expect("data tmpdir");
     let path = data_dir.path().join("00-fixture.ttl");
     let mut f = std::fs::File::create(&path).expect("create ttl");
-    f.write_all(DATA.as_bytes()).expect("write ttl");
+    f.write_all(ttl.as_bytes()).expect("write ttl");
 
     // Bulk import builds a fully persisted binary index with no trailing
     // novelty, so `fast_path_store` holds and the detectors actually fire.
@@ -345,7 +352,7 @@ async fn repeated_variable_patterns_decline_the_aggregate_fast_paths() {
     let _guard = FastPathGuard;
 
     let db_dir = TempDir::new().expect("db tmpdir");
-    let (fluree, ledger_id) = indexed_ledger(&db_dir, "repeated-var-guards").await;
+    let (fluree, ledger_id) = indexed_ledger(&db_dir, "repeated-var-guards", DATA).await;
     let ledger = fluree.ledger(&ledger_id).await.expect("load");
     let cases = cases();
 
@@ -444,6 +451,104 @@ async fn repeated_variable_patterns_decline_the_aggregate_fast_paths() {
                     ));
                 }
             }
+        }
+    }
+
+    // ---- The datatype-constrained SUM --------------------------------------
+    // Routing `detect_fused_scan_sum_i64` through `validate_simple_triple` also
+    // inherits that helper's `tp.dtc.is_some()` decline, which the SUM detector
+    // never had of its own: it read only the predicate and the object var, so a
+    // datatype-constrained SUM took the fused scan and summed the predicate's
+    // whole object column across every datatype under it.
+    //
+    // A datatype constraint alongside a *variable* object has no SPARQL
+    // surface — it is the JSON-LD `{"@value": "?v", "@type": …}` form — so this
+    // runs on its own tiny ledger with two datatypes under one predicate.
+    // `xsd:positiveInteger` is chosen because it survives numeric-datatype
+    // normalization; `xsd:long` and friends fold into `xsd:integer` and would
+    // make the constraint a no-op.
+    {
+        let db_dir = TempDir::new().expect("db tmpdir");
+        let (fluree, ledger_id) = indexed_ledger(&db_dir, "dtc-sum", DTC_DATA).await;
+        let ledger = fluree.ledger(&ledger_id).await.expect("load");
+
+        let constrained = serde_json::json!({
+            "@context": {"ex": "http://ex/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+            "select": ["(as (sum ?v) ?n)"],
+            "where": {"@id": "?s", "ex:amount": {"@value": "?v", "@type": "xsd:integer"}}
+        });
+
+        let (store, tracing_guard) = span_capture::init_test_tracing();
+        set_fast_paths_disabled(false);
+        let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
+        let fast = match fluree.query(&db, &constrained).await {
+            Ok(r) => match r.to_sparql_json(&ledger.snapshot) {
+                Ok(json) => summarize(&json),
+                Err(e) => format!("ERR:{e}"),
+            },
+            Err(e) => format!("ERR:{e}"),
+        };
+        let dtc_sites: Vec<String> = store
+            .find_events("fast-path outcome")
+            .iter()
+            .filter(|e| e.fields.get("outcome").map(String::as_str) == Some("proceed"))
+            .filter_map(|e| e.fields.get("site").cloned())
+            .collect();
+
+        // Must-fire control on the same ledger: drop the constraint and the
+        // fused scan is entitled to the whole column again. Without it, a fix
+        // that disabled the detector outright would pass everything above.
+        let before = store.find_events("fast-path outcome").len();
+        let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
+        let unconstrained = match fluree
+            .query(
+                &db,
+                "SELECT (SUM(?v) AS ?n) WHERE { ?s <http://ex/amount> ?v }",
+            )
+            .await
+        {
+            Ok(r) => match r.to_sparql_json(&ledger.snapshot) {
+                Ok(json) => summarize(&json),
+                Err(e) => format!("ERR:{e}"),
+            },
+            Err(e) => format!("ERR:{e}"),
+        };
+        let plain_sites: Vec<String> = store.find_events("fast-path outcome")[before..]
+            .iter()
+            .filter(|e| e.fields.get("outcome").map(String::as_str) == Some("proceed"))
+            .filter_map(|e| e.fields.get("site").cloned())
+            .collect();
+        drop(tracing_guard);
+
+        if fast != "n=10" {
+            failures.push(format!(
+                "datatype-constrained SUM: got {fast}, expected n=10 — the \
+                 constraint selects only the xsd:integer row [proceeded: \
+                 {dtc_sites:?}]"
+            ));
+        }
+        let bad: Vec<&String> = dtc_sites
+            .iter()
+            .filter(|s| GUARDED_SITES.contains(&s.as_str()))
+            .collect();
+        if !bad.is_empty() {
+            failures.push(format!(
+                "datatype-constrained SUM: metadata fast path {bad:?} proceeded \
+                 on a triple carrying a datatype constraint it cannot honour"
+            ));
+        }
+        if unconstrained != "n=30" {
+            failures.push(format!(
+                "CTRL unconstrained SUM on the same ledger: got {unconstrained}, \
+                 expected n=30"
+            ));
+        }
+        if !plain_sites.iter().any(|s| s == "SUM(?o)") {
+            failures.push(format!(
+                "CTRL unconstrained SUM: expected site `SUM(?o)` to proceed — \
+                 the dtc decline must narrow the detector, not disable it \
+                 [proceeded: {plain_sites:?}]"
+            ));
         }
     }
 
