@@ -300,6 +300,14 @@ impl SourcePolicyOverride {
     /// Check if this override specifies any policy fields.
     ///
     /// Returns true if at least one policy field is set.
+    ///
+    /// Deliberately broader than [`GovernanceOptions::has_any_policy_inputs`],
+    /// which counts only `Some(true)` for `default_allow`: an override naming
+    /// only `default_allow: false` *is* an override and must be applied, even
+    /// though it does not by itself request enforcement. The two predicates
+    /// disagreeing is safe only because `merge_policy_opts` fills config into a
+    /// genuine unset rather than over an explicit value — see the precedence
+    /// note there before changing either one.
     pub fn has_policy(&self) -> bool {
         self.identity.is_some()
             || self.policy_class.is_some()
@@ -320,6 +328,9 @@ impl SourcePolicyOverride {
             policy_values: self.policy_values.clone(),
             // Already tri-state here; it used to collapse to `false` at this
             // boundary, which is the same lost-unset bug one scope down.
+            // Carrying it through is only half the fix — the explicit value
+            // then has to survive `merge_policy_opts`, which it does because
+            // config fills unset rather than overwriting.
             default_allow: self.default_allow,
         }
     }

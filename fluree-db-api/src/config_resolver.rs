@@ -336,11 +336,16 @@ pub fn configured_fulltext_properties_for_indexer(
 ///
 /// Algorithm:
 /// 1. No config policy → return opts unchanged
-/// 2. Query specifies policy → check override control:
-///    - Permitted → keep query opts, but still fill fields the request left
-///      unset (`default_allow: None`) from config
-///    - Denied → log warning, apply config defaults
-/// 3. No query policy → apply config defaults
+/// 2. Override control denies a policy-carrying request → log warning and let
+///    config *force* its values over the request's (the documented truth table)
+/// 3. Otherwise → config fills only what the request left genuinely unset;
+///    `policy_class` additionally applies only when the request carried no
+///    policy inputs at all, preserving the pre-tri-state behavior
+///
+/// The distinction that matters for `default_allow`: `None` means the caller
+/// never spoke, so config governs; `Some(v)` is an explicit request value and
+/// survives, because the only thing entitled to overrule an explicit caller
+/// value is override control saying so.
 pub fn merge_policy_opts(
     resolved: &ResolvedConfig,
     opts: &GovernanceOptions,
@@ -353,37 +358,44 @@ pub fn merge_policy_opts(
 
     // Does the query specify any policy inputs?
     let query_has_policy = opts.has_any_policy_inputs();
+    let override_denied =
+        query_has_policy && !policy.override_control.permits_override(server_identity);
 
-    if query_has_policy {
-        // Check if override is permitted
-        if policy.override_control.permits_override(server_identity) {
-            // The request's own policy inputs stand — but "carries an identity"
-            // is not an override of `f:defaultAllow`. Only an explicit
-            // `Some(v)` is; `None` means the caller never spoke, so the
-            // ledger's configured default still applies.
-            let mut merged = opts.clone();
-            if merged.default_allow.is_none() {
-                merged.default_allow = policy.default_allow;
-            }
-            return merged;
-        }
+    let mut merged = opts.clone();
+
+    if override_denied {
         tracing::warn!(
             server_identity,
             "Query-time policy override denied by config override control — applying config defaults"
         );
+
+        // Config wins outright, including over an explicit request value.
+        if let Some(default_allow) = policy.default_allow {
+            merged.default_allow = Some(default_allow);
+        }
+        if let Some(ref classes) = policy.policy_class {
+            merged.policy_class = Some(classes.clone());
+        }
+        return merged;
     }
 
-    // Apply config defaults
-    let mut merged = opts.clone();
-
-    // Apply default_allow from config (config says deny-by-default)
-    if let Some(default_allow) = policy.default_allow {
-        merged.default_allow = Some(default_allow);
+    // Config fills only a genuine unset. An explicit `Some(false)` reaches here
+    // via a request that carries no *other* policy input (a per-source
+    // `SourcePolicyOverride` naming only `default_allow: false` is exactly that
+    // shape, since `has_any_policy_inputs` counts only `Some(true)`), and it
+    // must not be clobbered by config's `f:defaultAllow true`.
+    if merged.default_allow.is_none() {
+        merged.default_allow = policy.default_allow;
     }
 
-    // Apply policy_class from config
-    if let Some(ref classes) = policy.policy_class {
-        merged.policy_class = Some(classes.clone());
+    // policy_class stays request-first: config supplies it only when the request
+    // carried no policy inputs at all. Widening this to "fill when unset" would
+    // start applying config's f:policyClass to identity-carrying requests on the
+    // local path, which it never has — see the note in fluree_ext.rs::wrap_policy.
+    if !query_has_policy {
+        if let Some(ref classes) = policy.policy_class {
+            merged.policy_class = Some(classes.clone());
+        }
     }
 
     // policy_source (GraphSourceRef) is resolved to graph IDs by the caller
@@ -2480,11 +2492,16 @@ mod tests {
         assert!(explicit_true.has_any_policy_inputs());
     }
 
-    /// An anonymous request carries no policy inputs, so it lands on the
-    /// config-defaults path — where an explicit `Some(false)` from the request
-    /// is still overwritten by config, as before.
+    /// An explicit `Some(false)` survives even though it carries no *other*
+    /// policy input and so lands on the config-defaults path.
+    ///
+    /// This is the shape a per-source `SourcePolicyOverride` takes when it names
+    /// only `default_allow: false`: `SourcePolicyOverride::has_policy()` counts
+    /// `is_some()` so the override is applied, but `has_any_policy_inputs()`
+    /// counts only `Some(true)` so the merge sees "no policy inputs". Config
+    /// must fill genuine unset, not overwrite an explicit caller value.
     #[test]
-    fn config_overwrites_explicit_false_on_the_no_policy_input_path() {
+    fn explicit_false_survives_the_no_policy_input_path() {
         let resolved = ResolvedConfig {
             policy: Some(PolicyDefaults {
                 default_allow: Some(true),
@@ -2498,7 +2515,62 @@ mod tests {
         };
         assert_eq!(
             merge_policy_opts(&resolved, &opts, None).default_allow,
-            Some(true)
+            Some(false),
+            "config f:defaultAllow true must not clobber an explicit request false"
+        );
+    }
+
+    /// The same shape as it actually arrives: through
+    /// `SourcePolicyOverride::to_query_connection_options()`.
+    #[test]
+    fn per_source_override_of_only_default_allow_false_survives_config() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let override_opts = crate::dataset::SourcePolicyOverride {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            override_opts.has_policy(),
+            "an override naming only default_allow is still an override"
+        );
+
+        let opts = override_opts.to_query_connection_options();
+        assert!(
+            !opts.has_any_policy_inputs(),
+            "precondition: Some(false) is not a policy input, so this lands on \
+             the config-defaults path"
+        );
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts, None).default_allow,
+            Some(false)
+        );
+    }
+
+    /// Override control still overrules an explicit request value — that is the
+    /// one thing entitled to, and the documented truth table.
+    #[test]
+    fn override_control_none_still_forces_config_over_explicit_request() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts, None).default_allow,
+            Some(false)
         );
     }
 
