@@ -1004,7 +1004,7 @@ pub async fn run(
                         } else {
                             // Rare fallback: GROUP BY produces grouped bindings requiring
                             // disaggregation, so fall back to the existing JSON-based formatter.
-                            let formatted_json = result.to_sparql_json(&view.snapshot)?;
+                            let formatted_json = cli_sparql_json(&result, &view.snapshot)?;
                             let output = output::format_result(
                                 &formatted_json,
                                 OutputFormatKind::Table,
@@ -1017,8 +1017,11 @@ pub async fn run(
                     }
                     detect::QueryFormat::JsonLd => {
                         // JSON-LD can be nested; keep bench output in the lightweight TSV form.
-                        let (text, total_rows) =
-                            result.to_tsv_limited(&view.snapshot, BENCH_ROWS)?;
+                        let (text, total_rows) = result.to_delimited_limited(
+                            &view.snapshot,
+                            BENCH_ROWS,
+                            &cli_delimited_config(OutputFormatKind::Tsv),
+                        )?;
                         print!("{text}");
                         print_footer(total_rows, Some(BENCH_ROWS), elapsed);
                     }
@@ -1027,11 +1030,8 @@ pub async fn run(
                 // Delimited fast path: write bytes directly to stdout (no JSON intermediate).
                 let total_rows = result.row_count();
                 let fmt_timer = Instant::now();
-                let bytes = if output_format == OutputFormatKind::Tsv {
-                    result.to_tsv_bytes(&view.snapshot)?
-                } else {
-                    result.to_csv_bytes(&view.snapshot)?
-                };
+                let bytes = result
+                    .to_delimited_bytes(&view.snapshot, &cli_delimited_config(output_format))?;
                 let fmt_elapsed = fmt_timer.elapsed();
                 use std::io::Write;
                 std::io::stdout().write_all(&bytes)?;
@@ -1125,7 +1125,7 @@ pub async fn run(
                     result.format_async(view.as_graph_db_ref(), &config).await?
                 } else {
                     match query_format {
-                        detect::QueryFormat::Sparql => result.to_sparql_json(&view.snapshot)?,
+                        detect::QueryFormat::Sparql => cli_sparql_json(&result, &view.snapshot)?,
                         detect::QueryFormat::JsonLd => {
                             result.to_jsonld_async(view.as_graph_db_ref()).await?
                         }
@@ -1498,11 +1498,8 @@ async fn run_cypher_query(
     // Delimited fast path mirrors the SPARQL/JSON-LD handler.
     if matches!(output_format, OutputFormatKind::Tsv | OutputFormatKind::Csv) {
         let total_rows = result.row_count();
-        let bytes = if output_format == OutputFormatKind::Tsv {
-            result.to_tsv_bytes(&view.snapshot)?
-        } else {
-            result.to_csv_bytes(&view.snapshot)?
-        };
+        let bytes =
+            result.to_delimited_bytes(&view.snapshot, &cli_delimited_config(output_format))?;
         use std::io::Write;
         std::io::stdout().write_all(&bytes)?;
         eprintln!(
@@ -1735,6 +1732,46 @@ fn reject_graph_source_unsupported(
     Ok(())
 }
 
+/// The SPARQL-JSON config the CLI renders with.
+///
+/// The CLI is a display surface: its output is read by a human in a terminal or
+/// piped into a shell one-liner, and the query's own PREFIX declarations are
+/// right there on screen to expand a CURIE with. So it deliberately opts out of
+/// the W3C absolute-IRI profile that the HTTP/API surfaces serialize under
+/// (issue #45) and keeps the abbreviated form issue #1466 established.
+///
+/// Every CLI call site that reaches a W3C writer goes through this (or
+/// [`cli_delimited_config`]) so the deviation is a visible decision, not a
+/// default it inherited.
+fn cli_sparql_json_config() -> fluree_db_api::FormatterConfig {
+    fluree_db_api::FormatterConfig::sparql_json().with_compact_iris()
+}
+
+/// The CSV/TSV config the CLI renders with — same rationale as
+/// [`cli_sparql_json_config`].
+fn cli_delimited_config(output_format: OutputFormatKind) -> fluree_db_api::FormatterConfig {
+    let config = if output_format == OutputFormatKind::Csv {
+        fluree_db_api::FormatterConfig::csv()
+    } else {
+        fluree_db_api::FormatterConfig::tsv()
+    };
+    config.with_compact_iris()
+}
+
+/// Format a result as SPARQL JSON for CLI display (compacted; see
+/// [`cli_sparql_json_config`]).
+fn cli_sparql_json(
+    result: &fluree_db_api::QueryResult,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+) -> Result<serde_json::Value, CliError> {
+    Ok(fluree_db_api::format::format_results(
+        result,
+        &result.context,
+        snapshot,
+        &cli_sparql_json_config(),
+    )?)
+}
+
 /// Build the formatter config for the JSON-returning graph-source / connection
 /// paths from the requested output format.
 fn json_path_formatter_config(
@@ -1745,7 +1782,7 @@ fn json_path_formatter_config(
     match output_format {
         OutputFormatKind::TypedJson => fluree_db_api::FormatterConfig::typed_json(),
         _ => match query_format {
-            detect::QueryFormat::Sparql => fluree_db_api::FormatterConfig::sparql_json(),
+            detect::QueryFormat::Sparql => cli_sparql_json_config(),
             detect::QueryFormat::JsonLd => {
                 let config = fluree_db_api::FormatterConfig::jsonld();
                 if normalize_arrays {
@@ -1961,8 +1998,9 @@ async fn connection_query_local(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_time_suffix_preserving_fragment, base_ledger_id, format_tally_suffix,
-        inject_sparql_from_before_where, json_path_display_format, jsonld_from_targets,
+        attach_time_suffix_preserving_fragment, base_ledger_id, cli_delimited_config,
+        cli_sparql_json_config, format_tally_suffix, inject_sparql_from_before_where,
+        json_path_display_format, json_path_formatter_config, jsonld_from_targets,
         query_targets_foreign_source, reject_graph_source_unsupported,
     };
     use crate::detect::QueryFormat;
@@ -2018,6 +2056,25 @@ mod tests {
             format_tally_suffix(None, None, Some(&empty), None, POLICY_ONLY),
             ""
         );
+    }
+
+    /// #1466: the CLI renders SPARQL results with CURIEs, opting out of the
+    /// W3C absolute-IRI profile the API/HTTP surfaces use (#45). Pinned here so
+    /// the deviation cannot be lost to a default change.
+    #[test]
+    fn cli_display_configs_compact_iris() {
+        assert!(!cli_sparql_json_config().absolute_iris);
+        for fmt in [OutputFormatKind::Csv, OutputFormatKind::Tsv] {
+            assert!(!cli_delimited_config(fmt).absolute_iris, "{fmt}");
+        }
+        // ...including the graph-source / connection path, which builds its
+        // config separately.
+        assert!(
+            !json_path_formatter_config(QueryFormat::Sparql, OutputFormatKind::Json, false)
+                .absolute_iris
+        );
+        // The W3C constructors themselves are unchanged (absolute).
+        assert!(fluree_db_api::FormatterConfig::sparql_json().absolute_iris);
     }
 
     #[test]

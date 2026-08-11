@@ -51,7 +51,7 @@ async fn seed(fluree: &support::MemoryFluree, ledger_id: &str) -> LedgerState {
 async fn policy_ctx(ledger: &LedgerState, policies: JsonValue) -> fluree_db_policy::PolicyContext {
     let qc_opts = GovernanceOptions {
         policy: Some(policies),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     policy_builder::build_policy_context_from_opts(
@@ -422,7 +422,7 @@ async fn legacy_modify_class_semantics_preserved() {
     }]);
     let qc_opts = GovernanceOptions {
         policy: Some(policies),
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let ctx = policy_builder::build_policy_context_from_opts(
@@ -495,7 +495,7 @@ async fn stored_verb_policy_via_policy_class() {
 
     let qc_opts = GovernanceOptions {
         policy_class: Some(vec!["http://example.org/ns/AppPolicy".to_string()]),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let ctx = policy_builder::build_policy_context_from_opts(
@@ -657,7 +657,7 @@ async fn post_state_condition_sees_staged_flakes() {
             "?$identity".to_string(),
             json!({"@id": "http://example.org/ns/apiUser"}),
         )])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
 
@@ -786,7 +786,7 @@ async fn scaffolder_write_profile_grants_class_ownership_only() {
     let qc_opts = GovernanceOptions {
         identity: Some("app-user@example.com".to_string()),
         policy_class: Some(vec![class.to_string()]),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let ctx = policy_builder::build_policy_context_from_opts(

@@ -741,10 +741,18 @@ impl Fluree {
             // The class-filter chain, identity contract (bind-only, never a
             // rule selector), and PolicyRules dispatch all live in the shared
             // helper so read and write paths can't drift. The config's
-            // policy_class is passed separately: merge_policy_opts returns
-            // the request opts unchanged when the request carries any policy
-            // input and override is permitted, so an identity-only request
-            // would otherwise never see the config's f:policyClass.
+            // policy_class is passed separately: merge_policy_opts keeps the
+            // request's own policy inputs when the request carries any and
+            // override is permitted, so an identity-only request would
+            // otherwise never see the config's f:policyClass.
+            //
+            // f:defaultAllow used to need the same sidecar and no longer does —
+            // it is tri-state, so merge_policy_opts fills an unset request from
+            // config. policy_class could follow, but folding it into the merge
+            // would also start applying config's f:policyClass to
+            // identity-carrying requests on the *local* path, which this sidecar
+            // never did. That is a behavior change, not a refactor; left alone
+            // deliberately.
             let config_policy_class = view
                 .resolved_config
                 .as_ref()

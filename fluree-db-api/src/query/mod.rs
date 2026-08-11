@@ -268,6 +268,10 @@ impl QueryResult {
     /// Format as SPARQL 1.1 Query Results JSON
     ///
     /// Returns W3C standard format with `{"head": {"vars": [...]}, "results": {"bindings": [...]}}`.
+    /// `uri` values are absolute IRIs — the format carries no prefix map, so a
+    /// CURIE in one could not be expanded back (issue #45). A display caller that
+    /// wants compaction formats with
+    /// `FormatterConfig::sparql_json().with_compact_iris()` instead.
     pub fn to_sparql_json(&self, snapshot: &LedgerSnapshot) -> format::Result<JsonValue> {
         let config = FormatterConfig::sparql_json();
         format::format_results(self, &self.context, snapshot, &config)
@@ -444,6 +448,47 @@ impl QueryResult {
     /// Format as CSV bytes with a row limit (for server benchmark/preview).
     ///
     /// Returns `(csv_bytes, total_row_count)`.
+    /// Format as TSV or CSV bytes under an explicit config (`config.format`
+    /// selects the delimiter).
+    ///
+    /// [`Self::to_csv_bytes`] and friends serialize the W3C `text/csv` /
+    /// `text/tab-separated-values` profile, with absolute IRIs. Reach for this
+    /// only to render for human display, passing
+    /// [`FormatterConfig::with_compact_iris`] to restore `@context` compaction
+    /// (the CLI's #1466 contract).
+    pub fn to_delimited_bytes(
+        &self,
+        snapshot: &LedgerSnapshot,
+        config: &FormatterConfig,
+    ) -> format::Result<Vec<u8>> {
+        let delimiter =
+            format::delimited::Delimiter::from_format(config.format).ok_or_else(|| {
+                format::FormatError::InvalidBinding(format!(
+                    "{:?} is not a delimited format",
+                    config.format
+                ))
+            })?;
+        format::delimited::format_bytes(self, snapshot, delimiter, config)
+    }
+
+    /// Row-limited [`Self::to_delimited_bytes`], as a string. Returns
+    /// `(text, total_row_count)`.
+    pub fn to_delimited_limited(
+        &self,
+        snapshot: &LedgerSnapshot,
+        limit: usize,
+        config: &FormatterConfig,
+    ) -> format::Result<(String, usize)> {
+        let delimiter =
+            format::delimited::Delimiter::from_format(config.format).ok_or_else(|| {
+                format::FormatError::InvalidBinding(format!(
+                    "{:?} is not a delimited format",
+                    config.format
+                ))
+            })?;
+        format::delimited::format_limited(self, snapshot, delimiter, limit, config)
+    }
+
     pub fn to_csv_bytes_limited(
         &self,
         snapshot: &LedgerSnapshot,

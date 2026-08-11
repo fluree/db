@@ -75,7 +75,8 @@ pub struct ResolvedConfig {
 pub struct PolicyDefaults {
     /// `f:defaultAllow` — whether to permit access when no policy rule
     /// matches. `None` means unconfigured, in which case the request's own
-    /// `default-allow` governs and that defaults to **false** (fail-closed).
+    /// (also tri-state) `default-allow` governs; unset on both sides resolves
+    /// fail-closed to **false**.
     ///
     /// Note this is only ever consulted for a request that carries policy
     /// inputs (an identity, a policy class, or an inline policy). A request

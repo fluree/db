@@ -50,7 +50,11 @@ pub struct FlureeHeaders {
 
     /// Default-allow flag — when true, permit access in the absence of matching
     /// policy rules. Delivered via the `fluree-default-allow` header.
-    pub default_allow: bool,
+    ///
+    /// Tri-state, mirroring `GovernanceOptions::default_allow`: `None` when the
+    /// header is absent, so the ledger's configured `f:defaultAllow` applies;
+    /// `Some(v)` when the caller sent it, which overrides config.
+    pub default_allow: Option<bool>,
 
     /// Enable all metadata tracking
     pub track_meta: bool,
@@ -87,7 +91,7 @@ impl Default for FlureeHeaders {
             policy: None,
             policy_class: Vec::new(),
             policy_values: None,
-            default_allow: false,
+            default_allow: None,
             track_meta: false,
             track_fuel: false,
             track_time: false,
@@ -162,7 +166,7 @@ impl FlureeHeaders {
         }
 
         // Boolean headers (presence or "true" value)
-        fluree_headers.default_allow = is_header_truthy(headers, Self::DEFAULT_ALLOW);
+        fluree_headers.default_allow = header_bool_opt(headers, Self::DEFAULT_ALLOW);
         fluree_headers.track_meta = is_header_truthy(headers, Self::TRACK_META);
         fluree_headers.track_fuel =
             fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_FUEL);
@@ -419,12 +423,13 @@ impl FlureeHeaders {
             );
         }
 
-        if self.default_allow
-            && !opts.contains_key("default-allow")
-            && !opts.contains_key("default_allow")
-            && !opts.contains_key("defaultAllow")
-        {
-            opts.insert("default-allow".to_string(), JsonValue::Bool(true));
+        if let Some(default_allow) = self.default_allow {
+            if !opts.contains_key("default-allow")
+                && !opts.contains_key("default_allow")
+                && !opts.contains_key("defaultAllow")
+            {
+                opts.insert("default-allow".to_string(), JsonValue::Bool(default_allow));
+            }
         }
 
         if let Some(max_fuel) = self.max_fuel {
@@ -474,6 +479,21 @@ fn is_header_truthy(headers: &HeaderMap, name: &str) -> bool {
     }
 }
 
+/// Tri-state read of a boolean header: `None` when absent, `Some(truthy)` when
+/// present. Used where "the caller didn't say" must stay distinct from "the
+/// caller said false".
+///
+/// Truthiness is byte-for-byte [`is_header_truthy`]'s: `true`, `1`, **or empty**.
+/// The empty case is deliberate and shared with every other boolean Fluree
+/// header — `fluree-track-meta:` with no value means "on" — so a bare
+/// `fluree-default-allow:` reads as `Some(true)`, not as absent and not as
+/// false. Only a present, non-empty, unrecognized value (`0`, `no`, `nonsense`)
+/// reads as `Some(false)`.
+fn header_bool_opt(headers: &HeaderMap, name: &str) -> Option<bool> {
+    get_header_str(headers, name)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1" || v.is_empty())
+}
+
 /// Axum extractor implementation
 #[axum::async_trait]
 impl<S> FromRequestParts<S> for FlureeHeaders
@@ -492,7 +512,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::FlureeHeaders;
+    use super::{FlureeHeaders, JsonValue};
     use axum::http::HeaderMap;
 
     #[test]
@@ -552,5 +572,65 @@ mod tests {
         let err = FlureeHeaders::from_headers(&headers).unwrap_err();
 
         assert!(err.to_string().contains("fluree-min-t"));
+    }
+
+    fn default_allow_for(value: Option<&str>) -> Option<bool> {
+        let mut headers = HeaderMap::new();
+        if let Some(v) = value {
+            headers.insert(FlureeHeaders::DEFAULT_ALLOW, v.parse().unwrap());
+        }
+        FlureeHeaders::from_headers(&headers).unwrap().default_allow
+    }
+
+    /// The header is tri-state: absent leaves the ledger's `f:defaultAllow`
+    /// free to apply, present is an override in whichever direction it names.
+    #[test]
+    fn default_allow_header_is_tri_state() {
+        assert_eq!(default_allow_for(None), None);
+        assert_eq!(default_allow_for(Some("true")), Some(true));
+        assert_eq!(default_allow_for(Some("1")), Some(true));
+        assert_eq!(default_allow_for(Some("")), Some(true));
+        assert_eq!(default_allow_for(Some("false")), Some(false));
+        assert_eq!(
+            default_allow_for(Some("nonsense")),
+            Some(false),
+            "unrecognized values fail closed rather than reading as absent"
+        );
+    }
+
+    /// Header injection carries the caller's explicit `false` into body opts, so
+    /// it stays distinguishable from "never said" downstream.
+    #[test]
+    fn injects_explicit_default_allow_into_opts() {
+        for (header, expected) in [("true", true), ("false", false)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(FlureeHeaders::DEFAULT_ALLOW, header.parse().unwrap());
+            let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+            let mut opts = serde_json::Map::new();
+            parsed.inject_into_opts(&mut opts);
+
+            assert_eq!(opts.get("default-allow"), Some(&JsonValue::Bool(expected)));
+        }
+
+        // Absent header injects nothing at all.
+        let parsed = FlureeHeaders::from_headers(&HeaderMap::new()).unwrap();
+        let mut opts = serde_json::Map::new();
+        parsed.inject_into_opts(&mut opts);
+        assert!(!opts.contains_key("default-allow"));
+    }
+
+    /// Body opts still win over headers.
+    #[test]
+    fn body_opts_default_allow_beats_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::DEFAULT_ALLOW, "true".parse().unwrap());
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        let mut opts = serde_json::Map::new();
+        opts.insert("default-allow".to_string(), JsonValue::Bool(false));
+        parsed.inject_into_opts(&mut opts);
+
+        assert_eq!(opts.get("default-allow"), Some(&JsonValue::Bool(false)));
     }
 }
