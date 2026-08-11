@@ -227,11 +227,18 @@ fn build_exists_semijoin_cache(
         if !schema_vars.contains(&sv) {
             continue;
         }
-        // The object var is fed by an outer pattern, so this EXISTS asks about
-        // one specific object rather than "any object". The subject-set key
-        // cannot express that, and the per-row guard in
-        // `try_eval_simple_exists_semijoin` would decline every row anyway —
-        // skip the entry so the PSOT scan below is never paid for.
+        // An object var an outer pattern can bind makes this EXISTS ask about
+        // one specific object, which the subject-set key cannot express.
+        //
+        // This is deliberately more conservative than the per-row guard in
+        // `try_eval_simple_exists_semijoin`, which declines only rows where the
+        // var is actually bound: a var in the schema may still be unbound in a
+        // given row (an unmatched OPTIONAL), and those rows would take the
+        // semijoin. Cache-build time has no per-row bindings to consult, so the
+        // choice is between skipping the entry and speculatively paying a PSOT
+        // scan for rows that may all decline. Skipping is the better trade, and
+        // it costs only performance — the per-row guard is what keeps the
+        // answer right.
         if schema_vars.contains(&ov) {
             continue;
         }
@@ -464,6 +471,13 @@ fn try_eval_simple_exists_semijoin(
     // a constant object but says nothing about a variable the current row has
     // already bound, and the cache key carries no object at all, so a
     // correlated object would silently be answered as "any object".
+    //
+    // Testing the row rather than the schema is not merely permissive, it is
+    // the correct reading: EXISTS substitutes only the bindings the row
+    // actually carries, so a variable left unbound by an unmatched OPTIONAL is
+    // a fresh free variable inside the subpattern. For those rows "does this
+    // subject have any object for this predicate" is exactly the question being
+    // asked, and the semijoin answers it.
     let Some(object_var) = tp.o.as_var() else {
         return Ok(None);
     };
