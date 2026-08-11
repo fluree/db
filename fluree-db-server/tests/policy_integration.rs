@@ -1731,3 +1731,206 @@ async fn cypher_write_under_employee_bearer_denied() {
         "expected exMessage in error; got: {err_msg}"
     );
 }
+
+// ── ledger-configured f:defaultAllow over real HTTP ───────────────────────────
+
+/// Creates a ledger with 3 documents, **no policies at all**, and a config graph
+/// declaring `f:defaultAllow <value>`.
+///
+/// Zero policies is the whole point: an identity-carrying request resolves to an
+/// empty restriction set, so `default_allow` alone decides what it sees.
+async fn setup_default_allow_config_ledger(
+    app: axum::Router,
+    ledger: &str,
+    configured_default_allow: bool,
+) -> axum::Router {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": ledger }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "create ledger");
+
+    let config_iri = format!("urn:fluree:{ledger}#config");
+    let trig = format!(
+        r#"
+        @prefix f:      <https://ns.flur.ee/db#> .
+        @prefix rdf:    <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix ex:     <http://example.org/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:doc1 rdf:type ex:Document ; schema:name "Public Post" ;
+                ex:classification "public" .
+        ex:doc2 rdf:type ex:Document ; schema:name "Internal Memo" ;
+                ex:classification "internal" .
+        ex:doc3 rdf:type ex:Document ; schema:name "Executive Salaries" ;
+                ex:classification "confidential" .
+
+        GRAPH <{config_iri}> {{
+            <urn:cfg:main> rdf:type f:LedgerConfig .
+            <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+            <urn:cfg:policy> f:defaultAllow {configured_default_allow} .
+        }}
+    "#
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/upsert/{ledger}"))
+                .header("content-type", "application/trig")
+                .body(Body::from(trig))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "seed data + config: {}",
+        resp.status()
+    );
+
+    app
+}
+
+/// Same document query as [`query_docs`], but `default-allow` is only present in
+/// `opts` when the caller names it — the unset case is the one that lets the
+/// ledger's `f:defaultAllow` govern, and it is unreachable through `query_docs`.
+async fn query_docs_tri_state(
+    app: axum::Router,
+    ledger: &str,
+    token: Option<&str>,
+    opts_default_allow: Option<bool>,
+    header_default_allow: Option<&str>,
+) -> (StatusCode, JsonValue) {
+    let mut opts = serde_json::Map::new();
+    if let Some(v) = opts_default_allow {
+        opts.insert("default-allow".to_string(), JsonValue::Bool(v));
+    }
+
+    let body = serde_json::json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "schema": "http://schema.org/"
+        },
+        "opts": JsonValue::Object(opts),
+        "select": ["?name", "?class"],
+        "where": [
+            {"@id": "?doc", "@type": "ex:Document"},
+            {"@id": "?doc", "schema:name": "?name"},
+            {"@id": "?doc", "ex:classification": "?class"}
+        ]
+    });
+
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/query/{ledger}"))
+        .header("content-type", "application/json");
+
+    if let Some(tok) = token {
+        req = req.header("authorization", format!("Bearer {tok}"));
+    }
+    if let Some(v) = header_default_allow {
+        req = req.header("fluree-default-allow", v);
+    }
+
+    let resp = app
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+
+    json_body(resp).await
+}
+
+/// The operator scenario, end to end over HTTP: a ledger configured
+/// `f:defaultAllow true` must apply to a request whose only policy signal is the
+/// identity the server injects from the Bearer token.
+///
+/// This is the seam the API-layer tests can't reach — `FlureeHeaders`, the
+/// header→opts injection, and `force_query_auth_opts` all sit between the wire
+/// and `merge_policy_opts`. Before the tri-state change this returned `[]`.
+#[tokio::test]
+async fn config_default_allow_true_applies_to_bearer_identity_over_http() {
+    let (_tmp, state) = policy_test_state().await;
+    let app =
+        setup_default_allow_config_ledger(build_router(state), "policy-cfg-allow:main", true).await;
+
+    let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/unknown-user",
+        "policy-cfg-allow:main",
+    );
+
+    let (status, json) =
+        query_docs_tri_state(app, "policy-cfg-allow:main", Some(&token), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let names = names_from_results(&json);
+    assert_eq!(
+        names.len(),
+        3,
+        "ledger f:defaultAllow true must govern an identity-only request; got: {names:?}"
+    );
+}
+
+/// The request still wins when it names `default-allow` explicitly — through
+/// body opts and through the `fluree-default-allow` header, which is the path
+/// `inject_into_opts` was restructured for.
+#[tokio::test]
+async fn explicit_request_default_allow_false_overrides_config_over_http() {
+    let (_tmp, state) = policy_test_state().await;
+    let app =
+        setup_default_allow_config_ledger(build_router(state), "policy-cfg-override:main", true)
+            .await;
+
+    let signing_key = SigningKey::from_bytes(&[10u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/unknown-user",
+        "policy-cfg-override:main",
+    );
+
+    // Body opts.
+    let (status, json) = query_docs_tri_state(
+        app.clone(),
+        "policy-cfg-override:main",
+        Some(&token),
+        Some(false),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names = names_from_results(&json);
+    assert!(
+        names.is_empty(),
+        "explicit opts default-allow:false must beat config true; got: {names:?}"
+    );
+
+    // Header, with no `default-allow` in the body at all.
+    let (status, json) = query_docs_tri_state(
+        app,
+        "policy-cfg-override:main",
+        Some(&token),
+        None,
+        Some("false"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names = names_from_results(&json);
+    assert!(
+        names.is_empty(),
+        "explicit fluree-default-allow:false header must beat config true; got: {names:?}"
+    );
+}
