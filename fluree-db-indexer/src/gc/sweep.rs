@@ -488,6 +488,23 @@ mod tests {
         assert_eq!(plan.scanned, 4, "3 roots plus the shared dict");
     }
 
+    /// Fail rather than pass vacuously when nothing was cached.
+    ///
+    /// With disk caching disabled every read falls through to storage, so the
+    /// cached and uncached paths become the same path and a test comparing
+    /// them proves nothing.
+    fn assert_cache_populated(cache_dir: &std::path::Path) {
+        let populated = std::fs::read_dir(cache_dir)
+            .map(|entries| entries.count() > 0)
+            .unwrap_or(false);
+        assert!(
+            populated,
+            "nothing was cached at {}; disk caching is disabled \
+             (FLUREE_DISK_CACHE_BUDGET_BYTES?) and this test would prove nothing",
+            cache_dir.display()
+        );
+    }
+
     /// A temp cache directory of this test's own, emptied before use so a
     /// previous run's entries cannot decide the outcome.
     fn empty_cache_dir(label: &str) -> std::path::PathBuf {
@@ -523,6 +540,7 @@ mod tests {
         let cached = plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
             .await
             .unwrap();
+        assert_cache_populated(&cache_dir);
 
         assert_eq!(cached.orphans, uncached.orphans);
         assert_eq!(cached.live, uncached.live);
@@ -560,6 +578,8 @@ mod tests {
         plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
             .await
             .unwrap();
+        assert_cache_populated(&cache_dir);
+
         let (oldest_root, oldest_manifest_addr) = &chain[0];
         let oldest_addr = candidate_addresses("memory", MAIN, oldest_root)[0].clone();
         storage.delete(&oldest_addr).await.unwrap();
