@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Internal benchmark tooling — never a release artifact.
+[package.metadata.dist]
+dist = false
+
 # Library + one small CLI (`bench-baseline`, capture/compare). No benches in
 # this crate — see <workspace>/BENCHMARKING.md and per-crate `benches/`.
 
