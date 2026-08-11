@@ -9501,3 +9501,227 @@ async fn indexed_values_bound_subject_through_type_anchor() {
         })
         .await;
 }
+
+/// Assert `sparql` plans as a *seeded* VALUES star, so the result assertions
+/// around it are actually exercising the batched-subject-probe lanes rather
+/// than the deferred property-join plan they replaced.
+async fn assert_values_seeded(
+    fluree: &fluree_db_api::Fluree,
+    view: &fluree_db_api::GraphDb,
+    sparql: &str,
+) {
+    let plan = fluree
+        .explain_sparql(view, sparql)
+        .await
+        .expect("explain should succeed");
+    let physical = plan["plan"]["physical"].to_string();
+    assert!(
+        physical.contains("ValuesOperator"),
+        "expected the VALUES to be planned, got {physical}"
+    );
+    assert!(
+        !physical.contains("PropertyJoinOperator"),
+        "expected the seeded lane, not the deferred property join: {physical}"
+    );
+}
+
+const NOVELTY_SUBJECT_QUERY: &str = r"
+    PREFIX ex: <http://example.org/ns/>
+    SELECT ?n
+    WHERE { VALUES ?s { ex:thing2 } ?s a ex:Thing ; ex:name ?n }
+";
+
+/// The seeded `VALUES` plan reads through the batched-subject-probe lanes, which
+/// read base leaflets directly and are latest-`t` only. Replay must still win.
+///
+/// `ex:thing1 ex:name` changes value between t=1 and t=2, so the predicate keeps
+/// live rows throughout and the query is a pure replay question. Asserts values,
+/// not plan shape — a lane that bails to a slower fallback is fine, one that
+/// serves the latest-`t` value for a historical read is not.
+#[tokio::test]
+async fn indexed_values_seeded_star_replays_at_historical_t() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/values-seed-historical:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 50_000_000,
+            };
+            let seed = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:thing1", "@type": "ex:Thing", "ex:name": "old"},
+                    {"@id": "ex:thing2", "@type": "ex:Thing", "ex:name": "keep"}
+                ]
+            });
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &seed,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let t1 = ledger1.t();
+
+            // t=2: change ex:thing1's name. ex:name keeps live rows either side.
+            let update = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "where": {"@id": "ex:thing1", "ex:name": "?n"},
+                "delete": {"@id": "ex:thing1", "ex:name": "?n"},
+                "insert": {"@id": "ex:thing1", "ex:name": "new"}
+            });
+            let ledger2 = fluree
+                .update(ledger1, &update)
+                .await
+                .expect("update")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger2.t()).await;
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT ?n
+                WHERE { VALUES ?s { ex:thing1 } ?s a ex:Thing ; ex:name ?n }
+            ";
+
+            let view_t1 = fluree.db_at_t(ledger_id, t1).await.expect("view at t=1");
+            assert_values_seeded(&fluree, &view_t1, q).await;
+            let at_t1 = fluree
+                .query(&view_t1, QueryInput::Sparql(q))
+                .await
+                .expect("historical query");
+            assert_eq!(
+                normalize_rows(&at_t1.to_jsonld(&view_t1.snapshot).expect("to_jsonld")),
+                normalize_rows(&json!([["old"]])),
+                "the seeded plan must replay to t=1, not serve the latest value"
+            );
+
+            let view_now = fluree.db(ledger_id).await.expect("current view");
+            let now = fluree
+                .query(&view_now, QueryInput::Sparql(q))
+                .await
+                .expect("current query");
+            assert_eq!(
+                normalize_rows(&now.to_jsonld(&view_now.snapshot).expect("to_jsonld")),
+                normalize_rows(&json!([["new"]])),
+                "the same plan at head must see the updated value"
+            );
+        })
+        .await;
+}
+
+/// Same lanes, novelty-overlay side: rows committed after the last index build
+/// live only in novelty, and the batched probes bail rather than read them.
+/// Whichever path the bail lands on must still return every matching row.
+#[tokio::test]
+async fn indexed_values_seeded_star_sees_novelty_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/values-seed-novelty:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 50_000_000,
+            };
+            let indexed = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [{"@id": "ex:thing1", "@type": "ex:Thing", "ex:name": "indexed"}]
+            });
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &indexed,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("indexed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+
+            // Committed but never indexed: ex:thing2 exists only in novelty, and
+            // ex:thing1 gains a second name there.
+            let overlay = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:thing2", "@type": "ex:Thing", "ex:name": "novel"},
+                    {"@id": "ex:thing1", "ex:name": "also"}
+                ]
+            });
+            let _ = fluree
+                .insert(ledger1, &overlay)
+                .await
+                .expect("novelty insert");
+
+            let view = fluree.db(ledger_id).await.expect("view with novelty");
+
+            assert_values_seeded(&fluree, &view, NOVELTY_SUBJECT_QUERY).await;
+            // Novelty-only subject, reached through the seeded lane.
+            let novel = fluree
+                .query(&view, QueryInput::Sparql(NOVELTY_SUBJECT_QUERY))
+                .await
+                .expect("novelty-subject query");
+            assert_eq!(
+                normalize_rows(&novel.to_jsonld(&view.snapshot).expect("to_jsonld")),
+                normalize_rows(&json!([["novel"]])),
+                "a subject that exists only in novelty must survive the seeded plan"
+            );
+
+            // Indexed subject whose values straddle the index/novelty boundary.
+            let straddle = fluree
+                .query(
+                    &view,
+                    QueryInput::Sparql(
+                        r"
+                        PREFIX ex: <http://example.org/ns/>
+                        SELECT ?n
+                        WHERE { VALUES ?s { ex:thing1 } ?s a ex:Thing ; ex:name ?n }
+                    ",
+                    ),
+                )
+                .await
+                .expect("straddling query");
+            let mut rows = normalize_rows(&straddle.to_jsonld(&view.snapshot).expect("to_jsonld"));
+            rows.sort_by_key(std::string::ToString::to_string);
+            assert_eq!(
+                rows,
+                normalize_rows(&json!([["also"], ["indexed"]])),
+                "the probe must merge the novelty value with the indexed one"
+            );
+        })
+        .await;
+}
