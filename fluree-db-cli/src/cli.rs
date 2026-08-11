@@ -53,9 +53,16 @@ pub struct PolicyArgs {
     pub policy_values_file: Option<PathBuf>,
 
     /// Allow access when no matching policy rules exist for the requested
-    /// operation. Defaults to false (deny-by-default).
-    #[arg(long = "default-allow")]
+    /// operation. When neither this nor `--no-default-allow` is given, the
+    /// ledger's configured `f:defaultAllow` governs.
+    #[arg(long = "default-allow", conflicts_with = "no_default_allow")]
     pub default_allow: bool,
+
+    /// Deny access when no matching policy rules exist, overriding any
+    /// `f:defaultAllow` the ledger config sets. The explicit fail-closed
+    /// counterpart to `--default-allow`.
+    #[arg(long = "no-default-allow")]
+    pub no_default_allow: bool,
 }
 
 impl PolicyArgs {
@@ -67,7 +74,18 @@ impl PolicyArgs {
             || self.policy_file.is_some()
             || self.policy_values.is_some()
             || self.policy_values_file.is_some()
-            || self.default_allow
+            || self.default_allow_opt().is_some()
+    }
+
+    /// The tri-state the two flags encode: `--default-allow` → `Some(true)`,
+    /// `--no-default-allow` → `Some(false)`, neither → `None` (defer to the
+    /// ledger's `f:defaultAllow`). Clap rejects both at once.
+    pub fn default_allow_opt(&self) -> Option<bool> {
+        match (self.default_allow, self.no_default_allow) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
     }
 
     /// Resolve `--policy` / `--policy-file` into a parsed JSON value, returning
@@ -138,7 +156,9 @@ impl PolicyArgs {
             },
             policy: self.resolve_policy()?,
             policy_values: self.resolve_policy_values()?,
-            default_allow: self.default_allow,
+            // Neither flag stays unset so the ledger's `f:defaultAllow` can
+            // apply; `--no-default-allow` is the explicit fail-closed spelling.
+            default_allow: self.default_allow_opt(),
         })
     }
 
@@ -189,12 +209,16 @@ impl PolicyArgs {
                 .or_insert_with(|| serde_json::Value::Object(as_object));
         }
 
-        if self.default_allow
-            && !opts.contains_key("default-allow")
-            && !opts.contains_key("default_allow")
-            && !opts.contains_key("defaultAllow")
-        {
-            opts.insert("default-allow".to_string(), serde_json::Value::Bool(true));
+        if let Some(default_allow) = self.default_allow_opt() {
+            if !opts.contains_key("default-allow")
+                && !opts.contains_key("default_allow")
+                && !opts.contains_key("defaultAllow")
+            {
+                opts.insert(
+                    "default-allow".to_string(),
+                    serde_json::Value::Bool(default_allow),
+                );
+            }
         }
 
         Ok(())
@@ -2970,4 +2994,96 @@ pub struct IcebergMapArgs {
     /// Use path-style S3 URLs
     #[arg(long)]
     pub s3_path_style: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PolicyArgs;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct PolicyOnly {
+        #[command(flatten)]
+        policy: PolicyArgs,
+    }
+
+    fn parse(args: &[&str]) -> PolicyArgs {
+        let mut argv = vec!["fluree"];
+        argv.extend_from_slice(args);
+        PolicyOnly::try_parse_from(argv)
+            .expect("should parse")
+            .policy
+    }
+
+    /// The two flags encode a tri-state. Neither must stay unset so the ledger's
+    /// `f:defaultAllow` governs — that is the whole point of the tri-state — and
+    /// `--no-default-allow` is the deny-by-default escape hatch.
+    #[test]
+    fn default_allow_flags_parse_as_tri_state() {
+        assert_eq!(parse(&[]).default_allow_opt(), None);
+        assert_eq!(parse(&["--default-allow"]).default_allow_opt(), Some(true));
+        assert_eq!(
+            parse(&["--no-default-allow"]).default_allow_opt(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn default_allow_flags_are_mutually_exclusive() {
+        let err = PolicyOnly::try_parse_from(["fluree", "--default-allow", "--no-default-allow"])
+            .err()
+            .expect("clap should reject both at once");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// Either explicit spelling is a policy flag on its own, so `inject_into_opts`
+    /// and the remote header builder both run for it.
+    #[test]
+    fn explicit_default_allow_alone_counts_as_set() {
+        assert!(!parse(&[]).is_set());
+        assert!(parse(&["--default-allow"]).is_set());
+        assert!(parse(&["--no-default-allow"]).is_set());
+    }
+
+    #[test]
+    fn inject_into_opts_carries_explicit_false() {
+        let mut opts = serde_json::Map::new();
+        parse(&["--no-default-allow"])
+            .inject_into_opts(&mut opts)
+            .unwrap();
+        assert_eq!(
+            opts.get("default-allow"),
+            Some(&serde_json::Value::Bool(false))
+        );
+
+        let mut opts = serde_json::Map::new();
+        parse(&["--default-allow"])
+            .inject_into_opts(&mut opts)
+            .unwrap();
+        assert_eq!(
+            opts.get("default-allow"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        // Unset injects nothing, leaving config free to govern.
+        let mut opts = serde_json::Map::new();
+        parse(&["--as", "did:key:alice"])
+            .inject_into_opts(&mut opts)
+            .unwrap();
+        assert!(!opts.contains_key("default-allow"));
+    }
+
+    /// Body opts still win over the flags.
+    #[test]
+    fn body_opts_default_allow_beats_flag() {
+        let mut opts = serde_json::Map::new();
+        opts.insert("default-allow".to_string(), serde_json::Value::Bool(true));
+        parse(&["--no-default-allow"])
+            .inject_into_opts(&mut opts)
+            .unwrap();
+        assert_eq!(
+            opts.get("default-allow"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
 }

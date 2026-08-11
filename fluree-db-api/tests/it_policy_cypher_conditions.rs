@@ -133,7 +133,7 @@ async fn cypher_policy_stored_relationship_condition() {
             "?$identity".to_string(),
             json!({"@id": "http://example.org/ns/aliceIdentity"}),
         )])),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
 
@@ -176,7 +176,7 @@ async fn cypher_policy_stored_relationship_condition() {
     // identity binding must never hold ($identity substitutes as null).
     let anon_opts = GovernanceOptions {
         policy_class: Some(vec!["http://example.org/ns/EmployeePolicy".to_string()]),
-        default_allow: false,
+        default_allow: Some(false),
         ..Default::default()
     };
     let anon_ctx = policy_builder::build_policy_context_from_opts(

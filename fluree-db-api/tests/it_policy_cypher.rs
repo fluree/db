@@ -87,7 +87,7 @@ async fn cypher_properties_under_policy_hides_protected_property() {
 
     let qc_opts = GovernanceOptions {
         policy: Some(deny_secret_policy()),
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let db_policy = fluree
@@ -151,7 +151,7 @@ async fn cypher_keys_under_policy_omits_protected_key() {
 
     let qc_opts = GovernanceOptions {
         policy: Some(deny_secret_policy()),
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let db_policy = fluree
@@ -193,7 +193,7 @@ async fn cypher_where_metadata_filter_under_policy_sees_filtered_flakes() {
 
     let qc_opts = GovernanceOptions {
         policy: Some(deny_secret_policy()),
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let db_policy = fluree
@@ -287,7 +287,7 @@ async fn cypher_typed_table_under_policy_filters_node_hydration() {
 
     let qc_opts = GovernanceOptions {
         policy: Some(deny_secret_policy()),
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let db_policy = fluree
@@ -357,7 +357,7 @@ async fn cypher_list_comprehension_member_under_policy_is_filtered() {
 
     let qc_opts = GovernanceOptions {
         policy: Some(deny_secret_policy()),
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let db_policy = fluree
@@ -407,7 +407,7 @@ async fn cypher_call_procedures_hide_policy_denied_property() {
 
     let qc_opts = GovernanceOptions {
         policy: Some(deny_secret_policy()),
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let db_policy = fluree

@@ -73,7 +73,11 @@ pub struct ResolvedConfig {
 /// Policy defaults from the config graph (`f:policyDefaults`).
 #[derive(Debug, Clone, Default)]
 pub struct PolicyDefaults {
-    /// `f:defaultAllow` — `None` means use system default (true).
+    /// `f:defaultAllow` — `None` means unconfigured, which leaves the request's
+    /// own (also tri-state) `default_allow` in force. Unset on both sides
+    /// resolves fail-closed to `false` for any request carrying policy inputs;
+    /// an anonymous request builds no policy context at all and so is
+    /// unenforced regardless of what this says.
     pub default_allow: Option<bool>,
     /// `f:policySource` — reference to graph containing policy rules.
     pub policy_source: Option<GraphSourceRef>,
