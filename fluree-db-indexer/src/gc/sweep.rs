@@ -29,6 +29,10 @@
 //! cannot be listed, or a CID whose codec is unrecognised aborts the plan.
 //! Under-counting the live set classifies live artifacts as orphans; the cost
 //! of over-counting is only that reclamation waits for the next run.
+//!
+//! One case is an ending rather than a failure: a root storage no longer holds
+//! at all. The chain stops there, which is what the collector truncating it
+//! means. See [`chain_cas_ids`].
 
 use crate::error::{IndexerError, Result};
 use crate::gc::collector::PrevIndexChainWalk;
@@ -37,6 +41,7 @@ use fluree_db_core::address_path::{ledger_id_to_path_prefix, shared_prefix_for_p
 use fluree_db_core::storage::{candidate_addresses, content_store_for, ContentStore};
 use fluree_db_core::{ContentId, Storage};
 use std::collections::HashSet;
+use std::path::Path;
 
 /// Concurrent storage deletes during a sweep. Deletes are independent
 /// round trips, so a serial pass over a large backlog is almost entirely
@@ -88,10 +93,18 @@ pub struct SweepResult {
 /// hold the ledger's index build excluded for the whole span of planning and
 /// deleting — a build publishes its artifacts before the root that references
 /// them, so a concurrent build's output is indistinguishable from an orphan.
+///
+/// `artifact_cache_dir` serves root reads from the local disk cache that
+/// builds and the collector already populate, turning the walk's one read per
+/// root into a local hit. Cached roots outlive their blobs in two cases —
+/// a crash between a release and its cache eviction, or a release by another
+/// process — so a cached chain can run past where storage ends it. The walk
+/// stops there anyway; see [`chain_cas_ids`].
 pub async fn plan_sweep<S>(
     storage: &S,
     ledger_name: &str,
     branches: &[BranchIndexHead],
+    artifact_cache_dir: Option<&Path>,
 ) -> Result<SweepPlan>
 where
     S: Storage + Clone,
@@ -102,7 +115,7 @@ where
     // neither informs the other, so planning waits for the slower of the two
     // rather than their sum.
     let (live, scanned) = futures::try_join!(
-        live_addresses(storage, &method, branches),
+        live_addresses(storage, &method, branches, artifact_cache_dir),
         swept_addresses(storage, &method, ledger_name, branches),
     )?;
 
@@ -188,6 +201,7 @@ async fn live_addresses<S>(
     storage: &S,
     method: &str,
     branches: &[BranchIndexHead],
+    artifact_cache_dir: Option<&Path>,
 ) -> Result<HashSet<String>>
 where
     S: Storage + Clone,
@@ -196,7 +210,7 @@ where
 
     let walks: Vec<_> = branches
         .iter()
-        .map(|branch| branch_live_addresses(storage, method, branch))
+        .map(|branch| branch_live_addresses(storage, method, branch, artifact_cache_dir))
         .collect();
 
     futures::stream::iter(walks)
@@ -213,6 +227,7 @@ async fn branch_live_addresses<S>(
     storage: &S,
     method: &str,
     branch: &BranchIndexHead,
+    artifact_cache_dir: Option<&Path>,
 ) -> Result<HashSet<String>>
 where
     S: Storage + Clone,
@@ -221,7 +236,7 @@ where
         return Ok(HashSet::new());
     };
     let store = content_store_for(storage.clone(), &branch.ledger_id);
-    let reachable = chain_cas_ids(&store, head, &branch.ledger_id).await?;
+    let reachable = chain_cas_ids(&store, head, &branch.ledger_id, artifact_cache_dir).await?;
 
     let mut addresses = HashSet::new();
     for id in &reachable {
@@ -249,28 +264,50 @@ where
 /// [`ChainCasIds`] reads each one once instead of once per root. Deduping at
 /// the CID level also keeps address derivation to one pass over the distinct
 /// refs rather than one per root.
+///
+/// Reading roots through a cache can carry the walk past a root the collector
+/// released, since the cached copy outlives the blob. Expanding such a root
+/// fails — its manifests were released with it — and that failure is read as
+/// the end of the chain rather than an error, because storage no longer holds
+/// the root and an uncached walk would have stopped there too. The roots
+/// beyond it were already unreachable, so the live set is the same either way.
 async fn chain_cas_ids<C>(
     store: &C,
     head: &ContentId,
     ledger_id: &str,
+    artifact_cache_dir: Option<&Path>,
 ) -> Result<HashSet<ContentId>>
 where
     C: ContentStore,
 {
     let mut chain_ids = ChainCasIds::new();
-    // Reads storage directly: a cached root outlives its release, and the walk
-    // ends where storage no longer holds one. See [`PrevIndexChainWalk`].
-    let mut walk = PrevIndexChainWalk::new(store, head, None);
+    let mut walk = PrevIndexChainWalk::new(store, head, artifact_cache_dir);
 
     // One root at a time: only the CIDs outlive each step, so a long chain
     // costs its distinct refs rather than every decoded root at once.
     while let Some(entry) = walk.next_entry().await? {
-        chain_ids.add_root(store, &entry.root).await.map_err(|e| {
-            IndexerError::StorageRead(format!(
+        if let Err(e) = chain_ids.add_root(store, &entry.root).await {
+            // Absence is the whole test, and it is the same one the walk uses
+            // to find the end of a chain. A root that *does* exist but cannot
+            // be expanded is a different thing: its refs are unreadable rather
+            // than gone, and a live set short of them would classify live
+            // artifacts as orphans. If existence cannot be established either,
+            // treat the root as present and refuse.
+            if !store.has(&entry.root_id).await.unwrap_or(true) {
+                tracing::debug!(
+                    root_id = %entry.root_id,
+                    t = entry.t,
+                    ledger_id,
+                    "index root released by prior GC outlived its cache entry; chain ends here"
+                );
+                break;
+            }
+
+            return Err(IndexerError::StorageRead(format!(
                 "cannot expand index root at t={} for {ledger_id}: {e}; refusing to sweep",
                 entry.t
-            ))
-        })?;
+            )));
+        }
         chain_ids.insert(entry.root_id);
         if let Some(garbage_id) = entry.garbage_id {
             chain_ids.insert(garbage_id);
@@ -365,6 +402,54 @@ mod tests {
         roots
     }
 
+    /// Like [`write_chain`], but each root routes a named graph through a
+    /// branch manifest of its own, so expanding a root reads that manifest and
+    /// a build superseding one root's manifest leaves the others readable.
+    ///
+    /// Returns each root's CID paired with the address of the manifest it
+    /// routes through.
+    async fn write_named_graph_chain(
+        storage: &MemoryStorage,
+        ledger_id: &str,
+        len: i64,
+        dict_branch: &ContentId,
+    ) -> Vec<(ContentId, String)> {
+        let mut chain: Vec<(ContentId, String)> = Vec::new();
+        for t in 1..=len {
+            // Distinct `g_id` per root, so each manifest is distinct content
+            // and lands at an address of its own.
+            let manifest = fluree_db_binary_index::format::branch::build_branch_bytes(
+                fluree_db_binary_index::RunSortOrder::Spot,
+                t as u16,
+                &[],
+            );
+            let (branch_cid, branch_addr) =
+                cid_and_addr_for(ledger_id, ContentKind::IndexBranch, &manifest);
+            storage.write_bytes(&branch_addr, &manifest).await.unwrap();
+
+            let prev = chain.last().map(|(id, _)| BinaryPrevIndexRef {
+                t: t - 1,
+                id: id.clone(),
+            });
+            let (cid, addr) = cid_and_addr_for(
+                ledger_id,
+                ContentKind::IndexRoot,
+                format!("{ledger_id}-ng-root-{t}").as_bytes(),
+            );
+            let bytes = crate::gc::test_support::fir6_with_named_graph_for(
+                ledger_id,
+                t,
+                prev,
+                None,
+                dict_branch.clone(),
+                Some(branch_cid),
+            );
+            storage.write_bytes(&addr, &bytes).await.unwrap();
+            chain.push((cid, branch_addr));
+        }
+        chain
+    }
+
     fn heads(pairs: &[(&str, Option<&ContentId>)]) -> Vec<BranchIndexHead> {
         pairs
             .iter()
@@ -391,7 +476,7 @@ mod tests {
         storage.write_bytes(&dict_addr, b"dict").await.unwrap();
         let roots = write_chain(&storage, MAIN, 3, &dict).await;
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]))
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
             .await
             .unwrap();
 
@@ -401,6 +486,101 @@ mod tests {
             plan.orphans
         );
         assert_eq!(plan.scanned, 4, "3 roots plus the shared dict");
+    }
+
+    /// A temp cache directory of this test's own, emptied before use so a
+    /// previous run's entries cannot decide the outcome.
+    fn empty_cache_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fluree-test-sweep-cache-{}-{}-{:?}",
+            label,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Reading roots through the cache does not change what a sweep plans
+    /// while every root it walks is still in storage.
+    #[tokio::test]
+    async fn a_cached_plan_matches_an_uncached_one() {
+        let storage = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let (_, dict_addr) = cid_and_addr_for(
+            MAIN,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"live-dict",
+        );
+        storage.write_bytes(&dict_addr, b"dict").await.unwrap();
+        let roots = write_chain(&storage, MAIN, 3, &dict).await;
+        let branches = heads(&[(MAIN, roots.last())]);
+        let cache_dir = empty_cache_dir("parity");
+
+        let uncached = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
+        let cached = plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
+            .await
+            .unwrap();
+
+        assert_eq!(cached.orphans, uncached.orphans);
+        assert_eq!(cached.live, uncached.live);
+        assert_eq!(cached.scanned, uncached.scanned);
+    }
+
+    /// The case the cache introduces: a root whose blob is gone but whose
+    /// cached copy remains — a crash between a release and its eviction. The
+    /// chain must end there, as it would without the cache, rather than
+    /// failing the plan on the manifests that were released with it.
+    #[tokio::test]
+    async fn a_released_root_ends_the_chain_even_when_its_cache_entry_survives() {
+        let storage = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let (_, dict_addr) = cid_and_addr_for(
+            MAIN,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"live-dict",
+        );
+        storage.write_bytes(&dict_addr, b"dict").await.unwrap();
+
+        // Roots that route a named graph, so expanding one reads its branch
+        // manifest — the read that fails once the root has been released.
+        let chain = write_named_graph_chain(&storage, MAIN, 3, &dict).await;
+        let head = chain.last().map(|(cid, _)| cid);
+        let branches = heads(&[(MAIN, head)]);
+        let cache_dir = empty_cache_dir("released-root");
+
+        // Prime the cache with the whole chain, then retire the oldest root
+        // and the manifest it routed through the way the collector does —
+        // but *without* evicting either from the cache, which is what a crash
+        // between the two leaves behind.
+        plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
+            .await
+            .unwrap();
+        let (oldest_root, oldest_manifest_addr) = &chain[0];
+        let oldest_addr = candidate_addresses("memory", MAIN, oldest_root)[0].clone();
+        storage.delete(&oldest_addr).await.unwrap();
+        storage.delete(oldest_manifest_addr).await.unwrap();
+
+        let cached = plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
+            .await
+            .expect("a released root ends the chain rather than failing the plan");
+
+        // The retained roots are still reachable, so nothing live is claimed.
+        for (root, manifest_addr) in &chain[1..] {
+            let root_addr = &candidate_addresses("memory", MAIN, root)[0];
+            assert!(
+                !cached.orphans.contains(root_addr),
+                "a root the chain still reaches must stay live"
+            );
+            assert!(
+                !cached.orphans.contains(manifest_addr),
+                "a manifest a live root routes through must stay live"
+            );
+        }
     }
 
     /// A root published with no `prev_index` severs the chain, and everything
@@ -431,7 +611,7 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, Some(&severed))]))
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, Some(&severed))]), None)
             .await
             .unwrap();
 
@@ -481,6 +661,7 @@ mod tests {
             &storage,
             NAME,
             &heads(&[(MAIN, main_roots.last()), (feature, feature_roots.last())]),
+            None,
         )
         .await
         .unwrap();
@@ -521,7 +702,7 @@ mod tests {
         storage.write_bytes(&stranded_addr, b"dict").await.unwrap();
 
         let roots = write_chain(&storage, MAIN, 2, &live).await;
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]))
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
             .await
             .unwrap();
 
@@ -553,7 +734,7 @@ mod tests {
 
         let roots = write_chain(&storage, MAIN, 1, &dict).await;
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]))
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
             .await
             .unwrap();
 
@@ -592,7 +773,7 @@ mod tests {
             .unwrap();
 
         let branches = heads(&[(MAIN, Some(&severed))]);
-        let plan = plan_sweep(&storage, NAME, &branches).await.unwrap();
+        let plan = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
         assert_eq!(plan.orphans.len(), 3, "the three stranded roots");
 
         let result = execute_sweep(&storage, &plan).await;
@@ -608,7 +789,7 @@ mod tests {
             "the dict it references survives"
         );
 
-        let after = plan_sweep(&storage, NAME, &branches).await.unwrap();
+        let after = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
         assert!(
             after.orphans.is_empty(),
             "a swept ledger has nothing left to reclaim: {:?}",
@@ -632,7 +813,7 @@ mod tests {
             .unwrap();
 
         let branches = heads(&[(MAIN, Some(&severed))]);
-        let plan = plan_sweep(&storage, NAME, &branches).await.unwrap();
+        let plan = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
         assert!(!plan.orphans.is_empty());
 
         execute_sweep(&storage, &plan).await;
@@ -717,7 +898,7 @@ mod tests {
             inner,
         };
 
-        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())])).await;
+        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None).await;
 
         assert!(
             result.is_err(),
@@ -748,7 +929,7 @@ mod tests {
         let oldest = candidate_addresses("memory", MAIN, &roots[0]);
         storage.delete(&oldest[0]).await.unwrap();
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]))
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
             .await
             .expect("a collected chain still plans");
 
@@ -780,7 +961,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())])).await;
+        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None).await;
 
         assert!(
             result.is_err(),
@@ -795,7 +976,7 @@ mod tests {
         let storage = MemoryStorage::new();
         let (missing, _) = cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"never-written");
 
-        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, Some(&missing))])).await;
+        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, Some(&missing))]), None).await;
 
         assert!(
             result.is_err(),

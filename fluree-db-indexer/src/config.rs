@@ -417,6 +417,19 @@ impl Default for IndexerConfig {
 }
 
 impl IndexerConfig {
+    /// Where binary index artifacts are cached on local disk.
+    ///
+    /// Sited under [`data_dir`](Self::data_dir) so the cache survives restarts
+    /// and is shared by every reader on this instance. With no `data_dir` it
+    /// falls back to the system temp directory, which a short-lived process
+    /// still benefits from within its own run.
+    pub fn artifact_cache_dir(&self) -> PathBuf {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("binary_artifact_cache"))
+            .unwrap_or_else(|| std::env::temp_dir().join("fluree_binary_cache"))
+    }
+
     /// Create a new configuration with custom values
     pub fn new(
         leaf_target_bytes: u64,
