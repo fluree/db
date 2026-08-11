@@ -3141,7 +3141,7 @@ pub(crate) fn apply_solution_modifiers(
         .into_iter()
         .flat_map(Grouping::group_by_vars)
         .collect();
-    let aggregates_vec: Vec<AggregateSpec> = grouping
+    let mut aggregates_vec: Vec<AggregateSpec> = grouping
         .map(|g| g.aggregates().cloned().collect())
         .unwrap_or_default();
     let post_binds_vec: Vec<(VarId, Expression)> = grouping
@@ -3180,6 +3180,103 @@ pub(crate) fn apply_solution_modifiers(
             }
         }
     }
+    // SPARQL 1.1 §18.5.1 lets an aggregate read a variable that is also a GROUP BY
+    // key: `SELECT ?k (COUNT(?k) AS ?n) … GROUP BY ?k` answers, per group, the
+    // number of solutions in which `?k` is bound.
+    //
+    // The traditional grouping path cannot compute that as written.
+    // `GroupByOperator::build_output_row` puts the *scalar* key value in group-key
+    // columns and only wraps non-key columns as `Binding::Grouped`, and
+    // `AggregateFn::apply` returns its input unchanged when it isn't `Grouped` —
+    // so an aggregate pointed at a key column would answer with the key term
+    // itself. So copy each aggregated key into a fresh non-key column before
+    // grouping and point the aggregate at the copy. `Expression::Var(k)`
+    // reproduces the key's unbound-ness, so an OPTIONAL-bound key keeps
+    // `COUNT(?k)` and `COUNT(*)` differing exactly where the spec says they
+    // should. The streaming path reads the copy as an ordinary upstream column,
+    // so one rewrite serves both operators.
+    let group_by_set: HashSet<VarId> = group_by_vec.iter().copied().collect();
+    let mut aliased_deps: Option<VariableDeps> = None;
+    if aggregates_vec.iter().any(|s| {
+        s.function
+            .input_var()
+            .is_some_and(|v| group_by_set.contains(&v))
+    }) {
+        // Mint copies above every id any stage from here on can name. WHERE-internal
+        // variables that never reached this schema are already consumed, so they
+        // cannot be confused with a copy.
+        let mut named: Vec<VarId> = where_schema_vec.clone();
+        named.extend(group_by_vec.iter().copied());
+        for spec in &aggregates_vec {
+            named.push(spec.output_var);
+            named.extend(spec.function.input_var());
+        }
+        for (var, expr) in post_binds_vec.iter().chain(order_binds.iter()) {
+            named.push(*var);
+            named.extend(expr.referenced_vars());
+        }
+        if let Some(expr) = having_expr {
+            named.extend(expr.referenced_vars());
+        }
+        named.extend(ordering.iter().map(|s| s.var));
+        named.extend(select_vars.into_iter().flatten().copied());
+        if let Some(deps) = variable_deps {
+            named.extend(deps.required_where_vars.iter().copied());
+            named.extend(deps.required_groupby_vars.iter().copied());
+            named.extend(deps.required_aggregate_vars.iter().copied());
+            named.extend(deps.required_having_vars.iter().copied());
+            named.extend(deps.required_sort_vars.iter().copied());
+            named.extend(deps.required_bind_vars.iter().flatten().copied());
+        }
+        let mut next_id = named
+            .iter()
+            .map(|v| v.0)
+            .max()
+            .map_or(0, |m| m.saturating_add(1));
+
+        // One copy per distinct key, however many aggregates read it.
+        let mut copies: Vec<(VarId, VarId)> = Vec::new();
+        for spec in &mut aggregates_vec {
+            let Some(input_var) = spec.function.input_var() else {
+                continue;
+            };
+            if !group_by_set.contains(&input_var) {
+                continue;
+            }
+            let copy = match copies.iter().find(|(key, _)| *key == input_var) {
+                Some((_, copy)) => *copy,
+                None => {
+                    let copy = VarId(next_id);
+                    next_id = next_id.saturating_add(1);
+                    copies.push((input_var, copy));
+                    copy
+                }
+            };
+            spec.function.substitute_var(input_var, copy);
+        }
+
+        for (key, copy) in &copies {
+            operator = Box::new(crate::bind::BindOperator::new(
+                operator,
+                *copy,
+                Expression::Var(*key),
+                Vec::new(),
+            ));
+            where_schema_vec.push(*copy);
+        }
+
+        // `variable_deps` was computed from the pre-rewrite IR, so it does not
+        // know the copies exist. Without this, `GroupByOperator`'s projection
+        // trimming drops the very column the aggregate now reads.
+        if let Some(deps) = variable_deps {
+            let mut deps = deps.clone();
+            deps.required_groupby_vars
+                .extend(copies.iter().map(|(_, copy)| *copy));
+            aliased_deps = Some(deps);
+        }
+    }
+    let variable_deps = aliased_deps.as_ref().or(variable_deps);
+
     // Get the schema after WHERE (before grouping), including any unbound pads.
     let where_schema: Arc<[VarId]> = Arc::from(where_schema_vec.into_boxed_slice());
 
@@ -3196,9 +3293,10 @@ pub(crate) fn apply_solution_modifiers(
             }
         }
 
-        // Validate aggregates
+        // Validate aggregates. No key-reading check here: the copy-before-group
+        // rewrite above has already moved every such aggregate off its key
+        // column, so the hazard it used to guard is unreachable.
         let current_schema = operator.schema();
-        let group_by_set: HashSet<VarId> = group_by_vec.iter().copied().collect();
         let mut seen_output_vars: HashSet<VarId> = HashSet::new();
 
         for spec in &aggregates_vec {
@@ -3206,11 +3304,6 @@ pub(crate) fn apply_solution_modifiers(
                 if !current_schema.contains(&input_var) {
                     return Err(QueryError::VariableNotFound(format!(
                         "Aggregate input variable {input_var:?} not found in schema"
-                    )));
-                }
-                if !group_by_vec.is_empty() && group_by_set.contains(&input_var) {
-                    return Err(QueryError::InvalidQuery(format!(
-                        "Aggregate input variable {input_var:?} is a GROUP BY key and will not be grouped"
                     )));
                 }
                 if spec.output_var != input_var && current_schema.contains(&spec.output_var) {

@@ -9,6 +9,91 @@
 //! - [`memory`]: In-memory backend ([`MemoryStorage`], [`MemoryContentStore`])
 //! - [`file`]: Filesystem backend behind the `native` feature ([`FileStorage`])
 
+/// When a write to `FileStorage` is reported complete.
+///
+/// Both settings are atomic — a reader never observes a partial file either
+/// way. They differ in what survives the machine losing power.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Durability {
+    /// Report complete once the bytes and the directory entry naming them have
+    /// been flushed to the device. Survives power loss; costs an fsync of the
+    /// staged file and one of its parent directory per write.
+    #[default]
+    Sync,
+    /// Report complete once the bytes reach the OS page cache. Survives process
+    /// death, but a power loss or kernel panic can lose writes already reported
+    /// as committed.
+    PageCache,
+}
+
+impl Durability {
+    /// Environment variable selecting the default for new `FileStorage`.
+    pub const ENV_VAR: &'static str = "FLUREE_STORAGE_FSYNC";
+
+    pub(crate) fn syncs(&self) -> bool {
+        matches!(self, Durability::Sync)
+    }
+
+    /// Default read from [`Self::ENV_VAR`], falling back to [`Self::Sync`] when
+    /// unset or unrecognized.
+    ///
+    /// Read once per storage construction rather than per write, so tests set
+    /// the field through `FileStorage::with_durability` and never race on
+    /// process environment.
+    fn from_env() -> Self {
+        Self::from_env_override().unwrap_or_default()
+    }
+
+    /// The setting [`Self::ENV_VAR`] asks for, or `None` when it is unset.
+    ///
+    /// Distinguishing "unset" from "set to on" is what lets configuration
+    /// supply a value that an operator can still override for one run.
+    pub fn from_env_override() -> Option<Self> {
+        std::env::var(Self::ENV_VAR)
+            .ok()
+            .as_deref()
+            .map(|v| Self::parse(Some(v)))
+    }
+
+    /// Resolve the setting for a storage instance.
+    ///
+    /// Environment beats configuration beats the default, matching the
+    /// precedence documented in `docs/operations/configuration.md` — a checked-in
+    /// config file never outranks an operator's one-off override.
+    pub fn resolve(configured: Option<Self>) -> Self {
+        Self::resolve_from(Self::from_env_override(), configured)
+    }
+
+    /// Pure half of [`Self::resolve`], so the precedence rule is testable
+    /// without touching process environment.
+    fn resolve_from(env: Option<Self>, configured: Option<Self>) -> Self {
+        env.or(configured).unwrap_or_default()
+    }
+
+    /// Pure half of [`Self::from_env`], so the accepted spellings are testable
+    /// without touching process environment.
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => Durability::PageCache,
+            _ => Durability::Sync,
+        }
+    }
+
+    /// Parse a configuration mode name (`sync` / `page-cache`).
+    ///
+    /// Named modes rather than the environment variable's boolean: a config
+    /// file is read to understand a deployment, and a name says what it does.
+    /// Returns `None` for an unrecognized value so the caller can reject it
+    /// rather than silently pick a durability the operator did not ask for.
+    pub fn from_mode_name(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "sync" | "fsync" => Some(Durability::Sync),
+            "page-cache" | "pagecache" => Some(Durability::PageCache),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod file;
 mod memory;
@@ -505,30 +590,63 @@ impl<S: Storage> StorageContentStore<S> {
     /// under the per-branch namespace (`mydb/main/index/objects/dicts/{sha}.dict`).
     /// Returns `None` for non-dict CIDs.
     fn legacy_dict_address(&self, id: &ContentId) -> Option<String> {
-        if id.codec() != crate::CODEC_FLUREE_DICT_BLOB {
-            return None;
-        }
-        let prefix = ledger_id_prefix_for_path(&self.ledger_id);
-        let hex = id.digest_hex();
-        Some(format!(
-            "fluree:{}://{}/index/objects/dicts/{}.dict",
-            self.method, prefix, hex
-        ))
+        legacy_dict_address(&self.method, &self.ledger_id, id)
     }
 
     /// Index roots were stored with a `.json` extension before the switch to `.fir6`.
     /// Returns `None` for non-IndexRoot CIDs.
     fn legacy_index_root_address(&self, id: &ContentId) -> Option<String> {
-        if id.codec() != crate::CODEC_FLUREE_INDEX_ROOT {
-            return None;
-        }
-        let prefix = ledger_id_prefix_for_path(&self.ledger_id);
-        let hex = id.digest_hex();
-        Some(format!(
-            "fluree:{}://{}/index/roots/{}.json",
-            self.method, prefix, hex
-        ))
+        legacy_index_root_address(&self.method, &self.ledger_id, id)
     }
+}
+
+/// The pre-global-dicts address, where dict blobs lived under the per-branch
+/// namespace (`mydb/main/index/objects/dicts/{sha}.dict`).
+///
+/// Returns `None` for non-dict CIDs.
+pub fn legacy_dict_address(method: &str, ledger_id: &str, id: &ContentId) -> Option<String> {
+    if id.codec() != crate::CODEC_FLUREE_DICT_BLOB {
+        return None;
+    }
+    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let hex = id.digest_hex();
+    Some(format!(
+        "fluree:{method}://{prefix}/index/objects/dicts/{hex}.dict"
+    ))
+}
+
+/// The index-root address from before the `.json` to `.fir6` rename.
+///
+/// Returns `None` for non-`IndexRoot` CIDs.
+fn legacy_index_root_address(method: &str, ledger_id: &str, id: &ContentId) -> Option<String> {
+    if id.codec() != crate::CODEC_FLUREE_INDEX_ROOT {
+        return None;
+    }
+    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let hex = id.digest_hex();
+    Some(format!("fluree:{method}://{prefix}/index/roots/{hex}.json"))
+}
+
+/// Every address at which a CID's blob could physically live, current layout
+/// first.
+///
+/// The storage layout has changed twice — dict blobs moved from the per-branch
+/// namespace to `@shared`, and index roots moved from `.json` to `.fir6` — and
+/// [`ContentStore::get`] falls back through the older forms. Anything deciding
+/// that a blob is unreferenced must account for all of them, or it will delete
+/// a live blob that exists only at a legacy address.
+///
+/// Returns an empty vector when the CID's codec is unrecognised. Callers that
+/// delete must treat that as "cannot locate this blob" and decline to act, not
+/// as "this blob occupies no addresses".
+pub fn candidate_addresses(method: &str, ledger_id: &str, id: &ContentId) -> Vec<String> {
+    let mut addresses = Vec::new();
+    if let Some(kind) = id.content_kind() {
+        addresses.push(content_address(method, kind, ledger_id, &id.digest_hex()));
+    }
+    addresses.extend(legacy_dict_address(method, ledger_id, id));
+    addresses.extend(legacy_index_root_address(method, ledger_id, id));
+    addresses
 }
 
 #[async_trait]
@@ -582,17 +700,33 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
                 "CID verification failed: provided CID {id} does not match bytes"
             )));
         }
-        let address = self.cid_to_address(id)?;
-        self.storage.write_bytes(&address, bytes).await
+        let kind = id.content_kind().ok_or_else(|| {
+            crate::error::Error::storage(format!("unknown codec {} in CID {}", id.codec(), id))
+        })?;
+        // Same address `cid_to_address` derives — both go through
+        // `content_address` with this kind — but routed so the write *decides*
+        // its durability from the content kind rather than inheriting the
+        // instance default. Today's callers are all commits and txns, which
+        // land on the same answer either way; a path that ingests index blobs
+        // by CID would silently start fsyncing them.
+        self.storage
+            .content_write_bytes_with_hash(kind, &self.ledger_id, &id.digest_hex(), bytes)
+            .await?;
+        Ok(())
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
-        let address = self.cid_to_address(id)?;
-        match self.storage.delete(&address).await {
-            Ok(()) => Ok(()),
-            Err(crate::error::Error::NotFound(_)) => Ok(()),
-            Err(e) => Err(e),
+        // Delete every address the blob could occupy, not just the current
+        // layout: on a ledger predating the `@shared` dict move or the
+        // `.fir6` rename, the only copy sits at a legacy address, and
+        // releasing just the canonical one silently reclaims nothing.
+        for address in candidate_addresses(&self.method, &self.ledger_id, id) {
+            match self.storage.delete(&address).await {
+                Ok(()) | Err(crate::error::Error::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
+        Ok(())
     }
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
@@ -1251,4 +1385,106 @@ pub trait StorageCas: Debug + Send + Sync {
     where
         F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
         T: Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content_kind::DictKind;
+    use crate::storage::memory::MemoryStorage;
+
+    const LEDGER: &str = "mydb:main";
+
+    /// `candidate_addresses` exists so that callers deciding a blob is
+    /// unreferenced see every address `ContentStore::get` would resolve it to.
+    /// A dict blob left at the pre-`@shared` address is readable, so it must
+    /// also be listed — otherwise a sweep deletes a live blob.
+    #[tokio::test]
+    async fn candidate_addresses_cover_the_legacy_dict_fallback() {
+        let storage = MemoryStorage::new();
+        let id = ContentId::new(
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"dict bytes",
+        );
+        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &id)
+            .expect("dict CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"dict bytes").await.unwrap();
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        assert_eq!(
+            store.get(&id).await.unwrap(),
+            b"dict bytes",
+            "reads fall back to the legacy dict address"
+        );
+        assert!(
+            candidate_addresses(storage.storage_method(), LEDGER, &id).contains(&legacy),
+            "the address reads fall back to must be listed as a candidate"
+        );
+    }
+
+    /// Same coupling for index roots written before the `.json` to `.fir6`
+    /// rename.
+    #[tokio::test]
+    async fn candidate_addresses_cover_the_legacy_index_root_fallback() {
+        let storage = MemoryStorage::new();
+        let id = ContentId::new(ContentKind::IndexRoot, b"root bytes");
+        let legacy = legacy_index_root_address(storage.storage_method(), LEDGER, &id)
+            .expect("index-root CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"root bytes").await.unwrap();
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        assert_eq!(
+            store.get(&id).await.unwrap(),
+            b"root bytes",
+            "reads fall back to the legacy index-root address"
+        );
+        assert!(
+            candidate_addresses(storage.storage_method(), LEDGER, &id).contains(&legacy),
+            "the address reads fall back to must be listed as a candidate"
+        );
+    }
+
+    /// A garbage manifest names a CID, not an address. On a ledger predating
+    /// the `@shared` dict move the only copy sits at the legacy address, so
+    /// releasing just the canonical one reclaims nothing while reporting
+    /// success — the leak GC exists to prevent.
+    #[tokio::test]
+    async fn release_reclaims_a_blob_at_its_legacy_address() {
+        let storage = MemoryStorage::new();
+        let id = ContentId::new(
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"legacy dict",
+        );
+        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &id)
+            .expect("dict CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"legacy dict").await.unwrap();
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        store.release(&id).await.expect("release succeeds");
+
+        assert!(
+            !storage.exists(&legacy).await.unwrap(),
+            "the legacy-located blob must actually be reclaimed"
+        );
+        assert!(!store.has(&id).await.unwrap(), "and be unreachable after");
+    }
+
+    /// The current-layout address always leads, so callers that only need the
+    /// canonical location can take the first entry.
+    #[test]
+    fn candidate_addresses_lead_with_the_current_layout() {
+        let id = ContentId::new(ContentKind::IndexLeaf, b"leaf");
+        let addresses = candidate_addresses("memory", LEDGER, &id);
+        assert_eq!(
+            addresses.first().map(String::as_str),
+            Some(
+                content_address("memory", ContentKind::IndexLeaf, LEDGER, &id.digest_hex())
+                    .as_str()
+            )
+        );
+    }
 }

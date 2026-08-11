@@ -345,6 +345,46 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 - High IOPS capability
 - Regular backups
 
+### Durability
+
+Every write is atomic: bytes are staged alongside the destination and moved into
+place, so a reader never observes a partially written file, and an interrupted
+write leaves nothing at the final name.
+
+Whether an acknowledged write survives the machine *losing power* is controlled
+by the storage node's `durability` property, or by `FLUREE_STORAGE_FSYNC`:
+
+| Mode | Acknowledged when | Survives |
+|---|---|---|
+| `sync` (default) | bytes and directory entry flushed to the device | process death and power loss |
+| `page-cache` | bytes reach the OS page cache | process death only |
+
+This applies to the writes that are the source of truth — commits, transactions,
+ledger config, graph-source mappings — and to nameservice records. Index nodes,
+dictionaries, sketches and annotation arenas are always written page-cache: they
+are written at much higher volume than commits and can be rebuilt from the commit
+chain, so flushing them would cost throughput on the busiest path for no
+durability gain.
+
+Turning durability off is reasonable for bulk imports (restartable from the
+source data), CI, and benchmarks. It is not a safe default for a ledger you
+intend to keep.
+
+> **macOS note.** `sync` on macOS issues `F_FULLFSYNC`, a full drive-cache
+> barrier that is far more expensive than the equivalent `fsync` on Linux —
+> measured here at ~4 ms versus ~0.08 ms. Local development on macOS may want
+> `FLUREE_STORAGE_FSYNC=0`; it is not representative of Linux production cost.
+
+Because the staged file is moved into place, each write gives the destination a
+new inode. Ownership, permissions, ACLs and hard links applied to a *path* are
+therefore dropped on the next write to that path — set them on the containing
+directory instead. This is immaterial for content-addressed blobs, which are
+written once and never rewritten, but it applies to the paths that are updated
+in place: nameservice head refs and ledger config.
+
+Configuration details: [Connection config (JSON-LD)](../reference/connection-config-jsonld.md#durability)
+and [Configuration](configuration.md).
+
 ## AWS Storage Details
 
 ### S3 Structure

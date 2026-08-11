@@ -12,6 +12,10 @@
 //! 3. Delete root N-1 itself (truncating the chain)
 //!
 //! This means GC operates on pairs: (newer root with manifest, older root to delete).
+//!
+//! Only branch-local artifacts are released here; dictionary blobs are shared
+//! across a ledger's branches and are deferred to the storage sweep. See
+//! [`partition_branch_local`] and the module docs on [`crate::gc`].
 
 use super::{parse_garbage_record, CleanGarbageConfig, CleanGarbageResult};
 use super::{DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS};
@@ -19,7 +23,13 @@ use crate::error::Result;
 use fluree_db_binary_index::IndexRoot;
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::ContentId;
+use futures::stream::StreamExt;
 use std::path::Path;
+
+/// Concurrent storage releases per garbage manifest. Releases are independent
+/// round trips, so a serial pass over a large manifest is almost entirely
+/// latency.
+const RELEASE_CONCURRENCY: usize = 32;
 
 /// Entry in the prev-index chain.
 pub(crate) struct IndexChainEntry {
@@ -46,6 +56,139 @@ fn parse_chain_fields(
     Ok((root.index_t, prev_id, garbage_id, root))
 }
 
+/// Split a garbage manifest's items into the branch-local CIDs this collector
+/// may release, returning them with a count of the shared ones it skipped.
+///
+/// Dictionary blobs live in the ledger-wide `@shared/dicts/` namespace, so a
+/// branch's manifest can name one that a sibling branch's index still
+/// references — content addressing makes identical dictionary content produce
+/// an identical CID, and a branch created from another starts out sharing it.
+/// This collector walks one branch's chain and holds no exclusion over the
+/// others, so it cannot establish that a shared blob is unreferenced.
+///
+/// Those blobs are left for the storage sweep, which unions the reachable set
+/// across every branch while holding them all excluded. See
+/// [`plan_sweep`](super::plan_sweep).
+fn partition_branch_local(garbage: &[String]) -> (Vec<ContentId>, usize) {
+    let mut branch_local = Vec::with_capacity(garbage.len());
+    let mut shared = 0;
+
+    for item in garbage {
+        match item.parse::<ContentId>() {
+            Ok(cid) if is_shared_across_branches(&cid) => shared += 1,
+            Ok(cid) => branch_local.push(cid),
+            Err(e) => tracing::warn!(
+                item,
+                error = %e,
+                "Skipping unrecognized garbage item (not a valid CID)"
+            ),
+        }
+    }
+
+    (branch_local, shared)
+}
+
+/// Whether `id` addresses a blob in the ledger-wide namespace shared by every
+/// branch, rather than one scoped to a single branch.
+fn is_shared_across_branches(id: &ContentId) -> bool {
+    id.codec() == fluree_db_core::CODEC_FLUREE_DICT_BLOB
+}
+
+/// Release every node listed in the garbage manifest at `garbage_id`.
+///
+/// Returns the number of nodes released, or `None` when the chain walk should
+/// stop: an unreadable or unparseable manifest, or one still inside the
+/// retention window. Manifests are consulted oldest-first, so one that is too
+/// recent guarantees every later one is newer still.
+async fn release_manifest_nodes(
+    store: &dyn ContentStore,
+    garbage_id: &ContentId,
+    manifest_t: i64,
+    cache_dir: Option<&Path>,
+    now_ms: i64,
+    min_age_ms: i64,
+) -> Option<usize> {
+    let bytes = match get_cached_or_remote(store, garbage_id, cache_dir).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::debug!(
+                t = manifest_t,
+                error = %e,
+                "Failed to load garbage record (may already be released), stopping GC"
+            );
+            return None;
+        }
+    };
+
+    let record = match parse_garbage_record(&bytes) {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::debug!(
+                t = manifest_t,
+                error = %e,
+                "Failed to parse garbage record, stopping GC"
+            );
+            return None;
+        }
+    };
+
+    // A record with no timestamp predates the `created_at_ms` field, so it was
+    // written at least a release ago — past any retention window. Treating the
+    // absent timestamp as "too recent" would stop the walk at that record on
+    // every pass, pinning every version newer than it.
+    if record.created_at_ms != 0 && now_ms - record.created_at_ms < min_age_ms {
+        tracing::debug!(
+            t = manifest_t,
+            age_mins = (now_ms - record.created_at_ms) / 60000,
+            "Garbage record too recent, stopping GC"
+        );
+        return None;
+    }
+
+    let release_started = std::time::Instant::now();
+    tracing::debug!(
+        t = manifest_t,
+        %garbage_id,
+        items = record.garbage.len(),
+        "GC releasing garbage record items"
+    );
+
+    let (cids, shared): (Vec<ContentId>, usize) = partition_branch_local(&record.garbage);
+
+    // Each release is an independent storage round trip. Stepping over absent
+    // manifests and untimestamped records means the first pass after this fix
+    // drains a backlog those two conditions had pinned, so a serial loop here
+    // is almost entirely latency — held against a GC semaphore permit.
+    let released = futures::stream::iter(cids)
+        .map(|cid| async move {
+            match store.release(&cid).await {
+                Ok(()) => 1,
+                Err(e) => {
+                    tracing::debug!(
+                        %cid,
+                        error = %e,
+                        "Failed to release garbage node (may already be released)"
+                    );
+                    0
+                }
+            }
+        })
+        .buffer_unordered(RELEASE_CONCURRENCY)
+        .fold(0usize, |acc, n| async move { acc + n })
+        .await;
+
+    tracing::debug!(
+        t = manifest_t,
+        %garbage_id,
+        released,
+        elapsed_ms = release_started.elapsed().as_millis() as u64,
+        deferred_to_sweep = shared,
+        "GC garbage record item release pass complete"
+    );
+
+    Some(released)
+}
+
 /// Get current timestamp in milliseconds
 fn current_timestamp_ms() -> i64 {
     std::time::SystemTime::now()
@@ -70,8 +213,15 @@ fn current_timestamp_ms() -> i64 {
 ///   With max_old_indexes=5, we keep current + 5 old = 6 total
 /// - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 30)
 ///
-/// Age is determined by the garbage record's `created_at_ms` field.
-/// If a garbage record is missing or has no timestamp, the index is skipped (conservative).
+/// Age is determined by the garbage record's `created_at_ms` field. A record
+/// with no timestamp predates the field and is treated as past the window.
+///
+/// # Roots with no garbage manifest
+///
+/// A root written before the manifest write became unconditional can carry
+/// none. The nodes it replaced cannot be named, so they are left in storage
+/// for the sweep to reclaim, and the walk continues rather than stopping — one
+/// such root would otherwise pin every version newer than it forever.
 ///
 /// # Safety
 ///
@@ -131,12 +281,14 @@ pub async fn clean_garbage(
     // from the retained set. Newest-first would truncate the chain at the
     // retention boundary, orphaning everything beyond.
     //
-    // We break (not continue) on any failure because skipping an entry and
-    // releasing a newer one would orphan the skipped entry and everything
-    // older than it.
+    // A read or retention failure breaks (not continues) because skipping an
+    // entry and releasing a newer one would orphan the skipped entry and
+    // everything older than it. A *missing* manifest is different: see the
+    // `None` arm below.
 
     let mut deleted_count = 0;
     let mut indexes_cleaned = 0;
+    let mut unnameable_indexes = 0;
 
     for i in (keep_count..index_chain.len()).rev() {
         let manifest_entry = &index_chain[i - 1];
@@ -144,92 +296,39 @@ pub async fn clean_garbage(
 
         // Manifest from the newer entry lists nodes from entry_to_delete
         // that were replaced when manifest_entry was built.
-        let garbage_id = match &manifest_entry.garbage_id {
-            Some(id) => id,
-            None => {
-                tracing::debug!(
-                    t = manifest_entry.t,
-                    "No garbage manifest in index, stopping GC"
-                );
-                break;
-            }
-        };
-
-        // Load the garbage record by CID
-        let record =
-            match get_cached_or_remote(store, garbage_id, config.artifact_cache_dir.as_deref())
+        match &manifest_entry.garbage_id {
+            Some(garbage_id) => {
+                match release_manifest_nodes(
+                    store,
+                    garbage_id,
+                    manifest_entry.t,
+                    config.artifact_cache_dir.as_deref(),
+                    now_ms,
+                    min_age_ms,
+                )
                 .await
-            {
-                Ok(bytes) => match parse_garbage_record(&bytes) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!(
-                            t = manifest_entry.t,
-                            error = %e,
-                            "Failed to parse garbage record, stopping GC"
-                        );
-                        break;
-                    }
-                },
-                Err(e) => {
-                    tracing::debug!(
-                        t = manifest_entry.t,
-                        error = %e,
-                        "Failed to load garbage record (may already be released), stopping GC"
-                    );
-                    break;
-                }
-            };
-
-        // Check age: if created_at_ms is 0 (old format) or too recent, stop.
-        // Newer manifests will be even more recent, so break is correct.
-        if record.created_at_ms == 0 || now_ms - record.created_at_ms < min_age_ms {
-            tracing::debug!(
-                t = manifest_entry.t,
-                age_mins = (now_ms - record.created_at_ms) / 60000,
-                min_age_mins = min_age_mins,
-                "Garbage record too recent, stopping GC"
-            );
-            break;
-        }
-
-        // Release the garbage nodes (CID strings parsed back to ContentId).
-        let release_started = std::time::Instant::now();
-        tracing::debug!(
-            t = manifest_entry.t,
-            garbage_id = %garbage_id,
-            items = record.garbage.len(),
-            "GC releasing garbage record items"
-        );
-        for item in &record.garbage {
-            match item.parse::<ContentId>() {
-                Ok(cid) => {
-                    if let Err(e) = store.release(&cid).await {
-                        tracing::debug!(
-                            cid = %cid,
-                            error = %e,
-                            "Failed to release garbage node (may already be released)"
-                        );
-                    } else {
-                        deleted_count += 1;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        item,
-                        error = %e,
-                        "Skipping unrecognized garbage item (not a valid CID)"
-                    );
+                {
+                    Some(released) => deleted_count += released,
+                    None => break,
                 }
             }
+            // Roots written before the manifest write became unconditional can
+            // carry none, and the nodes they replaced cannot be named from
+            // here. Those nodes are left for the storage sweep rather than
+            // stalling this walk permanently — a single such root would
+            // otherwise pin every version newer than it. Releasing the
+            // superseded root is still safe: the walk runs oldest-first, so
+            // nothing older than it remains to orphan.
+            None => {
+                tracing::warn!(
+                    t = manifest_entry.t,
+                    superseded_t = entry_to_delete.t,
+                    "index root has no garbage manifest; releasing the superseded root \
+                     and leaving its replaced nodes for the storage sweep"
+                );
+                unnameable_indexes += 1;
+            }
         }
-        tracing::debug!(
-            t = manifest_entry.t,
-            garbage_id = %garbage_id,
-            deleted_count,
-            elapsed_ms = release_started.elapsed().as_millis() as u64,
-            "GC garbage record item release pass complete"
-        );
 
         // Release entry_to_delete's own garbage manifest
         if let Some(ref old_garbage_id) = entry_to_delete.garbage_id {
@@ -258,6 +357,7 @@ pub async fn clean_garbage(
         tracing::info!(
             indexes_cleaned = indexes_cleaned,
             nodes_deleted = deleted_count,
+            unnameable_indexes = unnameable_indexes,
             retained_count = keep_count,
             "Garbage collection complete"
         );
@@ -273,9 +373,15 @@ pub async fn clean_garbage(
 ///
 /// Returns entries in order from newest to oldest.
 ///
-/// **Tolerant behavior**: If a prev_index link cannot be loaded (e.g., it was
-/// released by prior GC), the walk stops gracefully at that point rather than
-/// returning an error. This ensures GC is idempotent.
+/// **Tolerant behavior**: if a prev_index link points at a root that no longer
+/// exists — the normal result of a prior GC truncating the chain — the walk
+/// stops gracefully there rather than returning an error, which is what makes
+/// GC idempotent.
+///
+/// A root that *does* exist but cannot be read propagates the error instead.
+/// Returning a short chain would be indistinguishable from a genuinely short
+/// one, and callers that decide which artifacts are unreferenced would treat
+/// everything past the unreadable root as garbage.
 pub(crate) async fn walk_prev_index_chain_cs(
     store: &dyn ContentStore,
     current_root_id: &ContentId,
@@ -316,9 +422,21 @@ pub(crate) async fn walk_prev_index_chain_cs_cached(
                 if chain.is_empty() {
                     return Err(e);
                 }
+                // A *released* root is the normal end of a walk: GC truncates
+                // the chain from the oldest end, leaving the retained
+                // boundary's prev_index dangling. Any other read failure is
+                // not an ending — it is a root whose contents could not be
+                // seen, and a caller deciding what is unreferenced would treat
+                // everything beyond it as garbage. Distinguish by existence,
+                // since the disk-cache path stringifies the error and loses
+                // its kind. If existence cannot be established either, treat
+                // the root as present and propagate.
+                if store.has(&current_id).await.unwrap_or(true) {
+                    return Err(e);
+                }
                 tracing::debug!(
                     root_id = %current_id,
-                    "prev_index not found, chain ends here (prior GC)"
+                    "prev_index released by prior GC, chain ends here"
                 );
                 break;
             }
@@ -353,12 +471,15 @@ pub(crate) async fn walk_prev_index_chain_cs_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::root_assembly::{encode_and_write_root_v6, Fir6Inputs};
+    use crate::build::types::{UploadedDicts, UploadedIndexes};
+    use crate::IndexStats;
     use fluree_db_binary_index::{
         BinaryGarbageRef, BinaryPrevIndexRef, DictPackRefs, DictRefs, DictTreeRefs, IndexRoot,
     };
     use fluree_db_core::prelude::*;
     use fluree_db_core::storage::content_store_for;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     const LEDGER: &str = "test:main";
 
@@ -373,57 +494,18 @@ mod tests {
         prev_index: Option<BinaryPrevIndexRef>,
         garbage: Option<BinaryGarbageRef>,
     ) -> Vec<u8> {
-        let dummy_cid = ContentId::new(ContentKind::IndexLeaf, b"dummy");
-        let dummy_tree = DictTreeRefs {
-            branch: dummy_cid.clone(),
-            leaves: Vec::new(),
-        };
-        let root = IndexRoot {
-            ledger_id: LEDGER.to_string(),
-            index_t: t,
-            base_t: 0,
-            subject_id_encoding: fluree_db_core::SubjectIdEncoding::Narrow,
-            namespace_codes: BTreeMap::new(),
-            predicate_sids: Vec::new(),
-            graph_iris: Vec::new(),
-            datatype_iris: Vec::new(),
-            language_tags: Vec::new(),
-            dict_refs: DictRefs {
-                forward_packs: DictPackRefs {
-                    string_fwd_packs: Vec::new(),
-                    subject_fwd_ns_packs: Vec::new(),
-                },
-                subject_reverse: dummy_tree.clone(),
-                string_reverse: dummy_tree,
-            },
-            subject_watermarks: Vec::new(),
-            string_watermark: 0,
-            lex_sorted_string_ids: false,
-            total_commit_size: 0,
-            total_asserts: 0,
-            total_retracts: 0,
-            graph_arenas: Vec::new(),
-            default_graph_orders: Vec::new(),
-            named_graphs: Vec::new(),
-            stats: None,
-            schema: None,
+        crate::gc::test_support::minimal_fir6_for(
+            LEDGER,
+            t,
             prev_index,
             garbage,
-            sketch_ref: None,
-            has_annotations: false,
-            annotation_index: None,
-            had_annotation_arena: false,
-            o_type_table: IndexRoot::build_o_type_table(&[], &[]),
-            ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
-        };
-        root.encode()
+            ContentId::new(ContentKind::IndexLeaf, b"dummy"),
+        )
     }
 
     /// Helper: create a CID and its derived memory-storage address.
     fn cid_and_addr(kind: ContentKind, data: &[u8]) -> (ContentId, String) {
-        let cid = ContentId::new(kind, data);
-        let addr = fluree_db_core::content_address("memory", kind, LEDGER, &cid.digest_hex());
-        (cid, addr)
+        crate::gc::test_support::cid_and_addr_for(LEDGER, kind, data)
     }
 
     #[test]
@@ -1032,5 +1114,503 @@ mod tests {
         // --- Current root + its garbage manifest retained ---
         assert!(store.has(&new_root_cid).await.unwrap());
         assert!(store.has(&garb_cid).await.unwrap());
+    }
+
+    /// The minimal `Fir6Inputs` a rebuild publishes: no dict packs, no graph
+    /// data, and `prev_index` as the version this root supersedes.
+    fn minimal_fir6_inputs(t: i64, prev_index: Option<BinaryPrevIndexRef>) -> Fir6Inputs {
+        let dummy_cid = ContentId::new(ContentKind::IndexLeaf, b"dummy");
+        let dummy_tree = DictTreeRefs {
+            branch: dummy_cid,
+            leaves: Vec::new(),
+        };
+        Fir6Inputs {
+            ledger_id: LEDGER.to_string(),
+            index_t: t,
+            namespace_codes: BTreeMap::new(),
+            commit_derived_ns: HashMap::new(),
+            ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
+            predicate_sids: Vec::new(),
+            uploaded_dicts: UploadedDicts {
+                dict_refs: DictRefs {
+                    forward_packs: DictPackRefs {
+                        string_fwd_packs: Vec::new(),
+                        subject_fwd_ns_packs: Vec::new(),
+                    },
+                    subject_reverse: dummy_tree.clone(),
+                    string_reverse: dummy_tree,
+                },
+                subject_id_encoding: fluree_db_core::SubjectIdEncoding::Narrow,
+                subject_watermarks: Vec::new(),
+                string_watermark: 0,
+                graph_iris: Vec::new(),
+                datatype_iris: Vec::new(),
+                language_tags: Vec::new(),
+                numbig: BTreeMap::new(),
+                vectors: BTreeMap::new(),
+            },
+            v3_uploaded: UploadedIndexes {
+                default_graph_orders: Vec::new(),
+                named_graphs: Vec::new(),
+            },
+            graph_arenas: Vec::new(),
+            datatype_iris: Vec::new(),
+            language_tags: Vec::new(),
+            total_commit_size: 0,
+            total_asserts: 0,
+            total_retracts: 0,
+            db_stats: None,
+            db_schema: None,
+            sketch_ref: None,
+            attachment_events: None,
+            prev_index,
+        }
+    }
+
+    /// Roots in a synthetic chain that deviate from what the current write
+    /// path produces, identified by `t`.
+    #[derive(Default)]
+    struct LegacyRoots {
+        /// Published with no garbage manifest at all.
+        no_manifest: &'static [i64],
+        /// Manifest written before the `created_at_ms` field existed.
+        no_timestamp: &'static [i64],
+    }
+
+    /// Write a linked chain of index roots `t=1..=len`. Each root at `t > 1`
+    /// carries a garbage manifest listing the leaf blob its predecessor
+    /// referenced, aged past any retention threshold, except where `legacy`
+    /// says otherwise.
+    ///
+    /// Returns the root CIDs and the superseded leaf CIDs, each indexed by
+    /// `t - 1`.
+    async fn write_linked_chain(
+        storage: &MemoryStorage,
+        len: i64,
+        legacy: LegacyRoots,
+    ) -> (Vec<ContentId>, Vec<ContentId>) {
+        let aged_ts = current_timestamp_ms() - (60 * 60 * 1000);
+        let mut root_cids: Vec<ContentId> = Vec::new();
+        let mut leaf_cids: Vec<ContentId> = Vec::new();
+
+        for t in 1..=len {
+            let (leaf_cid, leaf_addr) =
+                cid_and_addr(ContentKind::IndexLeaf, format!("leaf-{t}").as_bytes());
+            storage
+                .write_bytes(&leaf_addr, b"superseded leaf")
+                .await
+                .unwrap();
+            leaf_cids.push(leaf_cid);
+
+            let garbage = if t > 1 && !legacy.no_manifest.contains(&t) {
+                let (garb_cid, garb_addr) =
+                    cid_and_addr(ContentKind::GarbageRecord, format!("garb-{t}").as_bytes());
+                let superseded = &leaf_cids[(t - 2) as usize];
+                let created_at_ms = if legacy.no_timestamp.contains(&t) {
+                    0
+                } else {
+                    aged_ts
+                };
+                let json = format!(
+                    r#"{{"ledger_id": "{LEDGER}", "t": {t}, "garbage": ["{superseded}"], "created_at_ms": {created_at_ms}}}"#
+                );
+                storage
+                    .write_bytes(&garb_addr, json.as_bytes())
+                    .await
+                    .unwrap();
+                Some(BinaryGarbageRef { id: garb_cid })
+            } else {
+                None
+            };
+
+            let prev_index = root_cids.last().map(|id| BinaryPrevIndexRef {
+                t: t - 1,
+                id: id.clone(),
+            });
+            let (root_cid, root_addr) =
+                cid_and_addr(ContentKind::IndexRoot, format!("root-{t}").as_bytes());
+            storage
+                .write_bytes(&root_addr, &minimal_fir6(t, prev_index, garbage))
+                .await
+                .unwrap();
+            root_cids.push(root_cid);
+        }
+
+        (root_cids, leaf_cids)
+    }
+
+    /// A rebuild publishes through `encode_and_write_root_v6` with no
+    /// `GarbageContext`, so the prior index head reaches the new root only via
+    /// `Fir6Inputs::prev_index`. Dropping it severs the prev-index chain: a
+    /// later chain walk stops at this root and every earlier version is
+    /// orphaned beyond GC's reach (#1548).
+    #[tokio::test]
+    async fn rebuild_root_links_prior_index_chain() {
+        let storage = MemoryStorage::new();
+        let store = test_store(&storage);
+        let (prior_head, _) = cid_and_addr(ContentKind::IndexRoot, b"prior-head");
+
+        let result = encode_and_write_root_v6(
+            &store,
+            minimal_fir6_inputs(
+                9,
+                Some(BinaryPrevIndexRef {
+                    t: 8,
+                    id: prior_head.clone(),
+                }),
+            ),
+            IndexStats::default(),
+        )
+        .await
+        .unwrap();
+
+        let published = IndexRoot::decode(&store.get(&result.root_id).await.unwrap()).unwrap();
+        assert_eq!(
+            published.prev_index.map(|p| p.id),
+            Some(prior_head),
+            "a rebuild root must link the prior index head; without it the chain \
+             walk terminates here and every earlier root is unreachable"
+        );
+    }
+
+    /// A rebuild supersedes the entire prior index, so its published root must
+    /// carry a garbage manifest naming what it replaced. Without one the root
+    /// becomes an absorbing barrier as soon as the chain grows past it (#1548).
+    #[tokio::test]
+    async fn rebuild_root_carries_garbage_manifest() {
+        let storage = MemoryStorage::new();
+        let (root_cids, _) = write_linked_chain(&storage, 2, LegacyRoots::default()).await;
+        let store = test_store(&storage);
+
+        let result = encode_and_write_root_v6(
+            &store,
+            minimal_fir6_inputs(
+                3,
+                Some(BinaryPrevIndexRef {
+                    t: 2,
+                    id: root_cids[1].clone(),
+                }),
+            ),
+            IndexStats::default(),
+        )
+        .await
+        .unwrap();
+
+        let published = IndexRoot::decode(&store.get(&result.root_id).await.unwrap()).unwrap();
+        let garbage_id = published
+            .garbage
+            .expect("rebuild root must carry a garbage manifest")
+            .id;
+        let record = parse_garbage_record(&store.get(&garbage_id).await.unwrap())
+            .expect("manifest must be readable");
+        assert_eq!(record.t, 3, "manifest belongs to the root that wrote it");
+    }
+
+    /// When the prior root cannot be expanded, what it superseded is unknown.
+    /// The manifest must then be absent rather than empty: an empty one claims
+    /// the rebuild replaced nothing, which would let GC release the prior root
+    /// while leaving behind every blob it referenced (#1548).
+    #[tokio::test]
+    async fn rebuild_omits_manifest_when_prior_root_unreadable() {
+        let storage = MemoryStorage::new();
+        let store = test_store(&storage);
+        // Never written to storage, so its reachable set cannot be computed.
+        let (unreadable, _) = cid_and_addr(ContentKind::IndexRoot, b"absent-prior-root");
+
+        let result = encode_and_write_root_v6(
+            &store,
+            minimal_fir6_inputs(
+                3,
+                Some(BinaryPrevIndexRef {
+                    t: 2,
+                    id: unreadable.clone(),
+                }),
+            ),
+            IndexStats::default(),
+        )
+        .await
+        .unwrap();
+
+        let published = IndexRoot::decode(&store.get(&result.root_id).await.unwrap()).unwrap();
+        assert!(
+            published.garbage.is_none(),
+            "an undeterminable garbage set must not be recorded as an empty one"
+        );
+        assert_eq!(
+            published.prev_index.map(|p| p.id),
+            Some(unreadable),
+            "the chain link is still published so the walk stays connected"
+        );
+    }
+
+    /// Reindex over an existing chain, then GC. The consolidated root
+    /// supersedes the whole prior chain, so everything past the retention
+    /// window must become collectable (#1548).
+    #[tokio::test]
+    async fn reindex_publish_leaves_superseded_roots_collectable() {
+        let storage = MemoryStorage::new();
+        let (root_cids, leaf_cids) = write_linked_chain(&storage, 3, LegacyRoots::default()).await;
+        let store = test_store(&storage);
+
+        let reindexed = encode_and_write_root_v6(
+            &store,
+            minimal_fir6_inputs(
+                4,
+                Some(BinaryPrevIndexRef {
+                    t: 3,
+                    id: root_cids[2].clone(),
+                }),
+            ),
+            IndexStats::default(),
+        )
+        .await
+        .unwrap();
+
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let result = clean_garbage(&store, &reindexed.root_id, config)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.indexes_cleaned, 2,
+            "t=1 and t=2 are past the retention window and must be released"
+        );
+        assert!(
+            !store.has(&root_cids[0]).await.unwrap(),
+            "t=1 root released"
+        );
+        assert!(
+            !store.has(&root_cids[1]).await.unwrap(),
+            "t=2 root released"
+        );
+        assert!(
+            !store.has(&leaf_cids[0]).await.unwrap(),
+            "t=1 leaf released"
+        );
+        assert!(
+            !store.has(&leaf_cids[1]).await.unwrap(),
+            "t=2 leaf released"
+        );
+        assert!(store.has(&root_cids[2]).await.unwrap(), "t=3 retained");
+        assert!(store.has(&reindexed.root_id).await.unwrap(), "current root");
+    }
+
+    /// Retention promises `current + max_old_indexes` versions. A root
+    /// published without a garbage manifest stops the collector's oldest-first
+    /// walk, so every version newer than the gap is retained forever and the
+    /// chain grows without bound (#1548).
+    #[tokio::test]
+    async fn gc_bounds_retained_chain_despite_manifest_gap() {
+        let storage = MemoryStorage::new();
+        let (root_cids, _) = write_linked_chain(
+            &storage,
+            6,
+            LegacyRoots {
+                no_manifest: &[4],
+                ..Default::default()
+            },
+        )
+        .await;
+        let store = test_store(&storage);
+
+        let max_old_indexes = 1;
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(max_old_indexes),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        clean_garbage(&store, &root_cids[5], config).await.unwrap();
+
+        let mut retained = Vec::new();
+        for (i, cid) in root_cids.iter().enumerate() {
+            if store.has(cid).await.unwrap() {
+                retained.push(i + 1);
+            }
+        }
+
+        assert!(
+            retained.len() <= 1 + max_old_indexes as usize,
+            "retention keeps current + {max_old_indexes} old roots, but t={retained:?} survive"
+        );
+    }
+
+    /// A branch's manifest can name a dictionary blob a sibling branch still
+    /// references — dictionaries live in the ledger-wide `@shared/dicts/`
+    /// namespace, and content addressing makes identical content share a CID.
+    /// The collector walks one branch and holds no exclusion over the others,
+    /// so it must leave those for the sweep rather than release them (#1548).
+    #[tokio::test]
+    async fn shared_dictionary_blobs_are_left_for_the_sweep() {
+        use fluree_db_core::content_kind::DictKind;
+
+        let storage = MemoryStorage::new();
+        let aged_ts = current_timestamp_ms() - (60 * 60 * 1000);
+
+        let (root1, addr1) = cid_and_addr(ContentKind::IndexRoot, b"root1");
+        let (root2, addr2) = cid_and_addr(ContentKind::IndexRoot, b"root2");
+        let (root3, addr3) = cid_and_addr(ContentKind::IndexRoot, b"root3");
+        let (garb2, garb2_addr) = cid_and_addr(ContentKind::GarbageRecord, b"garb2");
+
+        // One branch-local leaf and one shared dictionary, both superseded.
+        let (leaf, leaf_addr) = cid_and_addr(ContentKind::IndexLeaf, b"superseded-leaf");
+        let (dict, dict_addr) = cid_and_addr(
+            ContentKind::DictBlob {
+                dict: DictKind::SubjectReverse,
+            },
+            b"superseded-dict",
+        );
+        storage.write_bytes(&leaf_addr, b"leaf").await.unwrap();
+        storage.write_bytes(&dict_addr, b"dict").await.unwrap();
+
+        storage
+            .write_bytes(&addr1, &minimal_fir6(1, None, None))
+            .await
+            .unwrap();
+        storage
+            .write_bytes(
+                &addr2,
+                &minimal_fir6(
+                    2,
+                    Some(BinaryPrevIndexRef {
+                        t: 1,
+                        id: root1.clone(),
+                    }),
+                    Some(BinaryGarbageRef { id: garb2.clone() }),
+                ),
+            )
+            .await
+            .unwrap();
+        storage
+            .write_bytes(
+                &addr3,
+                &minimal_fir6(
+                    3,
+                    Some(BinaryPrevIndexRef {
+                        t: 2,
+                        id: root2.clone(),
+                    }),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        storage
+            .write_bytes(
+                &garb2_addr,
+                format!(
+                    r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": ["{leaf}", "{dict}"], "created_at_ms": {aged_ts}}}"#
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let store = test_store(&storage);
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let result = clean_garbage(&store, &root3, config).await.unwrap();
+
+        assert_eq!(
+            result.nodes_deleted, 1,
+            "only the branch-local leaf is released"
+        );
+        assert!(!store.has(&leaf).await.unwrap(), "the leaf is reclaimed");
+        assert!(
+            store.has(&dict).await.unwrap(),
+            "the shared dictionary survives; a sibling branch may still reference it"
+        );
+    }
+
+    /// A manifest with no `created_at_ms` predates the field, so its nodes are
+    /// long past any retention window. Reading the absent timestamp as "too
+    /// recent" stopped the walk at that record on every pass, pinning every
+    /// version newer than it (#1548).
+    #[tokio::test]
+    async fn manifest_without_timestamp_does_not_stop_gc() {
+        let storage = MemoryStorage::new();
+        // t=2's manifest predates the field; t=3's and t=4's are current.
+        let (root_cids, leaf_cids) = write_linked_chain(
+            &storage,
+            4,
+            LegacyRoots {
+                no_timestamp: &[2],
+                ..Default::default()
+            },
+        )
+        .await;
+        let store = test_store(&storage);
+
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let result = clean_garbage(&store, &root_cids[3], config).await.unwrap();
+
+        assert_eq!(
+            result.indexes_cleaned, 2,
+            "t=1 and t=2 are past retention and must be released"
+        );
+        assert!(
+            !store.has(&leaf_cids[0]).await.unwrap(),
+            "the pre-timestamp manifest still names t=1's superseded leaf"
+        );
+        assert!(
+            !store.has(&leaf_cids[1]).await.unwrap(),
+            "the walk continues past it to t=2's manifest"
+        );
+    }
+
+    /// Stepping over a manifest gap strands exactly the nodes that gap would
+    /// have named — one build's worth — and nothing more. The storage sweep
+    /// reclaims them; every other superseded node is still released here.
+    #[tokio::test]
+    async fn manifest_gap_strands_only_its_own_step() {
+        let storage = MemoryStorage::new();
+        // The manifest at t=4 would have named t=3's superseded leaf.
+        let (root_cids, leaf_cids) = write_linked_chain(
+            &storage,
+            6,
+            LegacyRoots {
+                no_manifest: &[4],
+                ..Default::default()
+            },
+        )
+        .await;
+        let store = test_store(&storage);
+
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let result = clean_garbage(&store, &root_cids[5], config).await.unwrap();
+
+        assert_eq!(
+            result.indexes_cleaned, 4,
+            "the gap must not stop the walk: t=1..4 are all past retention"
+        );
+        assert_eq!(
+            result.nodes_deleted, 3,
+            "every superseded node except the gap step's is released"
+        );
+
+        assert!(
+            store.has(&leaf_cids[2]).await.unwrap(),
+            "t=3's superseded leaf is unnameable and waits for the sweep"
+        );
+        for (t, leaf) in [(1, &leaf_cids[0]), (2, &leaf_cids[1]), (4, &leaf_cids[3])] {
+            assert!(
+                !store.has(leaf).await.unwrap(),
+                "t={t}'s superseded leaf is named by a manifest and must be released"
+            );
+        }
     }
 }

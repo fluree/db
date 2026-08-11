@@ -31,6 +31,9 @@ pub const FIELD_FILE_PATH: &str = "https://ns.flur.ee/system#filePath";
 /// AES-256 key field for file-based storage (optional)
 pub const FIELD_AES256_KEY: &str = "https://ns.flur.ee/system#AES256Key";
 
+/// Durability mode for file-based storage: `sync` or `page-cache` (optional)
+pub const FIELD_DURABILITY: &str = "https://ns.flur.ee/system#durability";
+
 /// S3 bucket field for S3 storage
 pub const FIELD_S3_BUCKET: &str = "https://ns.flur.ee/system#s3Bucket";
 

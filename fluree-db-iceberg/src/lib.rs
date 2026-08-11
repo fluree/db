@@ -58,6 +58,7 @@ pub mod config_value;
 pub mod credential;
 pub mod error;
 pub mod io;
+pub mod local_guard;
 pub mod manifest;
 pub mod metadata;
 pub mod mor_guard;
@@ -88,6 +89,10 @@ pub use config::{
 };
 pub use config_value::{ConfigValue, SecretResolveError, SecretResolver};
 pub use error::{IcebergError, Result};
+pub use local_guard::{
+    ensure_local_location_allowed, is_local_location, local_roots, resolve_local_path,
+    LOCAL_ROOTS_ENV,
+};
 pub use mor_guard::{
     ensure_no_delete_manifests, ensure_no_summary_deletes, mor_deletes_allowed,
     summary_indicates_deletes, ALLOW_MOR_DELETES_ENV,

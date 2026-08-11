@@ -503,7 +503,10 @@ impl crate::NameServiceLookup for FileNameService {
             }
 
             // Graph-source records are skipped by `load_record` (returns Ok(None)).
-            if let Ok(Some(record)) = self.load_record(&parent, &file_stem).await {
+            // A read failure must not silently shrink the result: callers
+            // that decide what to delete treat a missing branch as one with
+            // nothing to protect.
+            if let Some(record) = self.load_record(&parent, &file_stem).await? {
                 records.push(record);
             }
         }

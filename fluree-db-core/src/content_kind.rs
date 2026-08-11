@@ -164,6 +164,35 @@ pub enum ContentKind {
 // ============================================================================
 
 impl ContentKind {
+    /// Whether this kind is derived from the commit chain and can be rebuilt.
+    ///
+    /// Commits, transactions and the objects describing a ledger are the source
+    /// of truth: losing one loses data. Everything else — index nodes,
+    /// dictionaries, sketches, arenas — is recomputable from those, so storage
+    /// may trade durability for throughput when writing it. See
+    /// `docs/operations/scaling-and-resilience.md`.
+    pub fn is_derived(&self) -> bool {
+        match self {
+            ContentKind::Commit
+            | ContentKind::Txn
+            | ContentKind::LedgerConfig
+            | ContentKind::GraphSourceMapping => false,
+            ContentKind::IndexRoot
+            | ContentKind::IndexBranch
+            | ContentKind::IndexLeaf
+            | ContentKind::DictBlob { .. }
+            | ContentKind::GarbageRecord
+            | ContentKind::StatsSketch
+            | ContentKind::GraphSourceSnapshot
+            | ContentKind::SpatialIndex
+            | ContentKind::HistorySidecar
+            | ContentKind::AnnotationForwardBranch
+            | ContentKind::AnnotationForwardLeaf
+            | ContentKind::AnnotationReverseBranch
+            | ContentKind::AnnotationReverseLeaf => true,
+        }
+    }
+
     /// Map this content kind to its Fluree multicodec value.
     ///
     /// All `DictBlob { .. }` sub-kinds map to the single `CODEC_FLUREE_DICT_BLOB`.

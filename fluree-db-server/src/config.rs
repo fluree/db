@@ -438,6 +438,17 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_DISK_CACHE_MAX_MB")]
     pub disk_cache_max_mb: Option<usize>,
 
+    /// Directories under which catalog-less Iceberg tables may be read from the
+    /// local filesystem (colon-separated, absolute).
+    ///
+    /// Unset (the default) disables local-filesystem Iceberg tables entirely: a
+    /// graph source whose `table_location` is a `file://` URI or an absolute
+    /// path is refused at creation. When set, such locations are allowed and
+    /// every path read — including those a table's own manifests reference — is
+    /// confined to these directories. Use `/` to allow the whole filesystem.
+    #[arg(long, env = "FLUREE_ICEBERG_LOCAL_ROOTS")]
+    pub iceberg_local_roots: Option<String>,
+
     /// Request body size limit in bytes (default 50MB)
     #[arg(long, env = "FLUREE_BODY_LIMIT", default_value_t = server_defaults::DEFAULT_BODY_LIMIT)]
     pub body_limit: usize,
@@ -813,6 +824,7 @@ impl Default for ServerConfig {
             listen_addr: server_defaults::DEFAULT_LISTEN_ADDR.parse().unwrap(),
             storage_path: None,
             connection_config: None,
+            iceberg_local_roots: None,
             cors_enabled: server_defaults::DEFAULT_CORS_ENABLED,
             indexing_enabled: server_defaults::DEFAULT_INDEXING_ENABLED,
             bm25_auto_sync: server_defaults::DEFAULT_BM25_AUTO_SYNC,

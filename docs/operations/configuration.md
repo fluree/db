@@ -41,6 +41,7 @@ query_timeout_ms = 900000  # 15 minutes; set to 0 to disable
 query_min_t_timeout_ms = 5000
 # cache_max_mb = 4096  # global in-memory cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 # disk_cache_max_mb = 20480  # global on-disk cache budget (MB), shared across object storage + Iceberg; default: auto-detect; 0 disables
+# iceberg_local_roots = "/data/warehouse:/srv/lake"  # allow catalog-less Iceberg tables under these dirs; default: unset (local-filesystem tables disabled)
 
 [server.query_refresh]
 enabled = false
@@ -157,6 +158,7 @@ A few operational knobs are environment-only (no CLI flag):
 | `FLUREE_CYPHER_ALLOW_FULL_SCAN` | off | Allow bare Cypher `MATCH (n)` (no label/property/relationship constraint) to run as a whole-graph distinct-subject scan. Off by default — intended for benchmarks and ad-hoc exploration, not production queries. |
 | `FLUREE_PATH_MAX_VISITED` | 1,000,000 | Visited-node cap for path traversals (variable-length paths, `shortestPath`) — a runaway-closure backstop. Traversals that exceed it fail with a clear resource-limit error; raise for graphs whose legitimate closures are larger (the cap also bounds per-query traversal memory). Read once at startup. |
 | `FLUREE_CYPHER_AST_CACHE` | 512 | Capacity (entries) of the process-wide Cypher parsed-AST cache, keyed on statement text. Repeated statements (parameterized workloads, benchmark loops) skip re-parsing; parameters are substituted into a per-request clone. `0` disables the cache. Read once at startup. |
+| `FLUREE_STORAGE_FSYNC` | on | File-storage durability. On, a write is reported complete once its bytes and the directory entry naming them are flushed to the device, so an acknowledged commit survives power loss. Set to `0`/`false`/`off`/`no` to report completion once the bytes reach the OS page cache instead — faster, but a power loss or kernel panic can lose acknowledged commits. Read once per storage construction, and **overrides** a storage node's `durability` property so a one-off run needs no config edit. Applies only to the local file backend; S3 acknowledges after replication and the Raft log flushes independently. Derived content (index nodes, dictionaries, sketches, arenas) is written page-cache in either setting, since it is recomputable from the commit chain. See [Storage durability](storage.md#durability). |
 
 ### Precedence
 
@@ -857,9 +859,11 @@ fluree server run \
 | `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100000`                                                                |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
+| `FLUREE_DICT_COMPACTION`                | Merge forward dictionary packs during incremental index builds. Off (`0`/`false`/`off`/`no`) appends packs without ever merging them, so a dictionary's object and mapping count grows once per build forever — see [Forward pack compaction](../design/index-format.md#forward-pack-compaction). Read once per process. | `true` |
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
 | `FLUREE_DISK_CACHE_BUDGET_BYTES`        | On-disk cache budget (bytes); overrides `FLUREE_DISK_CACHE_MAX_MB`        | Auto-detect from free disk; `0` disables |
+| `FLUREE_ICEBERG_LOCAL_ROOTS`            | Colon-separated absolute directories under which catalog-less Iceberg tables may be read from the local filesystem. Unset disables local-filesystem tables entirely | Unset (local tables disabled) |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
 | `FLUREE_QUERY_TIMEOUT_MS`               | Max query execution time in milliseconds (`0` disables) | `900000`                                                     |
 | `FLUREE_QUERY_MIN_T_TIMEOUT_MS`         | Max read-after-write min-t wait in milliseconds | `5000`                                                                  |
@@ -1029,11 +1033,14 @@ cores and allocator pressure under concurrent load.
 ## Iceberg / R2RML Graph-Source Tuning
 
 Queries against an Iceberg-backed R2RML graph source are tuned by a set of
-environment-only knobs. All are optional; the defaults are chosen for correct,
-reasonable behavior out of the box.
+environment knobs. All are optional; the defaults are chosen for correct,
+reasonable behavior out of the box. `FLUREE_ICEBERG_LOCAL_ROOTS` is also
+settable from the config file (`[server] iceberg_local_roots`); the rest are
+environment-only.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `FLUREE_ICEBERG_LOCAL_ROOTS` | unset (local tables **disabled**) | Colon-separated absolute directories under which catalog-less Iceberg tables may be read from the local filesystem, in the style of `PATH`. Unset, a Direct `table_location` that is a `file://` URI or an absolute path is **refused when the graph source is created**, with an error naming this switch. When set, such locations are permitted *and* every path read — table location, metadata, manifests, data files — is confined to these directories, so a manifest reference that climbs out of the table root (`.../table/../../../etc/passwd`) is refused rather than followed. Containment is checked textually and against the canonical path, so a symlink out of a root does not escape it. `/` allows the whole filesystem — reasonable on a single-tenant workstation, risky on a shared deployment. See [Iceberg graph sources](../graph-sources/iceberg.md#enabling-local-tables). |
 | `FLUREE_ICEBERG_LOADTABLE_CACHE` | on | Master switch for all REST catalog caching. Set to `0`/`false`/`off` to build a fresh catalog client and reload the table on **every** scan (restores a per-scan OAuth exchange + `loadTable` round-trip). Disables the client/OAuth reuse, the cross-query `loadTable` cache, and the per-query snapshot pin. **Materialize refusal:** because disabling the cache also disables the per-query snapshot pin, `fluree materialize` **refuses to build** a twin while this is off (the twin's stamped watermark could not be guaranteed to describe its contents) — re-enable the cache to materialize. |
 | `FLUREE_ICEBERG_LOADTABLE_TTL_SECS` | `60` | TTL (seconds) for the **cross-query** `loadTable`-response cache. A REST `loadTable` GET against a catalog such as Snowflake Horizon costs ~1.3–3 s, so caching it lets a burst of queries against the same table skip the round-trip. The TTL bounds how stale a snapshot a *new* query may observe; `0` disables the cross-query layer (leaving only the per-query pin). Every cache read is additionally gated on vended-credential expiry (30 s buffer), so a long TTL never hands out about-to-expire credentials. |
 | `FLUREE_ICEBERG_REST_CLIENT_TTL_SECS` | `900` | TTL (seconds) for the process-wide REST **catalog-client** cache (the reused OAuth token + HTTPS pool). The cache is keyed by a fingerprint of the raw config JSON, which does **not** change when a secret referenced by env var / secret store is rotated; this TTL bounds how long a rotated secret stays stale before the client is rebuilt and re-authenticated. `0` rebuilds the client every query (restoring a per-query OAuth exchange). |
@@ -1044,6 +1051,7 @@ reasonable behavior out of the box.
 | `FLUREE_FUSED_VECTOR_FOLD` | on | Toggles the vectorized GROUP BY fold (a borrowed-key dense-id dict) for fused R2RML aggregates. Set to `0`/`false`/`off` to restore the byte-identical owned-key `HashMap` fold that clones a fresh key every row. Read at fused-operator construction (per query). |
 | `FLUREE_FUSED_R2RML_OUTPUT_BOUND` | on | Toggles emitting a fused GROUP BY rollup in bounded chunks (≤8192 groups per batch) so a high-cardinality result never fully materializes at once. Set to `0`/`false`/`off` to emit a single batch. Same rows either way, but a bare `LIMIT` with no `ORDER BY` can return a different prefix on vs off (group order is unspecified). Read at fused-operator construction (per query). |
 | `FLUREE_FUSED_R2RML_MULTIFACT` | on | Toggles the fused multi-fact branching-star join (one GROUP-KEY branch + one SEMI-JOIN branch). Set to `0`/`false`/`off` to decline the branching star to the generic pipeline (byte-identical). Read at fused-operator construction (per query). |
+| `FLUREE_FUSED_R2RML_MULTIFACT_GEN` | on | Toggles the S1/S2 generality WIDENING over the one-of-each cut: K≥2 SEMI-JOIN branches (S1) and ≥2 ref-IRI GROUP-BY keys (S2). Set to `0`/`false`/`off` to decline ONLY that increment — a K=1 branching star and a single ref-IRI key still fuse (byte-identical to before the widening). Rides on top of `FLUREE_FUSED_R2RML_MULTIFACT` / `FLUREE_FUSED_R2RML_AGG_JOIN` (either of those off declines the whole family). Read at fused-operator construction (per query). |
 | `FLUREE_ARROW_DIRECT_DECODE` | on | Toggles building a column directly from an Arrow array, skipping the two-hop per-cell intermediate. Set to `0`/`false`/`off` to restore the byte-identical two-hop decode. |
 | `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS` | `524288` | Target table rows materialized into RDF-term bindings per parallel window. Bounds resident memory during a scan (materialization explodes the compact columnar form into fat binding rows). Also caps the size of an inner scan eligible for the inner-scan cache above. |
 | `FLUREE_ICEBERG_SCAN_CONCURRENCY` | `min(cores, files, 8)` | Number of data files read concurrently within one scan. Raise it for high-latency remote object stores (it is not capped, but is bounded by the number of files in the scan). |

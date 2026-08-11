@@ -9,8 +9,9 @@
 //! their respective modules. Conversions from internal → wire types live
 //! here via `From` impls.
 //!
-//! Currently covers: `/reindex`. Other admin endpoints (`/create`, `/drop`,
-//! `/branch`, etc.) can be moved into this module incrementally.
+//! Currently covers: `/reindex` and `/sweep`. Other admin endpoints
+//! (`/create`, `/drop`, `/branch`, etc.) can be moved into this module
+//! incrementally.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -70,6 +71,80 @@ impl From<ReindexResult> for ReindexResponse {
                 total_bytes: r.stats.total_bytes,
             },
             fuel: r.fuel,
+        }
+    }
+}
+
+// =============================================================================
+// Storage sweep
+// =============================================================================
+
+/// Request body for `POST /sweep` and `POST /sweep/plan`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SweepRequest {
+    /// Ledger **name**, without a branch suffix. A sweep covers every branch
+    /// of the ledger, because dict blobs are shared across them.
+    pub ledger: String,
+}
+
+/// What a sweep would reclaim, from `POST /sweep/plan`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SweepPlanResponse {
+    pub ledger: String,
+    /// Number of artifacts no index chain references.
+    pub orphan_count: usize,
+    /// Artifacts examined across every swept prefix.
+    pub scanned: usize,
+    /// Distinct artifacts reachable from a live index chain.
+    pub live: usize,
+    /// The addresses that would be released. Included in full so an operator
+    /// can audit the set before running the destructive form; expect one entry
+    /// per orphaned artifact.
+    pub orphans: Vec<String>,
+}
+
+/// An artifact a sweep could not release.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SweepFailure {
+    pub address: String,
+    pub error: String,
+}
+
+/// What a sweep reclaimed, from `POST /sweep`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SweepResponse {
+    pub ledger: String,
+    /// Artifacts released.
+    pub reclaimed: usize,
+    /// Artifacts that resisted deletion. A sweep reports these rather than
+    /// failing: they stay in storage and the next run retries them.
+    pub failures: Vec<SweepFailure>,
+}
+
+impl SweepPlanResponse {
+    /// Build a response from a plan for `ledger`.
+    pub fn new(ledger: String, plan: crate::SweepPlan) -> Self {
+        Self {
+            ledger,
+            orphan_count: plan.orphans.len(),
+            scanned: plan.scanned,
+            live: plan.live,
+            orphans: plan.orphans,
+        }
+    }
+}
+
+impl SweepResponse {
+    /// Build a response from a result for `ledger`.
+    pub fn new(ledger: String, result: crate::SweepResult) -> Self {
+        Self {
+            ledger,
+            reclaimed: result.reclaimed,
+            failures: result
+                .failures
+                .into_iter()
+                .map(|(address, error)| SweepFailure { address, error })
+                .collect(),
         }
     }
 }

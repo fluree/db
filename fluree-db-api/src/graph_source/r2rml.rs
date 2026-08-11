@@ -21,7 +21,10 @@ use fluree_db_iceberg::{
         LoadTableResponse, RestCatalogClient, RestCatalogConfig, SendCatalogClient, TableIdentifier,
     },
     config::IoConfig,
-    io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
+    io::{
+        ColumnBatch, FileIcebergStorage, IcebergStorageBackend, S3IcebergStorage,
+        SendIcebergStorage, SendParquetReader,
+    },
     metadata::TableMetadata,
     scan::{
         topk::{batch_sort_values, plan_topk_read, TopKBound},
@@ -790,7 +793,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
         &self,
         graph_source_id: &str,
         table_name: &str,
-    ) -> QueryResult<(Arc<S3IcebergStorage>, Arc<TableMetadata>, String)> {
+    ) -> QueryResult<(Arc<IcebergStorageBackend>, Arc<TableMetadata>, String)> {
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
@@ -829,6 +832,9 @@ impl<'a> FlureeR2rmlProvider<'a> {
             })?
         };
 
+        // The effective Direct table location, captured for the relocated-table
+        // remap inference below (None for REST).
+        let mut direct_location: Option<String> = None;
         let (load_response, storage) = match &iceberg_config.catalog {
             CatalogConfig::Rest {
                 uri,
@@ -880,20 +886,58 @@ impl<'a> FlureeR2rmlProvider<'a> {
                         QueryError::Internal(format!("Failed to create S3 storage: {e}"))
                     })?
                 };
-                (load_response, Arc::new(storage))
+                (load_response, Arc::new(IcebergStorageBackend::S3(storage)))
             }
             CatalogConfig::Direct { table_location } => {
-                let storage: Arc<S3IcebergStorage> = Arc::new(
-                    S3IcebergStorage::from_default_chain(
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?,
+                // Warehouse-root resolution — the same step the query path
+                // (`load_table_context`) performs: when `table_location` is a
+                // catalog-less multi-table ROOT, resolve THIS table's own
+                // directory beneath it. Without this, pin resolution
+                // (`current_snapshot_id`) and materialize scans read
+                // `{root}/metadata/` and fail on any multi-table copy the
+                // query path handles fine.
+                //
+                // A location whose leaf directory is NAMED AFTER the table
+                // returns unchanged (that is the classifier — not "is this one
+                // table"), so those sources are byte-identical. A single-table
+                // location whose directory is named something else is treated
+                // as a root here, exactly as the query path has always treated
+                // it, so nothing that queries successfully today changes.
+                let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
+                    graph_source_id,
+                    &table_id.namespace,
+                    &table_id.table,
                 );
+                let effective_location = self
+                    .resolve_direct_table_location(
+                        table_location,
+                        &table_id,
+                        &lt_key,
+                        &iceberg_config,
+                    )
+                    .await?;
+                let table_location = &effective_location;
+                // The RESOLVED table dir is what the relocation remap compares
+                // against the metadata's own `location` — a warehouse root would
+                // never match it. Mirrors the query path's ordering.
+                direct_location = Some(effective_location.clone());
+
+                // Storage through the session, which dispatches on the location
+                // scheme (a `file://` / absolute-path table reads the filesystem
+                // directly, skipping the S3 client build and its credential-chain
+                // resolution). Going through the session rather than building a
+                // client here means the warehouse-root branch above — which
+                // already built one to LIST the root — hands its client over
+                // instead of having it constructed and discarded.
+                let storage = direct_session_storage(
+                    &self.session,
+                    &lt_key,
+                    table_location,
+                    iceberg_config.io.s3_region.as_deref(),
+                    iceberg_config.io.s3_endpoint.as_deref(),
+                    iceberg_config.io.s3_path_style,
+                )
+                .await?;
                 let cache = self.fluree.r2rml_cache();
                 let load_response = if let Some(metadata_location) =
                     cache.get_direct_metadata_location(table_location).await
@@ -948,6 +992,11 @@ impl<'a> FlureeR2rmlProvider<'a> {
             metadata
         };
 
+        // Relocated local table (copied/moved after writing): remap manifest
+        // file references from the metadata's declared root to the configured
+        // location. No-op for REST, S3, and locally-written tables.
+        let storage = remap_local_storage(storage, &metadata, direct_location.as_deref());
+
         Ok((storage, metadata, metadata_location))
     }
 
@@ -959,7 +1008,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// and [`Self::scan_for_materialize_stream`] (which does not).
     fn stream_scan_tasks(
         &self,
-        storage: &Arc<S3IcebergStorage>,
+        storage: &Arc<IcebergStorageBackend>,
         tasks: Vec<FileScanTask>,
     ) -> ColumnBatchStream {
         if tasks.is_empty() {
@@ -1010,7 +1059,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// gigabytes.
     async fn read_scan_tasks(
         &self,
-        storage: &Arc<S3IcebergStorage>,
+        storage: &Arc<IcebergStorageBackend>,
         tasks: Vec<FileScanTask>,
     ) -> QueryResult<Vec<ColumnBatch>> {
         use futures::stream::TryStreamExt;
@@ -1758,7 +1807,7 @@ async fn rest_session_storage(
     io: &IoConfig,
     load_response: &LoadTableResponse,
     catalog_uri: &str,
-) -> QueryResult<Arc<S3IcebergStorage>> {
+) -> QueryResult<Arc<IcebergStorageBackend>> {
     // The loadTable caches preserve `credentials` verbatim and only ever
     // MISS-and-reload on expiry, so a resolved `credentials == None` always means
     // the catalog genuinely vended nothing — never a dropped-credential
@@ -1820,7 +1869,7 @@ async fn rest_session_storage(
         .await
         .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
     };
-    let built = Arc::new(built);
+    let built = Arc::new(IcebergStorageBackend::S3(built));
     session.store_storage(lt_key.to_string(), Arc::clone(&built));
     Ok(built)
 }
@@ -1849,7 +1898,7 @@ async fn resolve_rest_load_and_storage(
     io: IoConfig,
     lt_key: String,
     catalog_uri: String,
-) -> QueryResult<(Arc<S3IcebergStorage>, LoadTableResponse)> {
+) -> QueryResult<(Arc<IcebergStorageBackend>, LoadTableResponse)> {
     // (1) Resolve the loadTable response, cheapest first: the per-query pin, then
     // the cross-query cache (skips the ~1–3s GET), then a real REST load.
     let load_response = if let Some(cached) = session.cached_load_table(&lt_key) {
@@ -2084,6 +2133,7 @@ impl FlureeR2rmlProvider<'_> {
                 let storage = direct_session_storage(
                     &self.session,
                     lt_key,
+                    &root,
                     iceberg_config.io.s3_region.as_deref(),
                     iceberg_config.io.s3_endpoint.as_deref(),
                     iceberg_config.io.s3_path_style,
@@ -2260,54 +2310,56 @@ impl FlureeR2rmlProvider<'_> {
                     let table_id = table_id.clone();
                     let lt_key_b = lt_key.clone();
                     let uri_b = uri.clone();
-                    let builder: super::lazy_storage::StorageBuilder<'static, S3IcebergStorage> =
-                        Arc::new(move || {
-                            let catalog = Arc::clone(&catalog);
-                            let cache = Arc::clone(&cache);
-                            let session = Arc::clone(&session);
-                            let io = io.clone();
-                            let table_id = table_id.clone();
-                            let lt_key = lt_key_b.clone();
-                            let catalog_uri = uri_b.clone();
-                            Box::pin(async move {
-                                resolve_rest_load_and_storage(
-                                    catalog,
-                                    cache,
-                                    session,
-                                    table_id,
-                                    io,
-                                    lt_key,
-                                    catalog_uri,
-                                )
-                                .await
-                                .map(|(storage, _)| storage)
-                                // Preserve the TYPED errors across the builder's
-                                // `IcebergError` channel: `storage_query_error` lifts
-                                // these two straight back to their `QueryError`
-                                // counterparts, so a lazy-forced build reports the same
-                                // 403 + wire code (`err:storage/AccessDenied` /
-                                // `err:catalog/CredentialsNotVended`) as the eager path.
-                                // A blanket `to_string()` here would flatten them into
-                                // an opaque string and put hosts back to regex-guessing.
-                                .map_err(|e| match e {
-                                    QueryError::StorageAccessDenied {
-                                        bucket,
-                                        key,
-                                        region,
-                                        message,
-                                    } => IcebergError::StorageAccessDenied {
-                                        bucket,
-                                        key,
-                                        region,
-                                        message,
-                                    },
-                                    QueryError::CatalogCredentialsNotVended { catalog_uri } => {
-                                        IcebergError::CatalogCredentialsNotVended { catalog_uri }
-                                    }
-                                    other => IcebergError::Catalog(other.to_string()),
-                                })
+                    let builder: super::lazy_storage::StorageBuilder<
+                        'static,
+                        IcebergStorageBackend,
+                    > = Arc::new(move || {
+                        let catalog = Arc::clone(&catalog);
+                        let cache = Arc::clone(&cache);
+                        let session = Arc::clone(&session);
+                        let io = io.clone();
+                        let table_id = table_id.clone();
+                        let lt_key = lt_key_b.clone();
+                        let catalog_uri = uri_b.clone();
+                        Box::pin(async move {
+                            resolve_rest_load_and_storage(
+                                catalog,
+                                cache,
+                                session,
+                                table_id,
+                                io,
+                                lt_key,
+                                catalog_uri,
+                            )
+                            .await
+                            .map(|(storage, _)| storage)
+                            // Preserve the TYPED errors across the builder's
+                            // `IcebergError` channel: `storage_query_error` lifts
+                            // these two straight back to their `QueryError`
+                            // counterparts, so a lazy-forced build reports the same
+                            // 403 + wire code (`err:storage/AccessDenied` /
+                            // `err:catalog/CredentialsNotVended`) as the eager path.
+                            // A blanket `to_string()` here would flatten them into
+                            // an opaque string and put hosts back to regex-guessing.
+                            .map_err(|e| match e {
+                                QueryError::StorageAccessDenied {
+                                    bucket,
+                                    key,
+                                    region,
+                                    message,
+                                } => IcebergError::StorageAccessDenied {
+                                    bucket,
+                                    key,
+                                    region,
+                                    message,
+                                },
+                                QueryError::CatalogCredentialsNotVended { catalog_uri } => {
+                                    IcebergError::CatalogCredentialsNotVended { catalog_uri }
+                                }
+                                other => IcebergError::Catalog(other.to_string()),
                             })
-                        });
+                        })
+                    });
                     return Ok((Arc::new(LazyS3Storage::deferred(builder)), md, loc));
                 }
             }
@@ -2316,6 +2368,7 @@ impl FlureeR2rmlProvider<'_> {
         // Resolve metadata location and create storage based on catalog mode.
         // `mut` so we can move the REST catalog's inline metadata out of the
         // response below (see the metadata resolution) without cloning it.
+        let mut direct_location: Option<String> = None;
         let (mut load_response, storage) = match &iceberg_config.catalog {
             CatalogConfig::Rest {
                 uri,
@@ -2486,6 +2539,7 @@ impl FlureeR2rmlProvider<'_> {
                     )
                     .await?;
                 let table_location = &effective_location;
+                direct_location = Some(effective_location.clone());
 
                 info!(
                     table_location = %table_location,
@@ -2511,6 +2565,7 @@ impl FlureeR2rmlProvider<'_> {
                     let storage = direct_session_storage(
                         &self.session,
                         &lt_key,
+                        table_location,
                         iceberg_config.io.s3_region.as_deref(),
                         iceberg_config.io.s3_endpoint.as_deref(),
                         iceberg_config.io.s3_path_style,
@@ -2531,6 +2586,7 @@ impl FlureeR2rmlProvider<'_> {
                     let storage = direct_session_storage(
                         &self.session,
                         &lt_key,
+                        table_location,
                         iceberg_config.io.s3_region.as_deref(),
                         iceberg_config.io.s3_endpoint.as_deref(),
                         iceberg_config.io.s3_path_style,
@@ -2602,6 +2658,9 @@ impl FlureeR2rmlProvider<'_> {
                 .map(|s| s.timestamp_ms)
                 .unwrap_or(0),
         );
+        // Relocated local table: remap manifest file references (no-op for
+        // REST/S3 and locally-written tables) BEFORE the ready-wrap.
+        let storage = remap_local_storage(storage, &metadata, direct_location.as_deref());
         Ok((
             Arc::new(LazyS3Storage::ready(storage)),
             metadata,
@@ -3291,25 +3350,76 @@ async fn resolve_table_metadata<S: SendIcebergStorage>(
 /// table returns that Arc. `cached_storage`/`store_storage` are gated on
 /// `cache_enabled()`, so with caching disabled this still builds per call
 /// (matching REST and the pre-#1498 behavior).
+/// Infer the location remap for a RELOCATED local Direct table — one copied or
+/// moved after being written, so its metadata/manifests reference the ORIGINAL
+/// root. Both ends of the mapping are already known: the metadata's own
+/// `location` (the old root — possibly an `s3://` URI, the copied-from-S3
+/// case) and the configured `table_location` (where the table sits now). So
+/// "copy the table directory, point at it" needs zero configuration. Identical
+/// roots — the common locally-written case — leave the storage untouched, as
+/// does any non-local backend.
+fn remap_local_storage(
+    storage: Arc<IcebergStorageBackend>,
+    metadata: &TableMetadata,
+    direct_location: Option<&str>,
+) -> Arc<IcebergStorageBackend> {
+    let Some(configured) = direct_location else {
+        return storage;
+    };
+    if !matches!(storage.as_ref(), IcebergStorageBackend::File(_)) {
+        return storage;
+    }
+    // `file:///x`, `file:/x`, and `/x` are the same local root spelled three
+    // ways — never remap between spellings of one root.
+    fn local_path(s: &str) -> &str {
+        s.strip_prefix("file://")
+            .or_else(|| s.strip_prefix("file:"))
+            .unwrap_or(s)
+    }
+    let declared = metadata.location.trim_end_matches('/');
+    let configured = configured.trim_end_matches('/');
+    if local_path(declared) == local_path(configured) {
+        return storage;
+    }
+    debug!(
+        declared = %declared,
+        configured = %configured,
+        "local Direct table is relocated; remapping manifest file references"
+    );
+    Arc::new(IcebergStorageBackend::File(FileIcebergStorage::with_remap(
+        declared, configured,
+    )))
+}
+
 async fn direct_session_storage(
     session: &super::catalog_session::IcebergCatalogSession,
     lt_key: &str,
+    table_location: &str,
     region: Option<&str>,
     endpoint: Option<&str>,
     path_style: bool,
-) -> QueryResult<Arc<S3IcebergStorage>> {
+) -> QueryResult<Arc<IcebergStorageBackend>> {
     if let Some(cached) = session.cached_storage(lt_key) {
-        debug!("S3 storage client reused (query-scoped, direct)");
+        debug!("storage client reused (query-scoped, direct)");
         return Ok(cached);
+    }
+    // Backend by location scheme: a local (`file://` / absolute-path) table
+    // reads the filesystem directly — no SDK client, no credential-chain
+    // resolution. Cached in the session like the S3 client for uniformity
+    // (the build is nearly free, but callers treat the cache as authoritative).
+    if FileIcebergStorage::is_local_location(table_location) {
+        let built = Arc::new(IcebergStorageBackend::File(FileIcebergStorage::new()));
+        session.store_storage(lt_key.to_string(), Arc::clone(&built));
+        return Ok(built);
     }
     // gs://-backed tables (GCS S3-interop endpoint) are read through this same S3
     // SDK path; the client is pinned to HTTP/1.1 to avoid the AWS-SDK HTTP/2
     // range-read bug against that endpoint.
-    let built = Arc::new(
+    let built = Arc::new(IcebergStorageBackend::S3(
         S3IcebergStorage::from_default_chain(region, endpoint, path_style)
             .await
             .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?,
-    );
+    ));
     session.store_storage(lt_key.to_string(), Arc::clone(&built));
     Ok(built)
 }
@@ -4370,12 +4480,26 @@ mod tests {
         let session = IcebergCatalogSession::default();
         let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
 
-        let first = direct_session_storage(&session, &key, Some("us-east-2"), None, false)
-            .await
-            .expect("offline SDK client construction");
-        let second = direct_session_storage(&session, &key, Some("us-east-2"), None, false)
-            .await
-            .expect("offline SDK client construction");
+        let first = direct_session_storage(
+            &session,
+            &key,
+            "s3://bucket/t",
+            Some("us-east-2"),
+            None,
+            false,
+        )
+        .await
+        .expect("offline SDK client construction");
+        let second = direct_session_storage(
+            &session,
+            &key,
+            "s3://bucket/t",
+            Some("us-east-2"),
+            None,
+            false,
+        )
+        .await
+        .expect("offline SDK client construction");
         assert!(
             Arc::ptr_eq(&first, &second),
             "the second Direct-mode acquisition must reuse the session-cached S3 client"
@@ -4384,9 +4508,16 @@ mod tests {
         // A different table (different key) is a distinct client — the cache keys
         // per (source, table), so unrelated tables never alias one client.
         let other_key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_GEOGRAPHY");
-        let other = direct_session_storage(&session, &other_key, Some("us-east-2"), None, false)
-            .await
-            .expect("offline SDK client construction");
+        let other = direct_session_storage(
+            &session,
+            &other_key,
+            "s3://bucket/t",
+            Some("us-east-2"),
+            None,
+            false,
+        )
+        .await
+        .expect("offline SDK client construction");
         assert!(
             !Arc::ptr_eq(&first, &other),
             "a different table must not reuse another table's cached client"

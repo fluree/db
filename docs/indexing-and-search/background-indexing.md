@@ -270,8 +270,23 @@ Old index snapshots are retained for time-travel safety and concurrent query saf
 - `IndexerConfig.gc_max_old_indexes`
 - `IndexerConfig.gc_min_time_mins`
 
-No standalone HTTP compaction endpoint is currently exposed. Use `POST
-/v1/fluree/reindex` when you need to force a full index refresh.
+The collector reclaims artifacts by *name*. Each index root carries a garbage manifest listing what the previous version replaced, and the collector walks the prev-index chain releasing exactly those. It therefore reaches only artifacts that some manifest records.
+
+It also releases only **branch-local** artifacts: index roots, leaves, branch manifests, and history sidecars. Dictionary blobs live in the ledger-wide `@shared/dicts/` namespace, shared by every branch, so a branch's manifest can name a dictionary a sibling branch still references — content addressing gives identical dictionary content an identical CID, and a branch created from another starts out sharing it. Background GC walks one branch and holds no exclusion over the others, so it cannot establish that a shared dictionary is unreferenced and leaves it alone.
+
+### Reclaiming orphaned artifacts
+
+Artifacts orphaned outside that chain are invisible to the collector. The main source is a reindex published by Fluree **4.1.4 or earlier**: it severed the prev-index chain, leaving every earlier root — and the blobs only those roots referenced — unreachable from any walk. Retention could never truncate past it, so a ledger that had been reindexed accumulated index artifacts without bound.
+
+`POST /v1/fluree/sweep` reclaims them, and `fluree sweep <ledger>` does the same from the CLI. A sweep enumerates what storage holds, subtracts everything reachable from a live index chain, and releases the remainder. Use `--dry-run` (or `POST /v1/fluree/sweep/plan`) to see what would be released first.
+
+A sweep is also the only thing that reclaims **dictionary blobs**, which background GC leaves alone for the reason above. Dictionaries are often the largest part of a ledger's index storage, so on a write-heavy ledger this is routine maintenance rather than a one-off repair: schedule a sweep rather than waiting for disk usage to become a problem. Running one when nothing is reclaimable is a safe no-op.
+
+A sweep is ledger-wide rather than per-branch, because dictionary blobs are shared across a ledger's branches. It touches only index artifacts — commits, transactions, and config blobs are reachable through the commit chain rather than the index chain, so a sweep cannot establish that they are unreferenced and never considers them.
+
+> **Single-process deployments only.** The hold that keeps index builds from writing during a sweep excludes the server's own indexer. An external or second-process indexer writing to the same storage is not excluded, and its in-flight artifacts would be indistinguishable from orphans.
+
+`POST /v1/fluree/reindex` rebuilds the index but does not reclaim anything by itself. A reindex now participates in the GC chain like any incremental build, so ordinary retention applies to the roots it supersedes; a sweep is only needed for artifacts orphaned by an earlier version.
 
 ## Troubleshooting
 
