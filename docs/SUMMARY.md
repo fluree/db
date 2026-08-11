@@ -226,6 +226,7 @@
 
 - [Troubleshooting](troubleshooting/README.md)
   - [Common errors](troubleshooting/common-errors.md)
+  - [Missing results at a historical `t`](troubleshooting/historical-results-missing.md)
   - [Debugging queries](troubleshooting/debugging-queries.md)
   - [Performance investigation with distributed tracing](troubleshooting/performance-tracing.md)
 
