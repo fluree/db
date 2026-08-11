@@ -2100,3 +2100,95 @@ async fn explicit_request_default_allow_false_overrides_config_over_http() {
         "explicit fluree-default-allow:false header must beat config true; got: {names:?}"
     );
 }
+
+/// The seam between the tri-state `f:defaultAllow` change and the enforcement
+/// signal: `denies_all_data` is derived from the *effective* `default_allow`,
+/// so a ledger that opens itself through config must flip the bit even though
+/// the request never mentions `default-allow`.
+///
+/// Neither half could test this alone — before the tri-state change the config
+/// value never reached an identity-carrying request at all, and the signal
+/// reads whatever the policy wrapper ended up with. Both orientations are
+/// pinned so the bit can't silently decouple from the config it reports on.
+#[tokio::test]
+async fn enforcement_signal_follows_configured_default_allow() {
+    async fn tracked_config_query(
+        app: axum::Router,
+        ledger: &str,
+        token: &str,
+    ) -> (StatusCode, JsonValue) {
+        // Note the absence of `default-allow` in opts: leaving it unset is what
+        // lets the ledger's configured value govern.
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
+            "opts": { "meta": { "policy": true } },
+            "select": ["?name"],
+            "where": [
+                {"@id": "?doc", "@type": "ex:Document"},
+                {"@id": "?doc", "schema:name": "?name"}
+            ]
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/fluree/query/{ledger}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        json_body(resp).await
+    }
+
+    // Configured open: enforcement is still active (an identity was supplied),
+    // but the configuration does grant a view of the data.
+    let (_tmp, state) = policy_test_state().await;
+    let app =
+        setup_default_allow_config_ledger(build_router(state), "policy-cfg-sig-open:main", true)
+            .await;
+    let signing_key = SigningKey::from_bytes(&[21u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/unknown-user",
+        "policy-cfg-sig-open:main",
+    );
+    let (status, json) = tracked_config_query(app, "policy-cfg-sig-open:main", &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["result"].as_array().map(Vec::len),
+        Some(3),
+        "config default-allow true opens the ledger to this identity; got: {json}"
+    );
+    assert_eq!(
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": false}),
+        "enforced, but the config grants a view; got: {json}"
+    );
+
+    // Configured closed: same request, opposite bit.
+    let (_tmp2, state2) = policy_test_state().await;
+    let app2 =
+        setup_default_allow_config_ledger(build_router(state2), "policy-cfg-sig-shut:main", false)
+            .await;
+    let signing_key2 = SigningKey::from_bytes(&[22u8; 32]);
+    let token2 = identity_token(
+        &signing_key2,
+        "http://example.org/unknown-user",
+        "policy-cfg-sig-shut:main",
+    );
+    let (status, json) = tracked_config_query(app2, "policy-cfg-sig-shut:main", &token2).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["result"],
+        serde_json::json!([]),
+        "config default-allow false keeps it fail-closed; got: {json}"
+    );
+    assert_eq!(
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": true}),
+        "no policies and no permissive default: no data flake could return; got: {json}"
+    );
+}
