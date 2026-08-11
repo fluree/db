@@ -8,7 +8,7 @@
 
 use crate::support;
 use crate::support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{DatasetSpec, FlureeBuilder, GraphSource};
 use serde_json::json;
 
 /// maker1 has two models, maker2 one. `ex:tag` gives maker1 a group whose
@@ -154,4 +154,78 @@ async fn sparql_group_concat_iri_agrees_with_explicit_str() {
     .expect("to_jsonld");
 
     assert_eq!(normalize_rows(&bare), normalize_rows(&via_str));
+}
+
+/// One subject under a prefix unique to this ledger. Two such ledgers allocate
+/// namespace codes independently and in the same order, so the two prefixes end
+/// up behind the *same* code — which is what makes the dataset test below able
+/// to see an expansion against the wrong table.
+async fn seed_single_prefix(
+    fluree: &MemoryFluree,
+    ledger_id: &str,
+    prefix: &str,
+    local: &str,
+) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"p": prefix},
+        "@graph": [{"@id": format!("p:{local}"), "p:tag": "shared"}]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+/// GROUP_CONCAT over a multi-ledger dataset.
+///
+/// `apply_aggregate` expands IRIs with `ctx.active_snapshot`'s namespace table,
+/// which is one ledger's. That is only sound because `DatasetOperator` stamps
+/// every cross-ledger `Binding::Sid` into `Binding::IriMatch` — carrying the
+/// IRI already decoded in its OWN ledger — before the batch leaves the member
+/// (`dataset_operator.rs::stamp_provenance`), and the expansion reads that
+/// canonical IRI rather than re-expanding a foreign SID.
+///
+/// The two ledgers here use different prefixes that were allocated the same
+/// namespace code, so expanding one ledger's SID against the other's table
+/// would emit a well-formed but WRONG IRI (`http://alpha.example/b1`) — the
+/// #1259 failure mode, and worse than the dropped member this fix removed.
+/// Asserting both absolute IRIs pins that it does not happen.
+#[tokio::test]
+async fn sparql_group_concat_iri_across_multi_ledger_dataset() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _alpha =
+        seed_single_prefix(&fluree, "gcns-alpha:main", "http://alpha.example/", "a1").await;
+    let _beta = seed_single_prefix(&fluree, "gcns-beta:main", "http://beta.example/", "b1").await;
+
+    let spec = DatasetSpec::new()
+        .with_default(GraphSource::new("gcns-alpha:main"))
+        .with_default(GraphSource::new("gcns-beta:main"));
+    let dataset = fluree
+        .build_dataset_view(&spec)
+        .await
+        .expect("build_dataset_view");
+
+    let sparql = r#"
+        SELECT (GROUP_CONCAT(?s; SEPARATOR="|") AS ?g)
+        WHERE { ?s ?p "shared" }"#;
+
+    let result = fluree
+        .query_dataset(&dataset, sparql)
+        .await
+        .expect("multi-ledger GROUP_CONCAT should succeed");
+    let primary = dataset.primary().unwrap();
+    let jsonld = result
+        .to_jsonld(primary.snapshot.as_ref())
+        .expect("to_jsonld");
+
+    let rows = normalize_rows(&jsonld);
+    let g = rows[0][0]
+        .as_str()
+        .expect("concat is a string, not null — both members are IRIs");
+    let parts: std::collections::HashSet<&str> = g.split('|').collect();
+    assert_eq!(
+        parts,
+        ["http://alpha.example/a1", "http://beta.example/b1"]
+            .into_iter()
+            .collect(),
+        "each subject must expand against its OWN ledger's namespace table, got {g:?}"
+    );
 }
