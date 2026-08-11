@@ -3293,6 +3293,14 @@ mod engine_tests {
         /// persist-regardless. Default to a FRESH window so tests opt in to staleness.
         window_age_ms: Option<i64>,
         scans: std::sync::atomic::AtomicUsize,
+        /// Re-present the same batches on every scan instead of draining them.
+        ///
+        /// Draining is the right default — it catches a fixture that gets pulled twice
+        /// when it should be pulled once. But it cannot model the case this module's
+        /// applied markers exist for: a window that is re-read because the shared
+        /// watermark could not advance. That needs the SAME rows and the SAME
+        /// `to_snapshot_id` presented again.
+        repeat: bool,
     }
 
     impl FakeSource {
@@ -3305,7 +3313,13 @@ mod engine_tests {
                 to_snapshot_id: Some(7),
                 window_age_ms: Some(0),
                 scans: std::sync::atomic::AtomicUsize::new(0),
+                repeat: false,
             }
+        }
+        /// Same window on every scan — see [`FakeSource::repeat`].
+        fn repeating(mut self) -> Self {
+            self.repeat = true;
+            self
         }
         fn scans(&self) -> usize {
             self.scans.load(std::sync::atomic::Ordering::SeqCst)
@@ -3330,7 +3344,11 @@ mod engine_tests {
             _from: Option<i64>,
         ) -> Result<MaterializeScan> {
             self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let taken: Vec<ColumnBatch> = std::mem::take(&mut *self.batches.lock().unwrap());
+            let taken: Vec<ColumnBatch> = if self.repeat {
+                self.batches.lock().unwrap().clone()
+            } else {
+                std::mem::take(&mut *self.batches.lock().unwrap())
+            };
             Ok(MaterializeScan {
                 to_snapshot_id: self.to_snapshot_id,
                 incremental: false,
@@ -3449,6 +3467,91 @@ mod engine_tests {
     /// A templated target fans out: one scan, N target ledgers, each its own commit
     /// domain. Pins that the tally counts TARGETS rather than polls — the accounting whose
     /// absence made a 21-of-22 production window read as a total stall.
+    /// The amplification this module's applied markers exist to stop, end to end.
+    ///
+    /// A re-presented window — same rows, same `to_snapshot_id`, which is exactly what
+    /// a job whose shared watermark cannot advance sees on every poll — must not
+    /// rewrite the targets that already have it.
+    ///
+    /// The assertion is each target ledger's `t`, and the choice matters. Reading the
+    /// DATA proves nothing, because re-application is idempotent and leaves it
+    /// identical either way. `subjects_upserted` proves nothing either — it is
+    /// `live.len()`, the subjects the accumulator PREPARED, counted before the target
+    /// loop runs, so it reads 3 whether or not a single commit happened. `t` only
+    /// advances on an actual commit, so it is the one observable that separates
+    /// "skipped" from "rewritten to the same value".
+    #[tokio::test]
+    async fn a_re_presented_window_does_not_rewrite_targets_that_already_applied_it() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[
+                ("id", &["1", "2", "3"]),
+                ("name", &["alice", "bob", "carol"]),
+                ("tenant", &["acme", "acme", "globex"]),
+            ])],
+        )
+        .repeating();
+
+        let first = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("first pass");
+        assert_eq!(first.tally.ok, 2, "two tenants => two target ledgers");
+
+        let targets = ["people_acme:main", "people_globex:main"];
+        let mut t_after_first = Vec::new();
+        for id in targets {
+            t_after_first.push(fluree.ledger(id).await.expect("target ledger").t());
+        }
+        assert!(
+            t_after_first.iter().all(|t| *t > 0),
+            "first pass must actually commit or the second proves nothing: {t_after_first:?}"
+        );
+
+        let second = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("second pass");
+
+        assert_eq!(
+            src.scans(),
+            2,
+            "the window really was re-read, not short-circuited"
+        );
+        for (id, before) in targets.iter().zip(&t_after_first) {
+            let after = fluree.ledger(id).await.expect("target ledger").t();
+            assert_eq!(
+                after, *before,
+                "{id} already applied this window; a second commit means the rewrite is back"
+            );
+        }
+        assert_eq!(
+            second.tally.ok, 2,
+            "a skipped target still counts as ok — it HAS the window; reporting it as \
+             anything else would read as a regression in the tally"
+        );
+        assert_eq!(
+            second.tally.deferred + second.tally.failed,
+            0,
+            "skipping is not deferral and not failure"
+        );
+    }
+
     #[tokio::test]
     async fn a_templated_target_fans_out_per_row() {
         let fluree = FlureeBuilder::memory().build_memory();
