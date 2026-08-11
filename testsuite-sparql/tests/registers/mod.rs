@@ -88,13 +88,9 @@ pub const SPARQL11_AGGREGATES: &[&str] = &[
     //     memory-backed, so the fast path never fires under it).
     //   * agg-err-01 (SUM/AVG must poison to unbound on a bound non-numeric
     //     group member, §18.5) was greened on main by the same 45d6009bf.
-    // COUNT(DISTINCT *): DEFERRED — the parser accepts it but the lowerer
-    // rejects it (lower/aggregate.rs); greening needs a new CountDistinctAll IR
-    // variant + whole-row group-operator plumbing (the operators feed each
-    // aggregate one input-var column, not the whole solution). Perf-neutral
-    // (per-group, off the per-row hot path); a standalone post-wave-3 follow-up,
-    // NOT X3 — PR-X2 (decision-owner).
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-count-rows-distinct",
+    //   * agg-count-rows-distinct (COUNT(DISTINCT *)) was greened by the
+    //     CountDistinctAll IR variant plus whole-row plumbing through both
+    //     group operators.
 ];
 
 pub const SPARQL11_BINDINGS: &[&str] = &[

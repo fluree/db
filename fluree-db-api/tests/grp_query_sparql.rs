@@ -11,10 +11,18 @@ mod it_query_construct;
 mod it_query_negation;
 #[path = "it_query_sparql.rs"]
 mod it_query_sparql;
+#[path = "it_query_sparql_agg_over_group_key.rs"]
+mod it_query_sparql_agg_over_group_key;
 #[path = "it_query_sparql_annotations.rs"]
 mod it_query_sparql_annotations;
+#[path = "it_query_sparql_count_distinct_star.rs"]
+mod it_query_sparql_count_distinct_star;
+#[path = "it_query_sparql_group_concat_iri.rs"]
+mod it_query_sparql_group_concat_iri;
 #[path = "it_query_sparql_parse_errors.rs"]
 mod it_query_sparql_parse_errors;
+#[path = "it_query_sparql_path_literal_object.rs"]
+mod it_query_sparql_path_literal_object;
 #[path = "it_query_sparql_setop_subselect.rs"]
 mod it_query_sparql_setop_subselect;
 #[path = "it_query_subquery.rs"]
