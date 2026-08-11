@@ -275,11 +275,16 @@ the rest of the per-request metadata at the end of the stream. `policy` (the
 per-policy counters) is not carried on the streaming surface — the `end` record
 reports only the request-level metadata.
 
-Both `policy_enforcement` bits are computed from the request's policy inputs
-and the ledger's policy configuration before execution. They do not depend on
-the data or on the query, so they are identical for every query a caller issues
-under the same policy context and cannot be used to probe for the existence of
-any particular row.
+Both `policy_enforcement` bits are settled before execution, from the request's
+policy inputs and the policy set they resolve to. That set is built from stored
+policy nodes — ledger data, selected through the identity's own `f:policyClass`
+assignments — so this is not a claim that no ledger data participates. The
+claim is narrower and is what matters: the value does not depend on the data
+the query reads or on the query itself. It is identical for every query a
+caller issues under the same policy context, changes only when the policy
+configuration or the caller's own assignments change, and you must already be
+acting as that identity to see it. So it reports your own authorization
+posture, and cannot be varied to probe for the existence of any particular row.
 
 **What `denies_all_data` does not say.** It does not mean the result is empty.
 Schema flakes — `rdf:type` with a schema-class object, `rdfs:subClassOf`,

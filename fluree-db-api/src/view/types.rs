@@ -754,10 +754,12 @@ impl GraphDb {
     /// The policy-enforcement state a request against this view executes under,
     /// or `None` when the view is unenforced (no policy attached, or root).
     ///
-    /// Derived entirely from the request's policy inputs and the ledger's
-    /// policy configuration, both already resolved when the view was built.
-    /// It reads nothing from the data and nothing from the query, so reporting
-    /// it cannot disclose whether any particular flake exists.
+    /// Read off the policy wrapper the view was built with, so it is settled
+    /// before execution. The wrapper's view set is assembled from stored policy
+    /// nodes selected by the caller's own `f:policyClass` assignments — ledger
+    /// data — but the result is independent of the data the query reads and of
+    /// the query itself, so reporting it cannot disclose whether any particular
+    /// flake exists. See [`fluree_db_core::PolicyEnforcement`].
     pub fn policy_enforcement(&self) -> Option<fluree_db_core::PolicyEnforcement> {
         let wrapper = self.policy.as_ref()?.wrapper();
         if wrapper.is_root() {

@@ -171,10 +171,21 @@ pub struct PolicyStats {
 /// but no policy ran" or "the request ran unenforced" — the two states a caller
 /// most needs separated.
 ///
-/// This is a pure function of the request's policy inputs and the ledger's
-/// policy configuration. It is constant across every query the caller issues
-/// under the same policy context and never reflects the data or the query, so
-/// it cannot be used to probe for the existence of rows.
+/// Ledger data does participate in producing it: the effective view-policy set
+/// is assembled from stored `f:AccessPolicy` nodes, selected through the
+/// identity's own `f:policyClass` assignments. What it never reflects is the
+/// data the query reads or the query itself. Three properties make it safe to
+/// report:
+///
+/// - **Query-independent.** It is settled when the view is built, before
+///   execution, and is identical for every query issued under the same policy
+///   context — so it cannot be varied to probe for a row.
+/// - **Constant per caller and ledger.** It changes only when the ledger's
+///   policy configuration or the caller's own policy assignments change, not
+///   when data is written.
+/// - **Self-describing only.** You must already be acting as an identity to
+///   see its enforcement state, so it discloses your own authorization
+///   posture and nothing about anyone else's data.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyEnforcement {
     /// Always `true` when this record is present: the request executed under a

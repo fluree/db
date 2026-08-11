@@ -689,8 +689,9 @@ across JSON-LD and SPARQL. Servers should accept either.
    only when the request ran under a non-root policy context: its absence
    is what tells a caller the request was unenforced, which the (then
    empty) `policy` map cannot. `denies_all_data` reports that the request's
-   policy configuration grants no view of the data — a property of the
-   request and the ledger's config, never of the data or the query. The `result` field carries whatever the untracked response
+   policy configuration grants no view of the data — settled before
+   execution and independent of the data the query reads and of the
+   query itself. The `result` field carries whatever the untracked response
    body would have been (SPARQL JSON, JSON-LD, agent-json, etc.). For
    agent-json responses the server SHOULD return the bare agent-json
    envelope as the response body and surface the tally only via the

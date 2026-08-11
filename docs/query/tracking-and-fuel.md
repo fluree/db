@@ -56,8 +56,9 @@ or the query touched only flakes no policy targets. `policy_enforcement`
 separates them — it is absent for the first, `denies_all_data: true` for the
 second, and `denies_all_data: false` for the third.
 
-Both `policy_enforcement` fields are derived from the request's policy inputs
-and the ledger's policy configuration, never from the data or the query. See
+Both `policy_enforcement` fields are settled before execution and never depend
+on the data the query reads or on the query itself — they are constant for a
+given caller and ledger. See
 [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied)
 for how to read them against an empty result set.
 
