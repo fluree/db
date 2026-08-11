@@ -32,7 +32,7 @@
 
 use crate::error::{IndexerError, Result};
 use crate::gc::collector::walk_prev_index_chain_cs;
-use fluree_db_binary_index::collect_root_cas_ids_expanded;
+use fluree_db_binary_index::ChainCasIds;
 use fluree_db_core::address_path::{ledger_id_to_path_prefix, shared_prefix_for_path};
 use fluree_db_core::storage::{candidate_addresses, content_store_for};
 use fluree_db_core::{ContentId, Storage};
@@ -188,23 +188,25 @@ where
         };
         let store = content_store_for(storage.clone(), &branch.ledger_id);
 
-        // Dedup at the CID level before deriving addresses. Consecutive roots
-        // in a chain share nearly all of their CAS refs, so deriving per root
-        // would rebuild the same handful of addresses once per root.
-        let mut reachable: HashSet<ContentId> = HashSet::new();
+        // Accumulate the whole chain into one set rather than expanding each
+        // root on its own: consecutive roots share nearly all of their branch
+        // manifests, and `ChainCasIds` reads each one once instead of once per
+        // root. Deduping at the CID level also keeps address derivation to one
+        // pass over the distinct refs rather than one per root.
+        let mut chain_ids = ChainCasIds::new();
         for entry in walk_prev_index_chain_cs(&store, head).await? {
-            let expanded = collect_root_cas_ids_expanded(&store, &entry.root)
-                .await
-                .map_err(|e| {
-                    IndexerError::StorageRead(format!(
-                        "cannot expand index root at t={} for {}: {e}; refusing to sweep",
-                        entry.t, branch.ledger_id
-                    ))
-                })?;
-            reachable.insert(entry.root_id);
-            reachable.extend(entry.garbage_id);
-            reachable.extend(expanded);
+            chain_ids.add_root(&store, &entry.root).await.map_err(|e| {
+                IndexerError::StorageRead(format!(
+                    "cannot expand index root at t={} for {}: {e}; refusing to sweep",
+                    entry.t, branch.ledger_id
+                ))
+            })?;
+            chain_ids.insert(entry.root_id);
+            if let Some(garbage_id) = entry.garbage_id {
+                chain_ids.insert(garbage_id);
+            }
         }
+        let reachable = chain_ids.into_ids();
 
         for id in &reachable {
             // An unrecognised codec is fatal rather than skipped: the sweep

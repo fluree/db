@@ -37,7 +37,7 @@
 //! - `fluree-db-indexer::build::root_assembly::superseded_cids` —
 //!   garbage-record diff (strict).
 //! - `fluree-db-indexer::gc::sweep::live_addresses` — storage-sweep live
-//!   set (strict).
+//!   set (strict, chain-wide via [`ChainCasIds`]).
 //! - `fluree-db-api::pack::compute_missing_index_artifacts` — pack
 //!   transfer (strict).
 //! - `fluree-db-api::ledger::loading::copy_index_to_branch` — branch
@@ -47,7 +47,7 @@ use std::collections::HashSet;
 
 use fluree_db_core::content_id::ContentId;
 use fluree_db_core::storage::ContentStore;
-use fluree_db_core::{Error, Result};
+use fluree_db_core::{AnnotationIndexRoot, Error, Result};
 
 use crate::annotation_arena::format::{AnnotationForwardBranch, AnnotationReverseBranch};
 use crate::format::branch::read_branch_from_bytes;
@@ -62,73 +62,166 @@ use crate::format::index_root::IndexRoot;
 /// returns `Err` — partial sets are never returned.
 ///
 /// Does NOT include the root's own CID, the garbage manifest CID, the
-/// `prev_index` link, or anything older in the chain — callers
-/// composing a chain-wide set should call this for each retained root
-/// and union the results.
+/// `prev_index` link, or anything older in the chain. Callers composing
+/// a set over several roots of one chain should use [`ChainCasIds`]
+/// rather than unioning per-root results, which re-reads every manifest
+/// the roots share.
 pub async fn collect_root_cas_ids_expanded(
     store: &dyn ContentStore,
     root: &IndexRoot,
 ) -> Result<HashSet<ContentId>> {
-    let mut ids: HashSet<ContentId> = root.all_cas_ids().into_iter().collect();
+    let mut chain_ids = ChainCasIds::new();
+    chain_ids.add_root(store, root).await?;
+    Ok(chain_ids.into_ids())
+}
 
-    // Named-graph branches → leaf (+ sidecar) CIDs.
-    for ng in &root.named_graphs {
-        for (_, branch_cid) in &ng.orders {
-            let bytes = store.get(branch_cid).await.map_err(|e| {
-                Error::invalid_index(format!(
-                    "failed to read named-graph branch {branch_cid} during CID expansion: {e}"
-                ))
-            })?;
-            let manifest = read_branch_from_bytes(&bytes).map_err(|e| {
-                Error::invalid_index(format!(
-                    "failed to decode named-graph branch {branch_cid} during CID expansion: {e}"
-                ))
-            })?;
-            for leaf in &manifest.leaves {
-                ids.insert(leaf.leaf_cid.clone());
-                if let Some(ref sc) = leaf.sidecar_cid {
-                    ids.insert(sc.clone());
-                }
+/// The CAS ids reachable from a run of roots in one index chain, expanded
+/// root by root.
+///
+/// Consecutive roots share nearly all of their branch manifests: an
+/// incremental build rewrites only the branches whose leaves changed, and
+/// carries the rest over by CID. Expanding each root on its own therefore
+/// fetches and decodes the shared manifests once per root, paying
+/// `O(roots × manifests)` reads for `O(distinct manifests)` of routing
+/// information. This remembers which manifests it has already expanded and
+/// reads each one once.
+///
+/// Skipping a repeat manifest is sound only because its leaves are already
+/// in the same set. An instance therefore covers exactly one accumulation —
+/// callers keeping per-branch sets need one instance per branch.
+///
+/// Expansion is strict, matching [`collect_root_cas_ids_expanded`]: the
+/// first read or decode failure returns `Err`.
+#[derive(Debug, Default)]
+pub struct ChainCasIds {
+    ids: HashSet<ContentId>,
+    /// Manifests whose leaves are already in `ids`. Separate from `ids`
+    /// because a manifest's own CID lands there via `all_cas_ids()` before
+    /// anything routes through it, so `ids` cannot say whether it was read.
+    expanded_manifests: HashSet<ContentId>,
+}
+
+impl ChainCasIds {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add every CAS id `root` reaches, expanding the branch manifests this
+    /// chain has not expanded already.
+    pub async fn add_root(&mut self, store: &dyn ContentStore, root: &IndexRoot) -> Result<()> {
+        self.ids.extend(root.all_cas_ids());
+
+        for named_graph in &root.named_graphs {
+            for (_, branch_cid) in &named_graph.orders {
+                self.expand_named_graph_branch(store, branch_cid).await?;
             }
         }
-    }
 
-    // Annotation arena: forward + reverse branches → leaf CIDs.
-    if let Some(ref ann) = root.annotation_index {
-        let fwd_bytes = store.get(&ann.forward_branch_cid).await.map_err(|e| {
-            Error::invalid_index(format!(
-                "failed to read annotation forward branch {} during CID expansion: {e}",
-                ann.forward_branch_cid
-            ))
-        })?;
-        let fwd_branch = AnnotationForwardBranch::decode(&fwd_bytes).map_err(|e| {
-            Error::invalid_index(format!(
-                "failed to decode annotation forward branch {} during CID expansion: {e}",
-                ann.forward_branch_cid
-            ))
-        })?;
-        for entry in &fwd_branch.leaves {
-            ids.insert(entry.leaf_cid.clone());
+        if let Some(ref annotation_index) = root.annotation_index {
+            self.expand_annotation_arena(store, annotation_index)
+                .await?;
         }
 
-        let rev_bytes = store.get(&ann.reverse_branch_cid).await.map_err(|e| {
-            Error::invalid_index(format!(
-                "failed to read annotation reverse branch {} during CID expansion: {e}",
-                ann.reverse_branch_cid
-            ))
-        })?;
-        let rev_branch = AnnotationReverseBranch::decode(&rev_bytes).map_err(|e| {
-            Error::invalid_index(format!(
-                "failed to decode annotation reverse branch {} during CID expansion: {e}",
-                ann.reverse_branch_cid
-            ))
-        })?;
-        for entry in &rev_branch.leaves {
-            ids.insert(entry.leaf_cid.clone());
-        }
+        Ok(())
     }
 
-    Ok(ids)
+    /// Add an id reachable from the chain but not from any root's contents,
+    /// such as a root's own CID or its garbage manifest.
+    pub fn insert(&mut self, id: ContentId) {
+        self.ids.insert(id);
+    }
+
+    pub fn into_ids(self) -> HashSet<ContentId> {
+        self.ids
+    }
+
+    /// Named-graph branch (`FBR3`) → leaf + sidecar CIDs.
+    async fn expand_named_graph_branch(
+        &mut self,
+        store: &dyn ContentStore,
+        branch_cid: &ContentId,
+    ) -> Result<()> {
+        let Some(bytes) = self
+            .read_unexpanded_manifest(store, branch_cid, "named-graph branch")
+            .await?
+        else {
+            return Ok(());
+        };
+        let manifest = read_branch_from_bytes(&bytes).map_err(|e| {
+            Error::invalid_index(format!(
+                "failed to decode named-graph branch {branch_cid} during CID expansion: {e}"
+            ))
+        })?;
+
+        for leaf in &manifest.leaves {
+            self.ids.insert(leaf.leaf_cid.clone());
+            if let Some(ref sidecar_cid) = leaf.sidecar_cid {
+                self.ids.insert(sidecar_cid.clone());
+            }
+        }
+        self.expanded_manifests.insert(branch_cid.clone());
+
+        Ok(())
+    }
+
+    /// Annotation arena: forward + reverse branches → leaf CIDs.
+    async fn expand_annotation_arena(
+        &mut self,
+        store: &dyn ContentStore,
+        annotation_index: &AnnotationIndexRoot,
+    ) -> Result<()> {
+        let forward_cid = &annotation_index.forward_branch_cid;
+        if let Some(bytes) = self
+            .read_unexpanded_manifest(store, forward_cid, "annotation forward branch")
+            .await?
+        {
+            let branch = AnnotationForwardBranch::decode(&bytes).map_err(|e| {
+                Error::invalid_index(format!(
+                    "failed to decode annotation forward branch {forward_cid} during CID expansion: {e}"
+                ))
+            })?;
+            self.ids
+                .extend(branch.leaves.iter().map(|entry| entry.leaf_cid.clone()));
+            self.expanded_manifests.insert(forward_cid.clone());
+        }
+
+        let reverse_cid = &annotation_index.reverse_branch_cid;
+        if let Some(bytes) = self
+            .read_unexpanded_manifest(store, reverse_cid, "annotation reverse branch")
+            .await?
+        {
+            let branch = AnnotationReverseBranch::decode(&bytes).map_err(|e| {
+                Error::invalid_index(format!(
+                    "failed to decode annotation reverse branch {reverse_cid} during CID expansion: {e}"
+                ))
+            })?;
+            self.ids
+                .extend(branch.leaves.iter().map(|entry| entry.leaf_cid.clone()));
+            self.expanded_manifests.insert(reverse_cid.clone());
+        }
+
+        Ok(())
+    }
+
+    /// Fetch a manifest's bytes, or `None` when its leaves are already
+    /// accounted for. `kind` names the artifact in read failures.
+    async fn read_unexpanded_manifest(
+        &self,
+        store: &dyn ContentStore,
+        manifest_cid: &ContentId,
+        kind: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        if self.expanded_manifests.contains(manifest_cid) {
+            return Ok(None);
+        }
+        let bytes = store.get(manifest_cid).await.map_err(|e| {
+            Error::invalid_index(format!(
+                "failed to read {kind} {manifest_cid} during CID expansion: {e}"
+            ))
+        })?;
+
+        Ok(Some(bytes))
+    }
 }
 
 /// Tolerant expansion: logs and skips per-branch failures.
@@ -229,10 +322,50 @@ mod tests {
     };
     use crate::format::wire_helpers::{DictPackRefs, DictRefs, DictTreeRefs};
     use fluree_db_core::storage::MemoryContentStore;
-    use fluree_db_core::{
-        AnnotationIndexRoot, AnnotationStats, ContentKind, EdgeKey, FlakeValue, Sid,
-    };
-    use std::collections::BTreeMap;
+    use fluree_db_core::{AnnotationStats, ContentKind, EdgeKey, FlakeValue, Sid};
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Mutex;
+
+    /// A store that records how many times each CID was fetched.
+    #[derive(Debug, Default)]
+    struct GetCountingStore {
+        inner: MemoryContentStore,
+        gets: Mutex<HashMap<ContentId, usize>>,
+    }
+
+    impl GetCountingStore {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn get_count(&self, id: &ContentId) -> usize {
+            self.gets.lock().unwrap().get(id).copied().unwrap_or(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for GetCountingStore {
+        async fn has(&self, id: &ContentId) -> Result<bool> {
+            self.inner.has(id).await
+        }
+
+        async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
+            *self.gets.lock().unwrap().entry(id.clone()).or_insert(0) += 1;
+            self.inner.get(id).await
+        }
+
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+
+        async fn release(&self, id: &ContentId) -> Result<()> {
+            self.inner.release(id).await
+        }
+    }
 
     fn cid(kind: ContentKind, seed: &[u8]) -> ContentId {
         ContentId::new(kind, seed)
@@ -299,9 +432,7 @@ mod tests {
     /// Build a root carrying an annotation arena that points to two real
     /// branch blobs (forward + reverse) each routing to a single leaf.
     /// Returns (root, fwd_leaf_cid, rev_leaf_cid).
-    async fn build_root_with_arena(
-        store: &MemoryContentStore,
-    ) -> (IndexRoot, ContentId, ContentId) {
+    async fn build_root_with_arena(store: &dyn ContentStore) -> (IndexRoot, ContentId, ContentId) {
         // Write empty leaves to CAS so the branch entries point somewhere
         // real. Their content doesn't matter — the helper only walks
         // branches, not leaves.
@@ -384,6 +515,48 @@ mod tests {
         assert!(
             ids.contains(&rev_leaf_cid),
             "reverse leaf CID missing — annotation branch was not expanded"
+        );
+    }
+
+    /// Roots that carry a manifest over unchanged must not make the chain
+    /// re-read it. This is what keeps a sweep's planning cost proportional to
+    /// the distinct manifests rather than to the length of the chain.
+    #[tokio::test]
+    async fn a_chain_reads_a_carried_over_manifest_once() {
+        let store = GetCountingStore::new();
+        let (root, fwd_leaf_cid, rev_leaf_cid) = build_root_with_arena(&store).await;
+
+        // What an incremental build that touched nothing in the arena
+        // publishes: a new root pointing at the previous arena's branches.
+        let mut later_root = root.clone();
+        later_root.index_t = root.index_t + 1;
+
+        let mut chain_ids = ChainCasIds::new();
+        chain_ids.add_root(&store, &root).await.unwrap();
+        chain_ids.add_root(&store, &later_root).await.unwrap();
+        let ids = chain_ids.into_ids();
+
+        let ann = root.annotation_index.as_ref().unwrap();
+        assert_eq!(
+            store.get_count(&ann.forward_branch_cid),
+            1,
+            "annotation forward branch re-read for a root that carried it over"
+        );
+        assert_eq!(
+            store.get_count(&ann.reverse_branch_cid),
+            1,
+            "annotation reverse branch re-read for a root that carried it over"
+        );
+
+        // The leaves behind the skipped read are still live: they entered the
+        // set when the first root expanded that manifest.
+        assert!(
+            ids.contains(&fwd_leaf_cid),
+            "forward leaf missing after the second root skipped its manifest"
+        );
+        assert!(
+            ids.contains(&rev_leaf_cid),
+            "reverse leaf missing after the second root skipped its manifest"
         );
     }
 
