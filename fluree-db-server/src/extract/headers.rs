@@ -466,8 +466,14 @@ fn is_header_truthy(headers: &HeaderMap, name: &str) -> bool {
 
 /// Tri-state read of a boolean header: `None` when absent, `Some(truthy)` when
 /// present. Used where "the caller didn't say" must stay distinct from "the
-/// caller said false" — anything present but unrecognized reads as `Some(false)`,
-/// which is the fail-closed direction for a security-relevant header.
+/// caller said false".
+///
+/// Truthiness is byte-for-byte [`is_header_truthy`]'s: `true`, `1`, **or empty**.
+/// The empty case is deliberate and shared with every other boolean Fluree
+/// header — `fluree-track-meta:` with no value means "on" — so a bare
+/// `fluree-default-allow:` reads as `Some(true)`, not as absent and not as
+/// false. Only a present, non-empty, unrecognized value (`0`, `no`, `nonsense`)
+/// reads as `Some(false)`.
 fn header_bool_opt(headers: &HeaderMap, name: &str) -> Option<bool> {
     get_header_str(headers, name)
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1" || v.is_empty())
