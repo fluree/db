@@ -310,6 +310,34 @@ impl DiskArtifactCache {
         state.tracked_bytes = Some(current.saturating_add(bytes));
     }
 
+    /// Drop one entry, keeping the byte accounting in step.
+    ///
+    /// An absent entry is the common case — most released CIDs were never
+    /// cached — and is not an error. Untracked totals stay untracked so the
+    /// next capacity check rescans rather than trusting a partial figure.
+    fn evict_entry(&self, path: &Path) {
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        let bytes = metadata.len();
+
+        match fs::remove_file(path) {
+            Ok(()) => {
+                let mut state = self.state.lock();
+                if let Some(tracked) = state.tracked_bytes {
+                    state.tracked_bytes = Some(tracked.saturating_sub(bytes));
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => tracing::debug!(
+                cache_dir = %self.root.display(),
+                path = %path.display(),
+                error = %err,
+                "failed to evict cache entry for a released object"
+            ),
+        }
+    }
+
     fn evict_until(&self, target_bytes: u64) -> io::Result<()> {
         let mut entries = scan_cache_entries(&self.root)?;
         let mut current = entries
@@ -559,6 +587,62 @@ pub fn best_effort_cache_bytes_to_path(cache_dir: &Path, target: &Path, bytes: &
     DiskArtifactCache::for_dir(cache_dir).best_effort_write(target, bytes);
 }
 
+/// Drop `id` from every disk cache this process holds open.
+///
+/// Callers delete an object from storage and then call this. A cache entry
+/// that outlives its blob still reads back, so anything deciding what storage
+/// holds from a cached read sees a deleted object as present — the index-chain
+/// walk ends at a root storage no longer holds, and a stale entry hides that
+/// ending.
+///
+/// Best effort, and narrower than "no entry outlives its blob":
+///
+/// - it reaches this process's caches, so a delete by another process leaves
+///   that process's entry behind,
+/// - a crash between the delete and this call leaves the entry behind, where
+///   it survives restarts and goes only when the cache exceeds its budget,
+/// - it drops entries keyed by CID ([`fetch_cached_bytes_cid`]). Entries
+///   [`fetch_cached_bytes`] keys by digest and extension would need a
+///   directory scan per call to find, which a release loop cannot afford, so
+///   they are left to budget eviction.
+///
+/// Consumers that must not act on a released object therefore still need to
+/// tolerate one, rather than treating this as a guarantee.
+pub fn evict_cached_cid(id: &ContentId) {
+    // Snapshot before touching the filesystem: a release loop runs many of
+    // these concurrently and the registry lock is process-global.
+    //
+    // Registered directories outlive the cache instances that opened them —
+    // callers build a `DiskArtifactCache` per fetch and drop it — so the entry
+    // to remove is found by directory, and the instance is used only when one
+    // still happens to be open.
+    let caches: Vec<(PathBuf, Option<Arc<DiskArtifactCache>>)> = CACHE_REGISTRY
+        .lock()
+        .iter()
+        .map(|(dir, cache)| (dir.clone(), cache.upgrade()))
+        .collect();
+
+    for (dir, cache) in caches {
+        let path = dir.join(id.to_string());
+        match cache {
+            // A live instance tracks its own byte total, so go through it and
+            // keep the budget accounting in step.
+            Some(cache) => cache.evict_entry(&path),
+            // Nothing holds this directory open, so no total needs adjusting;
+            // whichever instance opens it next rescans from disk.
+            None => match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => tracing::debug!(
+                    cache_dir = %dir.display(),
+                    error = %err,
+                    "failed to evict cache entry for a released object"
+                ),
+            },
+        }
+    }
+}
+
 pub async fn fetch_cached_bytes(
     cs: &dyn ContentStore,
     id: &ContentId,
@@ -688,6 +772,59 @@ mod tests {
         cache.best_effort_write(&dir.join("b.leaf"), &[0u8; 200]);
 
         assert_eq!(cache.current_bytes().unwrap(), 300);
+    }
+
+    /// A released object's entry must go, or a later read sees a blob storage
+    /// no longer holds.
+    #[tokio::test]
+    async fn evicting_a_cid_removes_its_cached_entry() {
+        let dir = temp_cache_dir("evict-cid");
+        let data = vec![7u8; 128];
+        let id = ContentId::new(crate::ContentKind::IndexRoot, &data);
+        let store = CountingStore {
+            data: data.clone(),
+            gets: Arc::new(AtomicUsize::new(0)),
+            delay: Duration::ZERO,
+        };
+
+        fetch_cached_bytes_cid(&store, &id, &dir).await.unwrap();
+        let cached = dir.join(id.to_string());
+        assert!(cached.exists(), "fetch should have populated the cache");
+
+        evict_cached_cid(&id);
+
+        assert!(
+            !cached.exists(),
+            "released CID still readable from the cache"
+        );
+    }
+
+    /// Most released CIDs were never cached, so an absent entry is the common
+    /// path, not an error.
+    #[test]
+    fn evicting_an_uncached_cid_is_silent() {
+        let dir = temp_cache_dir("evict-absent");
+        // Registers the cache so the eviction has somewhere to look.
+        let _cache = DiskArtifactCache::for_dir(&dir);
+        let id = ContentId::new(crate::ContentKind::IndexRoot, b"never-cached");
+
+        evict_cached_cid(&id);
+    }
+
+    /// Eviction and writes share the byte accounting, so a released entry does
+    /// not leave the budget overstated.
+    #[test]
+    fn tracked_bytes_updated_on_eviction() {
+        let dir = temp_cache_dir("evict-tracked");
+        let cache = DiskArtifactCache::with_budget(dir.clone(), 1024 * 1024);
+        let target = dir.join("tracked.leaf");
+
+        cache.best_effort_write(&target, &[0u8; 100]);
+        assert_eq!(cache.current_bytes().unwrap(), 100);
+
+        cache.evict_entry(&target);
+
+        assert_eq!(cache.current_bytes().unwrap(), 0);
     }
 
     #[test]
