@@ -9725,3 +9725,73 @@ async fn indexed_values_seeded_star_sees_novelty_overlay() {
         })
         .await;
 }
+
+/// The seeded plan over a predicate that a later full rebuild left with no live
+/// rows at all — the shape the batched-subject probes cannot reach through
+/// PSOT/POST, only through the SPOT history sidecars that #1624 now preserves.
+///
+/// This is the case the seeded plan changed the answer to: deferring routed it
+/// through `PropertyJoinOperator`, whose replay-aware driver selection happened
+/// to keep it correct, and seeding takes it off that lane. Full rebuild (not
+/// incremental) is the point — it is the path that used to drop the partition.
+#[tokio::test]
+async fn indexed_values_seeded_star_replays_fully_retracted_predicate() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/values-seed-retracted:main";
+
+    let seed = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            {"@id": "ex:thing1", "@type": "ex:Thing", "ex:name": "n1", "ex:legacy": "yes"},
+            {"@id": "ex:thing2", "@type": "ex:Thing", "ex:name": "n2", "ex:legacy": "yes"}
+        ]
+    });
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger1 = fluree
+        .insert(ledger0, &seed)
+        .await
+        .expect("seed insert")
+        .ledger;
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let t1 = ledger1.t();
+    let ledger1 = fluree.ledger(ledger_id).await.expect("reload at t=1");
+
+    // Retract every ex:legacy triple: the predicate is left with zero live rows.
+    let retract = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "where": {"@id": "?s", "ex:legacy": "?v"},
+        "delete": {"@id": "?s", "ex:legacy": "?v"}
+    });
+    let _ = fluree.update(ledger1, &retract).await.expect("retract");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let _ = fluree.ledger(ledger_id).await.expect("reload at t=2");
+
+    let q = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?v
+        WHERE { VALUES ?s { ex:thing1 } ?s a ex:Thing ; ex:legacy ?v }
+    ";
+
+    let view_t1 = fluree.db_at_t(ledger_id, t1).await.expect("view at t=1");
+    assert_values_seeded(&fluree, &view_t1, q).await;
+    let at_t1 = fluree
+        .query(&view_t1, QueryInput::Sparql(q))
+        .await
+        .expect("historical query");
+    assert_eq!(
+        normalize_rows(&at_t1.to_jsonld(&view_t1.snapshot).expect("to_jsonld")),
+        normalize_rows(&json!([["yes"]])),
+        "a fully-retracted predicate must still replay at t=1 through the seeded plan"
+    );
+
+    let view_now = fluree.db(ledger_id).await.expect("current view");
+    let now = fluree
+        .query(&view_now, QueryInput::Sparql(q))
+        .await
+        .expect("current query");
+    assert!(
+        normalize_rows(&now.to_jsonld(&view_now.snapshot).expect("to_jsonld")).is_empty(),
+        "the predicate is gone at head, so the same plan must return nothing"
+    );
+}
