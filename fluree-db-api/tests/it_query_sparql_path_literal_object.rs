@@ -266,7 +266,7 @@ async fn sparql_path_negated_set_literal_object_narrow_error() {
     let err = support::query_sparql(&fluree, &ledger, query)
         .await
         .err()
-        .expect("negated set onto a literal is still unsupported")
+        .unwrap_or_else(|| panic!("negated set onto a literal is still unsupported"))
         .to_string();
     assert!(
         err.contains("Negated property sets") && err.contains("not yet supported"),
