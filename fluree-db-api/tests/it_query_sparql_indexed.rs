@@ -9291,7 +9291,7 @@ async fn indexed_exists_graph_var_decodes_encoded_bindings() {
                 "exactly ex:s1's graph is populated: {json}"
             );
             assert_eq!(
-                bindings[0]["s"]["value"], "ex:s1",
+                bindings[0]["s"]["value"], "http://example.org/ns/s1",
                 "EXISTS must seed the row's own ?g, decoded from EncodedSid: {json}"
             );
             assert_eq!(

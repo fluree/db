@@ -209,17 +209,14 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-02",
     // open-eq-04 greened (D5 datatype-aware `=`/`!=`). open-eq-05/06 need BOTH the
     // scan-path EncodedLit datatype-carry (bench-sensitive, D5b class) AND typed-
-    // literal *constants* to carry their datatype (lower_typed_literal drops it);
-    // open-eq-07/08/10/11/12 now select the correct 12/42/52/52/10-row set but
-    // stay non-isomorphic on blank-node OUTPUT identity (the same object bnode is
-    // re-minted per binding) — orthogonal to the equality lattice.
+    // literal *constants* to carry their datatype (lower_typed_literal drops it).
+    // open-eq-07/08/10/11/12 greened by issue #45 (b): they already selected the
+    // correct 12/42/52/52/10-row set, and the residual mismatch was the SPARQL-JSON
+    // writer dropping the `datatype` off string-backed literals with an "inferable"
+    // type — so a typed object compared as a plain string and no bnode mapping was
+    // consistent. With the datatype emitted, the isomorphism resolves.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-05",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-06",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-07",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-08",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-10",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-11",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-12",
     // optional cluster (3): all three optional-complex-* use GRAPH ?x/?g and
     // are gated on PR-G1 (GRAPH-variable semantics). dawg-optional-filter-005's
     // doubly-nested `OPTIONAL { { ... FILTER } }` scope leak is fixed (PR-W1

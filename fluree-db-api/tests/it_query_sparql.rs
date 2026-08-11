@@ -7,7 +7,7 @@ use crate::support::{
     assert_index_defaults, genesis_ledger, normalize_rows, normalize_sparql_bindings, MemoryFluree,
     MemoryLedger,
 };
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{FlureeBuilder, FormatterConfig};
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
 
@@ -366,7 +366,8 @@ async fn sparql_basic_query_outputs_jsonld_and_sparql_json() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(jsonld, json!([["ex:jdoe", "Jane Doe"]]));
 
-    // SPARQL JSON output uses compact IRIs.
+    // SPARQL Results JSON carries the ABSOLUTE IRI even though the query
+    // declared `ex:` — the format has no prefix map to expand it with (#45).
     let sparql_json = result
         .to_sparql_json(&ledger.snapshot)
         .expect("to_sparql_json");
@@ -376,11 +377,24 @@ async fn sparql_basic_query_outputs_jsonld_and_sparql_json() {
             "head": {"vars": ["fullName", "person"]},
             "results": {"bindings": [
                 {
-                    "person": {"type": "uri", "value": "ex:jdoe"},
+                    "person": {"type": "uri", "value": "http://example.org/ns/jdoe"},
                     "fullName": {"type": "literal", "value": "Jane Doe"}
                 }
             ]}
         })
+    );
+
+    // The Fluree display profile (#1466) still compacts the same result.
+    let display = fluree_db_api::format::format_results(
+        &result,
+        &result.context,
+        &ledger.snapshot,
+        &FormatterConfig::sparql_json().with_compact_iris(),
+    )
+    .expect("compacting sparql_json");
+    assert_eq!(
+        display["results"]["bindings"][0]["person"]["value"],
+        json!("ex:jdoe")
     );
 }
 

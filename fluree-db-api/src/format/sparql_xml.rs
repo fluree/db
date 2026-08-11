@@ -11,7 +11,7 @@
 use crate::QueryResult;
 
 use super::config::FormatterConfig;
-use super::datatype::is_inferable_datatype;
+use super::datatype::may_omit_datatype;
 use super::iri::IriCompactor;
 use super::xml_escape::{escape_attr_into, escape_text_into};
 use super::{materialize, FormatError, Result};
@@ -327,7 +327,10 @@ fn write_literal(
         out.push('"');
     } else {
         let dt_iri = compactor.decode_sid(dtc.datatype())?;
-        if !is_inferable_datatype(&dt_iri) {
+        // `<literal>` content is text, so nothing about the datatype survives
+        // into the serialized form — under the W3C profile only `xsd:string`
+        // may go untagged (issue #45 (b), same rule as the SRJ writer).
+        if !may_omit_datatype(&dt_iri, compactor.emits_absolute_iris()) {
             out.push_str(r#" datatype=""#);
             escape_attr_into(&dt_iri, out);
             out.push('"');
@@ -447,7 +450,15 @@ mod tests {
         // BLANK_NODE (code 10) is registered with the "_:" prefix in production
         // (default_namespace_codes); mirror that so blank-node Sids resolve.
         namespaces.insert(fluree_vocab::namespaces::BLANK_NODE, "_:".to_string());
-        IriCompactor::from_namespaces(std::sync::Arc::new(namespaces))
+        // `format_results_string` builds the XML compactor with the W3C profile
+        // (`FormatterConfig::sparql_xml().absolute_iris`); mirror it, or these
+        // tests measure a render path production never takes.
+        IriCompactor::from_namespaces(std::sync::Arc::new(namespaces)).with_absolute_iris(true)
+    }
+
+    /// The pre-#45 profile, for asserting that a rule is actually flag-driven.
+    fn make_loose_compactor() -> IriCompactor {
+        make_test_compactor().with_absolute_iris(false)
     }
 
     fn make_test_result() -> QueryResult {
@@ -540,15 +551,20 @@ mod tests {
             )]],
         );
         let xml = fmt(&r, &c);
-        // xsd:string is inferable → no datatype attribute, just the value.
+        // A literal with no datatype and no xml:lang IS an xsd:string, so
+        // omitting the tag here is exact, not lossy — the one omission the W3C
+        // profile keeps.
         assert!(xml.contains("<literal>Alice</literal>"), "{xml}");
     }
 
+    /// Issue #45 (b), XML half. This test previously pinned the OPPOSITE: XML
+    /// dropped the datatype for every "inferable" type, so an `xsd:long` came
+    /// back as a bare `<literal>42</literal>` — a plain literal, which is
+    /// `xsd:string`, not the term the query produced. `<literal>` content is
+    /// text; nothing is inferable from it.
     #[test]
-    fn inferable_datatype_omitted_long() {
+    fn w3c_profile_keeps_datatype_on_inferable_types() {
         let c = make_test_compactor();
-        // xsd:long is inferable, so XML omits the datatype (value-type agnostic,
-        // unlike SPARQL-JSON which always carries datatype on numerics).
         let r = make_result(
             &["?v"],
             vec![vec![Binding::lit(
@@ -557,7 +573,36 @@ mod tests {
             )]],
         );
         let xml = fmt(&r, &c);
-        assert!(xml.contains("<literal>42</literal>"), "{xml}");
+        assert!(
+            xml.contains(
+                r#"<literal datatype="http://www.w3.org/2001/XMLSchema#long">42</literal>"#
+            ),
+            "{xml}"
+        );
+
+        // A string-backed literal with an inferable type — the STRDT shape — is
+        // the same rule.
+        let r = make_result(
+            &["?v"],
+            vec![vec![Binding::lit(
+                FlakeValue::String("2".to_string()),
+                Sid::new(2, "integer"),
+            )]],
+        );
+        assert!(
+            fmt(&r, &c).contains(
+                r#"<literal datatype="http://www.w3.org/2001/XMLSchema#integer">2</literal>"#
+            ),
+            "{}",
+            fmt(&r, &c)
+        );
+
+        // ...and it is flag-driven, not unconditional: the loose profile still
+        // omits, so this test measures the profile rather than a constant.
+        assert!(
+            fmt(&r, &make_loose_compactor()).contains("<literal>2</literal>"),
+            "loose profile should still omit"
+        );
     }
 
     #[test]

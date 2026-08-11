@@ -33,3 +33,5 @@ mod it_query_subselect_correlation;
 mod it_query_unwind;
 #[path = "it_query_values.rs"]
 mod it_query_values;
+#[path = "it_w3c_result_formats.rs"]
+mod it_w3c_result_formats;
