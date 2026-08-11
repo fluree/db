@@ -269,8 +269,15 @@ where
 /// released, since the cached copy outlives the blob. Expanding such a root
 /// fails — its manifests were released with it — and that failure is read as
 /// the end of the chain rather than an error, because storage no longer holds
-/// the root and an uncached walk would have stopped there too. The roots
-/// beyond it were already unreachable, so the live set is the same either way.
+/// the root and an uncached walk would have stopped there too.
+///
+/// The set that results is a superset of the uncached walk's, not a match: a
+/// root contributes its direct refs before any manifest is read, so the
+/// released root's own leave the accumulator holding refs the uncached walk
+/// never saw. Whichever of those blobs still exist stay counted live and wait
+/// for a later run, which is the direction that costs a deferral rather than
+/// a live artifact. The roots beyond the ending were already unreachable and
+/// contribute nothing either way.
 async fn chain_cas_ids<C>(
     store: &C,
     head: &ContentId,

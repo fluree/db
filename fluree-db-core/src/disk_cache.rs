@@ -601,6 +601,9 @@ pub fn best_effort_cache_bytes_to_path(cache_dir: &Path, target: &Path, bytes: &
 ///   that process's entry behind,
 /// - a crash between the delete and this call leaves the entry behind, where
 ///   it survives restarts and goes only when the cache exceeds its budget,
+/// - a fetch already in flight for `id` writes its result when it completes,
+///   which can be after this call. Eviction removes an entry; it cannot
+///   cancel the read that is about to replace it.
 /// - it drops entries keyed by CID ([`fetch_cached_bytes_cid`]). Entries
 ///   [`fetch_cached_bytes`] keys by digest and extension would need a
 ///   directory scan per call to find, which a release loop cannot afford, so
