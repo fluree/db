@@ -57,10 +57,11 @@ pub type SinkResult = std::result::Result<(), SinkError>;
 /// How many *quad-shaped* events [`GraphSink`] defines — events that carry a
 /// graph term and so must be routed to a particular graph by a dataset sink.
 ///
-/// Today that is exactly one: [`GraphSink::emit_quad`]. Every other emission
-/// event ([`GraphSink::emit_triple`], [`GraphSink::emit_list_item`],
-/// [`GraphSink::emit_reified_triple`]) has no graph term, which leaves the
-/// default graph as the only thing it can mean — see
+/// Today that is two: [`GraphSink::emit_quad`] and
+/// [`GraphSink::emit_quad_list_item`]. The remaining emission events
+/// ([`GraphSink::emit_triple`], [`GraphSink::emit_list_item`],
+/// [`GraphSink::emit_reified_triple`]) have no graph term, which leaves the
+/// default graph as the only thing they can mean — see
 /// [`DatasetCollectorSink::emit_list_item`](crate::DatasetCollectorSink) for
 /// the consequence.
 ///
@@ -72,7 +73,7 @@ pub type SinkResult = std::result::Result<(), SinkError>;
 /// an event would otherwise reach a dataset sink and be silently dropped into
 /// the default graph. Hence a hand-maintained count, deliberately sited next
 /// to the methods it counts so the adding diff touches it.
-pub const PROTOCOL_QUAD_EVENTS: usize = 1;
+pub const PROTOCOL_QUAD_EVENTS: usize = 2;
 
 /// Opaque term identifier for efficient triple emission
 ///
@@ -250,6 +251,45 @@ pub trait GraphSink {
         );
         Err(SinkError::rejected(
             "this sink is triple-only and cannot represent named graphs",
+        ))
+    }
+
+    /// Emit an indexed list element *inside* the named graph `graph`.
+    ///
+    /// The quad form of [`Self::emit_list_item`], and the second member of
+    /// [`PROTOCOL_QUAD_EVENTS`].
+    ///
+    /// It exists because the two collection styles diverge here. Under
+    /// [`CollectionStyle::Spine`](fluree_graph_turtle::CollectionStyle) — the
+    /// conformant shape — a collection is ordinary triples, so a collection
+    /// in a named graph already routes correctly through [`Self::emit_quad`]
+    /// and this method is never called. Under the indexed style, which exists
+    /// for Fluree ingest, the list element is metadata on the edge and has no
+    /// triple form; before this event a producer parsing `GRAPH g { :s :p (1
+    /// 2) }` had no way to say which graph the collection belonged to, and
+    /// `emit_list_item` would land it in the DEFAULT graph. That is silent
+    /// cross-graph data movement, which is why the gap could not survive a
+    /// real TriG reader.
+    ///
+    /// Only called when [`Self::supports_quads`] returns `true`. Like
+    /// [`Self::emit_quad`], the default body **errors**: a sink that accepts
+    /// quads but cannot place an indexed item in one must say so rather than
+    /// silently relocate it.
+    fn emit_quad_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+        graph: TermId,
+    ) -> SinkResult {
+        let _ = (subject, predicate, object, index, graph);
+        debug_assert!(
+            self.supports_quads(),
+            "emit_quad_list_item called on a sink that does not support quads"
+        );
+        Err(SinkError::rejected(
+            "this sink cannot place an indexed list item in a named graph",
         ))
     }
 
@@ -728,7 +768,7 @@ mod tests {
     #[test]
     fn widening_the_quad_surface_forces_a_routing_decision() {
         assert_eq!(
-            PROTOCOL_QUAD_EVENTS, 1,
+            PROTOCOL_QUAD_EVENTS, 2,
             "GraphSink's quad-shaped surface changed. Every dataset sink must \
              route the new event to its named graph — DatasetCollectorSink, \
              and anything downstream implementing GraphSink. Check \

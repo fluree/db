@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 
 use crate::error::{Result, TurtleError};
 use crate::lex::{StreamingLexer, Token, TokenKind};
-use crate::options::{CollectionStyle, NumericStyle, ParserOptions};
+use crate::options::{CollectionStyle, Dialect, NumericStyle, ParserOptions};
 
 /// RDF well-known IRIs (imported from vocab crate)
 const RDF_TYPE: &str = rdf::TYPE;
@@ -22,6 +22,22 @@ const RDF_REST: &str = rdf::REST;
 const RDF_NIL: &str = rdf::NIL;
 
 /// Turtle parser state.
+/// Where an IRI token's text came from, which decides what still needs
+/// checking after it.
+///
+/// The distinction is not cosmetic: it is the difference between a string the
+/// lexer has already scanned character by character and one it assembled from
+/// escapes and never looked at again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IriSource {
+    /// A verbatim `<...>` span. Every character satisfied `is_iri_char`, so
+    /// none of them is in the IRIREF exclusion set.
+    Lexed,
+    /// Text produced by expanding `\uXXXX` escapes. What the escapes denote
+    /// was never scanned, and is where a non-IRI hides.
+    Escaped,
+}
+
 pub struct Parser<'a, 'input, S> {
     /// Source input for span extraction.
     input: &'input str,
@@ -54,6 +70,14 @@ pub struct Parser<'a, 'input, S> {
     rdf_nil_term: Option<TermId>,
     rdf_first_term: Option<TermId>,
     rdf_rest_term: Option<TermId>,
+    /// The named graph currently in scope, if inside a TriG graph block.
+    ///
+    /// Every emission funnels through `sink_emit_triple` /
+    /// `sink_emit_list_item`, so setting this one field is what makes ALL of
+    /// the Turtle productions — object lists, collections, blank-node
+    /// property lists, reification — land in the right graph. `None` is the
+    /// default graph, which is also every Turtle document.
+    current_graph: Option<TermId>,
     /// Prefix mappings (prefix -> namespace IRI)
     prefixes: FxHashMap<String, String>,
     /// Base IRI for relative IRI resolution
@@ -115,6 +139,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         prefixed_term_cache.reserve(est_unique);
 
         Ok(Self {
+            current_graph: None,
             input,
             lexer,
             current_token,
@@ -320,7 +345,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         predicate: TermId,
         object: TermId,
     ) -> Result<()> {
-        self.sink.emit_triple(subject, predicate, object)?;
+        match self.current_graph {
+            Some(graph) => self.sink.emit_quad(subject, predicate, object, graph)?,
+            None => self.sink.emit_triple(subject, predicate, object)?,
+        }
         self.emit_count += 1;
         Ok(())
     }
@@ -333,8 +361,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         object: TermId,
         index: i32,
     ) -> Result<()> {
-        self.sink
-            .emit_list_item(subject, predicate, object, index)?;
+        match self.current_graph {
+            Some(graph) => self
+                .sink
+                .emit_quad_list_item(subject, predicate, object, index, graph)?,
+            None => self
+                .sink
+                .emit_list_item(subject, predicate, object, index)?,
+        }
         self.emit_count += 1;
         Ok(())
     }
@@ -357,13 +391,130 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     // Term caching helpers
     // =========================================================================
 
+    /// Check that a **resolved** IRI is an RDF term, when validation is on.
+    ///
+    /// Runs after escape expansion and base resolution, because that is where
+    /// the problem lives: `<http://ex/ >` is legal Turtle *source* whose
+    /// value is not an IRI (`turtle-eval-bad-01`).
+    ///
+    /// `position` is the IRI token's own start, not the offset of the
+    /// offending character. Escape expansion and resolution both change the
+    /// string's length, so an index into the resolved value maps back to
+    /// nothing in particular; the token start is the honest, checkable
+    /// position, and the message names the character.
+    ///
+    /// Off by default — one predictable branch on the ingest hot path.
+    ///
+    /// # Placement: parser-side, per resolution — and why that matters later
+    ///
+    /// This runs *before* [`Self::sink_term_iri`], so it fires once per
+    /// resolved occurrence. `sink_term_iri` sits behind `iri_term_cache`,
+    /// which dedupes by resolved IRI: the same IRI appearing a thousand times
+    /// reaches the sink once. So moving validation sink-side would silently
+    /// change error MULTIPLICITY from per-occurrence to per-unique-term.
+    ///
+    /// It is moot today, because the parser fails fast — the first violation
+    /// ends the parse, verified: three copies of the same bad IRI produce one
+    /// error, at the first one's offset. The question becomes live only if
+    /// `--continue-on-error` lands AND validation moves behind that cache, at
+    /// which point a document repeating one bad IRI a thousand times would
+    /// report it once and a user counting diagnostics would under-count.
+    /// Whoever implements continue-on-error should keep the check on this side
+    /// of the cache, or decide deliberately that per-unique-term is what they
+    /// want.
+    #[inline]
+    fn check_iri(&self, iri: &str, position: u32) -> Result<()> {
+        if !self.options.validate {
+            return Ok(());
+        }
+        match fluree_vocab::iri::iri_violation(iri) {
+            None => Ok(()),
+            // `escape_debug`, not the raw IRI. The offending character is by
+            // definition one an IRI may not hold, and the two worst are the
+            // ones that damage the report itself: an expanded newline ends
+            // the diagnostic's first line, truncating it wherever a caller
+            // reads a headline, and an expanded NUL makes captured stderr
+            // binary — at which point `grep` answers "no match" for text
+            // that is right there. This session has already been bitten by
+            // exactly that, twice, in committed source.
+            Some(violation) => Err(TurtleError::parse(
+                position as usize,
+                format!("{violation} (<{}>)", iri.escape_debug()),
+            )),
+        }
+    }
+
+    /// Check that a language tag is well-formed, when validation is on.
+    ///
+    /// KNOWN LIMITATION, deliberately not fixed: `"x"@base` and `"x"@prefix`
+    /// are well-formed `LANGTAG`s that this parser rejects. The lexer decides
+    /// `@base`/`@prefix` are directive keywords before anything knows a string
+    /// literal precedes them, so those two tags never reach here as tags at
+    /// all. No W3C test covers either — `base` and `prefix` are not registered
+    /// language subtags, so no conformance suite asks for them — and fixing it
+    /// means giving the lexer the parser's context, which is a real
+    /// restructuring for a case no document has. Recorded rather than
+    /// silently carried.
+    ///
+    /// Language-tag validation is otherwise here and not in the lexer for a
+    /// related reason: `@BASE` must keep lexing as a
+    /// LangTag token so the parser can reject it in *directive* position
+    /// (Turtle's `@`-directives are case-sensitive). A lexer-level check
+    /// would turn that into a lexical error and change what the parser sees.
+    #[inline]
+    fn check_lang(&self, tag: &str, position: u32) -> Result<()> {
+        if !self.options.validate {
+            return Ok(());
+        }
+        match fluree_vocab::lang::language_tag_violation(tag) {
+            None => Ok(()),
+            // Escaped, though nothing reachable through the Turtle lexer today
+            // needs it — and the earlier justification here had this backwards.
+            // The lexer's `take_while` admits only `[a-zA-Z0-9-]`, which is
+            // NARROWER than the grammar in characters and wider only in SHAPE
+            // (digits first, leading/trailing/doubled `-`). So a control
+            // character cannot reach this arm; `@en_GB`, `@é` and `@` are all
+            // lexical errors.
+            //
+            // Kept anyway: `escape_debug` on a short, already-ASCII string is
+            // free, `language_tag_violation` is a shared predicate whose other
+            // callers have their own lexers, and M2's separate N-Triples
+            // reader may well be looser here. Unreachable through the Turtle
+            // lexer today, kept for the shared predicate and future readers.
+            Some(violation) => Err(TurtleError::parse(
+                position as usize,
+                format!("{violation} (@{})", tag.escape_debug()),
+            )),
+        }
+    }
+
     /// Resolve an IRI string and look up / register as a term.
     #[inline]
-    fn resolve_iri_term(&mut self, iri: &str) -> Result<TermId> {
+    fn resolve_iri_term(&mut self, iri: &str, position: u32, source: IriSource) -> Result<TermId> {
         if self.base.is_none() && is_absolute_iri(iri) {
+            // Nothing was resolved, so this is the token's own text. What is
+            // left to check depends entirely on where that text came from.
+            match source {
+                // Nothing. The lexer scanned this span with `is_iri_char`,
+                // which is the exact complement of the forbidden set — pinned
+                // at every codepoint by `fluree-graph-format`'s
+                // `iriref_set_differential`, which is what licenses this skip
+                // and what will fail if the two ever drift. And the branch
+                // condition just established absoluteness. So for the
+                // commonest term in any document, a validating parse costs
+                // what an unvalidated one costs.
+                IriSource::Lexed => {}
+                // Expanded from `\uXXXX`, and the expansion is exactly what no
+                // scan has ever seen — `turtle-eval-bad-01/02/03`.
+                IriSource::Escaped => self.check_iri(iri, position)?,
+            }
             Ok(self.sink_term_iri(iri))
         } else {
             let resolved = self.resolve_iri(iri)?;
+            // Resolution composed a new string out of the reference and the
+            // base. Neither the lexer's scan nor the branch above says
+            // anything about the result, whatever the source was.
+            self.check_iri(&resolved, position)?;
             Ok(self.sink_term_iri(&resolved))
         }
     }
@@ -394,6 +545,24 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         } else {
             self.expand_prefixed_name(prefix, local)?
         };
+        // The expanded name is where a bad prefix NAMESPACE surfaces: the
+        // `@prefix` directive itself declares a string, and only concatenating
+        // it with a local name produces the IRI a term claims to be.
+        //
+        // Checked on the cache-miss path only. That is sound ONLY ONCE a
+        // prefix rebinding clears this cache — which it does not do on this
+        // branch. `prefixed_term_cache` is keyed by span text, and nothing
+        // here invalidates it when `@prefix e:` is redeclared, so today a
+        // second `e:x` returns the first one's term and never reaches this
+        // check. The dependency, not a soundness claim: the fix is
+        // `fix/turtle-prefix-redefinition` (main-targeted), and validation is
+        // correct on the cache-miss path either way — what the rebinding bug
+        // costs is that the miss never happens.
+        //
+        // The test that pins the two together — a rebinding to a namespace
+        // that makes the expansion a non-IRI — belongs at wave-3 integration,
+        // where both branches meet. Neither branch alone can host it.
+        self.check_iri(&iri, start)?;
         let id = self.sink_term_iri(&iri);
         // Cache with span text as key — avoids allocation on cache hits
         let span = self.span_text(start, end);
@@ -517,7 +686,158 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             TokenKind::KwPrefix | TokenKind::KwSparqlPrefix => self.parse_prefix_directive(),
             TokenKind::KwBase | TokenKind::KwSparqlBase => self.parse_base_directive(),
             TokenKind::Eof => Ok(()),
+            // TriG's two graph-block openers. In Turtle these fall through to
+            // `parse_triples`, which rejects them as it always has.
+            TokenKind::KwGraph if self.options.dialect == Dialect::TriG => {
+                self.parse_graph_keyword_block()
+            }
+            TokenKind::LBrace if self.options.dialect == Dialect::TriG => {
+                // A bare `{ … }` block is the DEFAULT graph, not a named one.
+                self.parse_wrapped_graph(None)
+            }
             _ => self.parse_triples(),
+        }
+    }
+
+    /// `GRAPH labelOrSubject wrappedGraph`.
+    fn parse_graph_keyword_block(&mut self) -> Result<()> {
+        self.advance()?; // consume GRAPH
+        let label = self.parse_graph_label()?;
+        if !matches!(self.current().kind, TokenKind::LBrace) {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "expected `{{` to open the graph block, found {:?}",
+                    self.current().kind
+                ),
+            ));
+        }
+        self.parse_wrapped_graph(Some(label))
+    }
+
+    /// `labelOrSubject ::= iri | BlankNode`.
+    ///
+    /// Deliberately narrower than `parse_subject`: a collection or a
+    /// blank-node PROPERTY LIST cannot name a graph, and accepting one would
+    /// emit its contents into a graph whose name is a node the document is
+    /// simultaneously describing.
+    fn parse_graph_label(&mut self) -> Result<TermId> {
+        match self.current().kind.clone() {
+            TokenKind::Iri => {
+                let s = self.current().start;
+                let e = self.current().end;
+                let iri = self.iri_content(s, e);
+                self.advance()?;
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
+            }
+            TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
+                self.advance()?;
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
+            }
+            TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
+                let s = self.current().start;
+                let e = self.current().end;
+                self.advance()?;
+                self.resolve_prefixed_term(s, e)
+            }
+            TokenKind::BlankNodeLabel => {
+                let label = self.blank_label(self.current().start, self.current().end);
+                self.advance()?;
+                Ok(self.sink_term_blank(Some(label)))
+            }
+            TokenKind::Anon => {
+                self.advance()?;
+                Ok(self.sink_term_blank(None))
+            }
+            other => Err(TurtleError::parse(
+                self.current().start as usize,
+                format!("expected a graph label (IRI or blank node), found {other:?}"),
+            )),
+        }
+    }
+
+    /// `wrappedGraph ::= '{' triplesBlock? '}'`, with `graph` in scope for
+    /// everything inside it.
+    ///
+    /// The capability probe fires HERE, once per named block, rather than per
+    /// triple: a triple-only sink cannot represent a named graph at all, and
+    /// discovering that on the thousandth statement would mean the first 999
+    /// were already misplaced.
+    fn parse_wrapped_graph(&mut self, graph: Option<TermId>) -> Result<()> {
+        if graph.is_some() && !self.sink.supports_quads() {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                "this document has named graphs but the output cannot represent \
+                 them; a triple-only sink would have to drop the graph names",
+            ));
+        }
+
+        self.advance()?; // consume `{`
+
+        let outer = self.current_graph;
+        self.current_graph = graph;
+
+        // Restore the enclosing graph even on error, so a failure inside the
+        // block cannot leak graph scope into the rest of the document.
+        let result = self.parse_graph_body();
+        self.current_graph = outer;
+        result?;
+
+        if !matches!(self.current().kind, TokenKind::RBrace) {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "expected `}}` to close the graph block, found {:?}",
+                    self.current().kind
+                ),
+            ));
+        }
+        self.advance()?; // consume `}`
+
+        // A graph block is one statement to the sink: its triples commit
+        // together, which is also what makes an aborted block contribute
+        // nothing.
+        self.sink.end_statement();
+        self.committed_current = true;
+        Ok(())
+    }
+
+    /// `triplesBlock ::= triples ('.' triplesBlock?)?` — statements inside a
+    /// graph block, where the final `.` is optional before `}`.
+    fn parse_graph_body(&mut self) -> Result<()> {
+        loop {
+            if matches!(self.current().kind, TokenKind::RBrace | TokenKind::Eof) {
+                return Ok(());
+            }
+
+            // `triples ::= subject predicateObjectList | blankNodePropertyList
+            // predicateObjectList?` — the list is optional ONLY after a
+            // `[ … ]` property list, which has already emitted its own
+            // triples. A bare subject or a collection with nothing said about
+            // it is a syntax error, not an empty statement.
+            let bnode_list_subject = matches!(self.current().kind, TokenKind::LBracket);
+            let subject = self.parse_subject()?;
+            let at_block_end = matches!(self.current().kind, TokenKind::Dot | TokenKind::RBrace);
+            if !(bnode_list_subject && at_block_end) {
+                self.parse_predicate_object_list(subject)?;
+            }
+
+            if matches!(self.current().kind, TokenKind::Dot) {
+                self.advance()?;
+            } else if matches!(self.current().kind, TokenKind::RBrace | TokenKind::Eof) {
+                return Ok(());
+            } else {
+                return Err(TurtleError::parse(
+                    self.current().start as usize,
+                    format!(
+                        "expected `.` or `}}` in graph block, found {:?}",
+                        self.current().kind
+                    ),
+                ));
+            }
         }
     }
 
@@ -543,6 +863,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         self.advance()?;
 
         // Get namespace IRI
+        let namespace_start = self.current().start;
         let namespace = match self.current().kind.clone() {
             TokenKind::Iri => {
                 let s = self.current().start;
@@ -559,6 +880,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
         };
         self.advance()?;
+
+        // Validate the DIRECTIVE's own value, not only the names built from
+        // it. Waiting for an expansion means a document that declares a
+        // non-IRI namespace and then never uses the prefix passes `check`
+        // clean — and `check`'s answer is "this document is valid RDF", which
+        // it is not. A namespace is also not merely a string: it is the
+        // scheme-and-authority half of every term the prefix will ever make.
+        self.check_iri(&namespace, namespace_start)?;
 
         // Register prefix
         self.sink_on_prefix(&prefix, &namespace);
@@ -665,6 +994,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         self.advance()?; // consume @base or BASE
 
         // Get base IRI
+        let base_start = self.current().start;
         let base_iri = match self.current().kind.clone() {
             TokenKind::Iri => {
                 let s = self.current().start;
@@ -700,6 +1030,13 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         // guaranteed absolute — which is what this line guarantees.
         let base_iri = self.resolve_iri(&base_iri)?;
 
+        // Same reason as the prefix namespace: `check` must not bless a
+        // document that declares a base which is not an IRI. This one matters
+        // more, because a bad base does not sit inertly — every relative
+        // reference in the rest of the document resolves against it, so one
+        // unchecked directive silently poisons every term downstream of it.
+        self.check_iri(&base_iri, base_start)?;
+
         // Set base
         self.sink_on_base(&base_iri);
         self.base = Some(base_iri);
@@ -715,7 +1052,32 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     /// Parse a triple statement.
     fn parse_triples(&mut self) -> Result<()> {
         let bnode_list_subject = matches!(self.current().kind, TokenKind::LBracket);
+
+        // TriG's `triplesOrGraph`: a bare label followed by `{` is a graph
+        // block, not a subject. Which it is cannot be known until the token
+        // AFTER the label, so the term is parsed first and reinterpreted —
+        // the parser's one token of lookahead is exactly enough, and only for
+        // the label forms. A `[ … ]` property list or a `( … )` collection
+        // has already emitted triples by the time we could look, and neither
+        // can name a graph anyway, so they are excluded here rather than
+        // rolled back.
+        let label_shaped = self.options.dialect == Dialect::TriG
+            && matches!(
+                self.current().kind,
+                TokenKind::Iri
+                    | TokenKind::IriEscaped(_)
+                    | TokenKind::PrefixedName
+                    | TokenKind::PrefixedNameNs
+                    | TokenKind::BlankNodeLabel
+                    | TokenKind::Anon
+            );
+
         let subject = self.parse_subject()?;
+
+        if label_shaped && matches!(self.current().kind, TokenKind::LBrace) {
+            return self.parse_wrapped_graph(Some(subject));
+        }
+
         // Turtle grammar: `blankNodePropertyList predicateObjectList? '.'` —
         // the predicate-object list is optional when the subject is a
         // `[...]` property list (its triples were emitted inside the list).
@@ -733,11 +1095,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -790,6 +1155,9 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                         | TokenKind::RBracket
                         | TokenKind::Eof
                         | TokenKind::AnnotationClose
+                        // TriG: a graph block's last statement may drop its
+                        // `.`, so `}` closes a trailing `;` the same way.
+                        | TokenKind::RBrace
                 ) {
                     break;
                 }
@@ -808,11 +1176,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -899,11 +1270,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1075,11 +1449,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let value =
                     &self.input[(str_start as usize + quote_len)..(str_end as usize - quote_len)];
                 let lang = self.lang_content(ls, le);
+                self.check_lang(lang, ls)?;
                 Ok(self.sink_term_literal(value, Datatype::rdf_lang_string(), Some(lang)))
             }
             TokenKind::DoubleCaret => {
+                let dt = self.current().start;
                 self.advance()?;
                 let datatype_iri = self.parse_datatype_iri()?;
+                self.check_iri(&datatype_iri, dt)?;
                 let value =
                     &self.input[(str_start as usize + quote_len)..(str_end as usize - quote_len)];
                 let datatype = Datatype::from_iri(&datatype_iri);
@@ -1101,11 +1478,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let le = self.current().end;
                 self.advance()?;
                 let lang = self.lang_content(ls, le);
+                self.check_lang(lang, ls)?;
                 Ok(self.sink_term_literal(value, Datatype::rdf_lang_string(), Some(lang)))
             }
             TokenKind::DoubleCaret => {
+                let dt = self.current().start;
                 self.advance()?;
                 let datatype_iri = self.parse_datatype_iri()?;
+                self.check_iri(&datatype_iri, dt)?;
                 let datatype = Datatype::from_iri(&datatype_iri);
                 Ok(self.sink_term_literal(value, datatype, None))
             }
@@ -1114,6 +1494,9 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     }
 
     /// Parse a datatype IRI after ^^.
+    ///
+    /// Returns the resolved string; the CALLER validates it, because only the
+    /// caller still holds the `^^` position to blame.
     fn parse_datatype_iri(&mut self) -> Result<String> {
         match self.current().kind.clone() {
             TokenKind::Iri => {
@@ -1330,11 +1713,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1395,11 +1781,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1546,6 +1935,28 @@ fn unescape_pn_local(local: &str) -> String {
 /// [`ParserOptions::default`].
 pub fn parse<S: GraphSink>(input: &str, sink: &mut S) -> Result<()> {
     Parser::new(input, sink)?.parse()
+}
+
+/// Parse a TriG document into GraphSink events.
+///
+/// TriG is Turtle plus named-graph blocks; this is [`parse_with_options`]
+/// under [`ParserOptions::conformant`] with [`Dialect::TriG`], which is what
+/// a converter wants. Use [`parse_with_options`] directly for other
+/// combinations.
+///
+/// # Errors
+///
+/// A document containing a NAMED graph requires a quad-capable sink. Against
+/// a triple-only one the parser refuses the block rather than folding its
+/// contents into the default graph, because a silently dropped graph name is
+/// data loss. A TriG document whose graphs are all the default graph parses
+/// into any sink.
+pub fn parse_trig<S: GraphSink>(input: &str, sink: &mut S) -> Result<()> {
+    parse_with_options(
+        input,
+        sink,
+        ParserOptions::conformant().with_dialect(Dialect::TriG),
+    )
 }
 
 /// Parse a Turtle document into GraphSink events under explicit

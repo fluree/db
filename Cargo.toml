@@ -51,6 +51,9 @@ exclude = [
     "testsuite-shacl",
     "testsuite-rdf",
     "scripts/local/load",
+    # Out-of-band bench tooling: not in CI, and must not lengthen
+    # `cargo check --workspace` for everyone else.
+    "benchmarks/conversion/harness",
 ]
 
 [workspace.package]

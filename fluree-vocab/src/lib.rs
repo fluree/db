@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 pub mod errors;
 pub mod iri;
+pub mod lang;
 
 /// Constraint on the datatype of an unresolved literal, using IRI strings.
 ///

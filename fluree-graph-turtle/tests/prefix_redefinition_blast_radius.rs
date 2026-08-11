@@ -9,19 +9,31 @@
 //! chunk data with chunks after it, and the guarded pre-scan path would have
 //! rejected the same file.
 //!
-//! # One assertion here describes a LIVE DEFECT on purpose
+//! # The two LIVE-DEFECT assertions here have since been CLOSED
 //!
-//! `wrong_after_carrier > 0` asserts that chunks *after* the redefinition are
-//! still mis-resolved. That is not a property worth having — it is the §1.4
-//! chunker gap (mid-file directive detection → serial fallback), which belongs
-//! to the parallel-convert workstream and is not touched here.
+//! This file was written on `main`, where two of its assertions deliberately
+//! pinned defects rather than properties: that chunks *after* a mid-file
+//! redefinition are still mis-resolved (the §1.4 chunker gap), and that
+//! `PrefixCheck` only matches a directive keyword at line start.
 //!
-//! It is asserted rather than `#[ignore]`d deliberately. An ignored test runs
-//! nowhere and rots; this one runs every time and will FAIL the moment §1.4
-//! lands — which is the signal wanted, because whoever closes that gap should
-//! be told to come here and flip this to `== 0`. Same for
-//! `the_guard_misses_a_mid_line_directive`, which pins that `PrefixCheck` only
-//! matches a directive keyword at line start.
+//! Both were asserted rather than `#[ignore]`d precisely so they would FAIL
+//! the moment §1.4 landed, and tell whoever closed the gap to come here. §1.4
+//! has landed — the parallel-convert workstream drives the streaming chunker
+//! with the real byte-level `BoundaryScanner` and detects a directive at any
+//! token start — so both assertions have been flipped to the closed behavior,
+//! which is what this comment is the record of.
+//!
+//! What replaced them is worth stating, because it is not "the chunker now
+//! chunks such a file correctly". It refuses it. A mid-file directive makes a
+//! document unchunkable — only the first chunk would carry the redefinition —
+//! so the reader thread raises [`SplitError::PrefixAfterData`] and stops.
+//!
+//! That refusal reaches a consumer through [`StreamingTurtleReader::join`] and
+//! NOT through `recv_chunk`, which reports the closed channel as a benign
+//! `Ok(None)`. Every live import call site joins (see `import.rs`, which
+//! carries a comment saying why). A consumer that drains without joining sees
+//! a short read and no error — which is exactly what the original version of
+//! this test did, and why it read as truncation when §1.4 landed.
 //!
 //! Adapted from the review probe in one respect: temporary files go through
 //! `tempfile` rather than a fixed path under the system temp dir, so
@@ -59,143 +71,116 @@ fn write_corpus(path: &std::path::Path, n: usize) {
 }
 
 #[test]
-fn streaming_reader_accepts_a_mid_file_redefinition() {
+fn streaming_reader_refuses_a_mid_file_redefinition_and_says_so() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let path = dir.join("corpus.ttl");
     write_corpus(&path, 4000);
 
-    // Claim 1: StreamingTurtleReader ACCEPTS the file (no PrefixAfterData).
-    let reader = StreamingTurtleReader::new(&path, 16 * 1024, 4, None)
-        .expect("StreamingTurtleReader accepts a mid-file redefinition");
+    // Claim 1: the reader still CONSTRUCTS. The header is well-formed, and the
+    // redefinition is only discoverable by scanning the body, which happens on
+    // the reader thread after this returns.
+    let mut reader = StreamingTurtleReader::new(&path, 16 * 1024, 4, None)
+        .expect("construction reads only the header");
 
     // Claim 2: the extracted prefix block is only the HEAD binding.
     let block = reader.prefix_block().to_string();
-    println!("prefix_block = {block:?}");
     assert!(block.contains("http://a/"), "head binding present");
     assert!(
         !block.contains("http://b/"),
         "redefinition is NOT in the extracted prelude"
     );
 
-    let prelude = reader.prelude().clone();
-    println!("prelude prefixes = {:?}", prelude.prefixes);
-
-    // Claim 3: the redefinition is delivered as ordinary chunk data.
+    // Claim 3: no chunk ever carries the redefinition, because the scanner
+    // stops at it. Before §1.4 this file streamed to completion and the
+    // redefinition arrived as ordinary chunk data with chunks after it.
     let mut chunks: Vec<(usize, String)> = Vec::new();
     while let Some((idx, raw)) = reader.recv_chunk().unwrap() {
         chunks.push((idx, String::from_utf8(raw).unwrap()));
     }
-    chunks.sort_by_key(|(i, _)| *i);
-    println!("chunk count = {}", chunks.len());
-    let carrier: Vec<usize> = chunks
-        .iter()
-        .filter(|(_, t)| t.contains("@prefix e: <http://b/>"))
-        .map(|(i, _)| *i)
-        .collect();
-    assert_eq!(
-        carrier.len(),
-        1,
-        "redefinition delivered inside exactly one chunk"
-    );
-    println!("redefinition carried in chunk index {}", carrier[0]);
     assert!(
-        chunks.len() > carrier[0] + 1,
-        "there ARE chunks after the carrier — cross-chunk exposure is real"
+        !chunks
+            .iter()
+            .any(|(_, t)| t.contains("@prefix e: <http://b/>")),
+        "no chunk may carry a mid-file redefinition"
     );
 
-    // Claim 4: parse each chunk the way import does — prelude prefixes seeded,
-    // prefix block prepended — and count how many subjects are wrong.
-    let seeded: Vec<(String, String)> = prelude.prefixes.to_vec();
-    let mut wrong_in_carrier = 0usize;
-    let mut wrong_after_carrier = 0usize;
-    // The object side is what distinguishes the fix. `e:tag` is cached under
-    // the first binding; after the rebinding, a stale cache serves the old
-    // expansion for the same span. Counted only inside the carrier chunk,
-    // because only there has the parser actually SEEN the redefinition.
-    let mut stale_objects_in_carrier = 0usize;
-    // Non-vacuity witness: post-redefinition triples in the carrier chunk
-    // REGARDLESS of how they resolved. The two `== 0` assertions below are
-    // only meaningful if the carrier actually contains such triples — at
-    // chunk sizes below 16 KB it contains none, and both assertions pass
-    // against a parser with the fix entirely removed. Counting structurally
-    // makes non-vacuity a property of the test, not of the `16 * 1024`
-    // constant above.
-    let mut post_redef_in_carrier = 0usize;
-    for (idx, text) in &chunks {
-        let doc = format!("{block}{text}");
-        let mut sink = GraphCollectorSink::new();
-        parse_with_prefixes_base(&doc, &mut sink, &seeded, None).expect("chunk parses");
-        for t in sink.into_graph().iter() {
-            let s = t.s.as_iri().unwrap_or("");
-            let n: usize = s
-                .rsplit("/s")
-                .next()
-                .and_then(|d| d.parse().ok())
-                .unwrap_or(usize::MAX);
-            let post_redefinition = n >= 2000 && n != usize::MAX;
-            if post_redefinition && *idx == carrier[0] {
-                post_redef_in_carrier += 1;
-            }
-            if post_redefinition && !s.starts_with("http://b/") {
-                if *idx == carrier[0] {
-                    wrong_in_carrier += 1;
-                } else {
-                    wrong_after_carrier += 1;
-                }
-            }
-            if post_redefinition && *idx == carrier[0] && t.o.as_iri() == Some("http://a/tag") {
-                stale_objects_in_carrier += 1;
-            }
-        }
-    }
+    // Claim 4 — THE claim, and the one the old version of this test could not
+    // make. Draining alone looks like a clean end of stream; the error lives
+    // on the reader thread and only `join` surfaces it. This is the assertion
+    // that distinguishes "refused" from "silently truncated", and it is why
+    // every import call site joins.
+    let joined = reader.join();
     assert!(
-        post_redef_in_carrier > 0,
-        "VACUOUS: the carrier chunk holds no post-redefinition triples, so the \
-         assertions below cannot distinguish the fix — the chunk size no longer \
-         places statements after the redefinition inside its chunk"
-    );
-    println!(
-        "post-redefinition subjects still on the OLD namespace: \
-         in carrier chunk = {wrong_in_carrier}, in later chunks = {wrong_after_carrier}"
-    );
-    println!("post-redefinition objects still resolving to http://a/tag inside the carrier chunk = {stale_objects_in_carrier}");
-
-    // THE assertion that distinguishes the fix. Without it, `e:tag` after the
-    // rebinding is served from the cache under the OLD namespace: this count
-    // is greater than zero (verified by reverting the parser to merge-base).
-    // With it, every one of them resolves to the new namespace.
-    assert_eq!(
-        stale_objects_in_carrier, 0,
-        "a prefixed name reused across the rebinding must follow it, not the cache"
+        matches!(
+            joined,
+            Err(fluree_graph_turtle::splitter::SplitError::PrefixAfterData { .. })
+        ),
+        "join must report the refusal, not a benign end of stream: {joined:?}"
     );
 
-    // The fix repairs the carrier chunk. Later chunks remain broken — the PR
-    // says so explicitly and does not claim otherwise.
-    assert_eq!(
-        wrong_in_carrier, 0,
-        "within the carrier chunk the fix must hold"
-    );
-    assert!(
-        wrong_after_carrier > 0,
-        "if this fails, the §1.4 chunker fix has landed: later chunks now see \
-         the redefinition — flip this to `== 0` and delete the tripwire note"
-    );
-
-    // Claim 5: the guarded pre-scan path WOULD have rejected this file.
+    // Claim 5: the in-memory and pre-scan paths agree with the streaming one.
     let (_, guard_ds) = extract_prefix_block(&path).unwrap();
-    let guarded = compute_chunk_boundaries(&path, guard_ds, 16 * 1024);
-    println!("compute_chunk_boundaries => {guarded:?}");
     assert!(
-        guarded.is_err(),
-        "the guarded path rejects what the streaming path accepts"
+        compute_chunk_boundaries(&path, guard_ds, 16 * 1024).is_err(),
+        "the pre-scan path refuses the same file"
     );
 }
 
-/// The PR also notes, without fixing: `PrefixCheck` only matches a directive
-/// keyword at line start, so a mid-line redefinition slips even the guard.
+/// The parser fix itself, on the shape that motivated it: a prefixed name
+/// reused across a rebinding must follow the rebinding, not the cache.
+///
+/// Kept separate from the chunker story above because it is a property of the
+/// PARSER and holds whether or not the document is ever chunked. Before the
+/// fix, `e:tag` after the redefinition was served from the span cache under
+/// the old namespace.
 #[test]
-fn the_guard_misses_a_mid_line_directive() {
+fn a_name_reused_across_a_rebinding_follows_it_rather_than_the_cache() {
+    let mut doc = String::from("@prefix e: <http://a/> .\n");
+    for i in 0..10 {
+        doc.push_str(&format!("e:s{i} <http://p/> e:tag .\n"));
+    }
+    doc.push_str("@prefix e: <http://b/> .\n");
+    for i in 10..20 {
+        doc.push_str(&format!("e:s{i} <http://p/> e:tag .\n"));
+    }
+
+    let mut sink = GraphCollectorSink::new();
+    parse_with_prefixes_base(&doc, &mut sink, &[], None).expect("parses");
+
+    let mut stale_subjects = 0usize;
+    let mut stale_objects = 0usize;
+    for t in sink.into_graph().iter() {
+        let s = t.s.as_iri().unwrap_or("");
+        let n: usize = s
+            .rsplit("/s")
+            .next()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(usize::MAX);
+        if n >= 10 && n != usize::MAX {
+            if !s.starts_with("http://b/") {
+                stale_subjects += 1;
+            }
+            if t.o.as_iri() == Some("http://a/tag") {
+                stale_objects += 1;
+            }
+        }
+    }
+    assert_eq!(
+        stale_subjects, 0,
+        "subjects after the rebinding must follow it"
+    );
+    assert_eq!(
+        stale_objects, 0,
+        "a repeated prefixed name must be re-expanded after a rebinding"
+    );
+}
+
+/// `main` noted, without fixing, that `PrefixCheck` matched a directive
+/// keyword only at line start, so a mid-line redefinition slipped the guard.
+/// §1.4 closed it: detection now fires at any token start.
+#[test]
+fn the_guard_catches_a_mid_line_directive() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
@@ -233,9 +218,7 @@ fn the_guard_misses_a_mid_line_directive() {
     let res = compute_chunk_boundaries(&mid_line, ds2, 1024);
     println!("mid-line directive (data_start={ds2}) => {res:?}");
     assert!(
-        res.is_ok(),
-        "if this fails, PrefixCheck has learned to match mid-line directives: \
-         the guard now catches what this test documents as missed — flip to \
-         `is_err()` and retire this note"
+        res.is_err(),
+        "a mid-line directive after data is caught too, not just a line-start one"
     );
 }

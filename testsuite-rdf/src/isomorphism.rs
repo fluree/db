@@ -25,7 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use fluree_graph_ir::{Term, Triple};
+use fluree_graph_ir::{Dataset, Graph, Term, Triple};
 
 /// Whether two graphs are isomorphic: equal after some bijective renaming of
 /// blank node labels.
@@ -227,6 +227,59 @@ fn terms_match(
         // already accounts for value, datatype and language tag.
         _ => expected == actual,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dataset isomorphism (TriG eval)
+// ---------------------------------------------------------------------------
+
+/// Whether two datasets are isomorphic.
+///
+/// Compared graph by graph: the default graphs must be isomorphic, and the
+/// named graphs must pair up. IRI-named graphs pair by name. Blank-node-named
+/// graphs have no stable name, so they pair by CONTENT — any unused partner
+/// whose graph is isomorphic — which is a sound approximation rather than the
+/// full thing: a true dataset isomorphism would solve one bijection across
+/// graph names AND graph contents simultaneously, so that a blank node
+/// appearing both as a graph name and inside a graph is forced to the same
+/// image. Nothing in the rdf11 TriG suite needs that, and the approximation
+/// only ever accepts, never rejects, a genuinely isomorphic pair. Any test it
+/// waves through for the wrong reason would have to have two
+/// blank-node-named graphs with interchangeable contents.
+pub fn are_datasets_isomorphic(expected: &Dataset, actual: &Dataset) -> bool {
+    if !are_graphs_isomorphic(
+        expected.default_graph().triples(),
+        actual.default_graph().triples(),
+    ) {
+        return false;
+    }
+
+    if expected.named_graph_count() != actual.named_graph_count() {
+        return false;
+    }
+
+    let mut unmatched: Vec<(&Term, &Graph)> = actual.named_graphs().collect();
+
+    for (name, graph) in expected.named_graphs() {
+        let found = if name.is_blank() {
+            unmatched.iter().position(|(other, g)| {
+                other.is_blank() && are_graphs_isomorphic(graph.triples(), g.triples())
+            })
+        } else {
+            unmatched.iter().position(|(other, g)| {
+                *other == name && are_graphs_isomorphic(graph.triples(), g.triples())
+            })
+        };
+
+        match found {
+            Some(i) => {
+                unmatched.swap_remove(i);
+            }
+            None => return false,
+        }
+    }
+
+    unmatched.is_empty()
 }
 
 #[cfg(test)]

@@ -1,0 +1,149 @@
+{
+  "$comment": [
+    "Pinned competitor set for the Tier-2 conversion matrix (bench-strategy §3, §6b F9).",
+    "Every sha256 here was computed by downloading the artifact, not copied from a page.",
+    "The harness hard-fails when an installed tool's --version disagrees with `version`:",
+    "a matrix is only comparable if the reader knows exactly what produced it, and the",
+    "lane's existing numbers rot precisely because nobody pins.",
+    "",
+    "`flags_disclosed` is the full argument list the harness passes in that mode. It is a",
+    "field rather than a comment because serd's -f trap (fast-and-loose URI mode, which is",
+    "how serdi's published-looking numbers were obtained) is exactly the kind of flag that",
+    "silently makes one column incomparable."
+  ],
+  "schema_version": 1,
+  "recorded": "2026-07-29",
+  "tools": {
+    "riot": {
+      "name": "Apache Jena riot",
+      "version": "6.1.0",
+      "version_probe": ["riot", "--version"],
+      "version_pattern": "Apache Jena RIOT version 6\\.1\\.0",
+      "source_url": "https://archive.apache.org/dist/jena/binaries/apache-jena-6.1.0.tar.gz",
+      "sha256": "653108a91fd9b309a89bc756258bae0bca01587cef475942d11852e3beba2ae3",
+      "install_cmd": "tar -xzf apache-jena-6.1.0.tar.gz && ln -sf $PWD/apache-jena-6.1.0/bin/riot .tools/bin/riot",
+      "runtime_requirement": "JDK 21+ (Jena 6.x). Hard requirement, not advisory: 6.1.0 will not start on 11 or 17.",
+      "modes": {
+        "default": {
+          "flags_disclosed": ["--output=NT"],
+          "note": "riot's DEFAULT is check-on for Turtle and check-off for N-Triples. Recording this mode alone would compare a validating Turtle run against a non-validating N-Triples one — see §6b F3."
+        },
+        "check_false": {
+          "flags_disclosed": ["--output=NT", "--check=false"],
+          "note": "Uniform no-validation. Comparable with our column until W-h8 lands."
+        },
+        "check_true": {
+          "flags_disclosed": ["--output=NT", "--check=true"],
+          "note": "Uniform validation. Becomes the primary cell once our --nocheck/validate split exists."
+        }
+      },
+      "jvm": {
+        "xmx": "-Xmx4g",
+        "note": "Pinned and disclosed per §6b F7. An unpinned JVM heap makes the peak-RSS column meaningless, and the memory-stability claim is restricted to -Xmx-pinned or non-JVM tools for exactly this reason."
+      }
+    },
+    "serdi": {
+      "name": "serd (serdi)",
+      "version": "0.32.10",
+      "version_probe": ["serdi", "--version"],
+      "version_pattern": "^serdi 0\\.32\\.10( |$)",
+      "source_url": "https://download.drobilla.net/serd-0.32.10.tar.xz",
+      "sha256": "b0e93b49e52f01a049475b7886ef140407115a32d3b1e5dc5f95141c88275d1c",
+      "install_cmd": "tar -xJf serd-0.32.10.tar.xz && cd serd-0.32.10 && meson setup build && ninja -C build && ln -sf $PWD/build/serdi ../bin/serdi",
+      "modes": {
+        "default": {
+          "flags_disclosed": ["-o", "ntriples"],
+          "note": "Default URI handling: full resolution. This is the honest comparison cell."
+        },
+        "fast_lax": {
+          "flags_disclosed": ["-o", "ntriples", "-f"],
+          "note": "THE TRAP (§3). -f is fast-and-loose URI mode. serd's own published-looking throughput was measured this way; a matrix that quotes -f numbers against another tool's validating numbers is not a comparison. Recorded so the difference is visible, never used as the headline cell."
+        }
+      }
+    },
+    "oxigraph": {
+      "name": "Oxigraph CLI",
+      "version": "0.5.9",
+      "version_probe": ["oxigraph", "--version"],
+      "version_pattern": "^oxigraph 0\\.5\\.9( |$)",
+      "source_url": "https://static.crates.io/crates/oxigraph-cli/oxigraph-cli-0.5.9.crate",
+      "sha256": "5864a77ae0f56d2cbb92463dea11280bc12379bf17f07e0e408ef70685ef7414",
+      "install_cmd": "cargo install oxigraph-cli --version 0.5.9 --locked --root .tools",
+      "modes": {
+        "default": {
+          "flags_disclosed": ["convert", "--to-format", "nt"],
+          "note": "The live Rust competitor — the most directly comparable column we have."
+        }
+      }
+    },
+    "rapper": {
+      "name": "raptor2 (rapper)",
+      "version": "2.0.16",
+      "version_probe": ["rapper", "--version"],
+      "version_pattern": "^2\\.0\\.16$",
+      "source_url": "https://download.librdf.org/source/raptor2-2.0.16.tar.gz",
+      "sha256": "089db78d7ac982354bdbf39d973baf09581e6904ac4c92a98c5caadb3de44680",
+      "install_cmd": "tar -xzf raptor2-2.0.16.tar.gz && cd raptor2-2.0.16 && ./configure --prefix=$PWD/../.. && make && make install",
+      "status": "dormant-since-2023",
+      "status_note": "Last release 2014, last commit 2023. Carried for historical continuity with the two most-cited benchmarks in the lane — the ones that disagree about this very library by ~6x. Labelled dormant in every rendered matrix so no reader mistakes it for a live competitor.",
+      "modes": {
+        "default": {
+          "flags_disclosed": ["-o", "ntriples"],
+          "note": "rapper needs -i to be told the input syntax; the harness passes it per corpus."
+        }
+      }
+    },
+    "rdflib": {
+      "name": "RDFLib (Python)",
+      "version": "7.6.0",
+      "version_probe": ["python3", "-c", "import rdflib; print(rdflib.__version__)"],
+      "version_pattern": "^7\\.6\\.0$",
+      "source_url": "https://pypi.org/project/rdflib/7.6.0/",
+      "sha256": null,
+      "sha256_note": "Not pinned by hash: this is a REFERENCE row, never a competitor cell. It exists to sanity-check our output by an independent implementation (isomorphism spot-check), not to be raced.",
+      "install_cmd": "python3 -m pip install rdflib==7.6.0",
+      "role": "reference-only",
+      "modes": {
+        "default": {
+          "flags_disclosed": [],
+          "note": "Orders of magnitude slower than every compiled tool. Quoting it as a speed win would be dishonest framing, so it is excluded from speed cells by construction."
+        }
+      }
+    },
+    "n3js": {
+      "name": "N3.js (Node)",
+      "version": "1.17.4",
+      "version_probe": ["node", "-e", "console.log(require('n3/package.json').version)"],
+      "version_pattern": "^1\\.17\\.4$",
+      "source_url": "https://registry.npmjs.org/n3/-/n3-1.17.4.tgz",
+      "sha256": null,
+      "sha256_note": "Reference row, as rdflib. Pin the hash before any published run.",
+      "install_cmd": "npm install --prefix .tools n3@1.17.4",
+      "role": "reference-only",
+      "modes": {
+        "default": {
+          "flags_disclosed": [],
+          "note": "Ecosystem reference point for the JSON-LD/JS lane, not a competitor cell."
+        }
+      }
+    }
+  },
+  "our_tool": {
+    "name": "fluree rdf",
+    "version_probe": ["fluree", "--version"],
+    "binary": "target/release/fluree",
+    "modes": {
+      "default": {
+        "flags_disclosed": ["rdf", "convert", "--to", "ntriples"],
+        "validation_level": "none",
+        "note": "Our parser performs NO IRI validation today (fluree-vocab has only is_absolute_iri + resolve_iri). This cell is therefore comparable with riot's check_false, NOT with its default. Stated in the matrix rather than left for a reader to discover."
+      },
+      "validate": {
+        "flags_disclosed": ["rdf", "convert", "--to", "ntriples"],
+        "validation_level": "iri+langtag",
+        "available_from": "W-h8",
+        "note": "DESIGNED NOW, FILLED LATER. When W-h8 lands, this becomes the primary cell opposite riot's check_true, and `default` gains --nocheck as the disclosed secondary. The matrix carries the column already so the comparison is never quietly asymmetric in the meantime."
+      }
+    }
+  }
+}

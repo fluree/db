@@ -50,6 +50,9 @@ struct BlockCore<W: Write> {
     /// statement, so that directives arriving during the prologue all land in
     /// the header.
     header_written: bool,
+    /// Whether `@prefix` directives reach the output. See
+    /// [`WriterConfig::declare_prefixes`](crate::WriterConfig::declare_prefixes).
+    declare_prefixes: bool,
     /// Committed run state — what has actually reached the output.
     committed: Run,
     /// Run state including the statement in flight.
@@ -68,6 +71,7 @@ impl<W: Write> BlockCore<W> {
             terms: WriterTerms::new(BlankLabeler::new(config.blank_labels)),
             prefixes: config.prefixes.clone(),
             header_written: false,
+            declare_prefixes: config.declare_prefixes,
             committed: Run::default(),
             working: Run::default(),
             in_statement: false,
@@ -86,7 +90,8 @@ impl<W: Write> BlockCore<W> {
     /// the rest of the document instead of silently expanding every IRI.
     fn on_prefix(&mut self, prefix: &str, namespace_iri: &str) -> SinkResult {
         self.prefixes.insert(prefix, namespace_iri);
-        if !self.header_written {
+        // Still recorded for compaction, just not announced.
+        if !self.declare_prefixes || !self.header_written {
             return Ok(());
         }
         // A directive is a top-level thing. TriG's `wrappedGraph` holds
@@ -149,10 +154,12 @@ impl<W: Write> BlockCore<W> {
         self.refuse_unwritable_positions(subject, predicate, graph)?;
 
         if !self.header_written {
-            write_prefix_declarations(&self.prefixes, &mut self.out)?;
-            // The header belongs to no statement; commit it before the first
-            // one can be rolled back and take it along.
-            self.out.commit_statement()?;
+            if self.declare_prefixes {
+                write_prefix_declarations(&self.prefixes, &mut self.out)?;
+                // The header belongs to no statement; commit it before the
+                // first one can be rolled back and take it along.
+                self.out.commit_statement()?;
+            }
             self.header_written = true;
         }
 
@@ -292,7 +299,9 @@ impl<W: Write> BlockCore<W> {
         }
         // An empty document still declares the prefixes it was given.
         if !self.header_written {
-            write_prefix_declarations(&self.prefixes, &mut self.out)?;
+            if self.declare_prefixes {
+                write_prefix_declarations(&self.prefixes, &mut self.out)?;
+            }
             self.header_written = true;
         }
         self.close_graph_block()?;
@@ -387,6 +396,22 @@ macro_rules! block_sink_common {
             _predicate: TermId,
             _object: TermId,
             _index: i32,
+        ) -> SinkResult {
+            self.0.refuse_list_item()
+        }
+
+        /// Same refusal as the triple form, for the same reason: the problem
+        /// is the indexed item, not the graph it names. Overridden
+        /// explicitly rather than left to the trait default, because these
+        /// writers DO claim quad support, and a reader of this impl should
+        /// see the refusal beside the capability rather than infer it.
+        fn emit_quad_list_item(
+            &mut self,
+            _subject: TermId,
+            _predicate: TermId,
+            _object: TermId,
+            _index: i32,
+            _graph: TermId,
         ) -> SinkResult {
             self.0.refuse_list_item()
         }
@@ -616,6 +641,69 @@ mod tests {
     }
 
     // ---------------------------------------------------------------- TriG
+
+    #[test]
+    fn suppressed_declarations_still_compact() {
+        // The knob withholds the directives without disabling compaction —
+        // that is the whole point. A chunk that declared nothing but expanded
+        // every IRI would defeat the reason for chunking Turtle at all.
+        let mut config = WriterConfig::new();
+        config.declare_prefixes = false;
+        let mut buf = Vec::new();
+        {
+            let mut w = TurtleWriter::with_config(&mut buf, &config);
+            w.on_prefix("ex", "http://example.org/");
+            let s = w.term_iri("http://example.org/s");
+            let p = w.term_iri("http://example.org/p");
+            let o = w.term_iri("http://example.org/o");
+            w.emit_triple(s, p, o).unwrap();
+            w.end_statement();
+            GraphSink::finish(&mut w).unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(
+            !out.contains("@prefix"),
+            "declarations were supposed to be suppressed:\n{out}"
+        );
+        assert!(
+            out.contains("ex:s"),
+            "compaction was lost along with the declaration:\n{out}"
+        );
+    }
+
+    #[test]
+    fn declarations_are_on_by_default() {
+        // A document that compacts without declaring is unreadable, so the
+        // default must never be the suppressed one.
+        assert!(WriterConfig::new().declare_prefixes);
+        assert!(WriterConfig::default().declare_prefixes);
+
+        let out = write_ttl(|w| {
+            w.on_prefix("ex", "http://example.org/");
+            let s = w.term_iri("http://example.org/s");
+            let p = w.term_iri("http://example.org/p");
+            let o = w.term_iri("http://example.org/o");
+            w.emit_triple(s, p, o).unwrap();
+            w.end_statement();
+        });
+        assert!(out.contains("@prefix ex:"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_document_declares_nothing_when_suppressed() {
+        // `finish` has its own declaration site for the empty-document case;
+        // it has to honour the knob too.
+        let mut config = WriterConfig::new();
+        config.declare_prefixes = false;
+        config.prefixes.insert("ex", "http://example.org/");
+        let mut buf = Vec::new();
+        {
+            let mut w = TurtleWriter::with_config(&mut buf, &config);
+            GraphSink::finish(&mut w).unwrap();
+        }
+        assert!(String::from_utf8(buf).unwrap().is_empty());
+    }
 
     fn write_trig(f: impl FnOnce(&mut TrigWriter<&mut Vec<u8>>)) -> String {
         let mut buf = Vec::new();

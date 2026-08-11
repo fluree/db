@@ -57,6 +57,27 @@ pub struct RunContext {
     pub bytes_decoded: u64,
     /// SHA-256 of the *decoded* document, or `None` under `--no-hash`.
     pub sha256: Option<String>,
+    /// Whether terms were validated (false under `--nocheck`).
+    ///
+    /// In the report because a `--nocheck` run and a validating run are not
+    /// comparable measurements, and a number that does not say which it was
+    /// invites exactly the comparison that flatters us. Every other RDF tool
+    /// worth benchmarking against validates by default, so an unlabelled
+    /// `--nocheck` figure would be a faster answer to an easier question.
+    pub validate: bool,
+    /// Statements skipped under `--continue-on-error`, when that ran.
+    ///
+    /// Carried here so the machine-readable channel holds the machine-readable
+    /// fact: under `--profile=json` stderr is one JSON document, so the
+    /// per-skip diagnostics cannot also be printed there without making it
+    /// unparseable.
+    pub skipped_statements: Option<u64>,
+    /// Threads that parsed. One is the serial path.
+    pub threads_used: usize,
+    /// Why that thread count — "parallel", or the reason the serial path was
+    /// taken. Reported because "why is this not using my cores" has no other
+    /// answer from outside the process.
+    pub parallel_reason: &'static str,
 }
 
 #[derive(Serialize)]
@@ -74,10 +95,24 @@ struct HostInfo {
     /// single-threaded number is never mistaken for a saturated one.
     available_parallelism: usize,
     threads_used: usize,
+    /// Why `threads_used` is what it is.
+    parallel_reason: &'static str,
     /// Peak resident set size for the process, in bytes, normalized across
     /// platforms. `None` where it cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     peak_rss_bytes: Option<u64>,
+    /// One-minute load average when the run finished. `None` where it cannot
+    /// be read.
+    ///
+    /// Recorded on every run, not just benchmark ones, because a timing taken
+    /// on a busy machine is not a timing and there is otherwise no way to tell
+    /// after the fact. This exists because a scaling sweep on this repo's own
+    /// hardware measured 1.46x while the load average was 65 on 16 cores —
+    /// the serial baseline, running unchanged code, had slowed by 3.1x. The
+    /// number was contention, not architecture, and nothing in the report
+    /// said so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load_average_1m: Option<f64>,
 }
 
 /// Environment variable naming the host's comparability class.
@@ -156,6 +191,24 @@ fn peak_rss_bytes() -> Option<u64> {
 
 #[cfg(not(unix))]
 fn peak_rss_bytes() -> Option<u64> {
+    None
+}
+
+/// One-minute load average, or `None` where the platform will not say.
+///
+/// Compared against `available_parallelism`, this is what tells a later reader
+/// whether a timing in the same document is worth anything.
+#[cfg(unix)]
+fn load_average_1m() -> Option<f64> {
+    let mut averages = [0f64; 3];
+    // SAFETY: `getloadavg` fills up to `nelem` entries of the array it is
+    // given and returns how many it wrote; the array outlives the call.
+    let written = unsafe { libc::getloadavg(averages.as_mut_ptr(), 3) };
+    (written > 0).then_some(averages[0])
+}
+
+#[cfg(not(unix))]
+fn load_average_1m() -> Option<f64> {
     None
 }
 
@@ -293,6 +346,12 @@ pub struct ProfileReport {
     /// there is no checkout to ask.
     git_sha: String,
     verb: &'static str,
+    /// Whether term validation ran. `false` marks a `--nocheck` run,
+    /// whose timings are NOT comparable with a validating tool's.
+    validated: bool,
+    /// Statements skipped by `--continue-on-error`. Absent when it did not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped_statements: Option<u64>,
     host: HostInfo,
     corpus: CorpusInfo,
     /// The measured window: from the first byte of input handling to the end
@@ -352,11 +411,13 @@ impl ProfileReport {
             .filter(|e| e.ns > 0)
             .collect();
 
-        // The sink runs inside the parse, so it is not part of the sequential
-        // sum; counting it would make "unattributed" negative on a fast run.
-        let sequential: u128 = Phase::ALL
+        // Only the phases that run one after another. The sink, serializer,
+        // writer and both parallel phases run INSIDE the parse, and `workers`
+        // is a cross-thread sum that exceeds the wall clock on any run that
+        // scales — counting them would claim more time than the run took and
+        // saturate the gap that is meant to reveal unmeasured work.
+        let sequential: u128 = Phase::SEQUENTIAL
             .into_iter()
-            .filter(|p| *p != Phase::Sink)
             .map(|p| timings.elapsed(p).as_nanos())
             .sum();
 
@@ -377,16 +438,18 @@ impl ProfileReport {
             tool_version: env!("CARGO_PKG_VERSION"),
             git_sha: git_sha(),
             verb: ctx.verb,
+            validated: ctx.validate,
+            skipped_statements: ctx.skipped_statements,
             host: HostInfo {
                 os: std::env::consts::OS,
                 arch: std::env::consts::ARCH,
                 host_class: host_class(),
                 available_parallelism: std::thread::available_parallelism()
                     .map_or(1, std::num::NonZeroUsize::get),
-                // `check` and `count` parse on the calling thread. The
-                // parallel pipeline reports its real width here.
-                threads_used: 1,
+                threads_used: ctx.threads_used,
+                parallel_reason: ctx.parallel_reason,
                 peak_rss_bytes: peak_rss_bytes(),
+                load_average_1m: load_average_1m(),
             },
             corpus: CorpusInfo {
                 input: ctx.input.clone(),
@@ -472,12 +535,23 @@ impl ProfileReport {
         print_summary("phase", &rows);
 
         eprintln!(
-            "  {} {} · {} · {} · {}",
+            "  {} {} · {} · {} · {}{}",
             self.verb,
             self.corpus.input,
             self.corpus.syntax,
             human_bytes(self.corpus.bytes_decoded),
             self.host.host_class,
+            // The whole argument for putting `validated` in the JSON is that an
+            // unlabelled --nocheck number is a faster answer to an easier
+            // question. A human reading a table is at least as likely to
+            // quote it, so scoping the label to JSON contradicted its own
+            // rationale. Shown only when OFF: the default is validating, and a
+            // line on every ordinary run is noise.
+            if self.validated {
+                String::new()
+            } else {
+                " · NOT VALIDATED (--nocheck)".to_string()
+            },
         );
         eprintln!(
             "  wall {} (input → parse; excludes startup{}) · {} unattributed",
@@ -538,6 +612,23 @@ impl ProfileReport {
             "  profiler cost {:.3}% of wall ({} clock reads @ {}ns/pair)",
             cal.measured_overhead_pct, cal.clock_reads, cal.clock_pair_ns,
         );
+        // A timing taken on a loaded machine is not a timing. Say so here
+        // rather than leave a later reader to wonder.
+        if let Some(load) = self.host.load_average_1m {
+            let cores = self.host.available_parallelism as f64;
+            if load > cores {
+                eprintln!(
+                    "  LOADED: 1-minute load average {load:.1} on {} core(s) — every duration \
+                     above is contended and none of them is a measurement",
+                    self.host.available_parallelism,
+                );
+            } else {
+                eprintln!(
+                    "  load average {load:.2} on {} core(s)",
+                    self.host.available_parallelism
+                );
+            }
+        }
         // Two verdicts, because they fail for different reasons and a Tier-1
         // gate keys on the first. A single flag that is false on every `count`
         // run is a flag nobody reads.
@@ -647,6 +738,10 @@ mod tests {
             bytes_on_wire: 4096,
             bytes_decoded: 4096,
             sha256: Some("abc123".to_string()),
+            validate: true,
+            skipped_statements: None,
+            threads_used: 1,
+            parallel_reason: "verb parses on the calling thread",
         }
     }
 

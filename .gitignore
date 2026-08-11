@@ -34,8 +34,15 @@ __pycache__/
 # Test database (generated data)
 /test-database/
 
-# Benchmark inputs/outputs — never tracked
-/benchmarks/
+# Benchmark inputs/outputs — never tracked.
+#
+# Narrowed from a blanket `/benchmarks/` so the Tier-2 conversion HARNESS can
+# live in-repo where the bench strategy puts it (§6.3). Git cannot re-include a
+# path inside an excluded directory, so the rule has to exclude the contents
+# rather than the directory. Corpora, fetched tools and run outputs stay
+# untracked via benchmarks/conversion/.gitignore.
+/benchmarks/*
+!/benchmarks/conversion/
 
 # Internal analysis scratch — not part of the published docs
 BI_QUERY_ANALYSIS.md

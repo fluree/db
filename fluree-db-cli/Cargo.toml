@@ -141,6 +141,11 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"
+# Dev-only, and deliberately so: this binds the SPARQL lexer's copy of the
+# IRIREF exclusion set to the three in the light crates (see
+# tests/iriref_fourth_copy.rs). fluree-db-cli is the smallest crate that
+# already depends on both sides, so the binding costs no production edge.
+fluree-db-sparql = { path = "../fluree-db-sparql" }
 predicates = "3"
 tempfile = "3"
 

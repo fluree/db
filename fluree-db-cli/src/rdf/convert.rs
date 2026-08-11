@@ -17,13 +17,14 @@
 
 use crate::cli::{BnodePolicyArg, RdfCommonArgs};
 use crate::error::{CliError, CliResult};
+use crate::rdf::parallel::ParallelConfig;
 use crate::rdf::profile::{ProfileReport, RunContext};
 use crate::rdf::syntax::{split_compression, RdfSyntax};
 use crate::rdf::writer::{is_writable, AnyWriter};
 use crate::rdf::{self, destination, diagnostic, exit_document_invalid};
 use colored::Colorize;
 use fluree_graph_format::{BlankNodeLabels, PrefixMap, WriterConfig, WriterStats};
-use fluree_graph_ir::{Phase, PhaseTimings, SinkError};
+use fluree_graph_ir::{GraphSink, Phase, PhaseTimings, SinkError};
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -48,6 +49,11 @@ pub struct ConvertArgs<'a> {
     pub bnode_policy: BnodePolicyArg,
     /// Prefixes to seed compaction with, as JSON or a path to JSON.
     pub prefixes: Option<&'a str>,
+    /// Parse threads. `0` means "as many as this host has"; `1` is the serial
+    /// path exactly, so the flag is never a correctness decision.
+    pub parallelism: usize,
+    /// Skip statements that do not parse rather than stopping at the first.
+    pub continue_on_error: bool,
 }
 
 /// Run `fluree rdf convert`.
@@ -92,12 +98,97 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
 
     let config = WriterConfig::new()
         .with_blank_labels(BlankNodeLabels::from(args.bnode_policy))
-        .with_prefixes(prefixes.clone());
+        .with_prefixes(prefixes.clone())
+        // Recovery needs `abort_statement` to be a true rollback: the parser
+        // emits during descent, so a bad statement has usually written part of
+        // itself by the time it is rejected. Without buffering, "skipped"
+        // would still leave fragments in the output.
+        .with_statement_buffering(args.continue_on_error);
 
     let destination::Destination { out, clock } = destination::open(args.output, target)?;
     let writer = AnyWriter::new(target, out, &config, &prefixes)?;
 
-    let run = rdf::parse_into(&loaded.text, common.base.as_deref(), writer, &mut timings);
+    // Parallel where it is byte-identical to serial, serial otherwise. The
+    // decision is reported under --profile rather than left implicit, because
+    // "why is this not using my cores" is otherwise unanswerable from outside.
+    //
+    // Recovery is serial: resync needs to see the document as one sequence of
+    // statements, and a chunk boundary is not a place a skipped statement can
+    // be reasoned about.
+    let plan = if args.continue_on_error {
+        ParallelPlan::serial("--continue-on-error resyncs over the whole document")
+    } else {
+        ParallelPlan::decide(
+            args.parallelism,
+            target,
+            loaded.text.len(),
+            config.blank_labels,
+        )
+    };
+    if args.continue_on_error {
+        return run_recovering(
+            common, args, &loaded, writer, &clock, target, quiet, timings,
+        );
+    }
+
+    // Chunk before committing to the parallel path. A mid-file directive makes
+    // a document unchunkable — only the first chunk would carry the
+    // redefinition — but the document itself is perfectly legal Turtle and
+    // must still convert, so this falls back to serial rather than refusing.
+    // Plan §1.4 specifies the fallback; aborting was the wrong reading.
+    let mut plan = plan;
+    let chunked = plan.workers.and_then(|workers| {
+        match fluree_graph_turtle::splitter::chunk_in_memory(
+            &loaded.text,
+            ParallelConfig::for_input(workers, loaded.text.len()).chunk_bytes,
+        ) {
+            Ok(split) => Some((workers, split)),
+            Err(e) => {
+                plan = ParallelPlan::serial(match e {
+                    fluree_graph_turtle::splitter::SplitError::PrefixAfterData { .. } => {
+                        "a directive after the header makes the input unchunkable"
+                    }
+                    _ => "the input could not be split into chunks",
+                });
+                if !quiet {
+                    eprintln!(
+                        "{} {} — converting serially",
+                        "note:".cyan().bold(),
+                        plan.reason
+                    );
+                }
+                None
+            }
+        }
+    });
+
+    if let Some((workers, (prefix_block, ranges))) = chunked {
+        // Workers write their own bytes; see `parallel` for the label scheme
+        // that makes that sound without a shared relabeller.
+        return run_parallel(
+            common,
+            args,
+            &loaded,
+            writer,
+            &clock,
+            target,
+            &config,
+            workers,
+            quiet,
+            timings,
+            &ranges,
+            &prefix_block,
+        );
+    }
+
+    let run = rdf::parse_into(
+        &loaded.text,
+        loaded.resolved.syntax,
+        common.base.as_deref(),
+        writer,
+        rdf::verb_options(common.nocheck),
+        &mut timings,
+    );
     let stats = run.sink.stats();
 
     // Flush before reporting anything, and through a handle that can return
@@ -145,7 +236,16 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     }
 
     if let Some(format) = common.profile {
-        emit_profile(common, &loaded, &run.outcome, &timings, wall, format)?;
+        emit_profile(
+            common,
+            &loaded,
+            &run.outcome,
+            &timings,
+            wall,
+            format,
+            plan,
+            None,
+        )?;
     } else if common.time {
         rdf::count::print_timing(wall, stats.statements, loaded.text.len() as u64);
     }
@@ -166,6 +266,370 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
         }
     }
     Ok(())
+}
+
+/// The parallel path: workers write bytes, the driver concatenates in order.
+#[allow(clippy::too_many_arguments)]
+fn run_parallel(
+    common: &RdfCommonArgs,
+    args: &ConvertArgs<'_>,
+    loaded: &rdf::Loaded,
+    writer: AnyWriter<destination::Out>,
+    clock: &crate::rdf::writer::WriteClock,
+    target: RdfSyntax,
+    writer_config: &WriterConfig,
+    workers: usize,
+    quiet: bool,
+    mut timings: PhaseTimings,
+    ranges: &[std::ops::Range<usize>],
+    prefix_block: &str,
+) -> CliResult<()> {
+    // The destination was opened through a writer that the parallel path does
+    // not use — the workers each build their own. Take the sink back out.
+    let mut out = writer.into_inner();
+
+    let config = ParallelConfig {
+        workers,
+        ..ParallelConfig::for_input(workers, loaded.text.len())
+    };
+
+    timings.enter(Phase::Parse);
+    let produced = crate::rdf::parallel::convert_parallel_bytes(
+        &loaded.text,
+        common.base.as_deref(),
+        &mut out,
+        target,
+        writer_config,
+        config,
+        ranges,
+        prefix_block,
+    );
+    timings.finish();
+
+    let outcome = match produced {
+        Ok(o) => o,
+        // A closed downstream is how `| head -5` ends. The failure carries its
+        // `io::ErrorKind` precisely so this check does not have to read a
+        // localized message.
+        Err(crate::rdf::parallel::ParallelFailure::Write(e))
+            if e.kind() == std::io::ErrorKind::BrokenPipe =>
+        {
+            return Ok(())
+        }
+        Err(e) => return Err(CliError::Usage(e.to_string())),
+    };
+
+    timings.enter(Phase::Write);
+    let flushed = out.flush();
+    timings.finish();
+
+    let wall = timings.wall();
+    timings.set(
+        Phase::Write,
+        clock.elapsed() + timings.elapsed(Phase::Write),
+    );
+    timings.set(
+        Phase::Workers,
+        Duration::from_nanos(outcome.worker_parse_nanos as u64),
+    );
+    timings.set(
+        Phase::Reassembly,
+        Duration::from_nanos(outcome.reassembly_wait_nanos as u64),
+    );
+
+    if flushed
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+    {
+        return Ok(());
+    }
+    flushed.map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
+
+    if let Some(err) = &outcome.error {
+        let d = diagnostic::from_turtle_error(err, &loaded.text);
+        eprintln!(
+            "{} {}: {}",
+            "error:".red().bold(),
+            loaded.input.display(),
+            d.message
+        );
+        eprintln!(
+            "  wrote {} statement(s) before the document stopped parsing — the output is a \
+             prefix of the conversion, not the whole of it",
+            outcome.statements
+        );
+        return Err(exit_document_invalid());
+    }
+
+    if let Some(format) = common.profile {
+        let empty = rdf::ParseOutcome {
+            counts: fluree_graph_ir::SinkCounts {
+                triples: outcome.statements,
+                ..fluree_graph_ir::SinkCounts::default()
+            },
+            sink: unresolved_sink_timing(),
+            error: None,
+        };
+        emit_profile(
+            common,
+            loaded,
+            &empty,
+            &timings,
+            wall,
+            format,
+            ParallelPlan {
+                workers: Some(workers),
+                reason: "parallel",
+            },
+            None,
+        )?;
+    } else if common.time {
+        rdf::count::print_timing(wall, outcome.statements, loaded.text.len() as u64);
+    }
+
+    if !quiet && common.profile != Some(crate::rdf::profile::ProfileFormat::Json) {
+        if let Some(path) = args.output {
+            eprintln!(
+                "{} {} statements → {} ({target}, {workers} workers, {} chunks)",
+                "✓".green(),
+                outcome.statements,
+                path.display(),
+                outcome.chunks,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The parallel path has no single sink to sample, so it reports no sink
+/// estimate rather than a fabricated one — each worker has its own writer and
+/// there is no one instrument that saw them all.
+fn unresolved_sink_timing() -> fluree_graph_ir::SinkTiming {
+    fluree_graph_ir::SinkTiming {
+        body: None,
+        finish: Duration::ZERO,
+        artifact: Duration::ZERO,
+        calls: 0,
+        sampled_calls: 0,
+        sampled_statements: 0,
+        clock_reads: 0,
+        clock_pair: Duration::ZERO,
+        relative_std_error: None,
+    }
+}
+
+/// The `--continue-on-error` path: parse with resync, report every skip, and
+/// exit 1 if anything was skipped.
+///
+/// Serial by construction and separate from the main driver because almost
+/// every step differs — the parse loop, the exit code, and what "success"
+/// means. Folding it into `run` with three `if recovering` branches would make
+/// both harder to read than either is apart.
+#[allow(clippy::too_many_arguments)]
+fn run_recovering(
+    common: &RdfCommonArgs,
+    args: &ConvertArgs<'_>,
+    loaded: &rdf::Loaded,
+    writer: AnyWriter<destination::Out>,
+    clock: &crate::rdf::writer::WriteClock,
+    target: RdfSyntax,
+    quiet: bool,
+    mut timings: PhaseTimings,
+) -> CliResult<()> {
+    let mut sink = crate::rdf::recover::PrefixRecorder::new(writer);
+
+    timings.enter(Phase::Parse);
+    let recovery =
+        crate::rdf::recover::parse_recovering(&loaded.text, common.base.as_deref(), &mut sink);
+    timings.finish();
+    let recovery = recovery?;
+
+    let mut writer = sink.into_inner();
+    let finished = GraphSink::finish(&mut writer);
+    let stats = writer.stats();
+    let mut out = writer.into_inner();
+
+    timings.enter(Phase::Write);
+    let flushed = out.flush();
+    timings.finish();
+
+    let wall = timings.wall();
+    timings.set(
+        Phase::Write,
+        clock.elapsed() + timings.elapsed(Phase::Write),
+    );
+
+    if flushed
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+        || finished
+            .as_ref()
+            .err()
+            .is_some_and(SinkError::is_broken_pipe)
+    {
+        return Ok(());
+    }
+    flushed.map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
+    finished.map_err(|e| CliError::Usage(format!("sink error: {e}")))?;
+
+    // Every skip, in document order, before the summary — unless stderr is
+    // carrying a JSON document, in which case the count travels inside it.
+    let human_stderr = common.profile != Some(crate::rdf::profile::ProfileFormat::Json);
+    for d in recovery.skipped.iter().filter(|_| human_stderr) {
+        let where_ = match (d.line, d.column) {
+            (Some(line), Some(column)) => format!("{}:{line}:{column}", loaded.input.display()),
+            _ => loaded.input.display(),
+        };
+        eprintln!("{} {where_}: {}", "skipped:".yellow().bold(), d.message);
+    }
+
+    // Recovery is exactly when profiling matters — resync re-parses from each
+    // error, so the cost of a dirty document is the thing a user most wants
+    // attributed. Emitting the diagnostics instead of the profile silently
+    // dropped a flag the user passed.
+    if let Some(format) = common.profile {
+        let reported = rdf::ParseOutcome {
+            counts: fluree_graph_ir::SinkCounts {
+                triples: stats.statements,
+                ..fluree_graph_ir::SinkCounts::default()
+            },
+            sink: unresolved_sink_timing(),
+            error: None,
+        };
+        emit_profile(
+            common,
+            loaded,
+            &reported,
+            &timings,
+            wall,
+            format,
+            ParallelPlan::serial("--continue-on-error resyncs over the whole document"),
+            Some(recovery.skipped.len() as u64),
+        )?;
+    } else if common.time {
+        rdf::count::print_timing(wall, stats.statements, loaded.text.len() as u64);
+    }
+
+    if recovery.is_clean() {
+        if !quiet {
+            if let Some(path) = args.output {
+                eprintln!(
+                    "{} {} statements → {} ({target})",
+                    "✓".green(),
+                    stats.statements,
+                    path.display(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // riot semantics: skipping is not success. The summary goes to stderr even
+    // under --quiet, because the one thing a script must not do is read a
+    // partial conversion as a whole one.
+    if common.profile == Some(crate::rdf::profile::ProfileFormat::Json) {
+        // stderr is carrying a JSON document; the skip count is in the exit
+        // code and the diagnostics already went out before it.
+        return Err(exit_document_invalid());
+    }
+    eprintln!(
+        "{} {} statement(s) skipped, {} written → {}",
+        "warning:".yellow().bold(),
+        recovery.skipped.len(),
+        stats.statements,
+        args.output
+            .map_or_else(|| "stdout".to_string(), |p| p.display().to_string()),
+    );
+    Err(exit_document_invalid())
+}
+
+/// Whether this conversion runs across threads, and why not when it does not.
+///
+/// Reported rather than silent: a user who passed `--parallelism 8` and got
+/// one core has no way to find out why from the outside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParallelPlan {
+    /// Worker count, or `None` for the serial path.
+    pub workers: Option<usize>,
+    /// Why the serial path was chosen, for the profile report.
+    pub reason: &'static str,
+}
+
+impl ParallelPlan {
+    /// Below this, threads cost more than they save — the whole document
+    /// parses in less time than it takes to start a pool.
+    const MIN_PARALLEL_BYTES: usize = 4 * 1024 * 1024;
+
+    /// The serial path, for a named reason.
+    pub fn serial(reason: &'static str) -> Self {
+        Self {
+            workers: None,
+            reason,
+        }
+    }
+
+    /// Decide, from the flag, the output syntax, the input size and the label
+    /// policy.
+    ///
+    /// The policy is a parameter rather than a check at the call site so a
+    /// second call site cannot be added that forgets it.
+    pub fn decide(
+        parallelism: usize,
+        target: RdfSyntax,
+        input_len: usize,
+        labels: BlankNodeLabels,
+    ) -> Self {
+        let requested = match parallelism {
+            // 0 is the global flag's "auto".
+            0 => std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            n => n,
+        };
+        if requested <= 1 {
+            return Self {
+                workers: None,
+                reason: "one worker requested",
+            };
+        }
+        // Ahead of the capability and size checks, because this one is about
+        // correctness rather than benefit. The parallel path renames every
+        // blank node into the coordination-free scheme so workers need no
+        // shared relabeller, which is the opposite of preserving labels: the
+        // user's `_:named` came out as `_:unamed`, byte-identical to relabel
+        // and silently ignoring the flag. Worse, the writer's refusal to
+        // preserve a label inside its own reserved namespace disappeared too,
+        // because the renamed label no longer collides — a run that must exit
+        // 2 exited 0 with labels the user did not write.
+        //
+        // Serial delivers the fidelity the flag asks for, so this downgrades
+        // rather than refusing, exactly as a mid-file directive does. The cost
+        // is speed, not correctness.
+        if labels == BlankNodeLabels::Preserve {
+            return Self {
+                workers: None,
+                reason: "--bnode-policy preserve requires serial label fidelity",
+            };
+        }
+        if !crate::rdf::parallel::can_run_parallel(target) {
+            return Self {
+                workers: None,
+                // Not a limitation of the writer: splitting the input changes
+                // the bytes for a syntax that folds across statements.
+                reason: "output syntax is not line-based, so chunking would change the bytes",
+            };
+        }
+        if input_len < Self::MIN_PARALLEL_BYTES {
+            return Self {
+                workers: None,
+                reason: "input is smaller than the parallel threshold",
+            };
+        }
+        Self {
+            workers: Some(requested),
+            reason: "parallel",
+        }
+    }
 }
 
 /// Resolve the output syntax: `--to`, then the output file's extension, then
@@ -399,6 +863,7 @@ fn report_parse_failure(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_profile(
     common: &RdfCommonArgs,
     loaded: &rdf::Loaded,
@@ -406,6 +871,8 @@ fn emit_profile(
     timings: &PhaseTimings,
     wall: Duration,
     format: crate::rdf::profile::ProfileFormat,
+    plan: ParallelPlan,
+    skipped: Option<u64>,
 ) -> CliResult<()> {
     let ctx = RunContext {
         verb: "convert",
@@ -416,6 +883,10 @@ fn emit_profile(
         bytes_on_wire: loaded.bytes_on_wire,
         bytes_decoded: loaded.text.len() as u64,
         sha256: (!common.no_hash).then(|| crate::rdf::profile::sha256_hex(&loaded.text)),
+        validate: !common.nocheck,
+        skipped_statements: skipped,
+        threads_used: plan.workers.unwrap_or(1),
+        parallel_reason: plan.reason,
     };
     ProfileReport::build(&ctx, timings, wall, outcome.counts, outcome.sink).emit(format)?;
     Ok(())
@@ -494,6 +965,23 @@ mod tests {
         assert!(err.to_string().contains("not valid JSON"), "{err}");
         let err = load_prefixes(Some("/nonexistent/ctx.json")).unwrap_err();
         assert!(err.to_string().contains("cannot read prefixes"), "{err}");
+    }
+
+    #[test]
+    fn preserving_labels_downgrades_to_serial_whatever_else_allows_parallel() {
+        // Everything else says parallel: eight workers, a line-based syntax, an
+        // input well over the threshold.
+        let big = 64 * 1024 * 1024;
+        let relabel = ParallelPlan::decide(8, RdfSyntax::NTriples, big, BlankNodeLabels::Relabel);
+        assert_eq!(relabel.workers, Some(8));
+
+        let preserve = ParallelPlan::decide(8, RdfSyntax::NTriples, big, BlankNodeLabels::Preserve);
+        assert_eq!(preserve.workers, None);
+        assert!(
+            preserve.reason.contains("preserve"),
+            "the profile has to say which flag cost the parallelism: {}",
+            preserve.reason
+        );
     }
 
     #[test]

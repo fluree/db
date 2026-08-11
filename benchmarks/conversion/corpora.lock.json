@@ -1,0 +1,110 @@
+{
+  "$comment": [
+    "Corpus set per bench-strategy §6b F2, which REPLACED the §3 set after the",
+    "adversarial methodology review. Two of the original choices were unusable:",
+    "",
+    "  - RiverBench flat-triples ships N-Triples ONLY. Its Turtle exists only as",
+    "    fragment tarballs, so producing a Turtle corpus would have meant converting",
+    "    NT with our own writer and then benchmarking everyone on input shaped by the",
+    "    thing under test. Circular. Retained as an NT-only pole instead.",
+    "  - sp2b is dead (generator 404) and its rationale was void anyway: it existed",
+    "    for comparability with serd's published numbers, and serd publishes none —",
+    "    only committed TSVs from its own harness.",
+    "",
+    "NOTHING here is vendored. Corpora are fetched and hash-verified. dbpedia-live is",
+    "CC-BY-SA: derivatives must not be committed, which is a licensing constraint on",
+    "this repo, not a preference.",
+    "",
+    "sha256 is null for the live upstreams that republish in place (DBLP is a rolling",
+    "dump). The fetcher RECORDS the hash on first download into corpora.local.json and",
+    "hard-fails on any later mismatch — the point is that one matrix run is internally",
+    "consistent and re-runnable, not that dblp.org freezes for us. Self-archive the",
+    "recorded pair before any publishable run (§6b: the DOI'd DROPS archive is NT-only,",
+    "so it cannot supply the Turtle half)."
+  ],
+  "schema_version": 1,
+  "recorded": "2026-07-29",
+  "corpora": {
+    "dblp-pair": {
+      "role": "PRIMARY",
+      "why": "The only source that publishes a same-day NATIVE Turtle and native N-Triples dump of the same data. That pairing is what lets the Turtle and NT columns be read against each other instead of conflated — the field's central error (§3: raptor is fastest in one study and slowest in the other, same library, different syntax).",
+      "license": "CC0",
+      "vendorable": true,
+      "files": {
+        "ttl": {
+          "url": "https://dblp.org/rdf/dblp.ttl.gz",
+          "syntax": "turtle",
+          "sha256": null
+        },
+        "nt": {
+          "url": "https://dblp.org/rdf/dblp.nt.gz",
+          "syntax": "ntriples",
+          "sha256": null
+        }
+      },
+      "same_day_requirement": "Both files MUST be fetched in one run. A ttl from Monday against an nt from Tuesday is not a pair, and the difference would land in the matrix as a syntax effect.",
+      "anchor_note": "hardware-benchmarks.md's 1.50M tr/s figure is almost certainly N-Triples content under a .ttl extension (§6b F4: 128 bytes/line arithmetic; the DROPS archive is NT-only). Verify file bytes before using that number as a Turtle anchor; the genuine Turtle anchor comes from dblp.ttl.gz here."
+    },
+    "bsbm": {
+      "role": "SECONDARY",
+      "why": "Deterministic generator with NATIVE -s ttl and -s nt emitters, so the syntax pair is generated rather than converted. fluree-bench-support's gen::bsbm already wraps it.",
+      "license": "generator output, unrestricted",
+      "vendorable": false,
+      "generator": {
+        "scale_factors": [1000, 10000],
+        "invocations": {
+          "ttl": ["generate", "-s", "ttl", "-pc", "{scale}"],
+          "nt": ["generate", "-s", "nt", "-pc", "{scale}"]
+        }
+      },
+      "determinism_note": "Same scale factor + same generator version = same bytes. The fetcher records the output hash so a re-run that differs is caught rather than averaged in."
+    },
+    "riverbench-assist-iot-weather": {
+      "role": "REGULARITY POLE (most regular)",
+      "why": "One end of the regularity axis. The 2024 loading-speed paper shows a 9x spread between poles, so a single-corpus number says almost nothing.",
+      "license": "CC-BY-4.0",
+      "vendorable": false,
+      "files": {
+        "nt": {
+          "url": "https://w3id.org/riverbench/datasets/assist-iot-weather/1.0.0/files/flat_full.nt.gz",
+          "syntax": "ntriples",
+          "sha256": null
+        }
+      },
+      "turtle_column": "N/A",
+      "turtle_column_reason": "RiverBench flat-triples ships N-Triples only. Converting it to Turtle with our own writer would benchmark every tool on input shaped by the tool under test."
+    },
+    "riverbench-dbpedia-live": {
+      "role": "REGULARITY POLE (most irregular)",
+      "why": "The other end of the axis: heterogeneous predicates, long tail of datatypes, the shape that punishes a parser tuned on regular data.",
+      "license": "CC-BY-SA-3.0",
+      "vendorable": false,
+      "license_constraint": "SHARE-ALIKE. Do not commit this file or any derivative of it — not a normalized copy, not a sample, not a trimmed fixture. Fetch, measure, discard.",
+      "files": {
+        "nt": {
+          "url": "https://w3id.org/riverbench/datasets/dbpedia-live/1.0.0/files/flat_full.nt.gz",
+          "syntax": "ntriples",
+          "sha256": null
+        }
+      },
+      "turtle_column": "N/A",
+      "turtle_column_reason": "As assist-iot-weather: N-Triples only upstream."
+    },
+    "synthetic": {
+      "role": "DETERMINISTIC BASELINE",
+      "why": "Generated locally, byte-identical everywhere, no network. It is what makes the harness runnable in a sandbox and what every smoke test uses. It is NOT a benchmark corpus: it is dense, uniform, and prefix-friendly, which flatters a parser. Never quote a number from it as a competitor result.",
+      "license": "n/a (generated)",
+      "vendorable": false,
+      "generator": {
+        "script": "gen-synthetic.sh",
+        "shape": "g1a: dense subject-major Turtle, ~28.5 bytes/triple, one prefix header, no multiline literals",
+        "sizes": {
+          "smoke": 10000,
+          "small": 250000,
+          "medium": 5000000
+        }
+      },
+      "shape_caveat": "The g1a shape has a single prefix header and no multiline literals, which is exactly the shape the parallel splitter is restricted to. Measuring scaling on it and reporting the number without that caveat would be the kind of claim §4 exists to prevent."
+    }
+  }
+}

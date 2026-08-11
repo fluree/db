@@ -18,22 +18,27 @@
 //! below.
 //!
 //! Grouping comments name the root cause; the letters match the burn-down
-//! categories in the workstream report. There are SEVEN groups, not six —
-//! it is easy to count the Turtle causes and forget E, which is the largest
-//! single group in the whole register:
+//! categories in the workstream report:
 //!
-//! - **A1** repeated `;` as empty predicateObjectList items (Turtle)
-//! - **A2** PN_LOCAL interior dot runs (Turtle)
-//! - **A3** relative `@base` resolution (Turtle)
-//! - **B**  directive keyword case, both directions (Turtle)
-//! - **C**  IRI / language-tag validation — the H-8 workstream (Turtle + NT)
-//! - **D**  boolean keyword vs longhand IR duality (Turtle)
-//! - **E**  no strict N-Triples reader, so the NT suites run through the
-//!   Turtle parser and a negative test whose document is valid Turtle cannot
-//!   fail (N-Triples only)
+//! - **A1** repeated `;` as empty predicateObjectList items (Turtle) — closed
+//! - **A2** PN_LOCAL interior dot runs (Turtle) — closed
+//! - **A3** relative `@base` resolution (Turtle) — closed
+//! - **B**  directive keyword case, both directions (Turtle) — closed
+//! - **C**  IRI / language-tag validation — the H-8 workstream — closed for
+//!   Turtle, N-Triples and TriG
+//! - **D**  boolean keyword vs longhand IR duality (Turtle) — closed
+//! - **E**  no strict N-Triples reader, so the NT suites ran through the
+//!   Turtle parser and a negative test whose document is valid Turtle could
+//!   not fail — CLOSED by the strict line reader in
+//!   `fluree-graph-turtle::nquads`; N-Triples and N-Quads are both 100%
+//! - **F**  TriG eval blocked on an N-Quads reader — closed by that same
+//!   reader, with no TriG change
 //!
-//! E is a product gap rather than a parser bug, which is why it reads as a
-//! footnote and then turns out to account for most of the N-Triples column.
+//! Two workstreams closed the last causes from opposite directions: the
+//! strict line reader (M2) closed E and F, and term validation (H-8) closed C.
+//! Every cause is now closed and every register is EMPTY — all four RDF 1.1
+//! suites score 100%. The both-way policing is what keeps that honest: a
+//! single regression re-populates a register or fails the suite.
 //!
 //! Baseline: rdf-tests submodule @ efccbc6b8, captured 2026-07-28 against the
 //! `feat/graphsink-protocol` base (#1552).
@@ -48,10 +53,18 @@
 pub const NEGATIVE_SYNTAX_BLIND_SPOT: &str =
     "negative-syntax tests do not check WHY the parser rejected the document";
 
-/// RDF 1.1 Turtle — 4 known failures out of 313, all cause C.
+/// RDF 1.1 Turtle — EMPTY. 313 of 313, in conformant mode.
 ///
-/// Causes A1, A2, A3, B and D were fixed in the burn-down; only the H-8
-/// term-validation work remains.
+/// Every cause the burn-down opened is closed: A1, A2, A3, B and D during the
+/// burn-down itself, and C — term validation — with the H-8 workstream. The
+/// register having nothing left in it is the claim; `check_testsuite` polices
+/// it in both directions, so a single Turtle regression re-populates this list
+/// or fails the suite.
+///
+/// Read it with the caveat above attached: 100% here is 100% of the RDF 1.1
+/// Turtle suite in `ParserOptions::conformant` mode. Ingest defaults score
+/// 89.8% BY DESIGN (indexed list items, canonicalized numerics), and the RDF
+/// 1.2 suites are informational and far lower.
 pub const RDF11_TURTLE: &[&str] = &[
     // A1 (repeated `;` as empty predicateObjectList items) — FIXED, entries
     // removed with the fix.
@@ -59,67 +72,48 @@ pub const RDF11_TURTLE: &[&str] = &[
     // A3 (relative @base resolution) — FIXED, entry removed with the fix.
     // B (directive keyword case, both directions) — FIXED, entries removed
     // with the fix.
+    // C (IRI / language-tag validation) — FIXED by H-8, entries removed with
+    // the fix. The parser now checks that a resolved IRI is an IRI after
+    // `\uXXXX` expansion and that a language tag matches the LANGTAG
+    // production, under `ParserOptions::validate`.
     // D (boolean keyword vs longhand IR duality) — FIXED, entries removed
     // with the fix.
-    // ---------------------------------------------------------------------
-    // C. TERM VALIDATION NOT IMPLEMENTED — the H-8 workstream ("IRI
-    // validation ships in the light crates"), not yet landed. The parser
-    // accepts IRIs that are ill-formed after `\uXXXX` expansion (a space,
-    // a `<`, a `>`) and language tags that are not `[a-zA-Z]+('-'...)`.
-    // These are precisely the `TestTurtleNegativeEval` class: the document
-    // lexes, but the terms it denotes are not RDF terms. Expect this group
-    // to clear wholesale when H-8 lands, together with the N-Triples
-    // language-tag entry. (4)
-    // ---------------------------------------------------------------------
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-01",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-02",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-03",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-bad-lang-01",
 ];
 
-/// RDF 1.1 N-Triples — 15 known failures out of 70.
-///
-/// Every entry is a NEGATIVE syntax test, and 14 of the 15 share one cause:
-/// there is no N-Triples parser. N-Triples is a syntactic subset of Turtle, so
-/// the suite runs through the Turtle parser; positive tests are therefore
-/// meaningful, but a negative test whose document is *valid Turtle* cannot
-/// fail. Read the 78.6% with that attached.
+/// RDF 1.1 N-Triples — CLEAN, 70/70.
 pub const RDF11_NTRIPLES: &[&str] = &[
-    // ---------------------------------------------------------------------
-    // E. HARNESS/PRODUCT GAP — no strict N-Triples mode. Each document below
-    // is invalid N-Triples and valid Turtle, so the Turtle parser accepts it
-    // as specified. Closing these needs an N-Triples reader (or a strict
-    // profile on the shared one) that refuses: directives, `,`/`;` lists,
-    // relative IRIs (N-Triples has no base), single/triple-quoted strings,
-    // and bare numeric literals. That reader is M1 scope — `fluree rdf
-    // convert` must read N-Triples natively for the parallel path anyway.
-    // Until then these are unenforceable, not broken. (14)
-    // ---------------------------------------------------------------------
-    // relative IRIs (subject, predicate, object, datatype)
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-06",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-07",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-08",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-uri-09",
-    // Turtle directives
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-prefix-01",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-base-01",
-    // object list (`,`)
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-struct-01",
-    // Turtle-only literal spellings: decimal, double, ''' and """ strings
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-02",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-03",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-04",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-string-05",
-    // bare integers
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-num-01",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-num-02",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-num-03",
-    // ---------------------------------------------------------------------
-    // C. TERM VALIDATION NOT IMPLEMENTED — the N-Triples half of the H-8
-    // language-tag gap; `"string"@1` is invalid in both grammars, so unlike
-    // the entries above this one is a genuine miss that a strict N-Triples
-    // reader would NOT fix. Clears with its Turtle twin
-    // (`turtle-syntax-bad-lang-01`). (1)
-    // ---------------------------------------------------------------------
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl#nt-syntax-bad-lang-01",
+    // EMPTY, and it took both workstreams to get here.
+    //
+    // Cause E is closed: the suites now run through the strict line reader in
+    // `fluree-graph-turtle::nquads`, not the Turtle parser, so every negative
+    // test whose document is valid Turtle and invalid N-Triples now fails as
+    // it should — directives, `,`/`;` lists, relative IRIs, single/triple
+    // quoted strings and bare numerics, 14 entries in all.
+    //
+    // Cause C is closed too. `nt-syntax-bad-lang-01` (`"string"@1`) was a
+    // genuine miss rather than a consequence of reading N-Triples with the
+    // Turtle parser, and a strict N-Triples reader would NOT have fixed it: it
+    // needed the H-8 language-tag predicate, and cleared with its Turtle twin
+    // `turtle-syntax-bad-lang-01`. Both readers call the same predicates.
 ];
+
+/// RDF 1.1 TriG — CLEAN, 356/356.
+pub const RDF11_TRIG: &[&str] = &[
+    // EMPTY, and it closed the way the Turtle register did — from two
+    // directions that had to meet.
+    //
+    // Cause F (eval blocked on an N-Quads reader) went first: the strict line
+    // reader landed and the whole eval family cleared with no TriG change.
+    // That left four `TestTrigNegativeEval` entries which were never eval
+    // failures at all — three ill-formed IRIs behind `\uXXXX` escapes and one
+    // bad language tag, the exact four-test shape the Turtle suite had.
+    //
+    // Cause C then closed them: term validation reaches TriG because the TriG
+    // parser is the Turtle grammar with a dialect flag, so the same
+    // `ParserOptions::validate` scan runs over graph-block content. Nothing
+    // TriG-specific was needed, which is the argument for one grammar with a
+    // dialect knob rather than a second parser.
+];
+
+/// RDF 1.1 N-Quads — CLEAN, 87/87.
+pub const RDF11_NQUADS: &[&str] = &[];

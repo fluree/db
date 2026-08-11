@@ -258,3 +258,108 @@ mod tests {
         }
     }
 }
+
+/// The `ECHAR` escape table, shared by every RDF text grammar.
+///
+/// `ECHAR ::= '\\' [tbnrf"'\\]` is written identically in Turtle, TriG,
+/// N-Triples, N-Quads and SPARQL. It lives here for the same reason the
+/// character-class predicates do: it is one grammar production, and a reader
+/// that transcribes its own copy will silently diverge the first time anyone
+/// corrects a row.
+///
+/// Returns `None` for a character that is not a valid escape — callers decide
+/// whether that is an error (it is, in every current grammar) and what to say.
+/// `\u` / `\U` are deliberately NOT here: they carry a payload, so they are
+/// scanning, not a lookup — see [`unicode_escape_value`].
+pub fn simple_escape(c: char) -> Option<char> {
+    match c {
+        't' => Some('\t'),
+        'b' => Some('\u{0008}'),
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        'f' => Some('\u{000C}'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        '\\' => Some('\\'),
+        _ => None,
+    }
+}
+
+/// Decode the hex payload of a `\uXXXX` / `\UXXXXXXXX` escape.
+///
+/// `None` when the payload is not PURE ASCII hex, or names a surrogate /
+/// out-of-range code point, which is not a Unicode scalar value and so cannot
+/// be a `char`.
+///
+/// The pure-hex check is not redundant with `from_str_radix`, which accepts a
+/// leading `+` — so `\u+041` would decode as `A`. The Turtle lexer never hit
+/// that because it gates on `is_hex_digit` while scanning, but a caller that
+/// slices first and converts second would inherit it. Gating HERE is what
+/// makes the two readers agree, which is the whole point of sharing this.
+///
+/// # Callers that slice raw bytes
+///
+/// `hex` is a `&str`, so this function cannot be handed a partial UTF-8
+/// sequence — but a caller that slices the RAW BYTES of a document to build it
+/// can panic before ever reaching here. Both current readers slice a `&str` at
+/// positions their own scanners produced, so the panic class is structurally
+/// out of reach for them; a third reader working over `&[u8]` would have to
+/// bound its slice itself. Stated because the guarantee lives at the call
+/// site, not in this signature.
+pub fn unicode_escape_value(hex: &str) -> Option<char> {
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::*;
+
+    #[test]
+    fn the_echar_table_is_the_grammar_row_for_row() {
+        assert_eq!(simple_escape('t'), Some('\t'));
+        assert_eq!(simple_escape('b'), Some('\u{0008}'));
+        assert_eq!(simple_escape('n'), Some('\n'));
+        assert_eq!(simple_escape('r'), Some('\r'));
+        assert_eq!(simple_escape('f'), Some('\u{000C}'));
+        assert_eq!(simple_escape('"'), Some('"'));
+        assert_eq!(simple_escape('\''), Some('\''));
+        assert_eq!(simple_escape('\\'), Some('\\'));
+    }
+
+    /// Anything outside the table is not an escape — notably `\a`, which some
+    /// C-family grammars have and RDF does not.
+    #[test]
+    fn characters_outside_the_table_are_not_escapes() {
+        for c in ['a', 'v', '0', 'x', 'u', 'U', ' '] {
+            assert_eq!(simple_escape(c), None, "{c:?} must not be an escape");
+        }
+    }
+
+    #[test]
+    fn unicode_escape_values_reject_non_scalars() {
+        assert_eq!(unicode_escape_value("0041"), Some('A'));
+        assert_eq!(unicode_escape_value("00000041"), Some('A'));
+        // A lone surrogate is not a Unicode scalar value.
+        assert_eq!(unicode_escape_value("D800"), None);
+        assert_eq!(unicode_escape_value("110000"), None);
+        assert_eq!(unicode_escape_value("zzzz"), None);
+    }
+
+    /// `from_str_radix` accepts a leading sign; a hex ESCAPE payload does not.
+    /// Without this gate `\\u+041` decodes as `A` — the one escape-handling
+    /// difference that survived unifying the table.
+    #[test]
+    fn a_signed_or_spaced_payload_is_not_hex() {
+        for payload in ["+041", "-041", " 041", "041 ", "0x41", "+0041"] {
+            assert_eq!(
+                unicode_escape_value(payload),
+                None,
+                "{payload:?} must not decode"
+            );
+        }
+        assert_eq!(unicode_escape_value("0041"), Some('A'));
+    }
+}

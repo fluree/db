@@ -2893,6 +2893,19 @@ pub struct RdfCommonArgs {
     /// over the input; leave it out when the timing is what matters.
     #[arg(long)]
     pub no_hash: bool,
+
+    /// Skip term validation: do not check that IRIs are IRIs after escape
+    /// expansion and base resolution, or that language tags are well-formed.
+    ///
+    /// Faster, and unsound. Grammar errors are still caught — this only turns
+    /// off the checks that decide whether the terms a well-formed document
+    /// *denotes* are RDF terms, so `<http://ex/ >` is accepted and
+    /// written back out as an IRI containing a space, which is not one.
+    /// Reach for it when you already trust the input and are measuring, not
+    /// when you are converting something you were sent. Benchmark runs that
+    /// use it are labelled in `--profile` output for exactly that reason.
+    #[arg(long)]
+    pub nocheck: bool,
 }
 
 /// How blank-node labels reach converted output.
@@ -2933,9 +2946,16 @@ pub enum RdfAction {
         /// How blank-node labels reach the output. `relabel` (default) mints
         /// fresh labels, as riot and Oxigraph do; `preserve` emits the
         /// input's. Fluree's own `_:fdb-` stable identifiers pass through
-        /// either way.
+        /// either way. `preserve` converts serially, because the parallel
+        /// path's labelling is what makes workers independent.
         #[arg(long, value_enum, default_value_t = BnodePolicyArg::Relabel)]
         bnode_policy: BnodePolicyArg,
+
+        /// Skip statements that do not parse instead of stopping at the
+        /// first one. Every skip is reported, and the run exits 1 so a
+        /// partial conversion cannot be mistaken for a clean one.
+        #[arg(long)]
+        continue_on_error: bool,
 
         /// Prefixes for compaction, as inline JSON or a path to a JSON file.
         /// A JSON-LD `@context` document works unchanged. Turtle and TriG
