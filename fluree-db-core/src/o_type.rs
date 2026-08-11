@@ -215,7 +215,34 @@ impl OType {
     /// the `p_id` that scopes the handle.
     #[inline]
     pub const fn o_key_is_globally_identifying(self) -> bool {
-        self.0 != Self::NUM_BIG_OVERFLOW.0
+        let mut i = 0;
+        while i < Self::NOT_GLOBALLY_IDENTIFYING.len() {
+            if self.0 == Self::NOT_GLOBALLY_IDENTIFYING[i].0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Every o_type whose `o_key` is scoped to something narrower than the
+    /// graph. Single source of truth for [`Self::o_key_is_globally_identifying`]
+    /// and [`Self::range_holds_non_globally_identifying`], so the point test and
+    /// the range test cannot drift apart.
+    const NOT_GLOBALLY_IDENTIFYING: [Self; 1] = [Self::NUM_BIG_OVERFLOW];
+
+    /// Whether the inclusive o_type range `[lo, hi]` can hold a row whose
+    /// `o_key` is not a graph-wide identity.
+    ///
+    /// Index keys lead with a big-endian `o_type`, so a leaflet's
+    /// `[first_key, last_key]` pair bounds every o_type it contains. This
+    /// answers the range form of [`Self::o_key_is_globally_identifying`]
+    /// without a caller having to know which o_types are the exceptions.
+    #[inline]
+    pub fn range_holds_non_globally_identifying(lo: Self, hi: Self) -> bool {
+        Self::NOT_GLOBALLY_IDENTIFYING
+            .iter()
+            .any(|t| lo.0 <= t.0 && t.0 <= hi.0)
     }
 
     // ── Constructors ───────────────────────────────────────────────────
@@ -676,6 +703,30 @@ mod tests {
             let ot = OType::from_u16(val);
             assert_eq!(ot.as_u16(), val);
         }
+    }
+
+    /// The point predicate and the range form share one exceptions list; this
+    /// pins that they agree, so a new non-identifying o_type added to the list
+    /// is answered by both.
+    #[test]
+    fn globally_identifying_point_and_range_agree() {
+        for &t in &OType::NOT_GLOBALLY_IDENTIFYING {
+            assert!(!t.o_key_is_globally_identifying(), "{t:?}");
+            assert!(OType::range_holds_non_globally_identifying(t, t));
+        }
+        // A range that straddles an exception reports it; one that stops short
+        // does not.
+        let ex = OType::NUM_BIG_OVERFLOW;
+        let below = OType::from_u16(ex.as_u16() - 1);
+        let above = OType::from_u16(ex.as_u16() + 1);
+        assert!(OType::range_holds_non_globally_identifying(below, above));
+        assert!(!OType::range_holds_non_globally_identifying(
+            OType::XSD_STRING,
+            below
+        ));
+        assert!(!OType::range_holds_non_globally_identifying(above, above));
+        assert!(below.o_key_is_globally_identifying());
+        assert!(above.o_key_is_globally_identifying());
     }
 
     #[test]

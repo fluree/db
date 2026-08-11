@@ -1301,22 +1301,28 @@ fn count_distinct_lead_groups_inner(
 ///
 /// OPST keys lead with a big-endian `o_type`, so the directory entry's
 /// `[first_key[0..2], last_key[0..2]]` interval bounds every `o_type` in the
-/// leaflet without opening a column. Leaflets are segmented type-homogeneously
-/// today (`leaflet.rs` asserts it), which makes the interval a point — the
-/// interval form costs nothing extra and stays correct if that ever changes.
+/// leaflet without opening a column. Which o_types are the exceptions is the
+/// `OType` vocabulary's business, not this walk's — both branches below defer
+/// to it, so a new non-identifying o_type needs no edit here.
+///
+/// Leaflets are segmented type-homogeneously today (`leaflet.rs` asserts it),
+/// so the point branch is the live one; the range branch costs nothing extra
+/// and stays correct if that ever changes.
 fn leaflet_may_hold_non_identifying_o_key(
     entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
 ) -> bool {
-    let o_type_at = |k: &[u8]| -> u16 {
-        u16::from_be_bytes([
+    let o_type_at = |k: &[u8]| -> OType {
+        OType::from_u16(u16::from_be_bytes([
             k.first().copied().unwrap_or(0),
             k.get(1).copied().unwrap_or(0),
-        ])
+        ]))
     };
     let lo = o_type_at(&entry.first_key);
     let hi = o_type_at(&entry.last_key);
-    let non_identifying = fluree_db_core::OType::NUM_BIG_OVERFLOW.as_u16();
-    lo <= non_identifying && non_identifying <= hi
+    if lo == hi {
+        return !lo.o_key_is_globally_identifying();
+    }
+    OType::range_holds_non_globally_identifying(lo, hi)
 }
 
 /// Per-chunk partial for the per-predicate distinct-object count: the same
