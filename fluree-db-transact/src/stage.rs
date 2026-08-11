@@ -2766,8 +2766,14 @@ async fn generate_upsert_deletions(
     // system RAM when indexing lags — which is why it runs at most once per
     // graph, and only on demand. It is authoritative in Sid space, needing
     // no dictionary translation.
+    // A snapshot with no range provider at all has no base index (genesis, or
+    // nothing indexed yet), so novelty is the only place a subject can exist
+    // and the presence check below is authoritative on its own.
+    let base_index_absent = ledger.snapshot.range_provider.is_none();
+    let can_decide_absence = binary_store.is_some() || base_index_absent;
+
     let mut per_g_subjects: HashMap<u16, HashSet<&Sid>> = HashMap::new();
-    if binary_store.is_some() {
+    if can_decide_absence {
         for (subject, txn_g) in subject_groups.keys() {
             if let Some(Some(ledger_g)) = ledger_g_for_txn_g.get(txn_g) {
                 per_g_subjects.entry(*ledger_g).or_default().insert(subject);
@@ -2783,7 +2789,8 @@ async fn generate_upsert_deletions(
     // per-predicate query surfaces the real failure.
     let subject_in_base = |subject: &Sid| -> bool {
         let Some(store) = binary_store.as_deref() else {
-            return true;
+            // Nothing to consult: absent iff there is no base index at all.
+            return !base_index_absent;
         };
         if matches!(
             store.find_subject_id_by_parts(subject.namespace_code, &subject.name),
@@ -2791,14 +2798,31 @@ async fn generate_upsert_deletions(
         ) {
             return true;
         }
-        match ledger.snapshot.decode_sid(subject) {
+        // Resolve the subject IRI so the store's full-IRI fallback can run. The
+        // snapshot is consulted first; when it cannot decode the namespace code
+        // the store's own namespace table is tried. A code that NEITHER knows
+        // was minted after the base index was written, so the subject provably
+        // has no rows in it — report absent rather than failing open.
+        //
+        // Reporting "present" here instead defeats the skip for every IRI shape
+        // that mints a namespace per subject — `MostGranular` splits
+        // `urn:…:<id>:r:<sig>` at the last `:` — sending each one down a
+        // per-(subject, predicate) degraded scan. Novelty presence is still
+        // checked by the caller, so a subject that exists only in unindexed
+        // commits is never wrongly skipped.
+        match ledger
+            .snapshot
+            .decode_sid(subject)
+            .or_else(|| store.sid_to_iri(subject))
+        {
             Some(iri) => !matches!(store.find_subject_id(&iri), Ok(None)),
-            None => true,
+            None => false,
         }
     };
 
     let mut retractions = Vec::new();
     let mut skipped_subjects = 0usize;
+    let mut pattern_queries = 0usize;
 
     // Query existing values for each (subject, predicate, graph) tuple
     let mut query_vars = VarRegistry::new();
@@ -2831,7 +2855,7 @@ async fn generate_upsert_deletions(
         // Skip subjects with no persisted or novelty presence entirely. The
         // base dictionary is a point probe, so it is consulted first; the
         // per-graph novelty set is built on the first dictionary miss only.
-        if binary_store.is_some() && !subject_in_base(subject) {
+        if can_decide_absence && !subject_in_base(subject) {
             let present = novelty_present.entry(effective_g_id).or_insert_with(|| {
                 let mut set = HashSet::new();
                 if let Some(subjects) = per_g_subjects.get(&effective_g_id) {
@@ -2870,6 +2894,7 @@ async fn generate_upsert_deletions(
         });
 
         for predicate in predicates {
+            pattern_queries += 1;
             // Query: <subject> <predicate> ?o
             let pattern = TriplePattern::new(
                 Ref::Sid(subject.clone()),
@@ -2932,6 +2957,7 @@ async fn generate_upsert_deletions(
     tracing::debug!(
         subject_count = subject_groups.len(),
         skipped_subjects,
+        pattern_queries,
         "upsert deletion subject pre-check"
     );
 
