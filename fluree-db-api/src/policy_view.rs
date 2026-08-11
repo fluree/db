@@ -528,21 +528,26 @@ async fn resolve_ledger_config_raw(
 ///
 /// * `ledger` - The ledger state to wrap
 /// * `identity_iri` - IRI of the identity subject (will query `f:policyClass`)
-/// * `default_allow` - Whether to allow when no policies match (default: false)
+/// * `default_allow` - Tri-state, same as `GovernanceOptions::default_allow`.
+///   Pass `true`/`false` for an explicit request-level value, or `None` to leave
+///   it unset so the ledger's configured `f:defaultAllow` governs.
 ///
 /// # Example
 ///
 /// ```ignore
+/// // explicit fail-closed
 /// let wrapped = wrap_identity_policy_view(&ledger, "did:example:user", false).await?;
+/// // defer to the ledger's f:defaultAllow
+/// let wrapped = wrap_identity_policy_view(&ledger, "did:example:user", None).await?;
 /// ```
 pub async fn wrap_identity_policy_view<'a>(
     ledger: &'a LedgerState,
     identity_iri: &str,
-    default_allow: bool,
+    default_allow: impl Into<Option<bool>>,
 ) -> Result<PolicyWrappedView<'a>> {
     let opts = GovernanceOptions {
         identity: Some(identity_iri.to_string()),
-        default_allow: Some(default_allow),
+        default_allow: default_allow.into(),
         ..Default::default()
     };
     wrap_policy_view(ledger, &opts).await
