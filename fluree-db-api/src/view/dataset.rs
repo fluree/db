@@ -131,29 +131,12 @@ impl DataSetDb {
     /// enforced. See [`GraphDb::policy_enforcement`] for why this discloses
     /// nothing about the data.
     pub fn policy_enforcement(&self) -> Option<fluree_db_core::PolicyEnforcement> {
-        let mut acc: Option<fluree_db_core::PolicyEnforcement> = None;
-        for graph in self.default.iter().chain(self.named.values()) {
-            match graph.policy_enforcement() {
-                Some(state) => {
-                    let denies_all_data =
-                        acc.as_ref().is_none_or(|a| a.denies_all_data) && state.denies_all_data;
-                    acc = Some(fluree_db_core::PolicyEnforcement {
-                        enforced: true,
-                        denies_all_data,
-                    });
-                }
-                // An unenforced graph can return data, so it clears the
-                // whole-dataset deny bit without clearing `enforced`.
-                None => {
-                    if let Some(a) = acc.as_mut() {
-                        a.denies_all_data = false;
-                    } else {
-                        acc = Some(fluree_db_core::PolicyEnforcement::default());
-                    }
-                }
-            }
-        }
-        acc.filter(|a| a.enforced)
+        aggregate_policy_enforcement(
+            self.default
+                .iter()
+                .chain(self.named.values())
+                .map(GraphDb::policy_enforcement),
+        )
     }
 
     /// Get a "primary" graph view for parsing/formatting.
@@ -309,10 +292,89 @@ impl std::fmt::Debug for DataSetDb {
     }
 }
 
+/// Fold per-graph enforcement states into the dataset-level state, where
+/// `None` means that graph was unenforced.
+///
+/// `enforced` if *any* graph is enforced; `denies_all_data` only if *every*
+/// graph is enforced and denies, since a single readable graph is enough for
+/// the request to return data. Order-independent by construction: `any` is an
+/// OR and `all` an AND over the same pass.
+fn aggregate_policy_enforcement(
+    states: impl IntoIterator<Item = Option<fluree_db_core::PolicyEnforcement>>,
+) -> Option<fluree_db_core::PolicyEnforcement> {
+    let (any_enforced, all_deny) = states.into_iter().fold(
+        (false, true),
+        |(any_enforced, all_deny), state| match state {
+            Some(state) => (true, all_deny && state.denies_all_data),
+            None => (any_enforced, false),
+        },
+    );
+
+    any_enforced.then_some(fluree_db_core::PolicyEnforcement {
+        enforced: true,
+        denies_all_data: all_deny,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::FlureeBuilder;
+    use fluree_db_core::PolicyEnforcement;
+
+    fn enforced(denies_all_data: bool) -> Option<PolicyEnforcement> {
+        Some(PolicyEnforcement {
+            enforced: true,
+            denies_all_data,
+        })
+    }
+
+    /// The dataset aggregation is where the ordering subtlety lives: an
+    /// unenforced graph must clear the whole-dataset deny bit without clearing
+    /// `enforced`, whichever side of an enforced graph it falls on.
+    #[test]
+    fn dataset_enforcement_aggregates_independently_of_order() {
+        // No graphs, and all-unenforced: nothing to claim.
+        assert_eq!(aggregate_policy_enforcement([]), None);
+        assert_eq!(aggregate_policy_enforcement([None, None]), None);
+
+        // A single enforced graph passes its own state through.
+        assert_eq!(
+            aggregate_policy_enforcement([enforced(true)]),
+            enforced(true)
+        );
+        assert_eq!(
+            aggregate_policy_enforcement([enforced(false)]),
+            enforced(false)
+        );
+
+        // One unenforced graph means data could have come back, in either
+        // order — this is the case worth pinning.
+        assert_eq!(
+            aggregate_policy_enforcement([None, enforced(true)]),
+            enforced(false)
+        );
+        assert_eq!(
+            aggregate_policy_enforcement([enforced(true), None]),
+            enforced(false)
+        );
+
+        // Every graph denies → the whole request denies.
+        assert_eq!(
+            aggregate_policy_enforcement([enforced(true), enforced(true)]),
+            enforced(true)
+        );
+
+        // A granting graph alongside a denying one does not deny, either way.
+        assert_eq!(
+            aggregate_policy_enforcement([enforced(false), enforced(true)]),
+            enforced(false)
+        );
+        assert_eq!(
+            aggregate_policy_enforcement([enforced(true), enforced(false)]),
+            enforced(false)
+        );
+    }
 
     #[tokio::test]
     async fn test_dataset_view_single() {
