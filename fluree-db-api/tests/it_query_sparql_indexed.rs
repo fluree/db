@@ -9322,3 +9322,476 @@ async fn indexed_exists_graph_var_decodes_encoded_bindings() {
         })
         .await;
 }
+
+// =============================================================================
+// VALUES-bound subject through an rdf:type anchor (issue #51)
+// =============================================================================
+
+/// `VALUES ?s { <iri> } . ?s a ex:Thing ; ex:name ?n` on an indexed ledger.
+///
+/// The planner used to defer a VALUES that preceded a star block, which left
+/// `?s` unbound when the star was planned: the bound-object `rdf:type` triple
+/// won the driver race, the whole `ex:Thing` extent was drained, and the VALUES
+/// discarded all but the matching subject. Seeding the VALUES instead makes the
+/// cost a function of the VALUES arity rather than the class size.
+///
+/// These assertions are on *results*, not latency — the plan-shape assertions
+/// live in `fluree-db-query`'s `test_connected_values_seeds_type_anchored_star`.
+/// The corpus gives `ex:name` a second class (`ex:Other`) so the anchor is not
+/// redundant and cannot be elided; `ex:Other` subjects in the VALUES set must
+/// still be excluded by it.
+#[tokio::test]
+async fn indexed_values_bound_subject_through_type_anchor() {
+    /// `ex:Thing` count. Large enough that a class-extent scan is visible in the
+    /// latency print, small enough to stay cheap in CI.
+    const THINGS: usize = 5_000;
+    /// `ex:Other` subjects, which carry `ex:name` but not `@type ex:Thing`.
+    const OTHERS: usize = 500;
+
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-values-type-anchor:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 50_000_000,
+            };
+            let mut graph: Vec<serde_json::Value> = (0..THINGS)
+                .map(|i| {
+                    json!({
+                        "@id": format!("ex:thing{i}"),
+                        "@type": "ex:Thing",
+                        "ex:name": format!("name{i}")
+                    })
+                })
+                .collect();
+            graph.extend((0..OTHERS).map(|i| {
+                json!({
+                    "@id": format!("ex:other{i}"),
+                    "@type": "ex:Other",
+                    "ex:name": format!("othername{i}")
+                })
+            }));
+            let insert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": graph
+            });
+
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            /// Sorted `?n` bindings, with the elapsed wall time for human eyes.
+            async fn names(
+                fluree: &fluree_db_api::Fluree,
+                view: &fluree_db_api::GraphDb,
+                label: &str,
+                sparql: &str,
+            ) -> Vec<String> {
+                let t0 = std::time::Instant::now();
+                let result = fluree
+                    .query(view, QueryInput::Sparql(sparql))
+                    .await
+                    .unwrap_or_else(|e| panic!("{label} query: {e}"));
+                let elapsed = t0.elapsed();
+                let json = result
+                    .to_sparql_json(&view.snapshot)
+                    .expect("sparql results json");
+                let mut names: Vec<String> = json["results"]["bindings"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{label}: bindings array in {json}"))
+                    .iter()
+                    .map(|b| b["n"]["value"].as_str().expect("?n binding").to_string())
+                    .collect();
+                names.sort();
+                println!("  [{label}] {elapsed:?}  rows={}", names.len());
+                names
+            }
+
+            let target = THINGS / 2;
+
+            // The shape under test: VALUES feeds the star's subject.
+            let seeded = names(
+                &fluree,
+                &view,
+                "values + type anchor",
+                &format!(
+                    "PREFIX ex: <http://example.org/ns/>
+                     SELECT ?s ?n
+                     WHERE {{ VALUES ?s {{ ex:thing{target} }} ?s a ex:Thing ; ex:name ?n }}"
+                ),
+            )
+            .await;
+
+            // Control: the same query with the IRI written inline.
+            let inlined = names(
+                &fluree,
+                &view,
+                "iri inlined         ",
+                &format!(
+                    "PREFIX ex: <http://example.org/ns/>
+                     SELECT ?n WHERE {{ ex:thing{target} a ex:Thing ; ex:name ?n }}"
+                ),
+            )
+            .await;
+
+            // Control: the same VALUES with the type anchor dropped.
+            let unanchored = names(
+                &fluree,
+                &view,
+                "values, no anchor   ",
+                &format!(
+                    "PREFIX ex: <http://example.org/ns/>
+                     SELECT ?s ?n WHERE {{ VALUES ?s {{ ex:thing{target} }} ?s ex:name ?n }}"
+                ),
+            )
+            .await;
+
+            let expected = vec![format!("name{target}")];
+            assert_eq!(seeded, expected, "VALUES + type anchor");
+            assert_eq!(inlined, expected, "IRI inlined control");
+            assert_eq!(unanchored, expected, "no-anchor control");
+
+            // Multi-row VALUES: the seeded plan must still apply the anchor, so
+            // the two ex:Other rows drop out even though they carry ex:name.
+            let mixed = names(
+                &fluree,
+                &view,
+                "values arity 5      ",
+                "PREFIX ex: <http://example.org/ns/>
+                 SELECT ?s ?n
+                 WHERE {
+                   VALUES ?s { ex:thing1 ex:other1 ex:thing2 ex:other2 ex:missing }
+                   ?s a ex:Thing ; ex:name ?n
+                 }",
+            )
+            .await;
+            assert_eq!(
+                mixed,
+                vec!["name1".to_string(), "name2".to_string()],
+                "the anchor must exclude ex:Other subjects and the absent IRI"
+            );
+        })
+        .await;
+}
+
+/// Assert `sparql` plans as a *seeded* VALUES star, so the result assertions
+/// around it are actually exercising the batched-subject-probe lanes rather
+/// than the deferred property-join plan they replaced.
+async fn assert_values_seeded(
+    fluree: &fluree_db_api::Fluree,
+    view: &fluree_db_api::GraphDb,
+    sparql: &str,
+) {
+    let plan = fluree
+        .explain_sparql(view, sparql)
+        .await
+        .expect("explain should succeed");
+    let physical = plan["plan"]["physical"].to_string();
+    assert!(
+        physical.contains("ValuesOperator"),
+        "expected the VALUES to be planned, got {physical}"
+    );
+    assert!(
+        !physical.contains("PropertyJoinOperator"),
+        "expected the seeded lane, not the deferred property join: {physical}"
+    );
+}
+
+const NOVELTY_SUBJECT_QUERY: &str = r"
+    PREFIX ex: <http://example.org/ns/>
+    SELECT ?n
+    WHERE { VALUES ?s { ex:thing2 } ?s a ex:Thing ; ex:name ?n }
+";
+
+/// The seeded `VALUES` plan reads through the batched-subject-probe lanes, which
+/// read base leaflets directly and are latest-`t` only. Replay must still win.
+///
+/// `ex:thing1 ex:name` changes value between t=1 and t=2, so the predicate keeps
+/// live rows throughout and the query is a pure replay question. Asserts values,
+/// not plan shape — a lane that bails to a slower fallback is fine, one that
+/// serves the latest-`t` value for a historical read is not.
+#[tokio::test]
+async fn indexed_values_seeded_star_replays_at_historical_t() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/values-seed-historical:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 50_000_000,
+            };
+            let seed = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:thing1", "@type": "ex:Thing", "ex:name": "old"},
+                    {"@id": "ex:thing2", "@type": "ex:Thing", "ex:name": "keep"}
+                ]
+            });
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &seed,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let t1 = ledger1.t();
+
+            // t=2: change ex:thing1's name. ex:name keeps live rows either side.
+            let update = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "where": {"@id": "ex:thing1", "ex:name": "?n"},
+                "delete": {"@id": "ex:thing1", "ex:name": "?n"},
+                "insert": {"@id": "ex:thing1", "ex:name": "new"}
+            });
+            let ledger2 = fluree
+                .update(ledger1, &update)
+                .await
+                .expect("update")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger2.t()).await;
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT ?n
+                WHERE { VALUES ?s { ex:thing1 } ?s a ex:Thing ; ex:name ?n }
+            ";
+
+            let view_t1 = fluree.db_at_t(ledger_id, t1).await.expect("view at t=1");
+            assert_values_seeded(&fluree, &view_t1, q).await;
+            let at_t1 = fluree
+                .query(&view_t1, QueryInput::Sparql(q))
+                .await
+                .expect("historical query");
+            assert_eq!(
+                normalize_rows(&at_t1.to_jsonld(&view_t1.snapshot).expect("to_jsonld")),
+                normalize_rows(&json!([["old"]])),
+                "the seeded plan must replay to t=1, not serve the latest value"
+            );
+
+            let view_now = fluree.db(ledger_id).await.expect("current view");
+            let now = fluree
+                .query(&view_now, QueryInput::Sparql(q))
+                .await
+                .expect("current query");
+            assert_eq!(
+                normalize_rows(&now.to_jsonld(&view_now.snapshot).expect("to_jsonld")),
+                normalize_rows(&json!([["new"]])),
+                "the same plan at head must see the updated value"
+            );
+        })
+        .await;
+}
+
+/// Same lanes, novelty-overlay side: rows committed after the last index build
+/// live only in novelty, and the batched probes bail rather than read them.
+/// Whichever path the bail lands on must still return every matching row.
+#[tokio::test]
+async fn indexed_values_seeded_star_sees_novelty_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/values-seed-novelty:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 50_000_000,
+            };
+            let indexed = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [{"@id": "ex:thing1", "@type": "ex:Thing", "ex:name": "indexed"}]
+            });
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &indexed,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("indexed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+
+            // Committed but never indexed: ex:thing2 exists only in novelty, and
+            // ex:thing1 gains a second name there.
+            let overlay = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:thing2", "@type": "ex:Thing", "ex:name": "novel"},
+                    {"@id": "ex:thing1", "ex:name": "also"}
+                ]
+            });
+            let _ = fluree
+                .insert(ledger1, &overlay)
+                .await
+                .expect("novelty insert");
+
+            let view = fluree.db(ledger_id).await.expect("view with novelty");
+
+            assert_values_seeded(&fluree, &view, NOVELTY_SUBJECT_QUERY).await;
+            // Novelty-only subject, reached through the seeded lane.
+            let novel = fluree
+                .query(&view, QueryInput::Sparql(NOVELTY_SUBJECT_QUERY))
+                .await
+                .expect("novelty-subject query");
+            assert_eq!(
+                normalize_rows(&novel.to_jsonld(&view.snapshot).expect("to_jsonld")),
+                normalize_rows(&json!([["novel"]])),
+                "a subject that exists only in novelty must survive the seeded plan"
+            );
+
+            // Indexed subject whose values straddle the index/novelty boundary.
+            let straddle = fluree
+                .query(
+                    &view,
+                    QueryInput::Sparql(
+                        r"
+                        PREFIX ex: <http://example.org/ns/>
+                        SELECT ?n
+                        WHERE { VALUES ?s { ex:thing1 } ?s a ex:Thing ; ex:name ?n }
+                    ",
+                    ),
+                )
+                .await
+                .expect("straddling query");
+            let mut rows = normalize_rows(&straddle.to_jsonld(&view.snapshot).expect("to_jsonld"));
+            rows.sort_by_key(std::string::ToString::to_string);
+            assert_eq!(
+                rows,
+                normalize_rows(&json!([["also"], ["indexed"]])),
+                "the probe must merge the novelty value with the indexed one"
+            );
+        })
+        .await;
+}
+
+/// The seeded plan over a predicate that a later full rebuild left with no live
+/// rows at all — the shape the batched-subject probes cannot reach through
+/// PSOT/POST, only through the SPOT history sidecars that #1624 now preserves.
+///
+/// This is the case the seeded plan changed the answer to: deferring routed it
+/// through `PropertyJoinOperator`, whose replay-aware driver selection happened
+/// to keep it correct, and seeding takes it off that lane. Full rebuild (not
+/// incremental) is the point — it is the path that used to drop the partition.
+#[tokio::test]
+async fn indexed_values_seeded_star_replays_fully_retracted_predicate() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/values-seed-retracted:main";
+
+    let seed = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            {"@id": "ex:thing1", "@type": "ex:Thing", "ex:name": "n1", "ex:legacy": "yes"},
+            {"@id": "ex:thing2", "@type": "ex:Thing", "ex:name": "n2", "ex:legacy": "yes"}
+        ]
+    });
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger1 = fluree
+        .insert(ledger0, &seed)
+        .await
+        .expect("seed insert")
+        .ledger;
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let t1 = ledger1.t();
+    let ledger1 = fluree.ledger(ledger_id).await.expect("reload at t=1");
+
+    // Retract every ex:legacy triple: the predicate is left with zero live rows.
+    let retract = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "where": {"@id": "?s", "ex:legacy": "?v"},
+        "delete": {"@id": "?s", "ex:legacy": "?v"}
+    });
+    let _ = fluree.update(ledger1, &retract).await.expect("retract");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let _ = fluree.ledger(ledger_id).await.expect("reload at t=2");
+
+    let q = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?v
+        WHERE { VALUES ?s { ex:thing1 } ?s a ex:Thing ; ex:legacy ?v }
+    ";
+
+    let view_t1 = fluree.db_at_t(ledger_id, t1).await.expect("view at t=1");
+    assert_values_seeded(&fluree, &view_t1, q).await;
+    let at_t1 = fluree
+        .query(&view_t1, QueryInput::Sparql(q))
+        .await
+        .expect("historical query");
+    assert_eq!(
+        normalize_rows(&at_t1.to_jsonld(&view_t1.snapshot).expect("to_jsonld")),
+        normalize_rows(&json!([["yes"]])),
+        "a fully-retracted predicate must still replay at t=1 through the seeded plan"
+    );
+
+    let view_now = fluree.db(ledger_id).await.expect("current view");
+    let now = fluree
+        .query(&view_now, QueryInput::Sparql(q))
+        .await
+        .expect("current query");
+    assert!(
+        normalize_rows(&now.to_jsonld(&view_now.snapshot).expect("to_jsonld")).is_empty(),
+        "the predicate is gone at head, so the same plan must return nothing"
+    );
+}
