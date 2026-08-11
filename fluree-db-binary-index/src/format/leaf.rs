@@ -145,6 +145,18 @@ pub struct LeafWriter {
     /// a new predicate/o_type segment (and thus a new leaflet). See
     /// `commit_pending_for_current_segment` / `commit_all_pending`.
     pending_history: Vec<HistEntryV2>,
+    /// Ordered-key span of the history committed into the leaflet currently
+    /// buffered, when it reaches outside that leaflet's rows. Applied to the
+    /// encoded leaflet's own routing keys at `flush_leaflet`, and reset with
+    /// it.
+    ///
+    /// Widening only the leaf header is not durable: an incremental update
+    /// re-derives the header from the leaflet directory
+    /// (`build_leaf_from_group`) and republishes the branch entry from it, so
+    /// a bound that lives only in the header is narrowed away by the first
+    /// update that touches the leaf.
+    leaflet_hist_min: Option<[u8; ORDERED_KEY_V2_SIZE]>,
+    leaflet_hist_max: Option<[u8; ORDERED_KEY_V2_SIZE]>,
 
     // Segmentation tracking.
     current_seg_p_id: Option<u32>,
@@ -182,6 +194,8 @@ impl LeafWriter {
             sidecar_builder: HistSidecarBuilder::new(),
             current_segment_started: false,
             pending_history: Vec::new(),
+            leaflet_hist_min: None,
+            leaflet_hist_max: None,
             current_seg_p_id: None,
             current_seg_o_type: None,
             encoded_leaflets: Vec::new(),
@@ -281,7 +295,20 @@ impl LeafWriter {
             self.sidecar_builder.start_leaflet();
             self.current_segment_started = true;
         }
-        self.widen_leaf_bounds(record_from_history(&entry));
+        let rec = record_from_history(&entry);
+        self.widen_leaf_bounds(rec);
+
+        // Record the span for the leaflet itself as well. Ordered keys are
+        // big-endian in sort-field order, so `memcmp` is the order's compare.
+        let mut key = [0u8; ORDERED_KEY_V2_SIZE];
+        write_ordered_key_v2(self.order, &rec, &mut key);
+        if self.leaflet_hist_min.is_none_or(|min| key < min) {
+            self.leaflet_hist_min = Some(key);
+        }
+        if self.leaflet_hist_max.is_none_or(|max| key > max) {
+            self.leaflet_hist_max = Some(key);
+        }
+
         self.sidecar_builder.push_entry(entry);
     }
 
@@ -400,11 +427,19 @@ impl LeafWriter {
     /// Callers must have no buffered records and no open sidecar segment, so
     /// the emitted leaflet and its segment stay index-aligned.
     fn flush_history_only_segments(&mut self, next: Option<&RunRecordV2>) -> io::Result<()> {
-        if self.pending_history.is_empty() {
+        let Some(first) = self.pending_history.first() else {
             return Ok(());
-        }
+        };
         let order = self.order;
         let next_seg = next.map(|r| SegmentKey::of(order, r.p_id, r.o_type));
+
+        // Entries are sorted and `next`'s segment sorts last, so if even the
+        // first entry belongs to it then all of them do and there is nothing
+        // to emit. This runs on every `push_record`, so take the O(1) exit
+        // before the take/copy/assign churn below.
+        if next_seg == Some(SegmentKey::of(order, first.p_id, first.o_type)) {
+            return Ok(());
+        }
 
         let pending = std::mem::take(&mut self.pending_history);
         let mut retained = Vec::new();
@@ -436,8 +471,17 @@ impl LeafWriter {
 
     /// Append one zero-row leaflet holding `entries` as its history segment.
     fn emit_history_only_leaflet(&mut self, entries: &[HistEntryV2]) -> io::Result<()> {
-        debug_assert!(
-            self.record_buf.is_empty() && !self.current_segment_started,
+        // Hard assert, not `debug_assert!`: a violation puts every subsequent
+        // leaf's history segments off by one against its leaflet directory,
+        // silently, and index artifacts are written by release builds where a
+        // debug assertion compiles to nothing. The damage reads as wrong
+        // history replay — the bug class this code exists to prevent — and is
+        // unrepairable short of another full rebuild. The check is two boolean
+        // loads, once per retracted segment.
+        assert!(
+            self.record_buf.is_empty()
+                && !self.current_segment_started
+                && self.leaflet_hist_min.is_none(),
             "history-only leaflet must not interleave with a leaflet still being \
              accumulated — its sidecar segment would take that leaflet's index"
         );
@@ -457,10 +501,6 @@ impl LeafWriter {
             self.sidecar_builder.push_entry(*entry);
         }
 
-        let homogeneous_o_type = entries
-            .iter()
-            .all(|e| e.o_type == first.o_type)
-            .then_some(first.o_type);
         self.encoded_leaflets.push(EncodedLeaflet {
             row_count: 0,
             lead_group_count: 0,
@@ -470,9 +510,13 @@ impl LeafWriter {
                 RunSortOrder::Post | RunSortOrder::Psot => Some(first.p_id),
                 RunSortOrder::Opst | RunSortOrder::Spot => None,
             },
+            // OPST segments by type, so the constant is known without a scan.
             o_type_const: match self.order {
                 RunSortOrder::Opst => Some(first.o_type),
-                _ => homogeneous_o_type,
+                _ => entries
+                    .iter()
+                    .all(|e| e.o_type == first.o_type)
+                    .then_some(first.o_type),
             },
             flags: 0,
             column_refs: Vec::new(),
@@ -513,8 +557,26 @@ impl LeafWriter {
         }
 
         let records = std::mem::take(&mut self.record_buf);
-        let encoded = encode_leaflet(&records, self.order, self.zstd_level)?;
+        let mut encoded = encode_leaflet(&records, self.order, self.zstd_level)?;
         let row_count = encoded.row_count as u64;
+
+        // Grow the leaflet's own routing keys over any history that reaches
+        // outside its rows — a fully-retracted subject in SPOT, or one sorting
+        // above the last live row in PSOT/POST. The leaf header is re-derived
+        // from these keys by the next incremental update, so a bound recorded
+        // only on the header does not survive. It also makes the
+        // `leaflet_out_of_range` prune sound on the leaflet's own terms rather
+        // than by way of the replay guard.
+        if let Some(min) = self.leaflet_hist_min.take() {
+            if min < encoded.first_key {
+                encoded.first_key = min;
+            }
+        }
+        if let Some(max) = self.leaflet_hist_max.take() {
+            if max > encoded.last_key {
+                encoded.last_key = max;
+            }
+        }
 
         // Ensure a history segment exists for this leaflet.
         // If committed history already started one, skip. Otherwise start an empty one.
@@ -593,9 +655,15 @@ impl LeafWriter {
             re_encoded_leaflet_count,
         });
 
-        // Reset for next leaf.
+        // Reset for next leaf. `last_record` is cleared alongside
+        // `leaf_first_record` so the next leaf's bounds are derived only from
+        // its own contents: a leaf can now consist solely of history-only
+        // leaflets, and leaving a value behind would make its `last_key`
+        // depend on the previous leaf's — sound only because build order is
+        // ascending, which is not an invariant worth carrying across leaves.
         self.leaf_accumulated_rows = 0;
         self.leaf_first_record = None;
+        self.last_record = None;
         self.history_seg_refs.clear();
 
         Ok(())

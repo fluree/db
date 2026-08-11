@@ -1331,3 +1331,70 @@ async fn incremental_merges_into_a_rebuilt_zero_row_partition() {
         "t=3 sees the two re-asserted flags"
     );
 }
+
+/// The deleted-entity case carried through a later incremental update.
+///
+/// A rebuild widens the routing keys so the deleted subject stays reachable,
+/// but the leaf header is re-derived from leaflet keys on the next
+/// incremental (`build_leaf_from_group` → `update_branch` → the branch
+/// entry). If only the header carried the bound, the first incremental after
+/// the rebuild would silently narrow it and the entity would vanish from
+/// `@t:1` again.
+#[tokio::test]
+async fn time_travel_fully_retracted_subject_survives_later_incremental() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tt-dead-subject-incr:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let mut invoices = Vec::with_capacity(5);
+    for i in 0..5 {
+        invoices.push(json!({
+            "@id": format!("ns:Invoice/inv-{i:02}"),
+            "@type": "ns:Invoice",
+            "ns:status": "paid",
+        }));
+    }
+    let tx1 = json!({"@context": ctx(), "@graph": invoices});
+    let _ = fluree.insert(ledger0, &tx1).await.expect("tx1");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let l1 = fluree.ledger(ledger_id).await.expect("reload after t=1");
+
+    // t=2: delete the highest-sorting invoice outright, then rebuild.
+    let tx2 = json!({
+        "@context": ctx(),
+        "where": {"@id": "ns:Invoice/inv-04", "?p": "?o"},
+        "delete": {"@id": "ns:Invoice/inv-04", "?p": "?o"}
+    });
+    let l2 = fluree.update(l1, &tx2).await.expect("tx2").ledger;
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    fluree.ledger(ledger_id).await.expect("reload after t=2");
+
+    let q_t1 = format!(
+        r"PREFIX ns: <http://example.org/ns#>
+          SELECT ?p ?o FROM <{ledger_id}@t:1>
+          WHERE {{ <http://example.org/ns#Invoice/inv-04> ?p ?o }}"
+    );
+    assert_eq!(
+        run_row_count(&fluree, &q_t1).await,
+        2,
+        "reachable after the rebuild"
+    );
+
+    // t=3: any unrelated write, indexed INCREMENTALLY.
+    let tx3 = json!({
+        "@context": ctx(),
+        "where": {"@id": "ns:Invoice/inv-00", "ns:status": "?s"},
+        "delete": {"@id": "ns:Invoice/inv-00", "ns:status": "?s"},
+        "insert": {"@id": "ns:Invoice/inv-00", "ns:status": "void"}
+    });
+    let _ = fluree.update(l2, &tx3).await.expect("tx3");
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    fluree.ledger(ledger_id).await.expect("reload after t=3");
+
+    assert_eq!(
+        run_row_count(&fluree, &q_t1).await,
+        2,
+        "the deleted entity must still be reachable at t=1 after an incremental"
+    );
+}

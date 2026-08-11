@@ -422,7 +422,8 @@ fn merge_and_encode_leaflet(
 
     if chunks.len() == 1 {
         // Common case: no split, all history stays with the single chunk.
-        let encoded = encode_leaflet(chunks[0], order, zstd_level)?;
+        let mut encoded = encode_leaflet(chunks[0], order, zstd_level)?;
+        widen_leaflet_keys_over_history(&mut encoded, &history, order);
         result.push(ProcessedLeafletV3 {
             encoded: EncodedLeafletInfo::Encoded(encoded),
             history,
@@ -431,7 +432,8 @@ fn merge_and_encode_leaflet(
         // Multiple chunks: partition history entries by chunk key boundaries.
         let partitioned = partition_history_to_chunks(&chunks, &history, order);
         for (chunk, chunk_history) in chunks.iter().zip(partitioned) {
-            let encoded = encode_leaflet(chunk, order, zstd_level)?;
+            let mut encoded = encode_leaflet(chunk, order, zstd_level)?;
+            widen_leaflet_keys_over_history(&mut encoded, &chunk_history, order);
             result.push(ProcessedLeafletV3 {
                 encoded: EncodedLeafletInfo::Encoded(encoded),
                 history: chunk_history,
@@ -440,6 +442,46 @@ fn merge_and_encode_leaflet(
     }
 
     Ok(result)
+}
+
+/// Grow a re-encoded leaflet's routing keys to span the history kept with it.
+///
+/// `encode_leaflet` derives keys from live rows alone, but a leaflet's sidecar
+/// can hold facts sorting outside them — a fully-retracted subject in SPOT, or
+/// one above the last live row in PSOT/POST. Routing, the
+/// `leaflet_out_of_range` prune, and the leaf header (hence the branch entry,
+/// via `build_leaf_from_group`) all read these keys, so a leaflet that stops
+/// at its rows makes that history unreachable at a historical `t`. The
+/// empty-after-retract branch above already preserves the range for the
+/// zero-row case; this is the same contract for a leaflet that still has rows.
+///
+/// The union stays inside the leaflet's routing interval — carried-forward
+/// history was already in it and novelty is sliced to it — so widening cannot
+/// make sibling leaflets overlap.
+fn widen_leaflet_keys_over_history(
+    encoded: &mut fluree_db_binary_index::format::leaflet::EncodedLeaflet,
+    history: &[HistEntryV2],
+    order: RunSortOrder,
+) {
+    let mut key = [0u8; ORDERED_KEY_V2_SIZE];
+    for entry in history {
+        let rec = RunRecordV2 {
+            s_id: entry.s_id,
+            o_key: entry.o_key,
+            p_id: entry.p_id,
+            t: entry.t,
+            o_i: entry.o_i,
+            o_type: entry.o_type,
+            g_id: 0,
+        };
+        write_ordered_key_v2(order, &rec, &mut key);
+        if key < encoded.first_key {
+            encoded.first_key = key;
+        }
+        if key > encoded.last_key {
+            encoded.last_key = key;
+        }
+    }
 }
 
 /// Split merged records by segmentation constraints and row-count limits.
@@ -1341,6 +1383,76 @@ mod tests {
             .expect("merging novelty into a rebuild-emitted empty partition must not fail");
         assert_eq!(gen2.leaves.len(), 1);
         assert_eq!(gen2.leaves[0].info.total_rows, 2);
+    }
+
+    /// Regression: a leaf bound widened to cover retracted-only history must
+    /// survive an incremental update.
+    ///
+    /// `build_leaf_from_group` re-derives the leaf header's keys from the
+    /// leaflet directory entries, and `update_branch` reads the branch entry
+    /// back out of that header. So widening only the leaf header is not
+    /// durable: the first `update_leaf` narrows it to the leaflets' own keys
+    /// and `find_leaves_in_range` starts skipping the leaf again. The
+    /// leaflet holding the history must span it too.
+    ///
+    /// SPOT is the case that bites, because its history commits into the
+    /// leaflet holding the neighbouring subject's rows rather than into a
+    /// history-only leaflet of its own.
+    #[test]
+    fn test_update_preserves_widened_bound_for_retracted_subject() {
+        // Generation 1, rebuild-side: subject 100 lives, subject 200 is fully
+        // retracted and survives only in the sidecar.
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 100, 10000, 1);
+        writer.push_record(rec2(100, 1, 10, 1)).unwrap();
+        for (t, op) in [(1u32, 1u8), (5, 0)] {
+            writer.push_history_entry(HistEntryV2 {
+                s_id: SubjectId(200),
+                p_id: 1,
+                o_type: OType::XSD_INTEGER.as_u16(),
+                o_key: ObjKey::encode_i64(20).as_u64(),
+                o_i: OI_NONE,
+                t,
+                op,
+            });
+        }
+        let leaves = writer.finish().unwrap();
+        let leaf = &leaves[0];
+        assert_eq!(
+            leaf.last_key.s_id,
+            SubjectId(200),
+            "the rebuild's own bound must span the retracted subject"
+        );
+
+        // Generation 2: any later incremental touching this leaf.
+        let novelty = vec![rec2(100, 2, 11, 9)];
+        let ops = vec![1u8];
+        let input = LeafUpdateInput {
+            leaf_bytes: &leaf.leaf_bytes,
+            novelty: &novelty,
+            novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
+            order: RunSortOrder::Spot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 10000,
+            sidecar_bytes: leaf.sidecar_bytes.as_deref(),
+        };
+        let gen2 = update_leaf(&input).unwrap();
+        assert_eq!(gen2.leaves.len(), 1);
+
+        let header = decode_leaf_header_v3(&gen2.leaves[0].info.leaf_bytes).unwrap();
+        let last = fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2(
+            RunSortOrder::Spot,
+            &header.last_key,
+        );
+        assert_eq!(
+            last.s_id,
+            SubjectId(200),
+            "the incremental re-derives the header from leaflet keys, so the \
+             leaflet must span the history or the bound is lost"
+        );
     }
 
     /// Regression: when a leaflet splits into multiple chunks, history entries
