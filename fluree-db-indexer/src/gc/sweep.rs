@@ -37,7 +37,6 @@ use fluree_db_core::address_path::{ledger_id_to_path_prefix, shared_prefix_for_p
 use fluree_db_core::storage::{candidate_addresses, content_store_for, ContentStore};
 use fluree_db_core::{ContentId, Storage};
 use std::collections::HashSet;
-use std::path::Path;
 
 /// Concurrent storage deletes during a sweep. Deletes are independent
 /// round trips, so a serial pass over a large backlog is almost entirely
@@ -89,22 +88,10 @@ pub struct SweepResult {
 /// hold the ledger's index build excluded for the whole span of planning and
 /// deleting — a build publishes its artifacts before the root that references
 /// them, so a concurrent build's output is indistinguishable from an orphan.
-///
-/// `artifact_cache_dir` serves root reads from the local disk cache the
-/// builds and the collector already populate, turning the walk's one read per
-/// root into a local hit. It trades an over-count for those reads: the walk
-/// recognises the end of a chain by a root that storage no longer holds, and a
-/// cached copy of a root the collector released reads back successfully, so
-/// the walk continues past the truncation point. Everything those older roots
-/// reference is then counted live, which defers reclaiming any of it until the
-/// cache entry is evicted. Deferral is the safe direction — see the module's
-/// Safety note — but it defers exactly what a sweep exists to reclaim, so pass
-/// `None` where reclaiming promptly matters more than planning quickly.
 pub async fn plan_sweep<S>(
     storage: &S,
     ledger_name: &str,
     branches: &[BranchIndexHead],
-    artifact_cache_dir: Option<&Path>,
 ) -> Result<SweepPlan>
 where
     S: Storage + Clone,
@@ -115,7 +102,7 @@ where
     // neither informs the other, so planning waits for the slower of the two
     // rather than their sum.
     let (live, scanned) = futures::try_join!(
-        live_addresses(storage, &method, branches, artifact_cache_dir),
+        live_addresses(storage, &method, branches),
         swept_addresses(storage, &method, ledger_name, branches),
     )?;
 
@@ -201,7 +188,6 @@ async fn live_addresses<S>(
     storage: &S,
     method: &str,
     branches: &[BranchIndexHead],
-    artifact_cache_dir: Option<&Path>,
 ) -> Result<HashSet<String>>
 where
     S: Storage + Clone,
@@ -210,7 +196,7 @@ where
 
     let walks: Vec<_> = branches
         .iter()
-        .map(|branch| branch_live_addresses(storage, method, branch, artifact_cache_dir))
+        .map(|branch| branch_live_addresses(storage, method, branch))
         .collect();
 
     futures::stream::iter(walks)
@@ -227,7 +213,6 @@ async fn branch_live_addresses<S>(
     storage: &S,
     method: &str,
     branch: &BranchIndexHead,
-    artifact_cache_dir: Option<&Path>,
 ) -> Result<HashSet<String>>
 where
     S: Storage + Clone,
@@ -236,7 +221,7 @@ where
         return Ok(HashSet::new());
     };
     let store = content_store_for(storage.clone(), &branch.ledger_id);
-    let reachable = chain_cas_ids(&store, head, &branch.ledger_id, artifact_cache_dir).await?;
+    let reachable = chain_cas_ids(&store, head, &branch.ledger_id).await?;
 
     let mut addresses = HashSet::new();
     for id in &reachable {
@@ -268,13 +253,14 @@ async fn chain_cas_ids<C>(
     store: &C,
     head: &ContentId,
     ledger_id: &str,
-    artifact_cache_dir: Option<&Path>,
 ) -> Result<HashSet<ContentId>>
 where
     C: ContentStore,
 {
     let mut chain_ids = ChainCasIds::new();
-    let mut walk = PrevIndexChainWalk::new(store, head, artifact_cache_dir);
+    // Reads storage directly: a cached root outlives its release, and the walk
+    // ends where storage no longer holds one. See [`PrevIndexChainWalk`].
+    let mut walk = PrevIndexChainWalk::new(store, head, None);
 
     // One root at a time: only the CIDs outlive each step, so a long chain
     // costs its distinct refs rather than every decoded root at once.
@@ -405,7 +391,7 @@ mod tests {
         storage.write_bytes(&dict_addr, b"dict").await.unwrap();
         let roots = write_chain(&storage, MAIN, 3, &dict).await;
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]))
             .await
             .unwrap();
 
@@ -415,88 +401,6 @@ mod tests {
             plan.orphans
         );
         assert_eq!(plan.scanned, 4, "3 roots plus the shared dict");
-    }
-
-    /// A temp cache directory of this test's own, emptied before use so a
-    /// previous run's entries cannot decide the outcome.
-    fn empty_cache_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("fluree-test-sweep-cache-{label}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
-    /// Reading roots through the cache does not change what a sweep plans
-    /// while every root it walks is still in storage.
-    #[tokio::test]
-    async fn a_cached_plan_matches_an_uncached_one() {
-        let storage = MemoryStorage::new();
-        let dict = dict_cid(b"live-dict");
-        let (_, dict_addr) = cid_and_addr_for(
-            MAIN,
-            ContentKind::DictBlob {
-                dict: DictKind::Graphs,
-            },
-            b"live-dict",
-        );
-        storage.write_bytes(&dict_addr, b"dict").await.unwrap();
-        let roots = write_chain(&storage, MAIN, 3, &dict).await;
-        let branches = heads(&[(MAIN, roots.last())]);
-        let cache_dir = empty_cache_dir("parity");
-
-        let uncached = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
-        let cached = plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
-            .await
-            .unwrap();
-
-        assert_eq!(cached.orphans, uncached.orphans);
-        assert_eq!(cached.live, uncached.live);
-        assert_eq!(cached.scanned, uncached.scanned);
-    }
-
-    /// The trade-off the cache buys: the walk ends at a root storage no longer
-    /// holds, but a cached copy reads back, so the chain still resolves and
-    /// everything it reaches stays live. Deferring reclamation is the safe
-    /// direction; this pins it as chosen rather than accidental.
-    #[tokio::test]
-    async fn a_cached_root_keeps_the_walk_going_after_its_blob_is_gone() {
-        let storage = MemoryStorage::new();
-        let dict = dict_cid(b"live-dict");
-        let (_, dict_addr) = cid_and_addr_for(
-            MAIN,
-            ContentKind::DictBlob {
-                dict: DictKind::Graphs,
-            },
-            b"live-dict",
-        );
-        storage.write_bytes(&dict_addr, b"dict").await.unwrap();
-        let roots = write_chain(&storage, MAIN, 3, &dict).await;
-        let branches = heads(&[(MAIN, roots.last())]);
-        let cache_dir = empty_cache_dir("truncation");
-
-        // Populate the cache with the whole chain, as a prior maintenance
-        // pass on this process would have.
-        plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
-            .await
-            .unwrap();
-
-        // Retire the oldest root the way the collector does.
-        let oldest_addr = &candidate_addresses("memory", MAIN, &roots[0])[0];
-        storage.delete(oldest_addr).await.unwrap();
-
-        let cached = plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
-            .await
-            .unwrap();
-        let uncached = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
-
-        // Uncached, the walk stops at the missing root and stops counting
-        // there. Cached, it reads the released root and keeps going.
-        assert!(
-            cached.live > uncached.live,
-            "a cached release should leave more counted live, not fewer: \
-             cached={} uncached={}",
-            cached.live,
-            uncached.live
-        );
     }
 
     /// A root published with no `prev_index` severs the chain, and everything
@@ -527,7 +431,7 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, Some(&severed))]), None)
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, Some(&severed))]))
             .await
             .unwrap();
 
@@ -577,7 +481,6 @@ mod tests {
             &storage,
             NAME,
             &heads(&[(MAIN, main_roots.last()), (feature, feature_roots.last())]),
-            None,
         )
         .await
         .unwrap();
@@ -618,7 +521,7 @@ mod tests {
         storage.write_bytes(&stranded_addr, b"dict").await.unwrap();
 
         let roots = write_chain(&storage, MAIN, 2, &live).await;
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]))
             .await
             .unwrap();
 
@@ -650,7 +553,7 @@ mod tests {
 
         let roots = write_chain(&storage, MAIN, 1, &dict).await;
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]))
             .await
             .unwrap();
 
@@ -689,7 +592,7 @@ mod tests {
             .unwrap();
 
         let branches = heads(&[(MAIN, Some(&severed))]);
-        let plan = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
+        let plan = plan_sweep(&storage, NAME, &branches).await.unwrap();
         assert_eq!(plan.orphans.len(), 3, "the three stranded roots");
 
         let result = execute_sweep(&storage, &plan).await;
@@ -705,7 +608,7 @@ mod tests {
             "the dict it references survives"
         );
 
-        let after = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
+        let after = plan_sweep(&storage, NAME, &branches).await.unwrap();
         assert!(
             after.orphans.is_empty(),
             "a swept ledger has nothing left to reclaim: {:?}",
@@ -729,7 +632,7 @@ mod tests {
             .unwrap();
 
         let branches = heads(&[(MAIN, Some(&severed))]);
-        let plan = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
+        let plan = plan_sweep(&storage, NAME, &branches).await.unwrap();
         assert!(!plan.orphans.is_empty());
 
         execute_sweep(&storage, &plan).await;
@@ -814,7 +717,7 @@ mod tests {
             inner,
         };
 
-        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None).await;
+        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())])).await;
 
         assert!(
             result.is_err(),
@@ -845,7 +748,7 @@ mod tests {
         let oldest = candidate_addresses("memory", MAIN, &roots[0]);
         storage.delete(&oldest[0]).await.unwrap();
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
+        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]))
             .await
             .expect("a collected chain still plans");
 
@@ -877,7 +780,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None).await;
+        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())])).await;
 
         assert!(
             result.is_err(),
@@ -892,7 +795,7 @@ mod tests {
         let storage = MemoryStorage::new();
         let (missing, _) = cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"never-written");
 
-        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, Some(&missing))]), None).await;
+        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, Some(&missing))])).await;
 
         assert!(
             result.is_err(),

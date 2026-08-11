@@ -41,6 +41,14 @@ use crate::run_index::build::incremental_root::IncrementalRootBuilder;
 use crate::{IndexResult, IndexStats, IndexerConfig};
 use tokio::sync::Semaphore;
 
+fn artifact_cache_dir(config: &IndexerConfig) -> std::path::PathBuf {
+    config
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("binary_artifact_cache"))
+        .unwrap_or_else(|| std::env::temp_dir().join("fluree_binary_cache"))
+}
+
 #[derive(Default)]
 struct Phase2FetchStats {
     leaf_fetches: AtomicU64,
@@ -682,7 +690,7 @@ pub async fn incremental_index(
         "starting incremental index build"
     );
 
-    let cache_dir = config.artifact_cache_dir();
+    let cache_dir = artifact_cache_dir(&config);
     let _ = std::fs::create_dir_all(&cache_dir);
 
     // Single global S3 budget shared across the whole fold: the reconcile

@@ -2084,18 +2084,6 @@ impl crate::Fluree {
         Ok((guards, branches))
     }
 
-    /// Where a sweep may read index roots from local disk instead of storage.
-    ///
-    /// Only the background indexer's cache qualifies: reading through a
-    /// directory no builder writes would cost the writes and return no hits.
-    /// `None` without one, which plans against storage alone.
-    fn sweep_artifact_cache_dir(&self) -> Option<&std::path::Path> {
-        match &self.indexing_mode {
-            IndexingMode::Background(handle) => Some(handle.artifact_cache_dir()),
-            IndexingMode::Disabled => None,
-        }
-    }
-
     /// The storage a sweep enumerates and deletes through.
     ///
     /// `None` only for permanent (append-only) backends, which cannot list a
@@ -2119,13 +2107,7 @@ impl crate::Fluree {
         let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
         let storage = self.sweepable_storage()?;
         let (_guards, branches) = self.hold_ledger_for_maintenance(&ledger_name).await?;
-        Ok(plan_sweep(
-            &storage,
-            &ledger_name,
-            &branches,
-            self.sweep_artifact_cache_dir(),
-        )
-        .await?)
+        Ok(plan_sweep(&storage, &ledger_name, &branches).await?)
     }
 
     /// Reclaim index artifacts that no live index chain references.
@@ -2140,13 +2122,7 @@ impl crate::Fluree {
         let storage = self.sweepable_storage()?;
         let (_guards, branches) = self.hold_ledger_for_maintenance(&ledger_name).await?;
 
-        let plan = plan_sweep(
-            &storage,
-            &ledger_name,
-            &branches,
-            self.sweep_artifact_cache_dir(),
-        )
-        .await?;
+        let plan = plan_sweep(&storage, &ledger_name, &branches).await?;
         info!(
             ledger_name = %ledger_name,
             orphans = plan.orphans.len(),
