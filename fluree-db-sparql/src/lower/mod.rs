@@ -739,22 +739,72 @@ mod tests {
     // against a different base and matched a different predicate.
     // ------------------------------------------------------------------
 
-    /// Lower `sparql` and return its single SERVICE pattern.
-    fn lower_one_service(sparql: &str) -> fluree_db_query::ir::ServicePattern {
+    /// Collect every SERVICE pattern reachable from `patterns`, at any depth.
+    ///
+    /// Walks the nesting containers, not just the top level: the prologue lives
+    /// on `LoweringContext` so it *should* reach a nested SERVICE identically —
+    /// but "should" is what let the original bug survive, since the body slice
+    /// was captured correctly in every position too. Ordered outermost-first,
+    /// then in pattern order, so a two-SERVICE query has a stable [0]/[1].
+    fn collect_services(patterns: &[Pattern]) -> Vec<fluree_db_query::ir::ServicePattern> {
+        let mut found = Vec::new();
+        for p in patterns {
+            match p {
+                Pattern::Service(s) => {
+                    found.push(s.clone());
+                    found.extend(collect_services(&s.patterns));
+                }
+                Pattern::Optional(inner)
+                | Pattern::Minus(inner)
+                | Pattern::Exists(inner)
+                | Pattern::NotExists(inner)
+                | Pattern::Graph {
+                    patterns: inner, ..
+                } => found.extend(collect_services(inner)),
+                Pattern::Union(branches) => {
+                    for branch in branches {
+                        found.extend(collect_services(branch));
+                    }
+                }
+                Pattern::Subquery(sub) => found.extend(collect_services(&sub.patterns)),
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// Lower `sparql` and return every SERVICE pattern in it, at any depth.
+    fn lower_services(sparql: &str) -> Vec<fluree_db_query::ir::ServicePattern> {
         let ast = parse_sparql(sparql).ast.expect("parse");
         let mut vars = VarRegistry::new();
         let query = lower_sparql_with_source(&ast, &test_encoder(), &mut vars, Some(sparql))
             .expect("lower");
-        let mut services: Vec<_> = query
-            .patterns
-            .iter()
-            .filter_map(|p| match p {
-                Pattern::Service(s) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
+        collect_services(&query.patterns)
+    }
+
+    /// Lower `sparql` and return its single SERVICE pattern (at any depth).
+    fn lower_one_service(sparql: &str) -> fluree_db_query::ir::ServicePattern {
+        let mut services = lower_services(sparql);
         assert_eq!(services.len(), 1, "expected exactly one SERVICE pattern");
         services.pop().unwrap()
+    }
+
+    /// Assert a SERVICE ships a sub-query whose body resolves to `expected`
+    /// predicates and that carries the prologue those names need.
+    fn assert_prologue_reaches(
+        service: &fluree_db_query::ir::ServicePattern,
+        expected: &[Ref],
+        what: &str,
+    ) {
+        let sent = service
+            .remote_query_text()
+            .unwrap_or_else(|| panic!("{what}: no remote query text"));
+        assert_eq!(
+            predicates_of(&sent),
+            predicate_refs(&service.patterns),
+            "{what}: remote must resolve the body to the same predicates we do"
+        );
+        assert_eq!(predicates_of(&sent), expected, "{what}: {sent}");
     }
 
     /// The predicate `Ref`s of every triple in a pattern list, in order.
@@ -853,6 +903,91 @@ mod tests {
             sent.contains("\"ex:p is not a curie\""),
             "literal text must survive verbatim: {sent}"
         );
+    }
+
+    /// `SERVICE SILENT` is the shape that converts the loud remote failure into a
+    /// quiet one — a dropped prologue there yields an empty result instead of an
+    /// error, so it is the position where the bug is *least* visible and most
+    /// worth pinning.
+    #[test]
+    fn remote_service_silent_query_forwards_prologue() {
+        let service = lower_one_service(
+            "PREFIX ex: <http://example.org/>\n\
+             SELECT * WHERE { \
+             SERVICE SILENT <fluree:remote:conn/db:main> { ?s ex:p ?o } }",
+        );
+        assert!(service.silent, "expected SERVICE SILENT");
+        assert_prologue_reaches(&service, &[Ref::Sid(Sid::new(100, "p"))], "SERVICE SILENT");
+    }
+
+    /// A SERVICE nested inside OPTIONAL / UNION / a sub-SELECT gets the same
+    /// prologue: it comes off the lowering context, not off the position.
+    #[test]
+    fn nested_remote_service_query_forwards_prologue() {
+        let cases = [
+            (
+                "OPTIONAL",
+                "PREFIX ex: <http://example.org/>\n\
+                 SELECT * WHERE { ?s ex:local ?x . \
+                 OPTIONAL { SERVICE <fluree:remote:conn/db:main> { ?s ex:p ?o } } }",
+            ),
+            (
+                "UNION",
+                "PREFIX ex: <http://example.org/>\n\
+                 SELECT * WHERE { { ?s ex:local ?x } UNION \
+                 { SERVICE <fluree:remote:conn/db:main> { ?s ex:p ?o } } }",
+            ),
+            (
+                "sub-SELECT",
+                "PREFIX ex: <http://example.org/>\n\
+                 SELECT * WHERE { { SELECT ?s ?o WHERE { \
+                 SERVICE <fluree:remote:conn/db:main> { ?s ex:p ?o } } } }",
+            ),
+            (
+                "GRAPH",
+                "PREFIX ex: <http://example.org/>\n\
+                 SELECT * WHERE { GRAPH <http://example.org/g> { \
+                 SERVICE <fluree:remote:conn/db:main> { ?s ex:p ?o } } }",
+            ),
+        ];
+        for (label, src) in cases {
+            let service = lower_one_service(src);
+            assert_prologue_reaches(&service, &[Ref::Sid(Sid::new(100, "p"))], label);
+        }
+    }
+
+    /// Two SERVICE clauses in one query: both ship, and both carry the prologue.
+    #[test]
+    fn multiple_remote_services_each_forward_prologue() {
+        let services = lower_services(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX other: <http://other.example/>\n\
+             SELECT * WHERE { \
+             SERVICE <fluree:remote:conn/a:main> { ?s ex:p ?o } . \
+             SERVICE <fluree:remote:conn/b:main> { ?o other:q ?z } }",
+        );
+        assert_eq!(services.len(), 2, "expected two SERVICE patterns");
+        assert_prologue_reaches(
+            &services[0],
+            &[Ref::Sid(Sid::new(100, "p"))],
+            "first SERVICE",
+        );
+        // `other:` resolves through a namespace the test encoder does not know,
+        // so it lands in the overflow/unregistered namespace — what matters is
+        // that BOTH sub-queries resolve identically to their local lowering.
+        assert_prologue_reaches(
+            &services[1],
+            &predicate_refs(&services[1].patterns),
+            "second SERVICE",
+        );
+        for (i, s) in services.iter().enumerate() {
+            let sent = s.remote_query_text().unwrap();
+            assert!(
+                sent.contains("PREFIX ex: <http://example.org/>")
+                    && sent.contains("PREFIX other: <http://other.example/>"),
+                "SERVICE {i} must carry the full prologue: {sent}"
+            );
+        }
     }
 
     /// A query with no prologue ships exactly what it shipped before: the fix
