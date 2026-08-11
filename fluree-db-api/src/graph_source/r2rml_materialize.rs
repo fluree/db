@@ -100,6 +100,36 @@ const WATERMARK_TARGET_PRED: &str = "urn:fluree:materialize#target";
 /// Predicate recording which source table the watermark belongs to.
 const WATERMARK_TABLE_PRED: &str = "urn:fluree:materialize#table";
 
+/// Subject-IRI prefix for a per-(source, RESOLVED target, table) applied marker.
+///
+/// Distinct from [`WATERMARK_SUBJECT_PREFIX`] because the two are keyed on
+/// different things and must never collide: the watermark is keyed on the target
+/// SPEC (one per job, `silver_{tenant}_{user}:main`), this on the RESOLVED ledger
+/// (`silver_acme_u1:main`). For a non-templated job those strings are equal, so a
+/// shared prefix would put both on the same subject.
+const APPLIED_SUBJECT_PREFIX: &str = "urn:fluree:materialize-applied:";
+/// Predicate holding the snapshot id a single resolved target has fully applied
+/// (string-encoded, like the watermark, to preserve i64 precision).
+///
+/// WHY THIS EXISTS. The watermark is shared across every target a templated job
+/// fans into, and it may not advance while ANY target is behind — otherwise the
+/// laggards would skip that window permanently. Correct, but it means the targets
+/// that DID commit earn no credit: the next poll re-reads the window and
+/// re-commits all of them, forever, for as long as one target cannot fit.
+///
+/// Measured in production: 19 of 23 targets committing and 4 deferring on every
+/// poll, unchanged across 22 consecutive polls, so 19 targets were rewritten every
+/// ~4 minutes for 13.7 h. The re-commits are idempotent but not free — they are
+/// writes, and they filled a 100 GiB volume to ENOSPC, which is unrecoverable
+/// because GC needs to write in order to reclaim.
+///
+/// This marker records what each resolved target has already applied, so a target
+/// that is caught up is SKIPPED rather than rewritten. It deliberately does not
+/// touch the scan window: the shared watermark still chooses it, so the source read
+/// is unchanged and there is no risk of starting a scan after rows a newly-created
+/// target still needs.
+const APPLIED_SNAPSHOT_PRED: &str = "urn:fluree:materialize#appliedSnapshotId";
+
 /// Subject-IRI prefix for a persisted tracking job. The full subject is
 /// `{PREFIX}{source}:{target-spec}`, matching the worker's own
 /// `(source, target)` job key.
@@ -646,8 +676,39 @@ impl Fluree {
         let mut ok_targets = 0usize;
         let mut deferred: Vec<(String, usize)> = Vec::new();
         let mut failed: Vec<(String, ApiError)> = Vec::new();
+        let mut skipped_targets = 0usize;
+        let mut newly_applied: Vec<String> = Vec::new();
+
+        // What each resolved target has already applied. Read once per pass, not per
+        // target. `force_full` ignores the markers for the same reason it ignores the
+        // watermark: the caller is asking for a rebuild, not a resume.
+        let applied = if force_full {
+            std::collections::HashMap::new()
+        } else {
+            self.materialize_applied_markers(MATERIALIZE_STATE_LEDGER, source_graph_source_id)
+                .await
+                .unwrap_or_else(|e| {
+                    // Non-fatal: an unreadable marker set costs the skip, not the pass.
+                    // Failing here would turn a state-ledger hiccup into a stalled job,
+                    // and re-applying is idempotent.
+                    warn!(
+                        source = %source_graph_source_id,
+                        error = %e,
+                        "materialize: could not read applied markers; re-applying every target"
+                    );
+                    std::collections::HashMap::new()
+                })
+        };
 
         for (target, (live, deletions)) in by_target {
+            // Already has this whole window. Skipping is what stops a job whose
+            // watermark cannot advance from rewriting its healthy targets on every
+            // poll — the amplification that filled a 100 GiB volume.
+            if target_is_caught_up(&applied, &target, &table_watermarks) {
+                skipped_targets += 1;
+                ok_targets += 1;
+                continue;
+            }
             match self
                 .materialize_one_target(&target, live, deletions, latest_by_key, txn_budget)
                 .await
@@ -655,6 +716,7 @@ impl Fluree {
                 Ok(retracted) => {
                     subjects_retracted += retracted;
                     ok_targets += 1;
+                    newly_applied.push(target);
                 }
                 // Deferral is not failure — it is backpressure on THIS target only.
                 Err(ApiError::NoveltyDeferred { remaining }) => {
@@ -683,8 +745,41 @@ impl Fluree {
                 targets_ok = tally.ok,
                 targets_deferred = tally.deferred,
                 targets_failed = tally.failed,
+                targets_skipped = skipped_targets,
                 "materialize: partial window"
             );
+        }
+
+        // Record what just landed, BEFORE the partial-window returns below.
+        //
+        // The ordering is the whole point. A job whose watermark can never advance is
+        // exactly the job that needs these markers, and both early returns sit between
+        // here and the watermark write — so putting this after them would record
+        // progress only for jobs that never needed it.
+        //
+        // After the data commits, never before: a crash in the gap re-applies the
+        // window, which is idempotent, whereas a marker written first would skip rows
+        // that were never committed. Same argument as the watermark, one target down.
+        if !newly_applied.is_empty() && !table_watermarks.is_empty() {
+            let nodes: Vec<JsonValue> = newly_applied
+                .iter()
+                .flat_map(|target| {
+                    table_watermarks.iter().map(move |(table, _from, to)| {
+                        applied_node(source_graph_source_id, target, table, *to)
+                    })
+                })
+                .collect();
+            let state = self.materialize_state_ledger().await?;
+            // Through the backpressure helper for the same reason the watermark write
+            // is: giving up here on a transient novelty condition would discard the
+            // knowledge of a window that DID commit, and the next poll would rewrite it.
+            self.transact_chunks_with_backpressure(
+                state,
+                vec![nodes],
+                |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+                ChunkVerb::Upsert,
+            )
+            .await?;
         }
 
         // The watermark is still SHARED across targets (per-target watermarks are the
@@ -794,6 +889,80 @@ impl Fluree {
         Ok(extract_first_i64(&json))
     }
 
+    /// Every resolved target's applied marker for one source, as
+    /// `(target, table) -> applied snapshot id`.
+    ///
+    /// ONE query for the whole job, not one per target: a templated job fans into as
+    /// many ledgers as it has (tenant,user) pairs — 23 here, unbounded in principle —
+    /// and a per-target read would put that many round trips in front of every poll.
+    ///
+    /// An empty map is the correct answer for a state ledger written before this
+    /// existed, and it makes the first poll behave exactly as it did before: nothing
+    /// is skipped, everything is applied, and the markers are written on the way out.
+    async fn materialize_applied_markers(
+        &self,
+        state_ledger_id: &str,
+        source_graph_source_id: &str,
+    ) -> Result<std::collections::HashMap<(String, String), i64>> {
+        let mut out = std::collections::HashMap::new();
+        if !self.ledger_exists(state_ledger_id).await? {
+            return Ok(out);
+        }
+        let db = self.db(state_ledger_id).await?;
+
+        let mut where_obj = Map::new();
+        where_obj.insert("@id".to_string(), JsonValue::String("?s".to_string()));
+        where_obj.insert(
+            WATERMARK_SOURCE_PRED.to_string(),
+            JsonValue::String(source_graph_source_id.to_string()),
+        );
+        where_obj.insert(
+            WATERMARK_TARGET_PRED.to_string(),
+            JsonValue::String("?target".to_string()),
+        );
+        where_obj.insert(
+            WATERMARK_TABLE_PRED.to_string(),
+            JsonValue::String("?table".to_string()),
+        );
+        // Binding the applied predicate is also what EXCLUDES watermark subjects:
+        // they carry the same source/target/table triple but never this predicate.
+        where_obj.insert(
+            APPLIED_SNAPSHOT_PRED.to_string(),
+            JsonValue::String("?applied".to_string()),
+        );
+        let query = json!({
+            "select": ["?target", "?table", "?applied"],
+            "where": JsonValue::Object(where_obj),
+        });
+
+        let result = self.query(&db, &query).await?;
+        let json = result.to_jsonld(&db.snapshot).map_err(|e| {
+            ApiError::Internal(format!("Failed to format applied-marker query: {e}"))
+        })?;
+        if let Some(rows) = json.as_array() {
+            for row in rows {
+                let Some(cols) = row.as_array() else { continue };
+                let (Some(t), Some(tbl), Some(a)) = (cols.first(), cols.get(1), cols.get(2)) else {
+                    continue;
+                };
+                let (Some(t), Some(tbl)) = (t.as_str(), tbl.as_str()) else {
+                    continue;
+                };
+                // String-encoded on write; tolerate a numeric literal rather than
+                // dropping the marker, since dropping it silently re-enables the
+                // rewrite this exists to prevent.
+                let applied = a
+                    .as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| a.as_i64());
+                if let Some(applied) = applied {
+                    out.insert((t.to_string(), tbl.to_string()), applied);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Open the shared materialization-state ledger, creating it if absent.
     ///
     /// Tolerates losing the create race: two concurrent pollers (or a poller and
@@ -898,6 +1067,79 @@ fn watermark_subject(source_graph_source_id: &str, target_spec: &str, table_name
         esc(target_spec),
         esc(table_name)
     )
+}
+
+/// The per-(source, RESOLVED target, table) applied-marker subject IRI. Same
+/// injective escaping as [`watermark_subject`], different prefix — see
+/// [`APPLIED_SUBJECT_PREFIX`] for why they must not share one.
+fn applied_subject(
+    source_graph_source_id: &str,
+    resolved_target: &str,
+    table_name: &str,
+) -> String {
+    fn esc(s: &str) -> String {
+        s.replace('%', "%25").replace(':', "%3A")
+    }
+    format!(
+        "{APPLIED_SUBJECT_PREFIX}{}:{}:{}",
+        esc(source_graph_source_id),
+        esc(resolved_target),
+        esc(table_name)
+    )
+}
+
+/// Build an applied-marker JSON-LD node for one resolved target and table.
+fn applied_node(
+    source_graph_source_id: &str,
+    resolved_target: &str,
+    table_name: &str,
+    applied_snapshot_id: i64,
+) -> JsonValue {
+    let mut node = Map::new();
+    node.insert(
+        "@id".to_string(),
+        JsonValue::String(applied_subject(
+            source_graph_source_id,
+            resolved_target,
+            table_name,
+        )),
+    );
+    node.insert(
+        APPLIED_SNAPSHOT_PRED.to_string(),
+        JsonValue::String(applied_snapshot_id.to_string()),
+    );
+    node.insert(
+        WATERMARK_SOURCE_PRED.to_string(),
+        JsonValue::String(source_graph_source_id.to_string()),
+    );
+    node.insert(
+        WATERMARK_TARGET_PRED.to_string(),
+        JsonValue::String(resolved_target.to_string()),
+    );
+    node.insert(
+        WATERMARK_TABLE_PRED.to_string(),
+        JsonValue::String(table_name.to_string()),
+    );
+    JsonValue::Object(node)
+}
+
+/// Is this target caught up on every table in the window?
+///
+/// `true` only when EVERY table's `to` is already covered. A target that has
+/// applied one table of a two-table window still has work, so it must not be
+/// skipped — that is the difference between skipping a no-op and silently dropping
+/// half a window.
+fn target_is_caught_up(
+    applied: &std::collections::HashMap<(String, String), i64>,
+    target: &str,
+    table_watermarks: &[(String, Option<i64>, i64)],
+) -> bool {
+    !table_watermarks.is_empty()
+        && table_watermarks.iter().all(|(table, _from, to)| {
+            applied
+                .get(&(target.to_string(), table.clone()))
+                .is_some_and(|a| *a >= *to)
+        })
 }
 
 /// Build the watermark JSON-LD node (`@id` + last snapshot id + source + target +
@@ -2682,6 +2924,94 @@ mod tests {
         assert_eq!(node[WATERMARK_SOURCE_PRED], json!("people:main"));
         assert_eq!(node[WATERMARK_TARGET_PRED], json!("silver:main"));
         assert_eq!(node[WATERMARK_TABLE_PRED], json!("demo.actors"));
+    }
+
+    /// Helper: build an applied-marker map the way a pass would read it.
+    #[cfg(test)]
+    fn applied_map(
+        entries: &[(&str, &str, i64)],
+    ) -> std::collections::HashMap<(String, String), i64> {
+        entries
+            .iter()
+            .map(|(target, table, a)| ((target.to_string(), table.to_string()), *a))
+            .collect()
+    }
+
+    /// The case this whole change exists for: a job whose watermark cannot advance
+    /// must still skip the targets that already have the window.
+    #[test]
+    fn a_target_that_applied_the_window_is_caught_up() {
+        let tw = vec![("silver.observation".to_string(), Some(10i64), 20i64)];
+        let applied = applied_map(&[("silver_acme_u1:main", "silver.observation", 20)]);
+        assert!(target_is_caught_up(&applied, "silver_acme_u1:main", &tw));
+        // A target the markers say nothing about must NOT be skipped.
+        assert!(!target_is_caught_up(&applied, "silver_acme_u2:main", &tw));
+    }
+
+    /// `>=`, not `==`: a marker ahead of this window (a re-poll of an older snapshot,
+    /// or a window that moved backwards after a forced full) still means "has it".
+    /// Equality here would re-apply and rebuild the amplification.
+    #[test]
+    fn an_applied_marker_at_or_beyond_the_window_counts_as_caught_up() {
+        let tw = vec![("t".to_string(), None, 20i64)];
+        assert!(target_is_caught_up(
+            &applied_map(&[("x:main", "t", 20)]),
+            "x:main",
+            &tw
+        ));
+        assert!(target_is_caught_up(
+            &applied_map(&[("x:main", "t", 21)]),
+            "x:main",
+            &tw
+        ));
+        assert!(!target_is_caught_up(
+            &applied_map(&[("x:main", "t", 19)]),
+            "x:main",
+            &tw
+        ));
+    }
+
+    /// ALL tables, not any. A target that applied one table of a two-table window
+    /// still owes the other one, and skipping it there would drop half a window
+    /// silently — the one bug in this change that would lose data rather than repeat
+    /// work.
+    #[test]
+    fn a_target_behind_on_any_table_is_not_caught_up() {
+        let tw = vec![
+            ("t_a".to_string(), None, 20i64),
+            ("t_b".to_string(), None, 30i64),
+        ];
+        let both = applied_map(&[("x:main", "t_a", 20), ("x:main", "t_b", 30)]);
+        assert!(target_is_caught_up(&both, "x:main", &tw));
+        let only_a = applied_map(&[("x:main", "t_a", 20)]);
+        assert!(!target_is_caught_up(&only_a, "x:main", &tw));
+        let a_ok_b_behind = applied_map(&[("x:main", "t_a", 20), ("x:main", "t_b", 29)]);
+        assert!(!target_is_caught_up(&a_ok_b_behind, "x:main", &tw));
+    }
+
+    /// An empty window must never mark anything caught up. `all()` over an empty
+    /// slice is vacuously true, so without the guard a source with no snapshots yet
+    /// would skip every target forever and materialize nothing.
+    #[test]
+    fn an_empty_window_leaves_every_target_not_caught_up() {
+        let applied = applied_map(&[("x:main", "t", 99)]);
+        assert!(!target_is_caught_up(&applied, "x:main", &[]));
+    }
+
+    /// The markers key on the RESOLVED target, and must not collide with the
+    /// spec-keyed watermark subject — which they would if both used one prefix, since
+    /// for a non-templated job spec == resolved.
+    #[test]
+    fn applied_and_watermark_subjects_never_collide() {
+        let w = watermark_subject("src:main", "silver:main", "t");
+        let a = applied_subject("src:main", "silver:main", "t");
+        assert_ne!(w, a);
+        assert!(a.starts_with(APPLIED_SUBJECT_PREFIX));
+        // Injective in the resolved target, like the watermark is in the spec.
+        assert_ne!(
+            applied_subject("s", "silver_a:main_b", "t"),
+            applied_subject("s", "silver_a:main", "b:t")
+        );
     }
 
     #[test]
