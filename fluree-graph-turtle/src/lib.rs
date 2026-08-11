@@ -32,6 +32,7 @@
 //! parse error.
 
 pub mod adapter;
+pub mod diagnostic;
 pub mod error;
 pub mod lex;
 pub mod options;

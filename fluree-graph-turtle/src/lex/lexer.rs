@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use fluree_graph_ir::LineIndex;
 use winnow::ascii::digit1;
 use winnow::combinator::{alt, opt, peek, preceded};
 use winnow::error::ContextError;
@@ -112,60 +113,40 @@ impl<'a> StreamingLexer<'a> {
 }
 
 /// Create a descriptive error message for an invalid token.
+///
+/// The message is a one-line headline followed by the shared caret block
+/// ([`LineIndex::caret_block`]) — the same block a
+/// [`Diagnostic`](fluree_graph_ir::Diagnostic) renders, so a raw lexer error
+/// and a structured diagnostic point at a position identically. The split at
+/// the first newline is load-bearing: [`TurtleError::to_diagnostic`] takes
+/// the headline from it.
+///
+/// The index is built here, on the error path only — a clean parse never
+/// scans the input for line starts.
 fn make_lex_error(source: &str, position: usize, input: &Input<'_>) -> TurtleError {
     let remaining = input.as_ref();
     let bad_char = remaining.chars().next().unwrap_or('?');
-    let (line, col) = lex_line_col(source, position);
-    let line_content = lex_get_line(source, line);
+    let index = LineIndex::new(source);
+    let (line, col) = index.line_col(position);
 
-    let pointer = " ".repeat(col.saturating_sub(1));
-    let message = if bad_char == '"' || bad_char == '\'' {
-        format!(
-            "unterminated string literal at line {line}, column {col}\n  |\n{line} | {line_content}\n  | {pointer}^"
-        )
+    let headline = if bad_char == '"' || bad_char == '\'' {
+        format!("unterminated string literal at line {line}, column {col}")
     } else if bad_char == '<' {
-        format!(
-            "invalid or unterminated IRI at line {line}, column {col}\n  |\n{line} | {line_content}\n  | {pointer}^"
-        )
+        format!("invalid or unterminated IRI at line {line}, column {col}")
     } else if !bad_char.is_ascii() && !is_pn_chars_base(bad_char) {
         format!(
-            "unexpected character '{}' (U+{:04X}) at line {}, column {}\n  |\n{} | {}\n  | {}^",
+            "unexpected character '{}' (U+{:04X}) at line {line}, column {col}",
             bad_char.escape_unicode(),
             bad_char as u32,
-            line,
-            col,
-            line,
-            line_content,
-            pointer
         )
     } else {
-        format!(
-            "unexpected character '{bad_char}' at line {line}, column {col}\n  |\n{line} | {line_content}\n  | {pointer}^"
-        )
+        format!("unexpected character '{bad_char}' at line {line}, column {col}")
     };
 
-    TurtleError::Lexer { position, message }
-}
-
-fn lex_line_col(source: &str, position: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut col = 1;
-    for (i, c) in source.char_indices() {
-        if i >= position {
-            break;
-        }
-        if c == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
+    TurtleError::Lexer {
+        position,
+        message: format!("{headline}\n{}", index.caret_block(line, col)),
     }
-    (line, col)
-}
-
-fn lex_get_line(source: &str, line_num: usize) -> &str {
-    source.lines().nth(line_num.saturating_sub(1)).unwrap_or("")
 }
 
 /// Skip whitespace and comments.
@@ -318,7 +299,13 @@ fn parse_at_directive(input: &mut Input<'_>) -> ModalResult<TokenKind> {
     let word: &str =
         take_while(1.., |c: char| c.is_ascii_alphanumeric() || c == '-').parse_next(input)?;
 
-    match word.to_lowercase().as_str() {
+    // Turtle's `@`-directives are case-SENSITIVE: the grammar spells them
+    // '@prefix' and '@base' as literal terminals, so `@BASE` is not a
+    // directive (it lexes as a language tag, which the parser then rejects in
+    // directive position). The SPARQL-style `PREFIX`/`BASE` forms in
+    // `parse_prefixed_name_or_keyword` are the case-INSENSITIVE ones — the
+    // two spellings genuinely differ.
+    match word {
         "prefix" => Ok(TokenKind::KwPrefix),
         "base" => Ok(TokenKind::KwBase),
         _ => Ok(TokenKind::LangTag),
@@ -401,14 +388,21 @@ fn parse_prefixed_name_or_keyword(input: &mut Input<'_>) -> ModalResult<TokenKin
             None => Ok(TokenKind::PrefixedNameNs),
         }
     } else {
-        // Check if it's a keyword
+        // Check if it's a keyword.
+        //
+        // `a`, `true` and `false` are literal terminals in the Turtle
+        // grammar and stay case-SENSITIVE. The SPARQL-style directives are
+        // not: Turtle 1.1 §6.4 defines them by reference to the SPARQL
+        // grammar, whose keywords are case-insensitive, so `base`, `Base`
+        // and `PreFIX` are all directives. (The `@`-prefixed spellings in
+        // `parse_at_directive` are the case-sensitive ones.)
         match word.as_str() {
             "a" => Ok(TokenKind::KwA),
             "true" => Ok(TokenKind::KwTrue),
             "false" => Ok(TokenKind::KwFalse),
-            "PREFIX" => Ok(TokenKind::KwSparqlPrefix),
-            "BASE" => Ok(TokenKind::KwSparqlBase),
             "GRAPH" => Ok(TokenKind::KwGraph),
+            w if w.eq_ignore_ascii_case("PREFIX") => Ok(TokenKind::KwSparqlPrefix),
+            w if w.eq_ignore_ascii_case("BASE") => Ok(TokenKind::KwSparqlBase),
             _ => {
                 input.reset(&start);
                 Err(winnow::error::ErrMode::Backtrack(ContextError::new()))
@@ -431,27 +425,33 @@ fn parse_pn_local(input: &mut Input<'_>) -> ModalResult<()> {
         return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
     }
 
+    // PN_LOCAL ::= (PN_CHARS_U | ':' | [0-9] | PLX)
+    //              ((PN_CHARS | '.' | ':' | PLX)* (PN_CHARS | ':' | PLX))?
+    //
+    // Dots are ordinary interior characters — a RUN of them is fine
+    // (`:s..2`) — and only the FINAL character is constrained: it may not be
+    // a dot, so a name-final dot is the statement terminator instead.
+    //
+    // One char of lookahead cannot decide that (`.` followed by `.` may still
+    // be interior), so scan greedily like `parse_blank_node_name` does and
+    // rewind to the last legal end. `last_good` is the byte length of the
+    // longest prefix that ends on PN_CHARS | ':' | PLX; it is tracked rather
+    // than trimmed off at the end because a trailing PLX may legally BE an
+    // escaped dot (`:a\.`), which trimming would eat.
+    let start = input.checkpoint();
+    let all: &str = input.as_ref();
+    let mut last_good: Option<usize> = None;
+    let consumed = |input: &Input<'_>| all.len() - input.as_ref().len();
+
     loop {
-        let _chunk: &str =
-            take_while(0.., |c: char| is_pn_chars(c) || c == ':').parse_next(input)?;
+        let chunk: &str =
+            take_while(0.., |c: char| is_pn_chars(c) || c == ':' || c == '.').parse_next(input)?;
 
-        if input.is_empty() {
-            break;
-        }
-
-        if input.starts_with('.') {
-            let rest = &input.as_ref()[1..];
-            if let Some(next_char) = rest.chars().next() {
-                if is_pn_chars(next_char)
-                    || next_char == ':'
-                    || next_char == '%'
-                    || next_char == '\\'
-                {
-                    '.'.parse_next(input)?;
-                    continue;
-                }
+        if !chunk.is_empty() {
+            let without_trailing_dots = chunk.trim_end_matches('.');
+            if !without_trailing_dots.is_empty() {
+                last_good = Some(consumed(input) - (chunk.len() - without_trailing_dots.len()));
             }
-            break;
         }
 
         if input.starts_with('%') {
@@ -460,18 +460,26 @@ fn parse_pn_local(input: &mut Input<'_>) -> ModalResult<()> {
             if hex.len() != 2 {
                 return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
             }
+            last_good = Some(consumed(input));
         } else if input.starts_with('\\') {
             '\\'.parse_next(input)?;
             let escaped: char = any.parse_next(input)?;
-            if "_~.-!$&'()*+,;=/?#@%".contains(escaped) {
-                // Valid local escape — consumed, content is in the span
-            } else {
+            if !"_~.-!$&'()*+,;=/?#@%".contains(escaped) {
                 return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
             }
+            last_good = Some(consumed(input));
         } else {
             break;
         }
     }
+
+    // No legal end means everything scanned was dots — not a local name.
+    let end = last_good.ok_or_else(|| winnow::error::ErrMode::Backtrack(ContextError::new()))?;
+
+    // Re-consume exactly the legal prefix so the token span stops before any
+    // trailing dot. `end` is a char boundary: only ASCII '.' is dropped.
+    input.reset(&start);
+    let _ = input.next_slice(end);
 
     Ok(())
 }
@@ -1065,6 +1073,129 @@ mod tests {
         assert_eq!(tok("BASE"), vec![TokenKind::KwSparqlBase]);
     }
 
+    /// The two directive spellings have different case rules, and the lexer
+    /// had both backwards. W3C: `turtle-syntax-base-04`,
+    /// `turtle-syntax-prefix-02`, `turtle-syntax-bad-base-02`.
+    #[test]
+    fn test_sparql_style_directives_are_case_insensitive() {
+        for spelling in ["BASE", "base", "Base", "BaSe"] {
+            assert_eq!(
+                tok(spelling),
+                vec![TokenKind::KwSparqlBase],
+                "{spelling} must lex as a SPARQL-style BASE"
+            );
+        }
+        for spelling in ["PREFIX", "prefix", "PreFIX", "Prefix"] {
+            assert_eq!(
+                tok(spelling),
+                vec![TokenKind::KwSparqlPrefix],
+                "{spelling} must lex as a SPARQL-style PREFIX"
+            );
+        }
+    }
+
+    /// `@`-directives are literal terminals — only lowercase is a directive.
+    /// `@BASE` lexes as a language tag, which the parser rejects in directive
+    /// position.
+    #[test]
+    fn test_at_directives_are_case_sensitive() {
+        assert_eq!(tok("@prefix"), vec![TokenKind::KwPrefix]);
+        assert_eq!(tok("@base"), vec![TokenKind::KwBase]);
+        for spelling in ["@BASE", "@Base", "@PREFIX", "@PreFIX"] {
+            assert_eq!(
+                tok(spelling),
+                vec![TokenKind::LangTag],
+                "{spelling} must NOT lex as a directive"
+            );
+        }
+    }
+
+    /// The Turtle keywords keep their case sensitivity — widening the
+    /// directives must not widen these.
+    #[test]
+    fn test_turtle_keywords_stay_case_sensitive() {
+        assert_eq!(tok("true"), vec![TokenKind::KwTrue]);
+        assert_eq!(tok("false"), vec![TokenKind::KwFalse]);
+        assert_eq!(tok("a"), vec![TokenKind::KwA]);
+        for not_a_keyword in ["TRUE", "True", "FALSE", "A"] {
+            assert!(
+                tokenize(not_a_keyword).is_err(),
+                "{not_a_keyword} must not lex as a keyword"
+            );
+        }
+    }
+
+    /// PN_LOCAL takes dots as ordinary interior characters — including runs
+    /// of them — and only forbids a dot as the FINAL character, where it is
+    /// the statement terminator instead. W3C: `turtle-syntax-ln-dots`.
+    #[test]
+    fn test_pn_local_interior_dots() {
+        // Single interior dot.
+        assert_eq!(tok_spans(":o.1"), vec![(TokenKind::PrefixedName, ":o.1")]);
+        // A RUN of interior dots — the case one char of lookahead cannot see.
+        assert_eq!(tok_spans(":s..2"), vec![(TokenKind::PrefixedName, ":s..2")]);
+        assert_eq!(
+            tok_spans(":a...b"),
+            vec![(TokenKind::PrefixedName, ":a...b")]
+        );
+        // Leading digit plus interior dot.
+        assert_eq!(tok_spans(":3.s"), vec![(TokenKind::PrefixedName, ":3.s")]);
+    }
+
+    /// A name-final dot terminates the statement and is not part of the name.
+    #[test]
+    fn test_pn_local_trailing_dot_is_the_terminator() {
+        assert_eq!(
+            tok_spans(":o.1."),
+            vec![(TokenKind::PrefixedName, ":o.1"), (TokenKind::Dot, ".")]
+        );
+        // A trailing RUN: the name keeps none of it, and each dot lexes out.
+        assert_eq!(
+            tok_spans(":s..2.."),
+            vec![
+                (TokenKind::PrefixedName, ":s..2"),
+                (TokenKind::Dot, "."),
+                (TokenKind::Dot, "."),
+            ]
+        );
+        assert_eq!(
+            tok_spans(":3."),
+            vec![(TokenKind::PrefixedName, ":3"), (TokenKind::Dot, ".")]
+        );
+    }
+
+    /// PLX (`%XX` and `\`-escapes) is a legal final element, so a name ending
+    /// in an ESCAPED dot keeps it — the reason the scan tracks the last legal
+    /// end instead of trimming trailing dots off the span.
+    #[test]
+    fn test_pn_local_plx_endings_survive() {
+        assert_eq!(tok_spans(r":a\."), vec![(TokenKind::PrefixedName, r":a\.")]);
+        assert_eq!(
+            tok_spans(r":a\..b"),
+            vec![(TokenKind::PrefixedName, r":a\..b")]
+        );
+        assert_eq!(tok_spans(":a%20"), vec![(TokenKind::PrefixedName, ":a%20")]);
+        // Percent-escape after an interior dot run.
+        assert_eq!(
+            tok_spans(":a..%20"),
+            vec![(TokenKind::PrefixedName, ":a..%20")]
+        );
+        // An escaped dot followed by the real terminator.
+        assert_eq!(
+            tok_spans(r":a\.."),
+            vec![(TokenKind::PrefixedName, r":a\."), (TokenKind::Dot, ".")]
+        );
+    }
+
+    /// PN_LOCAL may not START with a dot: `:.a` is the empty namespace, then
+    /// a dot — never a local name of `.a`.
+    #[test]
+    fn test_pn_local_cannot_start_with_a_dot() {
+        let toks = tok_spans(":.a");
+        assert_eq!(toks[0], (TokenKind::PrefixedNameNs, ":"));
+        assert_eq!(toks[1], (TokenKind::Dot, "."));
+    }
+
     #[test]
     fn test_lang_tag() {
         assert_eq!(tok("@en"), vec![TokenKind::LangTag]);
@@ -1387,5 +1518,141 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("line 2"));
         assert!(msg.contains("$"));
+    }
+}
+
+#[cfg(test)]
+mod caret_pin_tests {
+    use super::*;
+
+    /// Byte-for-byte pin on the caret diagnostics the lexer has always
+    /// produced. `make_lex_error` now composes its message from a headline
+    /// plus [`LineIndex::caret_block`] instead of formatting the block
+    /// inline; that refactor is only safe if the rendered bytes are
+    /// unchanged, and this is what says so.
+    ///
+    /// It also pins the structural split the diagnostic adapter depends on:
+    /// the headline is everything before the FIRST newline, the caret block
+    /// is everything after it.
+    #[test]
+    fn lexer_messages_render_exactly_as_before() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "ex:name $ ex:value",
+                "unexpected character '$' at line 1, column 9\n  |\n1 | ex:name $ ex:value\n  |         ^",
+            ),
+            (
+                "ex:name \"unterminated",
+                "unterminated string literal at line 1, column 9\n  |\n1 | ex:name \"unterminated\n  |         ^",
+            ),
+            (
+                "ex:name \"ok\" .\nex:other $ .",
+                "unexpected character '$' at line 2, column 10\n  |\n2 | ex:other $ .\n  |          ^",
+            ),
+            (
+                "<http://example.org/unterminated",
+                "invalid or unterminated IRI at line 1, column 1\n  |\n1 | <http://example.org/unterminated\n  | ^",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let err = tokenize(input).expect_err("input must not lex");
+            let TurtleError::Lexer { message, .. } = &err else {
+                panic!("expected a lexer error for {input:?}, got {err:?}");
+            };
+            assert_eq!(message, expected, "input {input:?}");
+
+            let (headline, block) = message
+                .split_once('\n')
+                .expect("every caret message is a headline then a block");
+            assert!(!headline.contains('\n'));
+            assert!(block.starts_with("  |\n") && block.ends_with('^'));
+        }
+    }
+
+    /// The gutter widens with the line number, so the three `|` stay in one
+    /// column past line 9. This is the one place the caret rendering
+    /// deliberately differs from what the lexer emitted before it shared
+    /// `LineIndex::caret_block`: the old fixed two-space gutter put the bar
+    /// (and the caret) one cell left of the source text from line 10 on.
+    /// Single-digit lines — every other case pinned above — are byte-identical.
+    #[test]
+    fn the_gutter_widens_past_line_nine() {
+        let mut source = "<http://ex/s> <http://ex/p> \"ok\" .\n".repeat(11);
+        source.push_str("ex:other $ .");
+        let err = tokenize(&source).expect_err("input must not lex");
+        let TurtleError::Lexer { message, .. } = &err else {
+            panic!("expected a lexer error, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "unexpected character '$' at line 12, column 10\n   |\n12 | ex:other $ .\n   |          ^"
+        );
+
+        let (_, block) = message.split_once('\n').expect("headline then block");
+        let bars: Vec<usize> = block
+            .lines()
+            .map(|l| l.find('|').expect("gutter bar"))
+            .collect();
+        assert_eq!(bars, vec![3, 3, 3], "all three bars share a column");
+    }
+
+    /// A non-ASCII, non-name character keeps its escaped spelling and its
+    /// code point — and the caret still counts CHARACTERS, so it lands under
+    /// the offending glyph rather than drifting right by its extra bytes.
+    #[test]
+    fn non_ascii_messages_and_caret_columns_are_unchanged() {
+        // Two multi-byte characters precede the offender, so its byte offset
+        // (15) and its column (14) differ — a byte-based column would put the
+        // caret in the wrong place.
+        let err = tokenize("ex:a \"héllö\" § .").expect_err("§ must not lex");
+        let TurtleError::Lexer { message, .. } = &err else {
+            panic!("expected a lexer error, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "unexpected character '\\u{a7}' (U+00A7) at line 1, column 14\n  |\n1 | ex:a \"héllö\" § .\n  |              ^"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mint_namespace_tests {
+    use super::*;
+
+    /// `GraphCollectorSink`/`TermTable` mint anonymous blank nodes as
+    /// `-b{N}`, and the disjointness argument for that prefix is that the
+    /// grammar cannot lex it. This asserts that argument against the real
+    /// lexer instead of asserting it in a comment — the comment was wrong
+    /// once already, claiming the label "still serializes".
+    ///
+    /// The consequence is the writers' contract: a minted anonymous label
+    /// CANNOT be passed through to output the way a user-written label can.
+    /// Round-tripping one produces a document this parser rejects, so a
+    /// writer must relabel every anonymous mint.
+    #[test]
+    fn minted_anonymous_labels_are_deliberately_unlexable() {
+        for position in [
+            "_:-b1 <http://ex/p> <http://ex/o> .",
+            "<http://ex/s> <http://ex/p> _:-b1 .",
+        ] {
+            let err = tokenize(position)
+                .expect_err("a leading '-' must not lex — that is what buys disjointness");
+            assert!(
+                matches!(err, TurtleError::Lexer { .. }),
+                "{position}: {err:?}"
+            );
+        }
+
+        // A MEDIAL '-' is legal, which is the distinction the old comment
+        // blurred: it is why `_:b-1` is fine and `_:-b1` is not.
+        assert!(
+            tokenize("_:b-1 <http://ex/p> <http://ex/o> .").is_ok(),
+            "a medial '-' is legal in BLANK_NODE_LABEL"
+        );
+
+        // And the collision the prefix exists to prevent is real: a bare
+        // `b1` mint is indistinguishable from a document's own `_:b1`.
+        assert!(tokenize("_:b1 <http://ex/p> <http://ex/o> .").is_ok());
     }
 }

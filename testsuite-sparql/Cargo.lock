@@ -1112,6 +1112,7 @@ name = "fluree-graph-format"
 version = "4.1.5"
 dependencies = [
  "fluree-graph-ir",
+ "fluree-vocab",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

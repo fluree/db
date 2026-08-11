@@ -842,7 +842,15 @@ pub type ChunkPayload = (usize, Vec<u8>);
 /// Parsed header directives extracted from a Turtle file's prefix block.
 ///
 /// - `prefixes`: short prefix → namespace IRI (already resolved against any `@base`)
-/// - `base`: base IRI (as declared)
+/// - `base`: base IRI, **as RESOLVED** — not as the document spelled it.
+///   A relative `@base` is resolved against the base in scope before it
+///   reaches `on_base`, so what lands here is always absolute.
+///
+/// That is load-bearing rather than incidental: this prelude is fed straight
+/// back into `parse_with_prefixes_base` for every chunk of a parallel import,
+/// and that entry point REFUSES a non-absolute base. A relative value here
+/// would fail the import loudly (never silently mis-resolve), but the reason
+/// it cannot happen is that resolution occurs upstream, at the directive.
 #[derive(Debug, Clone, Default)]
 pub struct TurtlePrelude {
     pub prefixes: Vec<(String, String)>,

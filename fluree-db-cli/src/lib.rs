@@ -14,6 +14,7 @@ pub mod error;
 pub mod graph_source_display;
 pub mod input;
 pub mod output;
+pub mod rdf;
 pub mod remote_client;
 
 use cli::{Cli, Commands};
@@ -31,6 +32,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
     let config_path = cli.config.as_deref();
     let direct = cli.direct;
+    let quiet = cli.quiet;
 
     match cli.command {
         Commands::Init { global, format } => {
@@ -691,6 +693,9 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::memory::run(action, &fluree_dir).await
         }
+
+        // No `.fluree/` lookup: the rdf verbs read files, not ledgers.
+        Commands::Rdf { action } => rdf::run(&action, quiet),
 
         Commands::Iceberg { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;

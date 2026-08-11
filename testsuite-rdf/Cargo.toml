@@ -1,0 +1,26 @@
+[package]
+name = "testsuite-rdf"
+version = "4.1.4"
+edition = "2021"
+publish = false
+
+# Standalone package: never part of the repo workspace (the root Cargo.toml
+# also excludes it by path, but that exclusion doesn't apply when the repo is
+# checked out as a nested git worktree — this marker keeps cargo from walking
+# up to an enclosing workspace root).
+[workspace]
+
+[dependencies]
+# Fluree crates under test — the syntax layer only. This harness deliberately
+# does NOT depend on fluree-db-api: it gates the parser/IR, not the database.
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+
+# Test infrastructure
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "rdf-conformance"
+path = "src/bin/rdf_conformance.rs"

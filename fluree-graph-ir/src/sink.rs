@@ -11,8 +11,8 @@
 //! - Future: `FlureeIngestSink`: Converts events to transaction IR
 //! - Future: `StreamingSink`: Writes triples directly to output
 
+use crate::term_table::TermTable;
 use crate::{Datatype, Graph, LiteralValue, Term, Triple};
-use std::collections::HashMap;
 
 /// Error returned by a [`GraphSink`] when it cannot accept an event.
 ///
@@ -53,6 +53,26 @@ impl SinkError {
 
 /// Result alias for [`GraphSink`] emission methods.
 pub type SinkResult = std::result::Result<(), SinkError>;
+
+/// How many *quad-shaped* events [`GraphSink`] defines — events that carry a
+/// graph term and so must be routed to a particular graph by a dataset sink.
+///
+/// Today that is exactly one: [`GraphSink::emit_quad`]. Every other emission
+/// event ([`GraphSink::emit_triple`], [`GraphSink::emit_list_item`],
+/// [`GraphSink::emit_reified_triple`]) has no graph term, which leaves the
+/// default graph as the only thing it can mean — see
+/// [`DatasetCollectorSink::emit_list_item`](crate::DatasetCollectorSink) for
+/// the consequence.
+///
+/// **If you add a quad-shaped event to the trait, bump this and route it in
+/// every dataset sink.** A test asserts the value, so the bump is forced and
+/// the failure names the work; what it cannot do is notice the new method by
+/// itself. Rust has no reflection over trait items, and a default-bodied
+/// addition compiles against every existing impl — which is exactly how such
+/// an event would otherwise reach a dataset sink and be silently dropped into
+/// the default graph. Hence a hand-maintained count, deliberately sited next
+/// to the methods it counts so the adding diff touches it.
+pub const PROTOCOL_QUAD_EVENTS: usize = 1;
 
 /// Opaque term identifier for efficient triple emission
 ///
@@ -207,6 +227,9 @@ pub trait GraphSink {
     /// Emit a quad: the triple `(subject, predicate, object)` in the named
     /// graph `graph`.
     ///
+    /// This is the trait's only quad-shaped event; adding another means
+    /// bumping [`PROTOCOL_QUAD_EVENTS`] and routing it in every dataset sink.
+    ///
     /// Only called when [`Self::supports_quads`] returns `true`. Unlike
     /// [`Self::emit_reified_triple`] — whose producers are all guarded by an
     /// explicit parser-side capability check — the default body **errors**
@@ -343,24 +366,8 @@ pub trait GraphSink {
 pub struct GraphCollectorSink {
     /// The graph being built
     graph: Graph,
-    /// Terms indexed by TermId
-    terms: Vec<Term>,
-    /// Counter for generating blank node IDs
-    blank_counter: u32,
-    /// Cache for blank node labels to TermId mapping
-    blank_labels: HashMap<String, TermId>,
-    /// Slots in `terms` that hold literals, in mint order.
-    ///
-    /// Literals are the only statement-scoped terms (see [`TermId`]): they
-    /// are minted per occurrence and never deduplicated, while IRI and blank
-    /// ids are cached by producers for the whole parse. `emit_*` clones a
-    /// term into the graph, so once the statement ends its literal slots hold
-    /// nothing anyone can still reference and may be overwritten.
-    literal_slots: Vec<u32>,
-    /// How far into `literal_slots` the current statement has consumed.
-    /// Reset to 0 by `end_statement`, which is what turns the list into a
-    /// per-statement ring instead of a per-document one.
-    literal_cursor: usize,
+    /// Terms indexed by TermId, with statement-scoped literal recycling
+    terms: TermTable,
     /// Graph length at the current statement's start — the rewind point for
     /// [`GraphSink::abort_statement`]. Advanced at every statement boundary,
     /// so it is always "everything before the statement in flight".
@@ -372,11 +379,7 @@ impl GraphCollectorSink {
     pub fn new() -> Self {
         Self {
             graph: Graph::new(),
-            terms: Vec::new(),
-            blank_counter: 0,
-            blank_labels: HashMap::new(),
-            literal_slots: Vec::new(),
-            literal_cursor: 0,
+            terms: TermTable::new(),
             statement_mark: 0,
         }
     }
@@ -385,11 +388,7 @@ impl GraphCollectorSink {
     pub fn with_base(base: impl Into<String>) -> Self {
         Self {
             graph: Graph::with_base(base),
-            terms: Vec::new(),
-            blank_counter: 0,
-            blank_labels: HashMap::new(),
-            literal_slots: Vec::new(),
-            literal_cursor: 0,
+            terms: TermTable::new(),
             statement_mark: 0,
         }
     }
@@ -414,57 +413,7 @@ impl GraphCollectorSink {
 
     /// Get a term by its ID
     fn get_term(&self, id: TermId) -> &Term {
-        &self.terms[id.0 as usize]
-    }
-
-    /// Add a term and return its ID
-    fn add_term(&mut self, term: Term) -> TermId {
-        let id = TermId(self.terms.len() as u32);
-        self.terms.push(term);
-        id
-    }
-
-    /// Debug-only invariant: every slot the current statement is about to
-    /// retire still holds a literal.
-    ///
-    /// `literal_slots` may only ever contain slots minted by
-    /// [`Self::add_literal_term`]. If an IRI or blank term is found in one,
-    /// something has routed a session-scoped term through the literal lane,
-    /// and retiring the slot would hand a producer-cached id to the next
-    /// literal — corrupting the graph silently and in a way that still looks
-    /// well-formed. Fail loudly in debug builds instead; compiled out of
-    /// release.
-    fn debug_assert_retiring_slots_are_literals(&self) {
-        if cfg!(debug_assertions) {
-            for &slot in &self.literal_slots[..self.literal_cursor] {
-                debug_assert!(
-                    matches!(self.terms[slot as usize], Term::Literal { .. }),
-                    "retiring non-literal slot {slot}: {:?} — literal_slots is polluted, \
-                     recycling it would clobber a producer-cached term id",
-                    self.terms[slot as usize]
-                );
-            }
-        }
-    }
-
-    /// Add a literal term, reusing a slot retired by [`GraphSink::end_statement`]
-    /// when one is available.
-    ///
-    /// Without this, the term table grows by one entry per literal
-    /// *occurrence* for the length of the document; with it, the high-water
-    /// mark is the widest single statement. Producers that never delimit
-    /// statements (the JSON-LD adapter) simply never recycle and keep
-    /// today's behavior.
-    fn add_literal_term(&mut self, term: Term) -> TermId {
-        if let Some(&slot) = self.literal_slots.get(self.literal_cursor) {
-            self.literal_cursor += 1;
-            self.terms[slot as usize] = term;
-            return TermId(slot);
-        }
-        let id = self.add_term(term);
-        self.literal_slots.push(id.0);
-        self.literal_cursor = self.literal_slots.len();
-        id
+        self.terms.get(id)
     }
 }
 
@@ -484,57 +433,19 @@ impl GraphSink for GraphCollectorSink {
     }
 
     fn term_iri(&mut self, iri: &str) -> TermId {
-        self.add_term(Term::iri(iri))
+        self.terms.iri(iri)
     }
 
     fn term_blank(&mut self, label: Option<&str>) -> TermId {
-        match label {
-            Some(l) => {
-                // Check if we've seen this label before
-                if let Some(&id) = self.blank_labels.get(l) {
-                    return id;
-                }
-
-                // Create new blank node with this label
-                let id = self.add_term(Term::blank(l));
-                self.blank_labels.insert(l.to_string(), id);
-                id
-            }
-            None => {
-                // Anonymous blank node (`[ … ]`, collection spine nodes,
-                // reifiers) — unique counter-based label. The leading '-'
-                // keeps the minted namespace disjoint from every
-                // user-written label: Turtle's BLANK_NODE_LABEL must start
-                // with PN_CHARS_U | [0-9], so `_:-b1` can never lex, while
-                // '-' stays legal medially so the label still serializes.
-                //
-                // Without it a document's own `_:b1` and the first mint are
-                // the same `BlankId` and their nodes silently MERGE. Matches
-                // `FlakeSink`/`ImportSink`, which carry the same fix for the
-                // same reason.
-                self.blank_counter += 1;
-                let label = format!("-b{}", self.blank_counter);
-                self.add_term(Term::blank(label))
-            }
-        }
+        self.terms.blank(label)
     }
 
     fn term_literal(&mut self, value: &str, datatype: Datatype, language: Option<&str>) -> TermId {
-        let term = match language {
-            Some(lang) => Term::lang_string(value, lang),
-            None if datatype.is_xsd_string() => Term::string(value),
-            None => Term::typed(value, datatype),
-        };
-        self.add_literal_term(term)
+        self.terms.literal(value, datatype, language)
     }
 
     fn term_literal_value(&mut self, value: LiteralValue, datatype: Datatype) -> TermId {
-        let term = Term::Literal {
-            value,
-            datatype,
-            language: None,
-        };
-        self.add_literal_term(term)
+        self.terms.literal_value(value, datatype)
     }
 
     /// Retire this statement's literal slots for reuse, and move the rewind
@@ -542,8 +453,7 @@ impl GraphSink for GraphCollectorSink {
     /// `emit_*` has already cloned every term it needed into the graph, and
     /// because producers only cache IRI and blank ids across statements.
     fn end_statement(&mut self) {
-        self.debug_assert_retiring_slots_are_literals();
-        self.literal_cursor = 0;
+        self.terms.end_statement();
         self.statement_mark = self.graph.len();
     }
 
@@ -552,9 +462,8 @@ impl GraphSink for GraphCollectorSink {
     /// exactly as a successful statement's are.
     fn abort_statement(&mut self) {
         // Same retirement, same invariant.
-        self.debug_assert_retiring_slots_are_literals();
+        self.terms.end_statement();
         self.graph.truncate(self.statement_mark);
-        self.literal_cursor = 0;
     }
 
     fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) -> SinkResult {
@@ -805,6 +714,44 @@ mod tests {
         let sink = GraphCollectorSink::new();
         assert!(!sink.supports_quads());
         assert!(!sink.supports_reified_triples());
+    }
+
+    /// The trait's quad-shaped surface is one method wide. This is the
+    /// tripwire for widening it: an event that carries a graph term needs
+    /// routing in every dataset sink, and one added with a default body
+    /// compiles silently against them all and lands in the default graph.
+    ///
+    /// The assertion cannot detect the new method — nothing in Rust can
+    /// enumerate trait items — so what it buys is a forced, greppable
+    /// decision point next to the methods it counts, and a failure message
+    /// that names the follow-up work.
+    #[test]
+    fn widening_the_quad_surface_forces_a_routing_decision() {
+        assert_eq!(
+            PROTOCOL_QUAD_EVENTS, 1,
+            "GraphSink's quad-shaped surface changed. Every dataset sink must \
+             route the new event to its named graph — DatasetCollectorSink, \
+             and anything downstream implementing GraphSink. Check \
+             DatasetCollectorSink::emit_list_item's doc comment too: it \
+             explains why the NON-quad events land in the default graph, and \
+             a new quad form may retire part of that reasoning."
+        );
+    }
+
+    /// The probe is what routes a producer between the two sinks, so the
+    /// split has to stay exactly where it is. Now that both sinks share a
+    /// term table, this is also the guard against the collector quietly
+    /// inheriting quad support it cannot honor: it has no named graph to put
+    /// a quad in, and answering `true` would send producers straight into the
+    /// trait default's refusal.
+    #[test]
+    fn the_quad_capability_split_is_the_only_difference_the_probe_reports() {
+        assert!(!GraphCollectorSink::new().supports_quads());
+        assert!(crate::DatasetCollectorSink::new().supports_quads());
+
+        // And neither claims reification — the capabilities are independent.
+        assert!(!GraphCollectorSink::new().supports_reified_triples());
+        assert!(!crate::DatasetCollectorSink::new().supports_reified_triples());
     }
 
     /// Symmetric with quads: a sink that claims the capability but never

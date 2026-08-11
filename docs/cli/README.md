@@ -63,6 +63,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`query`](query.md) | Query a ledger |
 | [`multi-query`](multi-query.md) | Run multiple queries against a single consistent snapshot |
 | [`validate`](validate.md) | Validate data against SHACL shapes (report) |
+| [`rdf`](rdf/README.md) | RDF syntax tooling — check, count, convert files with no ledger |
 | [`model`](model.md) | Governance model tooling — access profiles, SHACL entity shapes, class hierarchy |
 | [`history`](history.md) | Show change history for an entity |
 | [`export`](export.md) | Export ledger data |

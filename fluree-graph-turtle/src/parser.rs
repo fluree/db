@@ -681,6 +681,25 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         };
         self.advance()?;
 
+        // RFC 3986 §5.1.1: a base declared relative resolves against the base
+        // already in scope — `@base <foo/>` under `http://example.org/ns/` is
+        // `http://example.org/ns/foo/`. Installing the reference verbatim
+        // instead does not fail loudly; it silently mangles every IRI in the
+        // rest of the document, which is a converter writing wrong data.
+        //
+        // The mangling had a distinctive shape worth recording, because it is
+        // what the symptom looks like if this ever regresses: every later IRI
+        // came out with a LEADING COLON (`<:foo/a3>`). Nothing prepends that
+        // colon as a separate bug. With the base left as `foo/`,
+        // `fluree_vocab::iri::parse_iri_components` finds no `:`, so it
+        // reports an EMPTY scheme and treats the whole string as the path;
+        // §5.3 recomposition then unconditionally emits `scheme ":"`, and an
+        // empty scheme prints as a bare `:`. Verified directly:
+        // `resolve_iri("foo/", "a3") == ":foo/a3"`. The resolver is behaving
+        // as specified for an input that cannot occur once the base is
+        // guaranteed absolute — which is what this line guarantees.
+        let base_iri = self.resolve_iri(&base_iri)?;
+
         // Set base
         self.sink_on_base(&base_iri);
         self.base = Some(base_iri);
@@ -757,7 +776,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             self.parse_object_list(subject, predicate)?;
 
             if matches!(self.current().kind, TokenKind::Semicolon) {
-                self.advance()?;
+                // `predicateObjectList ::= verb objectList (';' (verb
+                // objectList)?)*` — the tail item is OPTIONAL, so a run of
+                // semicolons is legal and denotes nothing. Consume the whole
+                // run before deciding whether a predicate follows; generators
+                // emit `;;` and a trailing `;` routinely.
+                while matches!(self.current().kind, TokenKind::Semicolon) {
+                    self.advance()?;
+                }
                 if matches!(
                     self.current().kind,
                     TokenKind::Dot
@@ -988,16 +1014,43 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                     Ok(self.sink_term_literal(text, Datatype::xsd_double(), None))
                 }
             },
-            TokenKind::KwTrue => {
-                self.advance()?;
-                Ok(self
-                    .sink_term_literal_value(LiteralValue::Boolean(true), Datatype::xsd_boolean()))
-            }
-            TokenKind::KwFalse => {
-                self.advance()?;
-                Ok(self
-                    .sink_term_literal_value(LiteralValue::Boolean(false), Datatype::xsd_boolean()))
-            }
+            // The boolean keywords take the same lane as `Integer` and
+            // `Double`: canonicalized to a native value for ingest, routed
+            // through the typed-string lane for conformance. `true` and
+            // `"true"^^xsd:boolean` are ONE RDF term, and only the
+            // typed-string form makes them one IR term as well — `Term`'s
+            // equality and hash are variant-sensitive, so the two spellings
+            // would otherwise be distinct members of the same graph.
+            //
+            // Unlike the numeric tokens there is no span to read: the lexer
+            // matched these keywords case-sensitively, so the source spelling
+            // is exactly "true"/"false".
+            TokenKind::KwTrue => match self.options.numerics {
+                NumericStyle::Canonicalize => {
+                    self.advance()?;
+                    Ok(self.sink_term_literal_value(
+                        LiteralValue::Boolean(true),
+                        Datatype::xsd_boolean(),
+                    ))
+                }
+                NumericStyle::PreserveLexical => {
+                    self.advance()?;
+                    Ok(self.sink_term_literal("true", Datatype::xsd_boolean(), None))
+                }
+            },
+            TokenKind::KwFalse => match self.options.numerics {
+                NumericStyle::Canonicalize => {
+                    self.advance()?;
+                    Ok(self.sink_term_literal_value(
+                        LiteralValue::Boolean(false),
+                        Datatype::xsd_boolean(),
+                    ))
+                }
+                NumericStyle::PreserveLexical => {
+                    self.advance()?;
+                    Ok(self.sink_term_literal("false", Datatype::xsd_boolean(), None))
+                }
+            },
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
                 format!("expected literal, found {:?}", self.current().kind),
@@ -1515,6 +1568,14 @@ pub fn parse_with_options<S: GraphSink>(
 /// directives (e.g., from a file header) and wants to parse subsequent Turtle
 /// fragments without re-prepending/re-parsing the directive text.
 ///
+/// # Errors
+///
+/// `base` must be an ABSOLUTE IRI. A relative one is refused rather than
+/// resolved: a caller-supplied base has no document context to resolve
+/// against, and inventing one would guess at the caller's intent. Callers
+/// holding a possibly-relative base (a CLI `--base` flag, say) must resolve
+/// it themselves before calling.
+///
 /// Notes:
 /// - The provided `prefixes` and `base` affect **prefix expansion and IRI resolution**
 ///   inside the parser.
@@ -1535,6 +1596,10 @@ pub fn parse_with_prefixes_base<S: GraphSink>(
 /// This is the full entry point — every other `parse*` function is this one
 /// with something defaulted — so the chunked reader paths, which need the
 /// pre-seeded prelude, can opt into conformance options too.
+///
+/// # Errors
+///
+/// `base` must be an ABSOLUTE IRI; see [`parse_with_prefixes_base`].
 pub fn parse_with_prefixes_base_options<S: GraphSink>(
     input: &str,
     sink: &mut S,
@@ -1544,6 +1609,25 @@ pub fn parse_with_prefixes_base_options<S: GraphSink>(
 ) -> Result<()> {
     let mut parser = Parser::with_options(input, sink, options)?;
     if let Some(base) = base {
+        // The base PARAMETER gets the same absoluteness guarantee the `@base`
+        // DIRECTIVE gets, and for the same reason: a non-absolute base is not
+        // a base, and installing one silently mangles every IRI in the
+        // document rather than failing. `Some("foo/")` used to yield
+        // `<:foo/a>` — identical corruption to the directive bug, reached
+        // through the API instead of the syntax.
+        //
+        // A relative parameter is REFUSED outright rather than resolved:
+        // unlike a directive, which has a document base in scope to resolve
+        // against, a caller-supplied base has no context, and inventing one
+        // would be guessing at the caller's intent. This matches the error a
+        // relative `@base` gets when nothing is in scope.
+        if !is_absolute_iri(base) {
+            return Err(TurtleError::IriResolution(format!(
+                "base parameter '{base}' is not an absolute IRI — a base must be \
+                 absolute (it is what relative IRIs resolve against, so there is \
+                 nothing to resolve it against itself)"
+            )));
+        }
         parser.base = Some(base.to_string());
     }
     if !prefixes.is_empty() {
@@ -1644,6 +1728,236 @@ mod tests {
         assert!(
             matches!(&triple.p, Term::Iri(iri) if iri.as_ref() == "http://xmlns.com/foaf/0.1/name")
         );
+    }
+
+    /// `true` and `"true"^^xsd:boolean` are one RDF term written two ways.
+    /// Under the conformant preset they must be one IR term too, or a graph
+    /// stating the fact both ways holds two triples where RDF says one.
+    /// W3C: `literal_true`, `literal_false`, `turtle-subm-22`.
+    #[test]
+    fn test_boolean_keyword_and_longhand_agree_under_preserve_lexical() {
+        let both_ways = r#"
+            <http://a/s> <http://a/p> true .
+            <http://a/s> <http://a/p> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+            <http://a/s> <http://a/q> false .
+            <http://a/s> <http://a/q> "false"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+        "#;
+
+        let mut sink = GraphCollectorSink::new();
+        parse_with_options(both_ways, &mut sink, ParserOptions::conformant()).unwrap();
+        let mut graph = sink.into_graph();
+
+        // Four statements, two distinct triples — the halves must collapse.
+        assert_eq!(graph.len(), 4);
+        graph.canonicalize();
+        assert_eq!(
+            graph.len(),
+            2,
+            "keyword and longhand booleans did not dedupe to one term each"
+        );
+    }
+
+    /// The ingest default is unchanged: booleans stay native values there,
+    /// and the two spellings stay distinct (the behavior that made this a
+    /// defect, preserved deliberately for the storage path).
+    #[test]
+    fn test_boolean_keyword_stays_native_under_the_ingest_default() {
+        let input = "<http://a/s> <http://a/p> true .";
+
+        let mut sink = GraphCollectorSink::new();
+        parse(input, &mut sink).unwrap();
+        let triples = sink.into_graph().into_triples();
+
+        match &triples[0].o {
+            Term::Literal {
+                value, datatype, ..
+            } => {
+                assert!(
+                    matches!(value, fluree_graph_ir::LiteralValue::Boolean(true)),
+                    "ingest default must keep the native boolean, got {value:?}"
+                );
+                assert_eq!(
+                    datatype.as_iri(),
+                    "http://www.w3.org/2001/XMLSchema#boolean"
+                );
+            }
+            other => panic!("expected a literal, got {other:?}"),
+        }
+    }
+
+    /// Under the conformant preset the boolean carries its lexical form, so a
+    /// writer round-trips the source spelling rather than a re-canonicalized
+    /// one — the same contract the numeric lane already provides.
+    #[test]
+    fn test_boolean_keeps_its_lexical_form_under_the_conformant_preset() {
+        for (source, lexical) in [("true", "true"), ("false", "false")] {
+            let input = format!("<http://a/s> <http://a/p> {source} .");
+            let mut sink = GraphCollectorSink::new();
+            parse_with_options(&input, &mut sink, ParserOptions::conformant()).unwrap();
+            let triples = sink.into_graph().into_triples();
+
+            match &triples[0].o {
+                Term::Literal {
+                    value, datatype, ..
+                } => {
+                    assert_eq!(value.lexical(), lexical);
+                    assert_eq!(
+                        datatype.as_iri(),
+                        "http://www.w3.org/2001/XMLSchema#boolean"
+                    );
+                }
+                other => panic!("expected a literal, got {other:?}"),
+            }
+        }
+    }
+
+    /// The base PARAMETER reaches the same corruption the `@base` DIRECTIVE
+    /// did, through the API instead of the syntax: `Some("foo/")` produced
+    /// `<:foo/a>`. It is refused, not resolved — a caller-supplied base has
+    /// no document context to resolve against.
+    #[test]
+    fn test_relative_base_parameter_is_refused() {
+        for relative in ["foo/", "a3", "./x/", "../up/", "#frag"] {
+            let mut sink = GraphCollectorSink::new();
+            let result = parse_with_prefixes_base(r"<a> <b> <c> .", &mut sink, &[], Some(relative));
+            assert!(
+                result.is_err(),
+                "relative base parameter {relative:?} must be refused, not installed"
+            );
+        }
+    }
+
+    /// The refusal names the offending value, so a caller passing a bad
+    /// `--base` learns which input was wrong.
+    #[test]
+    fn test_relative_base_parameter_error_names_the_value() {
+        let mut sink = GraphCollectorSink::new();
+        let err = parse_with_prefixes_base(r"<a> <b> <c> .", &mut sink, &[], Some("foo/"))
+            .expect_err("a relative base parameter must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("foo/"), "error must name the value: {msg}");
+        assert!(msg.contains("absolute"), "error must say why: {msg}");
+    }
+
+    /// An absolute parameter still works, and still resolves relative IRIs.
+    #[test]
+    fn test_absolute_base_parameter_still_resolves() {
+        let mut sink = GraphCollectorSink::new();
+        parse_with_prefixes_base(
+            r"<a> <b> <c> .",
+            &mut sink,
+            &[],
+            Some("http://example.org/ns/"),
+        )
+        .unwrap();
+        let triples = sink.into_graph().into_triples();
+        assert_eq!(triples[0].s.as_iri(), Some("http://example.org/ns/a"));
+        assert_eq!(triples[0].o.as_iri(), Some("http://example.org/ns/c"));
+    }
+
+    /// `None` is unaffected — no base is not a bad base.
+    #[test]
+    fn test_absent_base_parameter_is_not_refused() {
+        let mut sink = GraphCollectorSink::new();
+        parse_with_prefixes_base(
+            r"<http://a/s> <http://a/p> <http://a/o> .",
+            &mut sink,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(sink.into_graph().len(), 1);
+    }
+
+    /// A relative `@base` resolves against the base in scope (RFC 3986
+    /// §5.1.1), and the resolution COMPOUNDS across redeclarations. W3C:
+    /// `turtle-subm-27`.
+    #[test]
+    fn test_relative_base_resolves_against_the_in_scope_base() {
+        let input = r"
+            @base <http://example.org/ns/> .
+            <a2> <b2> <c2> .
+            @base <foo/> .
+            <a3> <b3> <c3> .
+            @base <bar/> .
+            <a4> <b4> <c4> .
+        ";
+        let graph = parse_to_graph(input).unwrap();
+
+        let subjects: Vec<&str> = graph.iter().filter_map(|t| t.s.as_iri()).collect();
+        assert_eq!(
+            subjects,
+            vec![
+                "http://example.org/ns/a2",
+                "http://example.org/ns/foo/a3",
+                // Nested: `bar/` resolves against `.../ns/foo/`, not `.../ns/`.
+                "http://example.org/ns/foo/bar/a4",
+            ]
+        );
+    }
+
+    /// A relative prefix namespace resolves against the base current at the
+    /// `@prefix`, including a base that was itself relative.
+    #[test]
+    fn test_relative_prefix_namespace_follows_a_relative_base() {
+        let input = r"
+            @base <http://example.org/ns/> .
+            @base <foo/> .
+            @prefix p: <bar#> .
+            p:a4 p:b4 p:c4 .
+        ";
+        let graph = parse_to_graph(input).unwrap();
+        let triple = graph.iter().next().unwrap();
+        assert_eq!(triple.s.as_iri(), Some("http://example.org/ns/foo/bar#a4"));
+    }
+
+    /// A relative base with nothing to resolve against is an error, not a
+    /// verbatim install — the failure mode this fix exists to remove.
+    #[test]
+    fn test_relative_base_without_a_base_is_an_error() {
+        let input = r"
+            @base <foo/> .
+            <a> <b> <c> .
+        ";
+        assert!(parse_to_graph(input).is_err());
+    }
+
+    /// `predicateObjectList`'s tail item is optional, so a run of semicolons
+    /// is legal Turtle that denotes nothing. W3C: `repeated_semis_at_end`,
+    /// `repeated_semis_not_at_end`, `turtle-syntax-struct-04/05`.
+    #[test]
+    fn test_repeated_semicolons_are_empty_list_items() {
+        let cases = [
+            // between items
+            "<http://a/s> <http://a/p1> <http://a/o1>;; <http://a/p2> <http://a/o2> .",
+            // trailing, before the dot
+            "<http://a/s> <http://a/p1> <http://a/o1> ;; .",
+            // separated run, and a run longer than two
+            "<http://a/s> <http://a/p1> <http://a/o1> ; ; ; <http://a/p2> <http://a/o2> .",
+        ];
+
+        for input in cases {
+            let graph = parse_to_graph(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            let expected = if input.contains("p2") { 2 } else { 1 };
+            assert_eq!(graph.len(), expected, "wrong triple count for: {input}");
+        }
+    }
+
+    /// A semicolon run inside a blank-node property list terminates on `]`
+    /// the same way it terminates on `.` at statement level.
+    #[test]
+    fn test_repeated_semicolons_inside_blank_node_property_list() {
+        let input = r#"<http://a/s> <http://a/p> [ <http://a/q> "v" ;; ] ."#;
+        let graph = parse_to_graph(input).unwrap();
+        assert_eq!(graph.len(), 2);
+    }
+
+    /// The list must still START with a verb — `;` is a separator, not a
+    /// prefix, so a leading one stays an error.
+    #[test]
+    fn test_leading_semicolon_is_still_rejected() {
+        let input = "<http://a/s> ; <http://a/p> <http://a/o> .";
+        assert!(parse_to_graph(input).is_err());
     }
 
     #[test]

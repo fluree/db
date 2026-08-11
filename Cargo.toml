@@ -46,7 +46,12 @@ members = [
     "fluree-bench-virtual",
     "fluree-db-consensus",
 ]
-exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load"]
+exclude = [
+    "testsuite-sparql",
+    "testsuite-shacl",
+    "testsuite-rdf",
+    "scripts/local/load",
+]
 
 [workspace.package]
 version = "4.1.5"

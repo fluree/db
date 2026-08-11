@@ -55,6 +55,17 @@ fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 # ext→format table the server uses, instead of a divergent local copy (#1397).
 fluree-db-r2rml = { path = "../fluree-db-r2rml" }
 
+# `fluree rdf`: the RDF verbs parse and instrument directly against the light
+# graph crates rather than going through the ledger API — there is no ledger.
+fluree-graph-ir = { path = "../fluree-graph-ir" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+# `fluree rdf convert`: the streaming writers the verb serializes through.
+fluree-graph-format = { path = "../fluree-graph-format" }
+# `--profile`'s box table. Every dependency of this crate is already in the
+# CLI's graph, so sharing the renderer with the bench lane costs nothing and
+# keeps the two tables comparable by construction.
+fluree-bench-support = { path = "../fluree-bench-support" }
+
 # Developer memory layer (store + CLI subcommands)
 fluree-db-memory = { path = "../fluree-db-memory" }
 
@@ -123,13 +134,15 @@ fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 async-trait.workspace = true
 parking_lot = "0.12"
 
+# Transparent `.gz` / `.zst` input for the `rdf` verbs. Previously dev-only
+# (fixture generation); now on the runtime path.
+flate2 = { workspace = true }
+zstd = { workspace = true }
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
-# Used by `create --from` integration tests to produce .gz / .zst fixtures inline.
-flate2 = { workspace = true }
-zstd = { workspace = true }
 
 [lints]
 workspace = true
