@@ -589,7 +589,12 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
     }
 }
 
-fn flake_value_to_key(val: &FlakeValue, dtc: &DatatypeConstraint) -> MaterializedLitKey {
+/// The pipeline's canonical term identity for a materialized literal.
+///
+/// Shared with the exact NumBig distinct-object counter in [`crate::fast_count`],
+/// which must key arena values exactly as the general pipeline does or the two
+/// would disagree about how many distinct objects a graph holds.
+pub(crate) fn flake_value_to_key(val: &FlakeValue, dtc: &DatatypeConstraint) -> MaterializedLitKey {
     match val {
         FlakeValue::String(s) => MaterializedLitKey {
             discriminant: 1,
