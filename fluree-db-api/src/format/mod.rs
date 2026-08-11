@@ -431,7 +431,8 @@ pub fn format_results_string(
             return delimited::format_string_for(result, snapshot, config)
         }
         OutputFormat::SparqlXml => {
-            let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
+            let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
+                .with_absolute_iris(config.absolute_iris);
             return sparql_xml::format(result, &compactor, config);
         }
         OutputFormat::RdfXml => {

@@ -18,7 +18,7 @@
 //! - Disaggregation: `Binding::Grouped` explodes into multiple rows (cartesian product)
 
 use super::config::FormatterConfig;
-use super::datatype::omit_datatype_for_string_literal;
+use super::datatype::may_omit_datatype;
 use super::iri::IriCompactor;
 use super::json_write::{push_json_string, push_value};
 use super::{materialize, FormatError, Result};
@@ -396,7 +396,7 @@ fn write_literal(
             if let Some(lang) = lang {
                 out.push_str(r#","xml:lang":"#);
                 push_json_string(out, lang);
-            } else if !omit_datatype_for_string_literal(dt_iri, w3c_strict) {
+            } else if !may_omit_datatype(dt_iri, w3c_strict) {
                 out.push_str(r#","datatype":"#);
                 push_json_string(out, dt_iri);
             }
@@ -539,10 +539,7 @@ fn format_binding(
                             "value": s,
                             "xml:lang": lang_tag
                         })))
-                    } else if omit_datatype_for_string_literal(
-                        &dt_iri,
-                        compactor.emits_absolute_iris(),
-                    ) {
+                    } else if may_omit_datatype(&dt_iri, compactor.emits_absolute_iris()) {
                         // Omittable - a bare value denotes exactly this term
                         Ok(Some(json!({
                             "type": "literal",

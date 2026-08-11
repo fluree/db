@@ -129,6 +129,10 @@ async fn w3c_result_formats_emit_absolute_iris_under_every_prologue() {
             srx.contains(&format!("<uri>{S2}</uri>")),
             "{label}: SRX must carry the absolute IRI: {srx}"
         );
+        assert!(
+            srx.contains(r#"datatype="http://www.w3.org/2001/XMLSchema#integer""#),
+            "{label}: SRX must carry the literal's datatype: {srx}"
+        );
 
         // CSV and TSV carry the identical defect on main.
         let csv = result.to_csv(&view.snapshot).expect("csv");
@@ -210,6 +214,21 @@ async fn w3c_sparql_json_keeps_datatype_on_constructed_literals() {
             json!({"type": "literal", "value": lex, "datatype": dt}),
             "STRDT({lex}, {dt}) must round-trip its datatype"
         );
+
+        // SPARQL Results XML carries the identical rule: `<literal>` content is
+        // text, so nothing is inferable from it either. On main the XML writer
+        // dropped the tag for EVERY value kind, not just string-backed ones.
+        let srx = format::format_results_string(
+            &result,
+            &result.context,
+            &view.snapshot,
+            &FormatterConfig::sparql_xml(),
+        )
+        .expect("sparql_xml");
+        assert!(
+            srx.contains(&format!(r#"<literal datatype="{dt}">{lex}</literal>"#)),
+            "STRDT({lex}, {dt}) must round-trip its datatype in XML: {srx}"
+        );
     }
 
     // A plain string literal stays bare: no `datatype` and no `xml:lang` IS
@@ -232,5 +251,16 @@ async fn w3c_sparql_json_keeps_datatype_on_constructed_literals() {
         srj["results"]["bindings"][0]["v"],
         json!({"type": "literal", "value": "plain"}),
         "a simple literal stays bare"
+    );
+    let srx = format::format_results_string(
+        &result,
+        &result.context,
+        &view.snapshot,
+        &FormatterConfig::sparql_xml(),
+    )
+    .expect("sparql_xml");
+    assert!(
+        srx.contains("<literal>plain</literal>"),
+        "a simple literal stays bare in XML too: {srx}"
     );
 }

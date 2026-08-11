@@ -183,12 +183,13 @@ pub struct FormatterConfig {
     /// recover the term (SPARQL Results JSON §3.2.2, and the CSV/TSV spec, all
     /// define the value as the absolute IRI).
     ///
-    /// The same switch tightens the `datatype` rule for string-backed literals:
-    /// only `xsd:string` may be omitted, because these formats encode every
-    /// value as text and nothing about the datatype is recoverable from the
-    /// serialized form. See `datatype::omit_datatype_for_string_literal`.
+    /// The same switch tightens the `datatype` rule: only `xsd:string` may be
+    /// omitted, because these formats encode every value as text and nothing
+    /// about the datatype is recoverable from the serialized form. See
+    /// `datatype::may_omit_datatype`.
     ///
-    /// True for [`Self::sparql_json`], [`Self::csv`] and [`Self::tsv`]; false for
+    /// True for [`Self::sparql_json`], [`Self::sparql_xml`], [`Self::csv`] and
+    /// [`Self::tsv`]; false for
     /// the JSON-LD-flavored formats (JSON-LD, TypedJson, AgentJson, CypherJson,
     /// NDJSON), whose consumers receive the `@context` or are a human reading a
     /// terminal — that compaction is intentional and governed by #1466. Call
@@ -213,9 +214,15 @@ impl FormatterConfig {
     }
 
     /// Create a SPARQL XML config
+    ///
+    /// `absolute_iris` is set for the datatype half of the W3C profile: the XML
+    /// writer never compacted node IRIs to begin with (`write_sid_ref` streams
+    /// namespace prefix + name and never consults the compactor), so the flag is
+    /// inert for IRIs here and only tightens the `datatype` rule.
     pub fn sparql_xml() -> Self {
         Self {
             format: OutputFormat::SparqlXml,
+            absolute_iris: true,
             ..Default::default()
         }
     }
