@@ -1,17 +1,19 @@
-//! Regression corpus: CONSTRUCT value dedup must key on RDF triple identity.
+//! Regression corpus: CONSTRUCT uniqueness is RDF triple identity, applied to
+//! the graph — never to the rendered JSON.
 //!
 //! A CONSTRUCT result is an RDF graph, so triple identity is the full
 //! `(s, p, o)` tuple (SPARQL 1.1 §16.2 — set union of instantiated templates).
-//! The JSON-LD formatter's `dedupe_values` pass once tracked seen objects per
-//! SUBJECT, which silently dropped `<s> <p2> "x"` whenever `<s> <p1> "x"` had
-//! already been emitted. These tests pin the object-dedup scope to a single
-//! predicate, and pin the cases that must still collapse.
+//! The JSON-LD formatter used to carry its own `dedupe_values` pass keyed on
+//! the *rendered* object, which was wrong twice over: it tracked seen objects
+//! per SUBJECT (dropping `<s> <p2> "x"` after `<s> <p1> "x"`), and rendering is
+//! lossy, so distinct terms that render alike collapsed. Uniqueness now comes
+//! from `Graph::canonicalize()` and the formatter emits what it is given.
 //!
 //! Each test builds the Graph by hand, so a failure here is unambiguously a
-//! serializer defect — no query engine involved.
+//! serializer/graph defect — no query engine involved.
 
 use fluree_graph_format::{format_jsonld, JsonLdFormatConfig};
-use fluree_graph_ir::{Datatype, Graph, Term};
+use fluree_graph_ir::{Datatype, Graph, LiteralValue, Term};
 use serde_json::Value as JsonValue;
 
 /// Count object values across every `@graph` node, excluding `@id`/`@context`.
@@ -32,8 +34,11 @@ fn count_values(v: &JsonValue) -> usize {
         .sum()
 }
 
+/// Mirrors `fluree-db-api`'s `construct::format`: canonicalize the graph (RDF
+/// set semantics), then render. Uniqueness is the graph's job, not the
+/// formatter's.
 fn render(graph: &mut Graph) -> JsonValue {
-    graph.sort();
+    graph.canonicalize();
     format_jsonld(
         graph,
         &JsonLdFormatConfig::construct_parity(None, std::string::ToString::to_string),
@@ -147,6 +152,42 @@ fn equal_lexical_form_different_datatype_both_survive() {
 
     let out = render(&mut g);
     assert_eq!(count_values(&out), 2, "datatypes must not collapse: {out}");
+}
+
+/// The sharper case: BOTH datatypes are in the inferable family, so both
+/// render as the bare JSON scalar `1` and the rendered forms are identical.
+/// `"1"^^xsd:integer` and `"1"^^xsd:long` are still distinct RDF terms under
+/// one predicate, so both triples must survive — a dedupe keyed on the
+/// rendered JSON rather than the term drops the second.
+#[test]
+fn equal_rendering_different_datatype_same_predicate_both_survive() {
+    let mut g = Graph::new();
+    g.add_triple(
+        Term::iri("http://ex/s"),
+        Term::iri("http://ex/p1"),
+        Term::Literal {
+            value: LiteralValue::Integer(1),
+            datatype: Datatype::xsd_integer(),
+            language: None,
+        },
+    );
+    g.add_triple(
+        Term::iri("http://ex/s"),
+        Term::iri("http://ex/p1"),
+        Term::Literal {
+            value: LiteralValue::Integer(1),
+            datatype: Datatype::xsd_long(),
+            language: None,
+        },
+    );
+    assert_eq!(g.len(), 2, "two distinct RDF terms");
+
+    let out = render(&mut g);
+    assert_eq!(
+        count_values(&out),
+        2,
+        "xsd:integer and xsd:long both render as `1` but are distinct terms: {out}"
+    );
 }
 
 /// Term identity also includes the language tag.

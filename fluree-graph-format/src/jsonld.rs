@@ -6,7 +6,7 @@ use crate::policy::{BlankNodePolicy, ContextPolicy, TypeHandling};
 use fluree_graph_ir::datatype::iri as dt_iri;
 use fluree_graph_ir::{BlankId, Datatype, Graph, LiteralValue, Term};
 use serde_json::{json, Map, Value as JsonValue};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// Type alias for IRI compaction functions used in JSON-LD formatting.
@@ -30,12 +30,6 @@ pub struct JsonLdFormatConfig {
     /// When false (default), single values are scalars, multiple values are arrays.
     pub multicardinal_arrays: bool,
 
-    /// Deduplicate identical values within a property (CONSTRUCT parity)
-    ///
-    /// When true, duplicate values for the same predicate are removed.
-    /// When false (default), duplicates are preserved.
-    pub dedupe_values: bool,
-
     /// Optional IRI compaction function for vocab positions (predicates and @type values)
     ///
     /// If None, IRIs are output in expanded form.
@@ -54,7 +48,6 @@ impl std::fmt::Debug for JsonLdFormatConfig {
             .field("blank_node_policy", &self.blank_node_policy)
             .field("type_handling", &self.type_handling)
             .field("multicardinal_arrays", &self.multicardinal_arrays)
-            .field("dedupe_values", &self.dedupe_values)
             .field(
                 "compactor_vocab",
                 &self.compactor_vocab.as_ref().map(|_| "<fn>"),
@@ -94,12 +87,6 @@ impl JsonLdFormatConfig {
         self
     }
 
-    /// Enable value deduplication
-    pub fn with_dedupe_values(mut self, enabled: bool) -> Self {
-        self.dedupe_values = enabled;
-        self
-    }
-
     /// Set the IRI compactor function
     pub fn with_compactor<F>(mut self, compactor: F) -> Self
     where
@@ -123,8 +110,12 @@ impl JsonLdFormatConfig {
     /// This convenience builder encapsulates all CONSTRUCT-specific settings:
     /// - `rdf:type` → `@type` conversion
     /// - Singleton values unwrapped (arrays only for multi-values)
-    /// - Value deduplication (duplicate values removed)
     /// - Deterministic blank node IDs
+    ///
+    /// It does NOT deduplicate: a CONSTRUCT result is an RDF graph, and set
+    /// semantics belong to the graph, not the rendering. Call
+    /// [`Graph::canonicalize`](fluree_graph_ir::Graph::canonicalize) before
+    /// formatting.
     ///
     /// # Arguments
     ///
@@ -138,7 +129,6 @@ impl JsonLdFormatConfig {
     ///
     /// let config = JsonLdFormatConfig::construct_parity(None, |iri| iri.to_string());
     /// assert!(config.multicardinal_arrays);
-    /// assert!(config.dedupe_values);
     /// ```
     pub fn construct_parity<F>(orig_context: Option<JsonValue>, compactor: F) -> Self
     where
@@ -156,7 +146,6 @@ impl JsonLdFormatConfig {
             // For CONSTRUCT (JSON-LD): always use arrays for values.
             // (The API layer may override this for SPARQL CONSTRUCT output.)
             .with_multicardinal_arrays(true)
-            .with_dedupe_values(true)
             .with_compactor(compactor)
     }
 
@@ -354,12 +343,6 @@ impl SubjectData {
         node.insert("@id".to_string(), JsonValue::String(self.id.clone()));
 
         for (pred_iri, triples) in self.predicates {
-            // Track seen objects for deduplication, scoped to THIS predicate.
-            // RDF triple identity is (s, p, o), so the same object reached
-            // through a different predicate is a different triple and must
-            // still be emitted; a subject-wide set would drop it.
-            let mut seen_values: HashSet<String> = HashSet::new();
-
             // Check if this predicate is a list (any triple has list_index)
             let is_list = triples.iter().any(|(idx, _)| idx.is_some());
 
@@ -378,19 +361,17 @@ impl SubjectData {
                 let list_value = format_list_value(&triples, config, bnode_renamer);
                 node.insert(pred_key, list_value);
             } else {
-                // Normal multi-valued predicate
+                // Normal multi-valued predicate. Every triple reaching this
+                // point is emitted: the graph is the unit of RDF set
+                // semantics, so callers that need uniqueness apply
+                // `Graph::canonicalize()` before formatting. Deduplicating
+                // here instead would have to compare rendered JSON, and
+                // rendering is lossy — the inferable datatypes all collapse to
+                // bare scalars, so `"1"^^xsd:integer` and `"1"^^xsd:long` are
+                // indistinguishable once rendered despite being distinct RDF
+                // terms.
                 for (_, triple) in triples {
                     let obj_val = term_to_object(&triple.o, config, bnode_renamer);
-
-                    // Dedupe check
-                    if config.dedupe_values {
-                        let value_str = obj_val.to_string();
-                        if seen_values.contains(&value_str) {
-                            continue; // Skip duplicate
-                        }
-                        seen_values.insert(value_str);
-                    }
-
                     add_property(&mut node, &pred_key, obj_val);
                 }
             }
@@ -975,8 +956,10 @@ mod tests {
         assert_eq!(name[0], "Alice");
     }
 
+    /// Duplicate triples are collapsed by `Graph::canonicalize()` — the graph
+    /// is the unit of RDF set semantics. The formatter emits what it is given.
     #[test]
-    fn test_dedupe_values() {
+    fn test_canonicalized_graph_has_no_duplicate_values() {
         let mut graph = Graph::new();
 
         // Add duplicate values
@@ -998,9 +981,9 @@ mod tests {
             Term::string("Ali"),
         );
 
-        graph.sort();
+        graph.canonicalize();
 
-        let config = JsonLdFormatConfig::default().with_dedupe_values(true);
+        let config = JsonLdFormatConfig::default();
         let result = format_jsonld(&graph, &config);
 
         let nicks = &result["@graph"][0]["http://xmlns.com/foaf/0.1/nick"];
@@ -1032,12 +1015,10 @@ mod tests {
             Term::string("Al"), // duplicate
         );
 
-        graph.sort();
+        graph.canonicalize();
 
-        // Construct mode: singletons unwrapped + dedupe
-        let config = JsonLdFormatConfig::default()
-            .with_multicardinal_arrays(false)
-            .with_dedupe_values(true);
+        // Construct mode: singletons unwrapped; uniqueness from canonicalize
+        let config = JsonLdFormatConfig::default().with_multicardinal_arrays(false);
 
         let result = format_jsonld(&graph, &config);
         let node = &result["@graph"][0];
@@ -1191,8 +1172,9 @@ mod tests {
 
         graph.sort();
 
-        // Even with dedupe_values enabled, list indices should preserve duplicates
-        let config = JsonLdFormatConfig::default().with_dedupe_values(true);
+        // List items are index-distinguished, so a repeated value is a
+        // distinct triple and survives canonicalization.
+        let config = JsonLdFormatConfig::default();
         let result = format_jsonld(&graph, &config);
         let node = &result["@graph"][0];
 
