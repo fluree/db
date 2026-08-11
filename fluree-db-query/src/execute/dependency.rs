@@ -36,19 +36,6 @@ pub struct VariableDeps {
 /// - Empty select list (no explicit projection)
 /// - `Construct` without a template
 pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
-    // `COUNT(DISTINCT *)` counts distinct SOLUTIONS, so it reads every column of
-    // the pre-grouping row. It reports no input variable, so the backward walk
-    // below cannot see that dependency — trimming a column would silently
-    // collapse solutions that differ only in it. Disable trimming outright.
-    if query
-        .grouping
-        .iter()
-        .flat_map(Grouping::aggregates)
-        .any(|spec| matches!(spec.function, AggregateFn::CountDistinctAll(_)))
-    {
-        return None;
-    }
-
     // ---- backward walk ----
 
     // Seed deps from the query output requirements.
@@ -108,8 +95,18 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     // Aggregates: replace output vars with input vars.
     for spec in query.grouping.iter().flat_map(Grouping::aggregates) {
         if deps.remove(&spec.output_var) {
-            if let Some(input_var) = spec.function.input_var() {
-                deps.insert(input_var);
+            match &spec.function {
+                // `COUNT(DISTINCT *)` counts distinct SOLUTIONS, so its input is
+                // not one column but every user-visible variable (the list it
+                // carries — see `AggregateFn::CountDistinctAll`). Tracing them
+                // here is what keeps the pre-grouping stages from trimming away
+                // a column that two solutions differ only in; naming them
+                // individually leaves genuinely dead columns still trimmable,
+                // and leaves the post-grouping stages — already recorded above —
+                // untouched. Variables this list names from other scopes simply
+                // never match a schema and drop out.
+                AggregateFn::CountDistinctAll(vars) => deps.extend(vars.iter().copied()),
+                other => deps.extend(other.input_var()),
             }
         }
     }
