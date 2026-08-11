@@ -1732,6 +1732,172 @@ async fn cypher_write_under_employee_bearer_denied() {
     );
 }
 
+// ── policy tracking / enforcement reporting ──────────────────────────────────
+
+/// Run the standard document query with policy tracking requested via the
+/// `fluree-track-policy` header, returning the tracked envelope and the
+/// `x-fdb-policy-enforcement` response header.
+async fn tracked_query_docs(
+    app: axum::Router,
+    ledger: &str,
+    token: Option<&str>,
+    default_allow: bool,
+) -> (StatusCode, JsonValue, Option<String>) {
+    let body = serde_json::json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "schema": "http://schema.org/"
+        },
+        "opts": { "default-allow": default_allow },
+        "select": ["?name", "?class"],
+        "where": [
+            {"@id": "?doc", "@type": "ex:Document"},
+            {"@id": "?doc", "schema:name": "?name"},
+            {"@id": "?doc", "ex:classification": "?class"}
+        ]
+    });
+
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/query/{ledger}"))
+        .header("content-type", "application/json")
+        .header("fluree-track-policy", "true");
+
+    if let Some(tok) = token {
+        req = req.header("authorization", format!("Bearer {tok}"));
+    }
+
+    let resp = app
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let enforcement_header = resp
+        .headers()
+        .get("x-fdb-policy-enforcement")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let (status, json) = json_body(resp).await;
+    (status, json, enforcement_header)
+}
+
+/// An identity whose policies actually execute reports per-policy counts and
+/// enforcement with a non-empty view-policy set. No test covered the read-path
+/// tally at all before — the only policy-tracking test was on a transaction.
+#[tokio::test]
+async fn tracked_read_under_policies_reports_executed_and_allowed() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "policytrack1:main").await;
+
+    let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/public-user",
+        "policytrack1:main",
+    );
+
+    let (status, json, enforcement_header) =
+        tracked_query_docs(app, "policytrack1:main", Some(&token), false).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let stats = json["policy"]
+        .as_object()
+        .unwrap_or_else(|| panic!("policy tally should be present; got: {json}"));
+    let public = stats
+        .get("http://example.org/public-policy")
+        .unwrap_or_else(|| panic!("the public policy should have executed; got: {json}"));
+    assert!(
+        public["executed"].as_u64().unwrap_or(0) > 0,
+        "policy executed count should be non-zero; got: {json}"
+    );
+    assert!(
+        public["allowed"].as_u64().unwrap_or(0) > 0,
+        "the public user can see the public doc, so some flakes were allowed; got: {json}"
+    );
+
+    assert_eq!(
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": false}),
+        "policies exist for this identity, so the view set is not empty; got: {json}"
+    );
+    assert_eq!(
+        enforcement_header.as_deref(),
+        Some(r#"{"enforced":true,"denies_all_data":false}"#),
+        "the same state must ride the response header"
+    );
+}
+
+/// The reported case: an identity with no `f:policyClass` and
+/// `default-allow: false`. The result is empty and no policy ever runs, so the
+/// tally is `{}` — the enforcement record is the only thing distinguishing
+/// this from an unenforced request.
+///
+/// Companion to `identity_without_policy_class_default_allow_false_denies_all`,
+/// which pins the filtering itself.
+#[tokio::test]
+async fn tracked_read_zero_policy_identity_reports_deny_all() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "policytrack2:main").await;
+
+    let signing_key = SigningKey::from_bytes(&[12u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/unknown-user",
+        "policytrack2:main",
+    );
+
+    let (status, json, enforcement_header) =
+        tracked_query_docs(app, "policytrack2:main", Some(&token), false).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        json["result"],
+        serde_json::json!([]),
+        "fail-closed: no data rows; got: {json}"
+    );
+    assert_eq!(
+        json["policy"],
+        serde_json::json!({}),
+        "nothing executes under an empty policy set; got: {json}"
+    );
+    assert_eq!(
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": true}),
+        "enforced, and the configuration grants no view of the data; got: {json}"
+    );
+    assert_eq!(
+        enforcement_header.as_deref(),
+        Some(r#"{"enforced":true,"denies_all_data":true}"#)
+    );
+}
+
+/// An anonymous request builds no policy context. Its tracked output must be
+/// exactly what it was before the enforcement record existed: the empty tally,
+/// no enforcement field, and no enforcement header.
+#[tokio::test]
+async fn tracked_read_anonymous_reports_no_enforcement() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "policytrack3:main").await;
+
+    let (status, json, enforcement_header) =
+        tracked_query_docs(app, "policytrack3:main", None, false).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        json["result"].as_array().map(Vec::len),
+        Some(3),
+        "unenforced request sees every document; got: {json}"
+    );
+    assert_eq!(json["policy"], serde_json::json!({}));
+    assert!(
+        json.get("policy_enforcement").is_none(),
+        "no policy context was built, so no enforcement is claimed; got: {json}"
+    );
+    assert_eq!(
+        enforcement_header, None,
+        "and no enforcement header is emitted"
+    );
+}
+
 // ── ledger-configured f:defaultAllow over real HTTP ───────────────────────────
 
 /// Creates a ledger with 3 documents, **no policies at all**, and a config graph
@@ -1932,5 +2098,97 @@ async fn explicit_request_default_allow_false_overrides_config_over_http() {
     assert!(
         names.is_empty(),
         "explicit fluree-default-allow:false header must beat config true; got: {names:?}"
+    );
+}
+
+/// The seam between the tri-state `f:defaultAllow` change and the enforcement
+/// signal: `denies_all_data` is derived from the *effective* `default_allow`,
+/// so a ledger that opens itself through config must flip the bit even though
+/// the request never mentions `default-allow`.
+///
+/// Neither half could test this alone — before the tri-state change the config
+/// value never reached an identity-carrying request at all, and the signal
+/// reads whatever the policy wrapper ended up with. Both orientations are
+/// pinned so the bit can't silently decouple from the config it reports on.
+#[tokio::test]
+async fn enforcement_signal_follows_configured_default_allow() {
+    async fn tracked_config_query(
+        app: axum::Router,
+        ledger: &str,
+        token: &str,
+    ) -> (StatusCode, JsonValue) {
+        // Note the absence of `default-allow` in opts: leaving it unset is what
+        // lets the ledger's configured value govern.
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
+            "opts": { "meta": { "policy": true } },
+            "select": ["?name"],
+            "where": [
+                {"@id": "?doc", "@type": "ex:Document"},
+                {"@id": "?doc", "schema:name": "?name"}
+            ]
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/fluree/query/{ledger}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        json_body(resp).await
+    }
+
+    // Configured open: enforcement is still active (an identity was supplied),
+    // but the configuration does grant a view of the data.
+    let (_tmp, state) = policy_test_state().await;
+    let app =
+        setup_default_allow_config_ledger(build_router(state), "policy-cfg-sig-open:main", true)
+            .await;
+    let signing_key = SigningKey::from_bytes(&[21u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/unknown-user",
+        "policy-cfg-sig-open:main",
+    );
+    let (status, json) = tracked_config_query(app, "policy-cfg-sig-open:main", &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["result"].as_array().map(Vec::len),
+        Some(3),
+        "config default-allow true opens the ledger to this identity; got: {json}"
+    );
+    assert_eq!(
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": false}),
+        "enforced, but the config grants a view; got: {json}"
+    );
+
+    // Configured closed: same request, opposite bit.
+    let (_tmp2, state2) = policy_test_state().await;
+    let app2 =
+        setup_default_allow_config_ledger(build_router(state2), "policy-cfg-sig-shut:main", false)
+            .await;
+    let signing_key2 = SigningKey::from_bytes(&[22u8; 32]);
+    let token2 = identity_token(
+        &signing_key2,
+        "http://example.org/unknown-user",
+        "policy-cfg-sig-shut:main",
+    );
+    let (status, json) = tracked_config_query(app2, "policy-cfg-sig-shut:main", &token2).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["result"],
+        serde_json::json!([]),
+        "config default-allow false keeps it fail-closed; got: {json}"
+    );
+    assert_eq!(
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": true}),
+        "no policies and no permissive default: no data flake could return; got: {json}"
     );
 }

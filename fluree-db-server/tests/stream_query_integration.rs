@@ -655,6 +655,119 @@ async fn policy_identity_filters_streamed_rows() {
     );
 }
 
+/// The streaming endpoint must answer "was this enforced?" the same way the
+/// buffered one does. Before the terminal `end` record carried it, a caller
+/// streaming a policy-filtered result had no signal at all — and the docs tell
+/// readers that absence means unenforced, so silence there was a false
+/// negative on exactly the question the surface exists to answer.
+#[tokio::test]
+async fn stream_end_record_reports_policy_enforcement() {
+    let (_tmp, state) = policy_state().await;
+    let app = build_router(state);
+    setup_policy_ledger(&app, "strm:pol-track").await;
+
+    let query = |identity: &str, meta: bool| {
+        let mut opts = json!({ "identity": identity, "default-allow": false });
+        if meta {
+            opts["meta"] = json!({ "policy": true });
+        }
+        json!({
+            "@context": { "ex": "http://example.org/" },
+            "opts": opts,
+            "select": ["?name"],
+            "where": [
+                {"@id": "?d", "@type": "ex:Doc"},
+                {"@id": "?d", "ex:name": "?name"}
+            ]
+        })
+    };
+
+    let end_record = |records: &[JsonValue]| -> JsonValue {
+        records
+            .iter()
+            .find(|r| r["type"] == "end")
+            .unwrap_or_else(|| panic!("stream must terminate with an end record: {records:?}"))
+            .clone()
+    };
+
+    // An identity whose policies grant it something: enforced, and the view
+    // set is not empty.
+    let resp = stream_jsonld(
+        &app,
+        "strm:pol-track",
+        &query("http://example.org/public-user", true),
+    )
+    .await;
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    let end = end_record(&records);
+    assert_eq!(
+        end["policy_enforcement"],
+        json!({"enforced": true, "denies_all_data": false}),
+        "end record must report enforcement; got: {end}"
+    );
+
+    // Same request without asking for policy tracking: the signal stays
+    // opt-in, exactly as on the buffered path.
+    let resp = stream_jsonld(
+        &app,
+        "strm:pol-track",
+        &query("http://example.org/public-user", false),
+    )
+    .await;
+    let (_status, _ct, records) = ndjson_records(resp).await;
+    let end = end_record(&records);
+    assert!(
+        end.get("policy_enforcement").is_none(),
+        "enforcement is opt-in via meta.policy; got: {end}"
+    );
+
+    // An identity with no policy class under a fail-closed default: no data
+    // flake could have been returned.
+    let resp = stream_jsonld(
+        &app,
+        "strm:pol-track",
+        &query("http://example.org/nobody", true),
+    )
+    .await;
+    let (_status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(
+        records.iter().filter(|r| r["type"] == "row").count(),
+        0,
+        "fail-closed identity streams no rows"
+    );
+    let end = end_record(&records);
+    assert_eq!(
+        end["policy_enforcement"],
+        json!({"enforced": true, "denies_all_data": true}),
+        "end record must distinguish total denial from an empty result; got: {end}"
+    );
+
+    // Anonymous: no policy context, so no enforcement is claimed and the
+    // record keeps the shape it had before this field existed.
+    let anon = json!({
+        "@context": { "ex": "http://example.org/" },
+        "opts": { "meta": { "policy": true } },
+        "select": ["?name"],
+        "where": [
+            {"@id": "?d", "@type": "ex:Doc"},
+            {"@id": "?d", "ex:name": "?name"}
+        ]
+    });
+    let resp = stream_jsonld(&app, "strm:pol-track", &anon).await;
+    let (_status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(
+        records.iter().filter(|r| r["type"] == "row").count(),
+        3,
+        "unenforced request streams every row"
+    );
+    let end = end_record(&records);
+    assert!(
+        end.get("policy_enforcement").is_none(),
+        "no policy context was built, so no enforcement is claimed; got: {end}"
+    );
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

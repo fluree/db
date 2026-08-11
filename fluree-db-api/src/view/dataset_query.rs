@@ -695,6 +695,11 @@ impl Fluree {
         options: &QueryExecutionOptions,
         sink: &mut S,
     ) -> Result<()> {
+        // As in `execute_dataset_tracked_with_r2rml`: recorded before execution
+        // and aggregated across every graph. This is also the streaming dataset
+        // producer's path, so the NDJSON `end` record carries the same state.
+        tracker.record_policy_enforcement(dataset.policy_enforcement());
+
         let primary = dataset
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no default graphs"))?;
@@ -862,6 +867,10 @@ impl Fluree {
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+        // See `execute_view_tracked_with_r2rml`: recorded before execution, and
+        // aggregated across every graph the dataset can read.
+        tracker.record_policy_enforcement(dataset.policy_enforcement());
+
         let primary = dataset.primary().ok_or_else(|| {
             fluree_db_query::QueryError::InvalidQuery("Dataset has no default graphs".into())
         })?;

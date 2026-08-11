@@ -151,6 +151,10 @@ pub struct TrackedQueryResponse {
     pub fuel: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<std::collections::HashMap<String, PolicyStats>>,
+    /// Whether a non-root policy context governed this request. Absent means
+    /// the request ran unenforced — which `policy: {}` alone cannot tell you.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_enforcement: Option<fluree_db_core::PolicyEnforcement>,
     /// OWL2-RL materialization outcome (present when a reasoning mode ran).
     /// `reasoning.capped == true` means the result set may be incomplete.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,6 +169,7 @@ impl TrackedQueryResponse {
                 time,
                 fuel,
                 policy,
+                policy_enforcement,
                 reasoning,
             }) => Self {
                 status: 200,
@@ -172,6 +177,7 @@ impl TrackedQueryResponse {
                 time,
                 fuel,
                 policy,
+                policy_enforcement,
                 reasoning,
             },
             None => Self {
@@ -180,6 +186,7 @@ impl TrackedQueryResponse {
                 time: None,
                 fuel: None,
                 policy: None,
+                policy_enforcement: None,
                 reasoning: None,
             },
         }
@@ -198,6 +205,9 @@ pub struct TrackedErrorResponse {
     pub fuel: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<std::collections::HashMap<String, PolicyStats>>,
+    /// See [`TrackedQueryResponse::policy_enforcement`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_enforcement: Option<fluree_db_core::PolicyEnforcement>,
 }
 
 impl TrackedErrorResponse {
@@ -205,13 +215,18 @@ impl TrackedErrorResponse {
     pub fn new(status: u16, error: impl Into<String>, tally: Option<TrackingTally>) -> Self {
         match tally {
             Some(TrackingTally {
-                time, fuel, policy, ..
+                time,
+                fuel,
+                policy,
+                policy_enforcement,
+                ..
             }) => Self {
                 status,
                 error: error.into(),
                 time,
                 fuel,
                 policy,
+                policy_enforcement,
             },
             None => Self {
                 status,
@@ -219,6 +234,7 @@ impl TrackedErrorResponse {
                 time: None,
                 fuel: None,
                 policy: None,
+                policy_enforcement: None,
             },
         }
     }

@@ -1588,6 +1588,11 @@ impl Fluree {
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+        // Record whether policy governs this request, before executing: the
+        // state comes from the prepared view, so it is reported even when
+        // execution returns no rows or fails part-way.
+        tracker.record_policy_enforcement(db.policy_enforcement());
+
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
         // Single ledger + root policy ⇒ semantic stats rewrites are sound.

@@ -65,6 +65,10 @@ pub struct FlureeHeaders {
     /// Track execution time
     pub track_time: bool,
 
+    /// Track policy enforcement (per-policy executed/allowed counts and
+    /// whether policy governed the request).
+    pub track_policy: bool,
+
     /// Maximum fuel limit (decimal). Internally converted to micro-fuel.
     pub max_fuel: Option<f64>,
 
@@ -91,6 +95,7 @@ impl Default for FlureeHeaders {
             track_meta: false,
             track_fuel: false,
             track_time: false,
+            track_policy: false,
             max_fuel: None,
             min_t: None,
             content_type: None,
@@ -110,6 +115,7 @@ impl FlureeHeaders {
     pub const TRACK_META: &'static str = "fluree-track-meta";
     pub const TRACK_FUEL: &'static str = "fluree-track-fuel";
     pub const TRACK_TIME: &'static str = "fluree-track-time";
+    pub const TRACK_POLICY: &'static str = "fluree-track-policy";
     pub const MAX_FUEL: &'static str = "fluree-max-fuel";
     pub const MIN_T: &'static str = "fluree-min-t";
 
@@ -166,6 +172,8 @@ impl FlureeHeaders {
             fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_FUEL);
         fluree_headers.track_time =
             fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_TIME);
+        fluree_headers.track_policy =
+            fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_POLICY);
 
         // Numeric headers (decimal allowed)
         if let Some(val) = get_header_str(headers, Self::MAX_FUEL) {
@@ -206,7 +214,11 @@ impl FlureeHeaders {
 
     /// Check if tracking is enabled (any tracking header or max-fuel limit)
     pub fn has_tracking(&self) -> bool {
-        self.track_meta || self.track_fuel || self.track_time || self.max_fuel.is_some()
+        self.track_meta
+            || self.track_fuel
+            || self.track_time
+            || self.track_policy
+            || self.max_fuel.is_some()
     }
 
     /// Build `TrackingOptions` from header values.
@@ -217,7 +229,7 @@ impl FlureeHeaders {
         fluree_db_core::tracking::TrackingOptions {
             track_time: self.track_meta || self.track_time,
             track_fuel: self.track_meta || self.track_fuel || self.max_fuel.is_some(),
-            track_policy: self.track_meta,
+            track_policy: self.track_meta || self.track_policy,
             max_fuel: self.max_fuel.map(fluree_db_core::tracking::fuel_to_micro),
         }
     }
@@ -443,6 +455,9 @@ impl FlureeHeaders {
                 if self.track_fuel {
                     meta.insert("fuel".to_string(), JsonValue::Bool(true));
                 }
+                if self.track_policy {
+                    meta.insert("policy".to_string(), JsonValue::Bool(true));
+                }
                 if !meta.is_empty() {
                     opts.insert("meta".to_string(), JsonValue::Object(meta));
                 }
@@ -508,6 +523,45 @@ mod tests {
         let parsed = FlureeHeaders::from_headers(&headers).unwrap();
 
         assert_eq!(parsed.min_t, Some(42));
+    }
+
+    /// `fluree-track-policy` on its own must make the request tracked, ask the
+    /// engine for policy stats, and survive the header→opts injection. Before
+    /// this was parsed, the CLI's `--track-policy` was a no-op over HTTP.
+    #[test]
+    fn track_policy_header_enables_policy_tracking() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::TRACK_POLICY, "true".parse().unwrap());
+
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        assert!(parsed.track_policy);
+        assert!(parsed.has_tracking(), "policy alone must count as tracking");
+
+        let opts = parsed.to_tracking_options();
+        assert!(opts.track_policy);
+        assert!(!opts.track_fuel, "policy must not drag in fuel");
+        assert!(!opts.track_time, "policy must not drag in time");
+
+        let mut body_opts = serde_json::Map::new();
+        parsed.inject_into_opts(&mut body_opts);
+        assert_eq!(
+            body_opts.get("meta"),
+            Some(&serde_json::json!({"policy": true})),
+            "selective injection must carry policy through to the body opts"
+        );
+    }
+
+    /// The omnibus header still implies policy tracking.
+    #[test]
+    fn track_meta_header_implies_policy_tracking() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::TRACK_META, "true".parse().unwrap());
+
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        assert!(parsed.track_policy);
+        assert!(parsed.to_tracking_options().track_policy);
     }
 
     #[test]

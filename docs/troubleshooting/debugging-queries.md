@@ -78,76 +78,45 @@ curl -X POST http://localhost:8090/v1/fluree/explain \
 - Rows scanned vs returned
 - Index efficiency
 
-## Query Tracing
+## Execution Metrics
 
-### Enable Tracing
+### Enable Tracking
 
-Get detailed execution trace:
+Ask for per-request time and cost metrics:
 
 ```bash
-curl -X POST http://localhost:8090/v1/fluree/query \
-  -H "X-Fluree-Trace: true" \
+curl -X POST http://localhost:8090/v1/fluree/query/mydb \
+  -H "content-type: application/json" \
+  -H "fluree-track-meta: true" \
   -d '{...}'
 ```
 
 **Response:**
 ```json
 {
-  "results": [...],
-  "trace": {
-    "total_duration_ms": 45,
-    "phases": [
-      {
-        "phase": "parse",
-        "duration_ms": 2
-      },
-      {
-        "phase": "plan",
-        "duration_ms": 3
-      },
-      {
-        "phase": "execute",
-        "duration_ms": 38,
-        "steps": [
-          {
-            "step": "scan_POST_schema:name",
-            "duration_ms": 12,
-            "rows": 1000
-          },
-          {
-            "step": "scan_POST_schema:age",
-            "duration_ms": 15,
-            "rows": 1000
-          },
-          {
-            "step": "join",
-            "duration_ms": 8,
-            "rows": 1000
-          },
-          {
-            "step": "filter",
-            "duration_ms": 3,
-            "rows_in": 1000,
-            "rows_out": 573
-          }
-        ]
-      },
-      {
-        "phase": "serialize",
-        "duration_ms": 2
-      }
-    ]
-  }
+  "status": 200,
+  "result": [...],
+  "time": "45.12ms",
+  "fuel": 42.317
 }
 ```
 
-### Trace Analysis
+`fluree-track-time` and `fluree-track-fuel` request the two metrics
+individually. The same values ride the `x-fdb-time` and `x-fdb-fuel` response
+headers, which is how you read them for CSV/TSV output. The full cost ladder —
+what each unit of fuel is charged for — is in
+[Tracking and Fuel](../query/tracking-and-fuel.md).
+
+### Metric Analysis
 
 Look for:
-- **Slow phases:** Which phase takes longest?
-- **Excessive scans:** Too many rows scanned?
-- **Inefficient joins:** Large intermediate results?
-- **Ineffective filters:** Filters applied too late?
+- **High fuel relative to rows returned:** the query is scanning far more than
+  it emits — check the plan from `/explain` for a missing index-friendly
+  pattern or a filter applied too late.
+- **Fuel dominated by index touches:** consider a more selective leading
+  pattern.
+- **Time high but fuel low:** the cost is not I/O — look at joins and
+  materialization in the plan.
 
 ## Common Query Issues
 
@@ -370,39 +339,36 @@ Ensure patterns are connected:
 
 ## Policy Debugging
 
-### Enable Policy Trace
+### Report Policy Enforcement
 
-See which policies apply:
+Ask which policies ran, and whether policy governed the request at all:
 
 ```bash
-curl -X POST http://localhost:8090/v1/fluree/query \
-  -H "X-Fluree-Policy-Trace: true" \
+curl -X POST http://localhost:8090/v1/fluree/query/mydb \
+  -H "content-type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -H "fluree-track-policy: true" \
   -d '{...}'
 ```
 
 Response:
 ```json
 {
-  "results": [...],
-  "policy_trace": [
-    {
-      "policy": "ex:department-policy",
-      "matched": true,
-      "condition_met": true,
-      "decision": "allow",
-      "patterns_added": [
-        {"@id": "?person", "ex:department": "engineering"}
-      ]
-    },
-    {
-      "policy": "ex:role-policy",
-      "matched": false,
-      "reason": "subject_mismatch"
-    }
-  ],
-  "final_decision": "allow"
+  "status": 200,
+  "result": [...],
+  "policy": {
+    "ex:department-policy": { "executed": 12, "allowed": 7 }
+  },
+  "policy_enforcement": { "enforced": true, "denies_all_data": false }
 }
 ```
+
+`policy` counts per-policy evaluations; it is empty when no policy ran.
+`policy_enforcement` is what tells you *why* it is empty — whether the request
+ran under a policy context at all, and whether that context grants no view of
+the data. Neither field reports anything about which rows were filtered. See
+[Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied)
+for how to read them.
 
 ### Policy Impact on Query
 
