@@ -1044,18 +1044,26 @@ fn apply_values(
     operator
 }
 
-/// Does any VALUES pattern bind a variable that the triples also mention?
+/// Split a block's VALUES into those that can seed a same-subject star and the
+/// rest, which must stay behind the triples.
 ///
-/// Answers whether the VALUES can seed the triples. A connected VALUES constrains
-/// them; a disconnected one only multiplies rows.
-fn values_feed_triples(values: &[ValuesPattern], triples: &[TriplePattern]) -> bool {
-    let triple_vars: HashSet<VarId> = triples
-        .iter()
-        .flat_map(TriplePattern::referenced_vars)
-        .collect();
+/// A VALUES binding the star's subject constrains every triple in it at once, so
+/// seeding hands the star a bound driving set. Anything else — a VALUES binding
+/// only a leaf object var, or sharing no variable with the star at all — would
+/// seed a cartesian product instead, so it defers.
+///
+/// The caller only reaches this for a star (`is_property_join`), which guarantees
+/// every triple shares the first triple's subject var.
+fn split_values_seeding_star(
+    values: Vec<ValuesPattern>,
+    triples: &[TriplePattern],
+) -> (Vec<ValuesPattern>, Vec<ValuesPattern>) {
+    let Some(subject) = triples.first().and_then(|tp| tp.s.as_var()) else {
+        return (Vec::new(), values);
+    };
     values
-        .iter()
-        .any(|vp| vp.vars.iter().any(|v| triple_vars.contains(v)))
+        .into_iter()
+        .partition(|vp| vp.vars.contains(&subject))
 }
 
 /// Partition filters into those eligible for inline evaluation and those still waiting.
@@ -1946,30 +1954,34 @@ pub fn build_where_operators_seeded_with_needed(
                     // a pure star block. Wrapping VALUES first seeds the schema/operator and
                     // prevents `build_triple_operators()` from taking the property-join path.
                     //
-                    // Only defer a VALUES that is *disconnected* from the star (e.g. a pinned
-                    // vector-search query vector): seeding it would build a cartesian product
-                    // and cost a profitable fusion. A VALUES that shares a variable with the
-                    // star is a guaranteed producer with exact cardinality, and seeding it
-                    // lets `build_scan_or_join()` pick a bound-driven lane — batched-subject
-                    // -exists, MembershipJoin, or HashJoin — instead of draining the whole
-                    // class or predicate extent and filtering afterwards.
-                    let values_after_triples = operator.is_none()
+                    // A VALUES binding the star's SUBJECT is the exception: it constrains
+                    // every triple at once, so seeding it lets `build_scan_or_join()` pick a
+                    // bound-driven lane — batched-subject-exists, MembershipJoin, or HashJoin
+                    // — instead of draining the whole class or predicate extent and filtering
+                    // afterwards. Every other VALUES still defers, including one binding only
+                    // a leaf object var: seeding that costs the fusion for the whole star
+                    // without constraining the driving scan.
+                    //
+                    // The split is per-VALUES because the hazard is. A block may legally hold
+                    // both kinds, and seeding a disconnected VALUES alongside a subject-bound
+                    // one would reintroduce the cartesian seed the deferral exists to prevent.
+                    let (seed_values, deferred_values) = if operator.is_none()
                         && !block.values.is_empty()
                         && block.triples.len() >= 2
                         && is_property_join(&block.triples)
-                        && !values_feed_triples(&block.values, &block.triples);
+                    {
+                        split_values_seeding_star(block.values, &block.triples)
+                    } else {
+                        (block.values, Vec::new())
+                    };
 
                     // The deferred VALUES wrapper joins on its vars AFTER the triple
                     // operators run, so those vars must survive schema pruning even
                     // when the SELECT list doesn't mention them.
-                    if values_after_triples {
-                        if let Some(rwv) = augmented_rwv.as_mut() {
-                            for vp in &block.values {
-                                for v in &vp.vars {
-                                    if !rwv.contains(v) {
-                                        rwv.push(*v);
-                                    }
-                                }
+                    if let Some(rwv) = augmented_rwv.as_mut() {
+                        for v in deferred_values.iter().flat_map(|vp| &vp.vars) {
+                            if !rwv.contains(v) {
+                                rwv.push(*v);
                             }
                         }
                     }
@@ -1985,17 +1997,13 @@ pub fn build_where_operators_seeded_with_needed(
                         stats: stats.as_deref(),
                     };
                     let mut built = build_triple_operators(
-                        if values_after_triples {
-                            operator.take()
-                        } else {
-                            apply_values(operator.take(), block.values.clone())
-                        },
+                        apply_values(operator.take(), seed_values),
                         &block.triples,
                         &HashMap::new(),
                         &ctx,
                     )?;
-                    if values_after_triples {
-                        built = apply_values(Some(built), block.values)
+                    if !deferred_values.is_empty() {
+                        built = apply_values(Some(built), deferred_values)
                             .expect("apply_values should preserve operator");
                     }
                     operator = Some(built);
@@ -3324,15 +3332,147 @@ mod tests {
         let plan = op.describe();
         let ops = plan_ops(&plan);
 
+        assert_ne!(
+            ops.first(),
+            Some(&"ValuesOperator"),
+            "a subject-bound VALUES must seed the star, not filter it afterwards: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&"PropertyJoinOperator"),
+            "the star must not fuse into a driver scan of the class extent: {ops:?}"
+        );
+        assert!(
+            ops.contains(&"ValuesOperator"),
+            "the VALUES must still be applied somewhere in the plan: {ops:?}"
+        );
+    }
+
+    /// A VALUES binding only a leaf OBJECT var must not seed.
+    ///
+    /// It constrains one predicate of the star, not the driving scan, so seeding
+    /// it buys nothing and costs the fusion — a wide star becomes one join per
+    /// predicate. The #51 evidence (the arity sweep) only covers the
+    /// subject-connected shape, so this shape keeps the pre-#51 plan.
+    #[test]
+    fn test_object_var_values_keeps_property_join() {
+        use crate::binding::Binding;
+
+        // VALUES ?n { "x" } . ?s a <ex:Thing> ; <ex:name> ?n
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::lit(
+                    FlakeValue::String("x".into()),
+                    Sid::new(1, "string"),
+                )]],
+            },
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from("ex:Thing")),
+            )),
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
         assert_eq!(
-            ops,
-            vec![
-                "NestedLoopJoinOperator",
-                "NestedLoopJoinOperator",
-                "ValuesOperator",
-                "EmptyOperator",
-            ],
-            "expected the VALUES to seed the star from the base of the plan"
+            ops.first(),
+            Some(&"ValuesOperator"),
+            "an object-var VALUES must stay above the star: {ops:?}"
+        );
+        assert!(
+            ops.contains(&"PropertyJoinOperator"),
+            "the star must keep its fusion when nothing binds its subject: {ops:?}"
+        );
+    }
+
+    /// A block may hold both kinds of VALUES; only the subject-binding one seeds.
+    ///
+    /// The gate is per-VALUES because the hazard is. Seeding the whole slice
+    /// because one member happens to be connected would put the disconnected
+    /// VALUES at the base of the plan — the cartesian seed the deferral exists
+    /// to prevent.
+    #[test]
+    fn test_mixed_values_seeds_only_the_subject_binding_one() {
+        use crate::binding::Binding;
+
+        // VALUES ?s { <ex:thing1> } VALUES ?q { 0 } . ?s a <ex:Thing> ; <ex:name> ?n
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(0)],
+                rows: vec![vec![Binding::iri("ex:thing1")]],
+            },
+            Pattern::Values {
+                vars: vec![VarId(9)],
+                rows: vec![vec![Binding::lit(FlakeValue::Long(0), Sid::new(2, "long"))]],
+            },
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from("ex:Thing")),
+            )),
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        assert_eq!(
+            ops.first(),
+            Some(&"ValuesOperator"),
+            "the disconnected VALUES must stay above the star: {ops:?}"
+        );
+        assert_eq!(
+            ops.iter().rev().nth(1),
+            Some(&"ValuesOperator"),
+            "the subject-bound VALUES must seed from the base of the plan: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&"PropertyJoinOperator"),
+            "the seeded star must not drain the class extent: {ops:?}"
+        );
+    }
+
+    /// Neither VALUES binds the star's subject, so both defer.
+    ///
+    /// `{ VALUES ?a {..} VALUES ?b {..} ?s :p ?a . ?s :q ?r }` — legal SPARQL
+    /// where `?a` is a leaf object var and `?b` shares nothing. Keying the gate
+    /// on "any shared var" seeded both, putting the disconnected `?b` at the
+    /// base of the plan.
+    #[test]
+    fn test_values_sharing_only_object_vars_all_defer() {
+        use crate::binding::Binding;
+
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::iri("ex:a1")]],
+            },
+            Pattern::Values {
+                vars: vec![VarId(9)],
+                rows: vec![vec![Binding::iri("ex:b1")]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "p", VarId(1))),
+            Pattern::Triple(make_pattern(VarId(0), "q", VarId(2))),
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        assert_ne!(
+            ops.iter().rev().nth(1),
+            Some(&"ValuesOperator"),
+            "no VALUES binds the subject, so none may seed the plan's base: {ops:?}"
+        );
+        assert_eq!(
+            ops.last(),
+            Some(&"DatasetOperator"),
+            "the star should still drive its own scan: {ops:?}"
         );
     }
 
