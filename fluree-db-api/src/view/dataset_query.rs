@@ -665,6 +665,11 @@ impl Fluree {
         options: &QueryExecutionOptions,
         sink: &mut S,
     ) -> Result<()> {
+        // As in `execute_dataset_tracked_with_r2rml`: recorded before execution
+        // and aggregated across every graph. This is also the streaming dataset
+        // producer's path, so the NDJSON `end` record carries the same state.
+        tracker.record_policy_enforcement(dataset.policy_enforcement());
+
         let primary = dataset
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no default graphs"))?;

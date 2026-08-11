@@ -1383,6 +1383,15 @@ fn print_stream_footer(outcome: &query_stream::StreamOutcome, elapsed: std::time
     if let Some(fuel) = outcome.fuel {
         parts.push(format!("fuel {fuel}"));
     }
+    // Only the enforced case says anything; an unenforced stream reports
+    // nothing, as before.
+    if let Some(state) = outcome.policy_enforcement.as_ref().filter(|e| e.enforced) {
+        parts.push(if state.denies_all_data {
+            "policy enforced (grants no data)".to_string()
+        } else {
+            "policy enforced".to_string()
+        });
+    }
     eprintln!("({})", parts.join(", "));
 }
 

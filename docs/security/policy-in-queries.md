@@ -240,8 +240,8 @@ filters, which is exactly what row-level enforcement exists to prevent.
 
 What a caller *can* ask for is whether policy governed the request. Turn on
 policy tracking — `"opts": {"meta": {"policy": true}}` in a JSON-LD body, or
-the `fluree-track-policy: true` request header on any endpoint (SPARQL bodies
-have no `opts` to carry it) — and the response gains two siblings:
+the `fluree-track-policy: true` request header (SPARQL bodies have no `opts`
+to carry it) — and the response gains two siblings:
 
 ```json
 {
@@ -261,6 +261,19 @@ have no `opts` to carry it) — and the response gains two siblings:
 The same values ride the `x-fdb-policy` (base64 JSON) and
 `x-fdb-policy-enforcement` (plain JSON) response headers, which is how you read
 them for CSV, TSV, and other formats whose body has no room for a tally.
+
+On the NDJSON streaming endpoint (`/v1/fluree/stream/query/*`) the same
+`policy_enforcement` object rides the terminal `end` record, under the same
+presence rule:
+
+```json
+{"type":"end","rows":0,"t":7,"policy_enforcement":{"enforced":true,"denies_all_data":true}}
+```
+
+The state is settled before the first row is pulled, but it is reported with
+the rest of the per-request metadata at the end of the stream. `policy` (the
+per-policy counters) is not carried on the streaming surface — the `end` record
+reports only the request-level metadata.
 
 Both `policy_enforcement` bits are computed from the request's policy inputs
 and the ledger's policy configuration before execution. They do not depend on
