@@ -620,26 +620,32 @@ impl NestedLoopJoinOperator {
 
         // Determine right pattern output vars (vars that are still unbound after substitution),
         // filtered by the emission mask. This allows plan-time pruning of unused vars.
+        //
+        // A variable repeated across positions (`?x <p> ?x`, `?x ?x ?o`) is one
+        // output column, not two: the right scan's own schema folds the repeat
+        // into a single slot (`schema_from_pattern_with_emit`) and enforces the
+        // implied equality per row (`within_row_var_equality_ok`), so emitting
+        // it twice here would only build a batch schema that names the same
+        // VarId in two columns — which `Batch::new` rejects outright.
         let mut right_output_vars: Vec<VarId> = Vec::new();
+        let push_right_var = |out: &mut Vec<VarId>, v: VarId| {
+            if !left_var_positions.contains_key(&v) && !out.contains(&v) {
+                out.push(v);
+            }
+        };
         if right_emit.s {
             if let Ref::Var(v) = &right_pattern.s {
-                if !left_var_positions.contains_key(v) {
-                    right_output_vars.push(*v);
-                }
+                push_right_var(&mut right_output_vars, *v);
             }
         }
         if right_emit.p {
             if let Ref::Var(v) = &right_pattern.p {
-                if !left_var_positions.contains_key(v) {
-                    right_output_vars.push(*v);
-                }
+                push_right_var(&mut right_output_vars, *v);
             }
         }
         if right_emit.o {
             if let Term::Var(v) = &right_pattern.o {
-                if !left_var_positions.contains_key(v) {
-                    right_output_vars.push(*v);
-                }
+                push_right_var(&mut right_output_vars, *v);
             }
         }
 
