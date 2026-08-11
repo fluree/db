@@ -90,6 +90,12 @@ pub async fn collect_root_cas_ids_expanded(
 /// in the same set. An instance therefore covers exactly one accumulation —
 /// callers keeping per-branch sets need one instance per branch.
 ///
+/// Callers that *subtract* one root's set from another's — the garbage-record
+/// diff in `fluree-db-indexer::build::root_assembly::superseded_cids` —
+/// must expand each root through an instance of its own. Sharing one yields
+/// an empty difference, and the dedup means the second root's shared
+/// manifests are never even read.
+///
 /// Expansion is strict, matching [`collect_root_cas_ids_expanded`]: the
 /// first read or decode failure returns `Err`.
 #[derive(Debug, Default)]

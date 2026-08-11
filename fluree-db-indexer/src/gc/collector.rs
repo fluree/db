@@ -454,6 +454,13 @@ impl<'a> PrevIndexChainWalk<'a> {
     /// indistinguishable from a genuinely short one, and callers deciding
     /// which artifacts are unreferenced would treat everything past the
     /// unreadable root as garbage.
+    ///
+    /// A `cache_dir` weakens that ending. A cached copy of a released root
+    /// reads back, so the walk never learns storage has dropped it and
+    /// continues into a chain the collector already truncated. Callers that
+    /// must not act on a released root have to establish existence
+    /// themselves — see `gc::sweep::chain_cas_ids`, which reads a failed
+    /// expansion plus an absent root as the ending this walk missed.
     pub(crate) async fn next_entry(&mut self) -> Result<Option<IndexChainEntry>> {
         let Some(current_id) = self.next_id.take() else {
             return Ok(None);
