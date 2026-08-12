@@ -1152,10 +1152,15 @@ fn format_violations(
         // Which constraint failed. One `sh:message` often covers several
         // constraints on the same property, so the message alone cannot say
         // whether the value was absent, repeated, or the wrong datatype.
+        //
+        // Compacted the same way as the focus node and path — explicit
+        // prefixes only. `@vocab` compaction would render this one line as a
+        // bare term where the others never can, and a bare word in an error
+        // does not read as the identifier it is.
         let _ = writeln!(
             out,
             "     Constraint: {}",
-            compactor.compact_vocab_iri(v.constraint_component)
+            compactor.compact_id_iri(v.constraint_component)
         );
     }
     out
