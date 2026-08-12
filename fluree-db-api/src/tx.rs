@@ -572,9 +572,17 @@ pub(crate) struct StagedShaclContext<'a> {
 
     /// Staged `NamespaceRegistry` — D's snapshot namespaces plus
     /// any IRIs the in-flight transaction has registered. Required
-    /// when `cross_ledger_shapes` is `Some`; consulted as the term
-    /// context for compiling M's wire-form shapes against D.
+    /// when `cross_ledger_shapes` is `Some`, where it is the term
+    /// context for compiling M's wire-form shapes against D. Also
+    /// resolves identifiers in violation messages, so a property the
+    /// transaction itself introduced still renders as an IRI.
     pub staged_ns: Option<&'a fluree_db_transact::namespace::NamespaceRegistry>,
+
+    /// The JSON-LD context the transaction supplied, used to compact
+    /// identifiers in violation messages to the terms the author wrote.
+    /// `None` where the request carries no context — Turtle inserts and
+    /// commit replay — and those messages carry full IRIs instead.
+    pub txn_context: Option<&'a serde_json::Value>,
 
     /// Inline shape bundle parsed from `txn.opts.shapes` against the
     /// staged namespace registry. When `Some`, the bundle attaches
@@ -1044,27 +1052,87 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     .await?;
 
     // 6. Apply per-graph mode: warn violations log, reject violations fail.
+    //    The compactor is built only when there is something to report — it
+    //    merges namespace maps and parses the context, neither of which the
+    //    conforming path should pay for.
+    if outcome.conforms() {
+        return Ok(());
+    }
+    let compactor = violation_iri_compactor(view, &ctx);
+
     if !outcome.warn_violations.is_empty() {
         tracing::warn!(
             count = outcome.warn_violations.len(),
-            report = %format_violations(&outcome.warn_violations),
+            report = %format_violations(&outcome.warn_violations, &compactor),
             "SHACL violations (warn-mode graph, continuing)"
         );
     }
     if !outcome.reject_violations.is_empty() {
         return Err(fluree_db_transact::TransactError::ShaclViolation(
-            format_violations(&outcome.reject_violations),
+            format_violations(&outcome.reject_violations, &compactor),
         ));
     }
     Ok(())
 }
 
+/// Build the compactor that renders identifiers in violation messages.
+///
+/// Namespaces come from the snapshot plus anything this transaction registered,
+/// so a property the transaction itself introduced still resolves. The
+/// transaction's own context supplies the prefixes, which is what lets the
+/// message name terms the way the author wrote them; without one the compactor
+/// falls back to full IRIs rather than inventing prefixes the reader has no way
+/// to resolve.
+#[cfg(feature = "shacl")]
+fn violation_iri_compactor(
+    view: &StagedLedger,
+    ctx: &StagedShaclContext<'_>,
+) -> crate::format::IriCompactor {
+    use crate::format::IriCompactor;
+
+    let base = view.base().snapshot.shared_namespaces();
+    let namespace_codes = match ctx.staged_ns.map(NamespaceRegistry::delta) {
+        Some(delta) if !delta.is_empty() => {
+            let mut merged = (*base).clone();
+            merged.extend(delta.iter().map(|(code, prefix)| (*code, prefix.clone())));
+            std::sync::Arc::new(merged)
+        }
+        _ => base,
+    };
+
+    match ctx
+        .txn_context
+        .and_then(|raw| crate::ParsedContext::parse(None, raw).ok())
+    {
+        Some(parsed) => IriCompactor::new(namespace_codes, &parsed),
+        None => IriCompactor::from_namespaces(namespace_codes),
+    }
+}
+
 /// Format SHACL violations as a human-readable string, matching the shape of
 /// the prior `TransactError::ShaclViolation` payload so test assertions and
 /// log readers that look for familiar phrasing keep working.
+///
+/// Identifiers are rendered through `compactor`, so a focus node and path read
+/// as the terms the transaction was written with — or as full IRIs where it
+/// declared no context. Printing the raw Sid parts instead concatenates a
+/// namespace code onto a local name (`13address`), which reads as corrupt data
+/// rather than as the property it names.
 #[cfg(feature = "shacl")]
-fn format_violations(violations: &[fluree_db_shacl::ValidationResult]) -> String {
+fn format_violations(
+    violations: &[fluree_db_shacl::ValidationResult],
+    compactor: &crate::format::IriCompactor,
+) -> String {
     use std::fmt::Write;
+
+    // A Sid that will not decode has no better rendering than its own parts,
+    // and saying so beats emitting something that looks like an IRI.
+    let render = |sid: &Sid| {
+        compactor.compact_id_sid(sid).unwrap_or_else(|_| {
+            format!("<unresolved namespace {}>{}", sid.namespace_code, sid.name)
+        })
+    };
+
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -1073,10 +1141,22 @@ fn format_violations(violations: &[fluree_db_shacl::ValidationResult]) -> String
     );
     for (i, v) in violations.iter().enumerate() {
         let _ = writeln!(out, "  {}. {}", i + 1, v.message);
-        let _ = writeln!(out, "     Focus node: {}", v.focus_node);
+        let focus = match &v.focus_node {
+            fluree_db_shacl::FocusNode::Node(sid) => render(sid),
+            fluree_db_shacl::FocusNode::Literal(lit) => lit.value.to_string(),
+        };
+        let _ = writeln!(out, "     Focus node: {focus}");
         if let Some(path) = &v.result_path {
-            let _ = writeln!(out, "     Path: {}{}", path.namespace_code, path.name);
+            let _ = writeln!(out, "     Path: {}", render(path));
         }
+        // Which constraint failed. One `sh:message` often covers several
+        // constraints on the same property, so the message alone cannot say
+        // whether the value was absent, repeated, or the wrong datatype.
+        let _ = writeln!(
+            out,
+            "     Constraint: {}",
+            compactor.compact_vocab_iri(v.constraint_component)
+        );
     }
     out
 }
@@ -1096,6 +1176,7 @@ async fn stage_with_config_shacl(
     ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+    txn_context: Option<&JsonValue>,
 ) -> std::result::Result<(StagedLedger, NamespaceRegistry), fluree_db_transact::TransactError> {
     // Capture graph_delta + tracker before stage_txn consumes the options/txn.
     // graph_delta is used both for per-graph config lookup and for rebuilding
@@ -1259,7 +1340,8 @@ async fn stage_with_config_shacl(
                     crate::cross_ledger::GovernanceArtifact::Shapes(wire) => Some(wire),
                     _ => None,
                 }),
-            staged_ns: cross_ledger_shapes.as_deref().map(|_| &ns_registry),
+            staged_ns: Some(&ns_registry),
+            txn_context,
             inline_shape_bundle,
             cross_ledger_schema,
             cross_ledger_membership,
@@ -2130,8 +2212,15 @@ impl crate::Fluree {
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
 
         #[cfg(feature = "shacl")]
-        let (view, ns_registry) =
-            stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx).await?;
+        let (view, ns_registry) = stage_with_config_shacl(
+            ledger,
+            txn,
+            ns_registry,
+            options,
+            &mut resolve_ctx,
+            txn_json.get("@context"),
+        )
+        .await?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
@@ -2251,8 +2340,17 @@ impl crate::Fluree {
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
 
         #[cfg(feature = "shacl")]
-        let (view, ns_registry) =
-            stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx).await?;
+        let (view, ns_registry) = stage_with_config_shacl(
+            ledger,
+            txn,
+            ns_registry,
+            options,
+            &mut resolve_ctx,
+            // Txn-based entry: no source document, so no authoring
+            // context to compact violation messages against.
+            None,
+        )
+        .await?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
@@ -2458,10 +2556,18 @@ impl crate::Fluree {
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
 
         #[cfg(feature = "shacl")]
-        let (view, ns_registry) =
-            stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx)
-                .await
-                .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
+        let (view, ns_registry) = stage_with_config_shacl(
+            ledger,
+            txn,
+            ns_registry,
+            options,
+            &mut resolve_ctx,
+            // Txn-based entry: no source document, so no authoring
+            // context to compact violation messages against.
+            None,
+        )
+        .await
+        .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options)
             .await
@@ -3061,6 +3167,9 @@ impl crate::Fluree {
                 // the use case lands.
                 cross_ledger_shapes: None,
                 staged_ns: None,
+                // Turtle carries its prefixes in the document, not as a
+                // JSON-LD context the API sees, so violations name full IRIs.
+                txn_context: None,
                 cross_ledger_schema: None,
                 // Turtle insert API has no `opts.shapes` surface
                 // today — inline SHACL flows in over the JSON

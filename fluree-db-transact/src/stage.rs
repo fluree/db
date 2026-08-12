@@ -3058,7 +3058,11 @@ pub async fn stage_with_shacl(
     // Reject on violations only — spec-level `conforms` is also false for
     // warnings/infos, which must not block a commit.
     if report.violation_count() > 0 {
-        return Err(TransactError::ShaclViolation(format_shacl_report(&report)));
+        return Err(TransactError::ShaclViolation(format_shacl_report(
+            &report,
+            &base.snapshot,
+            &ns_registry,
+        )));
     }
 
     Ok((view, ns_registry))
@@ -3327,10 +3331,36 @@ async fn validate_staged_nodes(
     })
 }
 
-/// Format a SHACL validation report as a human-readable string
+/// Format a SHACL validation report as a human-readable string.
+///
+/// Identifiers are decoded to IRIs against the snapshot's namespaces, falling
+/// back to `ns_registry` for prefixes this transaction registered — a property
+/// the transaction itself introduced is absent from the snapshot until it
+/// commits. Printing the raw Sid parts instead concatenates a namespace code
+/// onto a local name (`13address`), which reads as corrupt data rather than as
+/// the property it names.
+///
+/// Unlike the api layer's equivalent, this reports full IRIs: the crate has no
+/// access to the transaction's JSON-LD context, so there are no author-supplied
+/// prefixes to compact against.
 #[cfg(feature = "shacl")]
-fn format_shacl_report(report: &ValidationReport) -> String {
+fn format_shacl_report(
+    report: &ValidationReport,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    ns_registry: &NamespaceRegistry,
+) -> String {
     use std::fmt::Write;
+
+    let render = |sid: &Sid| {
+        snapshot
+            .decode_sid(sid)
+            .or_else(|| {
+                ns_registry
+                    .get_prefix(sid.namespace_code)
+                    .map(|prefix| format!("{prefix}{}", sid.name))
+            })
+            .unwrap_or_else(|| format!("<unresolved namespace {}>{}", sid.namespace_code, sid.name))
+    };
 
     let mut output = String::new();
     writeln!(
@@ -3347,15 +3377,23 @@ fn format_shacl_report(report: &ValidationReport) -> String {
         .enumerate()
     {
         writeln!(&mut output, "  {}. {}", i + 1, result.message).ok();
-        writeln!(&mut output, "     Focus node: {}", result.focus_node).ok();
+        let focus = match &result.focus_node {
+            fluree_db_shacl::FocusNode::Node(sid) => render(sid),
+            fluree_db_shacl::FocusNode::Literal(lit) => lit.value.to_string(),
+        };
+        writeln!(&mut output, "     Focus node: {focus}").ok();
         if let Some(path) = &result.result_path {
-            writeln!(
-                &mut output,
-                "     Path: {}{}",
-                path.namespace_code, path.name
-            )
-            .ok();
+            writeln!(&mut output, "     Path: {}", render(path)).ok();
         }
+        // Which constraint failed. One `sh:message` often covers several
+        // constraints on the same property, so the message alone cannot say
+        // whether the value was absent, repeated, or the wrong datatype.
+        writeln!(
+            &mut output,
+            "     Constraint: {}",
+            result.constraint_component
+        )
+        .ok();
     }
 
     output

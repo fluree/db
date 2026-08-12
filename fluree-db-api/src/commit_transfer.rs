@@ -463,6 +463,10 @@ impl Fluree {
                         // re-validate same-ledger only.
                         cross_ledger_shapes: None,
                         staged_ns: None,
+                        // Replay carries no `opts` payload, so there is no
+                        // authoring context to compact against — violations
+                        // here name full IRIs.
+                        txn_context: None,
                         cross_ledger_schema: None,
                         // Inline shapes are an authoring-time
                         // construct; commit replay carries no

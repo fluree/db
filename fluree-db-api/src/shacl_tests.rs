@@ -115,6 +115,144 @@ async fn shacl_cardinality_constraints() {
     assert_shacl_violation(err, "Expected at most 1 value(s) but found 2");
 }
 
+/// A rejected transaction must name the focus node and path as terms the
+/// author would recognise, and say which constraint failed.
+///
+/// Regression for #1615: these were printed as a namespace code concatenated
+/// onto a local name (`13name`), which reads as corrupted data — the reporter
+/// spent their time hunting a serialization bug that did not exist. The
+/// constraint component was omitted entirely, so a shape whose single
+/// `sh:message` covers minCount, maxCount and datatype could not say which of
+/// them rejected the transaction.
+#[tokio::test]
+async fn violation_message_names_terms_and_constraint() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UserShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:property": [{
+            "@id": "ex:pshape1",
+            "sh:path": {"@id": "schema:name"},
+            "sh:minCount": 1
+        }]
+    });
+
+    let ledger = fluree
+        .create_ledger("shacl/violation-message:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:alex",
+                "@type": "ex:User"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let ApiError::Transact(TransactError::ShaclViolation(message)) = err else {
+        panic!("expected SHACL violation, got {err:?}");
+    };
+
+    // Compacted against the transaction's own context, so the message uses the
+    // prefixes the author declared.
+    assert!(
+        message.contains("Focus node: ex:alex"),
+        "focus node should name the term the transaction used: {message}"
+    );
+    assert!(
+        message.contains("Path: schema:name"),
+        "path should name the term the transaction used: {message}"
+    );
+    assert!(
+        message.contains("Constraint: sh:MinCountConstraintComponent"),
+        "the violated constraint component should be reported: {message}"
+    );
+
+    // The shape of the old output: a namespace code run together with a local
+    // name, indistinguishable from a corrupt identifier.
+    assert!(
+        !message.contains("Focus node: 13"),
+        "raw namespace codes must not reach the message: {message}"
+    );
+}
+
+/// The second half of #1615: one `sh:message` can cover several constraints on
+/// the same property, so the message alone cannot say which of them rejected
+/// the transaction. The reported component has to distinguish them.
+#[tokio::test]
+async fn violation_message_distinguishes_constraints_sharing_one_message() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    // One property, three constraints, a single message for all of them.
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UserShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:property": [{
+            "@id": "ex:pshape1",
+            "sh:path": {"@id": "schema:name"},
+            "sh:minCount": 1,
+            "sh:maxCount": 1,
+            "sh:datatype": {"@id": "xsd:string"},
+            "sh:message": "name is invalid"
+        }]
+    });
+
+    // Each case violates a different constraint on that one property.
+    let cases = [
+        (
+            "missing",
+            json!({"@id": "ex:alex", "@type": "ex:User"}),
+            "sh:MinCountConstraintComponent",
+        ),
+        (
+            "repeated",
+            json!({"@id": "ex:bri", "@type": "ex:User", "schema:name": ["Bri", "Brian"]}),
+            "sh:MaxCountConstraintComponent",
+        ),
+        (
+            "wrong-datatype",
+            json!({"@id": "ex:cass", "@type": "ex:User", "schema:name": 42}),
+            "sh:DatatypeConstraintComponent",
+        ),
+    ];
+
+    for (label, mut node, expected_component) in cases {
+        let ledger = fluree
+            .create_ledger(&format!("shacl/constraint-{label}:main"))
+            .await
+            .unwrap();
+        let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+        node.as_object_mut()
+            .unwrap()
+            .insert("@context".into(), context.clone());
+
+        let err = fluree.upsert(ledger, &node).await.unwrap_err();
+        let ApiError::Transact(TransactError::ShaclViolation(message)) = err else {
+            panic!("expected SHACL violation for {label}, got {err:?}");
+        };
+
+        assert!(
+            message.contains(&format!("Constraint: {expected_component}")),
+            "{label} should report {expected_component}: {message}"
+        );
+        // The shared message is what made these indistinguishable before.
+        assert!(
+            message.contains("name is invalid"),
+            "{label} should still carry the shape's message: {message}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn shacl_datatype_constraints() {
     let fluree = FlureeBuilder::memory().build_memory();
