@@ -1085,12 +1085,12 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
 
 /// Build the compactor that renders identifiers in violation messages.
 ///
-/// Namespaces come from the snapshot plus anything this transaction registered,
-/// so a property the transaction itself introduced still resolves. The
-/// transaction's own context supplies the prefixes, which is what lets the
-/// message name terms the way the author wrote them; without one the compactor
-/// falls back to full IRIs rather than inventing prefixes the reader has no way
-/// to resolve.
+/// Namespaces come from the snapshot plus whatever the operation introduced
+/// and has not committed yet, so a term it brought in itself still resolves.
+/// An authoring context, where the request carried one, supplies the prefixes
+/// that let the message name terms the way their author wrote them. Without
+/// one — a Turtle insert, a replayed commit — the compactor reports full IRIs
+/// rather than inventing prefixes the reader has no way to resolve.
 #[cfg(feature = "shacl")]
 fn violation_iri_compactor(
     view: &StagedLedger,
@@ -1126,10 +1126,10 @@ fn violation_iri_compactor(
 /// log readers that look for familiar phrasing keep working.
 ///
 /// Identifiers are rendered through `compactor`, so a focus node and path read
-/// as the terms the transaction was written with — or as full IRIs where it
-/// declared no context. Printing the raw Sid parts instead concatenates a
-/// namespace code onto a local name (`13address`), which reads as corrupt data
-/// rather than as the property it names.
+/// as the terms their author wrote — or as full IRIs where the operation
+/// carried no context to compact against. Printing the raw Sid parts instead
+/// concatenates a namespace code onto a local name (`13address`), which reads
+/// as corrupt data rather than as the property it names.
 #[cfg(feature = "shacl")]
 fn format_violations(
     violations: &[fluree_db_shacl::ValidationResult],
