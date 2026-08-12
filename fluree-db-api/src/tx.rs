@@ -1125,57 +1125,30 @@ fn violation_iri_compactor(
 /// the prior `TransactError::ShaclViolation` payload so test assertions and
 /// log readers that look for familiar phrasing keep working.
 ///
-/// Identifiers are rendered through `compactor`, so a focus node and path read
-/// as the terms their author wrote — or as full IRIs where the operation
-/// carried no context to compact against. Printing the raw Sid parts instead
-/// concatenates a namespace code onto a local name (`13address`), which reads
-/// as corrupt data rather than as the property it names.
+/// Supplies the resolution the shared layout cannot do for itself: identifiers
+/// go through `compactor`, so a focus node and path read as the terms their
+/// author wrote — or as full IRIs where the operation carried no context to
+/// compact against.
 #[cfg(feature = "shacl")]
 fn format_violations(
     violations: &[fluree_db_shacl::ValidationResult],
     compactor: &crate::format::IriCompactor,
 ) -> String {
-    use std::fmt::Write;
+    let violations: Vec<&fluree_db_shacl::ValidationResult> = violations.iter().collect();
 
-    // A Sid that will not decode has no better rendering than its own parts,
-    // and saying so beats emitting something that looks like an IRI.
-    let render = |sid: &Sid| {
-        compactor.compact_id_sid(sid).unwrap_or_else(|_| {
-            format!("[unresolved namespace {}]{}", sid.namespace_code, sid.name)
-        })
-    };
-
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "SHACL validation failed with {} violation(s):",
-        violations.len()
-    );
-    for (i, v) in violations.iter().enumerate() {
-        let _ = writeln!(out, "  {}. {}", i + 1, v.message);
-        let focus = match &v.focus_node {
-            fluree_db_shacl::FocusNode::Node(sid) => render(sid),
-            fluree_db_shacl::FocusNode::Literal(lit) => lit.value.to_string(),
-        };
-        let _ = writeln!(out, "     Focus node: {focus}");
-        if let Some(path) = &v.result_path {
-            let _ = writeln!(out, "     Path: {}", render(path));
-        }
-        // Which constraint failed. One `sh:message` often covers several
-        // constraints on the same property, so the message alone cannot say
-        // whether the value was absent, repeated, or the wrong datatype.
-        //
+    fluree_db_shacl::format_violations(
+        &violations,
+        |sid| {
+            compactor
+                .compact_id_sid(sid)
+                .unwrap_or_else(|_| fluree_db_shacl::unresolved_sid(sid))
+        },
         // Compacted the same way as the focus node and path — explicit
         // prefixes only. `@vocab` compaction would render this one line as a
         // bare term where the others never can, and a bare word in an error
         // does not read as the identifier it is.
-        let _ = writeln!(
-            out,
-            "     Constraint: {}",
-            compactor.compact_id_iri(v.constraint_component)
-        );
-    }
-    out
+        |iri| compactor.compact_id_iri(iri),
+    )
 }
 
 /// Perform staging followed by config-aware SHACL validation.
