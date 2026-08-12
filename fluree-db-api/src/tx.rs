@@ -3166,7 +3166,10 @@ impl crate::Fluree {
                 // resolve_cross_ledger_shapes_for_tx here when
                 // the use case lands.
                 cross_ledger_shapes: None,
-                staged_ns: None,
+                // Carries the prefixes this document declared, which the
+                // snapshot has not seen yet — without it a violation on a
+                // predicate the document introduces has no IRI to report.
+                staged_ns: Some(&ns_registry),
                 // Turtle carries its prefixes in the document, not as a
                 // JSON-LD context the API sees, so violations name full IRIs.
                 txn_context: None,

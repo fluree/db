@@ -253,6 +253,62 @@ async fn violation_message_distinguishes_constraints_sharing_one_message() {
     }
 }
 
+/// A Turtle insert declares its prefixes in the document, so a namespace it
+/// introduces reaches validation through the staging registry and nowhere
+/// else — the snapshot has never seen it. Without that registry the focus node
+/// has no IRI to report and falls back to naming the raw namespace code.
+///
+/// Turtle carries no JSON-LD context, so the message reports full IRIs; there
+/// are no author-declared terms to compact against.
+#[tokio::test]
+async fn turtle_violation_resolves_a_namespace_the_document_introduced() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UserShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:property": [{
+            "@id": "ex:pshape1",
+            "sh:path": {"@id": "schema:name"},
+            "sh:minCount": 1
+        }]
+    });
+
+    let ledger = fluree
+        .create_ledger("shacl/turtle-violation:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    // `fresh:` appears nowhere in the ledger, so its code is allocated during
+    // this parse and lives only in the staging registry.
+    let turtle = r"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix fresh: <http://brand-new.example/ns/> .
+        fresh:alex a ex:User .
+    ";
+    // `StageResult` is not `Debug`, so match rather than `unwrap_err`.
+    let Err(err) = fluree
+        .stage_turtle_insert(ledger, turtle, None, None, None)
+        .await
+    else {
+        panic!("expected the Turtle insert to be rejected");
+    };
+    let ApiError::Transact(TransactError::ShaclViolation(message)) = err else {
+        panic!("expected SHACL violation, got {err:?}");
+    };
+    assert!(
+        message.contains("Focus node: http://brand-new.example/ns/alex"),
+        "a namespace the document introduced should still resolve: {message}"
+    );
+    assert!(
+        !message.contains("unresolved namespace"),
+        "nothing should fall back to a raw namespace code: {message}"
+    );
+}
+
 #[tokio::test]
 async fn shacl_datatype_constraints() {
     let fluree = FlureeBuilder::memory().build_memory();
