@@ -3045,10 +3045,21 @@ impl FocusNode {
     }
 }
 
+/// Renders the node's internal parts, **not** an IRI.
+///
+/// A `Sid` is a namespace code plus a local name, and resolving the code to a
+/// prefix needs the ledger's namespace map — which a `Display` impl cannot
+/// reach. Anything user-facing must resolve the Sid itself; see
+/// `fluree-db-api`'s violation formatter, which decodes against the snapshot
+/// and the staged registry and compacts against the transaction's context.
+///
+/// The bracketed form is [`Sid`]'s own, chosen so the output cannot be
+/// mistaken for an identifier. Concatenating the parts bare renders
+/// `13address` for `…/ns/address`, which reads as corrupt data (#1615).
 impl std::fmt::Display for FocusNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FocusNode::Node(sid) => write!(f, "{}{}", sid.namespace_code, sid.name),
+            FocusNode::Node(sid) => write!(f, "{sid}"),
             FocusNode::Literal(lit) => write!(f, "{}", lit.value),
         }
     }
