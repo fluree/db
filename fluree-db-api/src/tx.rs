@@ -1141,7 +1141,7 @@ fn format_violations(
     // and saying so beats emitting something that looks like an IRI.
     let render = |sid: &Sid| {
         compactor.compact_id_sid(sid).unwrap_or_else(|_| {
-            format!("<unresolved namespace {}>{}", sid.namespace_code, sid.name)
+            format!("[unresolved namespace {}]{}", sid.namespace_code, sid.name)
         })
     };
 
