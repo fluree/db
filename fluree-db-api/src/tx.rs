@@ -572,11 +572,19 @@ pub(crate) struct StagedShaclContext<'a> {
 
     /// Staged `NamespaceRegistry` — D's snapshot namespaces plus
     /// any IRIs the in-flight transaction has registered. Required
-    /// when `cross_ledger_shapes` is `Some`, where it is the term
-    /// context for compiling M's wire-form shapes against D. Also
-    /// resolves identifiers in violation messages, so a property the
-    /// transaction itself introduced still renders as an IRI.
+    /// when `cross_ledger_shapes` is `Some`; consulted as the term
+    /// context for compiling M's wire-form shapes against D.
     pub staged_ns: Option<&'a fluree_db_transact::namespace::NamespaceRegistry>,
+
+    /// Namespace codes this operation introduced, which the snapshot will not
+    /// carry until it commits. Violation messages resolve against these on top
+    /// of the snapshot's, so a term the operation itself brought in still has
+    /// an IRI to report rather than a bare code.
+    ///
+    /// Every path holds these somewhere of its own — a staging registry's
+    /// delta, or the namespace deltas of the commits being replayed — so this
+    /// is the map rather than any one path's carrier for it.
+    pub uncommitted_namespaces: Option<&'a HashMap<u16, String>>,
 
     /// The JSON-LD context the transaction supplied, used to compact
     /// identifiers in violation messages to the terms the author wrote.
@@ -1091,10 +1099,14 @@ fn violation_iri_compactor(
     use crate::format::IriCompactor;
 
     let base = view.base().snapshot.shared_namespaces();
-    let namespace_codes = match ctx.staged_ns.map(NamespaceRegistry::delta) {
-        Some(delta) if !delta.is_empty() => {
+    let namespace_codes = match ctx.uncommitted_namespaces {
+        Some(uncommitted) if !uncommitted.is_empty() => {
             let mut merged = (*base).clone();
-            merged.extend(delta.iter().map(|(code, prefix)| (*code, prefix.clone())));
+            merged.extend(
+                uncommitted
+                    .iter()
+                    .map(|(code, prefix)| (*code, prefix.clone())),
+            );
             std::sync::Arc::new(merged)
         }
         _ => base,
@@ -1345,7 +1357,8 @@ async fn stage_with_config_shacl(
                     crate::cross_ledger::GovernanceArtifact::Shapes(wire) => Some(wire),
                     _ => None,
                 }),
-            staged_ns: Some(&ns_registry),
+            staged_ns: cross_ledger_shapes.as_deref().map(|_| &ns_registry),
+            uncommitted_namespaces: Some(ns_registry.delta()),
             txn_context,
             inline_shape_bundle,
             cross_ledger_schema,
@@ -3171,10 +3184,11 @@ impl crate::Fluree {
                 // resolve_cross_ledger_shapes_for_tx here when
                 // the use case lands.
                 cross_ledger_shapes: None,
-                // Carries the prefixes this document declared, which the
-                // snapshot has not seen yet — without it a violation on a
-                // predicate the document introduces has no IRI to report.
-                staged_ns: Some(&ns_registry),
+                staged_ns: None,
+                // The prefixes this document declared, which the snapshot has
+                // not seen yet — without them a violation on a predicate the
+                // document introduces has no IRI to report.
+                uncommitted_namespaces: Some(ns_registry.delta()),
                 // Turtle carries its prefixes in the document, not as a
                 // JSON-LD context the API sees, so violations name full IRIs.
                 txn_context: None,
