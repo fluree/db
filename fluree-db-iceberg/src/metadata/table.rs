@@ -208,6 +208,37 @@ impl TableMetadata {
         Ok(window[window.len() - max_snapshots].snapshot_id)
     }
 
+    /// Where an unpinned incremental consumer should end this pass: the head,
+    /// or an earlier snapshot when the backlog from `from_id` exceeds
+    /// `max_snapshots`.
+    ///
+    /// This is the whole decision in one place, so it is testable without a
+    /// storage backend — the caller does nothing but use the answer. Every way
+    /// of declining to cap returns the head unchanged:
+    ///
+    /// - no snapshots at all (`None`; there is nothing to read);
+    /// - `max_snapshots == 0`, the disable switch;
+    /// - `from_id` is `None` — an initial full read has no prefix to take, and a
+    ///   partial "full" read would be worse than an unbounded one;
+    /// - the backlog already fits;
+    /// - the window cannot be walked (expired ancestor, non-ancestor, rollback).
+    ///   That is the existing full-read fallback's case and it must keep it.
+    ///
+    /// Capping only ever returns an EARLIER snapshot than the head, never a
+    /// later one, so a consumer that records where it stopped cannot skip data.
+    pub fn capped_scan_end(
+        &self,
+        from_id: Option<i64>,
+        max_snapshots: usize,
+    ) -> Option<&super::Snapshot> {
+        let head = self.current_snapshot()?;
+        self.window_end_capped(from_id, head.snapshot_id, max_snapshots)
+            .ok()
+            .filter(|id| *id != head.snapshot_id)
+            .and_then(|id| self.snapshot(id))
+            .or(Some(head))
+    }
+
     /// Whether every snapshot in `(from_id, to_id]` was created by an `append`
     /// operation. Only then does an added-files incremental scan capture all
     /// changes (no `overwrite`/`delete`/`replace` => no updates or deletions to
@@ -630,6 +661,57 @@ mod tests {
         assert_eq!(meta.window_end_capped(None, 3, 1).unwrap(), 3);
         // from == to: empty window, nothing to cap.
         assert_eq!(meta.window_end_capped(Some(3), 3, 1).unwrap(), 3);
+    }
+
+    /// `capped_scan_end` is the decision a scan actually makes, so every way of
+    /// declining to cap is pinned here — a consumer calls this and nothing else.
+    #[test]
+    fn capped_scan_end_covers_every_decline_path() {
+        let meta = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+            snap(3, Some(2), 3, Some("append")),
+            snap(4, Some(3), 4, Some("append")),
+        ]);
+        let head = 4;
+
+        // Caps when the backlog exceeds the limit.
+        assert_eq!(meta.capped_scan_end(Some(1), 2).unwrap().snapshot_id, 3);
+
+        // Declines: disabled, initial full read, backlog already fits.
+        assert_eq!(meta.capped_scan_end(Some(1), 0).unwrap().snapshot_id, head);
+        assert_eq!(meta.capped_scan_end(None, 1).unwrap().snapshot_id, head);
+        assert_eq!(meta.capped_scan_end(Some(1), 99).unwrap().snapshot_id, head);
+
+        // Declines: the window cannot be walked. `from` is not an ancestor here,
+        // which is the rollback/branch case — the full-read fallback owns it, so
+        // this must return the head rather than inventing a bound.
+        let orphan = meta_with(vec![
+            snap(7, None, 7, Some("append")),
+            snap(8, Some(7), 8, Some("append")),
+        ]);
+        assert_eq!(orphan.capped_scan_end(Some(1), 1).unwrap().snapshot_id, 8);
+
+        // No snapshots: nothing to read, and no panic.
+        assert!(meta_with(vec![]).capped_scan_end(Some(1), 1).is_none());
+    }
+
+    /// The cap must never hand back a snapshot NEWER than the head — that would
+    /// read past what the caller asked for.
+    #[test]
+    fn capped_scan_end_never_exceeds_the_head() {
+        let meta = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+            snap(3, Some(2), 3, Some("append")),
+        ]);
+        for cap in 0..6 {
+            let chosen = meta.capped_scan_end(Some(1), cap).unwrap().sequence_number;
+            assert!(
+                chosen <= 3,
+                "cap {cap} chose sequence {chosen}, past the head"
+            );
+        }
     }
 
     /// An expired ancestor must still ERROR rather than silently capping to

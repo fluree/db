@@ -1313,30 +1313,23 @@ impl<'a> FlureeR2rmlProvider<'a> {
             // head unchanged — the existing full-read fallback owns that case and
             // must keep owning it.
             None => {
-                let head = metadata.current_snapshot();
                 let cap = materialize_max_snapshots_per_pass();
-                match head {
-                    Some(head) if cap > 0 => {
-                        let bounded = metadata
-                            .window_end_capped(from_snapshot_id, head.snapshot_id, cap)
-                            .ok()
-                            .filter(|id| *id != head.snapshot_id)
-                            .and_then(|id| metadata.snapshot(id));
-                        if let Some(b) = bounded {
-                            info!(
-                                graph_source_id = %graph_source_id,
-                                table = %table_name,
-                                from_snapshot_id = ?from_snapshot_id,
-                                head_snapshot_id = head.snapshot_id,
-                                bounded_to_snapshot_id = b.snapshot_id,
-                                max_snapshots_per_pass = cap,
-                                "materialize: backlog exceeds the per-pass cap, advancing by a prefix"
-                            );
-                        }
-                        bounded.or(Some(head))
+                let chosen = metadata.capped_scan_end(from_snapshot_id, cap);
+                // Log only when the cap actually bit, so a healthy job stays quiet.
+                if let (Some(chosen), Some(head)) = (chosen, metadata.current_snapshot()) {
+                    if chosen.snapshot_id != head.snapshot_id {
+                        info!(
+                            graph_source_id = %graph_source_id,
+                            table = %table_name,
+                            from_snapshot_id = ?from_snapshot_id,
+                            head_snapshot_id = head.snapshot_id,
+                            bounded_to_snapshot_id = chosen.snapshot_id,
+                            max_snapshots_per_pass = cap,
+                            "materialize: backlog exceeds the per-pass cap, advancing by a prefix"
+                        );
                     }
-                    other => other,
                 }
+                chosen
             }
         };
         let Some(to_snapshot) = to_snapshot else {
