@@ -244,6 +244,38 @@ impl ScanChoice {
     }
 }
 
+/// How many source snapshots one unpinned materialize pass may advance through.
+///
+/// `FLUREE_MATERIALIZE_MAX_SNAPSHOTS_PER_PASS`, default 64; `0` disables the cap
+/// and restores the previous "always read to head" behaviour.
+///
+/// **Why a cap exists at all.** The materialize watermark only advances when a
+/// whole pass succeeds. A pass that cannot finish its window writes no
+/// watermark, so the next pass re-reads a window one poll wider, and so on. Once
+/// that window outgrows the source's snapshot retention the stored watermark can
+/// no longer be resolved, and every subsequent poll falls back to a full table
+/// read — which is far more expensive, so it is even less likely to finish. The
+/// failure is self-reinforcing and has no exit: the entry condition for the
+/// incremental path is exactly what was lost.
+///
+/// Observed on a 17-table deployment: one affected table became 13 of 17 in
+/// about four hours, with every table then reading its whole self on every poll.
+///
+/// A cap bounds the work per pass, so the watermark advances every time and
+/// therefore stays inside retention. 64 is deliberately generous — a source
+/// committing 37-72 snapshots an hour stays under it at any sane poll interval,
+/// so a healthy job never notices the cap, while a backlogged one drains in
+/// bounded steps instead of never.
+fn materialize_max_snapshots_per_pass() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FLUREE_MATERIALIZE_MAX_SNAPSHOTS_PER_PASS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(64)
+    })
+}
+
 /// Field ids to project for `projection` against `schema`: every non-nested
 /// field when `projection` is empty, else the named columns that exist in the
 /// schema (unknown names are skipped — the consumer treats them as absent).
@@ -1266,7 +1298,46 @@ impl<'a> FlureeR2rmlProvider<'a> {
                         })?,
                 )
             }
-            None => metadata.current_snapshot(),
+            // Unpinned: read to the source's head, but advance through a long
+            // backlog in bounded steps rather than in one unbounded pass.
+            //
+            // A materialization whose watermark cannot advance re-reads a window
+            // that grows without bound, and once that window outgrows the source's
+            // snapshot retention the watermark can never be resolved again — every
+            // later poll degrades to a full table read, with no path back. Capping
+            // the pass keeps the watermark moving, which keeps it inside retention.
+            //
+            // Capping only ever moves `to` EARLIER, so it cannot skip a snapshot:
+            // the next poll resumes from the watermark this pass wrote. On any
+            // error (expired ancestor, non-ancestor, rollback) fall through to the
+            // head unchanged — the existing full-read fallback owns that case and
+            // must keep owning it.
+            None => {
+                let head = metadata.current_snapshot();
+                let cap = materialize_max_snapshots_per_pass();
+                match head {
+                    Some(head) if cap > 0 => {
+                        let bounded = metadata
+                            .window_end_capped(from_snapshot_id, head.snapshot_id, cap)
+                            .ok()
+                            .filter(|id| *id != head.snapshot_id)
+                            .and_then(|id| metadata.snapshot(id));
+                        if let Some(b) = bounded {
+                            info!(
+                                graph_source_id = %graph_source_id,
+                                table = %table_name,
+                                from_snapshot_id = ?from_snapshot_id,
+                                head_snapshot_id = head.snapshot_id,
+                                bounded_to_snapshot_id = b.snapshot_id,
+                                max_snapshots_per_pass = cap,
+                                "materialize: backlog exceeds the per-pass cap, advancing by a prefix"
+                            );
+                        }
+                        bounded.or(Some(head))
+                    }
+                    other => other,
+                }
+            }
         };
         let Some(to_snapshot) = to_snapshot else {
             // Table has no snapshots: nothing to materialize.

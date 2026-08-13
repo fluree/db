@@ -170,6 +170,44 @@ impl TableMetadata {
         }
     }
 
+    /// The end of a window `(from_id, to_id]` capped to at most `max_snapshots`
+    /// snapshots, so a consumer can advance through a long backlog in bounded
+    /// steps instead of one unbounded pass.
+    ///
+    /// Returns `to_id` unchanged when the window already fits, when `from_id` is
+    /// `None` (an initial full read has no prefix to take), or when
+    /// `max_snapshots` is `0` (disabled).
+    ///
+    /// **Why a consumer wants this.** A materialization whose watermark cannot
+    /// advance re-reads a window that grows without bound, and once that window
+    /// outgrows the source's snapshot retention the watermark can never be
+    /// resolved again — every later poll degrades to a full table read, forever.
+    /// Advancing by a bounded prefix keeps the watermark moving, which keeps it
+    /// inside retention, which is what makes the incremental path recoverable
+    /// rather than a one-way door.
+    ///
+    /// Errors propagate from [`Self::snapshot_window`] (unknown/expired/
+    /// non-ancestor), where the caller must already fall back to a full re-read.
+    pub fn window_end_capped(
+        &self,
+        from_id: Option<i64>,
+        to_id: i64,
+        max_snapshots: usize,
+    ) -> crate::error::Result<i64> {
+        if max_snapshots == 0 || from_id.is_none() {
+            return Ok(to_id);
+        }
+        let window = self.snapshot_window(from_id, to_id)?;
+        if window.len() <= max_snapshots {
+            return Ok(to_id);
+        }
+        // `snapshot_window` is NEWEST-first, and we want the OLDEST
+        // `max_snapshots` of them — the prefix adjacent to `from_id`. Counting
+        // that many back from the old end lands on the last snapshot of the
+        // prefix, which becomes this pass's `to`.
+        Ok(window[window.len() - max_snapshots].snapshot_id)
+    }
+
     /// Whether every snapshot in `(from_id, to_id]` was created by an `append`
     /// operation. Only then does an added-files incremental scan capture all
     /// changes (no `overwrite`/`delete`/`replace` => no updates or deletions to
@@ -549,6 +587,61 @@ mod tests {
         assert!(m.snapshot_window(Some(99), 3).is_err());
         // unknown `to` -> error
         assert!(m.snapshot_window(Some(1), 42).is_err());
+    }
+
+    /// A backlog longer than the cap is advanced in bounded steps, taking the
+    /// OLDEST snapshots first. Taking the newest instead would skip everything
+    /// between `from` and the chosen end — silent data loss, and the reason the
+    /// direction is asserted rather than assumed.
+    #[test]
+    fn window_end_capped_takes_the_oldest_prefix() {
+        // 1 <- 2 <- 3 <- 4 <- 5, watermark at 1, so the window is (1, 5] = 4 wide.
+        let meta = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+            snap(3, Some(2), 3, Some("append")),
+            snap(4, Some(3), 4, Some("append")),
+            snap(5, Some(4), 5, Some("append")),
+        ]);
+
+        // Cap 2 -> advance to snapshot 3, NOT 5: the two oldest after the
+        // watermark. Snapshot 2 must not be skipped.
+        assert_eq!(meta.window_end_capped(Some(1), 5, 2).unwrap(), 3);
+        // Cap 1 -> one step at a time.
+        assert_eq!(meta.window_end_capped(Some(1), 5, 1).unwrap(), 2);
+        // Successive passes converge on the head rather than stalling short of it.
+        assert_eq!(meta.window_end_capped(Some(3), 5, 2).unwrap(), 5);
+    }
+
+    #[test]
+    fn window_end_capped_is_a_no_op_when_it_cannot_help() {
+        let meta = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+            snap(3, Some(2), 3, Some("append")),
+        ]);
+
+        // Window already fits.
+        assert_eq!(meta.window_end_capped(Some(1), 3, 5).unwrap(), 3);
+        // Disabled.
+        assert_eq!(meta.window_end_capped(Some(1), 3, 0).unwrap(), 3);
+        // An initial full read has no prefix to take — capping it would produce a
+        // partial "full" read, which is worse than the unbounded one.
+        assert_eq!(meta.window_end_capped(None, 3, 1).unwrap(), 3);
+        // from == to: empty window, nothing to cap.
+        assert_eq!(meta.window_end_capped(Some(3), 3, 1).unwrap(), 3);
+    }
+
+    /// An expired ancestor must still ERROR rather than silently capping to
+    /// something arbitrary — the caller falls back to a full re-read, and that
+    /// decision has to stay with the caller.
+    #[test]
+    fn window_end_capped_propagates_an_expired_ancestor() {
+        let meta = meta_with(vec![
+            snap(3, Some(2), 3, Some("append")),
+            snap(4, Some(3), 4, Some("append")),
+        ]);
+        assert!(meta.window_end_capped(Some(1), 4, 2).is_err());
     }
 
     #[test]
