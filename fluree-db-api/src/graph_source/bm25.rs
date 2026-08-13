@@ -22,6 +22,53 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Outcome of narrowing an indexing query: the narrowed query, or the reason it
+/// could not be narrowed.
+///
+/// Spelled with `std::result::Result` because `Result` in this module is the
+/// crate alias over `ApiError`, and a decline is not an API error — it is the
+/// ordinary, correct fallback to the unscoped query.
+type ScopeOutcome = std::result::Result<JsonValue, &'static str>;
+
+/// Clauses that shape the result set rather than the scan, paired with why each
+/// one refuses narrowing, in **both** spellings the query parser accepts
+/// (`parse/options.rs` reads `groupBy` or `group-by`; `parse/mod.rs` reads
+/// `selectOne` or `select-one`). Any of them present means the query cannot be
+/// narrowed safely — see [`scope_indexing_query_to_subjects`].
+///
+/// Reason and clause live together so adding a spelling cannot silently inherit
+/// the wrong explanation.
+const RESULT_SHAPING_CLAUSES: &[(&str, &str)] = &[
+    (
+        "limit",
+        "the query carries `limit`, which truncates the result set",
+    ),
+    (
+        "offset",
+        "the query carries `offset`, which truncates the result set",
+    ),
+    (
+        "groupBy",
+        "the query carries `groupBy`, which reshapes the result set",
+    ),
+    (
+        "group-by",
+        "the query carries `groupBy`, which reshapes the result set",
+    ),
+    (
+        "having",
+        "the query carries `having`, which filters the result set",
+    ),
+    (
+        "selectOne",
+        "the query uses `selectOne`, which returns a single row",
+    ),
+    (
+        "select-one",
+        "the query uses `selectOne`, which returns a single row",
+    ),
+];
+
 /// Narrow an indexing query to a known set of subject IRIs by binding its
 /// subject variable with a `values` clause.
 ///
@@ -39,6 +86,8 @@ use tracing::{debug, info, warn};
 /// - the subject variable cannot be identified (see below);
 /// - the query already carries a top-level `values` clause, which this would
 ///   have to merge with rather than replace;
+/// - the query shapes its own result set with `limit`, `offset`, `groupBy` or
+///   `having`, or asks for a single row with `selectOne` (see below);
 /// - the affected set is empty (the caller treats that as a full resync).
 ///
 /// The subject variable is the single key of an object-form `select` —
@@ -46,6 +95,32 @@ use tracing::{debug, info, warn};
 /// `PropertyDeps::from_indexing_query` already assumes and the shape the BM25
 /// documentation specifies. A list-form select (`["?x", "?title"]`) does not
 /// identify which variable is the document, so it is left alone.
+///
+/// **Why result-shaping clauses must decline rather than narrow.** Scoping is
+/// only sound while it changes how rows are *found* and not which rows come
+/// back. Anything that truncates the result set breaks that, because scoping
+/// changes what the truncation is applied to. `apply_update` splits the
+/// affected set two ways: a subject the query returned is upserted, and a
+/// subject in `affected` but not in `seen` is passed to `remove_document`. So
+/// for a query carrying `limit`, the two paths take *opposite* actions on the
+/// same input. With `"limit": 2` over a four-document corpus, the initial build
+/// indexes `doc1, doc2`; a commit then touches `doc4`. Unscoped, the sync runs
+/// the full query, gets `doc1, doc2`, finds `doc4` unseen and removes it — a
+/// no-op here. Scoped, `doc4` is the only row the query can return, so it is
+/// upserted, leaving a three-document index where `resync_bm25_index` would
+/// produce two. `offset`, `groupBy` and `having` truncate or reshape for the
+/// same reason. `selectOne` is the same class and is stricter, not looser: it
+/// returns one row, so scoping changes *which* row rather than merely how it
+/// was found. Declining costs nothing but the optimisation on shapes we cannot
+/// reason about, which is the trade this function already commits to above.
+///
+/// The kebab-case spellings matter: `parse/options.rs` reads `groupBy` **or**
+/// `group-by`, and `parse/mod.rs` reads `selectOne` **or** `select-one`, so a
+/// guard naming only the camelCase form would let the other spelling through
+/// into exactly the divergence above. `limit`, `offset` and `having` have no
+/// alias. `orderBy` is deliberately absent: ordering alone does not change
+/// which rows come back, and every clause that turns an order into a
+/// truncation is already declined here.
 ///
 /// The saving comes from the *indexed* portion of the ledger, where a bound
 /// subject seeks into the leaflets instead of scanning them: fuel is flat in
@@ -59,19 +134,39 @@ use tracing::{debug, info, warn};
 fn scope_indexing_query_to_subjects(
     query: &JsonValue,
     affected_iris: &HashSet<Arc<str>>,
-) -> Option<JsonValue> {
-    if affected_iris.is_empty() || query.get("values").is_some() {
-        return None;
+) -> ScopeOutcome {
+    // The error carries WHY, so the caller can say which condition declined
+    // instead of leaving an operator to guess why a sync is still slow.
+    if affected_iris.is_empty() {
+        return Err("the affected set is empty (the caller treats this as a full resync)");
+    }
+    if query.get("values").is_some() {
+        return Err("the query already carries a top-level `values` clause");
+    }
+    if let Some(&(_, reason)) = RESULT_SHAPING_CLAUSES
+        .iter()
+        .find(|(clause, _)| query.get(clause).is_some())
+    {
+        return Err(reason);
     }
 
     // Object-form select only, with exactly one key: that key is the document
-    // variable. `selectOne` is included for symmetry with the parser.
-    let select = query.get("select").or_else(|| query.get("selectOne"))?;
-    let obj = select.as_object()?;
+    // variable. `selectOne` is declined above, not accepted here.
+    let Some(select) = query.get("select") else {
+        return Err("the query has no `select` clause");
+    };
+    let Some(obj) = select.as_object() else {
+        return Err("the `select` is not object-form, so it names no document variable");
+    };
     let mut keys = obj.keys();
-    let subject_var = keys.next()?;
-    if keys.next().is_some() || !subject_var.starts_with('?') {
-        return None;
+    let Some(subject_var) = keys.next() else {
+        return Err("the `select` object is empty");
+    };
+    if keys.next().is_some() {
+        return Err("the `select` binds more than one variable, so the document is ambiguous");
+    }
+    if !subject_var.starts_with('?') {
+        return Err("the `select` key is not a variable");
     }
 
     // Bind the document variable to the affected IRIs. Full IRIs, not the
@@ -90,10 +185,11 @@ fn scope_indexing_query_to_subjects(
         .collect();
 
     let mut scoped = query.clone();
-    scoped
-        .as_object_mut()?
-        .insert("values".to_string(), serde_json::json!([subject_var, rows]));
-    Some(scoped)
+    let Some(scoped_obj) = scoped.as_object_mut() else {
+        return Err("the query is not a JSON object");
+    };
+    scoped_obj.insert("values".to_string(), serde_json::json!([subject_var, rows]));
+    Ok(scoped)
 }
 
 /// Maximum concurrent CAS operations for BM25 leaflet reads/writes.
@@ -1051,19 +1147,29 @@ impl crate::Fluree {
         );
 
         // 8. Re-run the indexing query, scoped to the affected subjects where we
-        //    can. `scope_indexing_query_to_subjects` returns None when the query
+        //    can. `scope_indexing_query_to_subjects` declines when the query
         //    shape is not one we can safely narrow, in which case this falls back
         //    to the full scan and the filtering in `apply_update` below does the
         //    work — same results either way, just more of them computed.
+        //
+        //    Both outcomes log. A decline is correct, not an error, but it is
+        //    also invisible: the sync stays O(corpus) and nothing says why. The
+        //    reason is the one thing an operator needs to act on it.
         let scoped = scope_indexing_query_to_subjects(&query, &affected_iris);
-        let scoped_query = scoped.as_ref().unwrap_or(&query);
-        if scoped.is_some() {
-            debug!(
+        match &scoped {
+            Ok(_) => debug!(
                 graph_source_id = %graph_source_id,
                 affected_count = affected_iris.len(),
                 "Scoped indexing query to affected subjects"
-            );
+            ),
+            Err(reason) => debug!(
+                graph_source_id = %graph_source_id,
+                affected_count = affected_iris.len(),
+                reason = %reason,
+                "Indexing query not narrowed; falling back to the full scan"
+            ),
         }
+        let scoped_query = scoped.as_ref().unwrap_or(&query);
         let results = self
             .execute_bm25_indexing_query(&ledger, scoped_query)
             .await?;
@@ -1616,6 +1722,20 @@ mod scope_tests {
         assert_eq!(scoped["select"], doc_query()["select"]);
     }
 
+    /// Decline, and say which condition fired. Asserting the reason rather than
+    /// just `is_err()` is what stops one guard silently covering for another —
+    /// delete the `limit` check and the `limit` case must fail, not fall through
+    /// to some other decline and still pass.
+    fn assert_declines(q: &JsonValue, expect_reason_contains: &str) {
+        let err = scope_indexing_query_to_subjects(q, &iris(&["http://example.org/doc1"]))
+            .expect_err("this query shape must not be narrowed");
+        assert!(
+            err.contains(expect_reason_contains),
+            "declined for the wrong reason: wanted something containing \
+             {expect_reason_contains:?}, got {err:?}"
+        );
+    }
+
     #[test]
     fn declines_a_list_form_select() {
         // A list select does not say which variable is the document, so there is
@@ -1624,9 +1744,7 @@ mod scope_tests {
             "where": [{ "@id": "?x", "ex:title": "?title" }],
             "select": ["?x", "?title"]
         });
-        assert!(
-            scope_indexing_query_to_subjects(&q, &iris(&["http://example.org/doc1"])).is_none()
-        );
+        assert_declines(&q, "not object-form");
     }
 
     #[test]
@@ -1634,9 +1752,7 @@ mod scope_tests {
         let q = serde_json::json!({
             "select": { "?x": ["@id"], "?y": ["@id"] }
         });
-        assert!(
-            scope_indexing_query_to_subjects(&q, &iris(&["http://example.org/doc1"])).is_none()
-        );
+        assert_declines(&q, "more than one variable");
     }
 
     #[test]
@@ -1644,15 +1760,56 @@ mod scope_tests {
         // Injecting here would have to merge with the caller's own bindings.
         let mut q = doc_query();
         q["values"] = serde_json::json!(["?x", [{ "@id": "http://example.org/doc9" }]]);
-        assert!(
-            scope_indexing_query_to_subjects(&q, &iris(&["http://example.org/doc1"])).is_none()
-        );
+        assert_declines(&q, "`values`");
     }
 
     #[test]
     fn declines_an_empty_affected_set() {
         // The caller treats "nothing affected" as a full resync; binding an empty
         // values list would instead silently index nothing.
-        assert!(scope_indexing_query_to_subjects(&doc_query(), &iris(&[])).is_none());
+        let err = scope_indexing_query_to_subjects(&doc_query(), &iris(&[]))
+            .expect_err("an empty affected set must not be narrowed");
+        assert!(err.contains("affected set is empty"), "got {err:?}");
+    }
+
+    #[test]
+    fn declines_every_result_shaping_clause_in_both_spellings() {
+        // These do not change how rows are FOUND, they change which rows come
+        // BACK — and `apply_update` upserts what the query returned while
+        // removing what it did not, so a narrowed truncation makes the two paths
+        // disagree about the same subject. Concretely for `limit`: unscoped, an
+        // affected subject outside the top-N is unseen and gets removed; scoped,
+        // it is the only row and gets upserted, leaving one more document indexed
+        // than a full resync would produce.
+        //
+        // Both spellings are checked because the parser accepts both: missing
+        // `group-by` or `select-one` would leave exactly that divergence reachable
+        // through the alias.
+        for (clause, reason) in [
+            ("limit", "`limit`"),
+            ("offset", "`offset`"),
+            ("groupBy", "`groupBy`"),
+            ("group-by", "`groupBy`"),
+            ("having", "`having`"),
+        ] {
+            let mut q = doc_query();
+            q[clause] = serde_json::json!(2);
+            assert_declines(&q, reason);
+        }
+    }
+
+    #[test]
+    fn declines_select_one_in_both_spellings() {
+        // `selectOne` returns a single row, so scoping changes WHICH row rather
+        // than how it was found. Accepting it "for symmetry with the parser" was
+        // the original justification, and symmetry is not a safety argument.
+        for clause in ["selectOne", "select-one"] {
+            let mut q = serde_json::json!({
+                "@context": { "ex": "http://example.org/" },
+                "where": [{ "@id": "?x", "@type": "ex:Doc", "ex:title": "?title" }]
+            });
+            q[clause] = serde_json::json!({ "?x": ["@id", "ex:title"] });
+            assert_declines(&q, "`selectOne`");
+        }
     }
 }
