@@ -119,4 +119,14 @@ Implementation: `NamespaceRegistry::from_db` and `NamespaceRegistry::sid_for_iri
   (one per host), but it prevents deeper fragmentation that is common in path-heavy IRIs.
 - The `OVERFLOW` namespace code is a sentinel used when `u16` codes are exhausted; it is not a
   fallback mode. Overflow SIDs store the **full IRI** as the SID name.
+- **High-cardinality trailing segments allocate one namespace per subject.** Under `MostGranular`,
+  an opaque IRI splits at its *last* `/`, `#` or `:`, so a shape like
+  `urn:example:record:<id>:rev:<hash>` yields the prefix `urn:example:record:<id>:rev:` — unique to
+  that one subject. A dataset built this way allocates a namespace code per node rather than per
+  family, which has two consequences: the user code space (`USER_START`..`OVERFLOW`, ~65.5k codes)
+  can be exhausted by a few hundred thousand subjects, and per-transaction work that keys off
+  namespace codes degrades. The streaming preflight above only covers **bulk import** — ordinary
+  transactions get no such detection, so this is a data-modelling concern for write workloads.
+  Prefer moving the high-cardinality part into the *suffix* (`urn:example:record:<id>-rev-<hash>`)
+  or setting `HostPlusN(n)` on the ledger.
 

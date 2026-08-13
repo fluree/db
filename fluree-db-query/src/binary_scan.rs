@@ -1562,39 +1562,48 @@ impl BinaryScanOperator {
         let from_t = ctx.from_t;
         let cmp = self.index.comparator();
 
-        // Collect all overlay flakes for this graph+index (novelty is expected to be small),
-        // then narrow by equality match.
+        // Collect overlay flakes for this graph+index, applying the bound-term
+        // equality match INSIDE the walk.
+        //
+        // Filtering before the copy (rather than `retain`ing afterwards) is
+        // what keeps this path cheap: this fallback is reached once per probe
+        // of a subject/predicate/value that is absent from the persisted
+        // dictionaries, and callers such as upsert's existing-value lookup
+        // issue thousands of such probes per transaction. Cloning and sorting
+        // the whole graph's novelty on each one is O(novelty log novelty) per
+        // call; matching first makes it a comparison-only walk with no
+        // allocation for the (overwhelmingly common) non-matching flakes.
+        //
+        // Equivalent to the previous filter-after-resolve order:
+        // `resolve_overlay_retractions` decides each distinct fact
+        // `(s, p, o, dt, m)` independently, and an (s, p, o) equality filter
+        // either keeps or drops a fact's entries as a whole — so it can never
+        // separate an assertion from the retraction that cancels it.
         let mut flakes: Vec<Flake> = Vec::new();
         overlay.for_each_overlay_flake(self.g_id, self.index, None, None, true, to_t, &mut |f| {
-            if f.t <= to_t && from_t.is_none_or(|ft| f.t >= ft) {
-                flakes.push(f.clone());
+            if f.t > to_t || from_t.is_some_and(|ft| f.t < ft) {
+                return;
             }
+            if let Some(s) = s_sid.as_ref() {
+                if &f.s != s {
+                    return;
+                }
+            }
+            if let Some(p) = p_sid.as_ref() {
+                if &f.p != p {
+                    return;
+                }
+            }
+            if let Some(o) = self.bound_o.as_ref() {
+                if &f.o != o {
+                    return;
+                }
+            }
+            flakes.push(f.clone());
         });
 
         flakes.sort_by(cmp);
         flakes = resolve_overlay_retractions(flakes);
-
-        // Apply equality match (subject/predicate/object).
-        if s_sid.is_some() || p_sid.is_some() || self.bound_o.is_some() {
-            flakes.retain(|f| {
-                if let Some(s) = s_sid.as_ref() {
-                    if &f.s != s {
-                        return false;
-                    }
-                }
-                if let Some(p) = p_sid.as_ref() {
-                    if &f.p != p {
-                        return false;
-                    }
-                }
-                if let Some(o) = self.bound_o.as_ref() {
-                    if &f.o != o {
-                        return false;
-                    }
-                }
-                true
-            });
-        }
 
         // Apply object bounds (post-filter) when present.
         if let Some(bounds) = self.object_bounds.as_ref() {
