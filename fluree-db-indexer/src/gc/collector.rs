@@ -238,12 +238,18 @@ pub async fn clean_garbage(
         .min_time_garbage_mins
         .unwrap_or(DEFAULT_MIN_TIME_GARBAGE_MINS);
     // Past this many retained old versions the age guard is overridden — see
-    // `CleanGarbageConfig::hard_max_old_indexes`. Clamped to be at least
-    // `max_old_indexes` so a misconfiguration can never collect inside the
-    // retention target itself.
+    // `CleanGarbageConfig::hard_max_old_indexes`.
+    //
+    // Deliberately NOT clamped up to `max_old_indexes`. An earlier revision did
+    // that, to stop a misconfigured ceiling collecting inside the retention
+    // target, but the retention target is already enforced one level up: the
+    // loop below starts at `keep_count`, so no value of this can reach a version
+    // the retention promise covers. The clamp could not change any observable
+    // behaviour — mutation-testing it removed broke nothing — so it is gone
+    // rather than kept as a guard that reads as load-bearing and is not.
     let hard_max_old_indexes = config.hard_max_old_indexes.map_or_else(
         || max_old_indexes.saturating_mul(super::DEFAULT_HARD_MAX_MULTIPLE as usize),
-        |v| (v as usize).max(max_old_indexes),
+        |v| v as usize,
     );
     let min_age_ms = min_age_mins as i64 * 60 * 1000;
     let now_ms = current_timestamp_ms();
@@ -1108,18 +1114,38 @@ mod tests {
         );
     }
 
-    /// A ceiling below `max_old_indexes` must not collect inside the retention
-    /// target — a misconfigured (or zero) ceiling should degrade to "no override",
-    /// never to "delete the versions we promised to keep".
+    /// **The retention promise outranks the ceiling.** Even at the most hostile
+    /// setting — `hard_max_old_indexes: Some(0)`, i.e. "override the age guard
+    /// everywhere" — the newest `1 + max_old_indexes` versions must survive.
+    ///
+    /// The previous version of this test was VACUOUS and is worth recording as a
+    /// warning. It used `max_old_indexes: Some(5)` against a 3-entry chain, so
+    /// `index_chain.len() <= keep_count` returned early and the retention loop
+    /// never ran at all. It asserted `indexes_cleaned == 0` and passed because
+    /// nothing was attempted, not because anything was protected — it stayed
+    /// green with the ceiling logic removed entirely.
+    ///
+    /// This version makes the chain LONGER than `keep_count`, so the loop runs
+    /// and both halves are observable: the two eligible versions are collected
+    /// despite fresh garbage records (the ceiling working), and the two retained
+    /// ones survive (the retention promise holding). Lowering the loop's start
+    /// from `keep_count` to `0` fails this.
     #[tokio::test]
     async fn test_hard_ceiling_never_collects_inside_retention_target() {
         let storage = MemoryStorage::new();
 
+        // Chain newest-first once walked: [root4, root3, root2, root1].
+        // max_old_indexes = 1 -> keep_count = 2, so root4/root3 are retained and
+        // root2/root1 are gc-eligible.
         let (cid1, addr1) = cid_and_addr(ContentKind::IndexRoot, b"floor_root1");
         let (cid2, addr2) = cid_and_addr(ContentKind::IndexRoot, b"floor_root2");
         let (cid3, addr3) = cid_and_addr(ContentKind::IndexRoot, b"floor_root3");
+        let (cid4, addr4) = cid_and_addr(ContentKind::IndexRoot, b"floor_root4");
         let (garb_cid2, garb_addr2) = cid_and_addr(ContentKind::GarbageRecord, b"floor_garb2");
+        let (garb_cid3, garb_addr3) = cid_and_addr(ContentKind::GarbageRecord, b"floor_garb3");
 
+        // Every record is 5 minutes old against a 30-minute guard, so nothing
+        // here is collectable unless the ceiling overrides the age check.
         let recent_ts = current_timestamp_ms() - (5 * 60 * 1000);
 
         let root1 = minimal_fir6(1, None, None);
@@ -1139,36 +1165,70 @@ mod tests {
                 t: 2,
                 id: cid2.clone(),
             }),
+            Some(BinaryGarbageRef {
+                id: garb_cid3.clone(),
+            }),
+        );
+        let root4 = minimal_fir6(
+            4,
+            Some(BinaryPrevIndexRef {
+                t: 3,
+                id: cid3.clone(),
+            }),
             None,
         );
         let garbage2 = format!(
-            r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": ["old"], "created_at_ms": {recent_ts}}}"#
+            r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": [], "created_at_ms": {recent_ts}}}"#
+        );
+        let garbage3 = format!(
+            r#"{{"ledger_id": "{LEDGER}", "t": 3, "garbage": [], "created_at_ms": {recent_ts}}}"#
         );
 
         storage.write_bytes(&addr1, &root1).await.unwrap();
         storage.write_bytes(&addr2, &root2).await.unwrap();
         storage.write_bytes(&addr3, &root3).await.unwrap();
+        storage.write_bytes(&addr4, &root4).await.unwrap();
         storage
             .write_bytes(&garb_addr2, garbage2.as_bytes())
             .await
             .unwrap();
+        storage
+            .write_bytes(&garb_addr3, garbage3.as_bytes())
+            .await
+            .unwrap();
 
         let config = CleanGarbageConfig {
-            max_old_indexes: Some(5),
+            max_old_indexes: Some(1),
             min_time_garbage_mins: Some(30),
-            // Absurdly low: clamped up to max_old_indexes, so hard_keep = 6 and a
-            // 3-entry chain is entirely within retention.
+            // The most hostile setting: override the age guard everywhere.
             hard_max_old_indexes: Some(0),
             ..Default::default()
         };
 
         let store = test_store(&storage);
-        let result = clean_garbage(&store, &cid3, config).await.unwrap();
+        clean_garbage(&store, &cid4, config).await.unwrap();
 
-        assert_eq!(result.indexes_cleaned, 0);
-        assert!(store.has(&cid1).await.unwrap());
-        assert!(store.has(&cid2).await.unwrap());
-        assert!(store.has(&cid3).await.unwrap());
+        // Retained: the newest keep_count = 2. These must survive whatever the
+        // ceiling says — this is the half a wrong loop bound would break.
+        assert!(
+            store.has(&cid4).await.unwrap(),
+            "the current root must never be collected"
+        );
+        assert!(
+            store.has(&cid3).await.unwrap(),
+            "the retention target promises max_old_indexes=1 old version; the \
+             ceiling must not reach inside it"
+        );
+        // Eligible: collected despite garbage records well inside the age guard,
+        // which is the ceiling doing its job. Without it both would survive.
+        assert!(
+            !store.has(&cid2).await.unwrap(),
+            "past the ceiling, age must not protect an eligible version"
+        );
+        assert!(
+            !store.has(&cid1).await.unwrap(),
+            "past the ceiling, age must not protect an eligible version"
+        );
     }
 
     #[tokio::test]
