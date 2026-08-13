@@ -1634,11 +1634,17 @@ async fn bm25_incremental_sync_matches_full_resync() {
 }
 
 /// The narrowing has to reduce the work the engine does, not merely the rows it
-/// hands back. `bm25_incremental_sync_matches_full_resync` pins correctness and
-/// the `scope_tests` unit tests pin the shape of the generated clause, but
-/// neither would notice if the `values` binding were applied as a post-filter
-/// over a full scan — which is exactly the regression that would quietly undo
-/// the point of scoping the query.
+/// hands back. `bm25_incremental_sync_matches_full_resync` pins correctness,
+/// `it_bm25_sync_scoping.rs` pins that the sync path really takes this branch,
+/// and the `scope_tests` unit tests pin the shape of the generated clause and
+/// every condition that declines it.
+///
+/// This one is deliberately none of those: it is a **characterization test of
+/// the query engine**, and it passes with this PR's source reverted, because it
+/// hand-builds the `values` clause. Keep it anyway — it is what would catch a
+/// future engine change that turned a `values` binding into a post-filter over a
+/// full scan, quietly removing the reason for scoping at all. It does not
+/// belong to this PR's guard set; the two tests named above are that.
 ///
 /// Measured against a corpus large enough that a full scan cannot be mistaken
 /// for a narrow one, on an **indexed** ledger because that is what the sync
