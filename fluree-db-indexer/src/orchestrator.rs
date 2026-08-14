@@ -967,10 +967,13 @@ impl BackgroundIndexerWorker {
         (worker, handle)
     }
 
-    /// Attach a [`LedgerEventBus`]. [`run`](Self::run) subscribes,
-    /// performs a catch-up sweep, then translates
-    /// `LedgerCommitPublished` events into trigger calls. The
-    /// subscriber's lifetime is tied to the `run` task.
+    /// Attach a [`LedgerEventBus`]. [`run`](Self::run) subscribes and
+    /// translates `LedgerCommitPublished` events into trigger calls,
+    /// re-sweeping if the broadcast channel lags. The subscriber's
+    /// lifetime is tied to the `run` task.
+    ///
+    /// This is optional and orthogonal to catching up: `run` sweeps for
+    /// behind ledgers with or without a bus.
     pub fn with_event_bus(mut self, event_bus: Arc<LedgerEventBus>) -> Self {
         self.event_bus = Some(event_bus);
         self
@@ -984,6 +987,51 @@ impl BackgroundIndexerWorker {
     /// 3. Resolves waiters based on min_t predicate
     /// 4. Handles cancellation and backoff
     pub async fn run(mut self) {
+        // Catch up on ledgers that are already behind, whether or not an event
+        // bus was wired.
+        //
+        // This sweep used to live in `run_event_subscriber`, which runs only
+        // when a caller supplied an event bus — and the only caller that does
+        // is the raft leader task. Every embedded and standalone deployment
+        // therefore had NO catch-up sweep at all, not even at startup, leaving
+        // triggering entirely to the post-commit hooks in the api layer. Those
+        // are in-process, so they die with the process.
+        //
+        // That combination is a deadlock, not a slow path. `at_max_novelty`
+        // gates on the ledger's accumulated novelty, not on the size of the
+        // incoming transaction, so a ledger loaded with a backlog already over
+        // `reindex_max_bytes` rejects EVERY write:
+        //
+        //     novelty >= reindex_max_bytes -> write rejected -> no commit
+        //       -> no post-commit trigger, and no sweep to replace it
+        //       -> novelty stays >= reindex_max_bytes, forever
+        //
+        // The one thing that can lower novelty is gated behind the one thing
+        // novelty blocks, and no smaller write can break in. Restarting does
+        // not help, because the sweep that would have found it never ran.
+        //
+        // Observed on a 24-ledger materialize fan-out: ledgers sitting at
+        // commit_t 597 / index_t 251 with no index build ever attempted, for
+        // hours, across a fresh process. Because a materialize job's watermark
+        // cannot advance while any of its fan-out targets is behind, single
+        // wedged targets froze 13 source tables behind them.
+        //
+        // Sweeping from here rather than subscribing the worker to the bus is
+        // deliberate: `process_ledger` builds whenever `commit_t > index_t`
+        // with no byte gate, so triggering off every `LedgerCommitPublished`
+        // would index after every commit and quietly discard the
+        // `reindex_min_bytes` threshold the operator configured.
+        //
+        // The sweep gets the trigger surface rather than the full
+        // `IndexerHandle` for the same reason the subscriber does — see below.
+        let _sweep_guard = {
+            let trigger = self.subscriber_trigger.clone();
+            let nameservice = Arc::clone(&self.nameservice);
+            AbortOnDrop(tokio::spawn(async move {
+                catch_up_sweep(&trigger, nameservice.as_ref()).await;
+            }))
+        };
+
         // Guard ensures aborting the outer `run` task also aborts
         // the subscriber — its broadcast receiver doesn't otherwise
         // observe cancellation.
@@ -1787,17 +1835,16 @@ async fn catch_up_sweep(handle: &TriggerHandle, nameservice: &dyn IndexingNameSe
 }
 
 /// Translate [`NameServiceEvent::LedgerCommitPublished`] from `bus`
-/// into [`IndexerHandle::trigger`] calls. Catch-up sweeps run at
-/// startup and on `Lagged`. Returns when the bus closes.
+/// into [`IndexerHandle::trigger`] calls. A catch-up sweep runs on
+/// `Lagged`; the startup sweep belongs to
+/// [`BackgroundIndexerWorker::run`], which performs it whether or not
+/// a bus was wired. Returns when the bus closes.
 async fn run_event_subscriber(
     bus: Arc<LedgerEventBus>,
     handle: TriggerHandle,
     nameservice: Arc<dyn IndexingNameService>,
 ) {
-    // Subscribe before the catch-up sweep so events arriving during
-    // the sweep are buffered, not lost.
     let mut subscription = bus.subscribe(SubscriptionScope::All);
-    catch_up_sweep(&handle, nameservice.as_ref()).await;
 
     loop {
         match subscription.receiver.recv().await {
@@ -3225,6 +3272,71 @@ mod tests {
             !handle.is_pending("current:main").await,
             "current ledger should be skipped"
         );
+    }
+
+    /// **The deadlock this exists to break.** The catch-up sweep used to run
+    /// only from `run_event_subscriber`, which is spawned only when a caller
+    /// supplied an event bus — and in this repo only the raft leader task does.
+    /// So every embedded and standalone deployment started with no sweep, and a
+    /// ledger whose backlog already exceeded `reindex_max_bytes` rejected every
+    /// write, published no commit, and therefore never triggered the indexer
+    /// that was the only thing able to drain it.
+    ///
+    /// The property: a worker with NO event bus must still catch up a ledger
+    /// that is behind when it starts. `catch_up_sweep_triggers_only_behind_ledgers`
+    /// covers the sweep as a function; nothing asserted that `run()` calls it,
+    /// which is exactly where the bug lived.
+    ///
+    /// Observed in production: ledgers at commit_t 597 / index_t 251 with no
+    /// index build ever attempted across a fresh process, freezing 13
+    /// materialize source tables behind them.
+    #[tokio::test]
+    async fn run_sweeps_behind_ledgers_without_an_event_bus() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns = Arc::new(MemoryNameService::new());
+        let ns_dyn: Arc<dyn IndexingNameService> = Arc::clone(&ns) as _;
+
+        // Both ledgers exist before the worker starts, so the sweep is the only
+        // thing that can find them: no commit is published afterwards, and
+        // there is no bus to carry an event even if one were.
+        ns.create_ledger("behind:main").unwrap();
+        ns.publish_commit("behind:main", 7, &test_commit_cid(7))
+            .await
+            .unwrap();
+        ns.create_ledger("current:main").unwrap();
+
+        let (worker, handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns_dyn), IndexerConfig::default());
+        assert!(
+            worker.event_bus.is_none(),
+            "this test is only meaningful without a bus — that is the deployment shape that wedged"
+        );
+        let run_task = tokio::spawn(worker.run());
+
+        let triggered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if handle.is_pending("behind:main").await {
+                    return true;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        // Read this before aborting: `current:main` is caught up, so the sweep
+        // must leave it alone. Asserting it against a ledger that exists (rather
+        // than one absent from the nameservice) is what makes the assertion able
+        // to fail at all.
+        let current_pending = handle.is_pending("current:main").await;
+        run_task.abort();
+
+        assert!(
+            triggered,
+            "a ledger behind at startup must be swept even with no event bus; \
+             without this the only escape is a manual reindex"
+        );
+        assert!(!current_pending, "a caught-up ledger must not be triggered");
     }
 
     #[tokio::test]
