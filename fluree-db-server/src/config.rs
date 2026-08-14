@@ -426,6 +426,16 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_REINDEX_MAX_BYTES")]
     pub reindex_max_bytes: Option<usize>,
 
+    /// How often to re-sweep for ledgers whose indexing has stalled (seconds)
+    ///
+    /// A safety net for a ledger that falls behind and then stops receiving the
+    /// commits that would trigger it. Only ledgers that are behind AND whose
+    /// commit_t has not moved since the previous sweep are queued, so a healthy
+    /// deployment pays one nameservice listing per interval and nothing else.
+    /// `0` disables the re-sweep; the sweep performed at start-up always runs.
+    #[arg(long, env = "FLUREE_INDEXER_CATCHUP_INTERVAL_SECS", default_value_t = fluree_db_indexer::DEFAULT_CATCHUP_INTERVAL_SECS)]
+    pub indexer_catchup_interval_secs: u64,
+
     /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 50% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
@@ -830,6 +840,7 @@ impl Default for ServerConfig {
             bm25_auto_sync: server_defaults::DEFAULT_BM25_AUTO_SYNC,
             reindex_min_bytes: server_defaults::DEFAULT_REINDEX_MIN_BYTES,
             reindex_max_bytes: None,
+            indexer_catchup_interval_secs: fluree_db_indexer::DEFAULT_CATCHUP_INTERVAL_SECS,
             cache_max_mb: None,
             disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
