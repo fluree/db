@@ -862,6 +862,12 @@ impl IndexerHandle {
         self.trigger.trigger(ledger_id, min_t).await
     }
 
+    /// Queue a ledger only if nothing else already owns it. See
+    /// [`TriggerHandle::trigger_if_idle`].
+    pub async fn trigger_if_idle(&self, ledger_id: &str, min_t: i64) -> bool {
+        self.trigger.trigger_if_idle(ledger_id, min_t).await
+    }
+
     /// Exclude index builds for a ledger. See
     /// [`TriggerHandle::acquire_maintenance`].
     pub fn acquire_maintenance(&self, ledger_id: &str) -> Option<MaintenanceGuard> {
