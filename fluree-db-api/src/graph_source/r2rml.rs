@@ -244,6 +244,54 @@ impl ScanChoice {
     }
 }
 
+/// Rows a single FULL materialize read may take before checkpointing.
+///
+/// `FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS`, default 250_000; `0` disables
+/// the bound and restores the previous read-it-all behaviour.
+fn materialize_max_rows_per_full_pass() -> i64 {
+    static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+            .unwrap_or(250_000)
+    })
+}
+
+/// The commit sequence to stop a full read at, or `None` to read it whole.
+///
+/// Walks `tasks` (already sorted by `(data_sequence_number, path)`) accumulating
+/// rows, and returns the sequence of the commit the budget ran out in. The whole
+/// of that commit is kept: a cut INSIDE a commit leaves the target in a state no
+/// snapshot names, and an unnameable state cannot be checkpointed.
+///
+/// `None` when the bound is disabled, the plan already fits, any task lacks a
+/// sequence number, or the budget runs out in the final commit — stopping there
+/// would checkpoint at the head, which is the whole read with extra steps.
+fn full_read_prefix(tasks: &[fluree_db_iceberg::scan::FileScanTask], max_rows: i64) -> Option<i64> {
+    if max_rows <= 0 {
+        return None;
+    }
+    let total: i64 = tasks.iter().map(|t| t.data_file.record_count).sum();
+    if total <= max_rows {
+        return None;
+    }
+    let last_seq = tasks
+        .iter()
+        .filter_map(|t| t.data_sequence_number)
+        .next_back()?;
+    let mut rows = 0i64;
+    for t in tasks {
+        let seq = t.data_sequence_number?;
+        rows = rows.saturating_add(t.data_file.record_count);
+        if rows >= max_rows {
+            return (seq < last_seq).then_some(seq);
+        }
+    }
+    None
+}
+
 /// Field ids to project for `projection` against `schema`: every non-nested
 /// field when `projection` is empty, else the named columns that exist in the
 /// schema (unknown names are skipped — the consumer treats them as absent).
@@ -1277,7 +1325,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 stream: empty_batch_stream(),
             });
         };
-        let to_snapshot_id = to_snapshot.snapshot_id;
+        let mut to_snapshot_id = to_snapshot.snapshot_id;
 
         // Schema AT the `to` snapshot (falls back to current when the snapshot
         // carries no schema-id) — identical to current for an unpinned read.
@@ -1358,7 +1406,57 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 estimated_rows = plan.estimated_row_count,
                 "materialize: full scan plan"
             );
-            plan.tasks
+
+            // A full read cannot be bounded by snapshot — there is no `from` to
+            // take a prefix after — so bound it by rows instead, and checkpoint
+            // at the snapshot that prefix corresponds to.
+            //
+            // This is the path a source lands on once its watermark has expired,
+            // and without a bound it is a trap: the read is the most expensive
+            // one the table has, so it is the most likely to exhaust the target's
+            // novelty and defer, which writes no watermark, which guarantees the
+            // same read next poll. Every later poll is then the same full read,
+            // forever. Bounding it means each pass finishes, writes a watermark,
+            // and the one after starts incremental.
+            //
+            // Tasks arrive sorted by `(data_sequence_number, path)`, so a prefix
+            // is a prefix in COMMIT order. The cut is then extended to the end of
+            // its commit: splitting inside one would leave the target holding
+            // part of a commit with no snapshot to name that state, and a
+            // checkpoint that cannot be named cannot be resumed from.
+            match full_read_prefix(&plan.tasks, materialize_max_rows_per_full_pass()) {
+                Some(cut_seq) => {
+                    match metadata.snapshot_at_or_before_sequence(to_snapshot_id, cut_seq) {
+                        Ok(Some(checkpoint)) if checkpoint.snapshot_id != to_snapshot_id => {
+                            let kept: Vec<_> = plan
+                                .tasks
+                                .into_iter()
+                                .filter(|t| t.data_sequence_number.is_some_and(|s| s <= cut_seq))
+                                .collect();
+                            info!(
+                                to_snapshot_id,
+                                checkpoint_snapshot_id = checkpoint.snapshot_id,
+                                checkpoint_sequence = cut_seq,
+                                files_this_pass = kept.len(),
+                                files_total = plan.files_selected,
+                                "materialize: full read bounded to a commit prefix; \
+                             the watermark will checkpoint short of the head"
+                            );
+                            // Reporting the checkpoint as this scan's `to` is what
+                            // makes the caller's existing watermark write land there —
+                            // no new vocabulary, and the crash-safety ordering
+                            // (watermark after data) is unchanged.
+                            to_snapshot_id = checkpoint.snapshot_id;
+                            kept
+                        }
+                        // No nameable checkpoint short of the head: read it whole, as
+                        // before. Better an expensive honest read than a watermark
+                        // pointing somewhere the data does not correspond to.
+                        _ => plan.tasks,
+                    }
+                }
+                None => plan.tasks,
+            }
         };
 
         // How OLD is the window we are about to read? Measured from Iceberg's own
@@ -4541,5 +4639,88 @@ mod tests {
             "dim_customer.AbCdEf/".to_string(),
         ]));
         assert!(!super::listing_is_single_table(&[]));
+    }
+
+    fn t(seq: i64, rows: i64) -> fluree_db_iceberg::scan::FileScanTask {
+        let df = fluree_db_iceberg::manifest::DataFile {
+            file_path: format!("f{seq}-{rows}.parquet"),
+            file_format: fluree_db_iceberg::manifest::FileFormat::Parquet,
+            record_count: rows,
+            file_size_in_bytes: rows,
+            partition: fluree_db_iceberg::manifest::PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: None,
+            nan_value_counts: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            split_offsets: None,
+            sort_order_id: None,
+        };
+        fluree_db_iceberg::scan::FileScanTask::for_whole_file(df, vec![], None)
+            .with_data_sequence_number(seq)
+    }
+
+    /// The cut lands on a COMMIT boundary, never inside one. A partial commit
+    /// leaves the target in a state no snapshot names, and an unnameable state
+    /// cannot be checkpointed or resumed from.
+    #[test]
+    fn full_read_prefix_cuts_on_a_commit_boundary() {
+        // commit 10: 60 rows, commit 20: 60, commit 30: 60 => 180 total
+        let tasks = vec![
+            t(10, 30),
+            t(10, 30),
+            t(20, 30),
+            t(20, 30),
+            t(30, 30),
+            t(30, 30),
+        ];
+
+        // Budget runs out inside commit 20 -> keep all of 20, cut there.
+        assert_eq!(super::full_read_prefix(&tasks, 70), Some(20));
+        // Budget runs out on the first file of commit 10 -> cut at 10.
+        assert_eq!(super::full_read_prefix(&tasks, 10), Some(10));
+    }
+
+    /// Every reason to decline to cut. Each returns `None`, meaning "read it
+    /// whole" — the pre-existing behaviour.
+    #[test]
+    fn full_read_prefix_declines_when_a_cut_would_not_help() {
+        let tasks = vec![t(10, 30), t(20, 30), t(30, 30)];
+
+        assert_eq!(super::full_read_prefix(&tasks, 0), None, "disabled");
+        assert_eq!(super::full_read_prefix(&tasks, -1), None, "negative");
+        assert_eq!(super::full_read_prefix(&tasks, 90), None, "already fits");
+        assert_eq!(
+            super::full_read_prefix(&tasks, 1_000),
+            None,
+            "budget exceeds total"
+        );
+        assert_eq!(super::full_read_prefix(&[], 10), None, "no tasks");
+
+        // The budget runs out in the FINAL commit. Checkpointing at the head is
+        // the whole read with extra bookkeeping, so decline.
+        assert_eq!(
+            super::full_read_prefix(&tasks, 85),
+            None,
+            "cut would be the head"
+        );
+
+        // A task with no attributable sequence cannot be ordered, so no cut is
+        // safe — better an expensive honest read than a wrong checkpoint.
+        let unattributed = vec![
+            t(10, 30),
+            fluree_db_iceberg::scan::FileScanTask::for_whole_file(
+                tasks[0].data_file.clone(),
+                vec![],
+                None,
+            ),
+            t(30, 30),
+        ];
+        assert_eq!(
+            super::full_read_prefix(&unattributed, 40),
+            None,
+            "unknown sequence"
+        );
     }
 }
