@@ -48,10 +48,10 @@ use crate::{publish_index_result, IndexResult};
 use fluree_db_core::Storage;
 use fluree_db_core::StorageBackend;
 use fluree_db_nameservice::{
-    IndexingNameService, LedgerEventBus, NameServiceEvent, SubscriptionScope,
+    IndexingNameService, LedgerEventBus, NameServiceEvent, NsRecord, SubscriptionScope,
 };
 use futures::FutureExt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -642,6 +642,60 @@ impl TriggerHandle {
         IndexCompletion { receiver: rx }
     }
 
+    /// Queue `ledger_id` only if nothing else already owns it.
+    ///
+    /// For callers that are guessing — a timer noticing a ledger looks stuck —
+    /// rather than reacting to a commit they just made. Returns whether it
+    /// queued.
+    ///
+    /// Unlike [`trigger`](Self::trigger) this **never** clears `cancelled` and
+    /// **never** resets the retry backoff. Those are correct for an explicit
+    /// trigger and wrong for a periodic one: on a timer they would resurrect
+    /// work an operator deliberately cancelled, and reset the backoff of a
+    /// failing build over and over. It also registers no waiter, so the entry
+    /// converges back to `Idle` on success without anything to resolve.
+    ///
+    /// Declines when the ledger is already Pending or InProgress, has been
+    /// cancelled, or is held for maintenance — a sweep must not start a build
+    /// underneath a reindex that took the ledger quiet.
+    ///
+    /// `min_t` must be the record's `commit_t`: `process_ledger`'s satisfaction
+    /// gate returns early without building when `index_t >= pending_min_t`.
+    pub async fn trigger_if_idle(&self, ledger_id: &str, min_t: i64) -> bool {
+        // Check the maintenance hold before the states lock: a poisoned lock
+        // means some holder panicked, and the conservative reading of "someone
+        // may hold this" is to decline.
+        match self.maintenance.lock() {
+            Ok(holds) if holds.contains(ledger_id) => return false,
+            Err(_) => return false,
+            Ok(_) => {}
+        }
+
+        {
+            let mut states = self.states.lock().await;
+            if let Some(existing) = states.get(ledger_id) {
+                if existing.phase != IndexPhase::Idle
+                    || existing.cancelled
+                    || existing.has_pending_work()
+                {
+                    return false;
+                }
+            }
+            let state = states.entry(ledger_id.to_string()).or_default();
+            state.pending_min_t = Some(min_t);
+            state.phase = IndexPhase::Pending;
+        }
+
+        self.tick.send_modify(|t| *t = t.wrapping_add(1));
+
+        info!(
+            ledger_id = %ledger_id,
+            min_t,
+            "Catch-up sweep queued a stalled ledger"
+        );
+        true
+    }
+
     /// Exclude index builds for `ledger_id` until the returned guard drops.
     ///
     /// Returns `None` when another maintenance operation already holds the
@@ -1024,11 +1078,21 @@ impl BackgroundIndexerWorker {
         //
         // The sweep gets the trigger surface rather than the full
         // `IndexerHandle` for the same reason the subscriber does — see below.
+        //
+        // The same task then re-sweeps on a timer, for the residual the start-up
+        // sweep cannot cover: a ledger that falls behind later and stops
+        // receiving the commits that would trigger it.
         let _sweep_guard = {
             let trigger = self.subscriber_trigger.clone();
             let nameservice = Arc::clone(&self.nameservice);
+            let interval = self.config.catchup_interval;
             AbortOnDrop(tokio::spawn(async move {
                 catch_up_sweep(&trigger, nameservice.as_ref()).await;
+                if interval.is_zero() {
+                    debug!("indexer catch-up re-sweep disabled");
+                    return;
+                }
+                run_catchup_sweeps(trigger, nameservice, interval).await;
             }))
         };
 
@@ -1831,6 +1895,95 @@ async fn catch_up_sweep(handle: &TriggerHandle, nameservice: &dyn IndexingNameSe
             "Catch-up: triggering indexer"
         );
         let _ = handle.trigger(record.ledger_id, record.commit_t).await;
+    }
+}
+
+/// Ledgers that are behind AND whose `commit_t` has not moved since the
+/// previous observation, most-behind first. Returns `(ledger_id, commit_t)`.
+///
+/// Kept as a pure function so the decision is testable without a nameservice,
+/// a worker, or a timer.
+///
+/// The stall condition is what makes a *periodic* sweep affordable.
+/// `catch_up_sweep`'s own predicate is "behind", which on a busy deployment
+/// matches most ledgers — and `process_ledger` builds whenever
+/// `commit_t > index_t` with no byte gate, so re-sweeping on "behind" alone
+/// would force an extra index build per ledger per interval. A ledger that is
+/// still committing has a moving `commit_t` and is already served by the
+/// post-commit trigger; a wedged one is frozen by definition.
+///
+/// A ledger seen for the first time is deliberately skipped: it has no previous
+/// `commit_t` to compare against, so the earliest a stall can be asserted is
+/// the second observation.
+///
+/// The predicate can misfire once, on a ledger whose commits happen to straddle
+/// two sweeps at the same `commit_t`. That costs one extra build and then
+/// converges: afterwards `index_t == commit_t`, `has_novelty()` is false, and it
+/// is not swept again until it falls behind.
+fn stalled_ledgers(records: &[NsRecord], last_seen: &HashMap<String, i64>) -> Vec<(String, i64)> {
+    let mut stalled: Vec<(String, i64)> = records
+        .iter()
+        .filter(|r| !r.retracted && r.has_novelty())
+        .filter(|r| last_seen.get(&r.ledger_id) == Some(&r.commit_t))
+        .map(|r| (r.ledger_id.clone(), r.commit_t))
+        .collect();
+    // Most-behind first: on a deployment that starts with a backlog, the ledger
+    // blocking writes should be queued ahead of one merely lagging by a commit.
+    let gap = |id: &str| {
+        records
+            .iter()
+            .find(|r| r.ledger_id == id)
+            .map(|r| r.commit_t - r.index_t)
+            .unwrap_or(0)
+    };
+    stalled.sort_by(|a, b| gap(&b.0).cmp(&gap(&a.0)).then_with(|| a.0.cmp(&b.0)));
+    stalled
+}
+
+/// Re-sweep for stalled ledgers on a timer, forever.
+///
+/// The start-up sweep in [`BackgroundIndexerWorker::run`] fixes a process that
+/// begins with a backlog. This covers the residual: a ledger that falls behind
+/// afterwards and stops receiving the commits that would trigger it — a rebase
+/// writing past the per-commit gate, or an indexer process that does not write
+/// the storage it indexes and so has no trigger source at all.
+///
+/// `interval` of zero disables it; the caller checks that before spawning.
+async fn run_catchup_sweeps(
+    handle: TriggerHandle,
+    nameservice: Arc<dyn IndexingNameService>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    // `Skip` rather than the default `Burst`: if a sweep overruns the period,
+    // running the missed ticks back to back would list the nameservice in a
+    // tight loop for as long as it takes to catch up.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick of a tokio interval fires immediately, and `run` has just
+    // swept.
+    ticker.tick().await;
+
+    let mut last_seen: HashMap<String, i64> = HashMap::new();
+    loop {
+        ticker.tick().await;
+
+        let records = match nameservice.all_records().await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!(error = %e, "catch-up re-sweep: all_records() failed");
+                continue;
+            }
+        };
+
+        for (ledger_id, commit_t) in stalled_ledgers(&records, &last_seen) {
+            handle.trigger_if_idle(&ledger_id, commit_t).await;
+        }
+
+        last_seen = records
+            .into_iter()
+            .filter(|r| !r.retracted)
+            .map(|r| (r.ledger_id, r.commit_t))
+            .collect();
     }
 }
 
@@ -3337,6 +3490,190 @@ mod tests {
              without this the only escape is a manual reindex"
         );
         assert!(!current_pending, "a caught-up ledger must not be triggered");
+    }
+
+    fn ns_record(name: &str, commit_t: i64, index_t: i64, retracted: bool) -> NsRecord {
+        let mut record = NsRecord::new(name, "main");
+        record.commit_t = commit_t;
+        record.index_t = index_t;
+        record.retracted = retracted;
+        record
+    }
+
+    /// The predicate that makes a *periodic* sweep affordable. Sweeping on
+    /// "behind" alone would re-index every actively-committing ledger once per
+    /// interval, because `process_ledger` has no byte gate.
+    #[test]
+    fn stalled_ledgers_wants_frozen_ledgers_only() {
+        let records = vec![
+            ns_record("frozen", 100, 40, false),
+            ns_record("advancing", 100, 40, false),
+            ns_record("firstsight", 100, 40, false),
+            ns_record("current", 100, 100, false),
+            ns_record("retracted", 100, 40, true),
+        ];
+        let last_seen = HashMap::from([
+            ("frozen:main".to_string(), 100),
+            // Committed since the previous sweep: the post-commit trigger owns it.
+            ("advancing:main".to_string(), 90),
+            ("current:main".to_string(), 100),
+            ("retracted:main".to_string(), 100),
+        ]);
+
+        let stalled = stalled_ledgers(&records, &last_seen);
+
+        assert_eq!(
+            stalled,
+            vec![("frozen:main".to_string(), 100)],
+            "only a behind ledger whose commit_t has not moved since the previous \
+             sweep is stalled; an advancing one, a caught-up one, a retracted one, \
+             and one seen for the first time are all left alone"
+        );
+    }
+
+    #[test]
+    fn stalled_ledgers_queues_the_most_behind_first() {
+        let records = vec![
+            ns_record("small", 100, 95, false),
+            ns_record("huge", 100, 10, false),
+            ns_record("mid", 100, 60, false),
+        ];
+        let last_seen = HashMap::from([
+            ("small:main".to_string(), 100),
+            ("huge:main".to_string(), 100),
+            ("mid:main".to_string(), 100),
+        ]);
+
+        let ids: Vec<String> = stalled_ledgers(&records, &last_seen)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec!["huge:main", "mid:main", "small:main"],
+            "the ledger most likely to be blocking writes goes first"
+        );
+    }
+
+    /// `trigger` clears `cancelled` and zeroes the retry backoff, which is right
+    /// for an explicit request and wrong for one a timer made: on a timer it
+    /// would resurrect work an operator cancelled, and reset a failing build's
+    /// backoff every interval.
+    #[tokio::test]
+    async fn trigger_if_idle_yields_to_everything_that_already_owns_the_ledger() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
+        let (_worker, handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns), IndexerConfig::default());
+
+        assert!(
+            handle.trigger.trigger_if_idle("fresh:main", 5).await,
+            "an untracked ledger is idle, so the sweep may queue it"
+        );
+        assert!(
+            !handle.trigger.trigger_if_idle("fresh:main", 5).await,
+            "already pending — the sweep must not re-queue it"
+        );
+
+        // Cancelled work stays cancelled.
+        let _ = handle.trigger("cancelled:main", 5).await;
+        handle.cancel("cancelled:main").await;
+        assert!(
+            !handle.trigger.trigger_if_idle("cancelled:main", 5).await,
+            "a deliberately cancelled ledger must not be resurrected on a timer"
+        );
+
+        // A maintenance hold means a reindex is writing index artifacts; a build
+        // started underneath it would race those writes.
+        let _guard = handle
+            .trigger
+            .acquire_maintenance("held:main")
+            .expect("nothing else holds it");
+        assert!(
+            !handle.trigger.trigger_if_idle("held:main", 5).await,
+            "a ledger held for maintenance must be left alone"
+        );
+    }
+
+    /// The residual the start-up sweep cannot cover: a ledger that falls behind
+    /// *after* the worker starts and then stops receiving the commits that would
+    /// trigger it. It is created after `run()` is spawned, so the start-up sweep
+    /// cannot be what finds it, and no event bus is wired, so nothing can carry
+    /// a commit event either — only the timer can.
+    #[tokio::test]
+    async fn periodic_sweep_finds_a_ledger_that_stalls_after_startup() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns = Arc::new(MemoryNameService::new());
+        let ns_dyn: Arc<dyn IndexingNameService> = Arc::clone(&ns) as _;
+        let config = IndexerConfig::default().with_catchup_interval(Duration::from_millis(20));
+        let (worker, handle) = BackgroundIndexerWorker::new(backend, Arc::clone(&ns_dyn), config);
+        let run_task = tokio::spawn(worker.run());
+
+        // Let the start-up sweep run and find nothing.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !handle.is_pending("late:main").await,
+            "the ledger does not exist yet"
+        );
+
+        ns.create_ledger("late:main").unwrap();
+        ns.publish_commit("late:main", 11, &test_commit_cid(11))
+            .await
+            .unwrap();
+
+        // Two ticks minimum: the first records `commit_t`, the second sees it
+        // unchanged and calls it stalled.
+        let triggered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.is_pending("late:main").await {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        run_task.abort();
+
+        assert!(
+            triggered,
+            "a ledger that stalls after start-up must be picked up by the periodic \
+             re-sweep; otherwise the only escape is a restart or a manual reindex"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_if_idle_does_not_reset_the_retry_backoff() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns: Arc<dyn IndexingNameService> = Arc::new(MemoryNameService::new());
+        let (worker, handle) =
+            BackgroundIndexerWorker::new(backend, Arc::clone(&ns), IndexerConfig::default());
+
+        {
+            let mut states = worker.states.lock().await;
+            let state = states.entry("failing:main".to_string()).or_default();
+            state.retry_count = 4;
+            state.next_retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+            state.pending_min_t = Some(9);
+            state.phase = IndexPhase::Pending;
+        }
+
+        assert!(
+            !handle.trigger.trigger_if_idle("failing:main", 9).await,
+            "a ledger with pending work is not idle"
+        );
+
+        let states = worker.states.lock().await;
+        let state = states.get("failing:main").expect("state kept");
+        assert_eq!(
+            state.retry_count, 4,
+            "the sweep must not reset backoff — on a timer that is a hot retry loop"
+        );
+        assert!(
+            state.next_retry_at.is_some(),
+            "the retry deadline must stand"
+        );
     }
 
     #[tokio::test]
