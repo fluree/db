@@ -1966,6 +1966,42 @@ impl Operator for BinaryScanOperator {
         if s_sid.is_some() && filter.s_id.is_none() && self.unresolved_bound_subject_iri.is_none() {
             return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
         }
+        // Last chance to narrow before falling back to the widened walk below.
+        //
+        // `build_filter_from_snapshot_sids` resolves `Ref::Sid` through
+        // `ctx.active_snapshot`, but a pattern SID is encoded against
+        // `ctx.original_snapshot` (see `reencode_sid`). In a per-graph context the
+        // two namespace tables differ, so the filter lookup either used the wrong
+        // IRI or never ran — leaving a decoded IRI that was never actually probed
+        // against the store's subject dictionary. Probe it here with the IRI the
+        // pattern really means:
+        //
+        // - `Ok(Some)` — narrow to `s_id` and drop the per-row IRI comparison. The
+        //   subject dictionary is a bijection over the namespaces `find_subject_id`
+        //   consults, so filtering on `s_id` selects exactly the rows the row-by-row
+        //   `resolve_subject_iri(..) == target_iri` check would have kept.
+        // - `Ok(None)` — a conclusive base miss, so novelty is the only place the
+        //   subject can be. Same standard the bound-object `Ref` arm above already
+        //   applies, and the same one `generate_upsert_deletions` relies on.
+        // - `Err(_)` — the dictionary could not answer; absence stays undecidable
+        //   and the widened scan below remains the correct (if slow) answer.
+        //
+        // Skipping this made an absent bound subject cost a full predicate-partition
+        // walk with a dictionary lookup per row — O(partition), not O(1). It is not
+        // an upsert-only path: `join.rs` and `optional.rs` rebind a correlated
+        // subject to `Ref::Iri` per driving row, so every non-batched probe for a
+        // missing subject paid it.
+        if let Some(target_iri) = self.unresolved_bound_subject_iri.clone() {
+            match store_ref.find_subject_id(&target_iri) {
+                Ok(Some(s_id)) => {
+                    filter.s_id = Some(s_id);
+                    self.unresolved_bound_subject_iri = None;
+                }
+                Ok(None) => return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await,
+                Err(_) => {}
+            }
+        }
+
         if self.unresolved_bound_subject_iri.is_some() && filter.p_id.is_some() {
             self.index = IndexType::Psot;
         }
