@@ -2536,6 +2536,39 @@ mem:constraint-01kv3h37ky6wpm8c8jdvpnamjk a mem:Constraint ;
     mem:createdAt "2026-06-14T16:58:01.214124+00:00"^^xsd:dateTime ;
     mem:rationale "Non-obvious behavior change: distinguishing \"WHERE matched nothing\" (no-op) from \"no WHERE clause\" (fire once) and the OPTIONAL=1-row subtlety prevents future regressions or confusion when touching stage.rs." .
 
+mem:constraint-01m05g7q976rta26m1qmrmv904 a mem:Constraint ;
+    mem:content "In generate_upsert_deletions, \"no base index\" must be `snapshot.range_provider.is_none() && snapshot.t == 0`, never the provider check alone. LedgerManager treats a binary-store load failure as non-fatal (\"Failed to load binary store, continuing without\"), leaving an indexed ledger (t>0) with no provider; deciding absence there skips every subject and silently commits zero retractions. Mirrors fluree_db_core::range, which treats a missing provider as an empty index only at t==0 and otherwise errors \"binary-only db has no range_provider attached\". snapshot.t is index-derived (genesis: base_t and t both 0); live t is ledger.t()." ;
+    mem:tag "invariant" ;
+    mem:tag "namespace" ;
+    mem:tag "range-provider" ;
+    mem:tag "staging" ;
+    mem:tag "transact" ;
+    mem:tag "upsert" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/src/ledger_manager.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_upsert_skip_fires.rs" ;
+    mem:artifactRef "fluree-db-core/src/range.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "fix/upsert-skip-absence-guard" ;
+    mem:createdAt "2026-08-16T14:39:57.735894+00:00"^^xsd:dateTime ;
+    mem:rationale "The absent-subject skip converts an undecidable state into \"absent\"; any future gate on range_provider alone re-opens silent retraction loss, which no results-only test on an indexed ledger can catch." .
+
+mem:fact-01m05g7xz8kj17pqk3z40xc13c a mem:Fact ;
+    mem:content "A BinaryIndexStore's namespace table is always a subset of its LedgerSnapshot's: the index root is a materialized cache at index_t, and ns_helpers::sync_store_and_snapshot_ns reconciles every store code back into the snapshot on load (the read-only view path in fluree_ext.rs only augments store-from-snapshot and documents the same subset invariant). So `store.sid_to_iri` can never decode a namespace code that `snapshot.decode_sid` could not — do not add it as a fallback." ;
+    mem:tag "binary-index" ;
+    mem:tag "invariant" ;
+    mem:tag "namespace" ;
+    mem:tag "snapshot" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/ns_helpers.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/fluree_ext.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "fix/upsert-skip-absence-guard" ;
+    mem:createdAt "2026-08-16T14:40:04.584509+00:00"^^xsd:dateTime ;
+    mem:rationale "Removes a plausible-looking but dead fallback branch; a code the pre-txn snapshot cannot decode was minted by the current txn and provably names no base-index row." .
+
 mem:fact-01kynp3kwy5kxn5yff47hv9507 a mem:Fact ;
     mem:content "Upsert staging was ~8ms/flake (35-70s per bulk txn): generate_upsert_deletions ran one execute_pattern per (subject,predicate); for subjects not in the persisted dict, BinaryScanOperator's unresolved_bound_subject_iri fallback degrades to a full PSOT predicate-partition walk with per-row resolve_subject_iri. Fixed (branch fix/upsert-staging-new-subject-scan, 0282073e2): group by subject, pre-check existence via subject reverse dict (authoritative under canonical ns encoding; subject_reverse_tree always Some in prod loader) + one Sid-space novelty walk per graph; absent subjects skip all lookups. 600 new subjects: 13.3s → 0.9ms. Resolved-subject point queries were already fast (~12µs/tuple)." ;
     mem:tag "binary-scan" ;

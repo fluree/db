@@ -56,6 +56,9 @@ impl<'a> FlakeEvalParams<'a> {
     }
 }
 
+/// Cache of `(graph, subject) -> classes` shared across concurrent evaluations.
+type ClassCache = Arc<RwLock<std::collections::HashMap<(GraphId, Sid), Vec<Sid>>>>;
+
 /// Policy context for evaluation
 ///
 /// Holds the policy wrapper, grounded identity, and class cache.
@@ -72,7 +75,7 @@ pub struct PolicyContext {
     /// different `rdf:type` values in different named graphs, and an `f:onClass`
     /// decision made against another graph's classes is simply wrong. Keying on
     /// `Sid` alone made the result depend on which graph populated the entry first.
-    class_cache: Arc<RwLock<std::collections::HashMap<(GraphId, Sid), Vec<Sid>>>>,
+    class_cache: ClassCache,
 }
 
 impl PolicyContext {
