@@ -12,7 +12,7 @@ fluree mcp init --ide claude-code            # or cursor / vscode / windsurf / z
 
 This wires `fluree mcp serve` with the `docs` toolset (ranked search over this documentation, version-exact) and the `memory` toolset (persistent project memory). Use `--toolsets docs` to skip memory. Without MCP, the same corpus is available as plain commands: `fluree docs search`, `fluree docs get`, `fluree docs examples`, `fluree docs tree`.
 
-Claude Code can install that wiring instead of doing it by hand: the `fluree-cli` plugin in [fluree/claude-plugins](https://github.com/fluree/claude-plugins) registers the MCP server and adds skills for driving the CLI, which defer to this page rather than restating it. A `fluree-companion` plugin for stack-first workflows — provisioning a Fluree AI stack, authenticating against it, and working through its own surfaces — is forthcoming in the same repo.
+The `fluree-cli` plugin in [fluree/claude-plugins](https://github.com/fluree/claude-plugins) registers the docs MCP server (`--toolsets docs` — no memory toolset; run `fluree mcp init` yourself if you want that too) and adds skills for driving the CLI, which defer to this page rather than restating it. The same marketplace carries `fluree-companion` for stack-first workflows — connecting to a Fluree AI stack, authenticating against it, and working through the stack's own surfaces.
 
 ## Probe, don't assume
 
