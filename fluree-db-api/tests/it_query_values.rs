@@ -392,3 +392,248 @@ async fn values_federated_query_connection_from_two_ledgers() {
         normalize_rows(&json!(["Khris", "Nikola"]))
     );
 }
+
+// --- single-row VALUES folded into a bound object -------------------------
+//
+// `VALUES ?o { <iri> }` is the constant `<iri>`, so the planner rewrites the
+// object position of the triples it constrains (see
+// `where_plan::inline_singleton_values_objects`). These tests pin the result
+// equivalence that licenses the rewrite, and the shapes deliberately left out
+// of it.
+
+const VALUES_PREFIXES: &str = "PREFIX ex: <http://example.com/>\n\
+     PREFIX schema: <http://schema.org/>\n";
+
+async fn sparql_rows(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    body: &str,
+) -> Vec<serde_json::Value> {
+    let query = format!("{VALUES_PREFIXES}{body}");
+    let result = support::query_sparql(fluree, ledger, &query)
+        .await
+        .expect("sparql query should succeed");
+    normalize_rows(&result.to_jsonld(&ledger.snapshot).expect("to_jsonld"))
+}
+
+#[tokio::test]
+async fn values_object_iri_matches_inlined_constant() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    let with_values = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?name WHERE { VALUES ?f { ex:brian } \
+         ?s ex:friend ?f . ?s schema:name ?name }",
+    )
+    .await;
+    let inlined = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?name WHERE { ?s ex:friend ex:brian . ?s schema:name ?name }",
+    )
+    .await;
+
+    assert_eq!(with_values, inlined);
+    assert_eq!(
+        with_values,
+        normalize_rows(&json!([
+            ["ex:alice", "Alice"],
+            ["ex:cam", "Cam"],
+            ["ex:liam", "Liam"]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn values_object_var_stays_projectable_after_inlining() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    // ?f no longer appears in any triple once the constant is folded in, so it
+    // has to come back from the retained VALUES pattern.
+    let rows = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?f WHERE { VALUES ?f { ex:brian } \
+         ?s ex:friend ?f . ?s schema:age ?age }",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        normalize_rows(&json!([
+            ["ex:alice", "ex:brian"],
+            ["ex:cam", "ex:brian"],
+            ["ex:liam", "ex:brian"]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn values_object_iri_still_filters_a_wide_star() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    let with_values = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?name ?age WHERE { VALUES ?f { ex:alice } \
+         ?s ex:friend ?f . ?s schema:name ?name . ?s schema:age ?age . \
+         OPTIONAL { ?s schema:email ?email } }",
+    )
+    .await;
+    let inlined = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?name ?age WHERE { ?s ex:friend ex:alice . \
+         ?s schema:name ?name . ?s schema:age ?age . \
+         OPTIONAL { ?s schema:email ?email } }",
+    )
+    .await;
+
+    assert_eq!(with_values, inlined);
+    assert_eq!(
+        with_values,
+        normalize_rows(&json!([["ex:cam", "Cam", 34], ["ex:liam", "Liam", 13]]))
+    );
+}
+
+#[tokio::test]
+async fn values_object_iri_keeps_minus_sharing_the_variable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    // MINUS is scoped by the variables it shares with the left side. Folding
+    // the constant into the MINUS group would remove ?f from it and turn the
+    // MINUS into a no-op, so nested groups are left alone.
+    let rows = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s WHERE { VALUES ?f { ex:brian } ?s ex:friend ?f . \
+         MINUS { ?other ex:friend ?f } }",
+    )
+    .await;
+
+    assert_eq!(rows, normalize_rows(&json!([])));
+}
+
+#[tokio::test]
+async fn multi_row_values_object_is_a_set_not_a_constant() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    let rows = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?f WHERE { VALUES ?f { ex:brian ex:cam } \
+         ?s ex:friend ?f . ?s schema:name ?name }",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        normalize_rows(&json!([
+            ["ex:alice", "ex:brian"],
+            ["ex:cam", "ex:brian"],
+            ["ex:liam", "ex:brian"],
+            ["ex:liam", "ex:cam"]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn values_object_literal_matches_inlined_literal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    // Literal cells are NOT folded (datatype/language matching stays with the
+    // scan layer); the answer must still match the inlined form.
+    let with_values = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s WHERE { VALUES ?age { 50 } ?s schema:age ?age . ?s schema:name ?name }",
+    )
+    .await;
+    let inlined = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s WHERE { ?s schema:age 50 . ?s schema:name ?name }",
+    )
+    .await;
+
+    assert_eq!(with_values, inlined);
+    assert_eq!(
+        with_values,
+        normalize_rows(&json!([["ex:alice"], ["ex:brian"]]))
+    );
+}
+
+#[tokio::test]
+async fn chained_union_after_a_broad_scan_returns_every_branch() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    // A 3-way UNION nests as Union([[Union([[A],[B]])],[C]]); the outer branch
+    // holding the inner UNION has no triples of its own, and used to be costed
+    // as an unknown property scan. Ordering must not change the answer.
+    let rows = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?name WHERE { ?s schema:name ?name . \
+         { ?s ex:friend ex:brian } UNION { ?s ex:friend ex:alice } \
+         UNION { ?s ex:friend ex:cam } }",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        normalize_rows(&json!([
+            ["ex:alice", "Alice"],
+            ["ex:cam", "Cam"],
+            ["ex:cam", "Cam"],
+            ["ex:liam", "Liam"],
+            ["ex:liam", "Liam"],
+            ["ex:liam", "Liam"]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn trailing_values_keeps_minus_correlated() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    // A VALUES written AFTER the MINUS still binds ?f for the whole group, so
+    // the anti-join is correlated on ?f and removes every row. Folding the
+    // constant into the triple would take ?f out of the MINUS's order-
+    // preservation set, letting it float ahead of the VALUES and degenerate
+    // into a disjoint-domain no-op.
+    let rows = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s WHERE { ?s ex:friend ?f . \
+         MINUS { ?other ex:friend ?f } VALUES ?f { ex:brian } }",
+    )
+    .await;
+
+    assert_eq!(rows, normalize_rows(&json!([])));
+}
+
+#[tokio::test]
+async fn trailing_values_keeps_not_exists_correlated() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    let rows = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s WHERE { ?s ex:friend ?f . \
+         FILTER NOT EXISTS { ?other ex:friend ?f . FILTER(?other != ?s) } \
+         VALUES ?f { ex:brian } }",
+    )
+    .await;
+
+    assert_eq!(rows, normalize_rows(&json!([])));
+}

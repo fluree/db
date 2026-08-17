@@ -1062,6 +1062,9 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
     // Separate triples from non-triples
     let mut triples: Vec<&TriplePattern> = Vec::new();
     let mut non_triple_estimate: f64 = HIGHLY_SELECTIVE;
+    // Did any non-triple pattern contribute a real row count (as opposed to an
+    // Expander/Deferred that says nothing about absolute cardinality)?
+    let mut has_sized_source = false;
 
     for p in patterns {
         match p {
@@ -1074,6 +1077,7 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
                 match card {
                     PatternEstimate::Source { row_count } => {
                         non_triple_estimate *= row_count.max(HIGHLY_SELECTIVE);
+                        has_sized_source = true;
                     }
                     PatternEstimate::Reducer { multiplier } => {
                         non_triple_estimate *= multiplier;
@@ -1088,7 +1092,22 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
     }
 
     if triples.is_empty() {
-        return (DEFAULT_PROPERTY_SCAN_SELECTIVITY) * non_triple_estimate;
+        // A branch made ONLY of sized sources already knows its own cardinality —
+        // multiplying by the unknown-scan default would invent rows that are not
+        // there. This is the common shape of a chained UNION: `{A} UNION {B} UNION
+        // {C}` nests as `Union([[Union([[A],[B]])], [C]])`, so the outer branch
+        // holding the inner UNION has no triples of its own. Scaling it by
+        // DEFAULT_PROPERTY_SCAN_SELECTIVITY put a 30-row union at 20M rows, which
+        // pushed it behind every real scan; the correlated UnionOperator then
+        // rebuilt and re-ran all three branches once per driving row.
+        //
+        // With no sized source (only OPTIONAL/MINUS/FILTER/BIND) nothing is known,
+        // so the unknown-scan default still applies.
+        return if has_sized_source {
+            non_triple_estimate.max(HIGHLY_SELECTIVE)
+        } else {
+            DEFAULT_PROPERTY_SCAN_SELECTIVITY * non_triple_estimate
+        };
     }
 
     // Sort triples by standalone row count for initial ordering (most selective first)
@@ -3343,6 +3362,63 @@ mod tests {
         };
         // Sum of branch estimates: 100 + 200 = 300
         assert!((row_count - 300.0).abs() < f64::EPSILON);
+    }
+
+    /// A chained `{A} UNION {B} UNION {C}` nests as `Union([[Union([[A],[B]])],
+    /// [C]])`, so the outer branch holding the inner UNION owns no triples of
+    /// its own. Scaling such a branch by the unknown-property-scan default put
+    /// a 30-row union at 20M rows, which pushed it behind every real scan and
+    /// left the correlated `UnionOperator` rebuilding all three branches once
+    /// per driving row (measured: 53 s on a 200k-row driver).
+    #[test]
+    fn test_estimate_nested_union_is_not_scaled_by_unknown_scan_default() {
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "a"),
+            PropertyStatData {
+                count: 100,
+                ndv_values: 10,
+                ndv_subjects: 100,
+            },
+        );
+
+        let branch = |o: &str| {
+            vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "a")),
+                Term::Iri(Arc::from(o)),
+            ))]
+        };
+        // Each bound-object branch is count/ndv = 10 rows.
+        let nested = Pattern::Union(vec![
+            vec![Pattern::Union(vec![branch("ex:x"), branch("ex:y")])],
+            branch("ex:z"),
+        ]);
+
+        let card = estimate_pattern(&nested, &HashSet::new(), Some(&stats));
+        let PatternEstimate::Source { row_count } = card else {
+            panic!("expected Source")
+        };
+        assert!(
+            (row_count - 30.0).abs() < f64::EPSILON,
+            "nested union should cost its branches (10+10+10), got {row_count}"
+        );
+    }
+
+    /// With nothing sized to go on, the unknown-scan default still applies.
+    #[test]
+    fn test_estimate_branch_with_no_sized_source_keeps_scan_default() {
+        let optional_only = vec![Pattern::Optional(vec![Pattern::Triple(make_pattern(
+            VarId(0),
+            "opt",
+            VarId(1),
+        ))])];
+
+        let card = estimate_branch_cardinality(&optional_only, None);
+        assert!(
+            (card - DEFAULT_PROPERTY_SCAN_SELECTIVITY).abs() < f64::EPSILON,
+            "expected the unknown-scan default, got {card}"
+        );
     }
 
     #[test]

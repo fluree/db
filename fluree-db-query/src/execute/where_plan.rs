@@ -1805,6 +1805,134 @@ fn elide_redundant_type_filters(
     )
 }
 
+/// The constant term a single-row VALUES cell stands for, when it is a reference.
+///
+/// Only reference bindings convert: a literal cell would have to reproduce the
+/// datatype/language matching rules that `TriplePattern::dtc` and the scan layer
+/// apply to `Term::Value`, and getting that subtly wrong changes results rather
+/// than timings.
+fn values_cell_as_ref_term(binding: &crate::binding::Binding) -> Option<Term> {
+    match binding {
+        crate::binding::Binding::Sid { sid, .. } => Some(Term::Sid(sid.clone())),
+        crate::binding::Binding::IriMatch { iri, .. } => Some(Term::Iri(iri.clone())),
+        _ => None,
+    }
+}
+
+/// Substitute a single-row VALUES' IRI into the object position of the triples
+/// it constrains, keeping the VALUES pattern itself.
+///
+/// `VALUES ?o { <iri> }` *is* the constant `<iri>` — one row, one binding — so a
+/// sibling `?s <p> ?o` is the same pattern as `?s <p> <iri>`. Only the constant
+/// form narrows anything, though: a VALUES binding a leaf object var is deferred
+/// above the star (see [`split_values_seeding_star`] and
+/// [`build_property_join_block`]), so `PropertyJoinOperator` drives off whatever
+/// else is bound, drains that predicate's whole extent, and only then does the
+/// one-row VALUES filter it. Measured on a 200k-claim ledger: 54 ms versus 0.0 ms
+/// for the same query with the IRI written inline, and 240 ms versus 0.1 ms once
+/// the star widens to five predicates.
+///
+/// The VALUES stays in the list, so the variable is still bound for projection,
+/// FILTERs, and later patterns — it just no longer has to do the narrowing.
+///
+/// Deliberately narrow, because each relaxation reaches code with its own gates:
+/// - **one row only** — a multi-row VALUES is a set, not a constant;
+/// - **reference cells only** — see [`values_cell_as_ref_term`];
+/// - **object position only** — a var used as subject or predicate keeps today's
+///   behaviour ([`split_values_seeding_star`] already seeds the subject case, and
+///   the fixed-subject scan fast paths carry their own absent-subject gates);
+/// - **one inner-join region only** — substitution never crosses a compound
+///   pattern such as UNION/OPTIONAL/MINUS/EXISTS/NOT EXISTS/subquery. MINUS in
+///   particular changes meaning when a shared variable stops appearing before
+///   it; keeping each VALUES and rewritten triple in the same contiguous
+///   Triple/VALUES/BIND/FILTER region preserves that variable-domain boundary.
+///
+/// Returns `None` when nothing was substituted, so callers keep borrowing the
+/// original slice.
+fn inline_singleton_values_objects(patterns: &[Pattern]) -> Option<Vec<Pattern>> {
+    // Preserve the existing subject/predicate seeding paths everywhere in this
+    // list. This is intentionally more conservative than checking per region:
+    // one variable keeps one planning role throughout the enclosing group.
+    let mut non_object_vars: HashSet<VarId> = HashSet::new();
+    for p in patterns {
+        if let Pattern::Triple(tp) = p {
+            if let Ref::Var(v) = &tp.s {
+                non_object_vars.insert(*v);
+            }
+            if let Ref::Var(v) = &tp.p {
+                non_object_vars.insert(*v);
+            }
+        }
+    }
+
+    let is_inner_join_member = |p: &Pattern| {
+        matches!(
+            p,
+            Pattern::Triple(_) | Pattern::Values { .. } | Pattern::Bind { .. } | Pattern::Filter(_)
+        )
+    };
+
+    let mut replacements: Vec<(usize, Term)> = Vec::new();
+    let mut start = 0;
+    while start < patterns.len() {
+        if !is_inner_join_member(&patterns[start]) {
+            start += 1;
+            continue;
+        }
+
+        let mut end = start + 1;
+        while end < patterns.len() && is_inner_join_member(&patterns[end]) {
+            end += 1;
+        }
+
+        // Constants are local to this contiguous inner-join region. In
+        // particular, a VALUES after MINUS cannot rewrite a triple before the
+        // MINUS: doing so removes the shared variable from the anti-join's
+        // order-preservation set before the VALUES has bound it.
+        let mut constants: HashMap<VarId, Term> = HashMap::new();
+        for p in &patterns[start..end] {
+            if let Pattern::Values { vars, rows } = p {
+                let [row] = rows.as_slice() else { continue };
+                for (var, cell) in vars.iter().zip(row) {
+                    if !non_object_vars.contains(var) {
+                        if let Some(term) = values_cell_as_ref_term(cell) {
+                            constants.insert(*var, term);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (offset, p) in patterns[start..end].iter().enumerate() {
+            let Pattern::Triple(tp) = p else { continue };
+            if tp.dtc.is_some() {
+                continue;
+            }
+            let Some(object_var) = tp.o.as_var() else {
+                continue;
+            };
+            if let Some(term) = constants.get(&object_var) {
+                replacements.push((start + offset, term.clone()));
+            }
+        }
+
+        start = end;
+    }
+
+    if replacements.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = patterns.to_vec();
+    for (idx, term) in replacements {
+        let Pattern::Triple(tp) = &mut rewritten[idx] else {
+            unreachable!("replacement indices only come from triple patterns")
+        };
+        tp.o = term;
+    }
+    Some(rewritten)
+}
+
 /// Build WHERE operators with an optional initial seed operator and explicit needed-vars + GROUP BY keys.
 ///
 /// Handles all pattern types: Triple, VALUES, BIND, FILTER, OPTIONAL, UNION,
@@ -1869,6 +1997,12 @@ pub fn build_where_operators_seeded_with_needed(
     // removes no rows when stats prove the predicate's subjects are all `C`.
     let elided_storage = elide_redundant_type_filters(patterns, stats.as_deref(), planning);
     let patterns: &[Pattern] = elided_storage.as_deref().unwrap_or(patterns);
+
+    // Within each inner-join region, fold a single-row VALUES' IRI into the
+    // object position it constrains, so reordering and the scan layer both see
+    // a constant instead of a variable the VALUES wrapper only filters later.
+    let inlined_storage = inline_singleton_values_objects(patterns);
+    let patterns: &[Pattern] = inlined_storage.as_deref().unwrap_or(patterns);
 
     // Apply generalized pattern reordering upfront for all pattern lists.
     //
@@ -3434,6 +3568,237 @@ mod tests {
         assert!(
             !ops.contains(&"PropertyJoinOperator"),
             "the seeded star must not drain the class extent: {ops:?}"
+        );
+    }
+
+    // --- single-row VALUES object inlining --------------------------------
+
+    fn object_terms(patterns: &[Pattern]) -> Vec<Term> {
+        patterns
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::Triple(tp) => Some(tp.o.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A one-row IRI VALUES becomes a constant object, and the VALUES stays.
+    #[test]
+    fn singleton_iri_values_inlines_into_object_position() {
+        use crate::binding::Binding;
+
+        // VALUES ?sub { <ex:sub42> } . ?claim <relSubject> ?sub . ?claim <dimension> ?dim
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "sub42"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "relSubject", VarId(1))),
+            Pattern::Triple(make_pattern(VarId(0), "dimension", VarId(2))),
+        ];
+
+        let rewritten = inline_singleton_values_objects(&patterns).expect("should inline");
+        assert_eq!(
+            object_terms(&rewritten),
+            vec![Term::Sid(Sid::new(13, "sub42")), Term::Var(VarId(2))],
+            "only the VALUES-bound object becomes a constant"
+        );
+        assert!(
+            matches!(rewritten[0], Pattern::Values { .. }),
+            "the VALUES must stay so the variable is still bound downstream"
+        );
+    }
+
+    /// A var used as a subject keeps its variable form everywhere, so the
+    /// existing subject-seeding path (`split_values_seeding_star`) still fires.
+    #[test]
+    fn singleton_values_skips_var_used_as_subject() {
+        use crate::binding::Binding;
+
+        // VALUES ?s { <ex:thing1> } . ?s <name> ?n . ?other <friend> ?s
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(0)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "thing1"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+            Pattern::Triple(make_pattern(VarId(2), "friend", VarId(0))),
+        ];
+
+        assert!(inline_singleton_values_objects(&patterns).is_none());
+    }
+
+    /// Multi-row VALUES is a set, not a constant.
+    #[test]
+    fn multi_row_values_is_not_inlined() {
+        use crate::binding::Binding;
+
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![
+                    vec![Binding::sid(Sid::new(13, "a"))],
+                    vec![Binding::sid(Sid::new(13, "b"))],
+                ],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "relSubject", VarId(1))),
+        ];
+
+        assert!(inline_singleton_values_objects(&patterns).is_none());
+    }
+
+    /// Literal cells keep the datatype/language matching rules of the scan
+    /// layer instead of being folded into a bare constant term.
+    #[test]
+    fn literal_and_undef_values_cells_are_not_inlined() {
+        use crate::binding::Binding;
+
+        let literal = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::lit(
+                    FlakeValue::String("x".into()),
+                    Sid::new(1, "string"),
+                )]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+        ];
+        assert!(inline_singleton_values_objects(&literal).is_none());
+
+        let undef = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::Unbound]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+        ];
+        assert!(inline_singleton_values_objects(&undef).is_none());
+    }
+
+    /// A VALUES written AFTER an order-sensitive pattern must not fold.
+    ///
+    /// `reorder_patterns` places MINUS/EXISTS/NOT EXISTS on the set of vars
+    /// their predecessors PRODUCE. Folding shrinks a triple's produced set, so
+    /// a trailing VALUES would let the anti-join float ahead of the VALUES that
+    /// binds the shared variable and degenerate into a disjoint-domain no-op.
+    #[test]
+    fn values_after_an_order_sensitive_pattern_is_not_folded() {
+        use crate::binding::Binding;
+
+        let values = || Pattern::Values {
+            vars: vec![VarId(1)],
+            rows: vec![vec![Binding::sid(Sid::new(13, "brian"))]],
+        };
+        let inner = || vec![Pattern::Triple(make_pattern(VarId(3), "friend", VarId(1)))];
+
+        for blocker in [
+            Pattern::Minus(inner()),
+            Pattern::Exists(inner()),
+            Pattern::NotExists(inner()),
+        ] {
+            let patterns = vec![
+                Pattern::Triple(make_pattern(VarId(0), "friend", VarId(1))),
+                blocker.clone(),
+                values(),
+            ];
+            assert!(
+                inline_singleton_values_objects(&patterns).is_none(),
+                "a VALUES behind {blocker:?} must not fold"
+            );
+        }
+    }
+
+    /// A compound-pattern boundary limits substitution; it does not disable
+    /// independent regions that follow it.
+    #[test]
+    fn values_after_minus_only_folds_triples_in_its_own_region() {
+        use crate::binding::Binding;
+
+        let patterns = vec![
+            Pattern::Triple(make_pattern(VarId(0), "friend", VarId(1))),
+            Pattern::Minus(vec![Pattern::Triple(make_pattern(
+                VarId(3),
+                "blocked",
+                VarId(1),
+            ))]),
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "brian"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(4), "author", VarId(1))),
+        ];
+
+        let rewritten = inline_singleton_values_objects(&patterns).expect("later region folds");
+        assert_eq!(
+            object_terms(&rewritten),
+            vec![Term::Var(VarId(1)), Term::Sid(Sid::new(13, "brian"))],
+            "the pre-MINUS triple keeps the shared var; only the post-MINUS triple folds"
+        );
+    }
+
+    /// The same shapes DO fold when the VALUES comes first: its own
+    /// `produced_vars` keeps the variable in the anti-join's ordering set.
+    #[test]
+    fn values_before_an_order_sensitive_pattern_still_folds() {
+        use crate::binding::Binding;
+
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "brian"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "friend", VarId(1))),
+            Pattern::Minus(vec![Pattern::Triple(make_pattern(
+                VarId(3),
+                "friend",
+                VarId(1),
+            ))]),
+        ];
+
+        let rewritten = inline_singleton_values_objects(&patterns).expect("should fold");
+        assert_eq!(
+            object_terms(&rewritten),
+            vec![Term::Sid(Sid::new(13, "brian"))],
+            "the required triple folds"
+        );
+        let Pattern::Minus(inner) = &rewritten[2] else {
+            panic!("MINUS must survive the rewrite");
+        };
+        assert_eq!(
+            object_terms(inner),
+            vec![Term::Var(VarId(1))],
+            "the MINUS group keeps sharing the variable"
+        );
+    }
+
+    /// Nested groups are left alone: MINUS changes meaning when a shared
+    /// variable stops appearing in it.
+    #[test]
+    fn singleton_values_does_not_reach_into_nested_groups() {
+        use crate::binding::Binding;
+
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "sub42"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "relSubject", VarId(1))),
+            Pattern::Minus(vec![Pattern::Triple(make_pattern(
+                VarId(3),
+                "blocked",
+                VarId(1),
+            ))]),
+        ];
+
+        let rewritten = inline_singleton_values_objects(&patterns).expect("should inline");
+        let Pattern::Minus(inner) = &rewritten[2] else {
+            panic!("MINUS must survive the rewrite");
+        };
+        assert_eq!(
+            object_terms(inner),
+            vec![Term::Var(VarId(1))],
+            "the MINUS group must keep sharing the variable"
         );
     }
 
