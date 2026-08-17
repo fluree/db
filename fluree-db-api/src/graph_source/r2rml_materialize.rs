@@ -740,6 +740,23 @@ impl Fluree {
             deferred: deferred.len(),
             failed: failed.len(),
         };
+        // Report skips on EVERY pass, not only an incomplete one.
+        //
+        // An all-skip pass is `is_complete()`, so it would otherwise be the ONE outcome
+        // that prints nothing whatsoever — and that is precisely the shape a
+        // wrongly-skipped target takes. `all_skipped` is the specific alarm: nothing was
+        // written this pass, yet the watermark is about to advance. That is legitimate
+        // for a genuinely idle window and a data-loss signature otherwise, so it has to
+        // be visible either way rather than inferred by diffing a target ledger's `t`.
+        if skipped_targets > 0 {
+            info!(
+                source = %source_graph_source_id,
+                targets_skipped = skipped_targets,
+                targets_ok = tally.ok,
+                all_skipped = skipped_targets == tally.ok && tally.is_complete(),
+                "materialize: targets already held this window; nothing written for them"
+            );
+        }
         if !tally.is_complete() {
             info!(
                 targets_ok = tally.ok,
@@ -1129,6 +1146,39 @@ fn applied_node(
 /// applied one table of a two-table window still has work, so it must not be
 /// skipped — that is the difference between skipping a no-op and silently dropping
 /// half a window.
+///
+/// # Why this is `==` and must not become an inequality
+///
+/// `applied` and `to` are Iceberg **snapshot ids**, and the spec assigns those
+/// randomly: there is no ordering between two snapshot ids, not even between a
+/// snapshot and its own parent. `a >= to` therefore compares two unrelated random
+/// i64s and calls the answer "has this target already applied the window".
+///
+/// That comparison makes the marker a one-way ratchet. It is only rewritten when a
+/// window's `to` happens to compare greater, so it climbs the running maximum of a
+/// random sequence and then exceeds every later draw permanently — after roughly
+/// `ln(n)` windows a target stops being written to at all. Measured on a 17-source
+/// deployment: every marker had ratcheted to between 8.19e18 and 9.22e18 against an
+/// `i64::MAX` of 9.223e18, so all 17 were skipped on every poll, each skip was
+/// counted as an ok target, and the watermark advanced past data that was never
+/// applied. About 80% of the entities in the source lakehouse were discarded.
+///
+/// Equality is what the question actually asks, and it fully covers the case this
+/// skip exists for: a job whose watermark cannot advance re-presents the SAME `to`
+/// on every poll, so equality matches and the skip fires.
+///
+/// The two cases an inequality was reaching for both survive equality:
+///
+/// - A re-poll of an older snapshot: equality declines to skip, so the target
+///   re-applies. Re-application is idempotent, so the cost is repeated work, never
+///   corruption — strictly safer than skipping data that was never applied.
+/// - A window that moved backwards after a forced full: moot, because `force_full`
+///   discards the markers before the target loop runs.
+///
+/// If "at or beyond" is ever genuinely needed it requires a quantity that IS
+/// ordered — the Iceberg **sequence number**, which increases by one per commit —
+/// which means storing the sequence alongside the snapshot id in the marker. Do not
+/// reintroduce an inequality over snapshot ids.
 fn target_is_caught_up(
     applied: &std::collections::HashMap<(String, String), i64>,
     target: &str,
@@ -1138,7 +1188,7 @@ fn target_is_caught_up(
         && table_watermarks.iter().all(|(table, _from, to)| {
             applied
                 .get(&(target.to_string(), table.clone()))
-                .is_some_and(|a| *a >= *to)
+                .is_some_and(|a| *a == *to)
         })
 }
 
@@ -2948,27 +2998,87 @@ mod tests {
         assert!(!target_is_caught_up(&applied, "silver_acme_u2:main", &tw));
     }
 
-    /// `>=`, not `==`: a marker ahead of this window (a re-poll of an older snapshot,
-    /// or a window that moved backwards after a forced full) still means "has it".
-    /// Equality here would re-apply and rebuild the amplification.
+    /// `==`, and only `==`. A marker that merely DIFFERS from this window's `to` — in
+    /// either numeric direction — has not applied this window.
     #[test]
-    fn an_applied_marker_at_or_beyond_the_window_counts_as_caught_up() {
+    fn only_an_applied_marker_equal_to_the_window_counts_as_caught_up() {
         let tw = vec![("t".to_string(), None, 20i64)];
         assert!(target_is_caught_up(
             &applied_map(&[("x:main", "t", 20)]),
             "x:main",
             &tw
         ));
-        assert!(target_is_caught_up(
-            &applied_map(&[("x:main", "t", 21)]),
-            "x:main",
-            &tw
-        ));
+        assert!(
+            !target_is_caught_up(&applied_map(&[("x:main", "t", 21)]), "x:main", &tw),
+            "a marker numerically above `to` is a DIFFERENT snapshot, not a later one"
+        );
         assert!(!target_is_caught_up(
             &applied_map(&[("x:main", "t", 19)]),
             "x:main",
             &tw
         ));
+    }
+
+    /// Snapshot ids are random, so an applied marker can be numerically far larger
+    /// than a snapshot committed long after it. Skipping on `>=` therefore ratchets:
+    /// the marker climbs the running maximum of a random sequence and then exceeds
+    /// every later draw permanently, and the target is never written to again.
+    ///
+    /// These are real values from a deployment where that happened — all 17 markers
+    /// had reached 8.19e18–9.22e18 against an `i64::MAX` of 9.223e18, every target was
+    /// skipped on every poll, and the watermark advanced past data that was never
+    /// applied. Each `to` below is a genuinely LATER commit than the marker beside it,
+    /// despite being numerically smaller.
+    ///
+    /// Small sequence-shaped fixtures cannot catch this — an ordered fixture will
+    /// ratify an ordering comparison — which is why these are the production numbers.
+    #[test]
+    fn a_marker_numerically_above_a_later_snapshot_is_not_caught_up() {
+        // (table, ratcheted applied marker, the genuinely later snapshot it skipped)
+        let observed = [
+            (
+                "silver.place",
+                9_220_834_252_869_770_488i64,
+                5_644_295_785_472_712_989i64,
+            ),
+            (
+                "silver.observation",
+                9_217_340_116_954_323_563,
+                3_238_671_374_642_079_740,
+            ),
+            (
+                "silver.concept_scheme",
+                9_086_429_568_298_186_029,
+                753_340_878_885_049_461,
+            ),
+            (
+                "silver.concept",
+                9_052_937_455_619_636_065,
+                1_349_575_232_631_351_152,
+            ),
+            (
+                "silver.link",
+                9_196_238_952_972_422_466,
+                9_139_397_570_598_290_786,
+            ),
+        ];
+        for (table, marker, later_to) in observed {
+            assert!(
+                marker > later_to,
+                "{table}: this fixture is only meaningful while the marker is \
+                 numerically larger than the later snapshot — that is the whole trap"
+            );
+            let tw = vec![(table.to_string(), None, later_to)];
+            assert!(
+                !target_is_caught_up(
+                    &applied_map(&[("silver_acme_u1:main", table, marker)]),
+                    "silver_acme_u1:main",
+                    &tw
+                ),
+                "{table}: marker {marker} is a different snapshot from {later_to}, not \
+                 a later one — skipping here is what discarded the window"
+            );
+        }
     }
 
     /// ALL tables, not any. A target that applied one table of a two-table window
