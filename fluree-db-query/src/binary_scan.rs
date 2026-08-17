@@ -1024,7 +1024,7 @@ impl BinaryScanOperator {
             .map_err(|e| QueryError::Policy(e.to_string()))?;
 
         enforcer
-            .filter_flakes_for_graph(snapshot, overlay, to_t, &ctx.tracker, flakes)
+            .filter_flakes_for_graph(snapshot, db.g_id, overlay, to_t, &ctx.tracker, flakes)
             .await
             .map_err(|e| QueryError::Policy(e.to_string()))
     }
