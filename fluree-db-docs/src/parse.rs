@@ -177,7 +177,16 @@ fn unique_anchor(content: &str, counter: &mut HashMap<String, usize>) -> String 
 /// `- [Title](path)` list item becomes a [`TreeNode`]; 2-space indentation
 /// denotes nesting. Non-link lines (the `# Summary` header, blank lines,
 /// separators, draft entries without a link) are ignored.
+///
+/// HTML comment spans are stripped BEFORE the line scan. mdBook parses
+/// CommonMark, so an entry commented out with `<!-- … -->` — including the
+/// multi-line block form used to temporarily unpublish a whole section — is
+/// not a chapter. A line scan that missed that would disagree with mdBook in
+/// exactly the direction the corpus policy forbids: a commented-out (i.e.
+/// deliberately unpublished) page would still count as "published" here,
+/// leaving it embedded and searchable with every guardrail green.
 pub fn parse_summary(md: &str) -> Vec<TreeNode> {
+    let md = strip_html_comments(md);
     let flat: Vec<(usize, String, String)> = md
         .lines()
         .filter_map(|line| {
@@ -193,6 +202,31 @@ pub fn parse_summary(md: &str) -> Vec<TreeNode> {
 
     let mut iter = flat.into_iter().peekable();
     build_tree(&mut iter, 0)
+}
+
+/// Remove `<!-- … -->` spans (same-line or spanning lines). An unterminated
+/// comment runs to end of input, matching how mdBook's CommonMark parse
+/// treats it. Newlines inside a span are preserved so line-based depth
+/// arithmetic on the surviving text is unaffected.
+fn strip_html_comments(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut rest = md;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => {
+                let span = &rest[start..start + end];
+                out.extend(span.chars().filter(|&c| c == '\n'));
+                rest = &rest[start + end + 3..];
+            }
+            None => {
+                out.extend(rest[start..].chars().filter(|&c| c == '\n'));
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 type SummaryItems = std::iter::Peekable<std::vec::IntoIter<(usize, String, String)>>;
@@ -227,7 +261,12 @@ fn build_tree(items: &mut SummaryItems, depth: usize) -> Vec<TreeNode> {
     nodes
 }
 
-/// Extract `(title, path)` from a `- [Title](path)` list item.
+/// Extract `(title, path)` from a `- [Title](path)` list item. A leading
+/// `./` on the path is normalized away — mdBook accepts
+/// `- [T](./a/b.md)` as the same chapter as `a/b.md`, and embedded asset
+/// paths never carry the prefix, so keeping it would make a genuinely
+/// published page fail the closed-set guardrail with a message claiming
+/// the opposite of the truth.
 fn parse_link(item: &str) -> Option<(String, String)> {
     let s = item
         .trim_start_matches("- ")
@@ -236,7 +275,8 @@ fn parse_link(item: &str) -> Option<(String, String)> {
     let open = s.find('[')?;
     let mid = s[open..].find("](")? + open;
     let close = s[mid + 2..].find(')')? + mid + 2;
-    Some((s[open + 1..mid].to_string(), s[mid + 2..close].to_string()))
+    let path = s[mid + 2..close].trim_start_matches("./").to_string();
+    Some((s[open + 1..mid].to_string(), path))
 }
 
 fn normalize_id(content: &str) -> String {
@@ -301,5 +341,44 @@ mod tests {
         let md = "# Title\n\nSome **bold** text.\n";
         let secs = parse_sections("x.md", md);
         assert!(secs[0].body.contains("**bold**"));
+    }
+
+    #[test]
+    fn summary_ignores_html_comments_in_both_forms() {
+        // mdBook (CommonMark) treats commented-out entries as not-chapters;
+        // the tree/guardrail scan must agree in both the same-line and the
+        // multi-line block form, or a deliberately unpublished page still
+        // counts as published.
+        let md = concat!(
+            "# Summary\n\n",
+            "- [Kept](kept.md)\n",
+            "<!-- - [SameLine](same-line.md) -->\n",
+            "<!--\n",
+            "- [Blocked](blocked.md)\n",
+            "  - [BlockedChild](blocked-child.md)\n",
+            "-->\n",
+            "- [Also Kept](also-kept.md)\n",
+        );
+        let tree = parse_summary(md);
+        let paths: Vec<&str> = tree.iter().map(|n| n.path.as_str()).collect();
+        assert_eq!(paths, vec!["kept.md", "also-kept.md"]);
+    }
+
+    #[test]
+    fn summary_unterminated_comment_runs_to_end() {
+        let md = "- [Kept](kept.md)\n<!--\n- [Gone](gone.md)\n";
+        let tree = parse_summary(md);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].path, "kept.md");
+    }
+
+    #[test]
+    fn summary_normalizes_dot_slash_link_prefixes() {
+        // `- [T](./a/b.md)` is the same chapter as `a/b.md` to mdBook, and
+        // embedded asset paths never carry `./` — without normalization the
+        // guardrail would call a published page unpublished.
+        let md = "- [T](./contributing/benches.md)\n";
+        let tree = parse_summary(md);
+        assert_eq!(tree[0].path, "contributing/benches.md");
     }
 }
