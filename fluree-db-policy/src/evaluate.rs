@@ -56,7 +56,8 @@ impl<'a> FlakeEvalParams<'a> {
     }
 }
 
-/// Cache of `(graph, subject) -> classes` shared across concurrent evaluations.
+/// Shared (graph, subject) -> classes cache for runtime class-membership
+/// checks. See the `class_cache` field docs for why the graph is in the key.
 type ClassCache = Arc<RwLock<std::collections::HashMap<(GraphId, Sid), Vec<Sid>>>>;
 
 /// Policy context for evaluation
