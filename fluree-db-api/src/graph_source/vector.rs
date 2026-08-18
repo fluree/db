@@ -36,7 +36,7 @@ use std::collections::HashSet;
 #[cfg(feature = "vector")]
 use std::sync::Arc;
 #[cfg(feature = "vector")]
-use tracing::{info, warn};
+use tracing::info;
 
 // =============================================================================
 // Vector Index Creation
@@ -499,15 +499,39 @@ impl crate::Fluree {
             affected_sids.extend(subjects);
         }
 
-        // If no subjects affected, fall back to full resync
+        // Nothing the index covers changed in this window. Same reasoning, and the
+        // same fix, as the BM25 path in `bm25.rs` — see the long comment there for
+        // the production incident that motivated it. An empty set here is the walk
+        // succeeding and reporting no indexed property was touched, not a failure
+        // to determine one, so the index is already correct as of `ledger_t` and
+        // rebuilding it is pure waste. Vector rebuilds are dearer than BM25 ones,
+        // because a resync re-embeds every document.
         if affected_sids.is_empty() {
-            warn!(
+            index.watermark.update(&source_ledger_alias, ledger_t);
+            let new_index_id = self
+                .write_vector_snapshot_blob(graph_source_id, &index, ledger_t)
+                .await?;
+            let (name, branch) = split_ledger_id(graph_source_id).map_err(|e| {
+                crate::ApiError::config(format!("Invalid graph source ID '{graph_source_id}': {e}"))
+            })?;
+            self.publisher()?
+                .publish_graph_source_index(&name, &branch, &new_index_id, ledger_t)
+                .await?;
+            info!(
                 graph_source_id = %graph_source_id,
                 old_watermark = old_watermark,
                 ledger_t = ledger_t,
-                "No affected subjects detected, falling back to full resync"
+                "No indexed properties changed in this window; advancing watermark without a resync"
             );
-            return self.resync_vector_index(graph_source_id).await;
+            return Ok(VectorSyncResult {
+                graph_source_id: graph_source_id.to_string(),
+                upserted: 0,
+                removed: 0,
+                skipped: 0,
+                old_watermark,
+                new_watermark: ledger_t,
+                was_full_resync: false,
+            });
         }
 
         // 7. Convert affected Sids to IRIs

@@ -941,15 +941,61 @@ impl crate::Fluree {
             affected_sids.extend(subjects);
         }
 
-        // If no subjects affected, fall back to full resync
+        // Nothing the index covers changed in this window.
+        //
+        // This is a DETERMINATE answer, not a failure to work one out: the walk
+        // above completed, and `affected_subjects` reported that none of the
+        // commits touched a property the index depends on. Queries whose shape
+        // cannot be narrowed at all never reach here — they decline earlier, and
+        // declining is what routes those to a full resync. So an empty set here
+        // means the index is already correct as of `ledger_t`, and the only work
+        // owed is to record that.
+        //
+        // It used to fall back to a full resync, and on an append-heavy ledger
+        // whose writes mostly miss the indexed properties that is pathological
+        // rather than merely wasteful. Measured on a deployment indexing
+        // `as:content`/`as:name`/`as:summary`/`as:preferredUsername` while the
+        // write volume was observations carrying only `sosa:` properties: 23 full
+        // index rebuilds in 10 minutes across 4 ledgers, one of them triggered by
+        // a ONE-commit window (`old_watermark=15194 ledger_t=15195`) over a
+        // 15,000-commit ledger. It also feeds back — a rebuild is slow, the ledger
+        // advances while it runs, so the next window is wider and rebuilds again.
+        // Resident memory reached 23.5 GiB of non-reclaimable anon against a 6 GiB
+        // index-cache bound, and the process was OOM-killed three times.
+        //
+        // The watermark is advanced and PERSISTED rather than left alone. Leaving
+        // it is cheaper per pass but never converges: every later sync re-walks a
+        // commit range that grows without bound, which on a busy ledger becomes
+        // thousands of commit reads per sync — a slower version of the same
+        // problem. Persisting costs one index serialization, which is O(index) and
+        // bounded, and skips exactly the expensive half of a resync: the full
+        // ledger re-query and rebuild.
         if affected_sids.is_empty() {
-            warn!(
+            index.watermark.update(&source_ledger_alias, ledger_t);
+            let new_snapshot_id = self.write_bm25_snapshot(graph_source_id, &index).await?;
+            let mut manifest = manifest;
+            manifest.append(Bm25SnapshotEntry::new(ledger_t, new_snapshot_id.clone()));
+            let removed = manifest.trim(snapshot_retention());
+            self.publish_bm25_manifest(graph_source_id, &manifest, ledger_t)
+                .await?;
+            if let Some(storage) = self.admin_storage() {
+                delete_old_snapshots(storage, graph_source_id, &removed).await;
+            }
+            info!(
                 graph_source_id = %graph_source_id,
                 old_watermark = old_watermark,
                 ledger_t = ledger_t,
-                "No affected subjects detected, falling back to full resync"
+                "No indexed properties changed in this window; advancing watermark without a resync"
             );
-            return self.resync_bm25_index(graph_source_id).await;
+            return Ok(Bm25SyncResult {
+                graph_source_id: graph_source_id.to_string(),
+                upserted: 0,
+                removed: 0,
+                affected_subjects: 0,
+                old_watermark,
+                new_watermark: ledger_t,
+                was_full_resync: false,
+            });
         }
 
         // 7. Convert affected Sids to IRIs
