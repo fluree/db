@@ -134,7 +134,7 @@ async fn local_table_end_to_end() {
 
     // Full unpinned streaming read: all 5 rows.
     let scan = provider
-        .scan_for_materialize_stream(gs, "silver.people", &[], None, None)
+        .scan_for_materialize_stream(gs, "silver.people", &[], None, None, None)
         .await
         .expect("full scan");
     assert_eq!(scan.to_snapshot_id, Some(current));
@@ -170,7 +170,7 @@ async fn local_table_end_to_end() {
     };
 
     let scan = provider
-        .scan_for_materialize_stream(gs, "silver.people", &[], Some(first), None)
+        .scan_for_materialize_stream(gs, "silver.people", &[], Some(first), None, None)
         .await
         .expect("incremental scan");
     assert!(scan.incremental, "append-only window scans incrementally");
@@ -184,7 +184,7 @@ async fn local_table_end_to_end() {
     // PINNED read: to = the FIRST snapshot → only the first append's rows,
     // and the resolved watermark is the pin, not current.
     let scan = provider
-        .scan_for_materialize_stream(gs, "silver.people", &[], None, Some(first))
+        .scan_for_materialize_stream(gs, "silver.people", &[], None, Some(first), None)
         .await
         .expect("pinned scan");
     assert_eq!(scan.to_snapshot_id, Some(first), "pin is honored");
@@ -198,7 +198,7 @@ async fn local_table_end_to_end() {
     // An expired/unknown pin is the typed error, never a fall-forward.
     // (`MaterializeScan` has no Debug — a stream field — so match manually.)
     match provider
-        .scan_for_materialize_stream(gs, "silver.people", &[], None, Some(999))
+        .scan_for_materialize_stream(gs, "silver.people", &[], None, Some(999), None)
         .await
     {
         Ok(_) => panic!("unknown pin must fail, not fall forward"),
