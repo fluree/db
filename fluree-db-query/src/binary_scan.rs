@@ -1545,6 +1545,79 @@ impl BinaryScanOperator {
 }
 
 impl BinaryScanOperator {
+    /// Key bounds that bracket every flake this fallback could match, in
+    /// `index` order, or `None` when nothing constrains the order's leading
+    /// component.
+    ///
+    /// `Segment::range` seeks with `partition_point` on both ends, so supplying
+    /// bounds turns the overlay walk from O(novelty) into
+    /// O(log novelty + matched) and lets `may_overlap` skip whole segments. With
+    /// `first`/`rhs` left `None` the walk covers the entire graph's novelty on
+    /// every probe — and this fallback is reached once per probe of a term
+    /// absent from the persisted dictionaries, which correlated joins issue by
+    /// the thousand.
+    ///
+    /// Bounds are an optimization only: the per-flake equality checks in the
+    /// walk remain the correctness backstop, exactly as in
+    /// `fast_path_common::collect_resolved_overlay_ops`. They must therefore
+    /// never exclude a matching flake — each bound pins only components that
+    /// lead `index`'s sort order and are pinned by an equality match, and lets
+    /// every trailing component span its full range.
+    ///
+    /// `first` is left-*exclusive*, so it sets `t` to `i64::MIN` (with the
+    /// minimal `op`/`m`) to sort strictly below any real flake; `rhs` is
+    /// inclusive and maxes the same trailing components. This mirrors
+    /// `predicate_walk_bounds`.
+    fn overlay_walk_bounds(
+        &self,
+        s_sid: &Option<Sid>,
+        p_sid: &Option<Sid>,
+    ) -> Option<(Flake, Flake)> {
+        use fluree_db_core::flake::FlakeMeta;
+
+        // (value, datatype) pair bracketing the bound object, or the full range.
+        let o_bounds = || match self.bound_o.as_ref() {
+            Some(o) => ((o.clone(), Sid::min()), (o.clone(), Sid::max())),
+            None => (
+                (FlakeValue::min(), Sid::min()),
+                (FlakeValue::max(), Sid::max()),
+            ),
+        };
+        let s_bounds = || match s_sid.as_ref() {
+            Some(s) => (s.clone(), s.clone()),
+            None => (Sid::min(), Sid::max()),
+        };
+        let p_bounds = || match p_sid.as_ref() {
+            Some(p) => (p.clone(), p.clone()),
+            None => (Sid::min(), Sid::max()),
+        };
+
+        // Only worth bounding when the order's leading component is pinned;
+        // otherwise the range spans everything anyway.
+        match self.index {
+            IndexType::Spot if s_sid.is_none() => return None,
+            IndexType::Psot | IndexType::Post if p_sid.is_none() => return None,
+            IndexType::Opst if self.bound_o.is_none() => return None,
+            _ => {}
+        }
+
+        let ((o_min, dt_min), (o_max, dt_max)) = o_bounds();
+        let (s_min, s_max) = s_bounds();
+        let (p_min, p_max) = p_bounds();
+
+        let first = Flake::new(s_min, p_min, o_min, dt_min, i64::MIN, false, None);
+        let rhs = Flake::new(
+            s_max,
+            p_max,
+            o_max,
+            dt_max,
+            i64::MAX,
+            true,
+            Some(FlakeMeta::max()),
+        );
+        Some((first, rhs))
+    }
+
     async fn open_overlay_only_fallback(
         &mut self,
         ctx: &ExecutionContext<'_>,
@@ -1579,28 +1652,45 @@ impl BinaryScanOperator {
         // `(s, p, o, dt, m)` independently, and an (s, p, o) equality filter
         // either keeps or drops a fact's entries as a whole — so it can never
         // separate an assertion from the retraction that cancels it.
+        let bounds = self.overlay_walk_bounds(s_sid, p_sid);
+        let (first, rhs) = match bounds.as_ref() {
+            Some((f, r)) => (Some(f), Some(r)),
+            None => (None, None),
+        };
+        // `leftmost` must be false whenever `first` is supplied, or the seek's
+        // lower bound is ignored and the walk starts at index 0 again.
+        let leftmost = first.is_none();
+
         let mut flakes: Vec<Flake> = Vec::new();
-        overlay.for_each_overlay_flake(self.g_id, self.index, None, None, true, to_t, &mut |f| {
-            if f.t > to_t || from_t.is_some_and(|ft| f.t < ft) {
-                return;
-            }
-            if let Some(s) = s_sid.as_ref() {
-                if &f.s != s {
+        overlay.for_each_overlay_flake(
+            self.g_id,
+            self.index,
+            first,
+            rhs,
+            leftmost,
+            to_t,
+            &mut |f| {
+                if f.t > to_t || from_t.is_some_and(|ft| f.t < ft) {
                     return;
                 }
-            }
-            if let Some(p) = p_sid.as_ref() {
-                if &f.p != p {
-                    return;
+                if let Some(s) = s_sid.as_ref() {
+                    if &f.s != s {
+                        return;
+                    }
                 }
-            }
-            if let Some(o) = self.bound_o.as_ref() {
-                if &f.o != o {
-                    return;
+                if let Some(p) = p_sid.as_ref() {
+                    if &f.p != p {
+                        return;
+                    }
                 }
-            }
-            flakes.push(f.clone());
-        });
+                if let Some(o) = self.bound_o.as_ref() {
+                    if &f.o != o {
+                        return;
+                    }
+                }
+                flakes.push(f.clone());
+            },
+        );
 
         flakes.sort_by(cmp);
         flakes = resolve_overlay_retractions(flakes);
@@ -1966,6 +2056,43 @@ impl Operator for BinaryScanOperator {
         if s_sid.is_some() && filter.s_id.is_none() && self.unresolved_bound_subject_iri.is_none() {
             return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
         }
+
+        // Last chance to narrow before falling back to the widened walk below.
+        //
+        // `build_filter_from_snapshot_sids` resolves `Ref::Sid` through
+        // `ctx.active_snapshot`, but a pattern SID is encoded against
+        // `ctx.original_snapshot` (see `reencode_sid`). In a per-graph context the
+        // two namespace tables differ, so the filter lookup either used the wrong
+        // IRI or never ran — leaving a decoded IRI that was never actually probed
+        // against the store's subject dictionary. Probe it here with the IRI the
+        // pattern really means:
+        //
+        // - `Ok(Some)` — narrow to `s_id` and drop the per-row IRI comparison. The
+        //   subject dictionary is a bijection over the namespaces `find_subject_id`
+        //   consults, so filtering on `s_id` selects exactly the rows the row-by-row
+        //   `resolve_subject_iri(..) == target_iri` check would have kept.
+        // - `Ok(None)` — a conclusive base miss, so novelty is the only place the
+        //   subject can be. Same standard the bound-object `Ref` arm above already
+        //   applies, and the same one `generate_upsert_deletions` relies on.
+        // - `Err(_)` — the dictionary could not answer; absence stays undecidable
+        //   and the widened scan below remains the correct (if slow) answer.
+        //
+        // Skipping this made an absent bound subject cost a full predicate-partition
+        // walk with a dictionary lookup per row — O(partition), not O(1). It is not
+        // an upsert-only path: `join.rs` and `optional.rs` rebind a correlated
+        // subject to `Ref::Iri` per driving row, so every non-batched probe for a
+        // missing subject paid it.
+        if let Some(target_iri) = self.unresolved_bound_subject_iri.clone() {
+            match store_ref.find_subject_id(&target_iri) {
+                Ok(Some(s_id)) => {
+                    filter.s_id = Some(s_id);
+                    self.unresolved_bound_subject_iri = None;
+                }
+                Ok(None) => return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await,
+                Err(_) => {}
+            }
+        }
+
         if self.unresolved_bound_subject_iri.is_some() && filter.p_id.is_some() {
             self.index = IndexType::Psot;
         }

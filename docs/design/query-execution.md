@@ -74,6 +74,46 @@ The details differ:
 - `BinaryScanOperator` translates overlay flakes into integer-ID space and merges them into the decoded columnar stream.
 - `RangeScanOperator` delegates to `range_with_overlay`, which combines `RangeProvider` output with overlay output.
 
+## Bound-term resolution and the overlay-only fallback
+
+`BinaryScanOperator::open()` translates each bound term of the triple pattern
+into a persisted dictionary id (`BinaryFilter`). A term that fails to translate
+cannot constrain the base scan, so the scan would degrade into a wide walk. How
+that is handled depends on *why* the translation failed:
+
+- **Conclusive miss** — the dictionary was consulted and answered "absent"
+  (`find_subject_id` / `find_string_id` returning `Ok(None)`, or a value that
+  does not encode). The term names no base row at all, so the scan takes
+  `open_overlay_only_fallback` and reads novelty exclusively.
+- **Undecidable** — the dictionary could not answer (an I/O error). Absence is
+  unproven, so the scan stays widened and correctness is preserved by a
+  row-by-row check.
+
+A bound **subject** needs one extra step before that split. Pattern SIDs are
+encoded against `ctx.original_snapshot`, but the filter resolves them through
+`ctx.active_snapshot`, and in a per-graph context those namespace tables differ.
+`open()` therefore keeps the decoded IRI in `unresolved_bound_subject_iri` and
+probes it against the store's subject dictionary directly before deciding — so
+the common case (a subject that simply does not exist) is a single dictionary
+lookup rather than a full predicate-partition walk with an IRI resolution per
+row. This matters well beyond point queries: `join.rs` and `optional.rs` rebind
+a correlated subject to `Ref::Iri` once per driving row, so a non-batched probe
+loop pays this cost per probe.
+
+The overlay-only walk is itself key-bounded. `Segment::range`
+(`fluree-db-novelty`) seeks with `partition_point` on both ends and
+`may_overlap` prunes whole segments, so `open_overlay_only_fallback` passes
+bounds derived from whichever bound terms lead the active index order
+(`overlay_walk_bounds`). Passing `None`/`None` instead walks every flake in the
+graph's novelty on every probe.
+
+Bounds are an **optimization only** — the per-flake equality checks inside the
+walk remain the correctness backstop, the same contract as
+`fast_path_common::collect_resolved_overlay_ops`. A bound must therefore never
+be too tight: pin only components that lead the sort order *and* are fixed by an
+equality match, and let every trailing component span its full range. `first` is
+left-exclusive (hence `t: i64::MIN`); `rhs` is inclusive.
+
 ## Planner fast paths
 
 Before building the generic operator tree, `build_operator_tree_inner`

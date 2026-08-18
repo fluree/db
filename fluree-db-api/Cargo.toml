@@ -417,6 +417,9 @@ harness = false
 name = "query_hot_whole_graph_agg"
 harness = false
 
+[[test]]
+name = "it_absent_subject_scan_narrowing"
+
 [lints]
 workspace = true
 
