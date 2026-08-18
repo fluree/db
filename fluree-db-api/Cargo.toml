@@ -251,6 +251,13 @@ path = "tests/it_cyclic_bgp_probe.rs"
 name = "it_minmax_fast_path_fired"
 path = "tests/it_minmax_fast_path_fired.rs"
 
+# Standalone (not in grp_transact): asserts on the `upsert deletion subject
+# pre-check` tracing event via the thread-local span capture, so it must be the
+# only test in its process. Same convention as the span-capture tests above.
+[[test]]
+name = "it_upsert_skip_fires"
+path = "tests/it_upsert_skip_fires.rs"
+
 [[test]]
 name = "it_multi_graph_property_path"
 path = "tests/it_multi_graph_property_path.rs"

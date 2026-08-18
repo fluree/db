@@ -2766,10 +2766,18 @@ async fn generate_upsert_deletions(
     // system RAM when indexing lags — which is why it runs at most once per
     // graph, and only on demand. It is authoritative in Sid space, needing
     // no dictionary translation.
-    // A snapshot with no range provider at all has no base index (genesis, or
-    // nothing indexed yet), so novelty is the only place a subject can exist
-    // and the presence check below is authoritative on its own.
-    let base_index_absent = ledger.snapshot.range_provider.is_none();
+    // Genesis, or nothing indexed yet: novelty is the only place a subject can
+    // exist, so the presence check below is authoritative on its own.
+    //
+    // The `t == 0` conjunct mirrors `fluree_db_core::range`, which treats a
+    // missing range provider as an empty index only at genesis and errors
+    // otherwise ("binary-only db has no range_provider attached"). A binary
+    // store that fails to load is non-fatal in the ledger manager, which leaves
+    // an indexed ledger (`t > 0`) with no provider attached; subjects there DO
+    // have base rows we cannot see, so absence must stay undecidable and the
+    // per-predicate query must run — that path surfaces the load failure
+    // instead of silently skipping every retraction.
+    let base_index_absent = ledger.snapshot.range_provider.is_none() && ledger.snapshot.t == 0;
     let can_decide_absence = binary_store.is_some() || base_index_absent;
 
     let mut per_g_subjects: HashMap<u16, HashSet<&Sid>> = HashMap::new();
@@ -2789,8 +2797,10 @@ async fn generate_upsert_deletions(
     // per-predicate query surfaces the real failure.
     let subject_in_base = |subject: &Sid| -> bool {
         let Some(store) = binary_store.as_deref() else {
-            // Nothing to consult: absent iff there is no base index at all.
-            return !base_index_absent;
+            // Only reachable under `base_index_absent` (the caller gates on
+            // `can_decide_absence`): there is no base index, so no subject has
+            // rows in one. Novelty presence decides.
+            return false;
         };
         if matches!(
             store.find_subject_id_by_parts(subject.namespace_code, &subject.name),
@@ -2798,11 +2808,16 @@ async fn generate_upsert_deletions(
         ) {
             return true;
         }
-        // Resolve the subject IRI so the store's full-IRI fallback can run. The
-        // snapshot is consulted first; when it cannot decode the namespace code
-        // the store's own namespace table is tried. A code that NEITHER knows
-        // was minted after the base index was written, so the subject provably
-        // has no rows in it — report absent rather than failing open.
+        // Resolve the subject IRI so the store's full-IRI lookup can run.
+        //
+        // A namespace code the pre-transaction snapshot cannot decode was
+        // minted by this transaction, so it provably names no base-index row —
+        // report absent rather than failing open. The store's own namespace
+        // table is no help as a fallback: it is a subset of the snapshot's (the
+        // index root is a materialized cache at `index_t`, and
+        // `ns_helpers::sync_store_and_snapshot_ns` reconciles its codes back
+        // into the snapshot on load), so it can never decode a code the
+        // snapshot could not.
         //
         // Reporting "present" here instead defeats the skip for every IRI shape
         // that mints a namespace per subject — `MostGranular` splits
@@ -2810,11 +2825,7 @@ async fn generate_upsert_deletions(
         // per-(subject, predicate) degraded scan. Novelty presence is still
         // checked by the caller, so a subject that exists only in unindexed
         // commits is never wrongly skipped.
-        match ledger
-            .snapshot
-            .decode_sid(subject)
-            .or_else(|| store.sid_to_iri(subject))
-        {
+        match ledger.snapshot.decode_sid(subject) {
             Some(iri) => !matches!(store.find_subject_id(&iri), Ok(None)),
             None => false,
         }
