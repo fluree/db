@@ -244,52 +244,188 @@ impl ScanChoice {
     }
 }
 
-/// Rows a single FULL materialize read may take before checkpointing.
+/// Bytes of flakes one materialized row costs, for sizing the full-read budget.
 ///
-/// `FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS`, default 250_000; `0` disables
-/// the bound and restores the previous read-it-all behaviour.
-fn materialize_max_rows_per_full_pass() -> i64 {
+/// `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW`, default 108 — measured on the
+/// production table this bound was tuned against. It exists only to convert the
+/// novelty ceiling into a row count. A deployment whose rows are much wider or
+/// narrower should set THIS rather than overriding the row budget directly, so
+/// the derivation below keeps tracking the ceiling instead of drifting from it.
+fn flake_bytes_per_row() -> i64 {
     static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS")
+        std::env::var("FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW")
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|v| *v >= 0)
-            .unwrap_or(250_000)
+            .filter(|v| *v > 0)
+            .unwrap_or(108)
     })
 }
 
-/// The commit sequence to stop a full read at, or `None` to read it whole.
+/// The novelty ceiling this deployment commits against, in bytes.
+///
+/// Read from `FLUREE_REINDEX_MAX_BYTES` — the SAME variable that configures
+/// `IndexConfig::reindex_max_bytes`, which `at_max_novelty` compares novelty
+/// against (`novelty.size >= reindex_max_bytes`) — so the budget below and the
+/// wall it has to fit under cannot drift apart.
+fn novelty_ceiling_bytes() -> i64 {
+    static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FLUREE_REINDEX_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| {
+                i64::try_from(crate::server_defaults::default_reindex_max_bytes())
+                    .unwrap_or(i64::MAX)
+            })
+    })
+}
+
+/// Rows a single FULL materialize read may take before checkpointing.
+///
+/// `FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS` overrides; `0` disables the bound
+/// and restores read-it-all. Left unset it is DERIVED from the novelty ceiling,
+/// and that derivation is the whole point rather than a convenience.
+///
+/// A bounded pass is only worth anything if it can COMMIT. A window over the
+/// ceiling is DEFERRED, and a deferral discards the window's progress, so the
+/// next poll re-reads the same rows and stops at the same wall — nothing
+/// accumulates. A bound that does not fit under the ceiling is therefore not a
+/// bound at all: it changes how much is read and nothing about whether any of it
+/// lands. The previous flat 250_000 rows is ~27 MB of flakes, which against a
+/// deployment that has pinned the ceiling to 8 MiB could never commit, so the
+/// read repeated on every poll indefinitely.
+///
+/// Floored at 1_000 rows so a very small ceiling still makes forward progress
+/// rather than producing a zero-row pass that reads nothing and checkpoints
+/// nowhere.
+fn materialize_max_rows_per_full_pass() -> i64 {
+    static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if let Some(explicit) = std::env::var("FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+        {
+            return explicit;
+        }
+        rows_for_ceiling(novelty_ceiling_bytes(), flake_bytes_per_row())
+    })
+}
+
+/// Rows that fit under `ceiling_bytes` at `bytes_per_row`, floored at 1_000.
+///
+/// Split out from the env plumbing above so the arithmetic — the part that has
+/// to be right — is testable without touching process-global state.
+fn rows_for_ceiling(ceiling_bytes: i64, bytes_per_row: i64) -> i64 {
+    if bytes_per_row <= 0 {
+        return 1_000;
+    }
+    (ceiling_bytes / bytes_per_row).max(1_000)
+}
+
+/// The outcome of sizing a full read down to a commit prefix.
+///
+/// Typed rather than `Option`, so the caller can say WHICH reason fired. Every
+/// non-`Cut` outcome means "read it whole", and on a table whose window exceeds
+/// the novelty ceiling that read cannot commit — an uncommitted window writes no
+/// watermark, so the same read repeats on the next poll, forever. A silent
+/// decline is therefore an invisible livelock, and one was: in production the
+/// bound's success line never appeared across 16 consecutive passes and there was
+/// nothing in the log to say why. Finding it needed a state-ledger query.
+#[derive(Debug, PartialEq, Eq)]
+enum FullReadCut {
+    /// Cut after this commit sequence; keep every task at or below it.
+    Cut(i64),
+    /// The bound is switched off (`FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS=0`).
+    Disabled,
+    /// The plan already fits the budget — not alarming, and not worth a warning.
+    PlanFits,
+    /// A data file carries no commit sequence, so no ordering — and therefore no
+    /// cut — is safe.
+    NoSequence,
+    /// Every row sits in ONE commit, so there is no boundary short of the head to
+    /// checkpoint at.
+    SingleCommit,
+}
+
+impl FullReadCut {
+    /// Operator-facing reason for declining to bound the read.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Cut(_) => "bounded",
+            Self::Disabled => "the row bound is disabled",
+            Self::PlanFits => "the plan already fits the row budget",
+            Self::NoSequence => "a data file carries no commit sequence, so no cut is safe",
+            Self::SingleCommit => {
+                "every row is in a single commit, so there is no boundary short of the head"
+            }
+        }
+    }
+
+    /// Whether this outcome should be shouted about. `PlanFits` is the healthy
+    /// small-read case and `Disabled` is a deliberate configuration choice;
+    /// neither is news. The other two mean an unbounded read that may never
+    /// commit.
+    fn is_alarming(&self) -> bool {
+        matches!(self, Self::NoSequence | Self::SingleCommit)
+    }
+}
+
+/// The commit sequence to stop a full read at, or why it could not be cut.
 ///
 /// Walks `tasks` (already sorted by `(data_sequence_number, path)`) accumulating
 /// rows, and returns the sequence of the commit the budget ran out in. The whole
 /// of that commit is kept: a cut INSIDE a commit leaves the target in a state no
 /// snapshot names, and an unnameable state cannot be checkpointed.
-///
-/// `None` when the bound is disabled, the plan already fits, any task lacks a
-/// sequence number, or the budget runs out in the final commit — stopping there
-/// would checkpoint at the head, which is the whole read with extra steps.
-fn full_read_prefix(tasks: &[fluree_db_iceberg::scan::FileScanTask], max_rows: i64) -> Option<i64> {
+fn full_read_prefix(tasks: &[fluree_db_iceberg::scan::FileScanTask], max_rows: i64) -> FullReadCut {
     if max_rows <= 0 {
-        return None;
+        return FullReadCut::Disabled;
     }
     let total: i64 = tasks.iter().map(|t| t.data_file.record_count).sum();
     if total <= max_rows {
-        return None;
+        return FullReadCut::PlanFits;
     }
-    let last_seq = tasks
+    let Some(last_seq) = tasks
         .iter()
         .filter_map(|t| t.data_sequence_number)
-        .next_back()?;
+        .next_back()
+    else {
+        return FullReadCut::NoSequence;
+    };
     let mut rows = 0i64;
     for t in tasks {
-        let seq = t.data_sequence_number?;
+        let Some(seq) = t.data_sequence_number else {
+            return FullReadCut::NoSequence;
+        };
         rows = rows.saturating_add(t.data_file.record_count);
         if rows >= max_rows {
-            return (seq < last_seq).then_some(seq);
+            if seq < last_seq {
+                return FullReadCut::Cut(seq);
+            }
+            // The budget ran out inside the HEAD commit. Checkpointing at the
+            // head is the whole read with extra bookkeeping — but declining
+            // outright, which is what this used to do, is how a COMPACTED table
+            // livelocks. A compaction rewrites the table into files that all
+            // share one sequence number, so from then on the budget always lands
+            // in the head commit, the read is never bounded, and if the window
+            // is over the novelty ceiling it can never commit either.
+            //
+            // Fall back to the newest boundary STRICTLY BELOW the head. That is
+            // a smaller pass than the budget asked for, and it is still forward
+            // progress, which is the only property that matters here.
+            return tasks
+                .iter()
+                .filter_map(|t| t.data_sequence_number)
+                .filter(|s| *s < last_seq)
+                .max()
+                .map_or(FullReadCut::SingleCommit, FullReadCut::Cut);
         }
     }
-    None
+    // Unreachable: `total > max_rows` guarantees the accumulator crosses the
+    // budget above. Typed as the harmless outcome rather than a panic.
+    FullReadCut::PlanFits
 }
 
 /// Field ids to project for `projection` against `schema`: every non-nested
@@ -1424,8 +1560,10 @@ impl<'a> FlureeR2rmlProvider<'a> {
             // its commit: splitting inside one would leave the target holding
             // part of a commit with no snapshot to name that state, and a
             // checkpoint that cannot be named cannot be resumed from.
-            match full_read_prefix(&plan.tasks, materialize_max_rows_per_full_pass()) {
-                Some(cut_seq) => {
+            let budget_rows = materialize_max_rows_per_full_pass();
+            let cut = full_read_prefix(&plan.tasks, budget_rows);
+            match cut {
+                FullReadCut::Cut(cut_seq) => {
                     match metadata.snapshot_at_or_before_sequence(to_snapshot_id, cut_seq) {
                         Ok(Some(checkpoint)) if checkpoint.snapshot_id != to_snapshot_id => {
                             let kept: Vec<_> = plan
@@ -1449,13 +1587,52 @@ impl<'a> FlureeR2rmlProvider<'a> {
                             to_snapshot_id = checkpoint.snapshot_id;
                             kept
                         }
-                        // No nameable checkpoint short of the head: read it whole, as
-                        // before. Better an expensive honest read than a watermark
-                        // pointing somewhere the data does not correspond to.
-                        _ => plan.tasks,
+                        // No nameable checkpoint short of the head: read it whole.
+                        // Better an expensive honest read than a watermark pointing
+                        // somewhere the data does not correspond to — but SAY SO,
+                        // because an unbounded read over the novelty ceiling cannot
+                        // commit, and what cannot commit writes no watermark and so
+                        // repeats forever.
+                        outcome => {
+                            warn!(
+                                to_snapshot_id,
+                                cut_sequence = cut_seq,
+                                budget_rows,
+                                estimated_rows = plan.estimated_row_count,
+                                files = plan.files_selected,
+                                reason = match outcome {
+                                    Ok(None) => "no retained snapshot names the cut",
+                                    Ok(Some(_)) => "the only nameable checkpoint is the head",
+                                    Err(_) => "the checkpoint walk failed",
+                                },
+                                "materialize: full read could NOT be bounded — reading the \
+                                 whole table. If this window exceeds the novelty ceiling it \
+                                 cannot commit, and an uncommitted window writes no watermark, \
+                                 so this repeats on every poll"
+                            );
+                            plan.tasks
+                        }
                     }
                 }
-                None => plan.tasks,
+                // Not every decline is news: `PlanFits` is the healthy small read
+                // and `Disabled` is a deliberate choice. The other two mean an
+                // unbounded read, which is the shape that livelocks.
+                decline => {
+                    if decline.is_alarming() {
+                        warn!(
+                            to_snapshot_id,
+                            budget_rows,
+                            estimated_rows = plan.estimated_row_count,
+                            files = plan.files_selected,
+                            reason = decline.reason(),
+                            "materialize: full read could NOT be bounded — reading the whole \
+                             table. If this window exceeds the novelty ceiling it cannot \
+                             commit, and an uncommitted window writes no watermark, so this \
+                             repeats on every poll"
+                        );
+                    }
+                    plan.tasks
+                }
             }
         };
 
@@ -4677,9 +4854,15 @@ mod tests {
         ];
 
         // Budget runs out inside commit 20 -> keep all of 20, cut there.
-        assert_eq!(super::full_read_prefix(&tasks, 70), Some(20));
+        assert_eq!(
+            super::full_read_prefix(&tasks, 70),
+            super::FullReadCut::Cut(20)
+        );
         // Budget runs out on the first file of commit 10 -> cut at 10.
-        assert_eq!(super::full_read_prefix(&tasks, 10), Some(10));
+        assert_eq!(
+            super::full_read_prefix(&tasks, 10),
+            super::FullReadCut::Cut(10)
+        );
     }
 
     /// Every reason to decline to cut. Each returns `None`, meaning "read it
@@ -4688,22 +4871,41 @@ mod tests {
     fn full_read_prefix_declines_when_a_cut_would_not_help() {
         let tasks = vec![t(10, 30), t(20, 30), t(30, 30)];
 
-        assert_eq!(super::full_read_prefix(&tasks, 0), None, "disabled");
-        assert_eq!(super::full_read_prefix(&tasks, -1), None, "negative");
-        assert_eq!(super::full_read_prefix(&tasks, 90), None, "already fits");
+        use super::FullReadCut;
+        assert_eq!(
+            super::full_read_prefix(&tasks, 0),
+            FullReadCut::Disabled,
+            "disabled"
+        );
+        assert_eq!(
+            super::full_read_prefix(&tasks, -1),
+            FullReadCut::Disabled,
+            "negative"
+        );
+        assert_eq!(
+            super::full_read_prefix(&tasks, 90),
+            FullReadCut::PlanFits,
+            "already fits"
+        );
         assert_eq!(
             super::full_read_prefix(&tasks, 1_000),
-            None,
+            FullReadCut::PlanFits,
             "budget exceeds total"
         );
-        assert_eq!(super::full_read_prefix(&[], 10), None, "no tasks");
+        assert_eq!(
+            super::full_read_prefix(&[], 10),
+            FullReadCut::PlanFits,
+            "no tasks"
+        );
 
-        // The budget runs out in the FINAL commit. Checkpointing at the head is
-        // the whole read with extra bookkeeping, so decline.
+        // The budget runs out in the FINAL commit. Checkpointing at the head
+        // would be the whole read with extra bookkeeping — but declining
+        // outright is what livelocked a compacted table in production, so fall
+        // back to the newest boundary strictly below the head instead.
         assert_eq!(
             super::full_read_prefix(&tasks, 85),
-            None,
-            "cut would be the head"
+            FullReadCut::Cut(20),
+            "falls back below the head commit rather than declining"
         );
 
         // A task with no attributable sequence cannot be ordered, so no cut is
@@ -4719,8 +4921,62 @@ mod tests {
         ];
         assert_eq!(
             super::full_read_prefix(&unattributed, 40),
-            None,
+            FullReadCut::NoSequence,
             "unknown sequence"
         );
+    }
+
+    /// A COMPACTED table is the case the old `None` return livelocked on: a
+    /// compaction rewrites every file with one sequence number, so the budget
+    /// always lands in the head commit and there is no boundary below it. That
+    /// is genuinely uncuttable — but it must be REPORTED, not returned as a bare
+    /// "declined", because an unbounded read over the novelty ceiling never
+    /// commits and so repeats on every poll.
+    #[test]
+    fn full_read_prefix_reports_a_single_commit_table() {
+        let one_commit = vec![t(7, 400_000), t(7, 400_000)];
+        assert_eq!(
+            super::full_read_prefix(&one_commit, 250_000),
+            super::FullReadCut::SingleCommit
+        );
+        assert!(
+            super::FullReadCut::SingleCommit.is_alarming(),
+            "an uncuttable full read must be shouted about, not swallowed"
+        );
+        // And the two healthy outcomes must NOT be, or the log fills with noise
+        // on every small read and the real signal is lost.
+        assert!(!super::FullReadCut::PlanFits.is_alarming());
+        assert!(!super::FullReadCut::Disabled.is_alarming());
+    }
+
+    /// The row budget has to fit under the novelty ceiling, because a pass that
+    /// cannot commit defers, and a deferral discards the window's progress. The
+    /// old flat 250_000 rows is ~27 MB of flakes: against the 8 MiB ceiling this
+    /// deployment pins, it could never commit, so the read repeated forever.
+    #[test]
+    fn the_row_budget_is_derived_to_fit_the_novelty_ceiling() {
+        const BYTES_PER_ROW: i64 = 108;
+        let eight_mib = 8 * 1024 * 1024;
+
+        let rows = super::rows_for_ceiling(eight_mib, BYTES_PER_ROW);
+        assert!(
+            rows * BYTES_PER_ROW <= eight_mib,
+            "a full pass must fit the ceiling it has to commit under: \
+             {rows} rows * {BYTES_PER_ROW}B > {eight_mib}B"
+        );
+        assert!(
+            rows < 250_000,
+            "the derived budget must be tighter than the flat 250_000 that could not commit"
+        );
+
+        // A generous ceiling derives a generous budget — the derivation tracks
+        // the ceiling rather than clamping to some other constant.
+        assert!(super::rows_for_ceiling(256 * 1024 * 1024, BYTES_PER_ROW) > rows);
+
+        // Floors: a tiny or nonsensical ceiling still makes forward progress
+        // rather than a zero-row pass that reads nothing and checkpoints nowhere.
+        assert_eq!(super::rows_for_ceiling(1, BYTES_PER_ROW), 1_000);
+        assert_eq!(super::rows_for_ceiling(eight_mib, 0), 1_000);
+        assert_eq!(super::rows_for_ceiling(eight_mib, -5), 1_000);
     }
 }
