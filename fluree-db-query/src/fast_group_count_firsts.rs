@@ -27,7 +27,7 @@ use fluree_db_binary_index::{
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{FlakeValue, GraphId, LedgerSnapshot, QueryCancellation, Sid};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -1074,8 +1074,13 @@ impl AggStateStar {
         }
     }
 
-    fn observe(&mut self, s_id: u64, want_min: bool, want_max: bool, want_sample: bool) {
-        self.count = self.count.saturating_add(1);
+    /// Fold one group-predicate row for subject `s_id`, joined against `mult`
+    /// filter-star rows (the product of the filter predicates' per-subject row
+    /// counts). SPARQL bag semantics: the join multiplies each group row by
+    /// `mult`, so COUNT adds `mult`; MIN/MAX/SAMPLE over `?s` are
+    /// duplicate-insensitive and ignore it.
+    fn observe(&mut self, s_id: u64, mult: u64, want_min: bool, want_max: bool, want_sample: bool) {
+        self.count = self.count.saturating_add(mult);
         if want_sample && self.sample_s.is_none() {
             self.sample_s = Some(s_id);
         }
@@ -1095,6 +1100,10 @@ impl AggStateStar {
 /// `GROUP BY ?o ORDER BY DESC(?count) LIMIT k`
 ///
 /// Optionally also computes MIN/MAX/SAMPLE on `?s`.
+///
+/// COUNT honors SPARQL bag semantics: each group-predicate row is multiplied
+/// by the product of the filter predicates' per-subject row counts (the star
+/// join's multiplicity), not merely gated on subject existence (#1652).
 pub struct GroupByObjectStarTopKOperator {
     group_pred: crate::ir::triple::Ref,
     filter_preds: Vec<crate::ir::triple::Ref>,
@@ -1163,6 +1172,9 @@ impl Operator for GroupByObjectStarTopKOperator {
             return Err(QueryError::OperatorAlreadyOpened);
         }
 
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        const SITE: &str = "group_by_object_star_topk";
+
         if allow_cursor_fast_path(ctx) {
             if let Some(store) = ctx.binary_store.as_ref() {
                 let Some(batch) = compute_group_by_object_star_topk(
@@ -1182,6 +1194,10 @@ impl Operator for GroupByObjectStarTopKOperator {
                 else {
                     // Fast-path unavailable under this execution context (e.g., overlay requires fallback).
                     // Fall through to the provided fallback operator.
+                    stamp_fast_path(
+                        SITE,
+                        FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+                    );
                     let Some(fallback) = &mut self.fallback else {
                         return Err(QueryError::Internal(
                             "group-by-object star topk fast-path unavailable and no fallback provided".into(),
@@ -1191,6 +1207,7 @@ impl Operator for GroupByObjectStarTopKOperator {
                     self.state = OperatorState::Open;
                     return Ok(());
                 };
+                stamp_fast_path(SITE, FastPathOutcome::Proceed);
                 self.result = Some(batch);
                 self.emitted = false;
                 self.fallback = None;
@@ -1199,6 +1216,10 @@ impl Operator for GroupByObjectStarTopKOperator {
             }
         }
 
+        stamp_fast_path(
+            SITE,
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+        );
         let Some(fallback) = &mut self.fallback else {
             return Err(QueryError::Internal(
                 "group-by-object star topk fast-path unavailable and no fallback provided".into(),
@@ -1240,13 +1261,19 @@ impl Operator for GroupByObjectStarTopKOperator {
     }
 }
 
-fn collect_subject_set_for_predicate_group(
+/// Stream one filter predicate's PSOT rows and fold them into a
+/// `subject -> multiplicity` map. With `restrict_to` set (the running product
+/// over earlier filter predicates), a subject survives only if present there,
+/// and its new multiplicity is `restrict_to[s] * row_count(s)` — the star
+/// join's bag multiplicity across filter predicates. Without it, the
+/// multiplicity is this predicate's row count alone.
+fn collect_subject_counts_for_predicate_group(
     store: &Arc<BinaryIndexStore>,
     ctx: &ExecutionContext<'_>,
     g_id: GraphId,
     pred: &crate::ir::triple::Ref,
-    restrict_to: Option<&FxHashSet<u64>>,
-) -> Result<Option<FxHashSet<u64>>> {
+    restrict_to: Option<&FxHashMap<u64, u64>>,
+) -> Result<Option<FxHashMap<u64, u64>>> {
     let overlay_has_rows = ctx
         .overlay
         .map(fluree_db_core::OverlayProvider::epoch)
@@ -1257,7 +1284,7 @@ fn collect_subject_set_for_predicate_group(
         return if overlay_has_rows {
             Ok(None)
         } else {
-            Ok(Some(FxHashSet::default()))
+            Ok(Some(FxHashMap::default()))
         };
     };
     let mut out = ColumnSet::EMPTY;
@@ -1272,8 +1299,19 @@ fn collect_subject_set_for_predicate_group(
         return Ok(None);
     };
 
-    let mut set: FxHashSet<u64> = FxHashSet::default();
-    let mut last_s: Option<u64> = None;
+    let mut map: FxHashMap<u64, u64> = FxHashMap::default();
+    let flush = |s: u64, n: u64, map: &mut FxHashMap<u64, u64>| match restrict_to {
+        Some(r) => {
+            if let Some(&m) = r.get(&s) {
+                map.insert(s, m.saturating_mul(n));
+            }
+        }
+        None => {
+            map.insert(s, n);
+        }
+    };
+    let mut cur_s: Option<u64> = None;
+    let mut cur_n: u64 = 0;
     while let Some(batch) = cursor
         .next_batch()
         .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
@@ -1281,19 +1319,21 @@ fn collect_subject_set_for_predicate_group(
         ctx.check_cancelled()?;
         for i in 0..batch.row_count {
             let s = batch.s_id.get(i);
-            if last_s == Some(s) {
-                continue;
-            }
-            last_s = Some(s);
-            if let Some(r) = restrict_to {
-                if !r.contains(&s) {
-                    continue;
+            if cur_s == Some(s) {
+                cur_n += 1;
+            } else {
+                if let Some(prev) = cur_s {
+                    flush(prev, cur_n, &mut map);
                 }
+                cur_s = Some(s);
+                cur_n = 1;
             }
-            set.insert(s);
         }
     }
-    Ok(Some(set))
+    if let Some(prev) = cur_s {
+        flush(prev, cur_n, &mut map);
+    }
+    Ok(Some(map))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1372,13 +1412,14 @@ fn compute_group_by_object_star_topk(
         let mut g_i: usize = 0;
         let mut f_batch: Option<ColumnBatch> = None;
         let mut f_i: usize = 0;
-        let mut f_last: Option<u64> = None;
 
-        let next_filter_subject = |fcur: &mut BinaryCursor,
-                                   f_batch: &mut Option<ColumnBatch>,
-                                   f_i: &mut usize,
-                                   f_last: &mut Option<u64>|
-         -> Result<Option<u64>> {
+        // Next `(subject, row_count)` group of the filter predicate. The whole
+        // run is consumed (across batch refills) before returning, so filter
+        // subjects arrive strictly increasing with their bag multiplicity.
+        let next_filter_group = |fcur: &mut BinaryCursor,
+                                 f_batch: &mut Option<ColumnBatch>,
+                                 f_i: &mut usize|
+         -> Result<Option<(u64, u64)>> {
             loop {
                 if f_batch.is_none() || *f_i >= f_batch.as_ref().unwrap().row_count {
                     ctx.check_cancelled()?;
@@ -1389,16 +1430,31 @@ fn compute_group_by_object_star_topk(
                     if f_batch.is_none() {
                         return Ok(None);
                     }
-                }
-                let b = f_batch.as_ref().unwrap();
-                let s = b.s_id.get(*f_i);
-                *f_i += 1;
-                if *f_last == Some(s) {
                     continue;
                 }
-                *f_last = Some(s);
-                return Ok(Some(s));
+                break;
             }
+            let s = f_batch.as_ref().unwrap().s_id.get(*f_i);
+            let mut n: u64 = 0;
+            loop {
+                let b = f_batch.as_ref().unwrap();
+                while *f_i < b.row_count && b.s_id.get(*f_i) == s {
+                    n += 1;
+                    *f_i += 1;
+                }
+                if *f_i < b.row_count {
+                    break; // group ended within this batch
+                }
+                ctx.check_cancelled()?;
+                *f_batch = fcur
+                    .next_batch()
+                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
+                *f_i = 0;
+                if f_batch.is_none() {
+                    break; // stream ended; group is complete
+                }
+            }
+            Ok(Some((s, n)))
         };
 
         let peek_group_subject = |cursor: &mut BinaryCursor,
@@ -1419,8 +1475,8 @@ fn compute_group_by_object_star_topk(
             Ok(Some(b.s_id.get(*g_i)))
         };
 
-        let mut fs = next_filter_subject(&mut fcur, &mut f_batch, &mut f_i, &mut f_last)?;
-        while let (Some(gs), Some(cur_fs)) =
+        let mut fs = next_filter_group(&mut fcur, &mut f_batch, &mut f_i)?;
+        while let (Some(gs), Some((cur_fs, f_mult))) =
             (peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?, fs)
         {
             match gs.cmp(&cur_fs) {
@@ -1437,7 +1493,7 @@ fn compute_group_by_object_star_topk(
                     }
                 }
                 Ordering::Greater => {
-                    fs = next_filter_subject(&mut fcur, &mut f_batch, &mut f_i, &mut f_last)?;
+                    fs = next_filter_group(&mut fcur, &mut f_batch, &mut f_i)?;
                 }
                 Ordering::Equal => {
                     let s = gs;
@@ -1454,40 +1510,43 @@ fn compute_group_by_object_star_topk(
                         };
                         aggs.entry(k).or_insert_with(AggStateStar::new).observe(
                             s,
+                            f_mult,
                             want_min,
                             want_max,
                             want_sample,
                         );
                         g_i += 1;
                     }
-                    fs = next_filter_subject(&mut fcur, &mut f_batch, &mut f_i, &mut f_last)?;
+                    fs = next_filter_group(&mut fcur, &mut f_batch, &mut f_i)?;
                 }
             }
         }
     } else {
-        // General path: build subject set S by intersecting filter predicates.
-        let mut s_set: Option<FxHashSet<u64>> = None;
+        // General path: fold the filter predicates into a subject -> bag
+        // multiplicity map (the product of per-subject row counts; a subject
+        // absent from any filter predicate drops out).
+        let mut s_counts: Option<FxHashMap<u64, u64>> = None;
         for p in filter_preds {
-            let Some(next) = collect_subject_set_for_predicate_group(
+            let Some(next) = collect_subject_counts_for_predicate_group(
                 store,
                 ctx,
                 g_id,
                 p,
-                s_set.as_ref().map(|s| s as &FxHashSet<u64>),
+                s_counts.as_ref().map(|s| s as &FxHashMap<u64, u64>),
             )?
             else {
                 return Ok(None);
             };
-            s_set = Some(next);
-            if s_set
+            s_counts = Some(next);
+            if s_counts
                 .as_ref()
-                .is_some_and(std::collections::HashSet::is_empty)
+                .is_some_and(std::collections::HashMap::is_empty)
             {
                 break;
             }
         }
-        let s_set = s_set.unwrap_or_default();
-        if s_set.is_empty() {
+        let s_counts = s_counts.unwrap_or_default();
+        if s_counts.is_empty() {
             return Ok(Some(crate::binding::Batch::empty(schema)?));
         }
 
@@ -1498,15 +1557,16 @@ fn compute_group_by_object_star_topk(
             ctx.check_cancelled()?;
             for i in 0..batch.row_count {
                 let s = batch.s_id.get(i);
-                if !s_set.contains(&s) {
+                let Some(&mult) = s_counts.get(&s) else {
                     continue;
-                }
+                };
                 let k = ObjGroupKey {
                     o_type: batch.o_type.get(i),
                     o_key: batch.o_key.get(i),
                 };
                 aggs.entry(k).or_insert_with(AggStateStar::new).observe(
                     s,
+                    mult,
                     want_min,
                     want_max,
                     want_sample,
