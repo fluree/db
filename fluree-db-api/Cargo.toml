@@ -223,6 +223,11 @@ path = "tests/it_count_datatype_pin.rs"
 name = "it_fastpath_1652_regression"
 path = "tests/it_fastpath_1652_regression.rs"
 
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_datetime_component_presence"
+path = "tests/it_datetime_component_presence.rs"
+
 # Own binary: asserts fast-path routing via process-scoped tracing capture.
 [[test]]
 name = "it_exists_semijoin_correlation"
