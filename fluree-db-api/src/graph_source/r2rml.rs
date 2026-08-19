@@ -331,7 +331,29 @@ fn materialize_max_rows_per_full_pass() -> i64 {
     })
 }
 
-/// Rows that fit under `ceiling_bytes` at `bytes_per_row`, floored at 1_000.
+/// Fraction of the novelty ceiling one full pass may spend.
+///
+/// A pass gets a QUARTER of the ceiling, not all of it, and the reason is a
+/// production failure rather than caution. Spending the whole ceiling makes the
+/// budget so large that it exceeds the table, `full_read_prefix` answers
+/// `PlanFits`, no prefix is taken, no cursor is written — and the pass then fails
+/// anyway in the APPLY, which is where novelty is actually spent. The bound has to
+/// ENGAGE to be worth anything, and a budget bigger than the table cannot engage.
+///
+/// Observed 2026-08-18: raising the ceiling 8 MiB -> 96 MiB took the budget to
+/// ~932k rows against a 733,608-row table, so the bound stopped firing entirely
+/// while two of four targets still could not absorb the window. Raising the
+/// ceiling had DISABLED the mechanism meant to chip away at it.
+///
+/// A quarter is also the honest share: the ceiling is per-ledger and 17 sources
+/// commit into it, so one table's pass laying claim to all of it was never right.
+/// It matches the per-transaction budget's own `reindexMaxBytes / 4` derivation,
+/// and it leaves margin for `flake_bytes_per_row` being an UNDER-estimate — it was
+/// measured per accumulated item, and a source row can yield several.
+const PASS_CEILING_FRACTION: i64 = 4;
+
+/// Rows that fit under a pass's share of `ceiling_bytes` at `bytes_per_row`,
+/// floored at 1_000.
 ///
 /// Split out from the env plumbing above so the arithmetic — the part that has
 /// to be right — is testable without touching process-global state.
@@ -339,7 +361,7 @@ fn rows_for_ceiling(ceiling_bytes: i64, bytes_per_row: i64) -> i64 {
     if bytes_per_row <= 0 {
         return 1_000;
     }
-    (ceiling_bytes / bytes_per_row).max(1_000)
+    ((ceiling_bytes / PASS_CEILING_FRACTION) / bytes_per_row).max(1_000)
 }
 
 /// The outcome of sizing a full read down to a commit prefix.
@@ -5112,6 +5134,47 @@ mod tests {
         assert_eq!(super::rows_for_ceiling(1, BYTES_PER_ROW), 1_000);
         assert_eq!(super::rows_for_ceiling(eight_mib, 0), 1_000);
         assert_eq!(super::rows_for_ceiling(eight_mib, -5), 1_000);
+
+        // A pass claims a QUARTER of the ceiling, not all of it — see
+        // PASS_CEILING_FRACTION for why spending the whole thing disables the bound.
+        assert_eq!(
+            rows,
+            (eight_mib / 4) / BYTES_PER_ROW,
+            "a pass must budget a quarter of the ceiling"
+        );
+    }
+
+    /// The regression for the way this failed IN PRODUCTION on 2026-08-18, which no
+    /// unit test would have caught because the arithmetic was individually correct.
+    ///
+    /// Raising the ceiling 8 MiB -> 96 MiB to make the window committable also took
+    /// the derived budget to ~932k rows against a 733,608-row table. The budget
+    /// exceeded the table, so `full_read_prefix` answered `PlanFits`, no prefix was
+    /// taken and no cursor was written — while two of four fan-out targets still
+    /// could not absorb the window and kept deferring. Raising the ceiling had
+    /// DISABLED the mechanism meant to drain it, and the watermark stayed frozen.
+    ///
+    /// So the property is not "the budget fits the ceiling" — it is "the budget is
+    /// small enough to ENGAGE on the table that livelocked".
+    #[test]
+    fn the_budget_still_engages_on_the_table_that_livelocked() {
+        const BYTES_PER_ROW: i64 = 108;
+        const OBSERVED_PLAN_ROWS: i64 = 733_608;
+        let ninety_six_mib = 96 * 1024 * 1024;
+
+        let budget = super::rows_for_ceiling(ninety_six_mib, BYTES_PER_ROW);
+        assert!(
+            budget < OBSERVED_PLAN_ROWS,
+            "the bound must still cut a {OBSERVED_PLAN_ROWS}-row plan at a 96 MiB \
+             ceiling, else no prefix is taken and no cursor is ever written: \
+             budget was {budget}"
+        );
+        // And it must still fit comfortably under the ceiling it has to commit
+        // beneath, or we are back to a bound that cannot commit.
+        assert!(budget * BYTES_PER_ROW <= ninety_six_mib / 4);
+        // Sanity: raising the ceiling still raises the budget. The fix is a
+        // fraction, not a cap that stops tracking the ceiling.
+        assert!(budget > super::rows_for_ceiling(8 * 1024 * 1024, BYTES_PER_ROW));
     }
 
     /// The cursor route exists because the snapshot route cannot work on the only
