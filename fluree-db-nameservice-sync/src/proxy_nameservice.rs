@@ -141,14 +141,24 @@ impl ProxyNameService {
 
 #[async_trait]
 impl fluree_db_nameservice::RefLookup for ProxyNameService {
+    /// The proxy endpoint serves whole records, so a single-ref read is a
+    /// projection of `lookup` — still one HTTP round trip.
     async fn get_ref(
         &self,
-        _ledger_id: &str,
-        _kind: fluree_db_nameservice::RefKind,
+        ledger_id: &str,
+        kind: fluree_db_nameservice::RefKind,
     ) -> Result<Option<fluree_db_nameservice::RefValue>> {
-        Err(NameServiceError::storage(
-            "get_ref not supported in proxy mode".to_string(),
-        ))
+        use fluree_db_nameservice::{NameServiceLookup, RefKind, RefValue};
+        Ok(self.lookup(ledger_id).await?.map(|r| match kind {
+            RefKind::CommitHead => RefValue {
+                id: r.commit_head_id,
+                t: r.commit_t,
+            },
+            RefKind::IndexHead => RefValue {
+                id: r.index_head_id,
+                t: r.index_t,
+            },
+        }))
     }
 }
 
@@ -212,6 +222,13 @@ impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
                 "Nameservice proxy unexpected status {status} for {ledger_id}"
             ))),
         }
+    }
+
+    async fn heads(&self, ledger_id: &str) -> Result<Option<fluree_db_nameservice::LedgerHeads>> {
+        Ok(self
+            .lookup(ledger_id)
+            .await?
+            .map(|r| fluree_db_nameservice::LedgerHeads::from_record(&r)))
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {

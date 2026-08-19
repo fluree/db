@@ -24,15 +24,16 @@
 //! - A database with transactions
 
 use crate::ns_format::{
-    ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
+    merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
+    NS_VERSION,
 };
 use crate::{
     check_cas_expectation, deserialize_json, parse_default_context_value, ref_values_match,
     serialize_json, AdminPublisher, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError, NsLookupResult, NsRecord,
-    RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
-    StatusPublisher, StatusValue,
+    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceError,
+    NsLookupResult, NsRecord, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
+    StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::ledger_id::{format_ledger_id, normalize_ledger_id, split_ledger_id};
@@ -349,6 +350,26 @@ impl FileNameService {
         Ok(Some(record))
     }
 
+    /// Head pointers only: same files and merge rule as `load_record`, minus
+    /// the config/context/status fields.
+    async fn load_heads(&self, ledger_name: &str, branch: &str) -> Result<Option<LedgerHeads>> {
+        use fluree_db_core::StorageRead;
+        let main_address = Self::ns_address(ledger_name, branch);
+        let main_bytes = match self.storage.read_bytes(&main_address).await {
+            Ok(bytes) => bytes,
+            Err(fluree_db_core::Error::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(NameServiceError::from(e)),
+        };
+        if Self::is_graph_source_from_bytes(&main_bytes) {
+            return Ok(None);
+        }
+        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let index_file: Option<NsIndexFileV2> = self
+            .read_json_from_address(&Self::index_address(ledger_name, branch))
+            .await?;
+        Ok(Some(merge_heads(&main, index_file.as_ref())))
+    }
+
     /// Check if a record file is a graph source record (based on @type).
     /// Matches "f:IndexSource"/"f:MappedSource" compact prefixes and full IRIs.
     async fn is_graph_source_record(&self, name: &str, branch: &str) -> Result<bool> {
@@ -462,6 +483,11 @@ impl crate::NameServiceLookup for FileNameService {
         // A graph-source record is not a ledger (#1369). `load_record` reports it
         // as Ok(None) so the caller can fall back to the graph-source path.
         self.load_record(&ledger_name, &branch).await
+    }
+
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        self.load_heads(&ledger_name, &branch).await
     }
 
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
@@ -2321,6 +2347,50 @@ mod tests {
             .unwrap();
         assert_eq!(index.id, Some(index_cid));
         assert_eq!(index.t, 3);
+    }
+
+    #[tokio::test]
+    async fn test_file_heads_unknown_and_graph_source() {
+        let (_dir, ns) = setup().await;
+        assert_eq!(ns.heads("nonexistent:main").await.unwrap(), None);
+
+        ns.publish_graph_source("search", "main", GraphSourceType::Bm25, "{}", &[])
+            .await
+            .unwrap();
+        assert_eq!(ns.heads("search:main").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_file_heads_matches_lookup() {
+        let (_dir, ns) = setup().await;
+        let commit_cid = test_cid("commit-1");
+        let index_cid = ContentId::new(ContentKind::IndexRoot, b"index-1");
+        ns.publish_commit("mydb:main", 5, &commit_cid)
+            .await
+            .unwrap();
+
+        // Commit only: index unborn.
+        let heads = ns.heads("mydb:main").await.unwrap().unwrap();
+        assert_eq!(
+            heads.commit,
+            RefValue {
+                id: Some(commit_cid.clone()),
+                t: 5
+            }
+        );
+        assert_eq!(heads.index, RefValue { id: None, t: 0 });
+
+        // Separate index file merges in; heads agrees with lookup and get_ref.
+        ns.publish_index("mydb:main", 3, &index_cid).await.unwrap();
+        let heads = ns.heads("mydb:main").await.unwrap().unwrap();
+        let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+        assert_eq!(heads, LedgerHeads::from_record(&record));
+        assert_eq!(
+            Some(heads.index.clone()),
+            ns.get_ref("mydb:main", RefKind::IndexHead).await.unwrap()
+        );
+        assert_eq!(heads.index.id, Some(index_cid));
+        assert_eq!(crate::NsRecordSnapshot::from(&heads).index_t, 3);
     }
 
     // =========================================================================

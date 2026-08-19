@@ -6,7 +6,8 @@
 //! so they are defined once here to ensure consistency.
 
 use crate::{
-    is_zero, parse_default_context_value, ConfigPayload, ConfigValue, StatusPayload, StatusValue,
+    is_zero, parse_default_context_value, ConfigPayload, ConfigValue, LedgerHeads, RefValue,
+    StatusPayload, StatusValue,
 };
 use fluree_db_core::ContentId;
 use serde::{Deserialize, Serialize};
@@ -172,6 +173,32 @@ impl NsFileV2 {
             cid: Some(id.to_string()),
             t: snapshot.index_t,
         });
+    }
+}
+
+/// Head pointers from a main ns@v2 file plus its optional index-only file,
+/// using the read-time merge rule shared by `load_record`: the separate
+/// index file wins when its `t` is equal or higher.
+pub(crate) fn merge_heads(main: &NsFileV2, index_file: Option<&NsIndexFileV2>) -> LedgerHeads {
+    let parse = |s: Option<&str>| s.and_then(|s| s.parse::<ContentId>().ok());
+    let mut index = RefValue {
+        id: parse(main.index.as_ref().and_then(|i| i.cid.as_deref())),
+        t: main.index.as_ref().map(|i| i.t).unwrap_or(0),
+    };
+    if let Some(f) = index_file {
+        if f.index.t >= index.t {
+            index = RefValue {
+                id: parse(f.index.cid.as_deref()),
+                t: f.index.t,
+            };
+        }
+    }
+    LedgerHeads {
+        commit: RefValue {
+            id: parse(main.commit_cid.as_deref()),
+            t: main.t,
+        },
+        index,
     }
 }
 
