@@ -777,26 +777,32 @@ impl Fluree {
         // After the data commits, never before: a crash in the gap re-applies the
         // window, which is idempotent, whereas a marker written first would skip rows
         // that were never committed. Same argument as the watermark, one target down.
+        //
+        // Non-fatal, exactly as the marker READ above is, and for the same reason: a
+        // marker that fails to land costs one redundant re-apply on the next poll and
+        // nothing else, so it must not be able to fail the pass.
+        //
+        // Here it would cost more than the pass. This write sits BETWEEN the target
+        // loop and the failed/deferred returns, so propagating its error would surface
+        // a state-ledger error INSTEAD of `MaterializePartial { tally, detail }` —
+        // discarding the per-target tally and the identity of the target that actually
+        // failed. And the condition most likely to fail this write is the one this
+        // module most needs to report: at ENOSPC, the incident these markers exist to
+        // prevent, every state-ledger write fails, so an operator would get a bare disk
+        // error where the useful signal is "target X failed: No space left on device".
         if !newly_applied.is_empty() && !table_watermarks.is_empty() {
-            let nodes: Vec<JsonValue> = newly_applied
-                .iter()
-                .flat_map(|target| {
-                    table_watermarks.iter().map(move |(table, _from, to)| {
-                        applied_node(source_graph_source_id, target, table, *to)
-                    })
-                })
-                .collect();
-            let state = self.materialize_state_ledger().await?;
-            // Through the backpressure helper for the same reason the watermark write
-            // is: giving up here on a transient novelty condition would discard the
-            // knowledge of a window that DID commit, and the next poll would rewrite it.
-            self.transact_chunks_with_backpressure(
-                state,
-                vec![nodes],
-                |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
-                ChunkVerb::Upsert,
-            )
-            .await?;
+            if let Err(e) = self
+                .write_applied_markers(source_graph_source_id, &newly_applied, &table_watermarks)
+                .await
+            {
+                warn!(
+                    source = %source_graph_source_id,
+                    targets = newly_applied.len(),
+                    error = %e,
+                    "materialize: could not record applied markers; \
+                     those targets will be re-applied next poll"
+                );
+            }
         }
 
         // The watermark is still SHARED across targets (per-target watermarks are the
@@ -916,6 +922,15 @@ impl Fluree {
     /// An empty map is the correct answer for a state ledger written before this
     /// existed, and it makes the first poll behave exactly as it did before: nothing
     /// is skipped, everything is applied, and the markers are written on the way out.
+    ///
+    /// GROWTH. This set is unbounded in a way the watermark deliberately is not. The
+    /// watermark is keyed on the target SPEC, so a templated job keeps one row per
+    /// source table no matter how wide it fans; a marker is keyed on the RESOLVED
+    /// ledger, so the set grows with the fan-out and every poll reads all of it.
+    /// Nothing evicts a marker when a target ledger is retired, so a job that cycles
+    /// through `(tenant, user)` pairs accumulates rows it will never read usefully
+    /// again. Immaterial at the 23 targets this was built for; revisit before a fan-out
+    /// large enough that the per-poll read is a cost of its own.
     async fn materialize_applied_markers(
         &self,
         state_ledger_id: &str,
@@ -978,6 +993,39 @@ impl Fluree {
             }
         }
         Ok(out)
+    }
+
+    /// Record that `targets` have fully applied this window, one marker per
+    /// (source, resolved target, table).
+    ///
+    /// Errors are the caller's to swallow — see the call site for why this must not
+    /// fail a pass.
+    async fn write_applied_markers(
+        &self,
+        source_graph_source_id: &str,
+        targets: &[String],
+        table_watermarks: &[(String, Option<i64>, i64)],
+    ) -> Result<()> {
+        let nodes: Vec<JsonValue> = targets
+            .iter()
+            .flat_map(|target| {
+                table_watermarks.iter().map(move |(table, _from, to)| {
+                    applied_node(source_graph_source_id, target, table, *to)
+                })
+            })
+            .collect();
+        let state = self.materialize_state_ledger().await?;
+        // Through the backpressure helper for the same reason the watermark write is:
+        // giving up on a transient novelty condition would discard the knowledge of a
+        // window that DID commit, and the next poll would rewrite it.
+        self.transact_chunks_with_backpressure(
+            state,
+            vec![nodes],
+            |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+            ChunkVerb::Upsert,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Open the shared materialization-state ledger, creating it if absent.
