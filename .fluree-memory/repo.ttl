@@ -2045,6 +2045,20 @@ mem:fact-01kwsmdy5pms38yy81d0bdxprb a mem:Fact ;
     mem:branch "feature/merge-preview-changes" ;
     mem:createdAt "2026-07-05T17:15:17.046896+00:00"^^xsd:dateTime .
 
+mem:fact-01m0cs8ax1gv4kedajb8ff9yj2 a mem:Fact ;
+    mem:content "NameServiceLookup has three read depths, all backend-agnostic: get_ref(id, RefKind) → RefValue (one head; Dynamo = 1 GetItem, file = main JSON only), heads(id) → LedgerHeads{commit,index} (Dynamo = 1 projected Query over sk BETWEEN head AND index; file/S3 = main+index file via ns_format::merge_heads; Raft/Memory = 1 lock), lookup(id) → full NsRecord (4 Dynamo items + config/context parsing). Use the shallowest that answers the question. `None` from get_ref/heads = unknown, and on Raft also retracted (tombstone); only lookup surfaces retracted:true. LedgerHeads converts into NsRecordSnapshot for rollback capture." ;
+    mem:tag "api" ;
+    mem:tag "dynamodb" ;
+    mem:tag "nameservice" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-nameservice/src/lib.rs" ;
+    mem:artifactRef "fluree-db-nameservice/src/ns_format.rs" ;
+    mem:artifactRef "fluree-db-storage-aws/src/dynamodb/mod.rs" ;
+    mem:branch "feature/nameservice-heads-read" ;
+    mem:createdAt "2026-08-19T10:32:16.033424+00:00"^^xsd:dateTime ;
+    mem:rationale "External callers (Lambda query backend etc.) asked for the cheapest head read; the answer is the existing trait, not a new type or HTTP endpoint." .
+
 mem:decision-01kx0v325fhgme9a3yfn7cjqtq a mem:Decision ;
     mem:content "Policy condition unification (user-decided 2026-07): state graph IRIs are f:preState/f:postState (NOT f:pre/f:post); every f:query condition is an ASK contract regardless of language — JSON-LD gains the existing `{\"ask\": ...}` query form as preferred spelling (parse/mod.rs already parses ask; policy parser must accept it), SPARQL ASK/SELECT as-is, Cypher reserved via f:cypher datatype (read-only MATCH, ≥1 row = allow, $this/$identity/$value as native Cypher parameters). Per-policy f:queryState selector = whole-condition state switch for graph-less languages; SPARQL GRAPH f:postState for in-query mixing. Design doc: docs/design/policy-condition-languages.md." ;
     mem:tag "ask" ;
