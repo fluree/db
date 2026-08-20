@@ -612,6 +612,16 @@ impl fluree_db_nameservice::NameServiceLookup for NameServiceMode {
     > {
         self.reader().all_records().await
     }
+
+    async fn heads(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<
+        Option<fluree_db_nameservice::LedgerHeads>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().heads(ledger_id).await
+    }
 }
 
 // No `BranchLifecycle` impl for `NameServiceMode`: read-only modes can't
