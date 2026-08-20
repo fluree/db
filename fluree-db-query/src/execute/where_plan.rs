@@ -1865,6 +1865,16 @@ fn inline_singleton_values_objects(patterns: &[Pattern]) -> Option<Vec<Pattern>>
         }
     }
 
+    // Coupled with the order-sensitive classification in
+    // `planner::reorder_patterns` (see its `order_sensitive` match): a
+    // variable-free FILTER and a `BIND(BNODE(..))` are ordered against
+    // everything their predecessors produce, yet both are inner-join members
+    // here. Folding is safe for them today because the rewrite REPLACES ONLY
+    // triple objects and keeps every pattern — the retained one-row VALUES goes
+    // on producing its variable, so no preceding-produced set shrinks. A new
+    // order-sensitive classification that is also an inner-join member would
+    // break that, which `fold_survives_a_variable_free_filter_in_its_region`
+    // pins.
     let is_inner_join_member = |p: &Pattern| {
         matches!(
             p,
@@ -3769,6 +3779,64 @@ mod tests {
             object_terms(inner),
             vec![Term::Var(VarId(1))],
             "the MINUS group keeps sharing the variable"
+        );
+    }
+
+    /// A variable-free FILTER sits in the fold's region while
+    /// `planner::reorder_patterns` treats it as order-sensitive, ordering it
+    /// against everything produced before it. The fold must keep firing (it is
+    /// a row-independent predicate, so nothing about it depends on the object
+    /// term) AND must leave the VALUES pattern in place — the retained VALUES
+    /// is the whole reason the coupling is benign, because it goes on producing
+    /// the variable that the ordering set is built from.
+    ///
+    /// If a future order-sensitive classification is added that IS an
+    /// inner-join member, this pin is the one that should be revisited: see the
+    /// comment on `is_inner_join_member`.
+    #[test]
+    fn fold_survives_a_variable_free_filter_in_its_region() {
+        use crate::binding::Binding;
+        use crate::ir::Expression;
+        use fluree_db_core::FlakeValue;
+
+        // `FILTER(true)` references no variable, so `reorder_patterns` marks it
+        // order-sensitive and pins it against its predecessors' produced vars.
+        let variable_free_filter = Pattern::Filter(Expression::Const(FlakeValue::Boolean(true)));
+        assert!(
+            variable_free_filter.referenced_vars().is_empty(),
+            "the pinned coupling only applies to a FILTER with no variables"
+        );
+
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "brian"))]],
+            },
+            variable_free_filter,
+            Pattern::Triple(make_pattern(VarId(0), "friend", VarId(1))),
+        ];
+
+        let rewritten = inline_singleton_values_objects(&patterns)
+            .expect("a variable-free FILTER must not block the fold");
+        assert_eq!(
+            object_terms(&rewritten),
+            vec![Term::Sid(Sid::new(13, "brian"))],
+            "the triple still folds across the filter"
+        );
+        assert_eq!(
+            rewritten.len(),
+            patterns.len(),
+            "the rewrite replaces triple objects only; it never drops a pattern"
+        );
+        assert!(
+            matches!(&rewritten[0], Pattern::Values { vars, rows }
+                if vars == &[VarId(1)] && rows.len() == 1),
+            "the VALUES must survive: it keeps producing the variable that the \
+             order-sensitive FILTER is ordered against"
+        );
+        assert!(
+            matches!(&rewritten[1], Pattern::Filter(_)),
+            "the FILTER must survive in place"
         );
     }
 
