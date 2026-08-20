@@ -21,6 +21,7 @@ pub mod insert;
 pub mod list;
 pub mod load;
 pub mod log;
+pub mod manifest;
 /// `fluree materialize` — build a native twin from a virtual graph source.
 /// The module self-gates on the `iceberg` feature (empty without it).
 pub mod materialize;
@@ -35,6 +36,7 @@ pub mod remote;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod show;
+pub mod sweep;
 pub mod sync;
 pub mod token;
 pub mod track;

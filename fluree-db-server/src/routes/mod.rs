@@ -81,6 +81,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/create", post(ledger::create))
         .route("/drop", post(ledger::drop))
         .route("/reindex", post(ledger::reindex))
+        // Reclaims index artifacts no index chain references. Deletes storage
+        // and holds the ledger against indexing, so it is admin-gated and
+        // runs where the indexer does.
+        .route("/sweep", post(ledger::sweep))
+        .route("/sweep/plan", post(ledger::sweep_plan))
         .route("/branch", post(ledger::create_branch))
         .route("/drop-branch", post(ledger::drop_branch))
         .route("/drop-graph", post(ledger::drop_named_graph))
@@ -107,8 +112,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         );
 
     #[cfg(feature = "iceberg")]
-    let v1_admin_protected_writes =
-        v1_admin_protected_writes.route("/iceberg/map", post(iceberg::iceberg_map));
+    let v1_admin_protected_writes = v1_admin_protected_writes
+        .route("/iceberg/map", post(iceberg::iceberg_map))
+        .route("/iceberg/materialize", post(iceberg::iceberg_materialize))
+        .route("/iceberg/track", post(iceberg::iceberg_track))
+        .route("/iceberg/untrack", post(iceberg::iceberg_untrack));
 
     // Admin auth runs BEFORE leader-forward. Axum runs the
     // last-applied layer outermost, so `require_admin_token`
@@ -170,6 +178,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/iceberg/r2rml/validate",
             post(iceberg::iceberg_r2rml_validate),
         );
+    // Materialization tracking-worker status — reads this node's worker state.
+    #[cfg(feature = "iceberg")]
+    let v1_admin_protected_reads =
+        v1_admin_protected_reads.route("/iceberg/tracking", get(iceberg::iceberg_tracking_status));
 
     let v1_admin_protected_reads = v1_admin_protected_reads
         .layer(middleware::from_fn_with_state(

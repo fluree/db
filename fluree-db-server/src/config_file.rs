@@ -66,6 +66,10 @@ pub struct ServerFileConfig {
     pub cache_max_mb: Option<usize>,
     pub disk_cache_max_mb: Option<usize>,
 
+    /// Colon-separated absolute directories under which catalog-less Iceberg
+    /// tables may be read from the local filesystem. Absent disables them.
+    pub iceberg_local_roots: Option<String>,
+
     /// `[server.query_refresh]`
     #[serde(default)]
     pub query_refresh: Option<QueryRefreshFileConfig>,
@@ -426,6 +430,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "query_refresh_ttl_ms",
     "cache_max_mb",
     "disk_cache_max_mb",
+    "iceberg_local_roots",
     "indexing_enabled",
     "bm25_auto_sync",
     "reindex_min_bytes",
@@ -550,6 +555,11 @@ pub fn apply_to_server_config(
     if is_default("disk_cache_max_mb") {
         if let Some(v) = file.disk_cache_max_mb {
             config.disk_cache_max_mb = Some(v);
+        }
+    }
+    if is_default("iceberg_local_roots") {
+        if let Some(ref v) = file.iceberg_local_roots {
+            config.iceberg_local_roots = Some(v.clone());
         }
     }
 

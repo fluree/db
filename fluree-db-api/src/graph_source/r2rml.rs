@@ -21,14 +21,17 @@ use fluree_db_iceberg::{
         LoadTableResponse, RestCatalogClient, RestCatalogConfig, SendCatalogClient, TableIdentifier,
     },
     config::IoConfig,
-    io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
+    io::{
+        ColumnBatch, FileIcebergStorage, IcebergStorageBackend, S3IcebergStorage,
+        SendIcebergStorage, SendParquetReader,
+    },
     metadata::TableMetadata,
     scan::{
         topk::{batch_sort_values, plan_topk_read, TopKBound},
         ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
     },
     stats::{aggregate_column_stats, send_read_snapshot_data_files},
-    IcebergGsConfig,
+    DeleteConvention, IcebergGsConfig,
 };
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
@@ -148,6 +151,118 @@ fn int_pushdown_literal(
             scale: 0,
         }),
         _ => Some(LiteralValue::Int64(n)),
+    }
+}
+
+/// One materialize scan: what to read, how it was chosen, and how stale the window is.
+///
+/// A struct rather than a tuple because `window_age_ms` is easy to drop silently
+/// from a positional return, and dropping it reintroduces the watermark-staleness
+/// failure it exists to prevent.
+pub struct MaterializeScan {
+    /// The source's current snapshot — the new watermark to persist. `None` when
+    /// the table has no snapshots at all (nothing to materialize).
+    pub to_snapshot_id: Option<i64>,
+    /// Whether an added-files scan was used, rather than a full read.
+    pub incremental: bool,
+    /// Wall-clock span of the window, from Iceberg snapshot timestamps: how far the
+    /// stored watermark now lags the current snapshot. `None` on a first run (no
+    /// stored watermark) or when the stored snapshot is no longer resolvable —
+    /// both of which mean "persist regardless".
+    pub window_age_ms: Option<i64>,
+    /// Column batches, streamed. See [`Self::stream`] usage notes on the method.
+    pub stream: ColumnBatchStream,
+}
+
+/// Why a materialize poll reads added files only, or re-reads the whole table.
+///
+/// This type exists because the decision used to be one expression:
+///
+/// ```ignore
+/// let incremental = from_snapshot_id.is_some()
+///     && metadata.window_is_incremental_safe(from, to).unwrap_or(false);
+/// ```
+///
+/// `unwrap_or(false)` collapses three different situations into one boolean and
+/// discards the error that distinguishes them. That matters more than it looks,
+/// because the two branches are not comparable in cost: an added-files scan
+/// reads what changed, while the fallback reads the **entire table** into
+/// `Vec<ColumnBatch>` in memory. So a swallowed error silently escalates a
+/// few-MB read into an unbounded one.
+///
+/// It cost us a production outage. A source table's snapshot retention expired
+/// the stored watermark, every poll took the fallback, and on a 728,876-row
+/// table the process reached 21.4 GiB of anonymous memory and was OOMKilled
+/// every 8–17 minutes. **Not one log line said a full read had been chosen, let
+/// alone why** — the two branches were indistinguishable from outside, so the
+/// symptom presented as "Fluree uses all the memory" and took days to trace.
+///
+/// The distinction the boolean threw away is the whole diagnosis:
+///
+/// - [`FullUnsafeWindow`](Self::FullUnsafeWindow) is **correct and routine**. An
+///   `overwrite`/`delete` carries row-level changes an added-files scan cannot
+///   see, so a full read is the right answer, not a degradation.
+/// - [`FullUndeterminable`](Self::FullUndeterminable) is **a configuration
+///   problem to fix**. Retention is shorter than the poll interval, or the job
+///   was stopped for longer than retention. A full read still produces correct
+///   data, so this deliberately does not fail — but it must be visible, because
+///   left alone it repeats every poll forever and never self-heals.
+///
+/// Both used to log nothing. Now they log differently, which is the fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanChoice {
+    /// Window is `append`/`replace`-only: an added-files scan sees every change.
+    Incremental,
+    /// No stored watermark — first materialization of this source. Expected once
+    /// per source, and a full read is the only option.
+    FullInitial,
+    /// The window genuinely contains `overwrite`/`delete`. Full read is correct.
+    FullUnsafeWindow,
+    /// Safety could not be determined: the watermark snapshot is expired,
+    /// unknown, or not an ancestor of the current one. Carries the underlying
+    /// reason so the log says which.
+    FullUndeterminable(String),
+}
+
+impl ScanChoice {
+    fn decide(metadata: &TableMetadata, from: Option<i64>, to: i64) -> Self {
+        // A missing watermark is not a failure to classify — it is a first run.
+        // Kept separate from the error case so "expected once" and "someone
+        // should look at this" never share a log line.
+        if from.is_none() {
+            return Self::FullInitial;
+        }
+        match metadata.window_is_incremental_safe(from, to) {
+            Ok(true) => Self::Incremental,
+            Ok(false) => Self::FullUnsafeWindow,
+            Err(e) => Self::FullUndeterminable(e.to_string()),
+        }
+    }
+
+    fn is_incremental(&self) -> bool {
+        matches!(self, Self::Incremental)
+    }
+}
+
+/// Field ids to project for `projection` against `schema`: every non-nested
+/// field when `projection` is empty, else the named columns that exist in the
+/// schema (unknown names are skipped — the consumer treats them as absent).
+fn projected_field_ids(
+    schema: &fluree_db_iceberg::metadata::Schema,
+    projection: &[String],
+) -> Vec<i32> {
+    if projection.is_empty() {
+        schema
+            .fields
+            .iter()
+            .filter(|f| !f.is_nested())
+            .map(|f| f.id)
+            .collect()
+    } else {
+        projection
+            .iter()
+            .filter_map(|col| schema.field_by_name(col).map(|f| f.id))
+            .collect()
     }
 }
 
@@ -666,6 +781,608 @@ impl<'a> FlureeR2rmlProvider<'a> {
             session: std::sync::Arc::new(super::catalog_session::IcebergCatalogSession::default()),
         }
     }
+
+    /// Resolve a graph source's storage backend, parsed table metadata, and
+    /// metadata-location — the shared setup behind both full and incremental
+    /// scans (REST/Direct × GCS/S3 × credentials × caching).
+    ///
+    /// TODO(dedup): `scan_table` still inlines this same setup + the
+    /// `read_scan_tasks` read loop; once the incremental path is verified,
+    /// refactor `scan_table` to call these helpers and drop the duplication.
+    async fn prepare_iceberg_scan(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<(Arc<IcebergStorageBackend>, Arc<TableMetadata>, String)> {
+        // Look up the graph source record to get Iceberg connection info
+        let record = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .ok_or_else(|| {
+                QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
+            })?;
+
+        let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
+            QueryError::Internal(format!(
+                "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
+            ))
+        })?;
+        iceberg_config.validate().map_err(|e| {
+            QueryError::InvalidQuery(format!(
+                "Invalid Iceberg graph source config for '{graph_source_id}': {e}"
+            ))
+        })?;
+
+        use fluree_db_iceberg::catalog::parse_table_identifier;
+        use fluree_db_iceberg::config::CatalogConfig;
+        use fluree_db_iceberg::SendDirectCatalogClient;
+
+        let table_id = if !table_name.is_empty() {
+            parse_table_identifier(table_name).map_err(|e| {
+                QueryError::Internal(format!(
+                    "Failed to parse table identifier '{table_name}': {e}"
+                ))
+            })?
+        } else {
+            iceberg_config.table_identifier().map_err(|e| {
+                QueryError::Internal(format!("Failed to parse table identifier: {e}"))
+            })?
+        };
+
+        // The effective Direct table location, captured for the relocated-table
+        // remap inference below (None for REST).
+        let mut direct_location: Option<String> = None;
+        let (load_response, storage) = match &iceberg_config.catalog {
+            CatalogConfig::Rest {
+                uri,
+                warehouse,
+                auth,
+                ..
+            } => {
+                let auth_provider = auth.create_provider_arc().map_err(|e| {
+                    QueryError::Internal(format!("Failed to create auth provider: {e}"))
+                })?;
+                let catalog_config = RestCatalogConfig {
+                    uri: uri.clone(),
+                    warehouse: warehouse.clone(),
+                    ..Default::default()
+                };
+                let catalog =
+                    RestCatalogClient::new(catalog_config, auth_provider).map_err(|e| {
+                        QueryError::Internal(format!("Failed to create catalog client: {e}"))
+                    })?;
+                let load_response = catalog
+                    .load_table(&table_id, iceberg_config.io.vended_credentials)
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to load table from catalog: {e}"))
+                    })?;
+                // GCS-backed tables read through this same S3 SDK path; the
+                // client is pinned to HTTP/1.1 (see `S3IcebergStorage`). Vended
+                // creds win, with the io config as fallback for region/endpoint/
+                // path-style.
+                let storage = if let Some(ref credentials) = load_response.credentials {
+                    S3IcebergStorage::from_vended_credentials(
+                        credentials,
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?
+                } else {
+                    S3IcebergStorage::from_default_chain(
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?
+                };
+                (load_response, Arc::new(IcebergStorageBackend::S3(storage)))
+            }
+            CatalogConfig::Direct { table_location } => {
+                // Warehouse-root resolution — the same step the query path
+                // (`load_table_context`) performs: when `table_location` is a
+                // catalog-less multi-table ROOT, resolve THIS table's own
+                // directory beneath it. Without this, pin resolution
+                // (`current_snapshot_id`) and materialize scans read
+                // `{root}/metadata/` and fail on any multi-table copy the
+                // query path handles fine.
+                //
+                // A location whose leaf directory is NAMED AFTER the table
+                // returns unchanged (that is the classifier — not "is this one
+                // table"), so those sources are byte-identical. A single-table
+                // location whose directory is named something else is treated
+                // as a root here, exactly as the query path has always treated
+                // it, so nothing that queries successfully today changes.
+                let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
+                    graph_source_id,
+                    &table_id.namespace,
+                    &table_id.table,
+                );
+                let effective_location = self
+                    .resolve_direct_table_location(
+                        table_location,
+                        &table_id,
+                        &lt_key,
+                        &iceberg_config,
+                    )
+                    .await?;
+                let table_location = &effective_location;
+                // The RESOLVED table dir is what the relocation remap compares
+                // against the metadata's own `location` — a warehouse root would
+                // never match it. Mirrors the query path's ordering.
+                direct_location = Some(effective_location.clone());
+
+                // Storage through the session, which dispatches on the location
+                // scheme (a `file://` / absolute-path table reads the filesystem
+                // directly, skipping the S3 client build and its credential-chain
+                // resolution). Going through the session rather than building a
+                // client here means the warehouse-root branch above — which
+                // already built one to LIST the root — hands its client over
+                // instead of having it constructed and discarded.
+                let storage = direct_session_storage(
+                    &self.session,
+                    &lt_key,
+                    table_location,
+                    iceberg_config.io.s3_region.as_deref(),
+                    iceberg_config.io.s3_endpoint.as_deref(),
+                    iceberg_config.io.s3_path_style,
+                )
+                .await?;
+                let cache = self.fluree.r2rml_cache();
+                let load_response = if let Some(metadata_location) =
+                    cache.get_direct_metadata_location(table_location).await
+                {
+                    fluree_db_iceberg::catalog::LoadTableResponse {
+                        metadata_location,
+                        config: std::collections::HashMap::default(),
+                        credentials: None,
+                        metadata: None,
+                    }
+                } else {
+                    let direct_catalog =
+                        SendDirectCatalogClient::new(table_location.clone(), Arc::clone(&storage));
+                    let load_response =
+                        direct_catalog
+                            .load_table(&table_id, false)
+                            .await
+                            .map_err(|e| {
+                                QueryError::Internal(format!(
+                                    "Failed to resolve table metadata from {table_location}: {e}"
+                                ))
+                            })?;
+                    cache
+                        .put_direct_metadata_location(
+                            table_location.clone(),
+                            load_response.metadata_location.clone(),
+                        )
+                        .await;
+                    load_response
+                };
+                (load_response, storage)
+            }
+        };
+
+        let cache = self.fluree.r2rml_cache();
+        let metadata_location = load_response.metadata_location.clone();
+        let metadata = if let Some(cached) = cache.get_metadata(&metadata_location).await {
+            cached
+        } else {
+            let metadata_bytes = storage
+                .as_ref()
+                .read(&metadata_location)
+                .await
+                .map_err(|e| QueryError::Internal(format!("Failed to read table metadata: {e}")))?;
+            let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
+                QueryError::Internal(format!("Failed to parse table metadata: {e}"))
+            })?;
+            let metadata = Arc::new(parsed);
+            cache
+                .put_metadata(metadata_location.clone(), Arc::clone(&metadata))
+                .await;
+            metadata
+        };
+
+        // Relocated local table (copied/moved after writing): remap manifest
+        // file references from the metadata's declared root to the configured
+        // location. No-op for REST, S3, and locally-written tables.
+        let storage = remap_local_storage(storage, &metadata, direct_location.as_deref());
+
+        Ok((storage, metadata, metadata_location))
+    }
+
+    /// Stream a set of scan tasks as column batches, with bounded parallelism.
+    ///
+    /// Only `O(iceberg_scan_concurrency)` file decodes are resident at a time, so a
+    /// consumer that processes and drops each batch never holds the whole table.
+    /// This is the shared core of both [`Self::read_scan_tasks`] (which collects)
+    /// and [`Self::scan_for_materialize_stream`] (which does not).
+    fn stream_scan_tasks(
+        &self,
+        storage: &Arc<IcebergStorageBackend>,
+        tasks: Vec<FileScanTask>,
+    ) -> ColumnBatchStream {
+        if tasks.is_empty() {
+            return empty_batch_stream();
+        }
+        let footers = self.fluree.r2rml_cache().parquet_footers();
+        let concurrency = iceberg_scan_concurrency(tasks.len());
+        debug!(
+            files = tasks.len(),
+            concurrency, "streaming Parquet files (bounded parallel)"
+        );
+        let storage = Arc::clone(storage);
+        let stream = futures::stream::iter(tasks)
+            .map(move |task| {
+                let storage = Arc::clone(&storage);
+                let footers = Arc::clone(&footers);
+                async move {
+                    tokio::spawn(async move {
+                        let reader =
+                            SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
+                        reader.read_task(&task).await.map_err(|e| {
+                            QueryError::Internal(format!(
+                                "Failed to read Parquet file '{}': {e}",
+                                task.data_file.file_path
+                            ))
+                        })
+                    })
+                    .await
+                    .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
+                }
+            })
+            .buffer_unordered(concurrency)
+            // One file's `Result<Vec<ColumnBatch>>` becomes individual
+            // `Result<ColumnBatch>` items; a read error becomes one error item.
+            .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
+                Ok(batches) => {
+                    futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
+                }
+                Err(e) => futures::stream::iter(vec![Err(e)]),
+            });
+        Box::pin(stream)
+    }
+
+    /// Read a set of scan tasks into column batches with bounded parallelism.
+    ///
+    /// Collects the whole scan into memory. Prefer [`Self::stream_scan_tasks`] for
+    /// anything that can process incrementally — on a wide source this `Vec` is
+    /// gigabytes.
+    async fn read_scan_tasks(
+        &self,
+        storage: &Arc<IcebergStorageBackend>,
+        tasks: Vec<FileScanTask>,
+    ) -> QueryResult<Vec<ColumnBatch>> {
+        use futures::stream::TryStreamExt;
+        self.stream_scan_tasks(storage, tasks).try_collect().await
+    }
+
+    /// The source table's current snapshot id (the materialization "to" point),
+    /// or `None` if the table has no snapshots yet.
+    pub async fn current_snapshot_id(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<Option<i64>> {
+        let (_storage, metadata, _loc) = self
+            .prepare_iceberg_scan(graph_source_id, table_name)
+            .await?;
+        Ok(metadata.current_snapshot().map(|s| s.snapshot_id))
+    }
+
+    /// The source graph source's materialization options from the persisted
+    /// `IcebergGsConfig`: the optional tombstone/delete convention and the
+    /// optional latest-by-key ordering column. Both `None` means additive,
+    /// scan-order materialization (legacy behavior).
+    pub async fn materialize_options(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<(Option<DeleteConvention>, Option<String>)> {
+        let record = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .ok_or_else(|| {
+                QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
+            })?;
+        let config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
+            QueryError::Internal(format!(
+                "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
+            ))
+        })?;
+        Ok((config.delete, config.order_by))
+    }
+
+    /// Scan only the data files ADDED in the snapshot window
+    /// `(from_snapshot_id, to_snapshot_id]` (append-only incremental).
+    ///
+    /// Prefer [`Self::scan_for_materialize_stream`] with an explicit
+    /// `to_snapshot_id`: it has the same explicit-window semantics but yields
+    /// batches instead of collecting them, so peak memory is bounded by the
+    /// scan concurrency rather than the window size. This collecting variant
+    /// holds the whole window in memory (a `try_collect()` a streaming caller
+    /// could have written for itself) and remains for callers that genuinely
+    /// need the `Vec`.
+    ///
+    /// `from_snapshot_id = None` reads the full live state of `to_snapshot_id`
+    /// (initial materialization). The caller must verify the window is
+    /// incremental-safe (`TableMetadata::window_is_append_only`, allowing
+    /// compaction) and fall back to a full scan otherwise.
+    ///
+    /// A snapshot id that no longer resolves in the table metadata — typically
+    /// expired by the source's snapshot retention — is a typed
+    /// [`QueryError::SnapshotNotFound`], never a silent fall-forward.
+    pub async fn scan_table_incremental(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        from_snapshot_id: Option<i64>,
+        to_snapshot_id: i64,
+    ) -> QueryResult<Vec<ColumnBatch>> {
+        let (storage, metadata, _loc) = self
+            .prepare_iceberg_scan(graph_source_id, table_name)
+            .await?;
+
+        let snapshot_err_table = if table_name.is_empty() {
+            graph_source_id
+        } else {
+            table_name
+        };
+        let to_snapshot =
+            metadata
+                .snapshot(to_snapshot_id)
+                .ok_or_else(|| QueryError::SnapshotNotFound {
+                    table: snapshot_err_table.to_string(),
+                    snapshot_id: to_snapshot_id,
+                })?;
+        let schema = metadata
+            .schema_for_snapshot(to_snapshot)
+            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        let projected_field_ids = projected_field_ids(schema, projection);
+
+        let scan_config = ScanConfig::new().with_projection(projected_field_ids);
+        let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+        let plan = planner
+            .plan_incremental(from_snapshot_id, to_snapshot_id)
+            .await
+            .map_err(|e| match e {
+                // `to` was resolved above, so the only snapshot the planner can
+                // fail to find is `from` (`None` never reaches this arm: the
+                // planner treats it as "since genesis" without a lookup).
+                fluree_db_iceberg::IcebergError::SnapshotNotFound(_) => {
+                    QueryError::SnapshotNotFound {
+                        table: snapshot_err_table.to_string(),
+                        snapshot_id: from_snapshot_id.unwrap_or(to_snapshot_id),
+                    }
+                }
+                e => QueryError::Internal(format!("Failed to plan incremental scan: {e}")),
+            })?;
+
+        info!(
+            from_snapshot_id = ?from_snapshot_id,
+            to_snapshot_id,
+            files = plan.files_selected,
+            estimated_rows = plan.estimated_row_count,
+            "Iceberg incremental scan plan created"
+        );
+
+        self.read_scan_tasks(&storage, plan.added_tasks).await
+    }
+
+    /// Read the rows to materialize for the window ending at `to_snapshot_id`
+    /// (`None` = the source table's current snapshot), choosing incremental vs
+    /// full automatically. The choice and its reason are [`ScanChoice`] — read
+    /// that first, because "full" covers one routine case and one that should
+    /// page someone.
+    ///
+    /// **Pinned reads.** An explicit `to_snapshot_id` pins the read: the
+    /// window `(from, to]` and the projection schema both follow the pinned
+    /// snapshot (its `schema-id`, so a historical read under schema evolution
+    /// projects the columns its rows were written with). A pin that no longer
+    /// resolves in the table metadata — typically expired by the source's
+    /// snapshot retention — is a typed [`QueryError::SnapshotNotFound`],
+    /// **never** a fall-forward: the from-side fall-forward below is a
+    /// deliberate freshness/correctness trade a sync-to-head consumer wants,
+    /// but silently moving a caller's `to` pin would change what the caller
+    /// asked to read.
+    ///
+    /// Returns `(to_snapshot_id, incremental, batches)`:
+    /// - `to_snapshot_id` — the resolved snapshot id of this read (the new
+    ///   watermark to persist), or `None` if the table has no snapshots yet
+    ///   (nothing to materialize; only possible when the caller didn't pin).
+    /// - `incremental` — whether an added-files-only scan was used (vs a full
+    ///   read of the live table state).
+    ///
+    /// An incremental scan is used when `from_snapshot_id` is set **and** the
+    /// window `(from, to]` is incremental-safe — only `append`/`replace`
+    /// (compaction) operations, see
+    /// [`TableMetadata::window_is_incremental_safe`]. Otherwise a full scan of
+    /// `to` is performed: initial materialization (`from = None`), expired or
+    /// branched history, or a genuine `overwrite`/`delete` in the window (which
+    /// an added-files scan would miss). This keeps routine appends and periodic
+    /// compaction on the cheap incremental path while staying correct across
+    /// updates/deletes.
+    /// Yields batches rather than collecting them, so a consumer that processes and
+    /// drops each batch never holds the whole table in memory.
+    ///
+    /// There is deliberately **no collecting variant of this**. One existed
+    /// (`scan_for_materialize`, returning `Vec<ColumnBatch>`) and it was the only
+    /// caller's default, which is how the memory problem below shipped. Removing it
+    /// rather than leaving it beside this makes the memory shape structural instead
+    /// of advisory — collecting is still one `try_collect()` away for a caller that
+    /// genuinely needs it, but it has to be asked for.
+    ///
+    /// **This is the memory-shape difference that matters on a full read.** A full
+    /// read is not a degradation to be avoided — it is required whenever the
+    /// snapshot window contains `overwrite`/`delete`, which an added-files scan
+    /// cannot see (see [`ScanChoice`]). So a deployment can legitimately full-read a
+    /// large table on every poll, forever. Collecting that into a `Vec` made peak
+    /// memory proportional to the *table*; streaming makes it proportional to
+    /// `iceberg_scan_concurrency` file decodes.
+    ///
+    /// Measured on a 735,446-row source polled every ~50s: collecting drove the
+    /// process to 21.4 GiB of anonymous memory against a 24 GiB limit and it was
+    /// OOMKilled every 4–6 minutes, which also meant the transaction never committed
+    /// and the watermark never advanced — so the next poll re-read the same table.
+    pub async fn scan_for_materialize_stream(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        from_snapshot_id: Option<i64>,
+        to_snapshot_id: Option<i64>,
+    ) -> QueryResult<MaterializeScan> {
+        let (storage, metadata, _loc) = self
+            .prepare_iceberg_scan(graph_source_id, table_name)
+            .await?;
+
+        let snapshot_err_table = if table_name.is_empty() {
+            graph_source_id
+        } else {
+            table_name
+        };
+        let to_snapshot = match to_snapshot_id {
+            // A caller's pin must resolve — typed error, never fall-forward
+            // (see the doc comment).
+            Some(id) => {
+                Some(
+                    metadata
+                        .snapshot(id)
+                        .ok_or_else(|| QueryError::SnapshotNotFound {
+                            table: snapshot_err_table.to_string(),
+                            snapshot_id: id,
+                        })?,
+                )
+            }
+            None => metadata.current_snapshot(),
+        };
+        let Some(to_snapshot) = to_snapshot else {
+            // Table has no snapshots: nothing to materialize.
+            return Ok(MaterializeScan {
+                to_snapshot_id: None,
+                incremental: false,
+                window_age_ms: None,
+                stream: empty_batch_stream(),
+            });
+        };
+        let to_snapshot_id = to_snapshot.snapshot_id;
+
+        // Schema AT the `to` snapshot (falls back to current when the snapshot
+        // carries no schema-id) — identical to current for an unpinned read.
+        let schema = metadata
+            .schema_for_snapshot(to_snapshot)
+            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        let projected_field_ids = projected_field_ids(schema, projection);
+
+        let choice = ScanChoice::decide(&metadata, from_snapshot_id, to_snapshot_id);
+        let incremental = choice.is_incremental();
+
+        // Say WHY, at a level that matches how alarming it is. The routine
+        // reasons are `info`; an undeterminable window is `warn` because it is
+        // operator-actionable and unbounded in cost.
+        match &choice {
+            ScanChoice::Incremental | ScanChoice::FullInitial => {}
+            ScanChoice::FullUnsafeWindow => info!(
+                graph_source_id = %graph_source_id,
+                table = %table_name,
+                from_snapshot_id = ?from_snapshot_id,
+                to_snapshot_id,
+                "materialize: window contains overwrite/delete, full read required"
+            ),
+            ScanChoice::FullUndeterminable(reason) => warn!(
+                graph_source_id = %graph_source_id,
+                table = %table_name,
+                from_snapshot_id = ?from_snapshot_id,
+                to_snapshot_id,
+                reason = %reason,
+                "materialize: CANNOT DETERMINE incremental safety — falling back to a FULL \
+                 table read, which loads the whole table into memory. Usually means the stored \
+                 watermark snapshot has been expired by the source table's snapshot retention: \
+                 either retention is shorter than this job's poll interval, or the job was \
+                 stopped for longer than retention."
+            ),
+        }
+
+        let scan_config = ScanConfig::new().with_projection(projected_field_ids);
+        let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+
+        let tasks = if incremental {
+            let plan = planner
+                .plan_incremental(from_snapshot_id, to_snapshot_id)
+                .await
+                .map_err(|e| match e {
+                    // Both window ends resolved before planning (`to` above,
+                    // `from` inside the ScanChoice window walk), so this arm is
+                    // a should-not-happen backstop — but keep it typed so a pin
+                    // that expires between those checks and the manifest read
+                    // still surfaces as what it is.
+                    fluree_db_iceberg::IcebergError::SnapshotNotFound(_) => {
+                        QueryError::SnapshotNotFound {
+                            table: snapshot_err_table.to_string(),
+                            snapshot_id: from_snapshot_id.unwrap_or(to_snapshot_id),
+                        }
+                    }
+                    e => QueryError::Internal(format!("Failed to plan incremental scan: {e}")),
+                })?;
+            info!(
+                from_snapshot_id = ?from_snapshot_id,
+                to_snapshot_id,
+                files = plan.files_selected,
+                estimated_rows = plan.estimated_row_count,
+                "materialize: incremental (added-files) scan plan"
+            );
+            plan.added_tasks
+        } else {
+            // Full read of the `to` snapshot's live state — the pinned snapshot
+            // when the caller supplied one, the current snapshot otherwise
+            // (`plan_scan()` is exactly `plan_scan_for_snapshot(current)`).
+            let plan = planner
+                .plan_scan_for_snapshot(to_snapshot)
+                .await
+                .map_err(|e| QueryError::Internal(format!("Failed to plan full scan: {e}")))?;
+            info!(
+                to_snapshot_id,
+                files = plan.files_selected,
+                estimated_rows = plan.estimated_row_count,
+                "materialize: full scan plan"
+            );
+            plan.tasks
+        };
+
+        // How OLD is the window we are about to read? Measured from Iceberg's own
+        // snapshot timestamps, so it survives restarts and needs no bookkeeping.
+        //
+        // The caller uses this to decide whether to persist a watermark when it
+        // wrote NO data. Skipping that write is what stops the state ledger taking
+        // ~1,200 empty commits/hour — but skipping it forever is worse than the
+        // disease: the stored watermark eventually falls outside the source table's
+        // snapshot retention, `snapshot_window` can no longer resolve it, and every
+        // subsequent poll degrades to a FULL table read. That is exactly how one
+        // source ended up full-reading 739k rows on every poll.
+        let window_age_ms = from_snapshot_id
+            .and_then(|from| metadata.snapshot(from).map(|s| s.timestamp_ms))
+            .map(|from_ms| to_snapshot.timestamp_ms.saturating_sub(from_ms));
+
+        let stream = self.stream_scan_tasks(&storage, tasks);
+        Ok(MaterializeScan {
+            to_snapshot_id: Some(to_snapshot_id),
+            incremental,
+            window_age_ms,
+            stream,
+        })
+    }
 }
 
 impl std::fmt::Debug for FlureeR2rmlProvider<'_> {
@@ -856,6 +1573,42 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
         graph_source_id: &str,
     ) -> std::collections::HashMap<String, fluree_db_query::r2rml::TableWatermark> {
         self.session.pinned_tables(graph_source_id)
+    }
+
+    /// MAJOR-2 (#1529 review): refuse a materialize build whose stamped watermark
+    /// could not be trusted. (1) With the loadTable metadata cache disabled the pin
+    /// machinery is a documented no-op, so no snapshot is actually held for the
+    /// build. (2) If any table yielded a second distinct `metadata_location` during
+    /// the build, the source committed mid-build and the twin would be stamped with a
+    /// snapshot it does not contain. Checked at the build's start (cache) and again
+    /// before the completion stamp (conflicts).
+    fn verify_build_snapshot_integrity(
+        &self,
+        graph_source_id: &str,
+    ) -> std::result::Result<(), fluree_db_r2rml::R2rmlError> {
+        use fluree_db_r2rml::R2rmlError;
+        if !super::catalog_session::cache_enabled() {
+            return Err(R2rmlError::BuildSnapshotIntegrity(
+                "the loadTable metadata cache is disabled (FLUREE_ICEBERG_LOADTABLE_CACHE=0), so \
+                 Iceberg snapshot pinning is a no-op and the twin's stamped watermark cannot be \
+                 guaranteed to describe its contents; re-enable the cache to materialize"
+                    .to_string(),
+            ));
+        }
+        let conflicts = self.session.observed_snapshot_conflicts(graph_source_id);
+        if let Some((table, first, second)) = conflicts.first() {
+            return Err(R2rmlError::BuildSnapshotIntegrity(format!(
+                "table '{table}' moved snapshots during the build (read metadata_location \
+                 '{first}' then '{second}'): the source committed mid-build, so the twin's stamped \
+                 watermark would not describe its contents. Re-run against a quiesced source.{}",
+                if conflicts.len() > 1 {
+                    format!(" ({} tables affected)", conflicts.len())
+                } else {
+                    String::new()
+                }
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1054,7 +1807,7 @@ async fn rest_session_storage(
     io: &IoConfig,
     load_response: &LoadTableResponse,
     catalog_uri: &str,
-) -> QueryResult<Arc<S3IcebergStorage>> {
+) -> QueryResult<Arc<IcebergStorageBackend>> {
     // The loadTable caches preserve `credentials` verbatim and only ever
     // MISS-and-reload on expiry, so a resolved `credentials == None` always means
     // the catalog genuinely vended nothing — never a dropped-credential
@@ -1116,7 +1869,7 @@ async fn rest_session_storage(
         .await
         .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
     };
-    let built = Arc::new(built);
+    let built = Arc::new(IcebergStorageBackend::S3(built));
     session.store_storage(lt_key.to_string(), Arc::clone(&built));
     Ok(built)
 }
@@ -1145,7 +1898,7 @@ async fn resolve_rest_load_and_storage(
     io: IoConfig,
     lt_key: String,
     catalog_uri: String,
-) -> QueryResult<(Arc<S3IcebergStorage>, LoadTableResponse)> {
+) -> QueryResult<(Arc<IcebergStorageBackend>, LoadTableResponse)> {
     // (1) Resolve the loadTable response, cheapest first: the per-query pin, then
     // the cross-query cache (skips the ~1–3s GET), then a real REST load.
     let load_response = if let Some(cached) = session.cached_load_table(&lt_key) {
@@ -1380,6 +2133,7 @@ impl FlureeR2rmlProvider<'_> {
                 let storage = direct_session_storage(
                     &self.session,
                     lt_key,
+                    &root,
                     iceberg_config.io.s3_region.as_deref(),
                     iceberg_config.io.s3_endpoint.as_deref(),
                     iceberg_config.io.s3_path_style,
@@ -1397,13 +2151,27 @@ impl FlureeR2rmlProvider<'_> {
             }
         };
 
-        let matched = fluree_db_iceberg::catalog::match_warehouse_table_dir(requested, &listing)
-            .map_err(|e| {
-                QueryError::InvalidQuery(format!(
-                    "warehouse-root resolution for table '{}': {e}",
-                    table_id.table
-                ))
-            })?;
+        let matched =
+            match fluree_db_iceberg::catalog::match_warehouse_table_dir(requested, &listing) {
+                Ok(m) => m,
+                Err(e) => {
+                    // MAJOR-3 (#1529 review): the leaf-name heuristic (split on the
+                    // FIRST '.') can misclassify a legitimate SINGLE-table direct
+                    // location as a warehouse root — a table dir suffixed like
+                    // `orders-1a2b3c4d`, or a dir literally `DW.FACT_ORDER`. A real
+                    // Iceberg table directory has a `metadata/` child; if the listing
+                    // has one, this IS a single table, so return the location
+                    // unchanged rather than fail with a confusing "no directory
+                    // matches" error.
+                    if listing_is_single_table(&listing) {
+                        return Ok(table_location.to_string());
+                    }
+                    return Err(QueryError::InvalidQuery(format!(
+                        "warehouse-root resolution for table '{}': {e}",
+                        table_id.table
+                    )));
+                }
+            };
         Ok(format!("{root}/{matched}"))
     }
 
@@ -1542,54 +2310,56 @@ impl FlureeR2rmlProvider<'_> {
                     let table_id = table_id.clone();
                     let lt_key_b = lt_key.clone();
                     let uri_b = uri.clone();
-                    let builder: super::lazy_storage::StorageBuilder<'static, S3IcebergStorage> =
-                        Arc::new(move || {
-                            let catalog = Arc::clone(&catalog);
-                            let cache = Arc::clone(&cache);
-                            let session = Arc::clone(&session);
-                            let io = io.clone();
-                            let table_id = table_id.clone();
-                            let lt_key = lt_key_b.clone();
-                            let catalog_uri = uri_b.clone();
-                            Box::pin(async move {
-                                resolve_rest_load_and_storage(
-                                    catalog,
-                                    cache,
-                                    session,
-                                    table_id,
-                                    io,
-                                    lt_key,
-                                    catalog_uri,
-                                )
-                                .await
-                                .map(|(storage, _)| storage)
-                                // Preserve the TYPED errors across the builder's
-                                // `IcebergError` channel: `storage_query_error` lifts
-                                // these two straight back to their `QueryError`
-                                // counterparts, so a lazy-forced build reports the same
-                                // 403 + wire code (`err:storage/AccessDenied` /
-                                // `err:catalog/CredentialsNotVended`) as the eager path.
-                                // A blanket `to_string()` here would flatten them into
-                                // an opaque string and put hosts back to regex-guessing.
-                                .map_err(|e| match e {
-                                    QueryError::StorageAccessDenied {
-                                        bucket,
-                                        key,
-                                        region,
-                                        message,
-                                    } => IcebergError::StorageAccessDenied {
-                                        bucket,
-                                        key,
-                                        region,
-                                        message,
-                                    },
-                                    QueryError::CatalogCredentialsNotVended { catalog_uri } => {
-                                        IcebergError::CatalogCredentialsNotVended { catalog_uri }
-                                    }
-                                    other => IcebergError::Catalog(other.to_string()),
-                                })
+                    let builder: super::lazy_storage::StorageBuilder<
+                        'static,
+                        IcebergStorageBackend,
+                    > = Arc::new(move || {
+                        let catalog = Arc::clone(&catalog);
+                        let cache = Arc::clone(&cache);
+                        let session = Arc::clone(&session);
+                        let io = io.clone();
+                        let table_id = table_id.clone();
+                        let lt_key = lt_key_b.clone();
+                        let catalog_uri = uri_b.clone();
+                        Box::pin(async move {
+                            resolve_rest_load_and_storage(
+                                catalog,
+                                cache,
+                                session,
+                                table_id,
+                                io,
+                                lt_key,
+                                catalog_uri,
+                            )
+                            .await
+                            .map(|(storage, _)| storage)
+                            // Preserve the TYPED errors across the builder's
+                            // `IcebergError` channel: `storage_query_error` lifts
+                            // these two straight back to their `QueryError`
+                            // counterparts, so a lazy-forced build reports the same
+                            // 403 + wire code (`err:storage/AccessDenied` /
+                            // `err:catalog/CredentialsNotVended`) as the eager path.
+                            // A blanket `to_string()` here would flatten them into
+                            // an opaque string and put hosts back to regex-guessing.
+                            .map_err(|e| match e {
+                                QueryError::StorageAccessDenied {
+                                    bucket,
+                                    key,
+                                    region,
+                                    message,
+                                } => IcebergError::StorageAccessDenied {
+                                    bucket,
+                                    key,
+                                    region,
+                                    message,
+                                },
+                                QueryError::CatalogCredentialsNotVended { catalog_uri } => {
+                                    IcebergError::CatalogCredentialsNotVended { catalog_uri }
+                                }
+                                other => IcebergError::Catalog(other.to_string()),
                             })
-                        });
+                        })
+                    });
                     return Ok((Arc::new(LazyS3Storage::deferred(builder)), md, loc));
                 }
             }
@@ -1598,6 +2368,7 @@ impl FlureeR2rmlProvider<'_> {
         // Resolve metadata location and create storage based on catalog mode.
         // `mut` so we can move the REST catalog's inline metadata out of the
         // response below (see the metadata resolution) without cloning it.
+        let mut direct_location: Option<String> = None;
         let (mut load_response, storage) = match &iceberg_config.catalog {
             CatalogConfig::Rest {
                 uri,
@@ -1768,6 +2539,7 @@ impl FlureeR2rmlProvider<'_> {
                     )
                     .await?;
                 let table_location = &effective_location;
+                direct_location = Some(effective_location.clone());
 
                 info!(
                     table_location = %table_location,
@@ -1793,6 +2565,7 @@ impl FlureeR2rmlProvider<'_> {
                     let storage = direct_session_storage(
                         &self.session,
                         &lt_key,
+                        table_location,
                         iceberg_config.io.s3_region.as_deref(),
                         iceberg_config.io.s3_endpoint.as_deref(),
                         iceberg_config.io.s3_path_style,
@@ -1813,6 +2586,7 @@ impl FlureeR2rmlProvider<'_> {
                     let storage = direct_session_storage(
                         &self.session,
                         &lt_key,
+                        table_location,
                         iceberg_config.io.s3_region.as_deref(),
                         iceberg_config.io.s3_endpoint.as_deref(),
                         iceberg_config.io.s3_path_style,
@@ -1884,6 +2658,9 @@ impl FlureeR2rmlProvider<'_> {
                 .map(|s| s.timestamp_ms)
                 .unwrap_or(0),
         );
+        // Relocated local table: remap manifest file references (no-op for
+        // REST/S3 and locally-written tables) BEFORE the ready-wrap.
+        let storage = remap_local_storage(storage, &metadata, direct_location.as_deref());
         Ok((
             Arc::new(LazyS3Storage::ready(storage)),
             metadata,
@@ -2573,27 +3350,93 @@ async fn resolve_table_metadata<S: SendIcebergStorage>(
 /// table returns that Arc. `cached_storage`/`store_storage` are gated on
 /// `cache_enabled()`, so with caching disabled this still builds per call
 /// (matching REST and the pre-#1498 behavior).
+/// Infer the location remap for a RELOCATED local Direct table — one copied or
+/// moved after being written, so its metadata/manifests reference the ORIGINAL
+/// root. Both ends of the mapping are already known: the metadata's own
+/// `location` (the old root — possibly an `s3://` URI, the copied-from-S3
+/// case) and the configured `table_location` (where the table sits now). So
+/// "copy the table directory, point at it" needs zero configuration. Identical
+/// roots — the common locally-written case — leave the storage untouched, as
+/// does any non-local backend.
+fn remap_local_storage(
+    storage: Arc<IcebergStorageBackend>,
+    metadata: &TableMetadata,
+    direct_location: Option<&str>,
+) -> Arc<IcebergStorageBackend> {
+    let Some(configured) = direct_location else {
+        return storage;
+    };
+    if !matches!(storage.as_ref(), IcebergStorageBackend::File(_)) {
+        return storage;
+    }
+    // `file:///x`, `file:/x`, and `/x` are the same local root spelled three
+    // ways — never remap between spellings of one root.
+    fn local_path(s: &str) -> &str {
+        s.strip_prefix("file://")
+            .or_else(|| s.strip_prefix("file:"))
+            .unwrap_or(s)
+    }
+    let declared = metadata.location.trim_end_matches('/');
+    let configured = configured.trim_end_matches('/');
+    if local_path(declared) == local_path(configured) {
+        return storage;
+    }
+    debug!(
+        declared = %declared,
+        configured = %configured,
+        "local Direct table is relocated; remapping manifest file references"
+    );
+    Arc::new(IcebergStorageBackend::File(FileIcebergStorage::with_remap(
+        declared, configured,
+    )))
+}
+
 async fn direct_session_storage(
     session: &super::catalog_session::IcebergCatalogSession,
     lt_key: &str,
+    table_location: &str,
     region: Option<&str>,
     endpoint: Option<&str>,
     path_style: bool,
-) -> QueryResult<Arc<S3IcebergStorage>> {
+) -> QueryResult<Arc<IcebergStorageBackend>> {
     if let Some(cached) = session.cached_storage(lt_key) {
-        debug!("S3 storage client reused (query-scoped, direct)");
+        debug!("storage client reused (query-scoped, direct)");
         return Ok(cached);
+    }
+    // Backend by location scheme: a local (`file://` / absolute-path) table
+    // reads the filesystem directly — no SDK client, no credential-chain
+    // resolution. Cached in the session like the S3 client for uniformity
+    // (the build is nearly free, but callers treat the cache as authoritative).
+    if FileIcebergStorage::is_local_location(table_location) {
+        let built = Arc::new(IcebergStorageBackend::File(FileIcebergStorage::new()));
+        session.store_storage(lt_key.to_string(), Arc::clone(&built));
+        return Ok(built);
     }
     // gs://-backed tables (GCS S3-interop endpoint) are read through this same S3
     // SDK path; the client is pinned to HTTP/1.1 to avoid the AWS-SDK HTTP/2
     // range-read bug against that endpoint.
-    let built = Arc::new(
+    let built = Arc::new(IcebergStorageBackend::S3(
         S3IcebergStorage::from_default_chain(region, endpoint, path_style)
             .await
             .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?,
-    );
+    ));
     session.store_storage(lt_key.to_string(), Arc::clone(&built));
     Ok(built)
+}
+
+/// MAJOR-3 (#1529 review): whether a listing of immediate child directory names
+/// denotes a SINGLE Iceberg table rather than a warehouse root. Every Iceberg
+/// table directory carries a `metadata/` child (its table metadata); a warehouse
+/// root instead holds per-table subdirectories. Used to recover the single-table
+/// case when the leaf-name warehouse heuristic misfires.
+fn listing_is_single_table(listing: &[String]) -> bool {
+    listing.iter().any(|d| {
+        d.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(d)
+            .eq_ignore_ascii_case("metadata")
+    })
 }
 
 #[cfg(test)]
@@ -2645,6 +3488,162 @@ mod tests {
                 field(6, "double_key", json!("double")),
                 field(7, "float_key", json!("float")),
             ],
+        }
+    }
+
+    /// Build `TableMetadata` from a snapshot chain, through the real JSON
+    /// deserializer rather than a struct literal — `meta_with` in the iceberg
+    /// crate is `#[cfg(test)]`-private, and going through `from_json_str` has
+    /// the side benefit of exercising the path production actually takes.
+    ///
+    /// `chain` is `(snapshot_id, parent_id, operation)`.
+    fn meta_with_chain(chain: &[(i64, Option<i64>, Option<&str>)]) -> TableMetadata {
+        let snapshots: Vec<serde_json::Value> = chain
+            .iter()
+            .enumerate()
+            .map(|(i, (id, parent, op))| {
+                let mut s = json!({
+                    "snapshot-id": id,
+                    "sequence-number": i as i64 + 1,
+                    "timestamp-ms": 0,
+                    "manifest-list": format!("s3://b/t/snap-{id}.avro"),
+                    "summary": match op {
+                        Some(o) => json!({"operation": o}),
+                        // A snapshot with no recorded operation is a real
+                        // Iceberg shape and must stay representable: the
+                        // safety check treats it as unsafe (fail closed).
+                        None => json!({}),
+                    },
+                });
+                if let Some(pid) = parent {
+                    s["parent-snapshot-id"] = json!(pid);
+                }
+                s
+            })
+            .collect();
+
+        let current = chain.last().map(|(id, _, _)| *id);
+        let doc = json!({
+            "format-version": 2,
+            "location": "s3://b/t",
+            "last-sequence-number": chain.len() as i64,
+            "last-updated-ms": 0,
+            "last-column-id": 1,
+            "current-schema-id": 0,
+            "schemas": [],
+            "current-snapshot-id": current,
+            "snapshots": snapshots,
+            "snapshot-log": [],
+            "default-spec-id": 0,
+            "partition-specs": [],
+            "last-partition-id": 0,
+            "sort-orders": [],
+            "default-sort-order-id": 0,
+            "properties": {}
+        });
+        TableMetadata::from_json_str(&doc.to_string()).expect("metadata fixture must parse")
+    }
+
+    /// An append-only window takes the cheap path. The baseline: if this ever
+    /// stops holding, every poll is reading whole tables.
+    #[test]
+    fn append_only_window_scans_incrementally() {
+        let meta = meta_with_chain(&[
+            (1, None, Some("append")),
+            (2, Some(1), Some("append")),
+            (3, Some(2), Some("replace")),
+        ]);
+        assert_eq!(
+            ScanChoice::decide(&meta, Some(1), 3),
+            ScanChoice::Incremental
+        );
+        assert!(ScanChoice::decide(&meta, Some(1), 3).is_incremental());
+    }
+
+    /// No watermark is a FIRST RUN, not a failure to classify. It must not be
+    /// reported as undeterminable, or every new source looks like an incident.
+    #[test]
+    fn missing_watermark_is_initial_not_a_failure() {
+        let meta = meta_with_chain(&[(1, None, Some("append"))]);
+        assert_eq!(ScanChoice::decide(&meta, None, 1), ScanChoice::FullInitial);
+        assert!(!ScanChoice::decide(&meta, None, 1).is_incremental());
+    }
+
+    /// `overwrite` in the window: a full read is CORRECT here, and must be
+    /// distinguishable from the case below. Both were `false` before.
+    #[test]
+    fn overwrite_window_is_unsafe_not_undeterminable() {
+        let meta = meta_with_chain(&[(1, None, Some("append")), (2, Some(1), Some("overwrite"))]);
+        assert_eq!(
+            ScanChoice::decide(&meta, Some(1), 2),
+            ScanChoice::FullUnsafeWindow
+        );
+    }
+
+    /// THE REGRESSION TEST. An expired watermark — the snapshot is simply gone
+    /// from the table's history, which is what aggressive snapshot retention
+    /// does — must be `FullUndeterminable` carrying a reason, NOT silently
+    /// folded in with the routine case.
+    ///
+    /// This is the exact production failure: retention expired the stored
+    /// watermark, `.unwrap_or(false)` turned the resulting error into "not
+    /// safe", every poll full-read a 728,876-row table, and the process was
+    /// OOMKilled every 8-17 minutes with no log line explaining why.
+    #[test]
+    fn expired_watermark_is_undeterminable_with_a_reason() {
+        // Current history is 10 -> 11. Snapshot 1 has been expired away.
+        let meta = meta_with_chain(&[(10, None, Some("append")), (11, Some(10), Some("append"))]);
+
+        let choice = ScanChoice::decide(&meta, Some(1), 11);
+        match &choice {
+            ScanChoice::FullUndeterminable(reason) => {
+                assert!(
+                    !reason.is_empty(),
+                    "the reason is the whole point — it is what tells an operator \
+                     retention is shorter than the poll interval"
+                );
+            }
+            other => panic!("expired watermark must be FullUndeterminable, got {other:?}"),
+        }
+        assert!(
+            !choice.is_incremental(),
+            "must not attempt an incremental scan"
+        );
+    }
+
+    /// A watermark from a different lineage (branch/rewind) is also
+    /// undeterminable rather than unsafe — same treatment, different cause.
+    #[test]
+    fn non_ancestor_watermark_is_undeterminable() {
+        let meta = meta_with_chain(&[(1, None, Some("append")), (2, Some(1), Some("append"))]);
+        // 2 is a DESCENDANT of 1, so asking for the window (2, 1] walks off the
+        // root without finding 2 -> not an ancestor.
+        assert!(matches!(
+            ScanChoice::decide(&meta, Some(2), 1),
+            ScanChoice::FullUndeterminable(_)
+        ));
+    }
+
+    /// The four outcomes must stay four. Collapsing any two back together is
+    /// how the original bug is reintroduced, so assert they are all distinct.
+    #[test]
+    fn the_four_outcomes_are_distinguishable() {
+        let ok = meta_with_chain(&[(1, None, Some("append")), (2, Some(1), Some("append"))]);
+        let bad = meta_with_chain(&[(1, None, Some("append")), (2, Some(1), Some("delete"))]);
+        let gone = meta_with_chain(&[(9, None, Some("append")), (10, Some(9), Some("append"))]);
+
+        let all = [
+            ScanChoice::decide(&ok, Some(1), 2),
+            ScanChoice::decide(&ok, None, 2),
+            ScanChoice::decide(&bad, Some(1), 2),
+            ScanChoice::decide(&gone, Some(1), 10),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "outcomes {i} and {j} collapsed into one another");
+                }
+            }
         }
     }
 
@@ -3408,6 +4407,10 @@ mod tests {
             table: TableConfig::Identifier("ns.t".to_string()),
             io: IoConfig::default(),
             mapping: None,
+            // This fixture exercises auth fingerprinting, not CDC semantics, so the
+            // materialization options stay absent (their serde defaults).
+            delete: None,
+            order_by: None,
         }
         .to_json()
         .unwrap()
@@ -3477,12 +4480,26 @@ mod tests {
         let session = IcebergCatalogSession::default();
         let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
 
-        let first = direct_session_storage(&session, &key, Some("us-east-2"), None, false)
-            .await
-            .expect("offline SDK client construction");
-        let second = direct_session_storage(&session, &key, Some("us-east-2"), None, false)
-            .await
-            .expect("offline SDK client construction");
+        let first = direct_session_storage(
+            &session,
+            &key,
+            "s3://bucket/t",
+            Some("us-east-2"),
+            None,
+            false,
+        )
+        .await
+        .expect("offline SDK client construction");
+        let second = direct_session_storage(
+            &session,
+            &key,
+            "s3://bucket/t",
+            Some("us-east-2"),
+            None,
+            false,
+        )
+        .await
+        .expect("offline SDK client construction");
         assert!(
             Arc::ptr_eq(&first, &second),
             "the second Direct-mode acquisition must reuse the session-cached S3 client"
@@ -3491,12 +4508,38 @@ mod tests {
         // A different table (different key) is a distinct client — the cache keys
         // per (source, table), so unrelated tables never alias one client.
         let other_key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_GEOGRAPHY");
-        let other = direct_session_storage(&session, &other_key, Some("us-east-2"), None, false)
-            .await
-            .expect("offline SDK client construction");
+        let other = direct_session_storage(
+            &session,
+            &other_key,
+            "s3://bucket/t",
+            Some("us-east-2"),
+            None,
+            false,
+        )
+        .await
+        .expect("offline SDK client construction");
         assert!(
             !Arc::ptr_eq(&first, &other),
             "a different table must not reuse another table's cached client"
         );
+    }
+
+    #[test]
+    fn listing_is_single_table_detects_metadata_child() {
+        // MAJOR-3: a single Iceberg table dir has a `metadata/` child (alongside
+        // `data/`); a warehouse root instead holds per-table subdirs. The former
+        // must be recovered as single-table even when the leaf-name heuristic
+        // misfired (suffixed dir, or a dir literally `DW.FACT_ORDER`).
+        assert!(super::listing_is_single_table(&[
+            "data/".to_string(),
+            "metadata/".to_string(),
+        ]));
+        assert!(super::listing_is_single_table(&["METADATA/".to_string()]));
+        // A warehouse root (only table subdirs, no metadata/ child) is NOT single.
+        assert!(!super::listing_is_single_table(&[
+            "fact_order.UIHGsQex/".to_string(),
+            "dim_customer.AbCdEf/".to_string(),
+        ]));
+        assert!(!super::listing_is_single_table(&[]));
     }
 }

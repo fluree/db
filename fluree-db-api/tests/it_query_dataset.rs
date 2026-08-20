@@ -16,6 +16,7 @@ use fluree_db_api::TimeSpec;
 use fluree_db_api::{DataSetDb, DatasetSpec, FlureeBuilder, GraphDb, GraphSource, QueryInput};
 use fluree_db_core::load_commit_by_id;
 use serde_json::json;
+use serde_json::Value as JsonValue;
 
 // =============================================================================
 // Helper functions
@@ -3165,4 +3166,293 @@ async fn dataset_membership_shape_set_merges_identical_graphs() {
         union_rows, single_rows,
         "two identical default graphs RDF-merge to one triple set (§13.2); the join must not multiply"
     );
+}
+
+// =============================================================================
+// HTTP ledger-endpoint dataset semantics (azure-chat#50)
+//
+// The HTTP ledger endpoint builds its own `DatasetSpec` from a SPARQL dataset
+// clause (`ledger_scoped_sparql_dataset_spec` in fluree-db-server) and feeds it
+// to `build_dataset_view`, so its semantics are pinned here — in the crate that
+// owns the builder — as well as through the route itself in
+// fluree-db-server/tests/sparql_dataset_semantics.rs.
+//
+// The spec that endpoint builds for a within-ledger clause sets
+// `identifier` = the ledger id (a loading detail) and `source_alias` = the
+// graph IRI the user wrote. Registering both keys used to inject the ledger
+// alias into the named-graph map pointing at the named graph's view, so
+// `GRAPH ?g` enumerated it and doubled every solution.
+// =============================================================================
+
+const HTTP_DS_LEDGER: &str = "httpds:main";
+const HTTP_DS_G1: &str = "http://ex.org/g1";
+const HTTP_DS_G2: &str = "http://ex.org/g2";
+
+/// One default-graph triple plus a two-triple named graph, so "empty default
+/// graph" and "named graph enumerated once" are separately discriminating.
+async fn seed_http_dataset_ledger(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let trig = r#"
+        @prefix ex: <http://ex.org/> .
+
+        ex:d1 ex:name "D" .
+
+        <http://ex.org/g1> {
+            ex:s1 ex:name "A" .
+            ex:s2 ex:name "B" .
+            ex:s1 ex:knows ex:s2 .
+        }
+
+        <http://ex.org/g2> {
+            ex:s3 ex:name "C" .
+        }
+    "#;
+    fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger
+}
+
+/// The spec the ledger endpoint builds for `FROM NAMED <g1>` with no `FROM`:
+/// no default graph (SPARQL 1.1 §13.2) and one named source keyed by the IRI
+/// the user wrote.
+fn http_from_named_only_spec(graphs: &[&str]) -> DatasetSpec {
+    let mut spec = DatasetSpec::new();
+    for g in graphs {
+        spec = spec.with_named(
+            GraphSource::new(HTTP_DS_LEDGER)
+                .with_graph(fluree_db_api::dataset::GraphSelector::Iri((*g).to_string()))
+                .with_alias(*g),
+        );
+    }
+    spec
+}
+
+async fn http_ds_rows(dataset: &DataSetDb, fluree: &MemoryFluree, sparql: &str) -> Vec<JsonValue> {
+    let result = fluree
+        .query_dataset(dataset, sparql)
+        .await
+        .expect("query should succeed");
+    let primary = dataset.primary().expect("primary view");
+    let jsonld = result
+        .to_jsonld(primary.snapshot.as_ref())
+        .expect("to_jsonld");
+    normalize_rows(&jsonld)
+}
+
+/// `FROM NAMED <g1>` + `GRAPH ?g` binds `?g` to the declared graph and nothing
+/// else, once per solution. The ledger alias is not a named-graph key.
+#[tokio::test]
+async fn http_dataset_from_named_binds_only_declared_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let dataset = fluree
+        .build_dataset_view(&http_from_named_only_spec(&[HTTP_DS_G1]))
+        .await
+        .expect("build_dataset_view should succeed");
+
+    assert!(
+        dataset.get_named(HTTP_DS_LEDGER).is_none(),
+        "the ledger alias must not be registered as a named graph"
+    );
+    assert!(
+        dataset.get_named(HTTP_DS_G1).is_some(),
+        "the declared graph IRI is the dataset-local name"
+    );
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?g ?n WHERE { GRAPH ?g { ?s ex:name ?n } }
+        ",
+    )
+    .await;
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "one solution per triple, not one per graph key"
+    );
+    for row in &rows {
+        let g = serde_json::to_string(row).expect("row json");
+        assert!(
+            g.contains(HTTP_DS_G1) && !g.contains(HTTP_DS_LEDGER),
+            "?g must bind only the declared graph, got {g}"
+        );
+    }
+}
+
+/// Property-path form of the same shape: the single `ex:knows` edge comes back
+/// once, not once per graph key.
+#[tokio::test]
+async fn http_dataset_from_named_property_path_not_doubled() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let dataset = fluree
+        .build_dataset_view(&http_from_named_only_spec(&[HTTP_DS_G1]))
+        .await
+        .expect("build_dataset_view should succeed");
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?x ?y WHERE { GRAPH ?g { ?x ex:knows+ ?y } }
+        ",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 1, "the single knows edge is one solution");
+}
+
+/// N `FROM NAMED` clauses give exactly N graph bindings. The pre-fix shape
+/// gave N+1, the extra key aliasing whichever clause was processed last.
+#[tokio::test]
+async fn http_dataset_two_from_named_give_two_bindings() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let dataset = fluree
+        .build_dataset_view(&http_from_named_only_spec(&[HTTP_DS_G1, HTTP_DS_G2]))
+        .await
+        .expect("build_dataset_view should succeed");
+
+    assert!(
+        dataset.get_named(HTTP_DS_LEDGER).is_none(),
+        "the ledger alias must not be registered as a named graph"
+    );
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?g ?n WHERE { GRAPH ?g { ?s ex:name ?n } }
+        ",
+    )
+    .await;
+
+    // g1 carries two names, g2 one — three solutions over exactly two graphs.
+    assert_eq!(rows.len(), 3);
+    let all = serde_json::to_string(&rows).expect("rows json");
+    assert!(all.contains(HTTP_DS_G1) && all.contains(HTTP_DS_G2));
+    assert!(
+        !all.contains(HTTP_DS_LEDGER),
+        "no ledger-alias graph binding, got {all}"
+    );
+}
+
+/// `FROM NAMED` with no `FROM` leaves the default graph empty (§13.2), so a
+/// pattern outside `GRAPH { }` matches nothing — the ledger's default-graph
+/// triple ("D") must not leak in.
+#[tokio::test]
+async fn http_dataset_from_named_only_has_empty_default_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let dataset = fluree
+        .build_dataset_view(&http_from_named_only_spec(&[HTTP_DS_G1]))
+        .await
+        .expect("build_dataset_view should succeed");
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?n WHERE { ?s ex:name ?n }
+        ",
+    )
+    .await;
+
+    assert!(
+        rows.is_empty(),
+        "empty default graph matches nothing, got {rows:?}"
+    );
+}
+
+/// Under a dataset clause the ledger alias is not a graph name, so
+/// `GRAPH <ledger-alias>` behaves like any unknown graph name: zero rows, no
+/// error. Before the fix it resolved — to the *named* graph's triples.
+///
+/// Whether a dataset clause should let `GRAPH <ledger-alias>` address the
+/// ledger's default graph is a deliberate feature decision, not something to
+/// inherit by accident; D-2 keeps that spelling only on the no-dataset-clause
+/// path.
+#[tokio::test]
+async fn http_dataset_graph_ledger_alias_is_an_unknown_graph_name() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let dataset = fluree
+        .build_dataset_view(&http_from_named_only_spec(&[HTTP_DS_G1]))
+        .await
+        .expect("build_dataset_view should succeed");
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?n WHERE { GRAPH <httpds:main> { ?s ex:name ?n } }
+        ",
+    )
+    .await;
+
+    assert!(
+        rows.is_empty(),
+        "an unnamed graph yields no solutions and no error, got {rows:?}"
+    );
+}
+
+/// The spelling that still reaches the ledger's default graph under a dataset
+/// clause: name it with `FROM`. This is the migration path for queries written
+/// against the pre-4.1.4 fallback.
+#[tokio::test]
+async fn http_dataset_explicit_from_default_keeps_default_graph() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_http_dataset_ledger(&fluree, HTTP_DS_LEDGER).await;
+
+    let spec = DatasetSpec::new()
+        .with_default(
+            GraphSource::new(HTTP_DS_LEDGER)
+                .with_graph(fluree_db_api::dataset::GraphSelector::Default),
+        )
+        .with_named(
+            GraphSource::new(HTTP_DS_LEDGER)
+                .with_graph(fluree_db_api::dataset::GraphSelector::Iri(
+                    HTTP_DS_G1.to_string(),
+                ))
+                .with_alias(HTTP_DS_G1),
+        );
+    let dataset = fluree
+        .build_dataset_view(&spec)
+        .await
+        .expect("build_dataset_view should succeed");
+
+    let rows = http_ds_rows(
+        &dataset,
+        &fluree,
+        r"
+        PREFIX ex: <http://ex.org/>
+        SELECT ?n WHERE { ?s ex:name ?n }
+        ",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 1, "the default-graph triple, and only that");
 }

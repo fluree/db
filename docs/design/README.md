@@ -12,6 +12,10 @@ Why Fluree is fast, layer by layer: integer-ID execution, columnar leaflets with
 
 How queries run through a single preparation/execution pipeline, how scan operators select the binary-cursor path vs the range fallback, and where overlay novelty merges with indexed data (including graph scoping boundaries).
 
+### [Row-returning multi-fact virtual joins (late-materialization corridor)](virtual-multifact-row-corridor.md)
+
+Sized design (not yet implemented) for a row-returning multi-fact join over the virtual/R2RML path: why it needs a new row-emitting columnar operator rather than a widening of the fused aggregate, and how it reuses the semi-join membership + FK→IRI resolver + budget-forwarding primitives to prune columnar-first and late-materialize only surviving rows. Captured out of db #1589 (which shipped the fused-aggregate S1/S2 generality).
+
 ### [Auth Contract (CLI ↔ Server)](auth-contract.md)
 
 Wire-level contract between the Fluree CLI and any Fluree-compatible server, covering OIDC device auth, token refresh, and storage proxy authentication.

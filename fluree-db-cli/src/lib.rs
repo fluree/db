@@ -546,6 +546,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             Ok(())
         }
 
+        Commands::Manifest { output } => commands::manifest::run(output.as_deref()),
+
         Commands::Token { action } => commands::token::run(action),
 
         Commands::Remote { action } => {
@@ -654,6 +656,22 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::index::run_reindex(ledger.as_deref(), &fluree_dir, remote.as_deref(), direct)
                 .await
+        }
+
+        Commands::Sweep {
+            ledger,
+            dry_run,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::sweep::run_sweep(
+                ledger.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+                commands::sweep::SweepMode::from_dry_run(dry_run),
+            )
+            .await
         }
 
         #[cfg(feature = "server")]

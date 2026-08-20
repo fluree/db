@@ -67,9 +67,9 @@ use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError, NameServiceLookup,
-    NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result,
-    StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceError,
+    NameServiceLookup, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
+    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -292,6 +292,32 @@ impl NameServiceLookup for RaftNameService {
         let (name, branch) = split_ledger_id(ledger_id)?;
         let state = self.state.read().await;
         Ok(record_from_state(&state, &name, &branch))
+    }
+
+    /// One lock, two field reads. Mirrors `get_ref`: retracted branches are
+    /// tombstoned here (`None`) even though `lookup` still returns them.
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        let (name, branch) = split_ledger_id(ledger_id)?;
+        let state = self.state.read().await;
+        if !state.ledgers.contains_key(&name) {
+            return Ok(None);
+        }
+        let ref_key = RefKey::new(&name, &branch);
+        if state.retracted.contains(&ref_key) {
+            return Ok(None);
+        }
+        let entry = state.refs.get(&ref_key);
+        let index = entry.and_then(|e| e.index.as_ref());
+        Ok(Some(LedgerHeads {
+            commit: RefValue {
+                id: entry.map(|e| e.head.clone()),
+                t: entry.map(|e| e.t).unwrap_or(0),
+            },
+            index: RefValue {
+                id: index.map(|i| i.head.clone()),
+                t: index.map(|i| i.t).unwrap_or(0),
+            },
+        }))
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
@@ -2400,6 +2426,9 @@ mod tests {
             time: Some("12.34ms".to_string()),
             fuel: Some(1.5),
             policy: Some(policy),
+            // Read-path-only: never set on a transaction tally and deliberately
+            // absent from the recorded wire mirror (see `RecordedTally`).
+            policy_enforcement: None,
             reasoning: Some(ReasoningTally {
                 capped: true,
                 capped_reason: Some("budget".to_string()),
@@ -2477,6 +2506,7 @@ mod tests {
             time: None,
             fuel: Some(1.0),
             policy: None,
+            policy_enforcement: None,
             reasoning: Some(ReasoningTally {
                 capped: false,
                 capped_reason: None,
@@ -2759,6 +2789,7 @@ mod tests {
                 );
                 m
             }),
+            policy_enforcement: None,
             reasoning: Some(original_reasoning),
         };
         let original_transact = TransactApplied {
@@ -2804,11 +2835,15 @@ mod tests {
             time: rt_time,
             fuel: rt_fuel,
             policy: rt_policy,
+            policy_enforcement: rt_policy_enforcement,
             reasoning: rt_reasoning,
         } = rt_tally.expect("tally Some on round-trip");
         assert_eq!(rt_time, original_tally.time);
         assert_eq!(rt_fuel, original_tally.fuel);
         assert_eq!(rt_policy, original_tally.policy);
+        // Not carried by the recorded mirror: a replicated transaction never
+        // has a read-path enforcement record to carry.
+        assert_eq!(rt_policy_enforcement, None);
 
         let ReasoningTally {
             capped: rt_capped,
@@ -3076,6 +3111,25 @@ mod tests {
             .expect("index ref");
         assert!(index_ref.id.is_none());
         assert_eq!(index_ref.t, 0);
+    }
+
+    #[tokio::test]
+    async fn heads_matches_get_ref_and_tombstones_unknown() {
+        let state = fresh_state();
+        apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
+        seed_head(&state, "test/db", "main", cid(9), 3).await;
+
+        let ns = RaftNameService::new(state, stub_raft().await);
+        let heads = ns.heads("test/db:main").await.unwrap().expect("heads");
+        assert_eq!(
+            heads.commit,
+            RefValue {
+                id: Some(cid(9)),
+                t: 3
+            }
+        );
+        assert_eq!(heads.index, RefValue { id: None, t: 0 });
+        assert!(ns.heads("test/other:main").await.unwrap().is_none());
     }
 
     /// Convenience for the index-head tests: create a ledger and

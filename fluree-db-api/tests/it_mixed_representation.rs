@@ -161,7 +161,7 @@ async fn mixed_representation_count_distinct_and_group_counts() {
     .await;
     let a_count = groups
         .iter()
-        .find(|g| g["x"]["value"] == "ex:a")
+        .find(|g| g["x"]["value"] == "http://example.org/ns/a")
         .expect("ex:a group");
     assert_eq!(a_count["c"]["value"], "2", "ex:a rows merge into one group");
 }

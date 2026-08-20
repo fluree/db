@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -111,6 +111,10 @@ async fn stream_query_connection_inner(
 
     let fluree = state.fluree.clone();
 
+    // Advisory headers attached to the 200 — empty unless the request names
+    // only named graphs and then matches outside them (see `X_FDB_WARNING`).
+    // Both branches below set it, so there is no default to fall back on.
+    let warn_headers;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
 
@@ -146,6 +150,14 @@ async fn stream_query_connection_inner(
         let min_t = collect_sparql_min_t_requirements(headers.min_t, &sparql, None)?;
         await_query_min_t_requirements(state.as_ref(), min_t).await?;
 
+        // `build_stream_dataset_for_sparql` resolves the dataset internally, so
+        // nothing here would otherwise look at the clause — leaving the one
+        // surface whose caller is least likely to notice a short result set as
+        // the only silent one.
+        warn_headers = crate::routes::query::sparql_dataset_warning_headers(
+            fluree_db_sparql::parse_sparql(&sparql).ast.as_ref(),
+        );
+
         let dataset = fluree
             .build_stream_dataset_for_sparql(&sparql, &fluree_db_api::GovernanceOptions::default())
             .await
@@ -174,12 +186,14 @@ async fn stream_query_connection_inner(
         let ledger_id = get_ledger_id(None, &headers, &query_json)?;
 
         // If only a header ledger was given, materialize it as a `from` so the
-        // dataset spec is non-empty.
-        if query_json.get("from").is_none() && query_json.get("fromNamed").is_none() {
+        // dataset spec is non-empty. A `fromNamed`-only body already names its
+        // dataset and keeps its empty default graph (§13.2).
+        if crate::routes::query::needs_default_graph_injection(&query_json) {
             if let Some(obj) = query_json.as_object_mut() {
                 obj.insert("from".to_string(), JsonValue::String(ledger_id.clone()));
             }
         }
+        warn_headers = crate::routes::query::jsonld_dataset_semantics_warning_headers(&query_json);
 
         inject_headers_into_query(&mut query_json, &headers);
         if let Some(p) = bearer.0.as_ref() {
@@ -221,7 +235,9 @@ async fn stream_query_connection_inner(
     };
 
     tracing::info!(status = "start", "connection streaming query started");
-    Ok(finish_stream(&state, fluree, stream_plan, tracker))
+    let mut response = finish_stream(&state, fluree, stream_plan, tracker);
+    response.headers_mut().extend(warn_headers);
+    Ok(response)
 }
 
 async fn stream_query_inner(
@@ -257,6 +273,9 @@ async fn stream_query_inner(
     //  - Dataset: the connection/dataset path (policy, `from`/`fromNamed`,
     //    multi-ledger), which enforces per-request policy exactly like `/query`.
     let fluree = state.fluree.clone();
+    // Advisory headers attached to the 200 — empty unless the request names
+    // only named graphs and then matches outside them (see `X_FDB_WARNING`).
+    let mut warn_headers = HeaderMap::new();
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
         if let Some(p) = bearer.0.as_ref() {
@@ -308,10 +327,12 @@ async fn stream_query_inner(
                 ));
             }
             let spec = if has_dataset {
-                crate::routes::query::ledger_scoped_sparql_dataset_spec(
-                    &ledger,
-                    dataset_clause.expect("has_dataset implies a clause"),
-                )?
+                let dc = dataset_clause.expect("has_dataset implies a clause");
+                warn_headers = crate::routes::query::dataset_semantics_warning_headers(
+                    dc,
+                    parsed.ast.as_ref(),
+                );
+                crate::routes::query::ledger_scoped_sparql_dataset_spec(&ledger, dc)?
             } else {
                 let mut spec = fluree_db_api::DatasetSpec::new();
                 spec.default_graphs.push(
@@ -403,13 +424,18 @@ async fn stream_query_inner(
         let tracker = stream_tracker(Some(&query_json));
 
         if requires_dataset_features(&query_json) || has_policy_opts(&query_json) {
-            // Dataset path: ensure the spec carries the path ledger as a default
-            // graph, build the policy-wrapped dataset, then plan against it.
-            if query_json.get("from").is_none() {
+            // Dataset path: give the spec the path ledger as its default graph
+            // when the body named no dataset at all, then build the
+            // policy-wrapped dataset and plan against it. A `fromNamed`-only
+            // body keeps its empty default graph (§13.2), matching `/query` and
+            // the SPARQL surface.
+            if crate::routes::query::needs_default_graph_injection(&query_json) {
                 if let Some(obj) = query_json.as_object_mut() {
                     obj.insert("from".to_string(), JsonValue::String(ledger.clone()));
                 }
             }
+            warn_headers =
+                crate::routes::query::jsonld_dataset_semantics_warning_headers(&query_json);
             let dataset = fluree
                 .build_stream_dataset(&query_json)
                 .await
@@ -435,7 +461,9 @@ async fn stream_query_inner(
     };
 
     tracing::info!(status = "start", ledger = %ledger, "streaming query started");
-    Ok(finish_stream(&state, fluree, stream_plan, tracker))
+    let mut response = finish_stream(&state, fluree, stream_plan, tracker);
+    response.headers_mut().extend(warn_headers);
+    Ok(response)
 }
 
 /// Spawn the producer for a resolved plan and assemble the NDJSON streaming
@@ -505,7 +533,7 @@ fn request_carries_policy(headers: &FlureeHeaders) -> bool {
         || headers.policy.is_some()
         || !headers.policy_class.is_empty()
         || headers.policy_values.is_some()
-        || headers.default_allow
+        || headers.default_allow == Some(true)
 }
 
 /// A fuel + time tracker for the streaming endpoint, honoring any `max-fuel`

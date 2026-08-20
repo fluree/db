@@ -5,7 +5,7 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::ir::{Grouping, Pattern, Query};
+use crate::ir::{AggregateFn, Grouping, Pattern, Query};
 use crate::var_registry::VarId;
 use std::collections::HashSet;
 
@@ -15,7 +15,7 @@ use std::collections::HashSet;
 /// for all downstream consumers to function correctly.  The sets are
 /// computed once (backward from SELECT) and consulted by each operator to
 /// trim dead columns from its output.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VariableDeps {
     pub required_where_vars: Vec<VarId>,
     pub required_groupby_vars: Vec<VarId>,
@@ -95,8 +95,18 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     // Aggregates: replace output vars with input vars.
     for spec in query.grouping.iter().flat_map(Grouping::aggregates) {
         if deps.remove(&spec.output_var) {
-            if let Some(input_var) = spec.function.input_var() {
-                deps.insert(input_var);
+            match &spec.function {
+                // `COUNT(DISTINCT *)` counts distinct SOLUTIONS, so its input is
+                // not one column but every user-visible variable (the list it
+                // carries — see `AggregateFn::CountDistinctAll`). Tracing them
+                // here is what keeps the pre-grouping stages from trimming away
+                // a column that two solutions differ only in; naming them
+                // individually leaves genuinely dead columns still trimmable,
+                // and leaves the post-grouping stages — already recorded above —
+                // untouched. Variables this list names from other scopes simply
+                // never match a schema and drop out.
+                AggregateFn::CountDistinctAll(vars) => deps.extend(vars.iter().copied()),
+                other => deps.extend(other.input_var()),
             }
         }
     }

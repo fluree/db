@@ -106,6 +106,10 @@ impl From<RecordedTally> for TrackingTally {
             time: r.time,
             fuel: r.fuel,
             policy: r.policy,
+            // `policy_enforcement` is a read-path signal and is never set on a
+            // transaction tally, so it is deliberately absent from the recorded
+            // mirror — adding a field would shift every postcard byte offset.
+            policy_enforcement: None,
             reasoning: r.reasoning.map(Into::into),
         }
     }

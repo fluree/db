@@ -6,9 +6,32 @@
 //!
 //! Provides generic helpers to reduce duplication between parsing formats.
 
-use super::ast::UnresolvedExpression;
+use super::ast::{UnresolvedExpression, UnresolvedFilterValue};
 use super::error::{ParseError, Result};
 use std::sync::Arc;
+
+/// Reject a boolean-context (FILTER/HAVING) expression that is a bare
+/// non-boolean constant.
+///
+/// Expression evaluation treats non-bool constants as truthy, so a constant
+/// string or number silently turns the clause into a match-everything no-op —
+/// fail-open for any caller using it to narrow results. Boolean constants
+/// (`true`/`false`) stay allowed; they are explicit and behave as written.
+pub fn reject_constant_bool_expr(expr: &UnresolvedExpression, clause: &str) -> Result<()> {
+    let UnresolvedExpression::Const(value) = expr else {
+        return Ok(());
+    };
+    let rendered = match value {
+        UnresolvedFilterValue::Bool(_) => return Ok(()),
+        UnresolvedFilterValue::String(s) => format!("\"{s}\""),
+        UnresolvedFilterValue::Long(n) => n.to_string(),
+        UnresolvedFilterValue::Double(d) => d.to_string(),
+    };
+    Err(ParseError::InvalidFilter(format!(
+        "{clause} expression {rendered} is a constant and would match every row; \
+         use S-expression syntax referencing variables, e.g. (contains (lcase ?name) \"fred\")"
+    )))
+}
 
 /// Validate argument count and return error if it doesn't match expected count
 ///

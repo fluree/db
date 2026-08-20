@@ -113,7 +113,7 @@ async fn policy_class_survives_indexing() {
 
             let alice_opts = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
-                default_allow: false,
+                default_allow: Some(false),
                 ..Default::default()
             };
 
@@ -327,7 +327,7 @@ async fn policy_batched_join_lane_declines_index_only() {
 
             let alice_opts = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
-                default_allow: false,
+                default_allow: Some(false),
                 ..Default::default()
             };
             let policy_ctx = policy_builder::build_policy_context_from_opts(
@@ -459,12 +459,12 @@ async fn policy_count_respects_predicate_coverage() {
 
             let opts_allow = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
-                default_allow: true,
+                default_allow: Some(true),
                 ..Default::default()
             };
             let opts_deny = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
-                default_allow: false,
+                default_allow: Some(false),
                 ..Default::default()
             };
 
@@ -615,7 +615,7 @@ async fn policy_stats_count_by_predicate_uses_filtered_fallback() {
             // not the raw index count of 2.
             let alice_opts = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
-                default_allow: true,
+                default_allow: Some(true),
                 ..Default::default()
             };
             let policy_ctx = policy_builder::build_policy_context_from_opts(

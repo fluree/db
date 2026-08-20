@@ -1190,7 +1190,10 @@ SELECT ?x WHERE { ex:person-b ex:livesWith ?x }";
         1,
         "pragma owl2rl: expected derived symmetric edge, got {bindings:?}"
     );
-    assert_eq!(bindings[0]["x"]["value"], json!("ex:person-a"));
+    assert_eq!(
+        bindings[0]["x"]["value"],
+        json!("http://example.org/person-a")
+    );
 
     // Control: without the pragma only auto-RDFS applies — no symmetric edge.
     let without_pragma = "\

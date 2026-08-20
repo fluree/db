@@ -46,7 +46,7 @@ use fluree_db_r2rml::mapping::{
     TriplesMap,
 };
 use fluree_db_r2rml::materialize::{
-    expand_template, get_join_key_from_batch, materialize_object_from_batch,
+    canonical_join, expand_template, get_join_key_from_batch, materialize_object_from_batch,
     materialize_predicate_from_batch, materialize_subject_from_batch, parent_key_insert_keep_min,
     reverse_subject_template, RdfTerm,
 };
@@ -1184,12 +1184,15 @@ impl R2rmlScanOperator {
                 // fully before the next poll — acceptable, parents are small dims.)
                 ctx.check_cancelled()?;
                 if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
-                    let mut parent_join_cols: Vec<String> = rom
-                        .parent_columns()
-                        .into_iter()
-                        .map(std::string::ToString::to_string)
-                        .collect();
-                    parent_join_cols.sort();
+                    // MAJOR-1 (#1529 review): key the parent lookup through the SHARED
+                    // `canonical_join` (parent columns ordered deterministically, child
+                    // columns positionally aligned) so the index built here and the
+                    // child-side probe in `materialize_pom_object` agree on column
+                    // order. The old independent `parent_columns().sort()` matched the
+                    // probe only when the child-declared order happened to agree with
+                    // the parent-sorted order — a multi-column FK where they disagree
+                    // transposed the probe key and silently dropped every edge.
+                    let (parent_join_cols, _child_join_cols) = canonical_join(rom)?;
                     let lookup_key: LookupCacheKey =
                         (rom.parent_triples_map.clone(), parent_join_cols.clone());
 
@@ -1979,11 +1982,13 @@ fn materialize_pom_object(
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
 ) -> Result<Option<RdfTerm>> {
     if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
-        let child_columns: Vec<String> = rom
-            .child_columns()
-            .into_iter()
-            .map(std::string::ToString::to_string)
-            .collect();
+        // MAJOR-1 (#1529 review): resolve the join through the SHARED `canonical_join`
+        // so the child probe key is built in the SAME column order the parent index
+        // was keyed on (parent columns ordered deterministically, child columns
+        // positionally aligned). Reading `child_columns()` in declared order
+        // transposed the key whenever it disagreed with the parent-sorted order,
+        // silently dropping the FK edge as if it were dangling.
+        let (parent_join_cols, child_columns) = canonical_join(rom)?;
         // A null value in any join column means no FK reference at all → no triple
         // (both the scan and the shortcut agree; the shortcut relaxes only a
         // present-but-dangling FK, never a null one).
@@ -1992,27 +1997,20 @@ fn materialize_pom_object(
             Some(k) => k,
             None => return Ok(None),
         };
-        let mut parent_join_cols: Vec<String> = rom
-            .parent_columns()
-            .into_iter()
-            .map(std::string::ToString::to_string)
-            .collect();
-        parent_join_cols.sort();
-        let lookup_key = (rom.parent_triples_map.clone(), parent_join_cols);
+        let lookup_key = (rom.parent_triples_map.clone(), parent_join_cols.clone());
         // Trusted browse crawl: render the parent IRI from the child's own FK
-        // columns via the parent subject template — no parent scan. `child_key`
-        // is in `child_columns()` (declared) order, positionally aligned with
-        // `parent_columns()`; `build_ref_shortcut` only fires for a single-column
-        // FK, so this is one pair. Byte-identical to the scan path for a matched
-        // row (same template + `iri_escape`; the join guarantees the child FK
-        // value equals the parent key), differing only for a dangling FK (a
-        // templated IRI instead of no triple — the intended browse relaxation).
+        // columns via the parent subject template — no parent scan. `child_key` is in
+        // canonical (parent-aligned) order, so zip it with the SAME canonical parent
+        // columns; `build_ref_shortcut` only fires for a single-column FK, so this is
+        // one pair. Byte-identical to the scan path for a matched row (same template
+        // + `iri_escape`; the join guarantees the child FK value equals the parent
+        // key), differing only for a dangling FK (a templated IRI instead of no
+        // triple — the intended browse relaxation).
         if let Some(sc) = ref_shortcuts.get(&lookup_key) {
-            let values: HashMap<String, Option<String>> = rom
-                .parent_columns()
+            let values: HashMap<String, Option<String>> = parent_join_cols
                 .iter()
                 .zip(&child_key)
-                .map(|(pc, cv)| ((*pc).to_string(), Some(cv.clone())))
+                .map(|(pc, cv)| (pc.clone(), Some(cv.clone())))
                 .collect();
             return Ok(expand_template(&sc.subject_template, &values)
                 .ok()
@@ -3151,6 +3149,133 @@ mod tests {
         assert!(
             matches!(err, QueryError::MemoryBudgetExceeded { .. }),
             "fact-parent build must abort typed, got {err:?}"
+        );
+    }
+
+    /// A two-column Int64 batch, for composite-FK tests.
+    fn two_col_i64_batch(
+        (n0, v0): (&str, Vec<Option<i64>>),
+        (n1, v1): (&str, Vec<Option<i64>>),
+    ) -> ColumnBatch {
+        let schema = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: n0.to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: n1.to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 2,
+            },
+        ]));
+        ColumnBatch::new(schema, vec![Column::Int64(v0), Column::Int64(v1)]).unwrap()
+    }
+
+    #[test]
+    fn composite_fk_disagreeing_name_order_resolves_via_canonical_join() {
+        // MAJOR-1 (#1529 review): a composite FK whose child-declared column order
+        // disagrees with its parent-sorted order. Before the fix the operator keyed
+        // the parent index in parent-sorted order but probed it with the child key in
+        // DECLARED order — transposed, so the edge was silently dropped as dangling.
+        // With both sides routed through `canonical_join`, the edge resolves.
+        use fluree_db_r2rml::mapping::{
+            JoinCondition, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+        };
+
+        // Conditions ordered so that sorting by PARENT column reorders the pairs:
+        // (child c_hi -> parent z_zone), (child c_lo -> parent a_area).
+        let rom = RefObjectMap::with_conditions(
+            "#Zone",
+            vec![
+                JoinCondition::new("c_hi", "z_zone"),
+                JoinCondition::new("c_lo", "a_area"),
+            ],
+        );
+        // Canonical (pairs sorted by parent): parent [a_area, z_zone], child [c_lo, c_hi].
+        let (parent_cols, child_cols) = canonical_join(&rom).unwrap();
+        assert_eq!(
+            parent_cols,
+            vec!["a_area".to_string(), "z_zone".to_string()]
+        );
+        assert_eq!(child_cols, vec!["c_lo".to_string(), "c_hi".to_string()]);
+
+        let parent_tm = TriplesMap::new("#Zone", "zones")
+            .with_subject_template("http://ex/zone/{z_zone}_{a_area}");
+        // Parent row a_area=10, z_zone=99 -> subject http://ex/zone/99_10.
+        let parent_batch =
+            two_col_i64_batch(("a_area", vec![Some(10)]), ("z_zone", vec![Some(99)]));
+
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let lookup = Arc::new(
+            build_parent_lookup(&ctx, &parent_tm, &parent_cols, vec![parent_batch]).unwrap(),
+        );
+        let mut lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
+        lookups.insert(("#Zone".to_string(), parent_cols.clone()), lookup);
+        let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
+
+        // Child row c_hi=99 (-> z_zone), c_lo=10 (-> a_area); child-DECLARED order is
+        // [c_hi, c_lo], the transposition the old probe fell into.
+        let child_batch = two_col_i64_batch(("c_hi", vec![Some(99)]), ("c_lo", vec![Some(10)]));
+        let pom = PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/inZone"),
+            object_map: ObjectMap::RefObjectMap(rom),
+        };
+        let obj =
+            materialize_pom_object(&pom, &child_batch, 0, &lookups, &shortcuts).expect("no error");
+        assert_eq!(
+            obj,
+            Some(RdfTerm::iri("http://ex/zone/99_10")),
+            "composite FK with disagreeing name order must resolve via canonical_join"
+        );
+    }
+
+    #[test]
+    fn build_parent_lookup_keeps_min_subject_on_duplicate_join_key() {
+        // MAJOR-5 (#1529 review): build_parent_lookup's last-wins -> keep-min swap
+        // changes which parent a LIVE virtual query binds on a duplicate join key,
+        // yet reverting it left the whole suite green. Two parent rows share join key
+        // 1 but mint distinct subjects; keep-min must bind the lexicographically
+        // smaller IRI regardless of row order (rows are a-then-b, so last-wins would
+        // pick 'b' — this pins the keep-min semantics on the live query path).
+        let parent_tm = TriplesMap::new("#Customer", "customers")
+            .with_subject_template("http://ex/customer/{SID}");
+        let schema = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "JK".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "SID".to_string(),
+                field_type: FieldType::String,
+                nullable: false,
+                field_id: 2,
+            },
+        ]));
+        let batch = ColumnBatch::new(
+            schema,
+            vec![
+                Column::Int64(vec![Some(1), Some(1)]),
+                Column::String(vec![Some("a".to_string()), Some("b".to_string())]),
+            ],
+        )
+        .unwrap();
+
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let lookup =
+            build_parent_lookup(&ctx, &parent_tm, &["JK".to_string()], vec![batch]).unwrap();
+        assert_eq!(
+            lookup.get(&["1".to_string()][..]),
+            Some(&RdfTerm::iri("http://ex/customer/a")),
+            "keep-min must bind the lexicographically smaller subject on a dup join key"
         );
     }
 

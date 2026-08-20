@@ -71,6 +71,8 @@ mod inline_shapes;
 mod ledger;
 pub mod ledger_info;
 pub mod materialize;
+#[cfg(feature = "iceberg")]
+pub mod materialize_worker;
 mod merge;
 mod merge_preview;
 pub mod nameservice_query;
@@ -133,7 +135,7 @@ pub use dataset::{
     sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
     TimeSpec,
 };
-pub use error::{ApiError, BuilderError, BuilderErrors, Result};
+pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
 pub use fluree_db_core::storage::ledger_id_prefix_for_path;
 pub use fluree_db_core::RemoteObject;
@@ -205,10 +207,11 @@ pub use graph_source::{
     sample_column_values, sample_iceberg_rows, verify_storage_access, BrowseDepth, CatalogBrowse,
     CatalogMode, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider, GenerateOptions,
     GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig, IcebergCreateConfig,
-    IcebergCreateResult, PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult,
-    R2rmlMappingInput, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
-    StorageAccessReport, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride,
-    TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
+    IcebergCreateResult, MaterializeResult, PartitionFieldInfo, PersistedMaterializeJob,
+    R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode, SnapshotRef,
+    SortFieldInfo, StatsCompleteness, StatsTier, StorageAccessReport, StructuredR2rmlMapping,
+    SubjectStrategy, TableIdentifier, TableOverride, TablePreview, TableRef, TableSchema,
+    ValidateR2rmlResponse,
 };
 
 /// Secret-resolution injection point for `ConfigValue::SecretRef` in Iceberg
@@ -225,9 +228,17 @@ pub use fluree_db_iceberg::{SecretResolveError, SecretResolver};
 /// use site instead of silently diverging from a hard-copied literal.
 #[cfg(feature = "iceberg")]
 pub use fluree_db_iceberg::mor_guard::ALLOW_MOR_DELETES_ENV;
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::DeleteConvention;
 
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
+};
+
+#[cfg(feature = "iceberg")]
+pub use materialize_worker::{
+    MaterializeTrackingWorker, MaterializeWorkerConfig, MaterializeWorkerHandle,
+    MaterializeWorkerStats,
 };
 
 #[cfg(feature = "vector")]
@@ -249,7 +260,7 @@ pub use search::EmbeddedBm25SearchProvider;
 pub use fluree_db_indexer::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
     IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation, IndexStatusSnapshot,
-    IndexerConfig, IndexerHandle,
+    IndexerConfig, IndexerHandle, SweepPlan, SweepResult,
 };
 
 // Re-export commonly used types from child crates
@@ -337,7 +348,9 @@ pub use fluree_db_policy::{
 };
 
 // Re-export tracking types for query/transaction metrics
-pub use fluree_db_core::{FuelExceededError, PolicyStats, Tracker, TrackingOptions, TrackingTally};
+pub use fluree_db_core::{
+    FuelExceededError, PolicyEnforcement, PolicyStats, Tracker, TrackingOptions, TrackingTally,
+};
 
 /// Bundles the two R2RML provider references that always travel together.
 ///
@@ -598,6 +611,16 @@ impl fluree_db_nameservice::NameServiceLookup for NameServiceMode {
         fluree_db_nameservice::NameServiceError,
     > {
         self.reader().all_records().await
+    }
+
+    async fn heads(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<
+        Option<fluree_db_nameservice::LedgerHeads>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().heads(ledger_id).await
     }
 }
 
@@ -1558,6 +1581,7 @@ impl FlureeBuilder {
             path: None,
             aes256_key: None,
             address_identifier: None,
+            durability: None,
         };
 
         let publisher = PublisherConfig {

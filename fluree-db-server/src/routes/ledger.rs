@@ -12,7 +12,9 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use fluree_db_api::wire::{ReindexRequest, ReindexResponse};
+use fluree_db_api::wire::{
+    ReindexRequest, ReindexResponse, SweepPlanResponse, SweepRequest, SweepResponse,
+};
 use fluree_db_api::{
     ApiError, BranchDropReport, DropMode, DropNamedGraphReport, DropReport, DropStatus,
 };
@@ -358,6 +360,130 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
     }
     .instrument(span)
     .await
+}
+
+// =============================================================================
+// Storage sweep
+// =============================================================================
+
+/// Report which index artifacts are orphaned, without deleting them.
+///
+/// POST /fluree/sweep/plan
+///
+/// Runs the same exclusive hold as the destructive form, so the report
+/// reflects a quiesced ledger. In peer mode, forwards to the transaction
+/// server: the hold only excludes the in-process indexer, so it has to run
+/// where indexing does.
+pub async fn sweep_plan(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    sweep_plan_local(state, request).await.into_response()
+}
+
+async fn sweep_plan_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<Json<SweepPlanResponse>> {
+    let (req, span) = sweep_request_span(&state, request, "ledger:sweep-plan").await?;
+
+    async move {
+        let span = tracing::Span::current();
+        tracing::info!(status = "start", ledger = %req.ledger, "sweep plan requested");
+
+        let plan = state
+            .fluree
+            .plan_index_sweep(&req.ledger)
+            .await
+            .map_err(|e| {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:SweepFailed");
+                tracing::error!(error = %server_error, "sweep plan failed");
+                server_error
+            })?;
+
+        tracing::info!(
+            status = "success",
+            orphans = plan.orphans.len(),
+            scanned = plan.scanned,
+            "sweep plan complete"
+        );
+        Ok(Json(SweepPlanResponse::new(req.ledger, plan)))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Reclaim index artifacts that no index chain references.
+///
+/// POST /fluree/sweep
+///
+/// Covers every branch of the named ledger, because dict blobs are shared
+/// across branches. In peer mode, forwards to the transaction server.
+pub async fn sweep(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    sweep_local(state, request).await.into_response()
+}
+
+async fn sweep_local(state: Arc<AppState>, request: Request) -> Result<Json<SweepResponse>> {
+    let (req, span) = sweep_request_span(&state, request, "ledger:sweep").await?;
+
+    async move {
+        let span = tracing::Span::current();
+        tracing::info!(status = "start", ledger = %req.ledger, "sweep requested");
+
+        let result = state
+            .fluree
+            .sweep_index_storage(&req.ledger)
+            .await
+            .map_err(|e| {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:SweepFailed");
+                tracing::error!(error = %server_error, "sweep failed");
+                server_error
+            })?;
+
+        tracing::info!(
+            status = "success",
+            reclaimed = result.reclaimed,
+            failed = result.failures.len(),
+            "sweep complete"
+        );
+        Ok(Json(SweepResponse::new(req.ledger, result)))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Parse a sweep request body and build its tracing span.
+async fn sweep_request_span(
+    state: &Arc<AppState>,
+    request: Request,
+    operation: &'static str,
+) -> Result<(SweepRequest, tracing::Span)> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: SweepRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+    let span = create_request_span(
+        operation,
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.ledger),
+        None,
+        None,
+    );
+
+    Ok((req, span))
 }
 
 // =============================================================================

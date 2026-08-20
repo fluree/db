@@ -44,6 +44,75 @@ pub struct IcebergGsConfig {
     /// R2RML mapping source (format-agnostic, used in Phase 3)
     #[serde(default)]
     pub mapping: Option<MappingSource>,
+    /// Optional tombstone/delete convention. When set, materialization
+    /// classifies each source row as live or a delete (tombstone) and retracts
+    /// tombstoned subjects from the target ledger. Absent => additive (no
+    /// retraction), which is the legacy behavior.
+    #[serde(default)]
+    pub delete: Option<DeleteConvention>,
+    /// Optional ordering column for latest-by-key materialization. When set, the
+    /// rows of each subject within a refresh window are ordered by this column
+    /// (numeric/timestamp columns compare by value; others lexicographically) and
+    /// the **latest** row defines the subject — a whole-subject replace that
+    /// clears fields dropped in the newer revision, matching a
+    /// `ROW_NUMBER() … ORDER BY <col> DESC` latest-by-key view. Absent => the
+    /// last row in scan order wins and live revisions are merged per predicate
+    /// (legacy behavior; fields cleared in a later revision are NOT removed).
+    #[serde(default)]
+    pub order_by: Option<String>,
+}
+
+/// Declares how a delete is encoded in the source table's append log so the
+/// materializer can recognize "tombstone" rows and retract those subjects.
+///
+/// Append-only CDC sinks model a delete as an ordinary appended row carrying a
+/// marker. A row is a tombstone when the value of `column` is one of
+/// `deleted_values`. A `null` entry in `deleted_values` matches a NULL `column`
+/// value — the Debezium null-payload convention (used when the table has no
+/// explicit op column). Examples:
+/// - `{ column: "_op", deleted_values: ["d", "delete"] }` — value-match op column.
+/// - `{ column: "type", deleted_values: [null] }` — null-payload delete.
+/// - `{ column: "_op", deleted_values: ["d", null] }` — either.
+///
+/// The subject IRI of a tombstone row is derived by the SAME R2RML subject
+/// materializer as a live row, so the retracted IRI matches what was asserted.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct DeleteConvention {
+    /// Source column inspected to classify a row as a tombstone.
+    pub column: String,
+    /// Column values that mark a row as a delete (tombstone). A `null` element
+    /// matches a NULL `column` value (null-payload delete). Must be non-empty.
+    #[serde(default)]
+    pub deleted_values: Vec<Option<String>>,
+}
+
+impl DeleteConvention {
+    /// Validate the convention is usable: a column is named and at least one
+    /// delete value (possibly `null`) is declared.
+    pub fn validate(&self) -> Result<()> {
+        if self.column.trim().is_empty() {
+            return Err(IcebergError::Config(
+                "delete.column is required".to_string(),
+            ));
+        }
+        if self.deleted_values.is_empty() {
+            return Err(IcebergError::Config(
+                "delete.deleted_values must list at least one value (use null for a \
+                 null-payload delete)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Classify one row by its marker-column value (already converted to its
+    /// string form, or `None` when the column is null for that row): `true` if
+    /// that value — including `None` for a null — is in `deleted_values`.
+    pub fn is_tombstone(&self, column_value: Option<&str>) -> bool {
+        self.deleted_values
+            .iter()
+            .any(|d| d.as_deref() == column_value)
+    }
 }
 
 impl IcebergGsConfig {
@@ -81,7 +150,8 @@ impl IcebergGsConfig {
         if let CatalogConfig::Direct { table_location } = &self.catalog {
             let path = table_location
                 .trim_start_matches("s3://")
-                .trim_start_matches("s3a://");
+                .trim_start_matches("s3a://")
+                .trim_start_matches("file://");
             let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
             if segments.len() >= 3 {
                 // segments[0] = bucket, segments[1..n-2] = warehouse path,
@@ -116,11 +186,22 @@ impl IcebergGsConfig {
                         "catalog.table_location is required".to_string(),
                     ));
                 }
-                if !table_location.starts_with("s3://") && !table_location.starts_with("s3a://") {
+                let is_object_store =
+                    table_location.starts_with("s3://") || table_location.starts_with("s3a://");
+                // `file:///abs/path` (and the `file:/abs` single-slash variant) or a
+                // bare absolute path: a catalog-less LOCAL table, read from the
+                // filesystem with no object store or catalog service involved.
+                let is_local = crate::local_guard::is_local_location(table_location);
+                if !is_object_store && !is_local {
                     return Err(IcebergError::Config(format!(
-                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), got: {table_location}"
+                        "Direct catalog table_location must be an S3 URI (s3:// or s3a://), a \
+                         file:// URI, or an absolute local path, got: {table_location}"
                     )));
                 }
+                // Local locations are fail-closed: permitted only under an
+                // operator-allowlisted root. Refuse at creation rather than
+                // letting a disallowed path surface as a storage error later.
+                crate::local_guard::ensure_local_location_allowed(table_location)?;
                 // Validate table identifier can be derived from table_location
                 self.table_identifier()?;
                 // Vended credentials are not supported with Direct catalog
@@ -132,6 +213,10 @@ impl IcebergGsConfig {
                     ));
                 }
             }
+        }
+
+        if let Some(delete) = &self.delete {
+            delete.validate()?;
         }
 
         Ok(())
@@ -170,11 +255,15 @@ pub enum CatalogConfig {
 
     /// Metadata location is already known (e.g., from iceberg-rust commit).
     /// The engine reads `version-hint.text` from the metadata directory
-    /// to resolve the current metadata file.
+    /// to resolve the current metadata file, falling back to a
+    /// metadata-directory listing on backends that support it (local
+    /// filesystem).
     Direct {
-        /// S3 prefix for the table root directory.
-        /// Must contain a `metadata/` subdirectory with Iceberg metadata files.
-        /// Example: "s3://bucket/warehouse/my_namespace/my_table"
+        /// Table root directory: an S3 prefix
+        /// (`s3://bucket/warehouse/my_namespace/my_table`) or a LOCAL path
+        /// (`file:///data/warehouse/ns/table` or a bare absolute path) for
+        /// catalog-less tables on the local filesystem. Must contain a
+        /// `metadata/` subdirectory with Iceberg metadata files.
         table_location: String,
     },
 }
@@ -510,6 +599,8 @@ mod tests {
             table: TableConfig::Identifier("ns.table".to_string()),
             io: IoConfig::default(),
             mapping: None,
+            delete: None,
+            order_by: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -523,6 +614,8 @@ mod tests {
             table: TableConfig::Identifier("invalid".to_string()),
             io: IoConfig::default(),
             mapping: None,
+            delete: None,
+            order_by: None,
         };
         assert!(config.validate().is_err());
     }
@@ -539,6 +632,8 @@ mod tests {
                 ..Default::default()
             },
             mapping: None,
+            delete: None,
+            order_by: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -555,10 +650,71 @@ mod tests {
                 ..Default::default()
             },
             mapping: None,
+            delete: None,
+            order_by: None,
         };
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("S3 URI"));
+    }
+
+    #[test]
+    fn test_validate_direct_local_locations_are_fail_closed() {
+        // Catalog-less local tables: file:// URIs and bare absolute paths are
+        // recognized Direct locations, but reading the local filesystem is
+        // opt-in — without `FLUREE_ICEBERG_LOCAL_ROOTS` the config is refused
+        // with a message that names the switch, rather than accepted here and
+        // failing confusingly at the first scan.
+        for loc in [
+            "file:///data/warehouse/ns/table",
+            "file:/data/warehouse/ns/table",
+            "/data/warehouse/ns/table",
+        ] {
+            let config = IcebergGsConfig {
+                catalog: CatalogConfig::direct(loc),
+                table: TableConfig::Identifier(String::new()),
+                io: IoConfig {
+                    vended_credentials: false,
+                    ..Default::default()
+                },
+                mapping: None,
+                delete: None,
+                order_by: None,
+            };
+            if crate::local_guard::local_roots().is_none() {
+                let err = config
+                    .validate()
+                    .expect_err("local location must be refused while the allowlist is unset")
+                    .to_string();
+                assert!(
+                    err.contains(crate::local_guard::LOCAL_ROOTS_ENV),
+                    "refusal must name the switch that enables local tables: {err}"
+                );
+                assert!(
+                    !err.contains("must be an S3 URI"),
+                    "the location is recognized as local, not rejected as malformed: {err}"
+                );
+            }
+            // The table identifier derives from the path's last two segments,
+            // same as S3 locations — independent of the allowlist.
+            let id = config.table_identifier().unwrap();
+            assert_eq!(id.namespace, "ns");
+            assert_eq!(id.table, "table");
+        }
+
+        // Relative paths are still rejected.
+        let config = IcebergGsConfig {
+            catalog: CatalogConfig::direct("relative/path/table"),
+            table: TableConfig::Identifier(String::new()),
+            io: IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+            mapping: None,
+            delete: None,
+            order_by: None,
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -571,6 +727,8 @@ mod tests {
                 ..Default::default()
             },
             mapping: None,
+            delete: None,
+            order_by: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -578,6 +736,82 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Vended credentials"));
+    }
+
+    // ── Delete convention ──
+
+    fn dv(values: &[Option<&str>]) -> Vec<Option<String>> {
+        values
+            .iter()
+            .map(|v| v.map(std::string::ToString::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn test_delete_convention_validate() {
+        // value-match
+        assert!(DeleteConvention {
+            column: "_op".to_string(),
+            deleted_values: dv(&[Some("d"), Some("delete")]),
+        }
+        .validate()
+        .is_ok());
+        // null-payload (null entry)
+        assert!(DeleteConvention {
+            column: "type".to_string(),
+            deleted_values: dv(&[None]),
+        }
+        .validate()
+        .is_ok());
+        // empty column rejected
+        assert!(DeleteConvention {
+            column: String::new(),
+            deleted_values: dv(&[Some("d")]),
+        }
+        .validate()
+        .is_err());
+        // no delete values rejected
+        assert!(DeleteConvention {
+            column: "_op".to_string(),
+            deleted_values: vec![],
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn test_delete_convention_is_tombstone() {
+        let value = DeleteConvention {
+            column: "_op".to_string(),
+            deleted_values: dv(&[Some("d")]),
+        };
+        assert!(value.is_tombstone(Some("d")));
+        assert!(!value.is_tombstone(Some("c")));
+        assert!(!value.is_tombstone(None)); // null is NOT a delete unless listed
+
+        let null = DeleteConvention {
+            column: "type".to_string(),
+            deleted_values: dv(&[None]),
+        };
+        assert!(null.is_tombstone(None)); // null payload => tombstone
+        assert!(!null.is_tombstone(Some("Profile")));
+
+        // both: a value OR null marks a delete
+        let both = DeleteConvention {
+            column: "_op".to_string(),
+            deleted_values: dv(&[Some("d"), None]),
+        };
+        assert!(both.is_tombstone(Some("d")));
+        assert!(both.is_tombstone(None));
+        assert!(!both.is_tombstone(Some("u")));
+    }
+
+    #[test]
+    fn test_delete_convention_serde_default_absent() {
+        // A config without `delete` deserializes with delete == None (backward compat).
+        let json = r#"{"catalog":{"type":"direct","table_location":"s3://b/w/ns/t"},"table":""}"#;
+        let cfg = IcebergGsConfig::from_json(json).unwrap();
+        assert!(cfg.delete.is_none());
     }
 
     // ── Roundtrip serialization ──
@@ -594,6 +828,8 @@ mod tests {
             table: TableConfig::Identifier("ns.table".to_string()),
             io: IoConfig::default(),
             mapping: None,
+            delete: None,
+            order_by: None,
         };
 
         let json = original.to_json().unwrap();
@@ -612,6 +848,8 @@ mod tests {
                 ..Default::default()
             },
             mapping: None,
+            delete: None,
+            order_by: None,
         };
 
         let json = original.to_json().unwrap();

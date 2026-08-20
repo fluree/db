@@ -655,6 +655,119 @@ async fn policy_identity_filters_streamed_rows() {
     );
 }
 
+/// The streaming endpoint must answer "was this enforced?" the same way the
+/// buffered one does. Before the terminal `end` record carried it, a caller
+/// streaming a policy-filtered result had no signal at all — and the docs tell
+/// readers that absence means unenforced, so silence there was a false
+/// negative on exactly the question the surface exists to answer.
+#[tokio::test]
+async fn stream_end_record_reports_policy_enforcement() {
+    let (_tmp, state) = policy_state().await;
+    let app = build_router(state);
+    setup_policy_ledger(&app, "strm:pol-track").await;
+
+    let query = |identity: &str, meta: bool| {
+        let mut opts = json!({ "identity": identity, "default-allow": false });
+        if meta {
+            opts["meta"] = json!({ "policy": true });
+        }
+        json!({
+            "@context": { "ex": "http://example.org/" },
+            "opts": opts,
+            "select": ["?name"],
+            "where": [
+                {"@id": "?d", "@type": "ex:Doc"},
+                {"@id": "?d", "ex:name": "?name"}
+            ]
+        })
+    };
+
+    let end_record = |records: &[JsonValue]| -> JsonValue {
+        records
+            .iter()
+            .find(|r| r["type"] == "end")
+            .unwrap_or_else(|| panic!("stream must terminate with an end record: {records:?}"))
+            .clone()
+    };
+
+    // An identity whose policies grant it something: enforced, and the view
+    // set is not empty.
+    let resp = stream_jsonld(
+        &app,
+        "strm:pol-track",
+        &query("http://example.org/public-user", true),
+    )
+    .await;
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    let end = end_record(&records);
+    assert_eq!(
+        end["policy_enforcement"],
+        json!({"enforced": true, "denies_all_data": false}),
+        "end record must report enforcement; got: {end}"
+    );
+
+    // Same request without asking for policy tracking: the signal stays
+    // opt-in, exactly as on the buffered path.
+    let resp = stream_jsonld(
+        &app,
+        "strm:pol-track",
+        &query("http://example.org/public-user", false),
+    )
+    .await;
+    let (_status, _ct, records) = ndjson_records(resp).await;
+    let end = end_record(&records);
+    assert!(
+        end.get("policy_enforcement").is_none(),
+        "enforcement is opt-in via meta.policy; got: {end}"
+    );
+
+    // An identity with no policy class under a fail-closed default: no data
+    // flake could have been returned.
+    let resp = stream_jsonld(
+        &app,
+        "strm:pol-track",
+        &query("http://example.org/nobody", true),
+    )
+    .await;
+    let (_status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(
+        records.iter().filter(|r| r["type"] == "row").count(),
+        0,
+        "fail-closed identity streams no rows"
+    );
+    let end = end_record(&records);
+    assert_eq!(
+        end["policy_enforcement"],
+        json!({"enforced": true, "denies_all_data": true}),
+        "end record must distinguish total denial from an empty result; got: {end}"
+    );
+
+    // Anonymous: no policy context, so no enforcement is claimed and the
+    // record keeps the shape it had before this field existed.
+    let anon = json!({
+        "@context": { "ex": "http://example.org/" },
+        "opts": { "meta": { "policy": true } },
+        "select": ["?name"],
+        "where": [
+            {"@id": "?d", "@type": "ex:Doc"},
+            {"@id": "?d", "ex:name": "?name"}
+        ]
+    });
+    let resp = stream_jsonld(&app, "strm:pol-track", &anon).await;
+    let (_status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(
+        records.iter().filter(|r| r["type"] == "row").count(),
+        3,
+        "unenforced request streams every row"
+    );
+    let end = end_record(&records);
+    assert!(
+        end.get("policy_enforcement").is_none(),
+        "no policy context was built, so no enforcement is claimed; got: {end}"
+    );
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -822,4 +935,224 @@ async fn unknown_ledger_streams_error_terminal_or_4xx() {
         "missing ledger should not 200, got {}",
         resp.status()
     );
+}
+
+/// The streaming endpoint shares `ledger_scoped_sparql_dataset_spec` with
+/// `/query`, so it inherits the SPARQL §13.2 dataset semantics — and must
+/// surface the same advisory header on the one shape whose answer changed
+/// (azure-chat#50). Pre-fix this streamed 4 rows for the `GRAPH ?g` query
+/// (the ledger alias was a second named-graph key) and 1 row for the
+/// non-GRAPH query (the injected default graph).
+#[tokio::test]
+async fn sparql_from_named_dataset_semantics_stream() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:dsem").await;
+
+    let trig = "@prefix ex: <http://ex.org/> .\n\
+                ex:d1 ex:name \"D\" .\n\
+                <http://ex.org/g1> {\n\
+                  ex:s1 ex:name \"A\" .\n\
+                  ex:s2 ex:name \"B\" .\n\
+                }\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/upsert/strm:dsem")
+                .header("content-type", "application/trig")
+                .body(Body::from(trig))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trig upsert");
+
+    // GRAPH ?g over the one declared graph: one row per triple, no warning.
+    let resp = stream_sparql(
+        &app,
+        "strm:dsem",
+        "PREFIX ex: <http://ex.org/>\n\
+         SELECT ?g ?n FROM NAMED <http://ex.org/g1> WHERE { GRAPH ?g { ?s ex:name ?n } }",
+        None,
+    )
+    .await;
+    assert!(resp.headers().get("x-fdb-warning").is_none());
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 2);
+
+    // FROM NAMED with no FROM: empty default graph, and say so on the wire.
+    let resp = stream_sparql(
+        &app,
+        "strm:dsem",
+        "PREFIX ex: <http://ex.org/>\n\
+         SELECT ?n FROM NAMED <http://ex.org/g1> WHERE { ?s ex:name ?n }",
+        None,
+    )
+    .await;
+    let warning = resp
+        .headers()
+        .get("x-fdb-warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("streaming path must warn too");
+    assert!(warning.contains("FROM NAMED"), "{warning}");
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 0);
+}
+
+/// The streaming endpoints share the dataset-clause semantics of `/query` for
+/// JSON-LD too: a `fromNamed`-only body keeps its empty default graph on both
+/// the ledger-scoped and connection-scoped forms, and carries the advisory
+/// header. Pre-branch both streamed the ledger's default-graph row instead.
+#[tokio::test]
+async fn jsonld_from_named_dataset_semantics_stream() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:jdsem").await;
+
+    let trig = "@prefix ex: <http://ex.org/> .\n\
+                ex:d1 ex:name \"D\" .\n\
+                <http://ex.org/g1> {\n\
+                  ex:s1 ex:name \"A\" .\n\
+                }\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/upsert/strm:jdsem")
+                .header("content-type", "application/trig")
+                .body(Body::from(trig))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trig upsert");
+
+    let body = json!({
+        "@context": {"ex": "http://ex.org/"},
+        "fromNamed": {"g1": {"@id": "strm:jdsem", "@graph": "http://ex.org/g1"}},
+        "select": ["?n"],
+        "where": {"@id": "?s", "ex:name": "?n"}
+    });
+
+    // Ledger-scoped streaming form.
+    let resp = stream_jsonld(&app, "strm:jdsem", &body).await;
+    let warning = resp
+        .headers()
+        .get("x-fdb-warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("ledger-scoped streaming must warn");
+    assert!(warning.contains("fromNamed"), "{warning}");
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        records.iter().filter(|r| r["type"] == "row").count(),
+        0,
+        "empty default graph streams no rows"
+    );
+
+    // Connection-scoped streaming form (no path ledger).
+    let resp = stream_jsonld_connection(&app, &body).await;
+    let warning = resp
+        .headers()
+        .get("x-fdb-warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("connection streaming must warn too");
+    assert!(warning.contains("fromNamed"), "{warning}");
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 0);
+
+    // The named half still streams, and draws no warning.
+    let graph_body = json!({
+        "@context": {"ex": "http://ex.org/"},
+        "fromNamed": {"g1": {"@id": "strm:jdsem", "@graph": "http://ex.org/g1"}},
+        "select": ["?n"],
+        "where": [["graph", "g1", {"@id": "?s", "ex:name": "?n"}]]
+    });
+    let resp = stream_jsonld(&app, "strm:jdsem", &graph_body).await;
+    assert!(resp.headers().get("x-fdb-warning").is_none());
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 1);
+}
+
+/// PR #1631 review (stream_query.rs:115): the connection-scoped SPARQL
+/// streaming surface computed no advisory, so `FROM NAMED` with no `FROM`
+/// warned on `/v1/fluree/query` and on the ledger-scoped streaming route but
+/// was silent here — the surface where a caller is least likely to notice that
+/// a 200 carried fewer rows than they expected. All four SPARQL surfaces warn.
+#[tokio::test]
+async fn connection_sparql_from_named_only_warns_on_stream() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:cwarn").await;
+
+    let trig = "@prefix ex: <http://ex.org/> .\n\
+                ex:d1 ex:name \"D\" .\n\
+                <http://ex.org/g1> {\n\
+                  ex:s1 ex:name \"A\" .\n\
+                }\n";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/upsert/strm:cwarn")
+                .header("content-type", "application/trig")
+                .body(Body::from(trig))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "trig upsert");
+
+    // FROM NAMED with no FROM, matching outside GRAPH: empty default graph.
+    let resp = stream_sparql_connection(
+        &app,
+        "PREFIX ex: <http://ex.org/>\n\
+         SELECT ?n FROM NAMED <strm:cwarn> WHERE { ?s ex:name ?n }",
+        None,
+    )
+    .await;
+    let warning = resp
+        .headers()
+        .get("x-fdb-warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("connection-scoped SPARQL streaming must warn too");
+    assert!(warning.contains("FROM NAMED"), "{warning}");
+    // Route-neutral phrasing: on this route a clause IRI names a ledger, so the
+    // advisory must not tell the caller about "the ledger's" default graph.
+    assert!(
+        !warning.contains("ledger's default graph"),
+        "advisory must read correctly on the connection route: {warning}"
+    );
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 0);
+
+    // Everything inside GRAPH: correct, and nothing to advise about. On this
+    // route a clause IRI names a LEDGER, which resolves to that ledger's
+    // default graph — so `?g` binds the one declared name and yields the "D"
+    // triple, not g1's contents. (Selecting a graph *within* a ledger is the
+    // ledger-scoped route's job.)
+    let resp = stream_sparql_connection(
+        &app,
+        "PREFIX ex: <http://ex.org/>\n\
+         SELECT ?n FROM NAMED <strm:cwarn> WHERE { GRAPH ?g { ?s ex:name ?n } }",
+        None,
+    )
+    .await;
+    assert!(resp.headers().get("x-fdb-warning").is_none());
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(records.iter().filter(|r| r["type"] == "row").count(), 1);
 }

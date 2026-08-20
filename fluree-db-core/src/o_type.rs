@@ -90,7 +90,10 @@ impl OType {
     pub const XSD_DOUBLE: Self = Self(0x0010);
     /// `xsd:float`
     pub const XSD_FLOAT: Self = Self(0x0011);
-    /// `xsd:decimal` (inline f64 — overflow goes to NumBig arena via `NUM_BIG_OVERFLOW`).
+    /// `xsd:decimal`. Reserved: the indexer routes **every** typed
+    /// `xsd:decimal` to the NumBig arena under [`Self::NUM_BIG_OVERFLOW`]
+    /// (`resolver.rs`, `RawObject::DecimalStr` — there is no inline branch), so
+    /// no stored row carries this o_type.
     pub const XSD_DECIMAL: Self = Self(0x0012);
 
     // -- Temporal (various order-preserving encodings in o_key) --
@@ -189,6 +192,57 @@ impl OType {
     #[inline]
     pub const fn payload(self) -> u16 {
         self.0 & 0x3FFF
+    }
+
+    /// Whether `(o_type, o_key)` identifies an object term **graph-wide**.
+    ///
+    /// For almost every o_type it does: `o_key` is an inline value, a subject
+    /// dictionary id, or a handle into a graph-scoped arena, so two rows share
+    /// an `(o_type, o_key)` pair iff they carry the same object term.
+    ///
+    /// [`Self::NUM_BIG_OVERFLOW`] is the exception, and it is the whole reason
+    /// this predicate exists. Its `o_key` is a handle into a **per-predicate**
+    /// arena (`fluree-db-binary-index`, `arena::numbig` — "Per-predicate
+    /// equality-only arena") whose handles are allocated from 0 within each
+    /// `(g_id, p_id)`. The first big value under one predicate and the first
+    /// under another are both handle `0`, so the pair is an identity only once
+    /// `p_id` is fixed. Every `xsd:decimal` lands there unconditionally, as does
+    /// any `xsd:integer` too large for `i64`.
+    ///
+    /// Call this before using an `(o_type, o_key)` prefix as an object identity
+    /// in any whole-graph structure — a distinct count, a group key, a dedup
+    /// set. Per-predicate consumers are unaffected: their key already carries
+    /// the `p_id` that scopes the handle.
+    #[inline]
+    pub const fn o_key_is_globally_identifying(self) -> bool {
+        let mut i = 0;
+        while i < Self::NOT_GLOBALLY_IDENTIFYING.len() {
+            if self.0 == Self::NOT_GLOBALLY_IDENTIFYING[i].0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Every o_type whose `o_key` is scoped to something narrower than the
+    /// graph. Single source of truth for [`Self::o_key_is_globally_identifying`]
+    /// and [`Self::range_holds_non_globally_identifying`], so the point test and
+    /// the range test cannot drift apart.
+    const NOT_GLOBALLY_IDENTIFYING: [Self; 1] = [Self::NUM_BIG_OVERFLOW];
+
+    /// Whether the inclusive o_type range `[lo, hi]` can hold a row whose
+    /// `o_key` is not a graph-wide identity.
+    ///
+    /// Index keys lead with a big-endian `o_type`, so a leaflet's
+    /// `[first_key, last_key]` pair bounds every o_type it contains. This
+    /// answers the range form of [`Self::o_key_is_globally_identifying`]
+    /// without a caller having to know which o_types are the exceptions.
+    #[inline]
+    pub fn range_holds_non_globally_identifying(lo: Self, hi: Self) -> bool {
+        Self::NOT_GLOBALLY_IDENTIFYING
+            .iter()
+            .any(|t| lo.0 <= t.0 && t.0 <= hi.0)
     }
 
     // ── Constructors ───────────────────────────────────────────────────
@@ -649,6 +703,30 @@ mod tests {
             let ot = OType::from_u16(val);
             assert_eq!(ot.as_u16(), val);
         }
+    }
+
+    /// The point predicate and the range form share one exceptions list; this
+    /// pins that they agree, so a new non-identifying o_type added to the list
+    /// is answered by both.
+    #[test]
+    fn globally_identifying_point_and_range_agree() {
+        for &t in &OType::NOT_GLOBALLY_IDENTIFYING {
+            assert!(!t.o_key_is_globally_identifying(), "{t:?}");
+            assert!(OType::range_holds_non_globally_identifying(t, t));
+        }
+        // A range that straddles an exception reports it; one that stops short
+        // does not.
+        let ex = OType::NUM_BIG_OVERFLOW;
+        let below = OType::from_u16(ex.as_u16() - 1);
+        let above = OType::from_u16(ex.as_u16() + 1);
+        assert!(OType::range_holds_non_globally_identifying(below, above));
+        assert!(!OType::range_holds_non_globally_identifying(
+            OType::XSD_STRING,
+            below
+        ));
+        assert!(!OType::range_holds_non_globally_identifying(above, above));
+        assert!(below.o_key_is_globally_identifying());
+        assert!(above.o_key_is_globally_identifying());
     }
 
     #[test]

@@ -120,6 +120,8 @@ sysinfo = { workspace = true, optional = true }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tempfile = "3.19"
+# it_import_low_fd: the re-exec'd child lowers RLIMIT_NOFILE on itself.
+libc = "0.2"
 mimalloc.workspace = true
 fs2 = "0.4"
 # Used by import tests to produce .gz / .zst fixtures inline.
@@ -146,6 +148,29 @@ path = "tests/grp_graphsource.rs"
 [[test]]
 name = "grp_import"
 path = "tests/grp_import.rs"
+
+# Standalone (NOT in grp_import): re-execs itself and lowers RLIMIT_NOFILE
+# hard+soft in the child, which must not share a process with other tests.
+[[test]]
+name = "it_import_low_fd"
+path = "tests/it_import_low_fd.rs"
+
+# Standalone: end-to-end over a REAL local Iceberg table. Runs unconditionally
+# in CI against the committed fixture (tests/fixtures/iceberg/silver/people);
+# it sets FLUREE_ICEBERG_LOCAL_ROOTS itself, and FLUREE_LOCAL_ICEBERG_TABLE
+# optionally points it at a different table. Standalone because it writes
+# process env, which must not race other tests.
+[[test]]
+name = "it_iceberg_local_fs"
+path = "tests/it_iceberg_local_fs.rs"
+required-features = ["iceberg", "native"]
+
+# Standalone for the same reason: catalog-less WAREHOUSE-ROOT resolution through
+# every Direct entry point, against the committed fixture's parent directory.
+[[test]]
+name = "it_iceberg_warehouse_root"
+path = "tests/it_iceberg_warehouse_root.rs"
+required-features = ["iceberg", "native"]
 
 [[test]]
 name = "grp_index"
@@ -193,6 +218,33 @@ path = "tests/grp_transact.rs"
 name = "it_count_datatype_pin"
 path = "tests/it_count_datatype_pin.rs"
 
+# Own binary for the same reason (kill switch + routing assertions).
+[[test]]
+name = "it_fastpath_1652_regression"
+path = "tests/it_fastpath_1652_regression.rs"
+
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_datetime_component_presence"
+path = "tests/it_datetime_component_presence.rs"
+
+# Own binary: asserts fast-path routing via process-scoped tracing capture.
+[[test]]
+name = "it_exists_semijoin_correlation"
+path = "tests/it_exists_semijoin_correlation.rs"
+
+# Own binary: toggles the process-global fast-path kill switch AND asserts
+# fast-path routing, so it must not share a process with either.
+[[test]]
+name = "it_repeated_var_fast_path_guards"
+path = "tests/it_repeated_var_fast_path_guards.rs"
+
+# Own binary: toggles the process-global fast-path kill switch AND asserts
+# fast-path routing, so it must not share a process with either.
+[[test]]
+name = "it_distinct_object_numbig_gate"
+path = "tests/it_distinct_object_numbig_gate.rs"
+
 [[test]]
 name = "it_cyclic_bgp_novelty_pred"
 path = "tests/it_cyclic_bgp_novelty_pred.rs"
@@ -216,6 +268,13 @@ path = "tests/it_bm25_sync_scoping.rs"
 [[test]]
 name = "it_minmax_fast_path_fired"
 path = "tests/it_minmax_fast_path_fired.rs"
+
+# Standalone (not in grp_transact): asserts on the `upsert deletion subject
+# pre-check` tracing event via the thread-local span capture, so it must be the
+# only test in its process. Same convention as the span-capture tests above.
+[[test]]
+name = "it_upsert_skip_fires"
+path = "tests/it_upsert_skip_fires.rs"
 
 [[test]]
 name = "it_multi_graph_property_path"
@@ -375,6 +434,9 @@ harness = false
 [[bench]]
 name = "query_hot_whole_graph_agg"
 harness = false
+
+[[test]]
+name = "it_absent_subject_scan_narrowing"
 
 [lints]
 workspace = true

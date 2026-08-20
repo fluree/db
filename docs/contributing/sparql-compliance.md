@@ -430,6 +430,8 @@ SPARQL, JSON-LD query, and Cypher (`fluree-db-cypher`) all compile to the **same
 
 **Regression-test rule:** a compliance fix is not done when the W3C test goes green — it is done when the register entry is removed AND an equivalent JSON-LD test exists for behavior that JSON-LD can express.
 
+**Known corpus blind spot — CONSTRUCT result-graph serialization.** The W3C CONSTRUCT suites do run through the JSON-LD serializer (`query_handler.rs` formats the result with `to_construct`, then compares graphs for isomorphism), so a serializer defect is *reachable* by the suite — but the corpus contains no test where one subject carries the **same object under two different predicates**. A formatter that deduplicated objects per subject instead of per predicate therefore dropped a distinct triple while all 1,420 tests stayed green. Isomorphism comparison also cannot see a triple emitted twice, so neither direction of an RDF-set-semantics bug is corpus-guarded. Serialization changes that touch the CONSTRUCT/DESCRIBE graph path need engine-side regression tests regardless of a green suite: `fluree-graph-format/tests/construct_value_dedup.rs` (serializer alone) and the set-semantics block in `fluree-db-api/tests/it_query_construct.rs` (both graph serializations, novelty and indexed).
+
 ### Where to add parity tests
 
 | Language | Test files |

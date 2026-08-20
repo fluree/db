@@ -17,6 +17,10 @@ use fluree_db_server::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Best-effort raise of the open-file soft limit (macOS defaults to 256,
+    // which large imports exceed). Done before logging init; logged after.
+    let fd_raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();
+
     // 1. Parse CLI + env via clap (get both typed config and raw matches)
     let matches = ServerConfig::command().get_matches();
     let mut config = ServerConfig::from_arg_matches(&matches)?;
@@ -34,9 +38,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: {e}");
     }
 
+    // 3. Publish the Iceberg local-table allowlist into the environment the
+    //    guard reads. Done here so a value that arrived from the config file
+    //    (rather than `FLUREE_ICEBERG_LOCAL_ROOTS` directly) reaches the guard,
+    //    and before any graph source is built — the allowlist is captured on
+    //    first use.
+    if let Some(ref roots) = config.iceberg_local_roots {
+        // SAFETY: single-threaded startup, before any storage or scan is built.
+        std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", roots);
+    }
+
     // Initialize telemetry (logging + optional tracing)
     let telemetry_config = TelemetryConfig::with_server_config(&config);
     init_logging(&telemetry_config);
+    fluree_db_core::fd_limit::log_raise_outcome(&fd_raise);
 
     // Log startup info
     tracing::info!(

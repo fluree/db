@@ -96,6 +96,19 @@ pub async fn query_jsonld_formatted(
     Ok(result.to_jsonld_async(db.as_graph_db_ref()).await?)
 }
 
+/// Execute a SPARQL query and return formatted JSON-LD output (async formatting
+/// path). Lets tests assert named-graph reads via `GRAPH <g> { ... }`, which the
+/// JSON-LD/FQL default-graph `where` cannot express.
+pub async fn query_sparql_formatted(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &LedgerState,
+    sparql: &str,
+) -> fluree_db_api::Result<JsonValue> {
+    let db = graphdb_from_ledger(ledger);
+    let result = fluree.query(&db, sparql).await?;
+    Ok(result.to_jsonld_async(db.as_graph_db_ref()).await?)
+}
+
 /// Execute a JSON-LD query and format using a provided formatter config (async).
 pub async fn query_jsonld_format(
     fluree: &fluree_db_api::Fluree,

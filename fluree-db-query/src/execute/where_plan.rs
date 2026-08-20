@@ -1044,6 +1044,28 @@ fn apply_values(
     operator
 }
 
+/// Split a block's VALUES into those that can seed a same-subject star and the
+/// rest, which must stay behind the triples.
+///
+/// A VALUES binding the star's subject constrains every triple in it at once, so
+/// seeding hands the star a bound driving set. Anything else — a VALUES binding
+/// only a leaf object var, or sharing no variable with the star at all — would
+/// seed a cartesian product instead, so it defers.
+///
+/// The caller only reaches this for a star (`is_property_join`), which guarantees
+/// every triple shares the first triple's subject var.
+fn split_values_seeding_star(
+    values: Vec<ValuesPattern>,
+    triples: &[TriplePattern],
+) -> (Vec<ValuesPattern>, Vec<ValuesPattern>) {
+    let Some(subject) = triples.first().and_then(|tp| tp.s.as_var()) else {
+        return (Vec::new(), values);
+    };
+    values
+        .into_iter()
+        .partition(|vp| vp.vars.contains(&subject))
+}
+
 /// Partition filters into those eligible for inline evaluation and those still waiting.
 ///
 /// Filters consumed by pushdown are silently dropped. Filters whose required
@@ -1783,6 +1805,144 @@ fn elide_redundant_type_filters(
     )
 }
 
+/// The constant term a single-row VALUES cell stands for, when it is a reference.
+///
+/// Only reference bindings convert: a literal cell would have to reproduce the
+/// datatype/language matching rules that `TriplePattern::dtc` and the scan layer
+/// apply to `Term::Value`, and getting that subtly wrong changes results rather
+/// than timings.
+fn values_cell_as_ref_term(binding: &crate::binding::Binding) -> Option<Term> {
+    match binding {
+        crate::binding::Binding::Sid { sid, .. } => Some(Term::Sid(sid.clone())),
+        crate::binding::Binding::IriMatch { iri, .. } => Some(Term::Iri(iri.clone())),
+        _ => None,
+    }
+}
+
+/// Substitute a single-row VALUES' IRI into the object position of the triples
+/// it constrains, keeping the VALUES pattern itself.
+///
+/// `VALUES ?o { <iri> }` *is* the constant `<iri>` — one row, one binding — so a
+/// sibling `?s <p> ?o` is the same pattern as `?s <p> <iri>`. Only the constant
+/// form narrows anything, though: a VALUES binding a leaf object var is deferred
+/// above the star (see [`split_values_seeding_star`] and
+/// [`build_property_join_block`]), so `PropertyJoinOperator` drives off whatever
+/// else is bound, drains that predicate's whole extent, and only then does the
+/// one-row VALUES filter it. Measured on a 200k-claim ledger: 54 ms versus 0.0 ms
+/// for the same query with the IRI written inline, and 240 ms versus 0.1 ms once
+/// the star widens to five predicates.
+///
+/// The VALUES stays in the list, so the variable is still bound for projection,
+/// FILTERs, and later patterns — it just no longer has to do the narrowing.
+///
+/// Deliberately narrow, because each relaxation reaches code with its own gates:
+/// - **one row only** — a multi-row VALUES is a set, not a constant;
+/// - **reference cells only** — see [`values_cell_as_ref_term`];
+/// - **object position only** — a var used as subject or predicate keeps today's
+///   behaviour ([`split_values_seeding_star`] already seeds the subject case, and
+///   the fixed-subject scan fast paths carry their own absent-subject gates);
+/// - **one inner-join region only** — substitution never crosses a compound
+///   pattern such as UNION/OPTIONAL/MINUS/EXISTS/NOT EXISTS/subquery. MINUS in
+///   particular changes meaning when a shared variable stops appearing before
+///   it; keeping each VALUES and rewritten triple in the same contiguous
+///   Triple/VALUES/BIND/FILTER region preserves that variable-domain boundary.
+///
+/// Returns `None` when nothing was substituted, so callers keep borrowing the
+/// original slice.
+fn inline_singleton_values_objects(patterns: &[Pattern]) -> Option<Vec<Pattern>> {
+    // Preserve the existing subject/predicate seeding paths everywhere in this
+    // list. This is intentionally more conservative than checking per region:
+    // one variable keeps one planning role throughout the enclosing group.
+    let mut non_object_vars: HashSet<VarId> = HashSet::new();
+    for p in patterns {
+        if let Pattern::Triple(tp) = p {
+            if let Ref::Var(v) = &tp.s {
+                non_object_vars.insert(*v);
+            }
+            if let Ref::Var(v) = &tp.p {
+                non_object_vars.insert(*v);
+            }
+        }
+    }
+
+    // Coupled with the order-sensitive classification in
+    // `planner::reorder_patterns` (see its `order_sensitive` match): a
+    // variable-free FILTER and a `BIND(BNODE(..))` are ordered against
+    // everything their predecessors produce, yet both are inner-join members
+    // here. Folding is safe for them today because the rewrite REPLACES ONLY
+    // triple objects and keeps every pattern — the retained one-row VALUES goes
+    // on producing its variable, so no preceding-produced set shrinks. A new
+    // order-sensitive classification that is also an inner-join member would
+    // break that, which `fold_survives_a_variable_free_filter_in_its_region`
+    // pins.
+    let is_inner_join_member = |p: &Pattern| {
+        matches!(
+            p,
+            Pattern::Triple(_) | Pattern::Values { .. } | Pattern::Bind { .. } | Pattern::Filter(_)
+        )
+    };
+
+    let mut replacements: Vec<(usize, Term)> = Vec::new();
+    let mut start = 0;
+    while start < patterns.len() {
+        if !is_inner_join_member(&patterns[start]) {
+            start += 1;
+            continue;
+        }
+
+        let mut end = start + 1;
+        while end < patterns.len() && is_inner_join_member(&patterns[end]) {
+            end += 1;
+        }
+
+        // Constants are local to this contiguous inner-join region. In
+        // particular, a VALUES after MINUS cannot rewrite a triple before the
+        // MINUS: doing so removes the shared variable from the anti-join's
+        // order-preservation set before the VALUES has bound it.
+        let mut constants: HashMap<VarId, Term> = HashMap::new();
+        for p in &patterns[start..end] {
+            if let Pattern::Values { vars, rows } = p {
+                let [row] = rows.as_slice() else { continue };
+                for (var, cell) in vars.iter().zip(row) {
+                    if !non_object_vars.contains(var) {
+                        if let Some(term) = values_cell_as_ref_term(cell) {
+                            constants.insert(*var, term);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (offset, p) in patterns[start..end].iter().enumerate() {
+            let Pattern::Triple(tp) = p else { continue };
+            if tp.dtc.is_some() {
+                continue;
+            }
+            let Some(object_var) = tp.o.as_var() else {
+                continue;
+            };
+            if let Some(term) = constants.get(&object_var) {
+                replacements.push((start + offset, term.clone()));
+            }
+        }
+
+        start = end;
+    }
+
+    if replacements.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = patterns.to_vec();
+    for (idx, term) in replacements {
+        let Pattern::Triple(tp) = &mut rewritten[idx] else {
+            unreachable!("replacement indices only come from triple patterns")
+        };
+        tp.o = term;
+    }
+    Some(rewritten)
+}
+
 /// Build WHERE operators with an optional initial seed operator and explicit needed-vars + GROUP BY keys.
 ///
 /// Handles all pattern types: Triple, VALUES, BIND, FILTER, OPTIONAL, UNION,
@@ -1847,6 +2007,12 @@ pub fn build_where_operators_seeded_with_needed(
     // removes no rows when stats prove the predicate's subjects are all `C`.
     let elided_storage = elide_redundant_type_filters(patterns, stats.as_deref(), planning);
     let patterns: &[Pattern] = elided_storage.as_deref().unwrap_or(patterns);
+
+    // Within each inner-join region, fold a single-row VALUES' IRI into the
+    // object position it constrains, so reordering and the scan layer both see
+    // a constant instead of a variable the VALUES wrapper only filters later.
+    let inlined_storage = inline_singleton_values_objects(patterns);
+    let patterns: &[Pattern] = inlined_storage.as_deref().unwrap_or(patterns);
 
     // Apply generalized pattern reordering upfront for all pattern lists.
     //
@@ -1931,22 +2097,35 @@ pub fn build_where_operators_seeded_with_needed(
                     // Preserve property-join eligibility when a top-level VALUES precedes
                     // a pure star block. Wrapping VALUES first seeds the schema/operator and
                     // prevents `build_triple_operators()` from taking the property-join path.
-                    let values_after_triples = operator.is_none()
+                    //
+                    // A VALUES binding the star's SUBJECT is the exception: it constrains
+                    // every triple at once, so seeding it lets `build_scan_or_join()` pick a
+                    // bound-driven lane — batched-subject-exists, MembershipJoin, or HashJoin
+                    // — instead of draining the whole class or predicate extent and filtering
+                    // afterwards. Every other VALUES still defers, including one binding only
+                    // a leaf object var: seeding that costs the fusion for the whole star
+                    // without constraining the driving scan.
+                    //
+                    // The split is per-VALUES because the hazard is. A block may legally hold
+                    // both kinds, and seeding a disconnected VALUES alongside a subject-bound
+                    // one would reintroduce the cartesian seed the deferral exists to prevent.
+                    let (seed_values, deferred_values) = if operator.is_none()
                         && !block.values.is_empty()
                         && block.triples.len() >= 2
-                        && is_property_join(&block.triples);
+                        && is_property_join(&block.triples)
+                    {
+                        split_values_seeding_star(block.values, &block.triples)
+                    } else {
+                        (block.values, Vec::new())
+                    };
 
                     // The deferred VALUES wrapper joins on its vars AFTER the triple
                     // operators run, so those vars must survive schema pruning even
                     // when the SELECT list doesn't mention them.
-                    if values_after_triples {
-                        if let Some(rwv) = augmented_rwv.as_mut() {
-                            for vp in &block.values {
-                                for v in &vp.vars {
-                                    if !rwv.contains(v) {
-                                        rwv.push(*v);
-                                    }
-                                }
+                    if let Some(rwv) = augmented_rwv.as_mut() {
+                        for v in deferred_values.iter().flat_map(|vp| &vp.vars) {
+                            if !rwv.contains(v) {
+                                rwv.push(*v);
                             }
                         }
                     }
@@ -1962,17 +2141,13 @@ pub fn build_where_operators_seeded_with_needed(
                         stats: stats.as_deref(),
                     };
                     let mut built = build_triple_operators(
-                        if values_after_triples {
-                            operator.take()
-                        } else {
-                            apply_values(operator.take(), block.values.clone())
-                        },
+                        apply_values(operator.take(), seed_values),
                         &block.triples,
                         &HashMap::new(),
                         &ctx,
                     )?;
-                    if values_after_triples {
-                        built = apply_values(Some(built), block.values)
+                    if !deferred_values.is_empty() {
+                        built = apply_values(Some(built), deferred_values)
                             .expect("apply_values should preserve operator");
                     }
                     operator = Some(built);
@@ -3260,6 +3435,515 @@ mod tests {
         assert!(
             schema.contains(&VarId(9)),
             "expected VALUES var (?queryVec) to appear in schema"
+        );
+    }
+
+    /// Operator names of a linear plan, root first.
+    fn plan_ops(node: &crate::plan_node::PlanNode) -> Vec<&str> {
+        let mut ops = vec![node.op.as_str()];
+        for edge in &node.children {
+            ops.extend(plan_ops(&edge.node));
+        }
+        ops
+    }
+
+    /// Regression (#51): a VALUES sharing a variable with the star must seed it.
+    ///
+    /// Deferring it left `?s` unbound when the star was planned, so the driver
+    /// race picked the bound-object `rdf:type` triple and drained the entire
+    /// class extent, only for the deferred VALUES to discard all but one row —
+    /// O(|:Thing|) work for an O(1) lookup. Seeding puts the bound subject at
+    /// the base of the plan, where the join lanes can probe for it directly.
+    #[test]
+    fn test_connected_values_seeds_type_anchored_star() {
+        use crate::binding::Binding;
+
+        // VALUES ?s { <ex:thing1> } . ?s a <ex:Thing> ; <ex:name> ?n
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(0)],
+                rows: vec![vec![Binding::iri("ex:thing1")]],
+            },
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from("ex:Thing")),
+            )),
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        assert_ne!(
+            ops.first(),
+            Some(&"ValuesOperator"),
+            "a subject-bound VALUES must seed the star, not filter it afterwards: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&"PropertyJoinOperator"),
+            "the star must not fuse into a driver scan of the class extent: {ops:?}"
+        );
+        assert!(
+            ops.contains(&"ValuesOperator"),
+            "the VALUES must still be applied somewhere in the plan: {ops:?}"
+        );
+    }
+
+    /// A VALUES binding only a leaf OBJECT var must not seed.
+    ///
+    /// It constrains one predicate of the star, not the driving scan, so seeding
+    /// it buys nothing and costs the fusion — a wide star becomes one join per
+    /// predicate. The #51 evidence (the arity sweep) only covers the
+    /// subject-connected shape, so this shape keeps the pre-#51 plan.
+    #[test]
+    fn test_object_var_values_keeps_property_join() {
+        use crate::binding::Binding;
+
+        // VALUES ?n { "x" } . ?s a <ex:Thing> ; <ex:name> ?n
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::lit(
+                    FlakeValue::String("x".into()),
+                    Sid::new(1, "string"),
+                )]],
+            },
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from("ex:Thing")),
+            )),
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        assert_eq!(
+            ops.first(),
+            Some(&"ValuesOperator"),
+            "an object-var VALUES must stay above the star: {ops:?}"
+        );
+        assert!(
+            ops.contains(&"PropertyJoinOperator"),
+            "the star must keep its fusion when nothing binds its subject: {ops:?}"
+        );
+    }
+
+    /// A block may hold both kinds of VALUES; only the subject-binding one seeds.
+    ///
+    /// The gate is per-VALUES because the hazard is. Seeding the whole slice
+    /// because one member happens to be connected would put the disconnected
+    /// VALUES at the base of the plan — the cartesian seed the deferral exists
+    /// to prevent.
+    #[test]
+    fn test_mixed_values_seeds_only_the_subject_binding_one() {
+        use crate::binding::Binding;
+
+        // VALUES ?s { <ex:thing1> } VALUES ?q { 0 } . ?s a <ex:Thing> ; <ex:name> ?n
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(0)],
+                rows: vec![vec![Binding::iri("ex:thing1")]],
+            },
+            Pattern::Values {
+                vars: vec![VarId(9)],
+                rows: vec![vec![Binding::lit(FlakeValue::Long(0), Sid::new(2, "long"))]],
+            },
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from("ex:Thing")),
+            )),
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        assert_eq!(
+            ops.first(),
+            Some(&"ValuesOperator"),
+            "the disconnected VALUES must stay above the star: {ops:?}"
+        );
+        assert_eq!(
+            ops.iter().rev().nth(1),
+            Some(&"ValuesOperator"),
+            "the subject-bound VALUES must seed from the base of the plan: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&"PropertyJoinOperator"),
+            "the seeded star must not drain the class extent: {ops:?}"
+        );
+    }
+
+    // --- single-row VALUES object inlining --------------------------------
+
+    fn object_terms(patterns: &[Pattern]) -> Vec<Term> {
+        patterns
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::Triple(tp) => Some(tp.o.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A one-row IRI VALUES becomes a constant object, and the VALUES stays.
+    #[test]
+    fn singleton_iri_values_inlines_into_object_position() {
+        use crate::binding::Binding;
+
+        // VALUES ?sub { <ex:sub42> } . ?claim <relSubject> ?sub . ?claim <dimension> ?dim
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "sub42"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "relSubject", VarId(1))),
+            Pattern::Triple(make_pattern(VarId(0), "dimension", VarId(2))),
+        ];
+
+        let rewritten = inline_singleton_values_objects(&patterns).expect("should inline");
+        assert_eq!(
+            object_terms(&rewritten),
+            vec![Term::Sid(Sid::new(13, "sub42")), Term::Var(VarId(2))],
+            "only the VALUES-bound object becomes a constant"
+        );
+        assert!(
+            matches!(rewritten[0], Pattern::Values { .. }),
+            "the VALUES must stay so the variable is still bound downstream"
+        );
+    }
+
+    /// A var used as a subject keeps its variable form everywhere, so the
+    /// existing subject-seeding path (`split_values_seeding_star`) still fires.
+    #[test]
+    fn singleton_values_skips_var_used_as_subject() {
+        use crate::binding::Binding;
+
+        // VALUES ?s { <ex:thing1> } . ?s <name> ?n . ?other <friend> ?s
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(0)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "thing1"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+            Pattern::Triple(make_pattern(VarId(2), "friend", VarId(0))),
+        ];
+
+        assert!(inline_singleton_values_objects(&patterns).is_none());
+    }
+
+    /// Multi-row VALUES is a set, not a constant.
+    #[test]
+    fn multi_row_values_is_not_inlined() {
+        use crate::binding::Binding;
+
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![
+                    vec![Binding::sid(Sid::new(13, "a"))],
+                    vec![Binding::sid(Sid::new(13, "b"))],
+                ],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "relSubject", VarId(1))),
+        ];
+
+        assert!(inline_singleton_values_objects(&patterns).is_none());
+    }
+
+    /// Literal cells keep the datatype/language matching rules of the scan
+    /// layer instead of being folded into a bare constant term.
+    #[test]
+    fn literal_and_undef_values_cells_are_not_inlined() {
+        use crate::binding::Binding;
+
+        let literal = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::lit(
+                    FlakeValue::String("x".into()),
+                    Sid::new(1, "string"),
+                )]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+        ];
+        assert!(inline_singleton_values_objects(&literal).is_none());
+
+        let undef = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::Unbound]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
+        ];
+        assert!(inline_singleton_values_objects(&undef).is_none());
+    }
+
+    /// A VALUES written AFTER an order-sensitive pattern must not fold.
+    ///
+    /// `reorder_patterns` places MINUS/EXISTS/NOT EXISTS on the set of vars
+    /// their predecessors PRODUCE. Folding shrinks a triple's produced set, so
+    /// a trailing VALUES would let the anti-join float ahead of the VALUES that
+    /// binds the shared variable and degenerate into a disjoint-domain no-op.
+    #[test]
+    fn values_after_an_order_sensitive_pattern_is_not_folded() {
+        use crate::binding::Binding;
+
+        let values = || Pattern::Values {
+            vars: vec![VarId(1)],
+            rows: vec![vec![Binding::sid(Sid::new(13, "brian"))]],
+        };
+        let inner = || vec![Pattern::Triple(make_pattern(VarId(3), "friend", VarId(1)))];
+
+        for blocker in [
+            Pattern::Minus(inner()),
+            Pattern::Exists(inner()),
+            Pattern::NotExists(inner()),
+        ] {
+            let patterns = vec![
+                Pattern::Triple(make_pattern(VarId(0), "friend", VarId(1))),
+                blocker.clone(),
+                values(),
+            ];
+            assert!(
+                inline_singleton_values_objects(&patterns).is_none(),
+                "a VALUES behind {blocker:?} must not fold"
+            );
+        }
+    }
+
+    /// A compound-pattern boundary limits substitution; it does not disable
+    /// independent regions that follow it.
+    #[test]
+    fn values_after_minus_only_folds_triples_in_its_own_region() {
+        use crate::binding::Binding;
+
+        let patterns = vec![
+            Pattern::Triple(make_pattern(VarId(0), "friend", VarId(1))),
+            Pattern::Minus(vec![Pattern::Triple(make_pattern(
+                VarId(3),
+                "blocked",
+                VarId(1),
+            ))]),
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "brian"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(4), "author", VarId(1))),
+        ];
+
+        let rewritten = inline_singleton_values_objects(&patterns).expect("later region folds");
+        assert_eq!(
+            object_terms(&rewritten),
+            vec![Term::Var(VarId(1)), Term::Sid(Sid::new(13, "brian"))],
+            "the pre-MINUS triple keeps the shared var; only the post-MINUS triple folds"
+        );
+    }
+
+    /// The same shapes DO fold when the VALUES comes first: its own
+    /// `produced_vars` keeps the variable in the anti-join's ordering set.
+    #[test]
+    fn values_before_an_order_sensitive_pattern_still_folds() {
+        use crate::binding::Binding;
+
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "brian"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "friend", VarId(1))),
+            Pattern::Minus(vec![Pattern::Triple(make_pattern(
+                VarId(3),
+                "friend",
+                VarId(1),
+            ))]),
+        ];
+
+        let rewritten = inline_singleton_values_objects(&patterns).expect("should fold");
+        assert_eq!(
+            object_terms(&rewritten),
+            vec![Term::Sid(Sid::new(13, "brian"))],
+            "the required triple folds"
+        );
+        let Pattern::Minus(inner) = &rewritten[2] else {
+            panic!("MINUS must survive the rewrite");
+        };
+        assert_eq!(
+            object_terms(inner),
+            vec![Term::Var(VarId(1))],
+            "the MINUS group keeps sharing the variable"
+        );
+    }
+
+    /// A variable-free FILTER sits in the fold's region while
+    /// `planner::reorder_patterns` treats it as order-sensitive, ordering it
+    /// against everything produced before it. The fold must keep firing (it is
+    /// a row-independent predicate, so nothing about it depends on the object
+    /// term) AND must leave the VALUES pattern in place — the retained VALUES
+    /// is the whole reason the coupling is benign, because it goes on producing
+    /// the variable that the ordering set is built from.
+    ///
+    /// If a future order-sensitive classification is added that IS an
+    /// inner-join member, this pin is the one that should be revisited: see the
+    /// comment on `is_inner_join_member`.
+    #[test]
+    fn fold_survives_a_variable_free_filter_in_its_region() {
+        use crate::binding::Binding;
+        use crate::ir::Expression;
+        use fluree_db_core::FlakeValue;
+
+        // `FILTER(true)` references no variable, so `reorder_patterns` marks it
+        // order-sensitive and pins it against its predecessors' produced vars.
+        let variable_free_filter = Pattern::Filter(Expression::Const(FlakeValue::Boolean(true)));
+        assert!(
+            variable_free_filter.referenced_vars().is_empty(),
+            "the pinned coupling only applies to a FILTER with no variables"
+        );
+
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "brian"))]],
+            },
+            variable_free_filter,
+            Pattern::Triple(make_pattern(VarId(0), "friend", VarId(1))),
+        ];
+
+        let rewritten = inline_singleton_values_objects(&patterns)
+            .expect("a variable-free FILTER must not block the fold");
+        assert_eq!(
+            object_terms(&rewritten),
+            vec![Term::Sid(Sid::new(13, "brian"))],
+            "the triple still folds across the filter"
+        );
+        assert_eq!(
+            rewritten.len(),
+            patterns.len(),
+            "the rewrite replaces triple objects only; it never drops a pattern"
+        );
+        assert!(
+            matches!(&rewritten[0], Pattern::Values { vars, rows }
+                if vars == &[VarId(1)] && rows.len() == 1),
+            "the VALUES must survive: it keeps producing the variable that the \
+             order-sensitive FILTER is ordered against"
+        );
+        assert!(
+            matches!(&rewritten[1], Pattern::Filter(_)),
+            "the FILTER must survive in place"
+        );
+    }
+
+    /// Nested groups are left alone: MINUS changes meaning when a shared
+    /// variable stops appearing in it.
+    #[test]
+    fn singleton_values_does_not_reach_into_nested_groups() {
+        use crate::binding::Binding;
+
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::sid(Sid::new(13, "sub42"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "relSubject", VarId(1))),
+            Pattern::Minus(vec![Pattern::Triple(make_pattern(
+                VarId(3),
+                "blocked",
+                VarId(1),
+            ))]),
+        ];
+
+        let rewritten = inline_singleton_values_objects(&patterns).expect("should inline");
+        let Pattern::Minus(inner) = &rewritten[2] else {
+            panic!("MINUS must survive the rewrite");
+        };
+        assert_eq!(
+            object_terms(inner),
+            vec![Term::Var(VarId(1))],
+            "the MINUS group must keep sharing the variable"
+        );
+    }
+
+    /// Neither VALUES binds the star's subject, so both defer.
+    ///
+    /// `{ VALUES ?a {..} VALUES ?b {..} ?s :p ?a . ?s :q ?r }` — legal SPARQL
+    /// where `?a` is a leaf object var and `?b` shares nothing. Keying the gate
+    /// on "any shared var" seeded both, putting the disconnected `?b` at the
+    /// base of the plan.
+    #[test]
+    fn test_values_sharing_only_object_vars_all_defer() {
+        use crate::binding::Binding;
+
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::iri("ex:a1")]],
+            },
+            Pattern::Values {
+                vars: vec![VarId(9)],
+                rows: vec![vec![Binding::iri("ex:b1")]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "p", VarId(1))),
+            Pattern::Triple(make_pattern(VarId(0), "q", VarId(2))),
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        assert_ne!(
+            ops.iter().rev().nth(1),
+            Some(&"ValuesOperator"),
+            "no VALUES binds the subject, so none may seed the plan's base: {ops:?}"
+        );
+        assert_eq!(
+            ops.last(),
+            Some(&"DatasetOperator"),
+            "the star should still drive its own scan: {ops:?}"
+        );
+    }
+
+    /// Companion to `test_connected_values_seeds_type_anchored_star`: the
+    /// disjointness gate must not disturb a VALUES the star cannot consume.
+    ///
+    /// Same vector-search shape as
+    /// `test_values_does_not_block_property_join_schema_order`, asserted on the
+    /// operator tree rather than on schema order: seeding `?queryVec` here would
+    /// only cross-product the star, so the VALUES stays at the root.
+    #[test]
+    fn test_disconnected_values_stays_deferred_above_star() {
+        use crate::binding::Binding;
+
+        // VALUES ?queryVec { 0 } . ?article :date ?date ; :vec ?vec ; :title ?title
+        let patterns = vec![
+            Pattern::Values {
+                vars: vec![VarId(9)],
+                rows: vec![vec![Binding::lit(FlakeValue::Long(0), Sid::new(2, "long"))]],
+            },
+            Pattern::Triple(make_pattern(VarId(0), "date", VarId(1))),
+            Pattern::Triple(make_pattern(VarId(0), "vec", VarId(2))),
+            Pattern::Triple(make_pattern(VarId(0), "title", VarId(3))),
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        assert_eq!(
+            ops.first(),
+            Some(&"ValuesOperator"),
+            "disconnected VALUES must stay above the star, not seed it: {ops:?}"
+        );
+        assert_eq!(
+            ops.last(),
+            Some(&"DatasetOperator"),
+            "the star should still drive its own scan: {ops:?}"
         );
     }
 
@@ -4648,6 +5332,7 @@ mod tests {
                 patterns: vec![Pattern::Triple(make_pattern(VarId(10), "q", VarId(11)))],
             }],
             source_body: None,
+            source_prologue: None,
         })];
 
         let strategy = choose_exists_strategy(&outer_schema, &inner);
@@ -4733,6 +5418,7 @@ mod tests {
                 },
             ],
             source_body: None,
+            source_prologue: None,
         })];
 
         let strategy = choose_exists_strategy(&outer_schema, &inner);

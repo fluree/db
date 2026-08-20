@@ -285,6 +285,23 @@ X-Response-Time: 45
 
 ## Content Type Details
 
+### IRI form: absolute vs. abbreviated
+
+Response formats fall into two families, and they treat IRIs differently.
+
+**W3C result serializations** — `application/sparql-results+json`, `application/sparql-results+xml`,
+`text/csv`, `text/tab-separated-values` — always emit **absolute** IRIs. A query's `PREFIX` and `BASE`
+declarations do not shorten them. These formats carry no prefix map and no base slot, so an abbreviated
+IRI in one of them could not be expanded back by the consumer; the specs define the value as the
+absolute IRI.
+
+**JSON-LD-flavored formats** — `application/ld+json`, `application/json`,
+`application/vnd.fluree.agent+json`, typed JSON, NDJSON, and the `fluree` CLI's display output —
+abbreviate IRIs against the query's `@context` / `PREFIX` prologue. That is intentional: the consumer
+either receives the context alongside the data or is a human reading a terminal.
+
+If you need absolute IRIs from a SPARQL query, request `application/sparql-results+json`.
+
 ### JSON-LD (application/json, application/ld+json)
 
 **Request Example:**
@@ -367,7 +384,9 @@ Plain text SPARQL query in the request body.
 }
 ```
 
-Follows W3C SPARQL 1.1 Query Results JSON Format specification.
+Follows W3C SPARQL 1.1 Query Results JSON Format specification. `uri` values are always absolute
+IRIs, and a literal carries its `datatype` unless it is an `xsd:string` — see
+[IRI form](#iri-form-absolute-vs-abbreviated).
 
 ### Turtle (text/turtle)
 

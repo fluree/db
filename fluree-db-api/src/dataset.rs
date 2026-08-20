@@ -300,6 +300,14 @@ impl SourcePolicyOverride {
     /// Check if this override specifies any policy fields.
     ///
     /// Returns true if at least one policy field is set.
+    ///
+    /// Deliberately broader than [`GovernanceOptions::has_any_policy_inputs`],
+    /// which counts only `Some(true)` for `default_allow`: an override naming
+    /// only `default_allow: false` *is* an override and must be applied, even
+    /// though it does not by itself request enforcement. The two predicates
+    /// disagreeing is safe only because `merge_policy_opts` fills config into a
+    /// genuine unset rather than over an explicit value — see the precedence
+    /// note there before changing either one.
     pub fn has_policy(&self) -> bool {
         self.identity.is_some()
             || self.policy_class.is_some()
@@ -318,7 +326,12 @@ impl SourcePolicyOverride {
             policy_class: self.policy_class.clone(),
             policy: self.policy.clone(),
             policy_values: self.policy_values.clone(),
-            default_allow: self.default_allow.unwrap_or(false),
+            // Already tri-state here; it used to collapse to `false` at this
+            // boundary, which is the same lost-unset bug one scope down.
+            // Carrying it through is only half the fix — the explicit value
+            // then has to survive `merge_policy_opts`, which it does because
+            // config fills unset rather than overwriting.
+            default_allow: self.default_allow,
         }
     }
 }
@@ -771,7 +784,18 @@ pub struct GovernanceOptions {
     pub policy_class: Option<Vec<String>>,
     pub policy: Option<JsonValue>,
     pub policy_values: Option<HashMap<String, JsonValue>>,
-    pub default_allow: bool,
+    /// Tri-state default-allow: `None` means the caller did not say, so the
+    /// ledger's configured `f:defaultAllow` may fill it in
+    /// ([`crate::config_resolver::merge_policy_opts`]); `Some(v)` is an explicit
+    /// request-level override that wins over config. Resolve to a concrete bool
+    /// with [`GovernanceOptions::effective_default_allow`] — absent on both
+    /// sides is fail-closed (`false`).
+    ///
+    /// A bare `bool` here silently discarded a ledger's `f:defaultAllow true`
+    /// for every identity-carrying request: `merge_policy_opts` treats any
+    /// request with policy inputs as an override, and `false` was
+    /// indistinguishable from "unset".
+    pub default_allow: Option<bool>,
 }
 
 impl GovernanceOptions {
@@ -844,12 +868,13 @@ impl GovernanceOptions {
             }
         };
 
+        // Absent (or non-boolean) stays `None` so ledger config can fill it;
+        // an explicit `false` is preserved as an override of config.
         let default_allow = opts
             .get("default-allow")
             .or_else(|| opts.get("default_allow"))
             .or_else(|| opts.get("defaultAllow"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+            .and_then(serde_json::Value::as_bool);
 
         Ok(Self {
             identity,
@@ -860,12 +885,27 @@ impl GovernanceOptions {
         })
     }
 
+    /// Resolve the tri-state flag to the concrete bool the policy wrapper needs.
+    /// Call this only after [`crate::config_resolver::merge_policy_opts`] has had
+    /// a chance to fill `None` from the ledger's `f:defaultAllow`; still-unset
+    /// means nobody configured it, which is fail-closed.
+    pub fn effective_default_allow(&self) -> bool {
+        self.default_allow.unwrap_or(false)
+    }
+
+    /// Whether the request itself asked for policy enforcement.
+    ///
+    /// `Some(false)` deliberately does **not** count: it is the fail-closed
+    /// value, and treating it as a policy input would turn enforcement on for
+    /// an otherwise-anonymous request — the opposite of the pre-tri-state
+    /// behavior, where a literal `false` was indistinguishable from absent.
+    /// Only `Some(true)` contributes, exactly as the bare `bool` did.
     pub fn has_any_policy_inputs(&self) -> bool {
         self.identity.is_some()
             || self.policy_class.as_ref().is_some_and(|v| !v.is_empty())
             || self.policy.is_some()
             || self.policy_values.as_ref().is_some_and(|m| !m.is_empty())
-            || self.default_allow
+            || self.default_allow == Some(true)
     }
 }
 
@@ -970,7 +1010,9 @@ fn parse_graph_sources(
 /// ```
 ///
 /// Keys become the `source_alias`. The `@id` field is required (ledger reference).
-/// The `@graph` field is optional (graph selector — "default", "txn-meta", or IRI).
+/// The graph selector is optional ("default", "txn-meta", or a graph IRI) and may
+/// be spelled `@graph` or `graph` — the `from` single-source form reads the same
+/// two spellings, so neither form silently ignores the other's.
 fn parse_named_graph_object(
     obj: &serde_json::Map<String, JsonValue>,
 ) -> Result<Vec<GraphSource>, DatasetParseError> {
@@ -1014,21 +1056,8 @@ fn parse_named_graph_object(
             }
         }
 
-        // Parse graph selector from @graph
-        if let Some(graph_val) = entry.get("@graph") {
-            if identifier.contains("#txn-meta") {
-                return Err(DatasetParseError::AmbiguousGraphSelector(
-                    raw_identifier.to_string(),
-                ));
-            }
-            if let Some(graph_str) = graph_val.as_str() {
-                source.graph_selector = Some(GraphSelector::from_str(graph_str));
-            } else {
-                return Err(DatasetParseError::InvalidGraphSource(
-                    "'@graph' must be a string ('default', 'txn-meta', or a graph IRI)".to_string(),
-                ));
-            }
-        }
+        // Parse graph selector (`@graph` or `graph`)
+        source.graph_selector = parse_graph_selector_field(entry, &identifier, raw_identifier)?;
 
         // Parse policy override
         if let Some(policy_val) = entry.get("policy") {
@@ -1040,6 +1069,41 @@ fn parse_named_graph_object(
     Ok(sources)
 }
 
+/// Read a source object's graph selector, accepting either spelling.
+///
+/// The `fromNamed` object form historically read only `@graph` while the
+/// `from` single-source form read only `graph`. Writing the other form's
+/// spelling was not an error — the key was silently ignored and the source
+/// resolved to the whole ledger, so the query returned a plausible wrong
+/// answer with a 200. Both forms now accept both spellings.
+fn parse_graph_selector_field(
+    obj: &serde_json::Map<String, JsonValue>,
+    identifier: &str,
+    raw_identifier: &str,
+) -> Result<Option<GraphSelector>, DatasetParseError> {
+    let (key, graph_val) = match obj.get("@graph") {
+        Some(v) => ("@graph", v),
+        None => match obj.get("graph") {
+            Some(v) => ("graph", v),
+            None => return Ok(None),
+        },
+    };
+
+    // Ambiguity: the identifier already selected a graph via #txn-meta.
+    if identifier.contains("#txn-meta") {
+        return Err(DatasetParseError::AmbiguousGraphSelector(
+            raw_identifier.to_string(),
+        ));
+    }
+
+    let graph_str = graph_val.as_str().ok_or_else(|| {
+        DatasetParseError::InvalidGraphSource(format!(
+            "'{key}' must be a string ('default', 'txn-meta', or a graph IRI)"
+        ))
+    })?;
+    Ok(Some(GraphSelector::from_str(graph_str)))
+}
+
 /// Parse a single graph source from a JSON value
 ///
 /// Accepts:
@@ -1048,7 +1112,7 @@ fn parse_named_graph_object(
 ///   - `@id` / `id`: ledger reference (required)
 ///   - `t` / `at`: time specification
 ///   - `alias`: dataset-local alias (optional)
-///   - `graph`: graph selector - "default", "txn-meta", or IRI string (optional)
+///   - `graph` / `@graph`: graph selector - "default", "txn-meta", or IRI string (optional)
 ///   - `policy`: per-source policy override (optional)
 fn parse_single_graph_source(
     val: &JsonValue,
@@ -1110,24 +1174,8 @@ fn parse_single_graph_source(
                 }
             }
 
-            // Parse graph selector
-            if let Some(graph_val) = obj.get("graph") {
-                // Check for ambiguity: identifier has #txn-meta AND graph field provided
-                if identifier.contains("#txn-meta") {
-                    return Err(DatasetParseError::AmbiguousGraphSelector(
-                        raw_identifier.to_string(),
-                    ));
-                }
-
-                if let Some(graph_str) = graph_val.as_str() {
-                    source.graph_selector = Some(GraphSelector::from_str(graph_str));
-                } else {
-                    return Err(DatasetParseError::InvalidGraphSource(
-                        "'graph' must be a string ('default', 'txn-meta', or a graph IRI)"
-                            .to_string(),
-                    ));
-                }
-            }
+            // Parse graph selector (`graph` or `@graph`)
+            source.graph_selector = parse_graph_selector_field(obj, &identifier, raw_identifier)?;
 
             // Parse policy override
             if let Some(policy_val) = obj.get("policy") {
@@ -2560,5 +2608,174 @@ mod tests {
     fn test_sparql_dataset_ledger_ids_parse_error() {
         let result = sparql_dataset_ledger_ids("NOT VALID SPARQL }{}{");
         assert!(result.is_err());
+    }
+
+    // --- GovernanceOptions::default_allow tri-state parsing ---
+
+    fn parse_default_allow(query: &JsonValue) -> Option<bool> {
+        GovernanceOptions::from_json(query).unwrap().default_allow
+    }
+
+    /// An absent key must stay `None` so the ledger's `f:defaultAllow` can fill
+    /// it — collapsing it to `false` here is what silently discarded config.
+    #[test]
+    fn default_allow_absent_parses_as_unset() {
+        assert_eq!(parse_default_allow(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_default_allow(&serde_json::json!({"opts": {}})),
+            None,
+            "an opts object with no default-allow key"
+        );
+        assert_eq!(
+            parse_default_allow(&serde_json::json!({"opts": {"identity": "did:key:alice"}})),
+            None,
+            "carrying an identity is not a statement about default-allow"
+        );
+    }
+
+    #[test]
+    fn default_allow_explicit_values_parse_as_set() {
+        for key in ["default-allow", "default_allow", "defaultAllow"] {
+            assert_eq!(
+                parse_default_allow(&serde_json::json!({"opts": {key: false}})),
+                Some(false),
+                "{key} = false"
+            );
+            assert_eq!(
+                parse_default_allow(&serde_json::json!({"opts": {key: true}})),
+                Some(true),
+                "{key} = true"
+            );
+        }
+    }
+
+    /// Non-boolean values are ignored rather than coerced, which leaves the
+    /// field unset (the pre-existing `as_bool` behavior, now visible as `None`).
+    #[test]
+    fn default_allow_non_boolean_stays_unset() {
+        assert_eq!(
+            parse_default_allow(&serde_json::json!({"opts": {"default-allow": "true"}})),
+            None
+        );
+        assert_eq!(
+            parse_default_allow(&serde_json::json!({"opts": {"default-allow": null}})),
+            None
+        );
+    }
+
+    #[test]
+    fn effective_default_allow_is_fail_closed_when_unset() {
+        assert!(!GovernanceOptions::default().effective_default_allow());
+        assert!(!GovernanceOptions {
+            default_allow: Some(false),
+            ..Default::default()
+        }
+        .effective_default_allow());
+        assert!(GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        }
+        .effective_default_allow());
+    }
+
+    // ---------------------------------------------------------------------
+    // Graph-selector spelling. `fromNamed` entries once read only `@graph`
+    // and `from` source objects only `graph`; the other spelling was silently
+    // ignored and the source resolved to the whole ledger, so the query
+    // returned a wrong answer with no error. Both forms take both spellings.
+    // ---------------------------------------------------------------------
+
+    fn named_selector(query: &JsonValue, alias: &str) -> Option<GraphSelector> {
+        let (spec, _) = DatasetSpec::from_query_json(query).expect("parses");
+        spec.named_graphs
+            .iter()
+            .find(|s| s.source_alias.as_deref() == Some(alias))
+            .expect("named source present")
+            .graph_selector
+            .clone()
+    }
+
+    fn default_selector(query: &JsonValue) -> Option<GraphSelector> {
+        let (spec, _) = DatasetSpec::from_query_json(query).expect("parses");
+        spec.default_graphs[0].graph_selector.clone()
+    }
+
+    #[test]
+    fn from_named_entry_accepts_either_graph_spelling() {
+        let with_at = json!({
+            "fromNamed": {"g": {"@id": "db:main", "@graph": "http://ex.org/g1"}},
+            "select": ["?s"]
+        });
+        let without_at = json!({
+            "fromNamed": {"g": {"@id": "db:main", "graph": "http://ex.org/g1"}},
+            "select": ["?s"]
+        });
+
+        assert!(matches!(
+            named_selector(&with_at, "g"),
+            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+        ));
+        // Previously `None` — silently the whole ledger.
+        assert!(matches!(
+            named_selector(&without_at, "g"),
+            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+        ));
+        assert_eq!(
+            named_selector(&with_at, "g"),
+            named_selector(&without_at, "g")
+        );
+    }
+
+    #[test]
+    fn from_source_object_accepts_either_graph_spelling() {
+        let with_bare = json!({
+            "from": {"@id": "db:main", "graph": "http://ex.org/g1"},
+            "select": ["?s"]
+        });
+        let with_at = json!({
+            "from": {"@id": "db:main", "@graph": "http://ex.org/g1"},
+            "select": ["?s"]
+        });
+
+        assert!(matches!(
+            default_selector(&with_bare),
+            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+        ));
+        // Previously `None` — silently the whole ledger.
+        assert!(matches!(
+            default_selector(&with_at),
+            Some(GraphSelector::Iri(ref s)) if s == "http://ex.org/g1"
+        ));
+        assert_eq!(default_selector(&with_bare), default_selector(&with_at));
+    }
+
+    #[test]
+    fn graph_selector_keeps_txn_meta_ambiguity_check_for_both_spellings() {
+        for key in ["graph", "@graph"] {
+            let query = json!({
+                "from": {"@id": "db:main#txn-meta", key: "http://ex.org/g1"},
+                "select": ["?s"]
+            });
+            assert!(
+                matches!(
+                    DatasetSpec::from_query_json(&query),
+                    Err(DatasetParseError::AmbiguousGraphSelector(_))
+                ),
+                "#txn-meta + '{key}' must stay ambiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_selector_rejects_non_string_under_both_spellings() {
+        for key in ["graph", "@graph"] {
+            let query = json!({
+                "from": {"@id": "db:main", key: 7},
+                "select": ["?s"]
+            });
+            let err = DatasetSpec::from_query_json(&query).expect_err("must reject");
+            let msg = err.to_string();
+            assert!(msg.contains(key), "error should name the key used: {msg}");
+        }
     }
 }

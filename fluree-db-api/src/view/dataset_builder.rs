@@ -51,11 +51,20 @@ macro_rules! build_dataset_view_from_spec {
                 let view = ($load_view)(source).await?;
                 let view = ($apply_policy)(view, source).await?;
                 let view = $self.apply_config_defaults(view, None);
-                // Add by identifier (primary key)
-                dataset_db = dataset_db.with_named(source.identifier.as_str(), view.clone());
-                // Also add by alias if present (enables ["graph", "<alias>", ...] lookup)
-                if let Some(alias) = &source.source_alias {
-                    dataset_db = dataset_db.with_named(alias.as_str(), view);
+                // Register under exactly ONE key: the dataset-local name the user
+                // wrote. When an alias is present it IS that name, and the
+                // identifier is only how we load the source — on the ledger-scoped
+                // SPARQL path the identifier is the ledger id, so registering it
+                // too injected the ledger alias into the named-graph map, pointing
+                // at the named graph's view. `GRAPH ?g` enumerates the map's keys
+                // (fluree-db-query/src/graph.rs), so every solution came back twice
+                // and `GRAPH <ledger-alias>` resolved to the wrong graph's triples
+                // (azure-chat#50). Sources without an alias keep identifier keying.
+                match &source.source_alias {
+                    Some(alias) => dataset_db = dataset_db.with_named(alias.as_str(), view),
+                    None => {
+                        dataset_db = dataset_db.with_named(source.identifier.as_str(), view);
+                    }
                 }
             }
 

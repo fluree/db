@@ -37,7 +37,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | `-q, --quiet` | Suppress non-essential output |
 | `--no-color` | Disable colored output (also respects `NO_COLOR` env var) |
 | `--config <PATH>` | Path to config file |
-| `--memory-budget-mb <MB>` | Memory budget in MB for bulk import (0 = auto: 60% of system RAM). Affects chunk size, concurrency, and run budget when creating a ledger with `--from`. Set this to cap memory use; auto-detected thread count shrinks to fit it. |
+| `--memory-budget-mb <MB>` | Memory budget in MB for bulk import (0 = auto: **80% of system RAM** — sized for a dedicated machine). Affects chunk size, concurrency, and run budget when creating a ledger with `--from`. On a machine running anything else (IDE, Docker, a demo recorder), always pass an explicit budget — the auto default assumes it owns the box and can OOM a co-resident workload. Auto-detected thread count shrinks to fit the budget. |
 | `--parallelism <N>` | Number of parallel parse threads for bulk import (0 = auto: most logical cores, capped to fit the memory budget; explicit values honored as-is, floored at 1). Used when creating a ledger with `--from`. |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
@@ -55,11 +55,13 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`info`](info.md) | Show detailed information about a ledger |
 | [`drop`](drop.md) | Drop (delete) a ledger |
 | [`graph`](graph.md) | Manage named graphs within a ledger (list, drop) |
+| [`branch`](branch.md) | Branches: create, list, drop, rebase, merge, diff, revert |
 | [`insert`](insert.md) | Insert data into a ledger |
 | [`upsert`](upsert.md) | Upsert data (insert or update existing) |
 | [`update`](update.md) | Update with WHERE/DELETE/INSERT patterns |
 | [`load`](load.md) | Stream a CSV into a ledger as batched Cypher/JSON-LD upserts (`LOAD CSV`) |
 | [`query`](query.md) | Query a ledger |
+| [`multi-query`](multi-query.md) | Run multiple queries against a single consistent snapshot |
 | [`validate`](validate.md) | Validate data against SHACL shapes (report) |
 | [`model`](model.md) | Governance model tooling — access profiles, SHACL entity shapes, class hierarchy |
 | [`history`](history.md) | Show change history for an entity |
@@ -68,6 +70,9 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`show`](show.md) | Show decoded commit contents (flakes with resolved IRIs) |
 | [`index`](index.md) | Build or update the binary index (incremental) |
 | [`reindex`](reindex.md) | Full reindex from commit history |
+| [`sweep`](sweep.md) | Reclaim index artifacts no index chain references |
+| [`iceberg`](iceberg.md) | Map and manage Iceberg tables as graph sources (map, list, info, drop) |
+| [`materialize`](materialize.md) | Build a native ledger twin from a virtual (Iceberg/R2RML) graph source |
 | [`bm25`](bm25.md) | Manage BM25 full-text search indexes (create, list, sync, drop) |
 
 ### Remote Sync
@@ -80,7 +85,9 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`clone`](clone.md) | Clone a ledger from a remote (full commit download) |
 | [`pull`](pull.md) | Pull commits from upstream |
 | [`push`](push.md) | Push to upstream remote |
+| [`publish`](publish.md) | Create on the remote, push, and set upstream in one step |
 | [`track`](track.md) | Track remote-only ledgers (no local data) |
+| [`cache`](cache.md) | Manage the remote content cache (status, clear) |
 
 **Clone and pull** transfer commits and, by default, **binary index data** from the remote (pack protocol), so the local ledger is query-ready without a separate reindex. Use `--no-indexes` to skip index transfer and reduce download size; run `fluree reindex` afterward if you need the index. Large transfers may prompt for confirmation before streaming.
 
@@ -89,6 +96,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | Command | Description |
 |---------|-------------|
 | [`server`](server.md) | Manage the Fluree HTTP server (run, start, stop, status, restart, logs) |
+| [`cluster`](cluster.md) | Raft cluster administration (init, add, promote, status) |
 
 Start a server directly from a project directory — it inherits the same `.fluree/` context (config, storage) as the CLI. See [`server`](server.md) for details.
 
@@ -110,6 +118,7 @@ If you're building a custom server that must support the CLI end-to-end (for exa
 | Command | Description |
 |---------|-------------|
 | [`config`](config.md) | Manage configuration |
+| [`context`](context.md) | Get or set a ledger's default JSON-LD `@context` |
 | [`prefix`](prefix.md) | Manage IRI prefix mappings |
 | [`completions`](completions.md) | Generate shell completions |
 

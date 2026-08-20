@@ -8,8 +8,8 @@ use fluree_graph_ir::{Graph, Term, Triple};
 
 use crate::error::{R2rmlError, R2rmlResult};
 use crate::mapping::{
-    ConstantValue, JoinCondition, LogicalTable, ObjectMap, PredicateMap, PredicateObjectMap,
-    RefObjectMap, SubjectMap, TermType, TriplesMap,
+    ConstantValue, GraphMap, JoinCondition, LogicalTable, ObjectMap, PredicateMap,
+    PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
 };
 use crate::vocab::R2RML;
 
@@ -212,7 +212,52 @@ impl<'a> MappingExtractor<'a> {
             }
         }
 
+        // Extract rr:graph / rr:graphMap (subject-map-level named-graph routing).
+        subject_map.graph_map = self.extract_graph_map(&sm_triples);
+
         Ok(subject_map)
+    }
+
+    /// Extract a graph map from a term's triples: `rr:graph <iri>` (constant
+    /// shortcut) or `rr:graphMap [ rr:template | rr:column | rr:constant ]`.
+    /// Returns `None` when neither is present (the triples land in the default
+    /// graph). A graph term is always an IRI, so there is no term-type to parse.
+    fn extract_graph_map(&self, triples: &[&Triple]) -> Option<GraphMap> {
+        // rr:graph <iri> — constant shortcut.
+        if let Some(graph_obj) = self.find_object_optional(triples, R2RML::GRAPH) {
+            if let Some(iri) = self.term_to_iri(&graph_obj) {
+                return Some(GraphMap::constant(iri));
+            }
+        }
+
+        // rr:graphMap [ ... ] — a term map producing the graph IRI.
+        let graph_map_obj = self.find_object_optional(triples, R2RML::GRAPH_MAP)?;
+        let gm_triples = self.get_triples_for_term(&graph_map_obj);
+        let mut graph_map = GraphMap::default();
+
+        if let Some(template_obj) = self.find_object_optional(&gm_triples, R2RML::TEMPLATE) {
+            if let Some(template) = self.term_to_string(&template_obj) {
+                graph_map.template_columns = crate::mapping::extract_template_columns(&template);
+                graph_map.template = Some(template);
+            }
+        }
+        if let Some(column_obj) = self.find_object_optional(&gm_triples, R2RML::COLUMN) {
+            if let Some(col) = self.term_to_string(&column_obj) {
+                graph_map.column = Some(col);
+            }
+        }
+        if let Some(constant_obj) = self.find_object_optional(&gm_triples, R2RML::CONSTANT) {
+            if let Some(iri) = self.term_to_iri(&constant_obj) {
+                graph_map.constant = Some(iri);
+            }
+        }
+
+        // A graphMap that parsed no usable value source is treated as absent.
+        if graph_map.is_empty() {
+            None
+        } else {
+            Some(graph_map)
+        }
     }
 
     /// Extract all predicate-object maps from a TriplesMap
@@ -548,6 +593,73 @@ mod tests {
         } else {
             panic!("Expected column object map");
         }
+        // No graph map -> triples land in the default graph.
+        assert!(tm.subject_map.graph_map.is_none());
+    }
+
+    #[test]
+    fn test_extract_subject_graph_map_template() {
+        // rr:graphMap [ rr:template ... ] on the subject map routes every row's
+        // triples into a per-row named graph (e.g. one graph per tenant/user).
+        let graph = parse_r2rml(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#ActorMapping> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "actor" ] ;
+                rr:subjectMap [
+                    rr:template "http://example.org/{id}" ;
+                    rr:class ex:Profile ;
+                    rr:graphMap [ rr:template "http://example.org/graph/tenant/{tenant_id}/user/{user_id}" ]
+                ] ;
+                rr:predicateObjectMap [
+                    rr:predicate ex:name ;
+                    rr:objectMap [ rr:column "as_name" ]
+                ] .
+        "#,
+        );
+        let extractor = MappingExtractor::new(&graph);
+        let tms = extractor.extract_all().unwrap();
+        let gm = tms[0]
+            .subject_map
+            .graph_map
+            .as_ref()
+            .expect("graph map parsed");
+        assert_eq!(
+            gm.template.as_deref(),
+            Some("http://example.org/graph/tenant/{tenant_id}/user/{user_id}")
+        );
+        assert_eq!(gm.template_columns, vec!["tenant_id", "user_id"]);
+        assert!(gm.constant.is_none() && gm.column.is_none());
+    }
+
+    #[test]
+    fn test_extract_subject_graph_constant_shortcut() {
+        // rr:graph <iri> is the constant-graph shortcut for rr:graphMap [ rr:constant <iri> ].
+        let graph = parse_r2rml(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [
+                    rr:template "http://example.org/{id}" ;
+                    rr:graph ex:g1
+                ] ;
+                rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "c" ] ] .
+        "#,
+        );
+        let extractor = MappingExtractor::new(&graph);
+        let tms = extractor.extract_all().unwrap();
+        let gm = tms[0]
+            .subject_map
+            .graph_map
+            .as_ref()
+            .expect("graph map parsed");
+        assert_eq!(gm.constant.as_deref(), Some("http://example.org/g1"));
+        assert!(gm.template.is_none() && gm.column.is_none());
     }
 
     #[test]

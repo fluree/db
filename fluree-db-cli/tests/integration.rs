@@ -262,6 +262,58 @@ fn query_and_insert_accept_ledger_flag() {
         .stdout(predicate::str::contains("Carol"));
 }
 
+/// #1466 end to end: `--format json` on a SPARQL query prints the abbreviated
+/// IRI the query's own PREFIX declares. The W3C result writers emit absolute
+/// IRIs (#45); the CLI is a display surface and deliberately does not, so this
+/// pins the deviation against the real rendered bytes rather than the config.
+#[test]
+fn query_sparql_json_output_keeps_compact_iris() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "curiedb");
+
+    let assertion = fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "curiedb",
+            "--sparql",
+            "--format",
+            "json",
+            "-e",
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"Alice\" }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ex:alice"));
+    let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains("http://example.org/alice"),
+        "CLI json output should stay compacted, got: {stdout}"
+    );
+}
+
+/// Same contract for the delimited display formats.
+#[test]
+fn query_csv_output_keeps_compact_iris() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "curiecsv");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "curiecsv",
+            "--sparql",
+            "--format",
+            "csv",
+            "-e",
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"Alice\" }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ex:alice"));
+}
+
 #[test]
 fn query_ledger_flag_rejects_extra_positional() {
     let tmp = TempDir::new().unwrap();
@@ -1574,6 +1626,87 @@ fn config_list_empty() {
         .assert()
         .success()
         .stdout(predicate::str::contains("no configuration set"));
+}
+
+#[test]
+fn manifest_emits_machine_readable_surface() {
+    let tmp = TempDir::new().unwrap();
+    // Needs no .fluree/ directory — pure introspection of the clap tree.
+    let assert = fluree_cmd(&tmp).arg("manifest").assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&stdout).expect("manifest is JSON");
+
+    assert_eq!(manifest["manifest_version"], 1);
+    assert_eq!(manifest["name"], "fluree");
+    assert!(manifest["version"].as_str().is_some_and(|v| !v.is_empty()));
+
+    let paths: Vec<Vec<&str>> = manifest["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            c["path"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect()
+        })
+        .collect();
+    // The surface dependent repos teach.
+    assert!(paths.contains(&vec!["query"]));
+    assert!(paths.contains(&vec!["remote", "add"]));
+    assert!(paths.contains(&vec!["auth", "login"]));
+    assert!(paths.contains(&vec!["model", "access", "enable"]));
+    // Hidden machine commands (this one included) never leak into the
+    // teachable surface.
+    assert!(!paths.contains(&vec!["manifest"]));
+}
+
+#[test]
+fn config_list_redacts_credentials_unless_revealed() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    // A remote with a stored bearer token — the shape `remote add --token`
+    // and `auth login` persist (access + refresh tokens).
+    fluree_cmd(&tmp)
+        .args([
+            "config",
+            "set",
+            "remotes.origin.auth.token",
+            "sekrit-access",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "config",
+            "set",
+            "remotes.origin.auth.refresh_token",
+            "sekrit-refresh",
+        ])
+        .assert()
+        .success();
+
+    // Default list masks both values but keeps the keys visible.
+    fluree_cmd(&tmp)
+        .args(["config", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remotes.origin.auth.token"))
+        .stdout(predicate::str::contains("[redacted]"))
+        .stdout(predicate::str::contains("sekrit-access").not())
+        .stdout(predicate::str::contains("sekrit-refresh").not())
+        .stderr(predicate::str::contains("--reveal"));
+
+    // --reveal prints the raw values (the documented raw-config escape hatch).
+    fluree_cmd(&tmp)
+        .args(["config", "list", "--reveal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sekrit-access"))
+        .stdout(predicate::str::contains("sekrit-refresh"));
 }
 
 // ============================================================================
