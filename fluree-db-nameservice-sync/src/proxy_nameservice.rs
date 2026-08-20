@@ -139,26 +139,52 @@ impl ProxyNameService {
     }
 }
 
+/// Project a fetched record onto one head ref.
+///
+/// A retracted branch yields `None`, matching the raft nameservice: `lookup`
+/// keeps serving the record so admin tooling can see the `retracted` flag, but
+/// this is the active-read surface and must not resolve a head for a branch the
+/// operator soft-deleted. The remote endpoint projects `lookup`, so without
+/// this the proxy would resurrect branches its own raft-backed origin reports
+/// as gone.
+fn project_ref(
+    record: Option<NsRecord>,
+    kind: fluree_db_nameservice::RefKind,
+) -> Option<fluree_db_nameservice::RefValue> {
+    use fluree_db_nameservice::{RefKind, RefValue};
+    let r = record.filter(|r| !r.retracted)?;
+    Some(match kind {
+        RefKind::CommitHead => RefValue {
+            id: r.commit_head_id,
+            t: r.commit_t,
+        },
+        RefKind::IndexHead => RefValue {
+            id: r.index_head_id,
+            t: r.index_t,
+        },
+    })
+}
+
+/// Project a fetched record onto both head refs. Tombstones retracted
+/// branches for the same reason as [`project_ref`].
+fn project_heads(record: Option<NsRecord>) -> Option<fluree_db_nameservice::LedgerHeads> {
+    record
+        .filter(|r| !r.retracted)
+        .map(|r| fluree_db_nameservice::LedgerHeads::from_record(&r))
+}
+
 #[async_trait]
 impl fluree_db_nameservice::RefLookup for ProxyNameService {
     /// The proxy endpoint serves whole records, so a single-ref read is a
-    /// projection of `lookup` — still one HTTP round trip.
+    /// projection of `lookup` — still one HTTP round trip. Retracted branches
+    /// report `None`; see [`project_ref`].
     async fn get_ref(
         &self,
         ledger_id: &str,
         kind: fluree_db_nameservice::RefKind,
     ) -> Result<Option<fluree_db_nameservice::RefValue>> {
-        use fluree_db_nameservice::{NameServiceLookup, RefKind, RefValue};
-        Ok(self.lookup(ledger_id).await?.map(|r| match kind {
-            RefKind::CommitHead => RefValue {
-                id: r.commit_head_id,
-                t: r.commit_t,
-            },
-            RefKind::IndexHead => RefValue {
-                id: r.index_head_id,
-                t: r.index_t,
-            },
-        }))
+        use fluree_db_nameservice::NameServiceLookup;
+        Ok(project_ref(self.lookup(ledger_id).await?, kind))
     }
 }
 
@@ -224,11 +250,9 @@ impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
         }
     }
 
+    /// Retracted branches report `None` — see [`project_heads`].
     async fn heads(&self, ledger_id: &str) -> Result<Option<fluree_db_nameservice::LedgerHeads>> {
-        Ok(self
-            .lookup(ledger_id)
-            .await?
-            .map(|r| fluree_db_nameservice::LedgerHeads::from_record(&r)))
+        Ok(project_heads(self.lookup(ledger_id).await?))
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
@@ -277,6 +301,8 @@ impl fluree_db_nameservice::GraphSourceLookup for ProxyNameService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::{ContentId, ContentKind};
+    use fluree_db_nameservice::{RefKind, RefValue};
 
     #[test]
     fn test_proxy_nameservice_debug() {
@@ -343,6 +369,79 @@ mod tests {
         assert!(!record.retracted);
         // default_context is not exposed via proxy API
         assert!(record.default_context.is_none());
+    }
+
+    fn record(retracted: bool) -> NsRecord {
+        NsRecordResponse {
+            name: Some("books".to_string()),
+            branch: "main".to_string(),
+            commit_head_id: Some(ContentId::new(ContentKind::Commit, b"c").to_string()),
+            commit_t: 42,
+            index_head_id: Some(ContentId::new(ContentKind::IndexRoot, b"i").to_string()),
+            index_t: 40,
+            default_context: None,
+            retracted,
+            config_id: None,
+            source_branch: None,
+            branches: 0,
+        }
+        .into_ns_record("books:main")
+    }
+
+    #[test]
+    fn projections_carry_both_heads() {
+        let r = record(false);
+        let commit = project_ref(Some(r.clone()), RefKind::CommitHead).expect("commit ref");
+        assert_eq!(commit.id, Some(ContentId::new(ContentKind::Commit, b"c")));
+        assert_eq!(commit.t, 42);
+
+        let index = project_ref(Some(r.clone()), RefKind::IndexHead).expect("index ref");
+        assert_eq!(index.id, Some(ContentId::new(ContentKind::IndexRoot, b"i")));
+        assert_eq!(index.t, 40);
+
+        // `heads` must agree with the two single-ref reads, not drift from them.
+        let heads = project_heads(Some(r)).expect("heads");
+        assert_eq!(heads.commit, commit);
+        assert_eq!(heads.index, index);
+    }
+
+    /// A retracted branch is tombstoned on the active-read surface even though
+    /// the remote endpoint keeps serving its record (with the flag set) through
+    /// `lookup`. Without this the proxy resurrects branches a raft-backed
+    /// origin reports as gone — see `project_ref`.
+    #[test]
+    fn projections_tombstone_a_retracted_branch() {
+        let r = record(true);
+        assert!(r.retracted, "the record itself still carries the flag");
+        assert_eq!(project_ref(Some(r.clone()), RefKind::CommitHead), None);
+        assert_eq!(project_ref(Some(r.clone()), RefKind::IndexHead), None);
+        assert_eq!(project_heads(Some(r)), None);
+    }
+
+    /// An unknown ledger (the endpoint's 404) is `None`, distinct from a
+    /// known-but-unborn branch, which projects zeroed refs.
+    #[test]
+    fn projections_distinguish_unknown_from_unborn() {
+        assert_eq!(project_ref(None, RefKind::CommitHead), None);
+        assert_eq!(project_heads(None), None);
+
+        let unborn = NsRecordResponse {
+            name: Some("books".to_string()),
+            branch: "main".to_string(),
+            commit_head_id: None,
+            commit_t: 0,
+            index_head_id: None,
+            index_t: 0,
+            default_context: None,
+            retracted: false,
+            config_id: None,
+            source_branch: None,
+            branches: 0,
+        }
+        .into_ns_record("books:main");
+        let heads = project_heads(Some(unborn)).expect("unborn branch is known");
+        assert_eq!(heads.commit, RefValue { id: None, t: 0 });
+        assert_eq!(heads.index, RefValue { id: None, t: 0 });
     }
 
     /// Regression for finding #11: `source_branch` and `branches`

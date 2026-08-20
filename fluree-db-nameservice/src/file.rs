@@ -2393,6 +2393,58 @@ mod tests {
         assert_eq!(crate::NsRecordSnapshot::from(&heads).index_t, 3);
     }
 
+    /// `heads` and `lookup` must apply the SAME index merge rule. The
+    /// interesting boundary is equal `t` with different cids: `load_record`
+    /// takes `>=`, so the separate index file wins, and `merge_heads` claims
+    /// to match. Constructed by writing both ns files directly, since
+    /// `publish_index` only ever writes the separate one.
+    #[tokio::test]
+    async fn test_file_heads_agrees_with_lookup_at_equal_index_t() {
+        let (dir, ns) = setup().await;
+        let inline = ContentId::new(ContentKind::IndexRoot, b"inline");
+        let separate = ContentId::new(ContentKind::IndexRoot, b"separate");
+
+        ns.publish_commit("mydb:main", 9, &test_cid("commit-1"))
+            .await
+            .unwrap();
+
+        // Give the main file an inline index at t=5 ...
+        let main_path = dir.path().join(NS_VERSION).join("mydb").join("main.json");
+        let mut main: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&main_path).unwrap()).unwrap();
+        main["f:ledgerIndex"] = serde_json::json!({
+            "f:cid": inline.to_string(),
+            "f:t": 5,
+        });
+        std::fs::write(&main_path, serde_json::to_vec(&main).unwrap()).unwrap();
+
+        // ... and the separate index file a DIFFERENT cid at the same t.
+        let index_path = dir
+            .path()
+            .join(NS_VERSION)
+            .join("mydb")
+            .join("main.index.json");
+        std::fs::write(
+            &index_path,
+            serde_json::to_vec(&serde_json::json!({
+                "@context": ns_context(),
+                "f:ledgerIndex": { "f:cid": separate.to_string(), "f:t": 5 },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let heads = ns.heads("mydb:main").await.unwrap().unwrap();
+        let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+        assert_eq!(
+            heads,
+            LedgerHeads::from_record(&record),
+            "heads must not drift from lookup at the equal-t boundary"
+        );
+        assert_eq!(heads.index.id, Some(separate));
+        assert_eq!(heads.index.t, 5);
+    }
+
     // =========================================================================
     // StatusPublisher tests
     // =========================================================================

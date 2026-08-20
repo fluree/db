@@ -241,3 +241,95 @@ pub(crate) struct BranchPointRef {
     #[serde(rename = "f:t")]
     pub t: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::ContentKind;
+
+    fn cid(label: &str) -> ContentId {
+        ContentId::new(ContentKind::IndexRoot, label.as_bytes())
+    }
+
+    fn main_file(inline_index: Option<IndexRef>) -> NsFileV2 {
+        NsFileV2 {
+            context: ns_context(),
+            id: "mydb:main".to_string(),
+            record_type: vec!["f:LedgerSource".to_string()],
+            ledger: LedgerRef {
+                id: "mydb".to_string(),
+            },
+            branch: "main".to_string(),
+            commit_cid: Some(ContentId::new(ContentKind::Commit, b"c").to_string()),
+            t: 9,
+            index: inline_index,
+            status: "ready".to_string(),
+            default_context_cid: None,
+            status_v: None,
+            status_meta: None,
+            config_v: None,
+            config_meta: None,
+            config_cid: None,
+            source_branch: None,
+            branch_point: None,
+            branches: 0,
+        }
+    }
+
+    fn index_file(c: &ContentId, t: i64) -> NsIndexFileV2 {
+        NsIndexFileV2 {
+            context: ns_context(),
+            index: IndexRef {
+                cid: Some(c.to_string()),
+                t,
+            },
+        }
+    }
+
+    /// The separate index file wins at EQUAL `t`, not only when strictly
+    /// higher — `load_record` uses `>=` and `merge_heads` claims to match it
+    /// byte for byte. Flipping the comparison to `>` passes every other test
+    /// in this crate, so this is the only thing pinning the boundary.
+    #[test]
+    fn merge_heads_index_file_wins_at_equal_t() {
+        let inline = IndexRef {
+            cid: Some(cid("inline").to_string()),
+            t: 5,
+        };
+        let separate = index_file(&cid("separate"), 5);
+
+        let heads = merge_heads(&main_file(Some(inline)), Some(&separate));
+        assert_eq!(heads.index.t, 5);
+        assert_eq!(
+            heads.index.id,
+            Some(cid("separate")),
+            "at equal t the separate index file must win, matching load_record"
+        );
+    }
+
+    #[test]
+    fn merge_heads_keeps_the_higher_t_either_way() {
+        let inline = IndexRef {
+            cid: Some(cid("inline").to_string()),
+            t: 7,
+        };
+        // Stale separate file: the inline index is ahead and must survive.
+        let heads = merge_heads(
+            &main_file(Some(inline.clone())),
+            Some(&index_file(&cid("separate"), 3)),
+        );
+        assert_eq!((heads.index.id, heads.index.t), (Some(cid("inline")), 7));
+
+        // Separate file ahead: it wins.
+        let heads = merge_heads(
+            &main_file(Some(inline)),
+            Some(&index_file(&cid("separate"), 11)),
+        );
+        assert_eq!((heads.index.id, heads.index.t), (Some(cid("separate")), 11));
+
+        // No separate file at all, and no inline index at all.
+        let heads = merge_heads(&main_file(None), None);
+        assert_eq!(heads.index, RefValue { id: None, t: 0 });
+        assert_eq!(heads.commit.t, 9);
+    }
+}
