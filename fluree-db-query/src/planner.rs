@@ -157,8 +157,16 @@ fn class_count(stats: &StatsView, class: &Term) -> Option<u64> {
 ///
 /// This is context-aware: it considers which variables are already bound from
 /// previous patterns. A triple `?s :name ?name` is a full PropertyScan (count rows)
-/// when `?s` is unbound, but only ~ceil(count/ndv_subjects) rows per incoming row
-/// when `?s` is already bound from an earlier pattern.
+/// when `?s` is unbound, but only ~count/ndv_subjects rows per incoming row when
+/// `?s` is already bound from an earlier pattern.
+///
+/// Bound-subject / bound-object fan-out is kept FRACTIONAL (floored at 1.0, never
+/// rounded up): it is a per-row multiplier that seed ranking compares across
+/// patterns and the hash-join cost model multiplies along a chain. Rounding it up
+/// erased the distinction between a 1.004-per-subject predicate and a
+/// 1.96-per-subject one, so a star join over both tied and kept source order — and
+/// with HLL-estimated NDV the ratio for a one-value-per-subject predicate lands
+/// anywhere in ~[0.9, 1.1], so `ceil` flipped the plan on sketch noise.
 pub(crate) fn estimate_triple_row_count(
     pattern: &TriplePattern,
     bound_vars: &HashSet<VarId>,
@@ -201,7 +209,6 @@ pub(crate) fn estimate_triple_row_count(
                 if let Some(prop) = property_stats(s, &pattern.p) {
                     if prop.ndv_subjects > 0 {
                         return (prop.count as f64 / prop.ndv_subjects as f64)
-                            .ceil()
                             .max(HIGHLY_SELECTIVE);
                     }
                     return (prop.count as f64).min(BOUND_SUBJECT_FALLBACK_CAP);
@@ -217,9 +224,7 @@ pub(crate) fn estimate_triple_row_count(
             if let Some(s) = stats {
                 if let Some(prop) = property_stats(s, &pattern.p) {
                     if prop.ndv_values > 0 {
-                        return (prop.count as f64 / prop.ndv_values as f64)
-                            .ceil()
-                            .max(HIGHLY_SELECTIVE);
+                        return (prop.count as f64 / prop.ndv_values as f64).max(HIGHLY_SELECTIVE);
                     }
                     return (prop.count as f64).min(BOUND_OBJECT_FALLBACK_CAP);
                 }
@@ -2108,6 +2113,88 @@ mod tests {
                     if matches!(&tp.p, Ref::Sid(sid) if sid.name.as_ref() == "missing")
             ),
             "missing predicate should drive first: {ordered:?}"
+        );
+    }
+
+    /// SPARQLoscope dblp-core `optional-join-3-star-2` / `join-3-star-*`, with the
+    /// v4.1.6 import statistics verbatim. After `signatureOrdinal` seeds, both
+    /// remaining probes are bound-subject: `rdf:type` at 126.96M/64.69M ≈ 1.96 per
+    /// subject and `signatureDblpName` at 29.40M/29.28M ≈ 1.004. The rounded-up
+    /// estimate read both as 2 and kept source order, putting the 127M-row
+    /// predicate second (2.4x slower); the fractional fan-out orders them.
+    #[test]
+    fn star_join_fractional_fanout_orders_near_tied_bound_subject_probes() {
+        let rdf_type = Sid::new(
+            fluree_vocab::namespaces::RDF,
+            fluree_vocab::predicates::RDF_TYPE,
+        );
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "signatureOrdinal"),
+            PropertyStatData {
+                count: 29_400_871,
+                ndv_values: 502,
+                ndv_subjects: 29_281_959,
+            },
+        );
+        stats.properties.insert(
+            rdf_type.clone(),
+            PropertyStatData {
+                count: 126_963_741,
+                ndv_values: 34,
+                ndv_subjects: 64_688_460,
+            },
+        );
+        stats.properties.insert(
+            Sid::new(100, "signatureDblpName"),
+            PropertyStatData {
+                count: 29_400_871,
+                ndv_values: 4_037_180,
+                ndv_subjects: 29_281_959,
+            },
+        );
+
+        let patterns = vec![
+            Pattern::Triple(make_pattern(VarId(0), "signatureOrdinal", VarId(1))),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(rdf_type),
+                Term::Var(VarId(2)),
+            )),
+            Pattern::Triple(make_pattern(VarId(0), "signatureDblpName", VarId(3))),
+        ];
+        let ordered = reorder_patterns(&patterns, Some(&stats), &HashSet::new());
+        let names: Vec<&str> = ordered
+            .iter()
+            .map(|p| match p {
+                Pattern::Triple(tp) => match &tp.p {
+                    Ref::Sid(sid) => sid.name.as_ref(),
+                    _ => "?",
+                },
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["signatureOrdinal", "signatureDblpName", "type"],
+            "the ~1-per-subject probe must run before the ~2-per-subject one"
+        );
+
+        // The same order must hold for the v4.1.2 statistics (HLL noise put
+        // ndv_subjects above the flake count there), so the plan no longer
+        // depends on which side of an integer the sketch lands.
+        for key in ["signatureOrdinal", "signatureDblpName"] {
+            stats
+                .properties
+                .get_mut(&Sid::new(100, key))
+                .unwrap()
+                .ndv_subjects = 32_417_916;
+        }
+        let ordered = reorder_patterns(&patterns, Some(&stats), &HashSet::new());
+        assert!(
+            matches!(&ordered[1], Pattern::Triple(tp)
+                if matches!(&tp.p, Ref::Sid(sid) if sid.name.as_ref() == "signatureDblpName")),
+            "v4.1.2 stats must reorder identically: {ordered:?}"
         );
     }
 
