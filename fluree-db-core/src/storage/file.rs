@@ -406,6 +406,28 @@ impl StorageRead for FileStorage {
                     crate::error::Error::io(format!("Failed to open {}: {}", path.display(), e))
                 }
             })?;
+            // The fourth read path, held to the same rule as the other three:
+            // an empty file at a content address is debris, not content. A
+            // ranged read would otherwise stop at EOF and hand back an empty
+            // buffer — the "empty content" answer this whole change exists to
+            // replace with "absent". This arm is not hypothetical: once
+            // `resolve_local_path` refuses the debris, the leaflet reader
+            // falls through to `ContentStore::get_range`, which lands here for
+            // the very same file. Read off the open handle, so there is no
+            // extra stat and no window between the check and the read.
+            if file.metadata().map(|m| m.len() == 0).unwrap_or(false) {
+                tracing::warn!(
+                    address,
+                    path = %path.display(),
+                    "zero-length blob treated as absent on a ranged read (failed write \
+                     debris); it will be re-fetched or rebuilt. Delete it to reclaim the inode."
+                );
+                return Err(crate::error::Error::not_found(format!(
+                    "{}: {} (zero-length blob, treated as absent)",
+                    address,
+                    path.display()
+                )));
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::FileExt;
@@ -1211,6 +1233,40 @@ mod tests {
         assert_eq!(storage.read_bytes("z/empty.dict").await.unwrap(), b"real");
     }
 
+    /// A ranged read must agree with `read_bytes` on the same blob. Without the
+    /// guard the read stops at EOF and returns `Ok([])` — empty content, the
+    /// answer no caller can heal — where `read_bytes` says absent.
+    ///
+    /// Reached in practice *because of* `resolve_local_path`: the leaflet
+    /// reader tries the local path first, that guard refuses the debris, and it
+    /// falls through to `ContentStore::get_range`, which reads the same file
+    /// through here.
+    #[tokio::test]
+    async fn zero_length_blob_reads_as_absent_through_a_ranged_read() {
+        let (_dir, storage) = storage();
+        let address = "z/ranged.dict";
+        plant_zero_length(&storage, address);
+
+        let err = storage
+            .read_byte_range(address, 0..40)
+            .await
+            .expect_err("a zero-length blob must be absent on a ranged read, not empty content");
+        assert!(
+            matches!(err, crate::error::Error::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+
+        // The two read surfaces must not disagree about the same blob.
+        assert!(storage.read_bytes(address).await.is_err());
+
+        // And a real write over the debris restores both.
+        storage.write_bytes(address, b"real").await.unwrap();
+        assert_eq!(
+            storage.read_byte_range(address, 0..4).await.unwrap(),
+            b"real"
+        );
+    }
+
     /// The guard must not fire on legitimate content. A one-byte blob is the
     /// smallest thing that is genuinely there.
     #[tokio::test]
@@ -1221,5 +1277,10 @@ mod tests {
         assert!(storage.exists("z/tiny.dict").await.unwrap());
         assert!(storage.resolve_local_path("z/tiny.dict").is_some());
         assert_eq!(storage.read_bytes("z/tiny.dict").await.unwrap(), b"x");
+        // The ranged path agrees that one byte is present.
+        assert_eq!(
+            storage.read_byte_range("z/tiny.dict", 0..1).await.unwrap(),
+            b"x"
+        );
     }
 }
