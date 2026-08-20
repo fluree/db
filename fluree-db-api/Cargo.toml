@@ -218,6 +218,11 @@ path = "tests/grp_transact.rs"
 name = "it_count_datatype_pin"
 path = "tests/it_count_datatype_pin.rs"
 
+# Own binary for the same reason (kill switch + routing assertions).
+[[test]]
+name = "it_fastpath_1652_regression"
+path = "tests/it_fastpath_1652_regression.rs"
+
 # Own binary: asserts fast-path routing via process-scoped tracing capture.
 [[test]]
 name = "it_exists_semijoin_correlation"
