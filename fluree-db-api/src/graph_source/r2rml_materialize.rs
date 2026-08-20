@@ -3574,9 +3574,6 @@ mod engine_tests {
         }
     }
 
-    /// A templated target fans out: one scan, N target ledgers, each its own commit
-    /// domain. Pins that the tally counts TARGETS rather than polls — the accounting whose
-    /// absence made a 21-of-22 production window read as a total stall.
     /// The amplification this module's applied markers exist to stop, end to end.
     ///
     /// A re-presented window — same rows, same `to_snapshot_id`, which is exactly what
@@ -3662,6 +3659,9 @@ mod engine_tests {
         );
     }
 
+    /// A templated target fans out: one scan, N target ledgers, each its own commit
+    /// domain. Pins that the tally counts TARGETS rather than polls — the accounting whose
+    /// absence made a 21-of-22 production window read as a total stall.
     #[tokio::test]
     async fn a_templated_target_fans_out_per_row() {
         let fluree = FlureeBuilder::memory().build_memory();
