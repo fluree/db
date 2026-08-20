@@ -384,9 +384,21 @@ impl Fluree {
             PushError::Invalid(format!("base snapshot namespace corruption: {e}")).into_api_error()
         })?;
 
+        // The namespaces these commits introduce, which reach the snapshot only
+        // in `apply_pushed_commits_to_state` — after validation. Kept as a plain
+        // map so a rejected commit's violation can name the terms it brought in,
+        // including ones an earlier commit of the same push introduced.
+        let mut pushed_namespaces: HashMap<u16, String> = HashMap::new();
+
         for c in &decoded {
             // Current state is base db + evolving novelty.
             let current_t = base_state.snapshot.t.max(evolving_novelty.t);
+            pushed_namespaces.extend(
+                c.commit
+                    .namespace_delta
+                    .iter()
+                    .map(|(code, prefix)| (*code, prefix.clone())),
+            );
 
             // 4.0.1 Cross-commit namespace validation: namespace delta must be
             // conflict-free against the accumulated namespace table from parent + prior commits.
@@ -463,6 +475,15 @@ impl Fluree {
                         // re-validate same-ledger only.
                         cross_ledger_shapes: None,
                         staged_ns: None,
+                        // These commits' own namespaces do not reach the
+                        // snapshot until after validation, so a violation on a
+                        // term they introduce resolves through here or not at
+                        // all.
+                        uncommitted_namespaces: Some(&pushed_namespaces),
+                        // Replay carries no `opts` payload, so there is no
+                        // authoring context to compact against — violations
+                        // here name full IRIs.
+                        txn_context: None,
                         cross_ledger_schema: None,
                         // Inline shapes are an authoring-time
                         // construct; commit replay carries no

@@ -588,48 +588,6 @@ impl ShaclEngine {
             results: all_results,
         })
     }
-
-    /// Validate staged changes, returning an error if validation fails
-    ///
-    /// This is a convenience wrapper around `validate_staged` that converts
-    /// validation failures into errors, suitable for use in transaction staging.
-    pub async fn validate_staged_or_error(
-        &self,
-        db: GraphDbRef<'_>,
-        modified_subjects: &HashSet<Sid>,
-    ) -> Result<()> {
-        let report = self.validate_staged(db, modified_subjects).await?;
-
-        // Enforcement rejects on violations only — spec-level `conforms`
-        // is also false for warnings/infos, which must not block a commit.
-        if report.violation_count() == 0 {
-            Ok(())
-        } else {
-            // Build detailed error messages (limit to first 10 to avoid huge errors)
-            let details: Vec<String> = report
-                .results
-                .iter()
-                .filter(|r| r.severity == Severity::Violation)
-                .take(10)
-                .map(|r| {
-                    if let Some(ref path) = r.result_path {
-                        format!(
-                            "Node {}: property {}: {}",
-                            r.focus_node, path.name, r.message
-                        )
-                    } else {
-                        format!("Node {}: {}", r.focus_node, r.message)
-                    }
-                })
-                .collect();
-
-            Err(crate::error::ShaclError::ValidationFailed {
-                violation_count: report.violation_count(),
-                warning_count: report.warning_count(),
-                details,
-            })
-        }
-    }
 }
 
 /// Get focus nodes for a shape based on its targeting declarations
@@ -3041,15 +2999,6 @@ impl FocusNode {
         match self {
             FocusNode::Node(sid) => Some(sid),
             FocusNode::Literal(_) => None,
-        }
-    }
-}
-
-impl std::fmt::Display for FocusNode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FocusNode::Node(sid) => write!(f, "{}{}", sid.namespace_code, sid.name),
-            FocusNode::Literal(lit) => write!(f, "{}", lit.value),
         }
     }
 }

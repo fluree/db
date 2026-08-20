@@ -19,6 +19,24 @@ fn shacl_context() -> JsonValue {
     json!([default_context(), {"ex": "http://example.org/ns/"}])
 }
 
+/// The violation text from a rejected transaction, or a panic naming what came
+/// back instead.
+///
+/// Two variants carry it, because the tracked/policy entry point converts its
+/// errors to a `TrackedErrorResponse` and the violation arrives already
+/// stringified as an HTTP 400 rather than as the typed `ShaclViolation`. The
+/// text is identical either way, and the text is what these tests are about.
+fn shacl_violation_message(err: ApiError) -> String {
+    match err {
+        ApiError::Transact(TransactError::ShaclViolation(message)) => message,
+        ApiError::Http {
+            status: 400,
+            message,
+        } if message.contains("SHACL validation failed") => message,
+        other => panic!("expected SHACL violation, got {other:?}"),
+    }
+}
+
 fn assert_shacl_violation(err: ApiError, expected: &str) {
     match err {
         ApiError::Transact(TransactError::ShaclViolation(message)) => {
@@ -113,6 +131,297 @@ async fn shacl_cardinality_constraints() {
         .await
         .unwrap_err();
     assert_shacl_violation(err, "Expected at most 1 value(s) but found 2");
+}
+
+/// A rejected transaction must name the focus node and path as terms the
+/// author would recognise, and say which constraint failed.
+///
+/// Regression for #1615: these were printed as a namespace code concatenated
+/// onto a local name (`13name`), which reads as corrupted data — the reporter
+/// spent their time hunting a serialization bug that did not exist. The
+/// constraint component was omitted entirely, so a shape whose single
+/// `sh:message` covers minCount, maxCount and datatype could not say which of
+/// them rejected the transaction.
+#[tokio::test]
+async fn violation_message_names_terms_and_constraint() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UserShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:property": [{
+            "@id": "ex:pshape1",
+            "sh:path": {"@id": "schema:name"},
+            "sh:minCount": 1
+        }]
+    });
+
+    let ledger = fluree
+        .create_ledger("shacl/violation-message:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:alex",
+                "@type": "ex:User"
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    let ApiError::Transact(TransactError::ShaclViolation(message)) = err else {
+        panic!("expected SHACL violation, got {err:?}");
+    };
+
+    // Compacted against the transaction's own context, so the message uses the
+    // prefixes the author declared.
+    assert!(
+        message.contains("Focus node: ex:alex"),
+        "focus node should name the term the transaction used: {message}"
+    );
+    assert!(
+        message.contains("Path: schema:name"),
+        "path should name the term the transaction used: {message}"
+    );
+    assert!(
+        message.contains("Constraint: sh:MinCountConstraintComponent"),
+        "the violated constraint component should be reported: {message}"
+    );
+
+    // The shape of the old output: a namespace code run together with a local
+    // name, indistinguishable from a corrupt identifier.
+    assert!(
+        !message.contains("Focus node: 13"),
+        "raw namespace codes must not reach the message: {message}"
+    );
+}
+
+/// The same transaction, the same shape, the same `@context` — but with a policy
+/// attached, which is the normal configuration on a deployed server.
+///
+/// Policy-bearing writes go through `stage_transaction_tracked_with_policy`, and
+/// that path used to pass `txn_context: None` on the claim that a "Txn-based
+/// entry" has no source document to compact against. It does: the same
+/// `input.txn_json` it parsed a few lines earlier. So the fix for #1615 landed
+/// everywhere EXCEPT the path most rejected writes actually take — the tracked
+/// server write entry routes through here too — and an author with policy on saw
+/// `http://example.org/ns/alex` where the identical policy-free transaction
+/// reported `ex:alex`.
+///
+/// The policy here is permissive on purpose. It has to admit the write so the
+/// transaction reaches SHACL and fails THERE; a denying policy would reject it
+/// first and never produce a violation message to inspect.
+#[tokio::test]
+async fn violation_message_compacts_terms_on_the_policy_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UserShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:property": [{
+            "@id": "ex:pshape1",
+            "sh:path": {"@id": "schema:name"},
+            "sh:minCount": 1
+        }]
+    });
+
+    let ledger = fluree
+        .create_ledger("shacl/violation-message-policy:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    // Allow-all, so the write is admitted and SHACL is what rejects it.
+    let policy = json!([{
+        "@id": "ex:allowAll",
+        "f:action": [{"@id": "f:view"}, {"@id": "f:modify"}],
+        "f:allow": true
+    }]);
+    let qc_opts = crate::GovernanceOptions {
+        policy: Some(policy),
+        default_allow: Some(true),
+        ..Default::default()
+    };
+    let policy_ctx = crate::policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+
+    let data = json!({
+        "@context": context.clone(),
+        "@id": "ex:alex",
+        "@type": "ex:User"
+    });
+    let err = fluree
+        .stage_owned(ledger)
+        .upsert(&data)
+        .policy(policy_ctx)
+        .execute()
+        .await
+        .unwrap_err();
+
+    let message = shacl_violation_message(err);
+
+    assert!(
+        message.contains("Focus node: ex:alex"),
+        "a policy on the transaction must not cost the author their own terms: {message}"
+    );
+    assert!(
+        message.contains("Path: schema:name"),
+        "a policy on the transaction must not cost the author their own terms: {message}"
+    );
+    assert!(
+        message.contains("Constraint: sh:MinCountConstraintComponent"),
+        "the violated constraint component should be reported: {message}"
+    );
+    // The regression this guards is the un-compacted full IRI, not the raw code.
+    assert!(
+        !message.contains("http://example.org/ns/alex"),
+        "the focus node should be compacted, not a full IRI: {message}"
+    );
+    assert!(
+        !message.contains("Focus node: 13"),
+        "raw namespace codes must not reach the message: {message}"
+    );
+}
+
+/// The second half of #1615: one `sh:message` can cover several constraints on
+/// the same property, so the message alone cannot say which of them rejected
+/// the transaction. The reported component has to distinguish them.
+#[tokio::test]
+async fn violation_message_distinguishes_constraints_sharing_one_message() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    // One property, three constraints, a single message for all of them.
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UserShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:property": [{
+            "@id": "ex:pshape1",
+            "sh:path": {"@id": "schema:name"},
+            "sh:minCount": 1,
+            "sh:maxCount": 1,
+            "sh:datatype": {"@id": "xsd:string"},
+            "sh:message": "name is invalid"
+        }]
+    });
+
+    // Each case violates a different constraint on that one property.
+    let cases = [
+        (
+            "missing",
+            json!({"@id": "ex:alex", "@type": "ex:User"}),
+            "sh:MinCountConstraintComponent",
+        ),
+        (
+            "repeated",
+            json!({"@id": "ex:bri", "@type": "ex:User", "schema:name": ["Bri", "Brian"]}),
+            "sh:MaxCountConstraintComponent",
+        ),
+        (
+            "wrong-datatype",
+            json!({"@id": "ex:cass", "@type": "ex:User", "schema:name": 42}),
+            "sh:DatatypeConstraintComponent",
+        ),
+    ];
+
+    for (label, mut node, expected_component) in cases {
+        let ledger = fluree
+            .create_ledger(&format!("shacl/constraint-{label}:main"))
+            .await
+            .unwrap();
+        let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+        node.as_object_mut()
+            .unwrap()
+            .insert("@context".into(), context.clone());
+
+        let err = fluree.upsert(ledger, &node).await.unwrap_err();
+        let ApiError::Transact(TransactError::ShaclViolation(message)) = err else {
+            panic!("expected SHACL violation for {label}, got {err:?}");
+        };
+
+        assert!(
+            message.contains(&format!("Constraint: {expected_component}")),
+            "{label} should report {expected_component}: {message}"
+        );
+        // The shared message is what made these indistinguishable before.
+        assert!(
+            message.contains("name is invalid"),
+            "{label} should still carry the shape's message: {message}"
+        );
+    }
+}
+
+/// A Turtle insert declares its prefixes in the document, so a namespace it
+/// introduces reaches validation through the staging registry and nowhere
+/// else — the snapshot has never seen it. Without that registry the focus node
+/// has no IRI to report and falls back to naming the raw namespace code.
+///
+/// Turtle carries no JSON-LD context, so the message reports full IRIs; there
+/// are no author-declared terms to compact against.
+#[tokio::test]
+async fn turtle_violation_resolves_a_namespace_the_document_introduced() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UserShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:property": [{
+            "@id": "ex:pshape1",
+            "sh:path": {"@id": "schema:name"},
+            "sh:minCount": 1
+        }]
+    });
+
+    let ledger = fluree
+        .create_ledger("shacl/turtle-violation:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    // `fresh:` appears nowhere in the ledger, so its code is allocated during
+    // this parse and lives only in the staging registry.
+    let turtle = r"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix fresh: <http://brand-new.example/ns/> .
+        fresh:alex a ex:User .
+    ";
+    // `StageResult` is not `Debug`, so match rather than `unwrap_err`.
+    let Err(err) = fluree
+        .stage_turtle_insert(ledger, turtle, None, None, None)
+        .await
+    else {
+        panic!("expected the Turtle insert to be rejected");
+    };
+    let ApiError::Transact(TransactError::ShaclViolation(message)) = err else {
+        panic!("expected SHACL violation, got {err:?}");
+    };
+    assert!(
+        message.contains("Focus node: http://brand-new.example/ns/alex"),
+        "a namespace the document introduced should still resolve: {message}"
+    );
+    assert!(
+        !message.contains("unresolved namespace"),
+        "nothing should fall back to a raw namespace code: {message}"
+    );
 }
 
 #[tokio::test]

@@ -606,7 +606,19 @@ become part of permanent ledger state.
 
 ## Validation modes
 
-- **`f:ValidationReject`** (default): on any violation, the transaction fails with `ShaclViolation(report)`. The formatted report lists each violation's focus node, property path, and message.
+- **`f:ValidationReject`** (default): on any violation, the transaction fails with `ShaclViolation(report)`. The formatted report lists each violation's focus node, property path, failed constraint component, and message:
+
+  ```
+  SHACL validation failed with 1 violation(s):
+    1. Expected at least 1 value(s) but found 0
+       Focus node: ex:alex
+       Path: schema:name
+       Constraint: sh:MinCountConstraintComponent
+  ```
+
+  The constraint component matters when one `sh:message` covers several constraints on the same property — it is what distinguishes a value that was absent from one that was repeated or the wrong datatype.
+
+  Identifiers are compacted against the transaction's own `@context`, using its explicit prefixes and `@base` (never `@vocab`), so a violation names the terms you wrote. Where there is no context to compact against — a Turtle insert, or commit replay — the same fields report full IRIs instead.
 - **`f:ValidationWarn`**: violations are logged via `tracing::warn!` and the transaction proceeds. Any **non-violation** error from the SHACL pipeline (compile failure, range-scan failure) still propagates — Warn mode never silently admits a broken validation pipeline.
 
 ## Working with shapes across write surfaces
