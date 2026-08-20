@@ -1,7 +1,9 @@
 //! Shared fixtures for garbage-collection and sweep tests.
 
+use fluree_db_binary_index::format::index_root::NamedGraphRouting;
 use fluree_db_binary_index::{
     BinaryGarbageRef, BinaryPrevIndexRef, DictPackRefs, DictRefs, DictTreeRefs, IndexRoot,
+    RunSortOrder,
 };
 use fluree_db_core::{content_address, ContentId, ContentKind};
 use std::collections::BTreeMap;
@@ -11,12 +13,32 @@ use std::collections::BTreeMap;
 /// `dict_branch` becomes the reverse dictionary tree's branch CID, which is
 /// the root's only CAS reference — tests that need a root to hold a live
 /// artifact reference supply a real one.
+///
+/// The root carries no named graphs, so expanding it reads nothing. Use
+/// [`fir6_with_named_graph_for`] where the test needs expansion to touch
+/// storage.
 pub(crate) fn minimal_fir6_for(
     ledger_id: &str,
     t: i64,
     prev_index: Option<BinaryPrevIndexRef>,
     garbage: Option<BinaryGarbageRef>,
     dict_branch: ContentId,
+) -> Vec<u8> {
+    fir6_with_named_graph_for(ledger_id, t, prev_index, garbage, dict_branch, None)
+}
+
+/// Build a FIR6 root that routes one named graph through `branch_cid`.
+///
+/// Expanding such a root fetches the branch manifest, which is what makes a
+/// released root's expansion fail — the shape [`minimal_fir6_for`] cannot
+/// express.
+pub(crate) fn fir6_with_named_graph_for(
+    ledger_id: &str,
+    t: i64,
+    prev_index: Option<BinaryPrevIndexRef>,
+    garbage: Option<BinaryGarbageRef>,
+    dict_branch: ContentId,
+    named_graph_branch: Option<ContentId>,
 ) -> Vec<u8> {
     let dict_tree = DictTreeRefs {
         branch: dict_branch,
@@ -48,7 +70,14 @@ pub(crate) fn minimal_fir6_for(
         total_retracts: 0,
         graph_arenas: Vec::new(),
         default_graph_orders: Vec::new(),
-        named_graphs: Vec::new(),
+        named_graphs: named_graph_branch
+            .map(|branch_cid| {
+                vec![NamedGraphRouting {
+                    g_id: 1,
+                    orders: vec![(RunSortOrder::Spot, branch_cid)],
+                }]
+            })
+            .unwrap_or_default(),
         stats: None,
         schema: None,
         prev_index,
