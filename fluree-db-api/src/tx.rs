@@ -2553,9 +2553,14 @@ impl crate::Fluree {
             ns_registry,
             options,
             &mut resolve_ctx,
-            // Txn-based entry: no source document, so no authoring
-            // context to compact violation messages against.
-            None,
+            // The source document IS available here — `parse_transaction` above
+            // borrows it — so violations compact against the author's own terms.
+            // This entry point is where policy-bearing writes land, including the
+            // tracked server write path, so passing `None` here meant that on a
+            // deployed server with policy on, essentially every rejected write
+            // reported full IRIs while the same transaction without a policy
+            // reported `ex:alex`.
+            input.txn_json.get("@context"),
         )
         .await
         .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
