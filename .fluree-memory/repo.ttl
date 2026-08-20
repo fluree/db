@@ -3003,6 +3003,21 @@ mem:fact-01m0dazrcw355c6c1dkpdsgr8z a mem:Fact ;
     mem:createdAt "2026-08-19T15:12:04.000000+00:00"^^xsd:dateTime ;
     mem:rationale "The detector destructured (sv, pred, ov) but pushed only pred into filter_preds, discarding ov — so nothing ever compared filter object vars to each other. The pre-existing existence semantics mis-answered this shape too; the product fold made it a certified-lane divergence, which is why the fix is a decline, not a new counting rule." .
 
+mem:fact-01m0fxp7rvjkyvvkvka3dd24zh a mem:Fact ;
+    mem:content "Fast-path routing is observable for ANY operator built on FastPathOperator: its open() stamps `fast-path outcome` with the operator label as the `site` (fast_path_common.rs), so grepping a file for stamp_fast_path UNDERSTATES coverage — fast_predicate_scalar_agg has zero direct calls yet its lanes stamp as `SUM(DAY)`, `SUM(YEAR)`, `AVG numeric`, `COUNT(DISTINCT)`. Assert routing in tests via span_capture find_events(`fast-path outcome`) filtered on outcome=proceed. This matters because a silently disabled fast lane produces the SAME answer via its fallback: value assertions cannot see it, only the stamp can." ;
+    mem:tag "fast-path" ;
+    mem:tag "instrumentation" ;
+    mem:tag "routing-stamp" ;
+    mem:tag "testing" ;
+    mem:tag "tracing" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_datetime_component_presence.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_path_common.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_path_outcome.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-20T10:14:02.000000+00:00"^^xsd:dateTime ;
+    mem:rationale "A #1667 review item asked to add a stamp to the fused scalar-agg operator on the basis that it had none; the stamp already existed one layer up, so the fix was a test-side assertion and no production change. Check the FastPathOperator layer before concluding a lane is unstamped." .
+
 mem:fact-01m0bredy3qtxvftbwass43qkc a mem:Fact ;
     mem:content "#1652 case 3 FIXED: count_composite_join_pairs now gates via predicate_unsafe_for_cross_predicate_o_key_join (fast_path_common) — declines when either predicate's POST leaflets hold NUM_BIG_OVERFLOW objects (per-predicate arena handles, not value identity) OR list rows (HAS_O_I flag; list elems never match plain refs, aligned duplicate lists pair per-row — not expressible in an (s,o_type,o_key) key). Metadata-first: o_type_const point check, key-range bound for mixed leaflets, exact o_type-column decode ONLY when the range straddles 0x800B. Overlay lane: CursorSoIter declines row-level on live o_i (novelty lists). Pinned in it_fastpath_1652_regression.rs incl. must-fire on clean data." ;
     mem:tag "composite-join" ;
