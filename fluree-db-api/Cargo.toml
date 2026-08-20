@@ -218,6 +218,16 @@ path = "tests/grp_transact.rs"
 name = "it_count_datatype_pin"
 path = "tests/it_count_datatype_pin.rs"
 
+# Own binary for the same reason (kill switch + routing assertions).
+[[test]]
+name = "it_fastpath_1652_regression"
+path = "tests/it_fastpath_1652_regression.rs"
+
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_datetime_component_presence"
+path = "tests/it_datetime_component_presence.rs"
+
 # Own binary: asserts fast-path routing via process-scoped tracing capture.
 [[test]]
 name = "it_exists_semijoin_correlation"
@@ -243,6 +253,14 @@ path = "tests/it_cyclic_bgp_novelty_pred.rs"
 name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
 
+# Own binary: asserts on a tracing event to pin that the BM25 incremental sync
+# really narrows its indexing query. Same convention and same two hazards as the
+# capture tests above — process-global callsite-interest cache, thread-local
+# `set_default`.
+[[test]]
+name = "it_bm25_sync_scoping"
+path = "tests/it_bm25_sync_scoping.rs"
+
 # Standalone (not in grp_misc): its process-scoped tracing capture + the
 # process-global callsite-interest cache require being the only test in its
 # process to avoid parallel-interleaving flake. Same convention as the span-
@@ -250,6 +268,13 @@ path = "tests/it_cyclic_bgp_probe.rs"
 [[test]]
 name = "it_minmax_fast_path_fired"
 path = "tests/it_minmax_fast_path_fired.rs"
+
+# Standalone (not in grp_transact): asserts on the `upsert deletion subject
+# pre-check` tracing event via the thread-local span capture, so it must be the
+# only test in its process. Same convention as the span-capture tests above.
+[[test]]
+name = "it_upsert_skip_fires"
+path = "tests/it_upsert_skip_fires.rs"
 
 [[test]]
 name = "it_multi_graph_property_path"
@@ -409,6 +434,9 @@ harness = false
 [[bench]]
 name = "query_hot_whole_graph_agg"
 harness = false
+
+[[test]]
+name = "it_absent_subject_scan_narrowing"
 
 [lints]
 workspace = true

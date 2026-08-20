@@ -120,6 +120,15 @@ impl crate::NameServiceLookup for MemoryNameService {
             .cloned()
             .collect())
     }
+
+    async fn heads(&self, ledger_id: &str) -> Result<Option<crate::LedgerHeads>> {
+        let key = self.normalize_ledger_id(ledger_id);
+        Ok(self
+            .records
+            .read()
+            .get(&key)
+            .map(crate::LedgerHeads::from_record))
+    }
 }
 
 #[async_trait]
@@ -735,6 +744,27 @@ mod tests {
 
     fn test_index_id(label: &str) -> ContentId {
         ContentId::new(ContentKind::IndexRoot, label.as_bytes())
+    }
+
+    #[tokio::test]
+    async fn test_memory_ns_heads() {
+        let ns = MemoryNameService::new();
+        assert_eq!(ns.heads("mydb:main").await.unwrap(), None);
+
+        ns.publish_commit("mydb:main", 2, &test_commit_id("c2"))
+            .await
+            .unwrap();
+        ns.publish_index("mydb:main", 1, &test_index_id("i1"))
+            .await
+            .unwrap();
+
+        let heads = ns.heads("mydb:main").await.unwrap().unwrap();
+        assert_eq!(heads.commit.id, Some(test_commit_id("c2")));
+        assert_eq!(heads.commit.t, 2);
+        assert_eq!(heads.index.id, Some(test_index_id("i1")));
+        assert_eq!(heads.index.t, 1);
+        let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+        assert_eq!(heads, crate::LedgerHeads::from_record(&record));
     }
 
     #[tokio::test]

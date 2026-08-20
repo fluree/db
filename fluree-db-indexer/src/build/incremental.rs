@@ -760,7 +760,8 @@ pub async fn incremental_index(
     }
 
     let base_root = &novelty.base_root;
-    let mut root_builder = IncrementalRootBuilder::from_old_root(novelty.base_root.clone());
+    let mut root_builder =
+        IncrementalRootBuilder::from_old_root(novelty.base_root.clone(), ledger_id);
     root_builder.set_index_t(novelty.max_t);
     root_builder.add_commit_stats(
         novelty.delta_commit_size,

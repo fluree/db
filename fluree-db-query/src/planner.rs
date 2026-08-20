@@ -1062,6 +1062,16 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
     // Separate triples from non-triples
     let mut triples: Vec<&TriplePattern> = Vec::new();
     let mut non_triple_estimate: f64 = HIGHLY_SELECTIVE;
+    // Did any non-triple pattern contribute a real row count (as opposed to an
+    // Expander/Deferred that says nothing about absolute cardinality)?
+    //
+    // `Service` is excluded on purpose. Its `DEFAULT_SERVICE_ROW_COUNT` is a
+    // placement sentinel — `FULL_SCAN`, chosen to sort remote calls last — not
+    // knowledge of how many rows the endpoint returns. Counting it here would
+    // read "unknown, and expensive" as "known to be big" and let a triple-free
+    // SERVICE branch skip the unknown-scan default, which is the opposite of
+    // what that constant is for.
+    let mut has_sized_source = false;
 
     for p in patterns {
         match p {
@@ -1074,6 +1084,9 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
                 match card {
                     PatternEstimate::Source { row_count } => {
                         non_triple_estimate *= row_count.max(HIGHLY_SELECTIVE);
+                        if !matches!(other, Pattern::Service(_)) {
+                            has_sized_source = true;
+                        }
                     }
                     PatternEstimate::Reducer { multiplier } => {
                         non_triple_estimate *= multiplier;
@@ -1088,7 +1101,22 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
     }
 
     if triples.is_empty() {
-        return (DEFAULT_PROPERTY_SCAN_SELECTIVITY) * non_triple_estimate;
+        // A branch made ONLY of sized sources already knows its own cardinality —
+        // multiplying by the unknown-scan default would invent rows that are not
+        // there. This is the common shape of a chained UNION: `{A} UNION {B} UNION
+        // {C}` nests as `Union([[Union([[A],[B]])], [C]])`, so the outer branch
+        // holding the inner UNION has no triples of its own. Scaling it by
+        // DEFAULT_PROPERTY_SCAN_SELECTIVITY put a 30-row union at 20M rows, which
+        // pushed it behind every real scan; the correlated UnionOperator then
+        // rebuilt and re-ran all three branches once per driving row.
+        //
+        // With no sized source (only OPTIONAL/MINUS/FILTER/BIND) nothing is known,
+        // so the unknown-scan default still applies.
+        return if has_sized_source {
+            non_triple_estimate.max(HIGHLY_SELECTIVE)
+        } else {
+            DEFAULT_PROPERTY_SCAN_SELECTIVITY * non_triple_estimate
+        };
     }
 
     // Sort triples by standalone row count for initial ordering (most selective first)
@@ -1376,6 +1404,12 @@ pub fn reorder_patterns(
                 //
                 // All other filters/binds keep the existing dependency
                 // placement byte-identically.
+                //
+                // Coupled with `where_plan::inline_singleton_values_objects`:
+                // both classifications below are also inner-join members of its
+                // fold region (see the comment on its `is_inner_join_member`),
+                // so a new order-sensitive arm here that is likewise an
+                // inner-join member must be checked against that fold.
                 let order_sensitive = match pattern {
                     Pattern::Filter(_) => required_vars.is_empty(),
                     Pattern::Bind { expr, .. } => expr.contains_bnode(),
@@ -3345,6 +3379,63 @@ mod tests {
         assert!((row_count - 300.0).abs() < f64::EPSILON);
     }
 
+    /// A chained `{A} UNION {B} UNION {C}` nests as `Union([[Union([[A],[B]])],
+    /// [C]])`, so the outer branch holding the inner UNION owns no triples of
+    /// its own. Scaling such a branch by the unknown-property-scan default put
+    /// a 30-row union at 20M rows, which pushed it behind every real scan and
+    /// left the correlated `UnionOperator` rebuilding all three branches once
+    /// per driving row (measured: 53 s on a 200k-row driver).
+    #[test]
+    fn test_estimate_nested_union_is_not_scaled_by_unknown_scan_default() {
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "a"),
+            PropertyStatData {
+                count: 100,
+                ndv_values: 10,
+                ndv_subjects: 100,
+            },
+        );
+
+        let branch = |o: &str| {
+            vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "a")),
+                Term::Iri(Arc::from(o)),
+            ))]
+        };
+        // Each bound-object branch is count/ndv = 10 rows.
+        let nested = Pattern::Union(vec![
+            vec![Pattern::Union(vec![branch("ex:x"), branch("ex:y")])],
+            branch("ex:z"),
+        ]);
+
+        let card = estimate_pattern(&nested, &HashSet::new(), Some(&stats));
+        let PatternEstimate::Source { row_count } = card else {
+            panic!("expected Source")
+        };
+        assert!(
+            (row_count - 30.0).abs() < f64::EPSILON,
+            "nested union should cost its branches (10+10+10), got {row_count}"
+        );
+    }
+
+    /// With nothing sized to go on, the unknown-scan default still applies.
+    #[test]
+    fn test_estimate_branch_with_no_sized_source_keeps_scan_default() {
+        let optional_only = vec![Pattern::Optional(vec![Pattern::Triple(make_pattern(
+            VarId(0),
+            "opt",
+            VarId(1),
+        ))])];
+
+        let card = estimate_branch_cardinality(&optional_only, None);
+        assert!(
+            (card - DEFAULT_PROPERTY_SCAN_SELECTIVITY).abs() < f64::EPSILON,
+            "expected the unknown-scan default, got {card}"
+        );
+    }
+
     #[test]
     fn test_estimate_optional_multiplier() {
         let optional = Pattern::Optional(vec![Pattern::Triple(make_pattern(
@@ -3538,6 +3629,76 @@ mod tests {
 
         // Single triple: should be the triple's selectivity (count = 1000)
         assert!((est - 1000.0).abs() < f64::EPSILON);
+    }
+
+    /// A triple-free branch whose only sized member is a nested UNION knows its
+    /// own cardinality, so the unknown-scan default must not be multiplied in
+    /// on top of it — that is the chained-UNION shape whose 20M-row estimate
+    /// pushed a 30-row union behind every real scan.
+    #[test]
+    fn triple_free_branch_with_a_nested_union_is_not_scaled_by_the_unknown_default() {
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "name"),
+            PropertyStatData {
+                count: 1000,
+                ndv_values: 500,
+                ndv_subjects: 1000,
+            },
+        );
+
+        let branch = vec![Pattern::Union(vec![
+            vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
+            vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(2)))],
+        ])];
+        let est = estimate_branch_cardinality(&branch, Some(&stats));
+
+        assert!(
+            est < DEFAULT_PROPERTY_SCAN_SELECTIVITY,
+            "a sized branch must keep its own estimate ({est}), not be scaled by \
+             the unknown-scan default"
+        );
+    }
+
+    /// SERVICE is the one `Source` whose row count is a placement sentinel
+    /// (`FULL_SCAN`, to sort remote calls last) rather than knowledge of the
+    /// endpoint's cardinality. A triple-free SERVICE branch therefore knows
+    /// nothing, and must keep the unknown-scan default — otherwise "unknown and
+    /// expensive" would be read as "known to be big" and the branch could sort
+    /// ahead of local work.
+    #[test]
+    fn triple_free_service_branch_keeps_the_unknown_scan_default() {
+        let service = || {
+            Pattern::Service(crate::ir::ServicePattern {
+                silent: false,
+                endpoint: crate::ir::ServiceEndpoint::Iri(Arc::from("http://example.org/sparql")),
+                patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
+                source_body: None,
+                source_prologue: None,
+            })
+        };
+
+        let est = estimate_branch_cardinality(&[service()], None);
+        assert!(
+            est >= DEFAULT_PROPERTY_SCAN_SELECTIVITY * DEFAULT_SERVICE_ROW_COUNT,
+            "a SERVICE-only branch must stay at the unknown-scan default \
+             ({est}), so a remote call is not promoted ahead of local scans"
+        );
+
+        // The exclusion is specific to SERVICE: a branch that also holds a
+        // genuinely sized member still escapes the default.
+        let sized = vec![
+            service(),
+            Pattern::Values {
+                vars: vec![VarId(5)],
+                rows: vec![vec![crate::binding::Binding::sid(Sid::new(13, "a"))]],
+            },
+        ];
+        assert!(
+            estimate_branch_cardinality(&sized, None)
+                < DEFAULT_PROPERTY_SCAN_SELECTIVITY * DEFAULT_SERVICE_ROW_COUNT,
+            "a sized member alongside the SERVICE still sizes the branch"
+        );
     }
 
     // =========================================================================

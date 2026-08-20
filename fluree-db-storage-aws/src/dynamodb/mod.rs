@@ -24,9 +24,10 @@ use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPayload, ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher,
-    GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError,
-    NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup, RefPublisher, RefValue,
-    StatusCasResult, StatusLookup, StatusPayload, StatusPublisher, StatusValue,
+    GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle,
+    NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup,
+    RefPublisher, RefValue, StatusCasResult, StatusLookup, StatusPayload, StatusPublisher,
+    StatusValue,
 };
 use schema::*;
 use std::collections::HashMap;
@@ -597,6 +598,61 @@ impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
         let pk = Self::normalize(ledger_id);
         let items = self.query_metadata_items(&pk).await?;
         Ok(Self::items_to_ns_record(&pk, &items))
+    }
+
+    /// One consistent Query over the `head..=index` sort-key range, projected
+    /// to the four ref attributes — a single round trip and a single RCU,
+    /// versus a GetItem per ref or the full 4-item `lookup` query.
+    async fn heads(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<Option<LedgerHeads>, NameServiceError> {
+        let pk = Self::normalize(ledger_id);
+        let response = self
+            .client
+            .query()
+            .table_name(&self.table_name)
+            .key_condition_expression("#pk = :pk AND #sk BETWEEN :head AND :index")
+            .projection_expression("#sk, #cid, #ct, #iid, #it")
+            .expression_attribute_names("#pk", ATTR_PK)
+            .expression_attribute_names("#sk", ATTR_SK)
+            .expression_attribute_names("#cid", ATTR_COMMIT_ID)
+            .expression_attribute_names("#ct", ATTR_COMMIT_T)
+            .expression_attribute_names("#iid", ATTR_INDEX_ID)
+            .expression_attribute_names("#it", ATTR_INDEX_T)
+            .expression_attribute_values(":pk", AttributeValue::S(pk.clone()))
+            .expression_attribute_values(":head", AttributeValue::S(SK_HEAD.to_string()))
+            .expression_attribute_values(":index", AttributeValue::S(SK_INDEX.to_string()))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| NameServiceError::storage(format!("DynamoDB Query failed: {e}")))?;
+
+        let items = response.items();
+        let ref_from = |sk: &str, id_attr: &str, t_attr: &str| {
+            Self::find_item_by_sk(items, sk).map(|item| RefValue {
+                id: item
+                    .get(id_attr)
+                    .and_then(|v| v.as_s().ok())
+                    .and_then(|s| s.parse::<ContentId>().ok()),
+                t: item
+                    .get(t_attr)
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
+            })
+        };
+        let commit = ref_from(SK_HEAD, ATTR_COMMIT_ID, ATTR_COMMIT_T);
+        let index = ref_from(SK_INDEX, ATTR_INDEX_ID, ATTR_INDEX_T);
+        // No ref items at all: unborn (meta exists) or unknown — same rule as `get_ref`.
+        if commit.is_none() && index.is_none() && !self.meta_exists(&pk).await? {
+            return Ok(None);
+        }
+        let unborn = || RefValue { id: None, t: 0 };
+        Ok(Some(LedgerHeads {
+            commit: commit.unwrap_or_else(unborn),
+            index: index.unwrap_or_else(unborn),
+        }))
     }
 
     async fn all_records(&self) -> std::result::Result<Vec<NsRecord>, NameServiceError> {
