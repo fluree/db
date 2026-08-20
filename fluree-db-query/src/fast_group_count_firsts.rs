@@ -1102,8 +1102,10 @@ impl AggStateStar {
 /// Optionally also computes MIN/MAX/SAMPLE on `?s`.
 ///
 /// COUNT honors SPARQL bag semantics: each group-predicate row is multiplied
-/// by the product of the filter predicates' per-subject row counts (the star
-/// join's multiplicity), not merely gated on subject existence (#1652).
+/// by the product of the filter predicates' per-subject row counts, not merely
+/// gated on subject existence (#1652). That product is the star join's
+/// multiplicity only because the filter object vars are pairwise distinct —
+/// `detect_group_by_object_star_topk` declines when they are not.
 pub struct GroupByObjectStarTopKOperator {
     group_pred: crate::ir::triple::Ref,
     filter_preds: Vec<crate::ir::triple::Ref>,

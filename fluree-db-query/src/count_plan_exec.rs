@@ -3502,11 +3502,12 @@ fn execute_optional_chain_head(
         return Ok(Some(0));
     };
 
-    // This lane drives the IRI-only `PostObjectGroupCountIter`, which terminates
-    // on a homogeneous non-IRI leaflet (and POST orders such leaflets before
-    // `IRI_REF`). A literal-valued `?b` still survives the OPTIONAL with
-    // multiplier 1, so rather than undercount we defer any non-all-IRI `p1` to
-    // the generic pipeline.
+    // This lane drives the IRI-only `PostObjectGroupCountIter`, which drops
+    // non-IRI rows — row-wise in a mixed leaflet, whole-leaflet for a
+    // homogeneous non-IRI one. A literal-valued `?b` has no inner-chain
+    // continuation but still survives the OPTIONAL with multiplier 1, so those
+    // dropped rows would undercount; defer any non-all-IRI `p1` to the generic
+    // pipeline instead.
     if !predicate_objects_all_iri(store, g_id, p1_id)? {
         return Ok(None);
     }

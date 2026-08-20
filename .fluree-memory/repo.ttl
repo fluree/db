@@ -2989,8 +2989,22 @@ mem:fact-01m0bre5qrbr1kfpxvq97hhy7p a mem:Fact ;
     mem:updatedAt "2026-08-19T02:42:45.324959+00:00"^^xsd:dateTime ;
     mem:rationale "Any streaming group iterator over leaflet batches must carry the open group across refills — PsotSubjectCountIter/CursorSubjectCountStream are the reference pattern. Repro trick: reindex with IndexerConfig::with_leaflet_rows(3) forces boundary-straddling groups at tiny scale." .
 
+mem:fact-01m0dazrcw355c6c1dkpdsgr8z a mem:Fact ;
+    mem:content "#1652 follow-up: detect_group_by_object_star_topk (execute/operator_tree.rs) now requires filter object vars to be PAIRWISE DISTINCT. The operator folds filters as a product of per-subject counts, which is the join multiplicity only when they range independently — two filter triples sharing an object var join on it, so the true multiplicity is their per-subject value INTERSECTION. Shared var returned inflated counts plus phantom groups (subjects whose filter values are disjoint drop out generically). Distinct vars over the SAME predicate stay eligible: that product is correct. Probed both ways in it_fastpath_1652_regression.rs (must-not-fire + must-fire)." ;
+    mem:tag "correctness" ;
+    mem:tag "count" ;
+    mem:tag "fast-path" ;
+    mem:tag "group-by" ;
+    mem:tag "star-topk" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_fastpath_1652_regression.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-19T15:12:04.000000+00:00"^^xsd:dateTime ;
+    mem:rationale "The detector destructured (sv, pred, ov) but pushed only pred into filter_preds, discarding ov — so nothing ever compared filter object vars to each other. The pre-existing existence semantics mis-answered this shape too; the product fold made it a certified-lane divergence, which is why the fix is a decline, not a new counting rule." .
+
 mem:fact-01m0bredy3qtxvftbwass43qkc a mem:Fact ;
-    mem:content "#1652 case 3 FIXED: count_composite_join_pairs now gates via predicate_unsafe_for_cross_predicate_o_key_join (fast_path_common) — declines when either predicate's POST leaflets hold NUM_BIG_OVERFLOW objects (per-predicate arena handles, not value identity) OR list rows (HAS_O_I flag; generic list-element join semantics: list elems never match plain refs, aligned duplicate lists pair per-row — not expressible in an (s,o_type,o_key) key). Metadata-first: o_type_const point check, key-range bound for mixed leaflets, exact o_type-column decode ONLY when the range straddles 0x800B (inline numerics sort below, langstrings above — range alone over-declines). Overlay lane: CursorSoIter declines row-level on live o_i (novelty lists). Pinned in it_fastpath_1652_regression.rs incl. must-fire on clean data." ;
+    mem:content "#1652 case 3 FIXED: count_composite_join_pairs now gates via predicate_unsafe_for_cross_predicate_o_key_join (fast_path_common) — declines when either predicate's POST leaflets hold NUM_BIG_OVERFLOW objects (per-predicate arena handles, not value identity) OR list rows (HAS_O_I flag; list elems never match plain refs, aligned duplicate lists pair per-row — not expressible in an (s,o_type,o_key) key). Metadata-first: o_type_const point check, key-range bound for mixed leaflets, exact o_type-column decode ONLY when the range straddles 0x800B. Overlay lane: CursorSoIter declines row-level on live o_i (novelty lists). Pinned in it_fastpath_1652_regression.rs incl. must-fire on clean data." ;
     mem:tag "composite-join" ;
     mem:tag "correctness" ;
     mem:tag "count" ;
