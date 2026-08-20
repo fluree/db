@@ -57,3 +57,5 @@ mod it_query_typed_json;
 mod it_query_vocab_id_compaction;
 #[path = "it_query_wildcard_system_facts.rs"]
 mod it_query_wildcard_system_facts;
+#[path = "it_service_cross_ledger_iri.rs"]
+mod it_service_cross_ledger_iri;
