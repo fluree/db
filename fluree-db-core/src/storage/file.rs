@@ -333,21 +333,59 @@ impl FileStorage {
 impl StorageRead for FileStorage {
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         let path = self.resolve_path(address)?;
-        tokio::fs::read(&path).await.map_err(|e| {
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 crate::error::Error::not_found(format!("{}: {}", address, path.display()))
             } else {
                 crate::error::Error::io(format!("Failed to read {}: {}", path.display(), e))
             }
-        })
+        })?;
+        // A ZERO-LENGTH blob is not content — it is debris, and reporting it as
+        // absent is strictly better than returning it.
+        //
+        // Blobs here are content-addressed, so the address commits to a digest and
+        // no real artifact hashes to empty. An empty file at such an address can
+        // therefore only be a failed write (create succeeded, write did not — the
+        // classic ENOSPC shape, which left ~4,000 of these on one deployment).
+        //
+        // The distinction matters because the two outcomes are not equally
+        // recoverable: "absent" makes callers re-fetch or rebuild, while empty
+        // content propagates as a parse failure at some distant call site
+        // ("pack header: need 40 bytes, got 0") that no caller knows how to repair.
+        if bytes.is_empty() {
+            tracing::warn!(
+                address,
+                path = %path.display(),
+                "zero-length blob treated as absent (failed write debris); it will be \
+                 re-fetched or rebuilt. Delete it to reclaim the inode."
+            );
+            return Err(crate::error::Error::not_found(format!(
+                "{}: {} (zero-length blob, treated as absent)",
+                address,
+                path.display()
+            )));
+        }
+        Ok(bytes)
     }
 
     fn resolve_local_path(&self, address: &str) -> Option<std::path::PathBuf> {
         let path = self.resolve_path(address).ok()?;
-        if path.exists() {
-            Some(path)
-        } else {
-            None
+        // PRESENCE IS NOT VALIDITY. This returned any path that merely `exists()`,
+        // and callers then mmap or parse it directly — so a zero-length blob became
+        // an unrecoverable reader error rather than a miss the caller could heal.
+        // Excluding empty files here is what converts that poison back into a fetch.
+        // See `read_bytes` for why empty can never be legitimate content.
+        match std::fs::metadata(&path) {
+            Ok(m) if m.len() > 0 => Some(path),
+            Ok(_) => {
+                tracing::warn!(
+                    address,
+                    path = %path.display(),
+                    "zero-length blob ignored for local resolution; falling back to fetch"
+                );
+                None
+            }
+            Err(_) => None,
         }
     }
 
@@ -368,6 +406,28 @@ impl StorageRead for FileStorage {
                     crate::error::Error::io(format!("Failed to open {}: {}", path.display(), e))
                 }
             })?;
+            // The fourth read path, held to the same rule as the other three:
+            // an empty file at a content address is debris, not content. A
+            // ranged read would otherwise stop at EOF and hand back an empty
+            // buffer — the "empty content" answer this whole change exists to
+            // replace with "absent". This arm is not hypothetical: once
+            // `resolve_local_path` refuses the debris, the leaflet reader
+            // falls through to `ContentStore::get_range`, which lands here for
+            // the very same file. Read off the open handle, so there is no
+            // extra stat and no window between the check and the read.
+            if file.metadata().map(|m| m.len() == 0).unwrap_or(false) {
+                tracing::warn!(
+                    address,
+                    path = %path.display(),
+                    "zero-length blob treated as absent on a ranged read (failed write \
+                     debris); it will be re-fetched or rebuilt. Delete it to reclaim the inode."
+                );
+                return Err(crate::error::Error::not_found(format!(
+                    "{}: {} (zero-length blob, treated as absent)",
+                    address,
+                    path.display()
+                )));
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::FileExt;
@@ -425,7 +485,13 @@ impl StorageRead for FileStorage {
     async fn exists(&self, address: &str) -> Result<bool> {
         let path = self.resolve_path(address)?;
         match tokio::fs::metadata(&path).await {
-            Ok(_) => Ok(true),
+            // Zero length is absent here too, and the consistency is the point:
+            // reporting `true` for a blob `read_bytes` then refuses to return is a
+            // worse contract than either answer alone — a caller that checks before
+            // reading would see the blob appear and then vanish. Answering `false`
+            // also lets a writer replace the debris instead of skipping it as
+            // already-present, which is how the bad file finally leaves the disk.
+            Ok(m) => Ok(m.len() > 0),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(crate::error::Error::io(format!(
                 "Failed to stat {}: {}",
@@ -1100,5 +1166,121 @@ mod tests {
             .filter(|n| is_tmp_artifact(n))
             .collect();
         assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
+    }
+
+    /// Write a zero-length file directly, bypassing the storage API — which is
+    /// the only way this state arises now that writes are atomic. It models
+    /// debris already on disk from before that, or from a truncating crash
+    /// outside this process.
+    fn plant_zero_length(storage: &FileStorage, address: &str) -> std::path::PathBuf {
+        let path = storage.resolve_path(address).expect("resolve");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        path
+    }
+
+    /// A zero-length blob must read as ABSENT, not as empty content. This is the
+    /// ENOSPC debris case: ~4,000 such files survived one outage and turned every
+    /// later read into `pack header: need 40 bytes, got 0` — a parse failure no
+    /// caller can repair, where a miss would have been re-fetched.
+    #[tokio::test]
+    async fn zero_length_blob_reads_as_absent() {
+        let (_dir, storage) = storage();
+        plant_zero_length(&storage, "z/empty.dict");
+
+        let err = storage
+            .read_bytes("z/empty.dict")
+            .await
+            .expect_err("a zero-length blob must not read as empty content");
+        assert!(
+            matches!(err, crate::error::Error::NotFound(_)),
+            "must be NotFound so callers re-fetch rather than parse nothing: {err:?}"
+        );
+    }
+
+    /// `resolve_local_path` hands a path to callers that mmap or parse it
+    /// directly, so returning a zero-length blob converts recoverable debris into
+    /// an unrecoverable reader error. Presence is not validity.
+    #[test]
+    fn resolve_local_path_rejects_a_zero_length_blob() {
+        let (_dir, storage) = storage();
+        plant_zero_length(&storage, "z/empty.dict");
+
+        assert!(
+            storage.resolve_local_path("z/empty.dict").is_none(),
+            "a zero-length blob must not be offered as a local path"
+        );
+    }
+
+    /// `exists` has to agree with `read_bytes`. Reporting a blob present that the
+    /// reader then refuses is a worse contract than either answer alone, and
+    /// answering `false` is also what lets a writer replace the debris rather
+    /// than skip it as already-present.
+    #[tokio::test]
+    async fn exists_agrees_with_read_bytes_on_a_zero_length_blob() {
+        let (_dir, storage) = storage();
+        plant_zero_length(&storage, "z/empty.dict");
+
+        assert!(
+            !storage.exists("z/empty.dict").await.unwrap(),
+            "exists must not report a blob that read_bytes treats as absent"
+        );
+
+        // And the debris is replaceable: a normal write over it restores service.
+        storage.write_bytes("z/empty.dict", b"real").await.unwrap();
+        assert!(storage.exists("z/empty.dict").await.unwrap());
+        assert_eq!(storage.read_bytes("z/empty.dict").await.unwrap(), b"real");
+    }
+
+    /// A ranged read must agree with `read_bytes` on the same blob. Without the
+    /// guard the read stops at EOF and returns `Ok([])` — empty content, the
+    /// answer no caller can heal — where `read_bytes` says absent.
+    ///
+    /// Reached in practice *because of* `resolve_local_path`: the leaflet
+    /// reader tries the local path first, that guard refuses the debris, and it
+    /// falls through to `ContentStore::get_range`, which reads the same file
+    /// through here.
+    #[tokio::test]
+    async fn zero_length_blob_reads_as_absent_through_a_ranged_read() {
+        let (_dir, storage) = storage();
+        let address = "z/ranged.dict";
+        plant_zero_length(&storage, address);
+
+        let err = storage
+            .read_byte_range(address, 0..40)
+            .await
+            .expect_err("a zero-length blob must be absent on a ranged read, not empty content");
+        assert!(
+            matches!(err, crate::error::Error::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+
+        // The two read surfaces must not disagree about the same blob.
+        assert!(storage.read_bytes(address).await.is_err());
+
+        // And a real write over the debris restores both.
+        storage.write_bytes(address, b"real").await.unwrap();
+        assert_eq!(
+            storage.read_byte_range(address, 0..4).await.unwrap(),
+            b"real"
+        );
+    }
+
+    /// The guard must not fire on legitimate content. A one-byte blob is the
+    /// smallest thing that is genuinely there.
+    #[tokio::test]
+    async fn a_one_byte_blob_is_still_present() {
+        let (_dir, storage) = storage();
+        storage.write_bytes("z/tiny.dict", b"x").await.unwrap();
+
+        assert!(storage.exists("z/tiny.dict").await.unwrap());
+        assert!(storage.resolve_local_path("z/tiny.dict").is_some());
+        assert_eq!(storage.read_bytes("z/tiny.dict").await.unwrap(), b"x");
+        // The ranged path agrees that one byte is present.
+        assert_eq!(
+            storage.read_byte_range("z/tiny.dict", 0..1).await.unwrap(),
+            b"x"
+        );
     }
 }
