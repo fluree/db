@@ -179,7 +179,12 @@ impl Bm25WorkerState {
         // that no longer reads it, and `watched_ledgers` would report a ledger
         // nobody watches. Reachable through the `auto_register` arm, which
         // re-registers on every config republish.
-        self.unregister_graph_source(&graph_source_id);
+        //
+        // Prune directly rather than via `unregister_graph_source`: that logs
+        // "Unregistered graph source from maintenance", and an ordinary config
+        // republish emitting it mid-re-register is a misleading breadcrumb for
+        // anyone reading logs to find out why an index stopped syncing.
+        self.prune_reverse_edges(&graph_source_id);
 
         // Update forward map
         self.gs_to_ledgers
@@ -201,15 +206,21 @@ impl Bm25WorkerState {
         );
     }
 
-    /// Unregister a graph source. Returns whether it had been registered.
-    pub fn unregister_graph_source(&mut self, graph_source_id: &str) -> bool {
-        let graph_source_id = canonical_alias(graph_source_id);
-        let was_registered = match self.gs_to_ledgers.remove(&graph_source_id) {
+    /// Drop every map entry for an already-canonical graph source id, without
+    /// logging. Returns whether it had been registered.
+    ///
+    /// The removal half of both [`register_graph_source`](Self::register_graph_source)
+    /// (which prunes stale edges before rewriting them) and
+    /// [`unregister_graph_source`](Self::unregister_graph_source) (which adds the
+    /// log). Keeping the log out of here is what stops a re-register from
+    /// announcing an unregistration that did not happen.
+    fn prune_reverse_edges(&mut self, canonical_id: &str) -> bool {
+        let was_registered = match self.gs_to_ledgers.remove(canonical_id) {
             Some(ledgers) => {
                 // Remove from reverse map
                 for ledger in ledgers {
                     if let Some(graph_sources) = self.ledger_to_graph_sources.get_mut(&ledger) {
-                        graph_sources.remove(&graph_source_id);
+                        graph_sources.remove(canonical_id);
                         if graph_sources.is_empty() {
                             self.ledger_to_graph_sources.remove(&ledger);
                         }
@@ -220,6 +231,13 @@ impl Bm25WorkerState {
             None => false,
         };
         self.stats.registered_graph_sources = self.gs_to_ledgers.len();
+        was_registered
+    }
+
+    /// Unregister a graph source. Returns whether it had been registered.
+    pub fn unregister_graph_source(&mut self, graph_source_id: &str) -> bool {
+        let graph_source_id = canonical_alias(graph_source_id);
+        let was_registered = self.prune_reverse_edges(&graph_source_id);
         if was_registered {
             debug!(
                 graph_source_id,
@@ -886,6 +904,77 @@ mod tests {
             state.stats().registered_graph_sources,
             1,
             "re-registering is not a second registration"
+        );
+    }
+
+    /// Capture the `debug!` messages emitted while `f` runs, on this thread.
+    fn captured_debug_messages(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct Collect(Arc<Mutex<Vec<String>>>);
+        struct Visit<'a>(&'a mut Option<String>);
+        impl tracing::field::Visit for Visit<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    *self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> Layer<S> for Collect {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut msg = None;
+                event.record(&mut Visit(&mut msg));
+                if let Some(m) = msg {
+                    self.0.lock().unwrap().push(m);
+                }
+            }
+        }
+
+        let collect = Collect::default();
+        let sink = Arc::clone(&collect.0);
+        let subscriber = tracing_subscriber::registry().with(collect);
+        tracing::subscriber::with_default(subscriber, f);
+        let out = sink.lock().unwrap().clone();
+        out
+    }
+
+    /// A config republish re-registers, which prunes the old reverse edges —
+    /// but it must not announce an unregistration. That log line is what an
+    /// operator greps for when an index stops syncing, so emitting it on an
+    /// ordinary republish points the investigation at the wrong event.
+    ///
+    /// Enforced under `cargo nextest` (CI), which runs each test in its own
+    /// process. Under a bare parallel `cargo test` this can pass vacuously:
+    /// `with_default` is thread-local while tracing's callsite-interest cache
+    /// is process-global, so a sibling test hitting these callsites with no
+    /// subscriber installed can leave them cached as uninteresting and the
+    /// events never reach the collector. Verified by mutation
+    /// (`prune_reverse_edges` -> `unregister_graph_source`): red under nextest
+    /// and under `--test-threads=1`, green under bare parallel `cargo test`.
+    #[test]
+    fn re_registering_does_not_log_an_unregistration() {
+        let messages = captured_debug_messages(|| {
+            let mut state = Bm25WorkerState::new();
+            state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+            state.register_graph_source("search:main", &["ledger2:main".to_string()]);
+        });
+
+        assert!(
+            !messages.iter().any(|m| m.contains("Unregistered")),
+            "a re-register must not log an unregistration, got: {messages:?}"
+        );
+
+        // The real thing still says so, or the log would be useless.
+        let messages = captured_debug_messages(|| {
+            let mut state = Bm25WorkerState::new();
+            state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+            state.unregister_graph_source("search:main");
+        });
+        assert!(
+            messages.iter().any(|m| m.contains("Unregistered")),
+            "an actual unregister must still log, got: {messages:?}"
         );
     }
 
