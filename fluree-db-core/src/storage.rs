@@ -669,11 +669,15 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
         let address = self.cid_to_address(id)?;
-        match self.storage.read_bytes(&address).await {
+        // Keep the primary miss's message rather than discarding it: it carries
+        // the resolved path, and — for a zero-length blob — the reason the
+        // backend called it absent. Rebuilding a bare `not_found(address)` here
+        // throws both away, and this is the error a caller actually sees.
+        let primary = match self.storage.read_bytes(&address).await {
             Ok(bytes) => return Ok(bytes),
-            Err(crate::error::Error::NotFound(_)) => {}
+            Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
-        }
+        };
         // Fallback: dicts moved from per-branch to @shared namespace
         if let Some(legacy) = self.legacy_dict_address(id) {
             return self.storage.read_bytes(&legacy).await;
@@ -682,7 +686,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         if let Some(legacy) = self.legacy_index_root_address(id) {
             return self.storage.read_bytes(&legacy).await;
         }
-        Err(crate::error::Error::not_found(address))
+        Err(crate::error::Error::not_found(primary))
     }
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
@@ -747,11 +751,12 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
         let address = self.cid_to_address(id)?;
-        match self.storage.read_byte_range(&address, range.clone()).await {
+        // Same reason-preservation as `get` above.
+        let primary = match self.storage.read_byte_range(&address, range.clone()).await {
             Ok(bytes) => return Ok(bytes),
-            Err(crate::error::Error::NotFound(_)) => {}
+            Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
-        }
+        };
         // Fallback: dicts moved from per-branch to @shared namespace
         if let Some(legacy) = self.legacy_dict_address(id) {
             match self.storage.read_byte_range(&legacy, range.clone()).await {
@@ -764,7 +769,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         if let Some(legacy) = self.legacy_index_root_address(id) {
             return self.storage.read_byte_range(&legacy, range).await;
         }
-        Err(crate::error::Error::not_found(address))
+        Err(crate::error::Error::not_found(primary))
     }
 }
 
