@@ -27,6 +27,7 @@
   - [show](cli/show.md)
   - [index](cli/index.md)
   - [reindex](cli/reindex.md)
+  - [sweep](cli/sweep.md)
   - [config](cli/config.md)
   - [prefix](cli/prefix.md)
   - [token](cli/token.md)
@@ -87,6 +88,7 @@
 
 - [Design](design/README.md)
   - [Performance architecture](design/performance.md)
+  - [Row-returning multi-fact virtual joins (late-materialization corridor)](design/virtual-multifact-row-corridor.md)
   - [Query execution and overlay merge](design/query-execution.md)
   - [Auth contract (CLI ↔ Server)](design/auth-contract.md)
   - [Nameservice schema v2](design/nameservice-schema-v2.md)
@@ -191,6 +193,7 @@
     - [Team workflows: sharing memory via git](memory/guides/team-workflows.md)
     - [Customizing the rules file](memory/guides/rules-file.md)
     - [Migrating from plain-markdown memory](memory/guides/migrating.md)
+    - [Memory hygiene and auditing](memory/guides/hygiene-and-auditing.md)
   - [CLI reference](memory/cli/README.md)
     - [init](memory/cli/init.md)
     - [add](memory/cli/add.md)
@@ -199,6 +202,7 @@
     - [forget](memory/cli/forget.md)
     - [History via git](memory/cli/explain.md)
     - [status](memory/cli/status.md)
+    - [audit](memory/cli/audit.md)
     - [export / import](memory/cli/export-import.md)
     - [mcp-install](memory/cli/mcp-install.md)
   - [Reference](memory/reference/README.md)
@@ -224,6 +228,7 @@
 
 - [Troubleshooting](troubleshooting/README.md)
   - [Common errors](troubleshooting/common-errors.md)
+  - [Missing results at a historical `t`](troubleshooting/historical-results-missing.md)
   - [Debugging queries](troubleshooting/debugging-queries.md)
   - [Performance investigation with distributed tracing](troubleshooting/performance-tracing.md)
 
@@ -239,6 +244,7 @@
 - [Contributing](contributing/README.md)
   - [Dev setup](contributing/dev-setup.md)
   - [Tests](contributing/tests.md)
+  - [Adding a benchmark](contributing/benches.md)
   - [W3C SPARQL compliance suite](contributing/sparql-compliance.md)
   - [W3C SHACL compliance suite](contributing/shacl-compliance.md)
   - [Adding tracing spans](contributing/tracing-guide.md)

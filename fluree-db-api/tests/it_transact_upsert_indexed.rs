@@ -8,6 +8,12 @@
 //! that the skip never drops retractions for subjects that DO exist:
 //! persisted (base index), novelty-only (committed after the last index), and
 //! brand-new subjects all in one transaction.
+//!
+//! Correctness assertions alone cannot see the skip switching *off* in the
+//! absent-subject direction — failing open is conservatively correct, costing
+//! only extra queries — so that direction is asserted on the
+//! `skipped_subjects` / `pattern_queries` counters in the standalone
+//! `it_upsert_skip_fires` binary (span capture needs its own process).
 
 #![cfg(feature = "native")]
 
@@ -189,6 +195,147 @@ async fn upsert_mixed_persisted_novelty_new_subjects() {
             assert_eq!(name_values(&fluree, &ledger, "ex:b").await, expect("B1"));
             assert_eq!(name_values(&fluree, &ledger, "ex:c").await, expect("C2"));
             assert_eq!(name_values(&fluree, &ledger, "ex:d").await, expect("D1"));
+        })
+        .await;
+}
+
+/// Subjects whose IRI shape mints a **fresh namespace code per subject**.
+///
+/// Under `MostGranular` splitting, `urn:…:<id>:r:<sig>` splits at the last
+/// `:`, so every such subject gets its own namespace prefix. The pre-check
+/// resolves a subject's IRI in order to run the store's full-IRI lookup; when
+/// the pre-transaction snapshot cannot decode the namespace code it falls back
+/// to the store's own namespace table, and only reports "absent" when NEITHER
+/// can decode it (a code neither knows cannot name a row in the base index).
+///
+/// This pins both directions of that decision: subjects of this shape that
+/// already exist must still have their old values retracted, and brand-new
+/// ones must still be skipped rather than dragging the whole transaction
+/// through a per-(subject, predicate) scan.
+///
+/// The load-bearing case is `novel` — committed *after* the last index build,
+/// so its namespace code IS in the pre-transaction snapshot while the store's
+/// `find_subject_id` conclusively misses. `subject_in_base` therefore reports
+/// absent and only the novelty backstop keeps it from being skipped. That is
+/// the one direction where the fail-open removal could lose a retraction, and
+/// it is visible in the results: a wrong skip leaves the old value behind.
+#[tokio::test]
+async fn upsert_indexed_replaces_values_for_per_subject_namespaces() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 0,
+        reindex_max_bytes: 1_000_000,
+    };
+
+    let mut fluree = FlureeBuilder::file(path).build().expect("build");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/upsert-indexed-ns-per-subject:main";
+            let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+
+            // `base` shares one namespace; the rest each mint their own.
+            let base = "urn:it:ev:aaaa";
+            let rev = "urn:it:ev:aaaa:r:sig1";
+            let novel = "urn:it:ev:cccc:r:sig3";
+            let fresh = "urn:it:ev:bbbb:r:sig2";
+
+            let r1 = fluree
+                .upsert_with_opts(
+                    ledger,
+                    &json!({
+                        "@context": ctx(),
+                        "@graph": [
+                            {"@id": base, "ex:name": ["V1a", "V1b"]},
+                            {"@id": rev, "ex:name": "R1"}
+                        ]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .unwrap();
+
+            trigger_index_and_wait_outcome(&handle, ledger_id, r1.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert!(ledger.snapshot.range_provider.is_some());
+
+            // Novelty-only subject on a per-subject namespace: its code is
+            // minted here, so the next transaction's snapshot can decode it
+            // while the base index still has no row for it.
+            let r2 = fluree
+                .upsert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": novel, "ex:name": "C1"}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .unwrap();
+
+            // Re-upsert the persisted and novelty-only subjects, plus a
+            // brand-new one that also mints its own namespace (the skip path).
+            let r3 = fluree
+                .upsert_with_opts(
+                    r2.ledger,
+                    &json!({
+                        "@context": ctx(),
+                        "@graph": [
+                            {"@id": base, "ex:name": "V2"},
+                            {"@id": rev, "ex:name": "R2"},
+                            {"@id": novel, "ex:name": "C2"},
+                            {"@id": fresh, "ex:name": "N1"}
+                        ]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .unwrap();
+
+            let expect = |v: &str| vec![json!([v])];
+            assert_eq!(
+                name_values(&fluree, &r3.ledger, base).await,
+                expect("V2"),
+                "persisted subject on a shared namespace: both old values replaced"
+            );
+            assert_eq!(
+                name_values(&fluree, &r3.ledger, rev).await,
+                expect("R2"),
+                "persisted subject on a per-subject namespace: old value replaced"
+            );
+            assert_eq!(
+                name_values(&fluree, &r3.ledger, novel).await,
+                expect("C2"),
+                "novelty-only subject on a per-subject namespace: absent from the \
+                 base index, so only the novelty backstop keeps it from being skipped"
+            );
+            assert_eq!(
+                name_values(&fluree, &r3.ledger, fresh).await,
+                expect("N1"),
+                "brand-new per-subject-namespace subject inserted"
+            );
+
+            // Retractions must be staged, not merely masked by novelty.
+            trigger_index_and_wait_outcome(&handle, ledger_id, r3.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(name_values(&fluree, &ledger, base).await, expect("V2"));
+            assert_eq!(name_values(&fluree, &ledger, rev).await, expect("R2"));
+            assert_eq!(name_values(&fluree, &ledger, novel).await, expect("C2"));
+            assert_eq!(name_values(&fluree, &ledger, fresh).await, expect("N1"));
         })
         .await;
 }

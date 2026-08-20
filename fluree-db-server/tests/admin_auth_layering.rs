@@ -79,3 +79,31 @@ async fn authenticated_shape_passes_the_auth_gate() {
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// The sweep deletes index artifacts, so both its forms must sit behind the
+/// same outer auth gate as every other admin write rather than relying on
+/// route matching alone.
+#[tokio::test]
+async fn unauthenticated_sweep_is_rejected_before_downstream_work() {
+    for uri in ["/v1/fluree/sweep", "/v1/fluree/sweep/plan"] {
+        let (_tmp, state) = state_with_admin_auth_required().await;
+
+        let resp = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ledger":"test"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{uri} must be admin-gated"
+        );
+    }
+}

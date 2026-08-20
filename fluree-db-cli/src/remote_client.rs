@@ -98,8 +98,11 @@ pub(crate) fn policy_headers(policy: &PolicyArgs) -> Vec<(&'static str, String)>
             headers.push(("fluree-policy-values", s));
         }
     }
-    if policy.default_allow {
-        headers.push(("fluree-default-allow", "true".to_string()));
+    // Explicit `false` must travel too: the header is tri-state server-side, so
+    // omitting it would let the ledger's `f:defaultAllow` apply instead of the
+    // fail-closed posture `--no-default-allow` asked for.
+    if let Some(default_allow) = policy.default_allow_opt() {
+        headers.push(("fluree-default-allow", default_allow.to_string()));
     }
     headers
 }
@@ -144,8 +147,11 @@ pub(crate) fn inject_policy_into_json_opts(body: &mut serde_json::Value, policy:
         let obj: serde_json::Map<String, serde_json::Value> = values.into_iter().collect();
         opts_obj.insert("policy-values".to_string(), serde_json::Value::Object(obj));
     }
-    if policy.default_allow {
-        opts_obj.insert("default-allow".to_string(), serde_json::Value::Bool(true));
+    if let Some(default_allow) = policy.default_allow_opt() {
+        opts_obj.insert(
+            "default-allow".to_string(),
+            serde_json::Value::Bool(default_allow),
+        );
     }
 }
 
@@ -1962,18 +1968,54 @@ impl RemoteLedgerClient {
         ledger: &str,
     ) -> Result<fluree_db_api::wire::ReindexResponse, RemoteLedgerError> {
         let url = self.op_url_root("reindex");
+        self.post_ledger_op(&url, ledger, "reindex").await
+    }
+
+    /// Report which index artifacts a sweep would reclaim, without deleting.
+    ///
+    /// Shares `REINDEX_TIMEOUT`: planning walks every branch's index chain and
+    /// expands each root, so it scales with index size the same way a rebuild
+    /// does.
+    pub async fn sweep_plan(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::SweepPlanResponse, RemoteLedgerError> {
+        let url = self.op_url_root("sweep/plan");
+        self.post_ledger_op(&url, ledger, "sweep plan").await
+    }
+
+    /// Reclaim index artifacts that no index chain references.
+    pub async fn sweep(
+        &self,
+        ledger: &str,
+    ) -> Result<fluree_db_api::wire::SweepResponse, RemoteLedgerError> {
+        let url = self.op_url_root("sweep");
+        self.post_ledger_op(&url, ledger, "sweep").await
+    }
+
+    /// POST a `{"ledger": ...}` body to an admin operation and decode the
+    /// response.
+    ///
+    /// Shares `REINDEX_TIMEOUT`: each of these walks or rebuilds the index,
+    /// so they scale with index size rather than request size.
+    async fn post_ledger_op<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        ledger: &str,
+        operation: &str,
+    ) -> Result<T, RemoteLedgerError> {
         let body = serde_json::json!({ "ledger": ledger });
         let raw = self
             .send_json_with_timeout(
                 reqwest::Method::POST,
-                &url,
+                url,
                 "application/json",
                 Some(RequestBody::Json(&body)),
                 Self::REINDEX_TIMEOUT,
             )
             .await?;
         serde_json::from_value(raw)
-            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("reindex response: {e}")))
+            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("{operation} response: {e}")))
     }
 
     // =========================================================================
@@ -2787,6 +2829,70 @@ mod tests {
     fn test_client_strips_trailing_slash() {
         let client = RemoteLedgerClient::new("http://localhost:8090/fluree/", None);
         assert_eq!(client.base_url, "http://localhost:8090/fluree");
+    }
+
+    fn default_allow_header(policy: &PolicyArgs) -> Option<String> {
+        policy_headers(policy)
+            .into_iter()
+            .find(|(name, _)| *name == "fluree-default-allow")
+            .map(|(_, value)| value)
+    }
+
+    /// The producer/consumer seam: `--no-default-allow` is only meaningful
+    /// remotely if the header actually travels. Sending it solely for `true`
+    /// would silently drop the fail-closed posture over HTTP while it kept
+    /// working embedded.
+    #[test]
+    fn default_allow_header_travels_in_both_directions() {
+        assert_eq!(
+            default_allow_header(&PolicyArgs {
+                default_allow: true,
+                ..Default::default()
+            }),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            default_allow_header(&PolicyArgs {
+                no_default_allow: true,
+                ..Default::default()
+            }),
+            Some("false".to_string())
+        );
+        // Unset sends no header, leaving the ledger's f:defaultAllow in force.
+        assert_eq!(
+            default_allow_header(&PolicyArgs {
+                identity: Some("did:key:alice".into()),
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
+    /// Same tri-state on the JSON-LD body-opts path.
+    #[test]
+    fn default_allow_body_opts_travel_in_both_directions() {
+        let mut body = serde_json::json!({});
+        inject_policy_into_json_opts(
+            &mut body,
+            &PolicyArgs {
+                no_default_allow: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            body["opts"]["default-allow"],
+            serde_json::Value::Bool(false)
+        );
+
+        let mut body = serde_json::json!({});
+        inject_policy_into_json_opts(
+            &mut body,
+            &PolicyArgs {
+                identity: Some("did:key:alice".into()),
+                ..Default::default()
+            },
+        );
+        assert!(body["opts"].get("default-allow").is_none());
     }
 
     /// `put_upload_file` must send a fixed `Content-Length` and NOT

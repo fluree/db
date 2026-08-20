@@ -50,7 +50,11 @@ pub struct FlureeHeaders {
 
     /// Default-allow flag — when true, permit access in the absence of matching
     /// policy rules. Delivered via the `fluree-default-allow` header.
-    pub default_allow: bool,
+    ///
+    /// Tri-state, mirroring `GovernanceOptions::default_allow`: `None` when the
+    /// header is absent, so the ledger's configured `f:defaultAllow` applies;
+    /// `Some(v)` when the caller sent it, which overrides config.
+    pub default_allow: Option<bool>,
 
     /// Enable all metadata tracking
     pub track_meta: bool,
@@ -60,6 +64,10 @@ pub struct FlureeHeaders {
 
     /// Track execution time
     pub track_time: bool,
+
+    /// Track policy enforcement (per-policy executed/allowed counts and
+    /// whether policy governed the request).
+    pub track_policy: bool,
 
     /// Maximum fuel limit (decimal). Internally converted to micro-fuel.
     pub max_fuel: Option<f64>,
@@ -83,10 +91,11 @@ impl Default for FlureeHeaders {
             policy: None,
             policy_class: Vec::new(),
             policy_values: None,
-            default_allow: false,
+            default_allow: None,
             track_meta: false,
             track_fuel: false,
             track_time: false,
+            track_policy: false,
             max_fuel: None,
             min_t: None,
             content_type: None,
@@ -106,6 +115,7 @@ impl FlureeHeaders {
     pub const TRACK_META: &'static str = "fluree-track-meta";
     pub const TRACK_FUEL: &'static str = "fluree-track-fuel";
     pub const TRACK_TIME: &'static str = "fluree-track-time";
+    pub const TRACK_POLICY: &'static str = "fluree-track-policy";
     pub const MAX_FUEL: &'static str = "fluree-max-fuel";
     pub const MIN_T: &'static str = "fluree-min-t";
 
@@ -156,12 +166,14 @@ impl FlureeHeaders {
         }
 
         // Boolean headers (presence or "true" value)
-        fluree_headers.default_allow = is_header_truthy(headers, Self::DEFAULT_ALLOW);
+        fluree_headers.default_allow = header_bool_opt(headers, Self::DEFAULT_ALLOW);
         fluree_headers.track_meta = is_header_truthy(headers, Self::TRACK_META);
         fluree_headers.track_fuel =
             fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_FUEL);
         fluree_headers.track_time =
             fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_TIME);
+        fluree_headers.track_policy =
+            fluree_headers.track_meta || is_header_truthy(headers, Self::TRACK_POLICY);
 
         // Numeric headers (decimal allowed)
         if let Some(val) = get_header_str(headers, Self::MAX_FUEL) {
@@ -202,7 +214,11 @@ impl FlureeHeaders {
 
     /// Check if tracking is enabled (any tracking header or max-fuel limit)
     pub fn has_tracking(&self) -> bool {
-        self.track_meta || self.track_fuel || self.track_time || self.max_fuel.is_some()
+        self.track_meta
+            || self.track_fuel
+            || self.track_time
+            || self.track_policy
+            || self.max_fuel.is_some()
     }
 
     /// Build `TrackingOptions` from header values.
@@ -213,7 +229,7 @@ impl FlureeHeaders {
         fluree_db_core::tracking::TrackingOptions {
             track_time: self.track_meta || self.track_time,
             track_fuel: self.track_meta || self.track_fuel || self.max_fuel.is_some(),
-            track_policy: self.track_meta,
+            track_policy: self.track_meta || self.track_policy,
             max_fuel: self.max_fuel.map(fluree_db_core::tracking::fuel_to_micro),
         }
     }
@@ -407,12 +423,13 @@ impl FlureeHeaders {
             );
         }
 
-        if self.default_allow
-            && !opts.contains_key("default-allow")
-            && !opts.contains_key("default_allow")
-            && !opts.contains_key("defaultAllow")
-        {
-            opts.insert("default-allow".to_string(), JsonValue::Bool(true));
+        if let Some(default_allow) = self.default_allow {
+            if !opts.contains_key("default-allow")
+                && !opts.contains_key("default_allow")
+                && !opts.contains_key("defaultAllow")
+            {
+                opts.insert("default-allow".to_string(), JsonValue::Bool(default_allow));
+            }
         }
 
         if let Some(max_fuel) = self.max_fuel {
@@ -438,6 +455,9 @@ impl FlureeHeaders {
                 if self.track_fuel {
                     meta.insert("fuel".to_string(), JsonValue::Bool(true));
                 }
+                if self.track_policy {
+                    meta.insert("policy".to_string(), JsonValue::Bool(true));
+                }
                 if !meta.is_empty() {
                     opts.insert("meta".to_string(), JsonValue::Object(meta));
                 }
@@ -459,6 +479,21 @@ fn is_header_truthy(headers: &HeaderMap, name: &str) -> bool {
     }
 }
 
+/// Tri-state read of a boolean header: `None` when absent, `Some(truthy)` when
+/// present. Used where "the caller didn't say" must stay distinct from "the
+/// caller said false".
+///
+/// Truthiness is byte-for-byte [`is_header_truthy`]'s: `true`, `1`, **or empty**.
+/// The empty case is deliberate and shared with every other boolean Fluree
+/// header — `fluree-track-meta:` with no value means "on" — so a bare
+/// `fluree-default-allow:` reads as `Some(true)`, not as absent and not as
+/// false. Only a present, non-empty, unrecognized value (`0`, `no`, `nonsense`)
+/// reads as `Some(false)`.
+fn header_bool_opt(headers: &HeaderMap, name: &str) -> Option<bool> {
+    get_header_str(headers, name)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1" || v.is_empty())
+}
+
 /// Axum extractor implementation
 #[axum::async_trait]
 impl<S> FromRequestParts<S> for FlureeHeaders
@@ -477,7 +512,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::FlureeHeaders;
+    use super::{FlureeHeaders, JsonValue};
     use axum::http::HeaderMap;
 
     #[test]
@@ -490,6 +525,45 @@ mod tests {
         assert_eq!(parsed.min_t, Some(42));
     }
 
+    /// `fluree-track-policy` on its own must make the request tracked, ask the
+    /// engine for policy stats, and survive the header→opts injection. Before
+    /// this was parsed, the CLI's `--track-policy` was a no-op over HTTP.
+    #[test]
+    fn track_policy_header_enables_policy_tracking() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::TRACK_POLICY, "true".parse().unwrap());
+
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        assert!(parsed.track_policy);
+        assert!(parsed.has_tracking(), "policy alone must count as tracking");
+
+        let opts = parsed.to_tracking_options();
+        assert!(opts.track_policy);
+        assert!(!opts.track_fuel, "policy must not drag in fuel");
+        assert!(!opts.track_time, "policy must not drag in time");
+
+        let mut body_opts = serde_json::Map::new();
+        parsed.inject_into_opts(&mut body_opts);
+        assert_eq!(
+            body_opts.get("meta"),
+            Some(&serde_json::json!({"policy": true})),
+            "selective injection must carry policy through to the body opts"
+        );
+    }
+
+    /// The omnibus header still implies policy tracking.
+    #[test]
+    fn track_meta_header_implies_policy_tracking() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::TRACK_META, "true".parse().unwrap());
+
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        assert!(parsed.track_policy);
+        assert!(parsed.to_tracking_options().track_policy);
+    }
+
     #[test]
     fn rejects_negative_min_t_header() {
         let mut headers = HeaderMap::new();
@@ -498,5 +572,65 @@ mod tests {
         let err = FlureeHeaders::from_headers(&headers).unwrap_err();
 
         assert!(err.to_string().contains("fluree-min-t"));
+    }
+
+    fn default_allow_for(value: Option<&str>) -> Option<bool> {
+        let mut headers = HeaderMap::new();
+        if let Some(v) = value {
+            headers.insert(FlureeHeaders::DEFAULT_ALLOW, v.parse().unwrap());
+        }
+        FlureeHeaders::from_headers(&headers).unwrap().default_allow
+    }
+
+    /// The header is tri-state: absent leaves the ledger's `f:defaultAllow`
+    /// free to apply, present is an override in whichever direction it names.
+    #[test]
+    fn default_allow_header_is_tri_state() {
+        assert_eq!(default_allow_for(None), None);
+        assert_eq!(default_allow_for(Some("true")), Some(true));
+        assert_eq!(default_allow_for(Some("1")), Some(true));
+        assert_eq!(default_allow_for(Some("")), Some(true));
+        assert_eq!(default_allow_for(Some("false")), Some(false));
+        assert_eq!(
+            default_allow_for(Some("nonsense")),
+            Some(false),
+            "unrecognized values fail closed rather than reading as absent"
+        );
+    }
+
+    /// Header injection carries the caller's explicit `false` into body opts, so
+    /// it stays distinguishable from "never said" downstream.
+    #[test]
+    fn injects_explicit_default_allow_into_opts() {
+        for (header, expected) in [("true", true), ("false", false)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(FlureeHeaders::DEFAULT_ALLOW, header.parse().unwrap());
+            let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+            let mut opts = serde_json::Map::new();
+            parsed.inject_into_opts(&mut opts);
+
+            assert_eq!(opts.get("default-allow"), Some(&JsonValue::Bool(expected)));
+        }
+
+        // Absent header injects nothing at all.
+        let parsed = FlureeHeaders::from_headers(&HeaderMap::new()).unwrap();
+        let mut opts = serde_json::Map::new();
+        parsed.inject_into_opts(&mut opts);
+        assert!(!opts.contains_key("default-allow"));
+    }
+
+    /// Body opts still win over headers.
+    #[test]
+    fn body_opts_default_allow_beats_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(FlureeHeaders::DEFAULT_ALLOW, "true".parse().unwrap());
+        let parsed = FlureeHeaders::from_headers(&headers).unwrap();
+
+        let mut opts = serde_json::Map::new();
+        opts.insert("default-allow".to_string(), JsonValue::Bool(false));
+        parsed.inject_into_opts(&mut opts);
+
+        assert_eq!(opts.get("default-allow"), Some(&JsonValue::Bool(false)));
     }
 }

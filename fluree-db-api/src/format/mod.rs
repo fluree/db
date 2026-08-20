@@ -275,8 +275,14 @@ fn curie_align_enabled() -> bool {
 /// XML, typed, delimited) shares this compactor but receives `false` here and so
 /// keeps raw graph-source IRIs — that cross-format consistency work is register
 /// entry F16, deliberately out of scope for the corpus-gated F9 fix.
+/// Never true under [`FormatterConfig::absolute_iris`]: F9's job is to make
+/// virtual output match native, and under the W3C profile native emits the
+/// absolute IRI, which the `Binding::Iri` arm already does verbatim. So the
+/// alignment holds at the absolute end and this flag only fires on the
+/// compacting (CLI display) profile.
 fn graph_source_iri_compaction(result: &QueryResult, config: &FormatterConfig) -> bool {
     result.from_graph_source
+        && !config.absolute_iris
         && curie_align_enabled()
         && matches!(config.format, OutputFormat::SparqlJson)
 }
@@ -315,7 +321,8 @@ pub fn format_results(
     }
 
     let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
-        .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config));
+        .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config))
+        .with_absolute_iris(config.absolute_iris);
 
     // CONSTRUCT / DESCRIBE produce a graph, not a binding table, so the only
     // sensible JSON rendering is JSON-LD. Any JSON-producing format request
@@ -420,10 +427,12 @@ pub fn format_results_string(
 ) -> Result<String> {
     // Delimited-text fast-path: skip JSON DOM and JSON serialization entirely
     match config.format {
-        OutputFormat::Tsv => return delimited::format_tsv(result, snapshot),
-        OutputFormat::Csv => return delimited::format_csv(result, snapshot),
+        OutputFormat::Tsv | OutputFormat::Csv => {
+            return delimited::format_string_for(result, snapshot, config)
+        }
         OutputFormat::SparqlXml => {
-            let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
+            let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
+                .with_absolute_iris(config.absolute_iris);
             return sparql_xml::format(result, &compactor, config);
         }
         OutputFormat::RdfXml => {
@@ -437,7 +446,8 @@ pub fn format_results_string(
     // serde_json::Value DOM and its second serialization pass.
     if json_stream_eligible(result, config) {
         let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
-            .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config));
+            .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config))
+            .with_absolute_iris(config.absolute_iris);
         return stream_json(result, &compactor, config);
     }
 
@@ -512,7 +522,8 @@ pub async fn format_results_async(
     }
 
     let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context)
-        .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config));
+        .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config))
+        .with_absolute_iris(config.absolute_iris);
 
     // CONSTRUCT / DESCRIBE produce a graph (sync, no DB access needed); coerce
     // any JSON-producing format to JSON-LD rather than rejecting it. RDF/XML and
@@ -666,8 +677,9 @@ pub async fn format_results_string_async(
 ) -> Result<String> {
     // Delimited-text fast-path: skip JSON DOM and JSON serialization entirely
     match config.format {
-        OutputFormat::Tsv => return delimited::format_tsv(result, db.snapshot),
-        OutputFormat::Csv => return delimited::format_csv(result, db.snapshot),
+        OutputFormat::Tsv | OutputFormat::Csv => {
+            return delimited::format_string_for(result, db.snapshot, config)
+        }
         OutputFormat::SparqlXml => {
             let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);
@@ -712,8 +724,9 @@ pub async fn format_results_string_async_dataset(
     })?;
     let primary_db = primary.as_graph_db_ref();
     match config.format {
-        OutputFormat::Tsv => return delimited::format_tsv(result, primary_db.snapshot),
-        OutputFormat::Csv => return delimited::format_csv(result, primary_db.snapshot),
+        OutputFormat::Tsv | OutputFormat::Csv => {
+            return delimited::format_string_for(result, primary_db.snapshot, config)
+        }
         OutputFormat::SparqlXml => {
             let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);

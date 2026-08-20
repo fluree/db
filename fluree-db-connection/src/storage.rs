@@ -2,19 +2,22 @@
 
 use crate::config::{StorageConfig, StorageType};
 use crate::error::{ConnectionError, Result};
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-use fluree_db_core::FileStorage;
 use fluree_db_core::MemoryStorage;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+use fluree_db_core::{Durability, FileStorage};
 
 /// Create a memory storage instance
 pub fn create_memory_storage() -> MemoryStorage {
     MemoryStorage::new()
 }
 
-/// Create a file storage instance
+/// Create a file storage instance for `config`.
+///
+/// Durability comes from the config, with `FLUREE_STORAGE_FSYNC` taking
+/// precedence over it — see [`Durability::resolve`].
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-pub fn create_file_storage(base_path: &str) -> FileStorage {
-    FileStorage::new(base_path)
+pub fn create_file_storage(base_path: &str, config: &StorageConfig) -> FileStorage {
+    FileStorage::new(base_path).with_durability(Durability::resolve(config.durability))
 }
 
 /// Validate storage config and return the path for file storage
@@ -56,8 +59,16 @@ mod tests {
     #[test]
     #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     fn test_create_file_storage() {
-        let storage = create_file_storage("/tmp/test");
+        let config = StorageConfig {
+            storage_type: StorageType::File,
+            path: Some(Arc::from("/tmp/test")),
+            durability: Some(fluree_db_core::Durability::PageCache),
+            ..Default::default()
+        };
+        let storage = create_file_storage("/tmp/test", &config);
         assert!(format!("{storage:?}").contains("FileStorage"));
+        // The config's durability reaches the storage instance.
+        assert_eq!(storage.durability(), fluree_db_core::Durability::PageCache);
     }
 
     #[test]
@@ -76,6 +87,7 @@ mod tests {
             path: Some(Arc::from("/tmp/test")),
             aes256_key: None,
             address_identifier: None,
+            durability: None,
         };
         let result = validate_storage_config(&config).unwrap();
         assert_eq!(result, Some("/tmp/test"));
@@ -90,6 +102,7 @@ mod tests {
             path: None,
             aes256_key: None,
             address_identifier: None,
+            durability: None,
         };
         let result = validate_storage_config(&config);
         assert!(result.is_err());
@@ -107,6 +120,7 @@ mod tests {
             path: None,
             aes256_key: None,
             address_identifier: None,
+            durability: None,
         };
         let result = validate_storage_config(&config);
         assert!(result.is_err());

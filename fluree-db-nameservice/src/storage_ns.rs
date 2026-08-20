@@ -18,15 +18,16 @@
 //! Under contention, operations will retry with exponential backoff.
 
 use crate::ns_format::{
-    ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2, NS_VERSION,
+    merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
+    NS_VERSION,
 };
 use crate::{
     deserialize_json, parse_default_context_value, serialize_json, AdminPublisher, BranchLifecycle,
     CasResult, CommitPublisher, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue,
     GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher,
-    LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind,
-    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
-    StatusValue,
+    LedgerHeads, LedgerLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord,
+    RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
+    StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::ledger_id::{format_ledger_id, normalize_ledger_id, split_ledger_id};
@@ -326,6 +327,28 @@ where
         }
     }
 
+    /// Head pointers only: same keys and merge rule as `load_record`, minus
+    /// the config/context/status fields.
+    async fn load_heads(&self, ledger_name: &str, branch: &str) -> Result<Option<LedgerHeads>> {
+        let main_key = self.ns_key(ledger_name, branch);
+        let main_bytes = match self.storage.read_bytes(&main_key).await {
+            Ok(bytes) => bytes,
+            Err(CoreError::NotFound(_)) => return Ok(None),
+            Err(e) => {
+                return Err(NameServiceError::storage(format!(
+                    "Failed to read {main_key}: {e}"
+                )))
+            }
+        };
+        if Self::is_graph_source_from_bytes(&main_bytes) {
+            return Ok(None);
+        }
+        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let index_file: Option<NsIndexFileV2> =
+            self.read_json(&self.index_key(ledger_name, branch)).await?;
+        Ok(Some(merge_heads(&main, index_file.as_ref())))
+    }
+
     /// Load and merge main record with index file
     async fn load_record(&self, ledger_name: &str, branch: &str) -> Result<Option<NsRecord>> {
         let main_key = self.ns_key(ledger_name, branch);
@@ -499,6 +522,11 @@ where
         self.load_record(&ledger_name, &branch).await
     }
 
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        self.load_heads(&ledger_name, &branch).await
+    }
+
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         let prefix = if self.prefix.is_empty() {
             format!("{NS_VERSION}/{ledger_name}/")
@@ -569,7 +597,12 @@ where
                     let ledger_name = &path[..slash_pos];
                     let branch = path[slash_pos + 1..].trim_end_matches(".json");
 
-                    if let Ok(Some(record)) = self.load_record(ledger_name, branch).await {
+                    // A read failure must not silently shrink the result:
+                    // callers that decide what to delete treat a missing
+                    // branch as one with nothing to protect. `Ok(None)` is a
+                    // legitimate skip (graph-source record, or a branch
+                    // dropped since the key listing).
+                    if let Some(record) = self.load_record(ledger_name, branch).await? {
                         records.push(record);
                     }
                 }
@@ -2268,6 +2301,26 @@ mod tests {
             .unwrap();
         assert_eq!(index.id, Some(dummy_cid("index-1")));
         assert_eq!(index.t, 3);
+    }
+
+    #[tokio::test]
+    async fn test_storage_heads_matches_lookup() {
+        let ns = make_storage_ns();
+        assert_eq!(ns.heads("mydb:main").await.unwrap(), None);
+
+        publish_commit(&ns, "mydb:main", 5, &dummy_cid("commit-1")).await;
+        let heads = ns.heads("mydb:main").await.unwrap().unwrap();
+        assert_eq!(heads.commit.t, 5);
+        assert_eq!(heads.index, RefValue { id: None, t: 0 });
+
+        ns.publish_index("mydb:main", 3, &dummy_cid("index-1"))
+            .await
+            .unwrap();
+        let heads = ns.heads("mydb:main").await.unwrap().unwrap();
+        let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+        assert_eq!(heads, LedgerHeads::from_record(&record));
+        assert_eq!(heads.index.id, Some(dummy_cid("index-1")));
+        assert_eq!(heads.index.t, 3);
     }
 
     #[tokio::test]

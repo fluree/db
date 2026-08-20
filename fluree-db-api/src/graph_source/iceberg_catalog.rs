@@ -20,7 +20,9 @@ use crate::Result;
 
 use fluree_db_iceberg::catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient};
 use fluree_db_iceberg::io::batch::IcebergFieldTypeExt;
-use fluree_db_iceberg::io::{S3IcebergStorage, SendIcebergStorage};
+use fluree_db_iceberg::io::{
+    FileIcebergStorage, IcebergStorageBackend, S3IcebergStorage, SendIcebergStorage,
+};
 use fluree_db_iceberg::manifest::DataFile;
 use fluree_db_iceberg::metadata::{
     PartitionField, Schema, SchemaField, Snapshot, SortField, TableMetadata,
@@ -944,7 +946,14 @@ pub(crate) fn decide_credential_source(
 pub(crate) async fn build_preview_storage(
     conn: &IcebergConnectionConfig,
     credentials: Option<&fluree_db_iceberg::credential::VendedCredentials>,
-) -> Result<S3IcebergStorage> {
+) -> Result<IcebergStorageBackend> {
+    // A local (`file://` / absolute-path) Direct table reads the filesystem —
+    // no SDK client, no credential decision to make.
+    if let CatalogMode::Direct { table_location } = &conn.catalog_mode {
+        if FileIcebergStorage::is_local_location(table_location) {
+            return Ok(IcebergStorageBackend::File(FileIcebergStorage::new()));
+        }
+    }
     let io = &conn.io;
     let is_rest = matches!(conn.catalog_mode, CatalogMode::Rest(_));
     let storage =
@@ -979,7 +988,9 @@ pub(crate) async fn build_preview_storage(
                 return Err(crate::ApiError::CatalogCredentialsNotVended { catalog_uri });
             }
         };
-    storage.map_err(|e| crate::ApiError::config(format!("Failed to create S3 storage: {e}")))
+    storage
+        .map(IcebergStorageBackend::S3)
+        .map_err(|e| crate::ApiError::config(format!("Failed to create S3 storage: {e}")))
 }
 
 /// Map an iceberg-crate [`AggregatedColumnStats`] onto the API [`ColumnStats`].

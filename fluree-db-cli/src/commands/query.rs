@@ -69,7 +69,11 @@ impl TrackingFlags {
 
     /// Build the HTTP request headers that map 1:1 to the flag set.
     /// Empty when no tracking was requested.
-    fn as_request_headers(&self) -> Vec<(&'static str, String)> {
+    ///
+    /// Public so the seam against the server's `fluree-*` header parser can be
+    /// tested from one place — this producer and that consumer drifted apart
+    /// once already (`fluree-track-policy` went unparsed).
+    pub fn as_request_headers(&self) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();
         if !self.any() {
             return out;
@@ -99,10 +103,15 @@ impl TrackingFlags {
 /// Append fuel/time/policy fields from a tracked response to the existing
 /// row/time footer. `metrics` is `(track_fuel, track_time, track_policy)` —
 /// only requested fields are shown, even if the server returned more.
+///
+/// `enforcement` covers the case per-policy counts cannot: a request that ran
+/// under a policy context where nothing executed. Without it, `--track-policy`
+/// prints nothing at all for the fail-closed case.
 fn format_tally_suffix(
     fuel: Option<f64>,
     time: Option<&str>,
     policy: Option<&std::collections::HashMap<String, fluree_db_api::PolicyStats>>,
+    enforcement: Option<&fluree_db_api::PolicyEnforcement>,
     metrics: (bool, bool, bool),
 ) -> String {
     let (want_fuel, want_time, want_policy) = metrics;
@@ -118,11 +127,22 @@ fn format_tally_suffix(
         }
     }
     if want_policy {
-        if let Some(p) = policy {
-            if !p.is_empty() {
+        match policy.filter(|p| !p.is_empty()) {
+            Some(p) => {
                 let total_exec: u64 = p.values().map(|s| s.executed).sum();
                 let total_allowed: u64 = p.values().map(|s| s.allowed).sum();
                 parts.push(format!("policy {total_allowed}/{total_exec}"));
+            }
+            // No policy ran. Say whether that was because none applied under an
+            // active policy context, or because there was no policy at all.
+            None => {
+                if let Some(state) = enforcement.filter(|e| e.enforced) {
+                    if state.denies_all_data {
+                        parts.push("policy enforced (grants no data)".to_string());
+                    } else {
+                        parts.push("policy enforced (none ran)".to_string());
+                    }
+                }
             }
         }
     }
@@ -779,7 +799,10 @@ pub async fn run(
                     >(v.clone())
                     .ok()
                 });
-                (inner, Some((fuel, time, policy)))
+                let enforcement = envelope.get("policy_enforcement").and_then(|v| {
+                    serde_json::from_value::<fluree_db_api::PolicyEnforcement>(v.clone()).ok()
+                });
+                (inner, Some((fuel, time, policy, enforcement)))
             } else {
                 (result, None)
             };
@@ -808,9 +831,14 @@ pub async fn run(
             let output =
                 output::format_result(&result, output_format, query_format, effective_limit)?;
             println!("{}", output.text);
-            if let Some((fuel, time, policy)) = tracked_tally {
-                let tally_suffix =
-                    format_tally_suffix(fuel, time.as_deref(), policy.as_ref(), tracking_metrics);
+            if let Some((fuel, time, policy, enforcement)) = tracked_tally {
+                let tally_suffix = format_tally_suffix(
+                    fuel,
+                    time.as_deref(),
+                    policy.as_ref(),
+                    enforcement.as_ref(),
+                    tracking_metrics,
+                );
                 let time_str = format_duration(elapsed);
                 let total = output.total_rows;
                 match effective_limit {
@@ -914,6 +942,7 @@ pub async fn run(
                     response.fuel,
                     response.time.as_deref(),
                     response.policy.as_ref(),
+                    response.policy_enforcement.as_ref(),
                     tracking_metrics,
                 );
                 eprintln!(
@@ -975,7 +1004,7 @@ pub async fn run(
                         } else {
                             // Rare fallback: GROUP BY produces grouped bindings requiring
                             // disaggregation, so fall back to the existing JSON-based formatter.
-                            let formatted_json = result.to_sparql_json(&view.snapshot)?;
+                            let formatted_json = cli_sparql_json(&result, &view.snapshot)?;
                             let output = output::format_result(
                                 &formatted_json,
                                 OutputFormatKind::Table,
@@ -988,8 +1017,11 @@ pub async fn run(
                     }
                     detect::QueryFormat::JsonLd => {
                         // JSON-LD can be nested; keep bench output in the lightweight TSV form.
-                        let (text, total_rows) =
-                            result.to_tsv_limited(&view.snapshot, BENCH_ROWS)?;
+                        let (text, total_rows) = result.to_delimited_limited(
+                            &view.snapshot,
+                            BENCH_ROWS,
+                            &cli_delimited_config(OutputFormatKind::Tsv),
+                        )?;
                         print!("{text}");
                         print_footer(total_rows, Some(BENCH_ROWS), elapsed);
                     }
@@ -998,11 +1030,8 @@ pub async fn run(
                 // Delimited fast path: write bytes directly to stdout (no JSON intermediate).
                 let total_rows = result.row_count();
                 let fmt_timer = Instant::now();
-                let bytes = if output_format == OutputFormatKind::Tsv {
-                    result.to_tsv_bytes(&view.snapshot)?
-                } else {
-                    result.to_csv_bytes(&view.snapshot)?
-                };
+                let bytes = result
+                    .to_delimited_bytes(&view.snapshot, &cli_delimited_config(output_format))?;
                 let fmt_elapsed = fmt_timer.elapsed();
                 use std::io::Write;
                 std::io::stdout().write_all(&bytes)?;
@@ -1096,7 +1125,7 @@ pub async fn run(
                     result.format_async(view.as_graph_db_ref(), &config).await?
                 } else {
                     match query_format {
-                        detect::QueryFormat::Sparql => result.to_sparql_json(&view.snapshot)?,
+                        detect::QueryFormat::Sparql => cli_sparql_json(&result, &view.snapshot)?,
                         detect::QueryFormat::JsonLd => {
                             result.to_jsonld_async(view.as_graph_db_ref()).await?
                         }
@@ -1354,6 +1383,15 @@ fn print_stream_footer(outcome: &query_stream::StreamOutcome, elapsed: std::time
     if let Some(fuel) = outcome.fuel {
         parts.push(format!("fuel {fuel}"));
     }
+    // Only the enforced case says anything; an unenforced stream reports
+    // nothing, as before.
+    if let Some(state) = outcome.policy_enforcement.as_ref().filter(|e| e.enforced) {
+        parts.push(if state.denies_all_data {
+            "policy enforced (grants no data)".to_string()
+        } else {
+            "policy enforced".to_string()
+        });
+    }
     eprintln!("({})", parts.join(", "));
 }
 
@@ -1460,11 +1498,8 @@ async fn run_cypher_query(
     // Delimited fast path mirrors the SPARQL/JSON-LD handler.
     if matches!(output_format, OutputFormatKind::Tsv | OutputFormatKind::Csv) {
         let total_rows = result.row_count();
-        let bytes = if output_format == OutputFormatKind::Tsv {
-            result.to_tsv_bytes(&view.snapshot)?
-        } else {
-            result.to_csv_bytes(&view.snapshot)?
-        };
+        let bytes =
+            result.to_delimited_bytes(&view.snapshot, &cli_delimited_config(output_format))?;
         use std::io::Write;
         std::io::stdout().write_all(&bytes)?;
         eprintln!(
@@ -1697,6 +1732,46 @@ fn reject_graph_source_unsupported(
     Ok(())
 }
 
+/// The SPARQL-JSON config the CLI renders with.
+///
+/// The CLI is a display surface: its output is read by a human in a terminal or
+/// piped into a shell one-liner, and the query's own PREFIX declarations are
+/// right there on screen to expand a CURIE with. So it deliberately opts out of
+/// the W3C absolute-IRI profile that the HTTP/API surfaces serialize under
+/// (issue #45) and keeps the abbreviated form issue #1466 established.
+///
+/// Every CLI call site that reaches a W3C writer goes through this (or
+/// [`cli_delimited_config`]) so the deviation is a visible decision, not a
+/// default it inherited.
+fn cli_sparql_json_config() -> fluree_db_api::FormatterConfig {
+    fluree_db_api::FormatterConfig::sparql_json().with_compact_iris()
+}
+
+/// The CSV/TSV config the CLI renders with — same rationale as
+/// [`cli_sparql_json_config`].
+fn cli_delimited_config(output_format: OutputFormatKind) -> fluree_db_api::FormatterConfig {
+    let config = if output_format == OutputFormatKind::Csv {
+        fluree_db_api::FormatterConfig::csv()
+    } else {
+        fluree_db_api::FormatterConfig::tsv()
+    };
+    config.with_compact_iris()
+}
+
+/// Format a result as SPARQL JSON for CLI display (compacted; see
+/// [`cli_sparql_json_config`]).
+fn cli_sparql_json(
+    result: &fluree_db_api::QueryResult,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+) -> Result<serde_json::Value, CliError> {
+    Ok(fluree_db_api::format::format_results(
+        result,
+        &result.context,
+        snapshot,
+        &cli_sparql_json_config(),
+    )?)
+}
+
 /// Build the formatter config for the JSON-returning graph-source / connection
 /// paths from the requested output format.
 fn json_path_formatter_config(
@@ -1707,7 +1782,7 @@ fn json_path_formatter_config(
     match output_format {
         OutputFormatKind::TypedJson => fluree_db_api::FormatterConfig::typed_json(),
         _ => match query_format {
-            detect::QueryFormat::Sparql => fluree_db_api::FormatterConfig::sparql_json(),
+            detect::QueryFormat::Sparql => cli_sparql_json_config(),
             detect::QueryFormat::JsonLd => {
                 let config = fluree_db_api::FormatterConfig::jsonld();
                 if normalize_arrays {
@@ -1923,12 +1998,84 @@ async fn connection_query_local(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_time_suffix_preserving_fragment, base_ledger_id, inject_sparql_from_before_where,
-        json_path_display_format, jsonld_from_targets, query_targets_foreign_source,
-        reject_graph_source_unsupported,
+        attach_time_suffix_preserving_fragment, base_ledger_id, cli_delimited_config,
+        cli_sparql_json_config, format_tally_suffix, inject_sparql_from_before_where,
+        json_path_display_format, json_path_formatter_config, jsonld_from_targets,
+        query_targets_foreign_source, reject_graph_source_unsupported,
     };
     use crate::detect::QueryFormat;
     use crate::output::OutputFormatKind;
+    use fluree_db_api::{PolicyEnforcement, PolicyStats};
+
+    const POLICY_ONLY: (bool, bool, bool) = (false, false, true);
+
+    #[test]
+    fn policy_footer_reports_counts_when_policies_ran() {
+        let stats = std::collections::HashMap::from([(
+            "ex:pol".to_string(),
+            PolicyStats {
+                executed: 10,
+                allowed: 8,
+            },
+        )]);
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&stats), None, POLICY_ONLY),
+            ", policy 8/10"
+        );
+    }
+
+    /// The case that used to print nothing: enforcement was active but no
+    /// policy executed, so the counts are empty.
+    #[test]
+    fn policy_footer_reports_enforcement_when_no_policy_ran() {
+        let empty = std::collections::HashMap::new();
+        let deny_all = PolicyEnforcement {
+            enforced: true,
+            denies_all_data: true,
+        };
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&empty), Some(&deny_all), POLICY_ONLY),
+            ", policy enforced (grants no data)"
+        );
+
+        let some_grants = PolicyEnforcement {
+            enforced: true,
+            denies_all_data: false,
+        };
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&empty), Some(&some_grants), POLICY_ONLY),
+            ", policy enforced (none ran)"
+        );
+    }
+
+    /// An unenforced request has nothing to report, and must not gain a footer.
+    #[test]
+    fn policy_footer_silent_when_unenforced() {
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            format_tally_suffix(None, None, Some(&empty), None, POLICY_ONLY),
+            ""
+        );
+    }
+
+    /// #1466: the CLI renders SPARQL results with CURIEs, opting out of the
+    /// W3C absolute-IRI profile the API/HTTP surfaces use (#45). Pinned here so
+    /// the deviation cannot be lost to a default change.
+    #[test]
+    fn cli_display_configs_compact_iris() {
+        assert!(!cli_sparql_json_config().absolute_iris);
+        for fmt in [OutputFormatKind::Csv, OutputFormatKind::Tsv] {
+            assert!(!cli_delimited_config(fmt).absolute_iris, "{fmt}");
+        }
+        // ...including the graph-source / connection path, which builds its
+        // config separately.
+        assert!(
+            !json_path_formatter_config(QueryFormat::Sparql, OutputFormatKind::Json, false)
+                .absolute_iris
+        );
+        // The W3C constructors themselves are unchanged (absolute).
+        assert!(fluree_db_api::FormatterConfig::sparql_json().absolute_iris);
+    }
 
     #[test]
     fn attach_time_suffix_preserves_fragment() {

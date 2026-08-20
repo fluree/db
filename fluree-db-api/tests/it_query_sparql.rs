@@ -7,7 +7,7 @@ use crate::support::{
     assert_index_defaults, genesis_ledger, normalize_rows, normalize_sparql_bindings, MemoryFluree,
     MemoryLedger,
 };
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{FlureeBuilder, FormatterConfig};
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
 
@@ -366,7 +366,8 @@ async fn sparql_basic_query_outputs_jsonld_and_sparql_json() {
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(jsonld, json!([["ex:jdoe", "Jane Doe"]]));
 
-    // SPARQL JSON output uses compact IRIs.
+    // SPARQL Results JSON carries the ABSOLUTE IRI even though the query
+    // declared `ex:` — the format has no prefix map to expand it with (#45).
     let sparql_json = result
         .to_sparql_json(&ledger.snapshot)
         .expect("to_sparql_json");
@@ -376,11 +377,24 @@ async fn sparql_basic_query_outputs_jsonld_and_sparql_json() {
             "head": {"vars": ["fullName", "person"]},
             "results": {"bindings": [
                 {
-                    "person": {"type": "uri", "value": "ex:jdoe"},
+                    "person": {"type": "uri", "value": "http://example.org/ns/jdoe"},
                     "fullName": {"type": "literal", "value": "Jane Doe"}
                 }
             ]}
         })
+    );
+
+    // The Fluree display profile (#1466) still compacts the same result.
+    let display = fluree_db_api::format::format_results(
+        &result,
+        &result.context,
+        &ledger.snapshot,
+        &FormatterConfig::sparql_json().with_compact_iris(),
+    )
+    .expect("compacting sparql_json");
+    assert_eq!(
+        display["results"]["bindings"][0]["person"]["value"],
+        json!("ex:jdoe")
     );
 }
 
@@ -5414,6 +5428,63 @@ async fn sparql_service_remote_returns_mock_data() {
         jsonld,
         json!([["Alice", "alice@example.com"], ["Bob", "bob@example.com"]]),
         "Remote SERVICE should return mock data.\nGot: {jsonld:#}"
+    );
+}
+
+/// End to end: the query the engine ships to a remote SERVICE endpoint carries
+/// the parent query's prologue, so a prefixed name in the SERVICE body means the
+/// same thing there as here. Without it the remote fails with
+/// `Undefined prefix 'ex'` (the local-only lowering tests in
+/// `fluree-db-sparql::lower` cover both failure modes in detail; this one pins
+/// the executor call site).
+#[tokio::test]
+async fn sparql_service_remote_query_carries_query_prologue() {
+    assert_index_defaults();
+    let mut fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let mock = Arc::new(fluree_db_api::remote_service::MockRemoteService::new());
+    mock.register_response(
+        "acme",
+        "customers:main",
+        json!({
+            "head": {"vars": ["name"]},
+            "results": {"bindings": [{"name": {"type": "literal", "value": "Alice"}}]}
+        }),
+    );
+    fluree.set_remote_service(mock.clone());
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        BASE <http://base.example/>
+        SELECT ?name
+        WHERE {
+          SERVICE <fluree:remote:acme/customers:main> {
+            ?s ex:name ?name .
+          }
+        }
+    ";
+    support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("Remote SERVICE should succeed with mock");
+
+    let sent = mock.last_sparql().expect("mock should have been called");
+    assert!(
+        sent.contains("PREFIX ex: <http://example.org/>"),
+        "shipped sub-query must declare ex:, got: {sent}"
+    );
+    assert!(
+        sent.contains("BASE <http://base.example/>"),
+        "shipped sub-query must declare the base, got: {sent}"
+    );
+    assert!(
+        sent.contains("ex:name"),
+        "body must ship verbatim, got: {sent}"
+    );
+    // The prologue has to precede the query form to be legal SPARQL.
+    assert!(
+        sent.find("PREFIX ex:") < sent.find("SELECT"),
+        "prologue must precede SELECT, got: {sent}"
     );
 }
 

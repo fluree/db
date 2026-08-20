@@ -181,13 +181,101 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
 }
 ```
 
+**Local filesystem (no catalog, no object store):**
+
+A Direct `table_location` may also be a **local path** — a `file://` URI or a
+bare absolute path — for Iceberg tables written to the local filesystem (e.g.
+with pyiceberg or Spark against a local warehouse). No catalog service, no
+object store, no AWS credential resolution: the table is read straight from
+disk. Ideal for local development and test datasets.
+
+> **Local tables are opt-in.** Reading the local filesystem is **disabled by
+> default**: a Direct `table_location` that is a `file://` URI or an absolute
+> path is refused unless the operator has named the directories that may be
+> read, via `FLUREE_ICEBERG_LOCAL_ROOTS` (or `iceberg_local_roots` in the config
+> file). See [Enabling local tables](#enabling-local-tables) below.
+
+```json
+{
+  "catalog": {
+    "type": "direct",
+    "table_location": "file:///data/warehouse/logs/execution_log"
+  },
+  "table": "",
+  "io": { "vended_credentials": false }
+}
+```
+
+**Enabling local tables**
+
+`FLUREE_ICEBERG_LOCAL_ROOTS` is a colon-separated list of absolute directories,
+in the style of `PATH`:
+
+```bash
+export FLUREE_ICEBERG_LOCAL_ROOTS=/data/warehouse:/srv/lake
+fluree server run --storage-path .fluree/storage
+```
+
+or in `.fluree/config.toml`:
+
+```toml
+[server]
+iceberg_local_roots = "/data/warehouse:/srv/lake"
+```
+
+or in `.fluree/config.jsonld`:
+
+```json
+{
+  "@context": { "@vocab": "https://ns.flur.ee/config#" },
+  "server": {
+    "iceberg_local_roots": "/data/warehouse:/srv/lake"
+  }
+}
+```
+
+The allowlist does two jobs:
+
+1. **It enables local locations at all.** Unset, `table_location: "/data/wh/t"`
+   is refused when the graph source is created, with an error naming the switch.
+   Relative entries in the list are ignored, and a list that parses to nothing
+   is the same as unset.
+2. **It confines every path that is read.** Iceberg manifests reference data
+   files by absolute URI, and that metadata is only as trustworthy as whoever
+   supplied the table directory. Every resolved path — the table location,
+   metadata, manifests, and data files — must land under one of the roots, so a
+   reference such as `.../table/../../../etc/passwd` is refused rather than
+   followed. Containment is checked both textually and against the path's
+   canonical form, so a symlink out of a root does not escape it either.
+
+`FLUREE_ICEBERG_LOCAL_ROOTS=/` allows the whole filesystem. That is a deliberate
+choice for a single-tenant workstation, and a poor one for a shared deployment:
+any caller who can create a graph source can then point it at any directory the
+process can read.
+
+**Why it is off by default.** Fluree is embedded by services that forward
+caller-supplied `table_location` values from their own APIs. Before local
+support existed, this crate rejected everything that was not `s3://`, so those
+services inherited a scheme check they never had to write. Defaulting local
+access to on would have removed that protection silently on a version bump —
+so the capability ships closed, and an operator turns it on for the directories
+they intend to expose.
+
+**Copied and moved tables work with zero configuration.** Iceberg metadata
+references data files by absolute URI, so a table copied down from an object
+store (or moved on disk) carries its *original* location in every manifest.
+Fluree infers the relocation automatically: when the metadata's own `location`
+differs from the configured `table_location`, file references under the old
+root are read from the new one. Copy the table directory, point
+`table_location` at it, done — whether the manifests say `s3://bucket/...` or
+`file:///old/path/...`. (Only whole-directory copies are inferred; a table
+whose manifests reference files *outside* its own root is not remapped.)
+
 **Direct mode requirements:**
 
-- `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`) pointing to the table root directory.
-- The table must contain a `metadata/` subdirectory with:
-  - `version-hint.text` — the current metadata filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
-  - The referenced `.metadata.json` file
-- Direct mode uses ambient AWS credentials (IAM roles, env vars, `~/.aws/credentials`). It does **not** support vended credentials.
+- `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`), a `file://` URI, or an absolute local path, pointing to the table root directory. Local paths additionally require `FLUREE_ICEBERG_LOCAL_ROOTS` to name a directory containing them (see [Enabling local tables](#enabling-local-tables)).
+- The table must contain a `metadata/` subdirectory with the current `.metadata.json` file, and (for S3 locations) `version-hint.text` — the current metadata filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
+- Direct mode uses ambient AWS credentials (IAM roles, env vars, `~/.aws/credentials`) for S3 locations. It does **not** support vended credentials. Local locations use no credentials at all.
 
 **How Direct metadata resolution works:**
 
@@ -195,7 +283,7 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
   - `"{table_location}/metadata/version-hint.text"` to get the current metadata filename
   - `"{table_location}/metadata/{filename}"` as the table’s current metadata
 - `version-hint.text` may contain a bare filename (e.g., `00001-abc.metadata.json`), a full absolute path (`s3://...` / `gs://...`), or a bare integer version `N` — the Iceberg Hadoop file-based catalog convention — which resolves to `vN.metadata.json`.
-- If `version-hint.text` is missing or empty, Direct mode fails with an error mentioning `version-hint.text`.
+- **Local tables don't need `version-hint.text`** (pyiceberg and most non-Hadoop writers never produce it): when the hint is absent, the `metadata/` directory is listed and the highest-versioned `*.metadata.json` is used. On S3, where listing is not performed, a missing or empty `version-hint.text` fails with an error mentioning `version-hint.text`.
 
 **Iceberg table setup must already exist:**
 
@@ -796,6 +884,18 @@ A failed gate drops the twin so nothing unverified stays announced. See the [`fl
    merge-on-read semantics (e.g. Athena `DELETE`, Flink/CDC upserts, Snowflake v3
    deletion vectors, or Snowflake v2 once `ENABLE_ICEBERG_MERGE_ON_READ` is on).
    See the switch below to override.
+5. **No transitive traversal (fail-closed):** Property-path quantifiers (`p+`,
+   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
+   `shortestPath`, and subqueries need a native index to walk and cannot be
+   evaluated over an Iceberg source. A query using one is **refused** with HTTP
+   400 `err:db/InvalidQuery` naming the pattern, rather than returning the empty
+   result it would otherwise produce as a success. Fixed-length patterns (`p`,
+   `p/p`, …) and unquantified `a|b` / `^p` scan the tables normally. Bound the
+   traversal to a known depth (see [Graph Sources Overview → Query Patterns a
+   Graph Source Cannot
+   Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate)) or
+   [materialize a native twin](#materializing-a-native-twin), which evaluates
+   all of them.
 
 ### Environment switches
 

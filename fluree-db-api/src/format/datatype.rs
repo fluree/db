@@ -48,6 +48,33 @@ pub fn is_inferable_datatype(dt_iri: &str) -> bool {
     )
 }
 
+/// Whether a literal may be serialized without its `datatype`.
+///
+/// `w3c_strict` selects the rule for the W3C result serializations — SPARQL
+/// Results JSON, SPARQL Results **XML**, CSV and TSV (see
+/// [`crate::FormatterConfig::absolute_iris`]). There, only `xsd:string` may be
+/// dropped: all four encode every value as text, so nothing about the datatype
+/// is recoverable from the serialized form, and SPARQL Results JSON §3.2.2
+/// defines a literal with neither `datatype` nor `xml:lang` as a *simple
+/// literal* — i.e. an `xsd:string`. Dropping the tag off anything else changes
+/// which RDF term the document denotes: `STRDT("2", xsd:integer)` would come
+/// back as `"2"^^xsd:string`.
+///
+/// Otherwise the looser [`is_inferable_datatype`] rule applies, which is sound
+/// for the JSON-LD-flavored outputs: those render the value as a native JSON
+/// number / boolean, so the datatype really is recoverable from the JSON.
+///
+/// Applies to every value kind, not just string-backed literals: the XML writer
+/// gates all of them through one call, and an `xsd:long` in a `<literal>` is
+/// exactly as un-inferable as a string-backed one.
+pub fn may_omit_datatype(dt_iri: &str, w3c_strict: bool) -> bool {
+    if w3c_strict {
+        matches!(dt_iri, xsd::STRING | "xsd:string")
+    } else {
+        is_inferable_datatype(dt_iri)
+    }
+}
+
 // Note: is_reference_datatype is NOT needed - Binding::Sid already indicates references.
 // The Rust invariant (Binding::Lit never contains FlakeValue::Ref) eliminates the need
 // for datatype checks to identify references.
@@ -74,5 +101,34 @@ mod tests {
         assert!(!is_inferable_datatype(rdf::LANG_STRING));
         assert!(!is_inferable_datatype(jsonld::JSON));
         assert!(!is_inferable_datatype("http://example.org/customType"));
+    }
+
+    /// Issue #45 (b): under the W3C profile only `xsd:string` may lose its
+    /// datatype tag; the other "inferable" types must keep theirs because a
+    /// SPARQL-Results-JSON `value` is always a JSON string.
+    #[test]
+    fn test_may_omit_datatype() {
+        assert!(may_omit_datatype(xsd::STRING, true));
+        assert!(may_omit_datatype("xsd:string", true));
+        for dt in [
+            xsd::INTEGER,
+            xsd::LONG,
+            xsd::DOUBLE,
+            xsd::DECIMAL,
+            xsd::BOOLEAN,
+            fluree::EMBEDDING_VECTOR,
+        ] {
+            assert!(
+                !may_omit_datatype(dt, true),
+                "{dt} must keep its datatype in W3C output"
+            );
+            assert!(
+                may_omit_datatype(dt, false),
+                "{dt} stays inferable for JSON-LD-flavored output"
+            );
+        }
+        // Non-inferable types are emitted under either profile.
+        assert!(!may_omit_datatype(xsd::DATE, true));
+        assert!(!may_omit_datatype(xsd::DATE, false));
     }
 }

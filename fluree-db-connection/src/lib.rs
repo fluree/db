@@ -36,7 +36,7 @@ pub use aws::AwsConnectionHandle;
 
 // Re-export core types commonly used with connections
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-pub use fluree_db_core::FileStorage;
+pub use fluree_db_core::{Durability, FileStorage};
 pub use fluree_db_core::{LedgerSnapshot, MemoryStorage};
 
 /// Connection that can be file, memory, or AWS backed
@@ -197,7 +197,8 @@ fn create_sync_connection(config: ConnectionConfig) -> Result<ConnectionHandle> 
                     config.index_storage.path.as_ref().ok_or_else(|| {
                         ConnectionError::invalid_config("File storage requires path")
                     })?;
-                let storage = FileStorage::new(path.as_ref());
+                let storage = FileStorage::new(path.as_ref())
+                    .with_durability(Durability::resolve(config.index_storage.durability));
                 Ok(ConnectionHandle::File { config, storage })
             }
         }
@@ -232,7 +233,8 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
                     config.index_storage.path.as_ref().ok_or_else(|| {
                         ConnectionError::invalid_config("File storage requires path")
                     })?;
-                let storage = FileStorage::new(path.as_ref());
+                let storage = FileStorage::new(path.as_ref())
+                    .with_durability(Durability::resolve(config.index_storage.durability));
                 Ok(ConnectionHandle::File { config, storage })
             }
         }

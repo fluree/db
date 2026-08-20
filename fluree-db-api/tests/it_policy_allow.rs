@@ -788,7 +788,7 @@ async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
 
             let opts = GovernanceOptions {
                 policy: Some(policy),
-                default_allow: true,
+                default_allow: Some(true),
                 ..Default::default()
             };
 

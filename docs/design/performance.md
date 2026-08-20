@@ -41,6 +41,15 @@ r8a.4xlarge 16c/128 GB):
 Note that Fluree's write number is a *durable* write — committed and
 recoverable — compared against engines whose defaults are weaker.
 
+State the failure model when quoting these: durability here means the write
+survives the process dying. Surviving power loss additionally requires the
+storage backend to flush, which the file backend does by default
+(`FLUREE_STORAGE_FSYNC`, see [Configuration](../operations/configuration.md))
+and S3 does by acknowledging after replication. This table predates that
+default and was measured without the flush, so it is not a like-for-like
+comparison against an engine that fsyncs per commit; it needs a re-run before
+it is quoted again.
+
 > Internal criterion benchmarks that gate per-PR regressions are a different
 > thing entirely and are documented in [BENCHMARKING.md](../../BENCHMARKING.md).
 > They protect against drift; they do not measure competitors.
@@ -202,6 +211,38 @@ generic RDF cardinality math gets badly wrong:
   `MATCH (p {id: $x})-[:KNOWS*1..2]-(f) WITH DISTINCT f` emits its projected
   distinct rows, not its body's join product — the product overestimates by
   ~792 M on a 2-hop `KNOWS`.
+- **Branches made only of compound patterns.** `estimate_branch_cardinality`
+  scales a branch with no triples of its own by the unknown-property-scan
+  default, which is right for a branch it knows nothing about and wrong for one
+  whose single member already reports a row count. A chained
+  `{A} UNION {B} UNION {C}` parses as `Union([[Union([[A],[B]])],[C]])`, so the
+  outer branch holding the inner UNION owns no triples — a 30-row union was
+  costed at 20 M rows and placed behind every real scan. Since `UnionOperator`
+  is correlated (it rebuilds and re-runs each branch per input row), that
+  misplacement is superlinear: 53 s on a 200k-row driver versus 0.1 ms placed
+  first.
+
+### Pre-planning rewrites
+
+Two rewrites run over a pattern list before `reorder_patterns` sees it, so both
+ordering and the scan layer work from the narrower form:
+
+- **Redundant `rdf:type` elision** — drop `?s rdf:type <C>` when stats prove
+  every subject of a co-occurring predicate is a `C` (`elide_redundant_type_filters`).
+- **Single-row VALUES object folding** — `VALUES ?o { <iri> }` *is* the constant
+  `<iri>`, so `?s <p> ?o` in the same inner-join region is folded to `?s <p> <iri>`
+  (`inline_singleton_values_objects`). Without it a VALUES binding a leaf object
+  var is deferred *above* the star, so `PropertyJoinOperator` drives off whatever
+  else is bound and drains that predicate's whole extent before the one-row
+  VALUES filters it — 240 ms versus 0.1 ms for the inlined form on a
+  200k-subject star. The VALUES pattern stays in place, so the variable is still
+  bound for projection and FILTERs. The rewrite is restricted to one-row
+  reference cells in object position within one contiguous
+  Triple/VALUES/BIND/FILTER region: multi-row VALUES is a set rather than a
+  constant, literals carry datatype/language matching rules that belong to the
+  scan layer, subject/predicate positions keep the existing seeding path, and
+  compound patterns are rewrite boundaries because MINUS/EXISTS semantics can
+  change when a shared variable disappears before the retained VALUES binds it.
 
 ### Cost constants are coupled and tested
 

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use fluree_db_iceberg::catalog::LoadTableResponse;
 use fluree_db_iceberg::credential::VendedCredentials;
-use fluree_db_iceberg::io::S3IcebergStorage;
+use fluree_db_iceberg::io::IcebergStorageBackend;
 use fluree_db_query::r2rml::TableWatermark;
 
 /// Master switch for all Iceberg catalog caching. Read once from
@@ -96,7 +96,7 @@ pub(crate) struct IcebergCatalogSession {
     /// (`aws_config` load + S3 client + HTTP client) per scan. Invalidated by
     /// `store_load_table`: any fresh loadTable (including a creds-expiry reload)
     /// drops the entry, so a client built from stale credentials is never served.
-    storages: Mutex<HashMap<String, Arc<S3IcebergStorage>>>,
+    storages: Mutex<HashMap<String, Arc<IcebergStorageBackend>>>,
     /// Location-only snapshot pins from the loadTable-metadata cache's pointer
     /// rung (`21-loadtable-metadata-cache.md`): that path resolves a snapshot's
     /// `metadata_location` from disk WITHOUT a loadTable GET, so it has NO vended
@@ -116,6 +116,15 @@ pub(crate) struct IcebergCatalogSession {
     /// build. Recorded unconditionally (independent of the loadTable cache toggle):
     /// even with caching off, the build must record the snapshot each scan read.
     snapshots: Mutex<HashMap<String, TableWatermark>>,
+    /// MAJOR-2 (#1529 review): tables that yielded a SECOND DISTINCT
+    /// `metadata_location` during this build, keyed by `snapshot_key`, with
+    /// `(first_location, conflicting_location)`. `snapshots` is first-writer-wins,
+    /// so a mid-build snapshot move (a source commit while a Direct source's 2s
+    /// metadata cache expired, or a REST source with pinning off) would otherwise be
+    /// silently pinned to the first location while later scans read the second — a
+    /// twin whose stamped watermark does not describe its contents. Recorded here so
+    /// the build can fail loud instead.
+    snapshot_conflicts: Mutex<HashMap<String, (String, String)>>,
     /// Warehouse-root child-directory listings, keyed by warehouse root, so a
     /// catalog-less multi-table Direct source LISTs each root exactly ONCE per
     /// build (not once per table). Always cached (independent of the loadTable
@@ -230,7 +239,7 @@ impl IcebergCatalogSession {
     /// invalidated by a creds refresh. A hit lets a later scan (or the slice-1
     /// prefetch→scan) skip rebuilding the AWS SDK client. `None` when the cache is
     /// disabled or after a fresh loadTable dropped the entry.
-    pub(crate) fn cached_storage(&self, key: &str) -> Option<Arc<S3IcebergStorage>> {
+    pub(crate) fn cached_storage(&self, key: &str) -> Option<Arc<IcebergStorageBackend>> {
         if !cache_enabled() {
             return None;
         }
@@ -241,7 +250,7 @@ impl IcebergCatalogSession {
     /// Paired with `cached_storage`; `store_load_table` invalidates on a creds
     /// refresh, so an entry here always corresponds to the currently pinned creds.
     /// No-op when the cache is disabled.
-    pub(crate) fn store_storage(&self, key: String, storage: Arc<S3IcebergStorage>) {
+    pub(crate) fn store_storage(&self, key: String, storage: Arc<IcebergStorageBackend>) {
         if !cache_enabled() {
             return;
         }
@@ -263,11 +272,49 @@ impl IcebergCatalogSession {
     /// scan of the same table keeps the first-recorded watermark, matching the
     /// `metadata_location` pin.
     pub(crate) fn record_snapshot(&self, key: String, watermark: TableWatermark) {
-        self.snapshots
+        let mut snaps = self.snapshots.lock().unwrap();
+        match snaps.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(watermark);
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                // MAJOR-2: first-writer-wins keeps the first snapshot, but if a later
+                // touch read a DIFFERENT metadata_location the source moved mid-build
+                // — record it so the build fails loud rather than baking a twin whose
+                // stamp lies. First conflict per table wins (stable).
+                if e.get().metadata_location != watermark.metadata_location {
+                    self.snapshot_conflicts
+                        .lock()
+                        .unwrap()
+                        .entry(key)
+                        .or_insert_with(|| {
+                            (
+                                e.get().metadata_location.clone(),
+                                watermark.metadata_location.clone(),
+                            )
+                        });
+                }
+            }
+        }
+    }
+
+    /// MAJOR-2: tables that yielded a second distinct `metadata_location` this build
+    /// for `graph_source_id`, as `(table_name, first_location, conflicting_location)`.
+    /// Empty on a clean build (every table stayed on one snapshot).
+    pub(crate) fn observed_snapshot_conflicts(
+        &self,
+        graph_source_id: &str,
+    ) -> Vec<(String, String, String)> {
+        let prefix = format!("{graph_source_id}\u{1f}");
+        self.snapshot_conflicts
             .lock()
             .unwrap()
-            .entry(key)
-            .or_insert(watermark);
+            .iter()
+            .filter_map(|(k, (first, second))| {
+                k.strip_prefix(&prefix)
+                    .map(|t| (t.to_string(), first.clone(), second.clone()))
+            })
+            .collect()
     }
 
     /// The cached child-directory listing for a warehouse `root`, if this build
@@ -311,6 +358,7 @@ impl IcebergCatalogSession {
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
+    use fluree_db_iceberg::io::S3IcebergStorage;
 
     fn creds(expires_in_secs: Option<i64>) -> VendedCredentials {
         VendedCredentials {
@@ -345,6 +393,40 @@ mod tests {
         let hit = s.cached_load_table(&key).expect("hit after store");
         assert_eq!(hit.metadata_location, "s3://meta/1.json");
         assert!(hit.credentials.is_some());
+    }
+
+    #[test]
+    fn record_snapshot_flags_second_distinct_metadata_location() {
+        // MAJOR-2: first-writer-wins keeps snap-A, but a later scan reading snap-B
+        // means the source moved mid-build — a conflict the build must fail on.
+        let wm = |loc: &str| TableWatermark {
+            metadata_location: loc.to_string(),
+            snapshot_id: None,
+            sequence_number: None,
+        };
+        let s = IcebergCatalogSession::default();
+        let key = IcebergCatalogSession::snapshot_key("gs:main", "DW.FACT_ORDER");
+        s.record_snapshot(key.clone(), wm("s3://meta/snap-A.json"));
+        // Re-reading the SAME snapshot is not a conflict.
+        s.record_snapshot(key.clone(), wm("s3://meta/snap-A.json"));
+        assert!(
+            s.observed_snapshot_conflicts("gs:main").is_empty(),
+            "an identical re-read must not flag a conflict"
+        );
+        // A DISTINCT metadata_location flags the table.
+        s.record_snapshot(key, wm("s3://meta/snap-B.json"));
+        let conflicts = s.observed_snapshot_conflicts("gs:main");
+        assert_eq!(conflicts.len(), 1, "the moved table must be flagged");
+        assert_eq!(
+            conflicts[0],
+            (
+                "DW.FACT_ORDER".to_string(),
+                "s3://meta/snap-A.json".to_string(),
+                "s3://meta/snap-B.json".to_string()
+            )
+        );
+        // A different source's conflicts are scoped out.
+        assert!(s.observed_snapshot_conflicts("other:main").is_empty());
     }
 
     #[test]
@@ -471,11 +553,11 @@ mod tests {
             key.clone(),
             &resp("s3://snap-A.json", Some(creds(Some(3600)))),
         );
-        let storage = Arc::new(
+        let storage = Arc::new(IcebergStorageBackend::S3(
             S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
                 .await
                 .expect("offline SDK client construction"),
-        );
+        ));
         s.store_storage(key.clone(), Arc::clone(&storage));
         assert!(
             s.cached_storage(&key).is_some(),
@@ -503,11 +585,11 @@ mod tests {
         // on; the r2rml helper test drives the same contract end-to-end.
         let s = IcebergCatalogSession::default();
         let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
-        let storage = Arc::new(
+        let storage = Arc::new(IcebergStorageBackend::S3(
             S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
                 .await
                 .expect("offline SDK client construction"),
-        );
+        ));
         s.store_storage(key.clone(), Arc::clone(&storage));
         // No `store_load_table` in between (Direct mode's flow) — the client must
         // still be served, and it must be the very same Arc.

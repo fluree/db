@@ -594,19 +594,31 @@ async fn multi_query_per_alias_tracking_surfaces_under_opts_meta() {
     );
     // Both aliases tracked; each entry mirrors the single-query
     // TrackedQueryResponse fields (time / fuel / policy are siblings).
+    // `opts.meta: true` asks for all three, so all three must be there —
+    // a disjunction here passed on `time` alone and pinned nothing.
     for alias in ["by_alice", "by_brian"] {
         let entry = &tracking[alias];
         assert!(
             entry.is_object(),
             "tracking[{alias}] should be an object, got: {entry}"
         );
-        // At least one of the trackable metrics must be present.
-        let has_metric = entry.get("time").is_some()
-            || entry.get("fuel").is_some()
-            || entry.get("policy").is_some();
         assert!(
-            has_metric,
-            "tracking[{alias}] should report time / fuel / policy, got: {entry}"
+            entry["time"].is_string(),
+            "tracking[{alias}] should report time, got: {entry}"
+        );
+        assert!(
+            entry["fuel"].is_number(),
+            "tracking[{alias}] should report fuel, got: {entry}"
+        );
+        assert_eq!(
+            entry.get("policy"),
+            Some(&json!({})),
+            "policy tracking is on, and no policy runs on an unenforced query, \
+             so the map is present and empty; got: {entry}"
+        );
+        assert!(
+            entry.get("policy_enforcement").is_none(),
+            "these sub-queries carry no policy inputs, so nothing enforced them; got: {entry}"
         );
     }
 

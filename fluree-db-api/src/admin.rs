@@ -16,7 +16,8 @@ use fluree_db_core::{
     format_ledger_id, DEFAULT_BRANCH,
 };
 use fluree_db_indexer::{
-    clean_garbage, rebuild_index_from_commits_with_tracker, CleanGarbageConfig,
+    clean_garbage, execute_sweep, plan_sweep, rebuild_index_from_commits_with_tracker,
+    BranchIndexHead, CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
 };
 use fluree_db_nameservice::{GraphSourceType, NsRecord};
 use std::time::Duration;
@@ -383,15 +384,18 @@ mod validate_absolute_iri_tests {
     }
 }
 
-/// Parse a `drop_ledger` input.
+/// Parse the input to an operation that acts on a whole ledger.
 ///
 /// Accepted forms:
-/// - `"mydb"`: whole-ledger drop. Returns `"mydb"`.
+/// - `"mydb"`: names the whole ledger. Returns `"mydb"`.
 /// - Any branch-qualified id (`"mydb:main"`, `"mydb:dev"`, …) is rejected
-///   with `ApiError::Http(400)`. `:main` is not special: callers passing
-///   the suffix likely expected branch-level semantics, so they're routed
-///   to `drop_branch` with the same error shape as a non-default suffix.
-fn parse_whole_ledger_input(input: &str) -> Result<String> {
+///   with `ApiError::Http(400)`. `:main` is not special: a caller passing
+///   the suffix likely expected branch-level semantics, and silently
+///   widening that to every branch is the surprise worth refusing.
+///
+/// `operation` selects the rejection message, so each caller explains what
+/// *it* offers instead — see [`WholeLedgerOperation`].
+fn parse_whole_ledger_input(input: &str, operation: WholeLedgerOperation) -> Result<String> {
     use fluree_db_core::ledger_id::split_ledger_id;
 
     let bad_input = |msg: String| ApiError::Http {
@@ -411,10 +415,36 @@ fn parse_whole_ledger_input(input: &str) -> Result<String> {
     // No branch suffix is accepted — including the default-name suffix —
     // so callers can't be surprised by `drop_ledger("mydb:main")` quietly
     // removing every other branch alongside main.
-    Err(bad_input(format!(
-        "drop_ledger drops the whole ledger and does not accept a branch suffix '{branch}'. \
-         Pass \"{name}\" to drop the whole ledger, or use drop_branch(\"{name}\", \"{branch}\") to drop a single branch."
-    )))
+    Err(bad_input(operation.branch_suffix_message(&name, &branch)))
+}
+
+/// An operation that acts on a whole ledger and so refuses a branch suffix.
+///
+/// Named rather than a bare string so each operation's rejection tells the
+/// caller what *that* operation offers — pointing a `sweep` caller at
+/// `drop_branch` would be worse than unhelpful on a destructive surface.
+#[derive(Clone, Copy)]
+enum WholeLedgerOperation {
+    Drop,
+    Sweep,
+}
+
+impl WholeLedgerOperation {
+    fn branch_suffix_message(self, name: &str, branch: &str) -> String {
+        match self {
+            Self::Drop => format!(
+                "drop_ledger drops the whole ledger and does not accept a branch suffix \
+                 '{branch}'. Pass \"{name}\" to drop the whole ledger, or use \
+                 drop_branch(\"{name}\", \"{branch}\") to drop a single branch."
+            ),
+            Self::Sweep => format!(
+                "a sweep covers every branch of a ledger and does not accept a branch \
+                 suffix '{branch}' — dictionary blobs are shared across branches, so \
+                 reclaiming them is only safe with all of them accounted for. Pass \
+                 \"{name}\" to sweep the whole ledger."
+            ),
+        }
+    }
 }
 
 /// Sort branches so children come before their parents (leaf-first).
@@ -525,7 +555,7 @@ impl crate::Fluree {
     /// (Lambda, etc.) **MUST** check `NsRecord.retracted` before indexing
     /// and before publishing to prevent recreating files after drop.
     pub async fn drop_ledger(&self, ledger_id: &str, mode: DropMode) -> Result<DropReport> {
-        let ledger_name = parse_whole_ledger_input(ledger_id)?;
+        let ledger_name = parse_whole_ledger_input(ledger_id, WholeLedgerOperation::Drop)?;
         info!(ledger_name = %ledger_name, mode = ?mode, "Dropping whole ledger");
 
         let mut report = DropReport {
@@ -1678,12 +1708,21 @@ impl crate::Fluree {
             return Err(ApiError::NotFound("No commits to reindex".to_string()));
         }
 
-        // 2. Cancel background indexing if active
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            info!(ledger_id = %ledger_id, "Cancelling background indexing for reindex");
-            handle.cancel(&ledger_id).await;
-            handle.wait_for_idle(&ledger_id).await;
-        }
+        // 2. Hold the ledger against indexing for the whole rebuild.
+        //
+        // A reindex writes index artifacts before publishing the root that
+        // references them, so anything enumerating unreferenced artifacts
+        // meanwhile — a storage sweep — would see them as orphans and delete
+        // them. Cancelling and waiting for idle is not enough on its own: a
+        // build can start again the moment the wait returns. The guard is
+        // held until this function exits.
+        let _maintenance = match &self.indexing_mode {
+            IndexingMode::Background(handle) => {
+                info!(ledger_id = %ledger_id, "Holding ledger for reindex");
+                Some(hold_branch_quiesced(handle, &ledger_id).await?)
+            }
+            IndexingMode::Disabled => None,
+        };
 
         // Re-fetch the record after the background indexer has quiesced: a
         // background build racing this reindex may have published between
@@ -1968,5 +2007,129 @@ mod tests {
     #[test]
     fn test_drop_status_default() {
         assert_eq!(DropStatus::default(), DropStatus::NotFound);
+    }
+}
+
+// =============================================================================
+// Storage sweep (reclaims index artifacts no index chain references)
+// =============================================================================
+
+/// Take an exclusive maintenance hold on one branch, reporting a conflict
+/// rather than blocking when another operation already holds it.
+async fn hold_branch_quiesced<'a>(
+    handle: &'a fluree_db_indexer::IndexerHandle,
+    ledger_id: &'a str,
+) -> Result<MaintenanceGuard> {
+    handle.hold_quiesced(ledger_id).await.ok_or_else(|| {
+        ApiError::BranchConflict(format!(
+            "another maintenance operation holds {ledger_id}; retry when it completes"
+        ))
+    })
+}
+
+impl crate::Fluree {
+    /// Hold every branch of `ledger_name` excluded from indexing and collect
+    /// their index heads.
+    ///
+    /// Enumerates through `all_records` rather than `list_branches` so that
+    /// **retracted** branches participate. A soft drop is reversible until the
+    /// name is purged, so a soft-dropped branch's index must survive a sweep.
+    /// Its own artifacts are safe either way — an unlisted branch contributes
+    /// no prefix to scan — but dict blobs are shared across a ledger's
+    /// branches, so omitting one would reclaim dicts it still reads.
+    async fn hold_ledger_for_maintenance(
+        &self,
+        ledger_name: &str,
+    ) -> Result<(Vec<MaintenanceGuard>, Vec<BranchIndexHead>)> {
+        let records: Vec<_> = self
+            .nameservice()
+            .all_records()
+            .await?
+            .into_iter()
+            .filter(|r| r.name == ledger_name)
+            .collect();
+
+        if records.is_empty() {
+            return Err(ApiError::NotFound(format!(
+                "Ledger not found: {ledger_name}"
+            )));
+        }
+
+        // Holds are per-branch, so a ledger-wide sweep must hold them all.
+        // Guards release on drop, so an early return frees whatever was taken.
+        // `Disabled` leaves `guards` empty and the sweep runs unexcluded. That
+        // is safe only because no in-process indexer exists to race it; an
+        // external one is not covered here either way, which is the
+        // single-process caveat documented on `MaintenanceGuard`.
+        let mut guards = Vec::with_capacity(records.len());
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            for record in &records {
+                guards.push(hold_branch_quiesced(handle, &record.ledger_id).await?);
+            }
+        }
+
+        // Re-read after quiescing: a build that published between the
+        // enumeration above and the drain would have advanced the index head,
+        // and planning against the stale one would treat the new root's
+        // artifacts as orphaned.
+        let mut branches = Vec::with_capacity(records.len());
+        for record in &records {
+            let current = self.nameservice().lookup(&record.ledger_id).await?;
+            branches.push(BranchIndexHead {
+                ledger_id: record.ledger_id.clone(),
+                index_head_id: current.and_then(|r| r.index_head_id),
+            });
+        }
+
+        Ok((guards, branches))
+    }
+
+    /// The storage a sweep enumerates and deletes through.
+    ///
+    /// `None` only for permanent (append-only) backends, which cannot list a
+    /// prefix or delete.
+    fn sweepable_storage(&self) -> Result<std::sync::Arc<dyn fluree_db_core::Storage>> {
+        self.backend.admin_storage_cloned().ok_or_else(|| {
+            ApiError::Internal(
+                "storage sweep requires a backend that supports listing and deletion".to_string(),
+            )
+        })
+    }
+
+    /// Report which index artifacts under `ledger_name` no live index chain
+    /// references, without deleting anything.
+    ///
+    /// Takes the same exclusive hold as [`sweep_index_storage`](Self::sweep_index_storage)
+    /// so the report reflects a quiesced ledger, and releases it on return.
+    pub async fn plan_index_sweep(&self, ledger_name: &str) -> Result<SweepPlan> {
+        // Reject a branch-qualified alias rather than silently sweeping the
+        // whole ledger: a sweep is ledger-wide because dict blobs are shared.
+        let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
+        let storage = self.sweepable_storage()?;
+        let (_guards, branches) = self.hold_ledger_for_maintenance(&ledger_name).await?;
+        Ok(plan_sweep(&storage, &ledger_name, &branches).await?)
+    }
+
+    /// Reclaim index artifacts that no live index chain references.
+    ///
+    /// Plans and deletes under one hold: a plan describes storage as it stood
+    /// when planned, so releasing between the two would let a build publish
+    /// artifacts the plan had already classified as orphaned.
+    pub async fn sweep_index_storage(&self, ledger_name: &str) -> Result<SweepResult> {
+        // Reject a branch-qualified alias rather than silently sweeping the
+        // whole ledger: a sweep is ledger-wide because dict blobs are shared.
+        let ledger_name = parse_whole_ledger_input(ledger_name, WholeLedgerOperation::Sweep)?;
+        let storage = self.sweepable_storage()?;
+        let (_guards, branches) = self.hold_ledger_for_maintenance(&ledger_name).await?;
+
+        let plan = plan_sweep(&storage, &ledger_name, &branches).await?;
+        info!(
+            ledger_name = %ledger_name,
+            orphans = plan.orphans.len(),
+            scanned = plan.scanned,
+            live = plan.live,
+            "Reclaiming orphaned index artifacts"
+        );
+        Ok(execute_sweep(&storage, &plan).await)
     }
 }

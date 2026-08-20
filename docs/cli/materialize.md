@@ -34,7 +34,7 @@ fluree materialize <GRAPH_SOURCE> [OPTIONS]
 
 **Global flags** that tune the build (see [CLI README](README.md#global-options)):
 
-- `--memory-budget-mb <MB>` — Memory budget in MB (0 = auto). Drives chunk size, produce concurrency, and the FK parent-index budget. The build **fails loud** rather than exceeding it (see [Machine-safety posture](#machine-safety-posture)).
+- `--memory-budget-mb <MB>` — Memory budget in MB. `0` (unset) uses the co-resident default of **512 MB**, NOT host auto-sizing — pass `--max-performance` for the `0`-means-auto behavior (see [Machine-safety posture](#machine-safety-posture)). Drives chunk size, produce concurrency, and the FK parent-index budget; the build **fails loud** rather than exceeding it.
 - `--parallelism <N>` — Produce-side worker threads (0 = the co-resident default of 2). Also bounds the concurrent Iceberg snapshot pins and FK pre-index scans.
 
 ## Description
@@ -115,7 +115,7 @@ Twin ledger 'dw-gs-twin:main' built and verified: 35238778 flakes, index t=42.
 `--output pack`:
 
 ```
-Twin packed to dw-gs-twin_main.flpack (35238778 flakes). The source twin ledger 'dw-gs-twin:main' stays registered locally; drop it with `fluree drop dw-gs-twin:main` when no longer needed.
+Twin packed to dw-gs-twin_main.flpack (35238778 flakes). The source twin ledger 'dw-gs-twin:main' stays registered locally; drop it with `fluree drop dw-gs-twin --force` when no longer needed.
 ```
 
 ## See Also

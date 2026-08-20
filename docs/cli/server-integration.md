@@ -646,7 +646,7 @@ explicit `--remote`, and any custom HTTP implementation.
 | `fluree-track-meta` | `--track` | `"true"` (presence-truthy) | Shorthand: enable fuel + time + policy. |
 | `fluree-track-fuel` | `--track-fuel` (also implied by `--max-fuel`) | `"true"` | Report total fuel consumed. |
 | `fluree-track-time` | `--track-time` | `"true"` | Report query execution time. |
-| `fluree-track-policy` | `--track-policy` | `"true"` | Report per-policy executed/allowed counts. |
+| `fluree-track-policy` | `--track-policy` | `"true"` | Report per-policy executed/allowed counts, and whether policy governed the request. |
 | `fluree-max-fuel` | `--max-fuel <N>` | decimal string | Abort with `400` (or equivalent) when fuel exceeds `N`. Implies fuel tracking. |
 
 The CLI only sends headers that map to enabled flags — a server should
@@ -679,12 +679,19 @@ across JSON-LD and SPARQL. Servers should accept either.
      "result": <the normal query result body>,
      "time": "12.34ms",
      "fuel": 1234.567,
-     "policy": { "<policy-id>": { "executed": 3, "allowed": 2 } }
+     "policy": { "<policy-id>": { "executed": 3, "allowed": 2 } },
+     "policy_enforcement": { "enforced": true, "denies_all_data": false }
    }
    ```
 
    Only include `time`, `fuel`, `policy` for metrics the client actually
-   requested. The `result` field carries whatever the untracked response
+   requested. `policy_enforcement` accompanies `policy` and is included
+   only when the request ran under a non-root policy context: its absence
+   is what tells a caller the request was unenforced, which the (then
+   empty) `policy` map cannot. `denies_all_data` reports that the request's
+   policy configuration grants no view of the data — settled before
+   execution and independent of the data the query reads and of the
+   query itself. The `result` field carries whatever the untracked response
    body would have been (SPARQL JSON, JSON-LD, agent-json, etc.). For
    agent-json responses the server SHOULD return the bare agent-json
    envelope as the response body and surface the tally only via the
@@ -697,7 +704,8 @@ across JSON-LD and SPARQL. Servers should accept either.
    |---|---|---|
    | `x-fdb-fuel` | tracker.fuel | decimal string |
    | `x-fdb-time` | tracker.time | duration string, e.g. `"12.34ms"` |
-   | `x-fdb-policy` | tracker.policy | JSON object |
+   | `x-fdb-policy` | tracker.policy | base64-encoded JSON object |
+   | `x-fdb-policy-enforcement` | tracker.policy_enforcement | JSON object (omitted when unenforced) |
 
 ### Reference behavior
 

@@ -49,13 +49,24 @@ pub trait IcebergStorage: Debug {
         }
         Ok(out)
     }
+
+    /// List the immediate child FILE names under `prefix` (no recursion, no
+    /// directories). Used by catalog-less Direct mode to discover the current
+    /// `*.metadata.json` when `version-hint.text` is absent. Default:
+    /// unsupported — local-filesystem storage overrides it.
+    async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
+        let _ = prefix;
+        Err(IcebergError::storage(
+            "list_files (metadata-directory listing) is not supported by this storage backend",
+        ))
+    }
 }
 
-/// Send-safe storage for AWS SDK integration.
+/// Send-safe storage for spawned/multi-threaded readers.
 ///
 /// This trait mirrors `IcebergStorage` but requires `Send + Sync` for use with
-/// `tokio::spawn` and `Arc<dyn SendIcebergStorage>`.
-#[cfg(feature = "aws")]
+/// `tokio::spawn` and `Arc<dyn SendIcebergStorage>`. (Not feature-gated: the
+/// trait itself has no AWS dependency — only the S3 implementation does.)
 #[async_trait]
 pub trait SendIcebergStorage: Debug + Send + Sync {
     /// Read an entire file.
@@ -86,6 +97,15 @@ pub trait SendIcebergStorage: Debug + Send + Sync {
         let _ = prefix;
         Err(IcebergError::storage(
             "list_dir (warehouse-root listing) is not supported by this storage backend",
+        ))
+    }
+
+    /// List the immediate child FILE names under `prefix`. See
+    /// [`IcebergStorage::list_files`]. Default: unsupported.
+    async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
+        let _ = prefix;
+        Err(IcebergError::storage(
+            "list_files (metadata-directory listing) is not supported by this storage backend",
         ))
     }
 }
@@ -795,6 +815,20 @@ impl IcebergStorage for MemoryStorage {
         Ok(content.slice(start..end))
     }
 
+    async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
+        // Immediate children only: keys under `prefix/` with no further `/`.
+        let prefix = format!("{}/", prefix.trim_end_matches('/'));
+        let mut names: Vec<String> = self
+            .files
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix))
+            .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
     async fn file_size(&self, path: &str) -> Result<u64> {
         self.files
             .get(path)
@@ -864,6 +898,90 @@ impl<S: IcebergStorage> IcebergStorage for RangeOnlyStorage<S> {
 
     async fn file_size(&self, path: &str) -> Result<u64> {
         self.inner.file_size(path).await
+    }
+}
+
+/// The storage backends a graph source can read Iceberg files from, as one
+/// concrete type.
+///
+/// The scan surface (`SendScanPlanner`, `SendParquetReader`, the provider's
+/// session caches) is generic over `S: SendIcebergStorage + Clone` and the
+/// provider threads ONE storage type through all of them — this enum is that
+/// type, chosen per table location (`s3://`/`gs://` → S3, `file://`/absolute
+/// path → local filesystem). An enum rather than `Arc<dyn ...>` to keep the
+/// call sites concrete (workspace convention) and `Clone` trivially satisfied.
+#[cfg(feature = "aws")]
+#[derive(Clone, Debug)]
+pub enum IcebergStorageBackend {
+    /// Object-store reads (S3 / S3-compatible / GCS interop).
+    S3(S3IcebergStorage),
+    /// Local-filesystem reads (catalog-less local tables).
+    File(crate::io::file_storage::FileIcebergStorage),
+}
+
+#[cfg(feature = "aws")]
+#[async_trait]
+impl SendIcebergStorage for IcebergStorageBackend {
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        match self {
+            Self::S3(s) => SendIcebergStorage::read(s, path).await,
+            Self::File(f) => SendIcebergStorage::read(f, path).await,
+        }
+    }
+
+    async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        match self {
+            Self::S3(s) => SendIcebergStorage::read_range(s, path, range).await,
+            Self::File(f) => SendIcebergStorage::read_range(f, path, range).await,
+        }
+    }
+
+    async fn file_size(&self, path: &str) -> Result<u64> {
+        match self {
+            Self::S3(s) => SendIcebergStorage::file_size(s, path).await,
+            Self::File(f) => SendIcebergStorage::file_size(f, path).await,
+        }
+    }
+
+    async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        match self {
+            Self::S3(s) => SendIcebergStorage::read_ranges(s, path, ranges).await,
+            Self::File(f) => SendIcebergStorage::read_ranges(f, path, ranges).await,
+        }
+    }
+
+    async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
+        match self {
+            Self::S3(s) => SendIcebergStorage::list_dir(s, prefix).await,
+            Self::File(f) => SendIcebergStorage::list_dir(f, prefix).await,
+        }
+    }
+
+    async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
+        match self {
+            Self::S3(s) => SendIcebergStorage::list_files(s, prefix).await,
+            Self::File(f) => SendIcebergStorage::list_files(f, prefix).await,
+        }
+    }
+}
+
+#[cfg(feature = "aws")]
+#[async_trait(?Send)]
+impl IcebergStorage for IcebergStorageBackend {
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        SendIcebergStorage::read(self, path).await
+    }
+
+    async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        SendIcebergStorage::read_range(self, path, range).await
+    }
+
+    async fn file_size(&self, path: &str) -> Result<u64> {
+        SendIcebergStorage::file_size(self, path).await
+    }
+
+    async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
+        SendIcebergStorage::list_files(self, prefix).await
     }
 }
 

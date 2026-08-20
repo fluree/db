@@ -60,6 +60,7 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { workspace = true }
 postcard = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true

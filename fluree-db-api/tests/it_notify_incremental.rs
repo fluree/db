@@ -351,6 +351,123 @@ async fn notify_branch_catch_up_resolves_pre_fork_parent() {
     );
 }
 
+/// A branch's first *own* incremental index must be stamped with the branch's
+/// ledger_id, not the parent's.
+///
+/// `create_branch` copies the parent's index root by CID, so the branch's base
+/// root carries the parent's `ledger_id`. The load path re-stamps the cached
+/// snapshot from the nameservice record, but the incremental indexer used to
+/// clone the base root's `ledger_id` into every root it published. A cached
+/// branch handle refreshing onto that root then failed `apply_loaded_db`'s
+/// identity check ("Index ledger_id '<parent>' does not match expected
+/// '<branch>'") on every retry — leaving the branch permanently unwritable
+/// for any process holding it in cache.
+#[tokio::test]
+async fn notify_branch_refresh_after_incremental_index_on_branch() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_name = "it/notify-branch-idx";
+    let main_id = "it/notify-branch-idx:main";
+    let dev_id = "it/notify-branch-idx:dev";
+    let manager = peer_manager(&fluree);
+
+    let (local, indexer_handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async {
+            // 1. main: two commits, then an index — so the branch inherits a
+            //    root whose ledger_id is main's.
+            fluree
+                .create_ledger(ledger_name)
+                .await
+                .expect("create_ledger");
+            let main_ledger = fluree.ledger(main_id).await.expect("open main");
+            let main_ledger = insert_data(&fluree, main_ledger, "seed1").await;
+            let main_ledger = insert_data(&fluree, main_ledger, "seed2").await;
+            trigger_index_and_wait(&indexer_handle, main_id, main_ledger.t()).await;
+
+            // 2. Branch dev from indexed main and cache it (re-stamped to dev_id
+            //    by the load path).
+            fluree
+                .create_branch(ledger_name, "dev", None, None)
+                .await
+                .expect("create_branch");
+            let handle = manager.get_or_load(dev_id).await.expect("cache dev");
+            assert_eq!(handle.snapshot().await.ledger_id(), Some(dev_id));
+
+            // 3. Write on dev, then let the indexer index the branch itself.
+            let dev_ledger = fluree.ledger(dev_id).await.expect("open dev");
+            let dev_ledger = insert_data(&fluree, dev_ledger, "dev-only").await;
+            let dev_t = dev_ledger.t();
+            let outcome =
+                support::trigger_index_and_wait_outcome(&indexer_handle, dev_id, dev_t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = outcome else {
+                panic!("expected Completed");
+            };
+            let root_id = root_id.expect("completed index publishes a root");
+
+            // The published root must name the branch it indexes.
+            let record = fluree
+                .nameservice()
+                .lookup(dev_id)
+                .await
+                .expect("lookup dev")
+                .expect("dev record");
+            let cs = fluree_db_nameservice::branched_content_store_for_record(
+                fluree.backend(),
+                fluree.nameservice_mode().reader(),
+                &record,
+            )
+            .await
+            .expect("branched store");
+            let root_bytes = cs.get(&root_id).await.expect("read dev root");
+            let root =
+                fluree_db_binary_index::IndexRoot::decode(&root_bytes).expect("decode dev root");
+            assert_eq!(
+                root.ledger_id, dev_id,
+                "branch's incremental index root must carry the branch's ledger_id"
+            );
+
+            // 4. Refresh the cached handle: one commit behind plus the new
+            //    index → CommitCatchUp with an index update. This is the
+            //    transactor's cache-refresh step that used to fail with
+            //    LedgerIdMismatch on the branch's first own index.
+            let result = manager
+                .notify(NsNotify {
+                    ledger_id: dev_id.to_string(),
+                    record: None,
+                })
+                .await
+                .expect("notify on dev after branch index");
+            assert!(
+                matches!(result, NotifyResult::CommitsApplied { count: 1 }),
+                "expected CommitsApplied {{ count: 1 }}, got: {result:?}"
+            );
+
+            let state = manager
+                .get_or_load(dev_id)
+                .await
+                .expect("re-load dev")
+                .snapshot()
+                .await;
+            assert_eq!(
+                state.snapshot.t, dev_t,
+                "cached dev should be on the new index"
+            );
+            assert_eq!(state.ledger_id(), Some(dev_id));
+
+            // 5. And the branch stays writable through the cached path.
+            let _ = insert_data(&fluree, dev_ledger, "after-index").await;
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn notify_returns_not_loaded_for_uncached_ledger() {
     let fluree = FlureeBuilder::memory().build_memory();

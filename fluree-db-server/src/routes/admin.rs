@@ -467,6 +467,134 @@ pub async fn openapi_spec() -> Result<Json<serde_json::Value>> {
                     }
                 }
             },
+            "/v1/fluree/sweep": {
+                "post": {
+                    "summary": "Reclaim orphaned index artifacts",
+                    "description": "Releases index artifacts that no live index chain references. Covers every branch of the ledger, since dictionary blobs are shared across branches. Holds off index builds for the duration and aborts without deleting if any root cannot be read or any prefix cannot be listed. Single-process deployments only: the hold does not exclude an external indexer.",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "ledger": {
+                                            "type": "string",
+                                            "description": "Ledger name, without a branch suffix"
+                                        }
+                                    },
+                                    "required": ["ledger"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Sweep complete, including when nothing was reclaimable",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ledger": {
+                                                "type": "string"
+                                            },
+                                            "reclaimed": {
+                                                "type": "integer",
+                                                "description": "Artifacts released"
+                                            },
+                                            "failures": {
+                                                "type": "array",
+                                                "description": "Artifacts that could not be released; they stay in storage and the next sweep retries them",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "address": {
+                                                            "type": "string"
+                                                        },
+                                                        "error": {
+                                                            "type": "string"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Ledger does not exist"
+                        },
+                        "409": {
+                            "description": "Another maintenance operation holds one of the ledger's branches"
+                        }
+                    }
+                }
+            },
+            "/v1/fluree/sweep/plan": {
+                "post": {
+                    "summary": "Report what a sweep would reclaim",
+                    "description": "Same request body, hold, and admin protection as /v1/fluree/sweep, but deletes nothing.",
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "ledger": {
+                                            "type": "string",
+                                            "description": "Ledger name, without a branch suffix"
+                                        }
+                                    },
+                                    "required": ["ledger"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Plan computed",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ledger": {
+                                                "type": "string"
+                                            },
+                                            "orphan_count": {
+                                                "type": "integer",
+                                                "description": "Artifacts that would be released"
+                                            },
+                                            "scanned": {
+                                                "type": "integer",
+                                                "description": "Artifacts examined across every swept prefix"
+                                            },
+                                            "live": {
+                                                "type": "integer",
+                                                "description": "Distinct artifacts reachable from a live index chain"
+                                            },
+                                            "orphans": {
+                                                "type": "array",
+                                                "description": "Every address that would be released, in full",
+                                                "items": {
+                                                    "type": "string"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Ledger does not exist"
+                        },
+                        "409": {
+                            "description": "Another maintenance operation holds one of the ledger's branches"
+                        }
+                    }
+                }
+            },
             "/v1/fluree/query": {
                 "post": {
                     "summary": "Execute a query",

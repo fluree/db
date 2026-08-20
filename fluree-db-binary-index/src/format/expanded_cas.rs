@@ -34,8 +34,10 @@
 //!
 //! - `fluree-db-indexer::drop::collect_index_chain_cids` — drop / unpin
 //!   (tolerant).
-//! - `fluree-db-indexer::build::root_assembly::compute_garbage_from_prev_root`
-//!   — garbage-record diff (strict).
+//! - `fluree-db-indexer::build::root_assembly::superseded_cids` —
+//!   garbage-record diff (strict).
+//! - `fluree-db-indexer::gc::sweep::live_addresses` — storage-sweep live
+//!   set (strict).
 //! - `fluree-db-api::pack::compute_missing_index_artifacts` — pack
 //!   transfer (strict).
 //! - `fluree-db-api::ledger::loading::copy_index_to_branch` — branch

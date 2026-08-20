@@ -59,25 +59,109 @@ pub struct R2rmlRewriteResult {
 /// Build the loud-refuse error for [`R2rmlRewriteResult::unsupported`].
 ///
 /// Shared by every GRAPH execution path that consumes a rewrite result (the
-/// seeded and batched operators in `graph.rs`) so the user-facing message
-/// cannot drift between them. Kind names are deduplicated preserving first
-/// occurrence: two property paths in one scope read "property path", not
-/// "property path, property path".
-pub fn unsupported_subscope_error(graph_iri: &str, kinds: &[&str]) -> crate::error::QueryError {
+/// seeded and batched operators in `graph.rs`) and by the API-layer check that
+/// covers the same kinds *outside* a GRAPH scope
+/// ([`unsupported_outside_graph_scopes`]), so the user-facing message cannot
+/// drift between them. Kind names are deduplicated preserving first occurrence:
+/// two property paths in one scope read "property path", not "property path,
+/// property path".
+/// `graph_iris` names every graph source the refusal covers. `GraphOperator`
+/// always has exactly one (it is refusing inside one scope); the API-layer
+/// check can be guarding a dataset whose default graphs are several *different*
+/// sources, and naming only one of them would misdescribe the query.
+pub fn unsupported_subscope_error(graph_iris: &[&str], kinds: &[&str]) -> crate::error::QueryError {
     let mut unique: Vec<&str> = Vec::with_capacity(kinds.len());
     for &kind in kinds {
         if !unique.contains(&kind) {
             unique.push(kind);
         }
     }
+    let (subject, verb) = if graph_iris.len() == 1 {
+        ("graph source", "contains")
+    } else {
+        ("graph sources", "contain")
+    };
+    let names = graph_iris
+        .iter()
+        .map(|iri| format!("'{iri}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     crate::error::QueryError::InvalidQuery(format!(
-        "R2RML graph source '{}' contains pattern(s) that cannot be evaluated over a \
-         virtual dataset (an R2RML source has no native index, so these would silently \
-         return no rows): {}. Rewrite them as basic triple patterns or move them outside \
-         the GRAPH block.",
-        graph_iri,
+        "{subject} {names} {verb} pattern(s) that cannot be evaluated over a \
+         virtual dataset (a graph source has no native index, so these would silently \
+         return no rows): {}. Rewrite them as fixed-length steps between nodes, or run \
+         them against a native ledger.",
         unique.join(", ")
     ))
+}
+
+/// The kinds of pattern a graph source cannot evaluate, collected from the
+/// patterns that sit **outside** every `GRAPH` scope.
+///
+/// [`rewrite_patterns_for_r2rml`] records the same three kinds for the patterns
+/// *inside* one graph-source scope, and `GraphOperator` refuses on them. But a
+/// query addressed to a graph source can carry them at the top level too, where
+/// no `GRAPH` scope — and so no rewrite, and no refusal — ever sees them. There
+/// they evaluate against the graph source's view, which is a zero-flake genesis
+/// snapshot, and return silently-wrong results: `p+` nothing at all, `p*`/`p?`
+/// the zero-length identity match only. The API layer calls this before
+/// execution and refuses with [`unsupported_subscope_error`], so the refusal
+/// does not depend on whether the query happens to contain a `GRAPH` block.
+///
+/// Recursion mirrors the rewriter's, descending into the containers whose
+/// bodies evaluate against this view and stopping where they do not:
+/// - `GRAPH` is its own scope — already covered by the rewrite guard;
+/// - `SERVICE` targets another ledger or endpoint, which may have a native
+///   index, so refusing on its body would reject a query that works;
+/// - the RDF-star `EdgeAnnotation`/`AnnotationTarget` bodies are left untouched
+///   here exactly as the rewriter leaves them (RDF-star over a graph source is
+///   undefined rather than confirmed silently-empty).
+pub fn unsupported_outside_graph_scopes(patterns: &[Pattern]) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    collect_unsupported_outside_graph_scopes(patterns, &mut kinds);
+    kinds
+}
+
+fn collect_unsupported_outside_graph_scopes(patterns: &[Pattern], kinds: &mut Vec<&'static str>) {
+    for pattern in patterns {
+        match pattern {
+            // The three kinds the rewriter flags, named identically so one
+            // query reads the same whichever guard refuses it.
+            Pattern::PropertyPath(_) => kinds.push("property path"),
+            Pattern::ShortestPath(_) => kinds.push("shortest path"),
+            Pattern::Subquery(_) => kinds.push("subquery"),
+            // Containers whose bodies evaluate against this view.
+            Pattern::Optional(inner)
+            | Pattern::Minus(inner)
+            | Pattern::Exists(inner)
+            | Pattern::NotExists(inner)
+            | Pattern::DefaultGraphSource { patterns: inner } => {
+                collect_unsupported_outside_graph_scopes(inner, kinds);
+            }
+            Pattern::Union(branches) => {
+                for branch in branches {
+                    collect_unsupported_outside_graph_scopes(branch, kinds);
+                }
+            }
+            // Everything else is either a leaf, routed elsewhere, or its own
+            // scope — see the doc comment. Listed exhaustively so a new pattern
+            // variant that reads this view's index forces a decision here.
+            Pattern::Triple(_)
+            | Pattern::Filter(_)
+            | Pattern::Bind { .. }
+            | Pattern::Unwind { .. }
+            | Pattern::Values { .. }
+            | Pattern::IndexSearch(_)
+            | Pattern::VectorSearch(_)
+            | Pattern::R2rml(_)
+            | Pattern::GeoSearch(_)
+            | Pattern::S2Search(_)
+            | Pattern::Graph { .. }
+            | Pattern::Service(_)
+            | Pattern::EdgeAnnotation { .. }
+            | Pattern::AnnotationTarget { .. } => {}
+        }
+    }
 }
 
 /// The typed refusal for an R2RML graph-source query carrying `unconverted`
@@ -2655,8 +2739,10 @@ mod tests {
     /// order is preserved.
     #[test]
     fn unsupported_subscope_error_dedups_kinds() {
-        let err =
-            unsupported_subscope_error("gs:main", &["property path", "property path", "subquery"]);
+        let err = unsupported_subscope_error(
+            &["gs:main"],
+            &["property path", "property path", "subquery"],
+        );
         let msg = err.to_string();
         assert_eq!(
             msg.matches("property path").count(),
@@ -2668,6 +2754,58 @@ mod tests {
             "first-seen order must be preserved: {msg}"
         );
         assert!(msg.contains("gs:main"), "names the graph source: {msg}");
+    }
+
+    /// The out-of-scope scan flags the same kinds this rewriter flags inside a
+    /// scope, wherever a body evaluates against the graph source's own (empty)
+    /// index — and stops at the two scopes that are somebody else's problem: a
+    /// `GRAPH` block, which the rewrite guard already refuses, and a `SERVICE`
+    /// block, whose body runs against another ledger or endpoint that may well
+    /// have a native index.
+    #[test]
+    fn out_of_scope_scan_covers_bodies_this_view_evaluates() {
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        use crate::ir::{GraphName, ServiceEndpoint, ServicePattern};
+
+        let path = || {
+            Pattern::PropertyPath(PropertyPathPattern::new(
+                Ref::Sid(Sid::new(100, "n1")),
+                Sid::new(100, "edge"),
+                PathModifier::OneOrMore,
+                Ref::Var(VarId(0)),
+            ))
+        };
+
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[path()]),
+            vec!["property path"],
+            "a top-level path is exactly the bypass this scan exists to close"
+        );
+        assert_eq!(
+            unsupported_outside_graph_scopes(&[
+                Pattern::Optional(vec![path()]),
+                Pattern::Union(vec![vec![path()], vec![]]),
+            ]),
+            vec!["property path", "property path"],
+            "OPTIONAL and UNION bodies evaluate against this view"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[Pattern::Graph {
+                name: GraphName::Iri("gs:main".into()),
+                patterns: vec![path()],
+            }])
+            .is_empty(),
+            "a GRAPH scope is the rewrite guard's to refuse, not this scan's"
+        );
+        assert!(
+            unsupported_outside_graph_scopes(&[Pattern::Service(ServicePattern::new(
+                false,
+                ServiceEndpoint::Iri("fluree:ledger:other:main".into()),
+                vec![path()],
+            ))])
+            .is_empty(),
+            "a SERVICE body runs elsewhere and may have a native index"
+        );
     }
 
     #[test]

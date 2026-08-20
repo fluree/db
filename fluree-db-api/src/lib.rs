@@ -260,7 +260,7 @@ pub use search::EmbeddedBm25SearchProvider;
 pub use fluree_db_indexer::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
     IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation, IndexStatusSnapshot,
-    IndexerConfig, IndexerHandle,
+    IndexerConfig, IndexerHandle, SweepPlan, SweepResult,
 };
 
 // Re-export commonly used types from child crates
@@ -348,7 +348,9 @@ pub use fluree_db_policy::{
 };
 
 // Re-export tracking types for query/transaction metrics
-pub use fluree_db_core::{FuelExceededError, PolicyStats, Tracker, TrackingOptions, TrackingTally};
+pub use fluree_db_core::{
+    FuelExceededError, PolicyEnforcement, PolicyStats, Tracker, TrackingOptions, TrackingTally,
+};
 
 /// Bundles the two R2RML provider references that always travel together.
 ///
@@ -609,6 +611,16 @@ impl fluree_db_nameservice::NameServiceLookup for NameServiceMode {
         fluree_db_nameservice::NameServiceError,
     > {
         self.reader().all_records().await
+    }
+
+    async fn heads(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<
+        Option<fluree_db_nameservice::LedgerHeads>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().heads(ledger_id).await
     }
 }
 
@@ -1569,6 +1581,7 @@ impl FlureeBuilder {
             path: None,
             aes256_key: None,
             address_identifier: None,
+            durability: None,
         };
 
         let publisher = PublisherConfig {
