@@ -253,6 +253,14 @@ path = "tests/it_cyclic_bgp_novelty_pred.rs"
 name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
 
+# Own binary: asserts on a tracing event to pin that the BM25 incremental sync
+# really narrows its indexing query. Same convention and same two hazards as the
+# capture tests above — process-global callsite-interest cache, thread-local
+# `set_default`.
+[[test]]
+name = "it_bm25_sync_scoping"
+path = "tests/it_bm25_sync_scoping.rs"
+
 # Standalone (not in grp_misc): its process-scoped tracing capture + the
 # process-global callsite-interest cache require being the only test in its
 # process to avoid parallel-interleaving flake. Same convention as the span-

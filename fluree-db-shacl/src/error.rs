@@ -36,15 +36,4 @@ pub enum ShaclError {
     /// Circular shape reference detected
     #[error("Circular shape reference detected involving {shape_id}")]
     CircularReference { shape_id: Sid },
-
-    /// SHACL validation failed
-    ///
-    /// Contains a summary of the validation failures.
-    #[error("SHACL validation failed: {violation_count} violation(s), {warning_count} warning(s)")]
-    ValidationFailed {
-        violation_count: usize,
-        warning_count: usize,
-        /// Detailed messages for each violation (truncated if too many)
-        details: Vec<String>,
-    },
 }

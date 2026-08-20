@@ -30,6 +30,7 @@ use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ValueTypeTag};
 use fluree_db_core::{FlakeValue, GraphId};
 use fluree_vocab::namespaces;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -1102,11 +1103,11 @@ pub fn count_distinct_position_operator(
                 // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
                 // Distinct objects = lead bytes [0..10] — which excludes p_id,
                 // and so is not an object identity for a NumBig arena handle.
-                // Declines to the general pipeline for a graph holding any
-                // decimal or overflow integer.
+                // Those rows are counted exactly from the arena slice up to
+                // `numbig_exact_max_rows`; only a graph holding more NumBig
+                // rows than that declines to the general pipeline.
                 DistinctPosition::Objects => {
-                    let Some(count) = count_distinct_object_lead_groups(store, ctx.binary_g_id)?
-                    else {
+                    let Some(count) = count_distinct_objects(store, ctx.binary_g_id)? else {
                         return Ok(None);
                     };
                     (count, "COUNT(DISTINCT) objects")
@@ -1147,10 +1148,10 @@ struct LeadGroupPartial {
     count: u64,
     first_lead: Vec<u8>,
     last_lead: Vec<u8>,
-    /// Some leaflet in this chunk can hold an object key that is not a
-    /// graph-wide identity, so `count` is not a distinct-object count. Only
-    /// ever set for the OPST object walk.
-    non_identifying: bool,
+    /// Rows in leaflets excluded from `count` because their key range can hold
+    /// an object key that is not a graph-wide identity. Only ever non-zero for
+    /// the OPST object walk.
+    skipped_rows: u64,
 }
 
 /// Count distinct lead groups across all leaflets in a given sort order.
@@ -1170,8 +1171,70 @@ pub(crate) fn count_distinct_lead_groups(
     order: RunSortOrder,
     lead_len: usize,
 ) -> Result<u64> {
-    Ok(count_distinct_lead_groups_inner(store, g_id, order, lead_len, false)?.unwrap_or(0))
+    Ok(
+        count_distinct_lead_groups_inner(store, g_id, order, lead_len, false)?
+            .map_or(0, |w| w.count),
+    )
 }
+
+/// `fast-path outcome` site for the exact NumBig branch, distinct from the
+/// operator's own label so span capture can tell "counted from metadata alone"
+/// from "counted the arena slice exactly".
+const NUMBIG_EXACT_SITE: &str = "distinct object COUNT (numbig exact)";
+
+/// Row cap above which the exact branch declines to the general pipeline.
+///
+/// **This is a rollout guard, not a crossover threshold.** Timing the two lanes
+/// over synthetic ledgers (NumBig rows split across two predicates, plus a
+/// non-NumBig slice half its size) found no crossover at any size tried:
+///
+/// | NumBig rows | exact | general | ratio |
+/// |---|---|---|---|
+/// | 1 000 | 0.39 ms | 1.21 ms | 3.1x |
+/// | 10 000 | 3.39 ms | 13.31 ms | 3.9x |
+/// | 50 000 | 17.54 ms | 69.35 ms | 4.0x |
+/// | 200 000 | 72.73 ms | 345.04 ms | 4.7x |
+/// | 1 000 000 | 485.56 ms | 2774.54 ms | 5.7x |
+///
+/// The advantage *grows* with the slice, which is structural rather than
+/// lucky: the general pipeline scans and materializes every object in the
+/// graph, while this branch pays payload reads for the NumBig slice only and
+/// still answers the rest from directory metadata.
+///
+/// So declining is not the cheap option above the cap — the fallback scans and
+/// materializes every object in the graph rather than the NumBig slice alone,
+/// and pays for it in time.
+///
+/// The comparison is deliberately about time only. On memory the two are not
+/// ordered by entry count: the fallback holds more entries, but keys them as
+/// `GroupKeyOwned::Lit`, a small `Copy` struct, where this branch's set holds a
+/// `MaterializedLitKey` carrying an `Arc<str>` per distinct value. Which side
+/// wins depends on how many of those rows are distinct, so no claim is made.
+///
+/// Nothing here is being protected by the cap except the rollout itself: this
+/// is a new read path
+/// (branch seek, payload decode, arena mapping) and the cap bounds how much of
+/// a graph it can be responsible for while it soaks. It is a removal
+/// candidate after a release in production, not a number to tune.
+///
+/// The table is not reproduced by anything in the tree — there is no bench on
+/// this path, and `FLUREE_NUMBIG_EXACT_MAX_ROWS` appears only here and in
+/// `it_distinct_object_numbig_gate`. To re-derive it: build a ledger of N
+/// NumBig rows split across two predicates plus a non-NumBig slice of N/2,
+/// index it, and time `COUNT(DISTINCT ?o)` twice — once as-is for the exact
+/// lane, once with `FLUREE_NUMBIG_EXACT_MAX_ROWS=1` to force the decline. Treat
+/// the numbers as a recorded observation, not a maintained benchmark.
+///
+/// Overridable so the regression suite can sweep both sides, and so the timing
+/// above can be re-derived.
+fn numbig_exact_max_rows() -> u64 {
+    std::env::var("FLUREE_NUMBIG_EXACT_MAX_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(NUMBIG_EXACT_MAX_ROWS_DEFAULT)
+}
+
+const NUMBIG_EXACT_MAX_ROWS_DEFAULT: u64 = 25_000_000;
 
 /// Whole-graph distinct **objects** from OPST leaflet directories, or `None`
 /// when the graph holds an object whose `(o_type, o_key)` lead is not a
@@ -1186,32 +1249,204 @@ pub(crate) fn count_distinct_lead_groups(
 /// their distinct big-value counts rather than the size of the union: a silent
 /// undercount, never an over-report.
 ///
-/// Rather than special-case the NumBig slice (which needs `p_id` payload reads
-/// and arena loads), decline the whole count to the general pipeline. Ledgers
-/// with no decimals and no overflow integers — the overwhelming majority — keep
-/// the fast path, paying one extra 2-byte comparison per directory entry.
+/// The metadata walk therefore counts only the identifying part of the graph and
+/// reports the NumBig slice's row count separately; [`count_distinct_objects`]
+/// decides what to do with it.
 ///
 /// The per-predicate distinct-object count is unaffected and stays on its fast
 /// path: its 14-byte POST lead starts with `p_id`, which scopes the handle
 /// correctly. So is the distinct-subject count, whose SPOT lead is `s_id`.
-pub(crate) fn count_distinct_object_lead_groups(
+///
+/// Rather than decline the whole query over that slice, it is counted exactly.
+/// Three outcomes, in the order they are cheapest to establish:
+///
+/// * no NumBig rows — the metadata walk already answered, unchanged;
+/// * NumBig rows within [`numbig_exact_max_rows`] — add the exact count of the
+///   arena slice, which costs a two-column payload read over *only* those rows;
+/// * more than that — decline, because the general pipeline is scanning
+///   everything anyway and an in-memory distinct set over the slice stops being
+///   the cheaper way to answer.
+///
+/// The row tally comes from leaflet directory entries, so the threshold is
+/// decided before any payload is touched.
+pub(crate) fn count_distinct_objects(
     store: &BinaryIndexStore,
     g_id: GraphId,
 ) -> Result<Option<u64>> {
-    count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, 10, true)
+    let Some(walk) = count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, 10, true)?
+    else {
+        return Ok(None);
+    };
+    if walk.skipped_non_identifying_rows == 0 {
+        return Ok(Some(walk.count));
+    }
+    if walk.skipped_non_identifying_rows > numbig_exact_max_rows() {
+        return Ok(None);
+    }
+    let exact = count_distinct_numbig_objects(store, g_id)?;
+    crate::fast_path_outcome::stamp_fast_path(
+        NUMBIG_EXACT_SITE,
+        crate::fast_path_outcome::FastPathOutcome::Proceed,
+    );
+    Ok(Some(walk.count.saturating_add(exact)))
 }
 
-/// Returns `None` iff `require_identifying_o_key` and some leaflet's key range
-/// covers a `NUM_BIG_OVERFLOW` row.
+/// Exact distinct-value count over the `NUM_BIG_OVERFLOW` slice of the OPST
+/// index.
+///
+/// Two things make this more than "count the arena":
+///
+/// * an arena keeps a handle for a value whose rows have since been retracted,
+///   so the pairs must come from rows present in the index — this walks the
+///   rows and never reads arena membership;
+/// * one value under two predicates is two handles in two arenas, and within a
+///   legacy arena two handles can decode to the same value, so dedup happens on
+///   the decoded value rather than on `(p_id, handle)`.
+///
+/// Values are keyed with [`crate::group_aggregate::flake_value_to_key`], the
+/// general pipeline's own key function, so the two lanes partition a value set
+/// the same way.
+///
+/// The datatype passed to it is a constant `xsd:decimal` for the whole slice,
+/// which is *not* what the general pipeline resolves per row — there,
+/// `resolve_datatype_sid_for_value` falls through to
+/// `FlakeValue::overflow_numeric_datatype_sid` and tags an overflow BigInt
+/// `xsd:integer` and a BigDecimal `xsd:decimal`. The constant is still sound,
+/// for a reason worth stating exactly: `flake_value_to_key` already gives
+/// `Decimal` and `BigInt` distinct discriminants, and in the general lane the
+/// datatype is a function of that same variant, so it separates nothing the
+/// discriminant has not separated. Both choices yield the same partition, and
+/// only its size is read here.
+fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
+    use fluree_db_binary_index::format::column_block::ColumnId;
+    use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
+
+    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Opst) else {
+        return Ok(0);
+    };
+    let numbig = OType::NUM_BIG_OVERFLOW;
+    let (min_key, max_key) = o_type_range_keys(numbig, g_id);
+    let cmp = fluree_db_binary_index::format::run_record_v2::cmp_v2_for_order(RunSortOrder::Opst);
+    let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
+
+    let projection = ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::PId);
+            s.insert(ColumnId::OKey);
+            s
+        },
+    };
+    // `dtc` is constant for the whole slice. It does not have to match what the
+    // general pipeline resolves per row (`resolve_datatype_sid_for_value` gives
+    // an overflow BigInt `xsd:integer` and a BigDecimal `xsd:decimal`) because
+    // it cannot separate anything the key does not already separate:
+    // `flake_value_to_key` assigns `Decimal` and `BigInt` distinct
+    // discriminants, and in the general lane `dtc` is a function of that same
+    // variant. A constant therefore yields an identical partition, and only the
+    // partition's size is read here.
+    let dtc = fluree_db_core::DatatypeConstraint::Explicit(
+        store
+            .dt_sids()
+            .get(fluree_db_core::ids::DatatypeDictId::DECIMAL.as_u16() as usize)
+            .cloned()
+            .unwrap_or_else(|| fluree_db_core::Sid::new(0, "")),
+    );
+
+    // Pass 1: collect the distinct `(p_id, o_key)` handles. A handle repeats
+    // once per row that carries the value — one value under one predicate is a
+    // row per subject — so decoding per row would allocate a BigInt/BigDecimal
+    // plus a `String` and an `Arc<str>` for each of them. Deduping the `Copy`
+    // pair first costs one `u64`-ish hash per row and bounds the decodes by the
+    // arena's size rather than the slice's row count.
+    let mut handles: HashSet<(u32, u64)> = HashSet::new();
+    for leaf_entry in &branch.leaves[leaf_range] {
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        for (idx, entry) in handle.dir().entries.iter().enumerate() {
+            if entry.row_count == 0 || entry.o_type_const != Some(numbig.as_u16()) {
+                continue;
+            }
+            let batch = handle
+                .load_columns(idx, &projection, RunSortOrder::Opst)
+                .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
+            for row in 0..batch.row_count {
+                handles.insert((batch.p_id.get_or(row, 0), batch.o_key.get(row)));
+            }
+        }
+    }
+
+    // Pass 2: decode the survivors. Two handles in a legacy arena can decode to
+    // the same value, and one value under two predicates is two handles in two
+    // arenas, so the distinct count still has to come from the decoded values —
+    // deduping handles only removes the repeats that cannot possibly differ.
+    let mut distinct: HashSet<crate::group_aggregate::MaterializedLitKey> = HashSet::new();
+    for (p_id, o_key) in handles {
+        let val = store
+            .decode_value_v3(numbig.as_u16(), o_key, p_id, g_id)
+            .map_err(|e| QueryError::Internal(format!("numbig decode: {e}")))?;
+        distinct.insert(crate::group_aggregate::flake_value_to_key(&val, &dtc));
+    }
+    Ok(distinct.len() as u64)
+}
+
+/// Min/max OPST keys bracketing a single `o_type`.
+fn o_type_range_keys(
+    o_type: OType,
+    g_id: GraphId,
+) -> (
+    fluree_db_binary_index::format::run_record_v2::RunRecordV2,
+    fluree_db_binary_index::format::run_record_v2::RunRecordV2,
+) {
+    use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
+    let min_key = RunRecordV2 {
+        s_id: SubjectId(0),
+        o_key: 0,
+        p_id: 0,
+        t: 0,
+        o_i: 0,
+        o_type: o_type.as_u16(),
+        g_id,
+    };
+    let max_key = RunRecordV2 {
+        s_id: SubjectId(u64::MAX),
+        o_key: u64::MAX,
+        p_id: u32::MAX,
+        t: u32::MAX,
+        o_i: u32::MAX,
+        o_type: o_type.as_u16(),
+        g_id,
+    };
+    (min_key, max_key)
+}
+
+/// Outcome of a lead-group walk: distinct groups over the leaflets that were
+/// counted, plus how many rows were skipped because their `(o_type, o_key)`
+/// lead is not a graph-wide identity.
+struct LeadGroupWalk {
+    count: u64,
+    skipped_non_identifying_rows: u64,
+}
+
+/// Walks leaflet directories only. With `require_identifying_o_key`, leaflets
+/// whose key range can hold a non-identifying `o_key` are excluded from the
+/// count and their rows tallied instead — they cannot participate in seam
+/// dedup either, which is sound because a NumBig lead can never equal a
+/// non-NumBig one (the o_type differs in the leading two bytes).
 fn count_distinct_lead_groups_inner(
     store: &BinaryIndexStore,
     g_id: GraphId,
     order: RunSortOrder,
     lead_len: usize,
     require_identifying_o_key: bool,
-) -> Result<Option<u64>> {
+) -> Result<Option<LeadGroupWalk>> {
     let Some(branch) = store.branch_for_order(g_id, order) else {
-        return Ok(Some(0));
+        return Ok(Some(LeadGroupWalk {
+            count: 0,
+            skipped_non_identifying_rows: 0,
+        }));
     };
 
     let map = |chunk: &[LeafEntry]| -> Result<Option<LeadGroupPartial>> {
@@ -1219,7 +1454,7 @@ fn count_distinct_lead_groups_inner(
             count: 0,
             first_lead: Vec::new(),
             last_lead: Vec::new(),
-            non_identifying: false,
+            skipped_rows: 0,
         };
         for leaf_entry in chunk {
             let dir = store
@@ -1242,7 +1477,8 @@ fn count_distinct_lead_groups_inner(
                 // entry's own `[first, last]` interval says whether the leaflet
                 // can hold a non-identifying object key — no payload read.
                 if require_identifying_o_key && leaflet_may_hold_non_identifying_o_key(entry) {
-                    partial.non_identifying = true;
+                    partial.skipped_rows += u64::from(entry.row_count);
+                    continue;
                 }
 
                 partial.count += u64::from(entry.lead_group_count);
@@ -1260,18 +1496,18 @@ fn count_distinct_lead_groups_inner(
     };
 
     let combine = |left: LeadGroupPartial, right: LeadGroupPartial| -> LeadGroupPartial {
-        // Fold the flag before the empty-side short-circuits: an all-empty
-        // chunk still carries a verdict from its (skipped) sibling.
-        let non_identifying = left.non_identifying || right.non_identifying;
+        // Fold the tally before the empty-side short-circuits: a chunk with no
+        // counted leaflets may still have skipped some.
+        let skipped_rows = left.skipped_rows.saturating_add(right.skipped_rows);
         if right.first_lead.is_empty() {
             return LeadGroupPartial {
-                non_identifying,
+                skipped_rows,
                 ..left
             };
         }
         if left.first_lead.is_empty() {
             return LeadGroupPartial {
-                non_identifying,
+                skipped_rows,
                 ..right
             };
         }
@@ -1283,17 +1519,22 @@ fn count_distinct_lead_groups_inner(
                 .saturating_sub(seam_dedup),
             first_lead: left.first_lead,
             last_lead: right.last_lead,
-            non_identifying,
+            skipped_rows,
         }
     };
 
     let parallel = branch.leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
     let result = parallel_leaf_chunk_reduce(&branch.leaves, parallel, map, combine)?;
-    Ok(match result {
-        Some(p) if p.non_identifying => None,
-        Some(p) => Some(p.count),
-        None => Some(0),
-    })
+    Ok(Some(match result {
+        Some(p) => LeadGroupWalk {
+            count: p.count,
+            skipped_non_identifying_rows: p.skipped_rows,
+        },
+        None => LeadGroupWalk {
+            count: 0,
+            skipped_non_identifying_rows: 0,
+        },
+    }))
 }
 
 /// Whether an OPST leaflet's key range can cover an object key that is not a

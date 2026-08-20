@@ -102,6 +102,7 @@ pub mod compile;
 pub mod constraints;
 pub mod error;
 pub mod path;
+pub mod report_text;
 pub mod validate;
 
 pub use cache::{ShaclCache, ShaclCacheKey};
@@ -109,6 +110,7 @@ pub use compile::{CompiledShape, LiteralTarget, PropertyShape, Severity, ShapeId
 pub use constraints::Constraint;
 pub use error::{Result, ShaclError};
 pub use path::PropertyPath;
+pub use report_text::{format_violations, unresolved_sid, violations_of};
 pub use validate::{
     CrossLedgerMembership, FocusNode, ShaclEngine, ValidationReport, ValidationResult,
 };
