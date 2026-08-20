@@ -153,15 +153,31 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
                 estimated_row_count += data_file.record_count;
 
                 // Create file scan task with schema for correct field ID mapping
+                let eff_seq = effective_sequence_number(
+                    entry.sequence_number,
+                    manifest_entry.sequence_number,
+                );
                 let task = FileScanTask::for_whole_file_with_schema(
                     data_file,
                     projected_field_ids.clone(),
                     self.config.filter.clone(),
                     Arc::clone(&schema_arc),
-                );
+                )
+                // A full read carries it too. This is the read a consumer falls
+                // back to when its watermark expired, so it is exactly the read
+                // that most needs to be resumable.
+                .with_data_sequence_number(eff_seq);
                 tasks.push(task);
             }
         }
+
+        // Commit order, path as the tiebreak — see the same sort in
+        // `plan_incremental` for why this is a contract rather than a nicety.
+        tasks.sort_by(|a, b| {
+            a.data_sequence_number
+                .cmp(&b.data_sequence_number)
+                .then_with(|| a.data_file.file_path.cmp(&b.data_file.file_path))
+        });
 
         tracing::info!(
             files_selected,
@@ -317,14 +333,37 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
 
                 files_selected += 1;
                 estimated_row_count += data_file.record_count;
-                added_tasks.push(FileScanTask::for_whole_file_with_schema(
-                    data_file,
-                    projected_field_ids.clone(),
-                    self.config.filter.clone(),
-                    Arc::clone(&schema_arc),
-                ));
+                added_tasks.push(
+                    FileScanTask::for_whole_file_with_schema(
+                        data_file,
+                        projected_field_ids.clone(),
+                        self.config.filter.clone(),
+                        Arc::clone(&schema_arc),
+                    )
+                    // `eff_seq` is already the value this loop filters on; carrying
+                    // it lets a consumer order or checkpoint by commit without
+                    // re-deriving it from manifests it no longer holds.
+                    .with_data_sequence_number(eff_seq),
+                );
             }
         }
+
+        // Commit order, with the path as a deterministic tiebreak inside a commit.
+        //
+        // Manifest traversal is already sequential, so this order is stable today
+        // — but only incidentally. A consumer that stops part-way through a
+        // backlog and resumes needs the order to be a CONTRACT, because resuming
+        // against a different order either repeats files or skips them. Sorting
+        // makes it one, and costs a sort over file metadata rather than data.
+        //
+        // Sequence number first, not path first: an older row overwriting a newer
+        // one is the failure mode that matters here, and processing commits in
+        // order is what prevents it.
+        added_tasks.sort_by(|a, b| {
+            a.data_sequence_number
+                .cmp(&b.data_sequence_number)
+                .then_with(|| a.data_file.file_path.cmp(&b.data_file.file_path))
+        });
 
         tracing::info!(
             ?from_snapshot_id,

@@ -86,9 +86,29 @@ pub struct FileScanTask {
     pub length: i64,
     /// Iceberg schema for field ID mapping (ensures correct column mapping after schema evolution).
     pub iceberg_schema: Option<Arc<Schema>>,
+    /// Effective data sequence number of the file, when the planner knew it.
+    ///
+    /// Iceberg assigns this per commit and never reuses or reorders it, so it is
+    /// the only value on a task that says *when* the file's rows entered the
+    /// table. A consumer that must process files in commit order — or stop
+    /// part-way through a backlog and resume without going backwards — has
+    /// nothing else to sort or checkpoint on: paths are arbitrary, and manifest
+    /// iteration order is an implementation detail rather than a contract.
+    ///
+    /// `None` where the planner cannot attribute one (a whole-table read built
+    /// outside manifest traversal, and the test helpers). Consumers that need
+    /// ordering must treat `None` as "unknown", not as zero.
+    pub data_sequence_number: Option<i64>,
 }
 
 impl FileScanTask {
+    /// Attach the file's effective data sequence number.
+    #[must_use]
+    pub fn with_data_sequence_number(mut self, seq: i64) -> Self {
+        self.data_sequence_number = Some(seq);
+        self
+    }
+
     /// Create a task for reading an entire file.
     pub fn for_whole_file(
         data_file: DataFile,
@@ -103,6 +123,7 @@ impl FileScanTask {
             start: 0,
             length,
             iceberg_schema: None,
+            data_sequence_number: None,
         }
     }
 
@@ -121,6 +142,7 @@ impl FileScanTask {
             start: 0,
             length,
             iceberg_schema: Some(schema),
+            data_sequence_number: None,
         }
     }
 }
@@ -384,6 +406,83 @@ impl<'a, S: IcebergStorage> ScanPlanner<'a, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sort a resumable consumer depends on: commit order first, path as a
+    /// deterministic tiebreak inside one commit.
+    ///
+    /// This is asserted on the comparator rather than on a planner run because
+    /// the planners need storage; the ordering rule is the part that has to
+    /// hold, and it is what a cursor checkpoints against.
+    #[test]
+    fn tasks_order_by_commit_then_path() {
+        fn task(path: &str, seq: Option<i64>) -> FileScanTask {
+            let df = crate::manifest::DataFile {
+                file_path: path.to_string(),
+                file_format: crate::manifest::FileFormat::Parquet,
+                record_count: 1,
+                file_size_in_bytes: 1,
+                partition: crate::manifest::PartitionData::default(),
+                column_sizes: None,
+                value_counts: None,
+                null_value_counts: None,
+                nan_value_counts: None,
+                lower_bounds: None,
+                upper_bounds: None,
+                split_offsets: None,
+                sort_order_id: None,
+            };
+            let t = FileScanTask::for_whole_file(df, vec![], None);
+            match seq {
+                Some(s) => t.with_data_sequence_number(s),
+                None => t,
+            }
+        }
+
+        let mut tasks = [
+            task("z-early.parquet", Some(1)),
+            task("a-late.parquet", Some(9)),
+            task("m-mid-b.parquet", Some(5)),
+            task("m-mid-a.parquet", Some(5)),
+        ];
+        tasks.sort_by(|a, b| {
+            a.data_sequence_number
+                .cmp(&b.data_sequence_number)
+                .then_with(|| a.data_file.file_path.cmp(&b.data_file.file_path))
+        });
+
+        let order: Vec<&str> = tasks
+            .iter()
+            .map(|t| t.data_file.file_path.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "z-early.parquet", // seq 1 — earliest commit, despite sorting last by path
+                "m-mid-a.parquet", // seq 5, path tiebreak
+                "m-mid-b.parquet",
+                "a-late.parquet", // seq 9 — latest commit, despite sorting first by path
+            ],
+            "commit order must outrank path order: sorting by path alone would \
+             process a later commit before an earlier one, which lets an older \
+             row overwrite a newer one across a resume boundary"
+        );
+    }
+
+    /// `None` must not be treated as sequence zero. An unattributed file sorting
+    /// first would place it before every real commit.
+    #[test]
+    fn an_unknown_sequence_number_is_distinct_from_zero() {
+        assert_ne!(
+            Some(0i64),
+            Option::<i64>::None,
+            "a task with no attributable sequence number is 'unknown', not 'oldest'"
+        );
+        // And the helper never yields None: a missing entry seq inherits the
+        // manifest's, which is what makes the sort total in practice.
+        assert_eq!(effective_sequence_number(None, 7), 7);
+        assert_eq!(effective_sequence_number(Some(0), 7), 7);
+        assert_eq!(effective_sequence_number(Some(3), 7), 3);
+    }
 
     #[test]
     fn test_scan_config_builder() {

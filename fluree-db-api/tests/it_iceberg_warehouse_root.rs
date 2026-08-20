@@ -107,7 +107,7 @@ async fn warehouse_root_resolves_at_every_direct_entry_point() {
         .expect("fixture table has snapshots");
 
     let scan = provider
-        .scan_for_materialize_stream(gs, "silver.people", &[], None, None)
+        .scan_for_materialize_stream(gs, "silver.people", &[], None, None, None)
         .await
         .expect("scan_for_materialize_stream must resolve the table under the root");
     assert_eq!(
@@ -121,7 +121,7 @@ async fn warehouse_root_resolves_at_every_direct_entry_point() {
 
     // A pinned scan takes the same resolution path with a caller-supplied `to`.
     let scan = provider
-        .scan_for_materialize_stream(gs, "silver.people", &[], None, Some(current))
+        .scan_for_materialize_stream(gs, "silver.people", &[], None, Some(current), None)
         .await
         .expect("pinned scan under a warehouse root");
     assert_eq!(scan.to_snapshot_id, Some(current), "pin is honored");
