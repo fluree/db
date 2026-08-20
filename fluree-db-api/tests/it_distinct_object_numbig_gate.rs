@@ -27,12 +27,13 @@
 
 #![cfg(feature = "native")]
 
-#[path = "support/span_capture.rs"]
-mod span_capture;
+mod support;
 
-use fluree_db_api::{set_fast_paths_disabled, FlureeBuilder};
-use serde_json::Value;
+use fluree_db_api::{set_fast_paths_disabled, FlureeBuilder, IndexConfig, LedgerManagerConfig};
+use fluree_db_transact::{CommitOpts, TxnOpts};
+use serde_json::{json, Value};
 use std::io::Write;
+use support::span_capture;
 use tempfile::TempDir;
 
 /// Operator label the whole-graph distinct-object count stamps.
@@ -255,6 +256,20 @@ async fn build_indexed(ttl: &str, slug: &str) -> (TempDir, TempDir, fluree_db_ap
         .await
         .expect("import");
     (db_dir, data_dir, fluree, ledger_id)
+}
+
+/// Query an already-resolved view, as `Fluree::db` hands back.
+async fn run_view(
+    fluree: &fluree_db_api::Fluree,
+    view: &fluree_db_api::GraphDb,
+    sparql: &str,
+) -> Value {
+    fluree
+        .query(view, sparql)
+        .await
+        .unwrap_or_else(|e| panic!("query {sparql}: {e}"))
+        .to_sparql_json(&view.snapshot)
+        .unwrap_or_else(|e| panic!("to_sparql_json {sparql}: {e}"))
 }
 
 async fn run(
@@ -522,9 +537,134 @@ async fn distinct_object_count_declines_numbig_object_keys() {
         }
     }
 
+    // ---- Phase 4: composition with the retracted-partition rebuild ---------
+    failures.extend(gate_clears_after_retracting_every_decimal().await);
+
     assert!(
         failures.is_empty(),
         "distinct-object NumBig gate failures:\n  {}",
         failures.join("\n  ")
     );
+}
+
+/// The gate and the rebuild that drops retracted partitions have to compose:
+/// once every NumBig row is retracted and the index rebuilt, the graph no
+/// longer holds a non-identifying object key, so the fast path must come back.
+///
+/// The load-bearing detail is an ordering one. `count_distinct_lead_groups_inner`
+/// skips a directory entry on `row_count == 0 || lead_group_count == 0` *before*
+/// it consults `leaflet_may_hold_non_identifying_o_key`, so an emptied leaflet
+/// whose key range still spans `NUM_BIG_OVERFLOW` cannot trip the gate. Move
+/// the gate check above that skip and every ledger that has ever held a decimal
+/// declines forever, which no value assertion elsewhere in this file would
+/// catch — they all run on freshly imported ledgers with nothing retracted.
+async fn gate_clears_after_retracting_every_decimal() -> Vec<String> {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "numbig/retracted-decimals:main";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let mut failures: Vec<String> = Vec::new();
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            // Two decimals (NumBig) plus four objects that are not: distinct
+            // objects = 6 while the decimals are live, 4 once they are gone.
+            let seed = json!({
+                "@context": {"ex": "http://ex/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+                "@graph": [
+                    {"@id": "ex:a", "ex:cost": {"@value": "1.1", "@type": "xsd:decimal"}},
+                    {"@id": "ex:b", "ex:cost": {"@value": "2.2", "@type": "xsd:decimal"}},
+                    {"@id": "ex:c", "ex:label": "alpha"},
+                    {"@id": "ex:d", "ex:label": "beta"},
+                    {"@id": "ex:e", "ex:n": 7},
+                    {"@id": "ex:f", "ex:n": 8}
+                ]
+            });
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let seeded = fluree
+                .insert_with_opts(
+                    ledger,
+                    &seed,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert");
+            let ledger = seeded.ledger;
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            support::wait_for_index_application(&fluree, ledger_id, ledger.t()).await;
+
+            // While the decimals are live the gate declines, and the general
+            // pipeline answers 6. This half also proves the ledger really is on
+            // the indexed lane, so the post-retraction half is not vacuous.
+            let (store, tracing_guard) = span_capture::init_test_tracing();
+            let view = fluree.db(ledger_id).await.expect("indexed view");
+            let before = scalar(&run_view(&fluree, &view, Q_COUNT).await);
+            let before_sites = proceeded(&store, 0);
+            if before != "6" {
+                failures.push(format!(
+                    "with decimals live: COUNT(DISTINCT ?o) = {before}, expected 6"
+                ));
+            }
+            if before_sites.iter().any(|s| s == OBJECT_SITE) {
+                failures.push(format!(
+                    "with decimals live: `{OBJECT_SITE}` proceeded on a graph \
+                     holding NumBig objects [proceeded: {before_sites:?}]"
+                ));
+            }
+
+            let retracted = fluree
+                .update(
+                    ledger,
+                    &json!({
+                        "@context": {"ex": "http://ex/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+                        "delete": [
+                            {"@id": "ex:a", "ex:cost": {"@value": "1.1", "@type": "xsd:decimal"}},
+                            {"@id": "ex:b", "ex:cost": {"@value": "2.2", "@type": "xsd:decimal"}}
+                        ]
+                    }),
+                )
+                .await
+                .expect("retract every decimal")
+                .ledger;
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, retracted.t()).await;
+            support::wait_for_index_application(&fluree, ledger_id, retracted.t()).await;
+
+            let mark = store.find_events("fast-path outcome").len();
+            let view = fluree.db(ledger_id).await.expect("rebuilt view");
+            let after = scalar(&run_view(&fluree, &view, Q_COUNT).await);
+            let after_sites = proceeded(&store, mark);
+            drop(tracing_guard);
+
+            if after != "4" {
+                failures.push(format!(
+                    "after retracting every decimal: COUNT(DISTINCT ?o) = {after}, \
+                     expected 4 (two strings and two integers remain)"
+                ));
+            }
+            if !after_sites.iter().any(|s| s == OBJECT_SITE) {
+                failures.push(format!(
+                    "after retracting every decimal: expected `{OBJECT_SITE}` to \
+                     proceed again — an emptied leaflet whose key range still \
+                     spans NUM_BIG_OVERFLOW must be skipped on row_count before \
+                     the gate sees it [proceeded: {after_sites:?}]"
+                ));
+            }
+            failures
+        })
+        .await
 }
