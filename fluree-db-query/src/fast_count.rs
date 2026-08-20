@@ -1103,8 +1103,9 @@ pub fn count_distinct_position_operator(
                 // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
                 // Distinct objects = lead bytes [0..10] — which excludes p_id,
                 // and so is not an object identity for a NumBig arena handle.
-                // Declines to the general pipeline for a graph holding any
-                // decimal or overflow integer.
+                // Those rows are counted exactly from the arena slice up to
+                // `numbig_exact_max_rows`; only a graph holding more NumBig
+                // rows than that declines to the general pipeline.
                 DistinctPosition::Objects => {
                     let Some(count) = count_distinct_objects(store, ctx.binary_g_id)? else {
                         return Ok(None);
@@ -1200,16 +1201,32 @@ const NUMBIG_EXACT_SITE: &str = "distinct object COUNT (numbig exact)";
 /// graph, while this branch pays payload reads for the NumBig slice only and
 /// still answers the rest from directory metadata.
 ///
-/// So declining is not the cheap option above the cap — it is strictly worse
-/// on both axes. The fallback builds a distinct set over *every* object in the
-/// graph rather than over the NumBig slice, so it costs more memory than
-/// proceeding would have, as well as more time. Nothing here is being
-/// protected by the cap except the rollout itself: this is a new read path
+/// So declining is not the cheap option above the cap — the fallback scans and
+/// materializes every object in the graph rather than the NumBig slice alone,
+/// and pays for it in time.
+///
+/// The comparison is deliberately about time only. On memory the two are not
+/// ordered by entry count: the fallback holds more entries, but keys them as
+/// `GroupKeyOwned::Lit`, a small `Copy` struct, where this branch's set holds a
+/// `MaterializedLitKey` carrying an `Arc<str>` per distinct value. Which side
+/// wins depends on how many of those rows are distinct, so no claim is made.
+///
+/// Nothing here is being protected by the cap except the rollout itself: this
+/// is a new read path
 /// (branch seek, payload decode, arena mapping) and the cap bounds how much of
 /// a graph it can be responsible for while it soaks. It is a removal
 /// candidate after a release in production, not a number to tune.
 ///
-/// Overridable so the bench and the regression suite can sweep both sides.
+/// The table is not reproduced by anything in the tree — there is no bench on
+/// this path, and `FLUREE_NUMBIG_EXACT_MAX_ROWS` appears only here and in
+/// `it_distinct_object_numbig_gate`. To re-derive it: build a ledger of N
+/// NumBig rows split across two predicates plus a non-NumBig slice of N/2,
+/// index it, and time `COUNT(DISTINCT ?o)` twice — once as-is for the exact
+/// lane, once with `FLUREE_NUMBIG_EXACT_MAX_ROWS=1` to force the decline. Treat
+/// the numbers as a recorded observation, not a maintained benchmark.
+///
+/// Overridable so the regression suite can sweep both sides, and so the timing
+/// above can be re-derived.
 fn numbig_exact_max_rows() -> u64 {
     std::env::var("FLUREE_NUMBIG_EXACT_MAX_ROWS")
         .ok()
@@ -1239,9 +1256,8 @@ const NUMBIG_EXACT_MAX_ROWS_DEFAULT: u64 = 25_000_000;
 /// The per-predicate distinct-object count is unaffected and stays on its fast
 /// path: its 14-byte POST lead starts with `p_id`, which scopes the handle
 /// correctly. So is the distinct-subject count, whose SPOT lead is `s_id`.
-/// Whole-graph distinct objects, counting the NumBig slice exactly rather than
-/// declining the whole query because of it.
 ///
+/// Rather than decline the whole query over that slice, it is counted exactly.
 /// Three outcomes, in the order they are cheapest to establish:
 ///
 /// * no NumBig rows — the metadata walk already answered, unchanged;
@@ -1287,11 +1303,20 @@ pub(crate) fn count_distinct_objects(
 ///   legacy arena two handles can decode to the same value, so dedup happens on
 ///   the decoded value rather than on `(p_id, handle)`.
 ///
-/// Values are keyed exactly as the general pipeline keys them
-/// ([`crate::group_aggregate::flake_value_to_key`], normalized decimal lexical
-/// plus datatype) so the two lanes cannot disagree. Every NumBig row enters the
-/// pipeline tagged `xsd:decimal` regardless of whether the arena holds a
-/// BigDecimal or an overflow BigInt, and this mirrors that.
+/// Values are keyed with [`crate::group_aggregate::flake_value_to_key`], the
+/// general pipeline's own key function, so the two lanes partition a value set
+/// the same way.
+///
+/// The datatype passed to it is a constant `xsd:decimal` for the whole slice,
+/// which is *not* what the general pipeline resolves per row — there,
+/// `resolve_datatype_sid_for_value` falls through to
+/// `FlakeValue::overflow_numeric_datatype_sid` and tags an overflow BigInt
+/// `xsd:integer` and a BigDecimal `xsd:decimal`. The constant is still sound,
+/// for a reason worth stating exactly: `flake_value_to_key` already gives
+/// `Decimal` and `BigInt` distinct discriminants, and in the general lane the
+/// datatype is a function of that same variant, so it separates nothing the
+/// discriminant has not separated. Both choices yield the same partition, and
+/// only its size is read here.
 fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
     use fluree_db_binary_index::format::column_block::ColumnId;
     use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
@@ -1313,8 +1338,14 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
             s
         },
     };
-    // Every NumBig row is tagged xsd:decimal on the way into the pipeline, so
-    // the key's datatype is fixed for the whole slice.
+    // `dtc` is constant for the whole slice. It does not have to match what the
+    // general pipeline resolves per row (`resolve_datatype_sid_for_value` gives
+    // an overflow BigInt `xsd:integer` and a BigDecimal `xsd:decimal`) because
+    // it cannot separate anything the key does not already separate:
+    // `flake_value_to_key` assigns `Decimal` and `BigInt` distinct
+    // discriminants, and in the general lane `dtc` is a function of that same
+    // variant. A constant therefore yields an identical partition, and only the
+    // partition's size is read here.
     let dtc = fluree_db_core::DatatypeConstraint::Explicit(
         store
             .dt_sids()
@@ -1323,7 +1354,13 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
             .unwrap_or_else(|| fluree_db_core::Sid::new(0, "")),
     );
 
-    let mut distinct: HashSet<crate::group_aggregate::MaterializedLitKey> = HashSet::new();
+    // Pass 1: collect the distinct `(p_id, o_key)` handles. A handle repeats
+    // once per row that carries the value — one value under one predicate is a
+    // row per subject — so decoding per row would allocate a BigInt/BigDecimal
+    // plus a `String` and an `Arc<str>` for each of them. Deduping the `Copy`
+    // pair first costs one `u64`-ish hash per row and bounds the decodes by the
+    // arena's size rather than the slice's row count.
+    let mut handles: HashSet<(u32, u64)> = HashSet::new();
     for leaf_entry in &branch.leaves[leaf_range] {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
@@ -1336,14 +1373,21 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
                 .load_columns(idx, &projection, RunSortOrder::Opst)
                 .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
             for row in 0..batch.row_count {
-                let p_id = batch.p_id.get_or(row, 0);
-                let o_key = batch.o_key.get(row);
-                let val = store
-                    .decode_value_v3(numbig.as_u16(), o_key, p_id, g_id)
-                    .map_err(|e| QueryError::Internal(format!("numbig decode: {e}")))?;
-                distinct.insert(crate::group_aggregate::flake_value_to_key(&val, &dtc));
+                handles.insert((batch.p_id.get_or(row, 0), batch.o_key.get(row)));
             }
         }
+    }
+
+    // Pass 2: decode the survivors. Two handles in a legacy arena can decode to
+    // the same value, and one value under two predicates is two handles in two
+    // arenas, so the distinct count still has to come from the decoded values —
+    // deduping handles only removes the repeats that cannot possibly differ.
+    let mut distinct: HashSet<crate::group_aggregate::MaterializedLitKey> = HashSet::new();
+    for (p_id, o_key) in handles {
+        let val = store
+            .decode_value_v3(numbig.as_u16(), o_key, p_id, g_id)
+            .map_err(|e| QueryError::Internal(format!("numbig decode: {e}")))?;
+        distinct.insert(crate::group_aggregate::flake_value_to_key(&val, &dtc));
     }
     Ok(distinct.len() as u64)
 }

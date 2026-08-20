@@ -1268,6 +1268,49 @@ mod tests {
         LedgerSnapshot::genesis("test/main")
     }
 
+    /// `fast_count`'s exact NumBig branch keys its whole slice with a constant
+    /// `xsd:decimal`, where the general pipeline resolves `xsd:integer` for an
+    /// overflow BigInt and `xsd:decimal` for a BigDecimal. That is only sound
+    /// because the discriminant already separates the two variants, so the
+    /// datatype cannot merge anything it would otherwise keep apart.
+    ///
+    /// Merging these discriminants would make that branch silently undercount a
+    /// graph holding a BigInt and a BigDecimal with the same lexical form, and
+    /// no fixture over real data would necessarily catch it. Pinned here
+    /// because this is where the invariant lives.
+    #[test]
+    fn big_decimal_and_big_int_key_apart_regardless_of_datatype() {
+        use fluree_db_core::{DatatypeConstraint, Sid};
+        use std::str::FromStr;
+
+        let same_datatype = DatatypeConstraint::Explicit(Sid::xsd_decimal());
+        let dec = FlakeValue::Decimal(Box::new(
+            bigdecimal::BigDecimal::from_str("170141183460469231731687303715884105727").unwrap(),
+        ));
+        let int = FlakeValue::BigInt(Box::new(
+            num_bigint::BigInt::from_str("170141183460469231731687303715884105727").unwrap(),
+        ));
+
+        let dec_key = flake_value_to_key(&dec, &same_datatype);
+        let int_key = flake_value_to_key(&int, &same_datatype);
+        assert_ne!(
+            dec_key, int_key,
+            "a BigDecimal and a BigInt with the same lexical form must not \
+             collapse into one group when the datatype is held constant"
+        );
+
+        // And the datatype genuinely adds nothing here: resolving it per
+        // variant, as the general pipeline does, gives the same partition.
+        let per_variant_dec = flake_value_to_key(&dec, &same_datatype);
+        let per_variant_int =
+            flake_value_to_key(&int, &DatatypeConstraint::Explicit(Sid::xsd_integer()));
+        assert_ne!(per_variant_dec, per_variant_int);
+        assert_eq!(
+            dec_key, per_variant_dec,
+            "the decimal side is unaffected by the datatype choice"
+        );
+    }
+
     /// A path's group key keys on nodes AND per-hop edges, matching
     /// PartialEq/Hash — so GROUP BY does not merge two paths that DISTINCT keeps
     /// apart (same node sequence reached via different parallel edges). With no
