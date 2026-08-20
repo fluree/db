@@ -2792,13 +2792,17 @@ pub(crate) fn build_scan_or_join(
             // to amortize it; rows that do not fully ground the pattern keep
             // exact join semantics via a per-row fallback.
             if bounds.is_none() && inline_ops.is_empty() {
-                if let Some(key_vars) = membership_join_key_vars(
-                    &left_schema,
-                    tp,
-                    planning,
-                    hash_planner,
-                    left.estimated_rows(),
-                ) {
+                // The operator's own estimate when it has one (VALUES, subquery
+                // producers); else the planner's running chain estimate, which
+                // is what the hash-join gate below is costed against. Scans and
+                // nested loops report `None`, and reading that as "large" built
+                // a whole-predicate hash set for ~20 driving rows (BSBM Q10).
+                let driving_rows = left
+                    .estimated_rows()
+                    .or_else(|| hash_planner.step_est().map(|e| e.round().max(1.0) as usize));
+                if let Some(key_vars) =
+                    membership_join_key_vars(&left_schema, tp, planning, hash_planner, driving_rows)
+                {
                     return Box::new(crate::membership_join::MembershipJoinOperator::new(
                         left,
                         tp.clone(),
@@ -5505,6 +5509,78 @@ mod tests {
             None,
         )
         .is_some());
+    }
+
+    /// BSBM Q10 at 1M: `?offer product <P> . ?offer vendor ?v . ?offer publisher ?v`.
+    /// The scan and the nested loop above it report no row estimate of their own,
+    /// so the gate used to read the driving side as unbounded and drain the whole
+    /// `dc:publisher` extension to answer ~20 offers. The planner's running
+    /// chain estimate (≈20 here) must stand in, keeping the nested loop.
+    fn bsbm_q10_prefix(product_ndv: u64) -> BoxedOperator {
+        let mut stats = StatsView::default();
+        for (name, count, ndv_values) in [
+            ("product", 55_700, product_ndv),
+            ("vendor", 55_700, 29),
+            ("publisher", 83_550, 29),
+        ] {
+            stats.properties.insert(
+                Sid::new(100, name),
+                PropertyStatData {
+                    count,
+                    ndv_values,
+                    ndv_subjects: count,
+                },
+            );
+        }
+        let (offer, vendor) = (VarId(0), VarId(1));
+        let product = TriplePattern::new(
+            Ref::Var(offer),
+            Ref::Sid(Sid::new(100, "product")),
+            Term::Sid(Sid::new(101, "Product749")),
+        );
+        let vendor_tp = make_pattern(offer, "vendor", vendor);
+        let publisher_tp = make_pattern(offer, "publisher", vendor);
+
+        let bounds = HashMap::new();
+        let planning = PlanningContext::current();
+        let mut planner = HashJoinPlanner::new(Some(&stats)).with_left_estimate(None);
+        let mut bound: HashSet<VarId> = HashSet::new();
+        let mut op: Option<BoxedOperator> = None;
+        for tp in [&product, &vendor_tp, &publisher_tp] {
+            planner.before_step(tp, &bound);
+            let next = build_scan_or_join(
+                op.take(),
+                tp,
+                &bounds,
+                Vec::new(),
+                None,
+                EmitMask::ALL,
+                &[],
+                &planning,
+                &planner,
+            );
+            bound.extend(next.schema().iter().copied());
+            op = Some(next);
+        }
+        op.unwrap()
+    }
+
+    #[test]
+    fn membership_lane_reads_planner_estimate_when_operator_has_none() {
+        // 55_700 offers / 2_785 products = 20 driving rows: below the floor.
+        let op = bsbm_q10_prefix(2_785);
+        assert_eq!(
+            op.describe().op,
+            "NestedLoopJoinOperator",
+            "~20 driving rows must not drain the publisher extension"
+        );
+    }
+
+    #[test]
+    fn membership_lane_still_fires_on_large_planner_estimate() {
+        // 55_700 / 10 = 5_570 driving rows: well above the floor.
+        let op = bsbm_q10_prefix(10);
+        assert_eq!(op.describe().op, "MembershipJoinOperator");
     }
 
     /// The build ceiling still applies independently of the driving side.
