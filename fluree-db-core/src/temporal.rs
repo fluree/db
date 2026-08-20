@@ -2263,6 +2263,264 @@ fn compose_components(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Which calendar fields a temporal datatype actually carries
+// ---------------------------------------------------------------------------
+
+/// A calendar field of a temporal value, as the SPARQL accessor functions
+/// (`YEAR`, `MONTH`, `DAY`, `HOURS`, `MINUTES`, `SECONDS`) name them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CalendarField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+impl CalendarField {
+    /// Filler for a field absent from a value being promoted to a whole
+    /// instant. Year takes the Unix epoch's 1970 and the calendar fields their
+    /// first valid value, matching the XSD timeline mapping the promotion has
+    /// always used.
+    ///
+    /// For whole-value uses only — comparison, ordering, `TZ`/`TIMEZONE`.
+    /// Reading a field OFF a promoted instant must consult
+    /// [`TemporalKind::carries`] first and yield unbound rather than reporting
+    /// one of these as if it came from the data.
+    pub const fn promotion_default(self) -> i64 {
+        match self {
+            Self::Year => 1970,
+            Self::Month | Self::Day => 1,
+            Self::Hour | Self::Minute | Self::Second => 0,
+        }
+    }
+}
+
+/// An XSD temporal datatype, identified from any of the engine's three value
+/// representations: a [`FlakeValue`](crate::value::FlakeValue), an index
+/// [`OType`](crate::o_type::OType), or an encoded
+/// [`ObjKind`](crate::value_id::ObjKind).
+///
+/// Exists for [`Self::carries`] — the single answer to "does this value have
+/// that field at all", which three separate fast/slow paths in
+/// `fluree-db-query` previously each answered with their own hand-rolled
+/// defaults table.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TemporalKind {
+    DateTime,
+    Date,
+    Time,
+    GYear,
+    GYearMonth,
+    GMonth,
+    GDay,
+    GMonthDay,
+}
+
+impl TemporalKind {
+    /// Whether a value of this datatype carries `field` in its lexical form.
+    ///
+    /// `xsd:gYear` has a year and nothing else; `xsd:gMonth` has a month and
+    /// nothing else. Asking for a field the value does not carry —
+    /// `DAY("2005"^^xsd:gYear)`, `YEAR("--03"^^xsd:gMonth)` — has no answer in
+    /// the data, and the caller must yield unbound rather than report the
+    /// promotion's filler (day 1, month 1, or the epoch's year 1970) as though
+    /// it came from the value. That filler is invisible in an answer: on a
+    /// predicate mixing `xsd:date` with `xsd:gYear`, ordinary in bibliographic
+    /// data, it dragged `AVG(DAY(?o))` toward 1 and made `FILTER(DAY(?o) < 15)`
+    /// select precisely the rows with no day at all.
+    ///
+    /// `xsd:date` is treated as carrying the time-of-day fields, at the
+    /// midnight the XSD timeline maps it to. That one is a documented
+    /// convention rather than invented data — a date does begin at midnight,
+    /// and `YEAR`/`MONTH`/`DAY` of a date, the overwhelmingly common uses, are
+    /// genuine either way — so it stays.
+    pub const fn carries(self, field: CalendarField) -> bool {
+        use CalendarField::{Day, Hour, Minute, Month, Second, Year};
+        match self {
+            Self::DateTime | Self::Date => true,
+            Self::Time => matches!(field, Hour | Minute | Second),
+            Self::GYear => matches!(field, Year),
+            Self::GYearMonth => matches!(field, Year | Month),
+            Self::GMonth => matches!(field, Month),
+            Self::GDay => matches!(field, Day),
+            Self::GMonthDay => matches!(field, Month | Day),
+        }
+    }
+
+    /// Identify the datatype of a [`FlakeValue`](crate::value::FlakeValue).
+    ///
+    /// `FlakeValue::Long` carries no datatype of its own; a caller holding one
+    /// under an `xsd:gYear` binding (the numeric gYear encoding) passes
+    /// [`Self::GYear`] itself after checking that datatype.
+    pub fn from_flake_value(val: &crate::value::FlakeValue) -> Option<Self> {
+        use crate::value::FlakeValue;
+        Some(match val {
+            FlakeValue::DateTime(_) => Self::DateTime,
+            FlakeValue::Date(_) => Self::Date,
+            FlakeValue::Time(_) => Self::Time,
+            FlakeValue::GYear(_) => Self::GYear,
+            FlakeValue::GYearMonth(_) => Self::GYearMonth,
+            FlakeValue::GMonth(_) => Self::GMonth,
+            FlakeValue::GDay(_) => Self::GDay,
+            FlakeValue::GMonthDay(_) => Self::GMonthDay,
+            _ => return None,
+        })
+    }
+
+    /// Identify the datatype of an index [`OType`](crate::o_type::OType).
+    pub fn from_o_type(o_type: crate::o_type::OType) -> Option<Self> {
+        use crate::o_type::OType;
+        Some(match o_type {
+            OType::XSD_DATE_TIME => Self::DateTime,
+            OType::XSD_DATE => Self::Date,
+            OType::XSD_TIME => Self::Time,
+            OType::XSD_G_YEAR => Self::GYear,
+            OType::XSD_G_YEAR_MONTH => Self::GYearMonth,
+            OType::XSD_G_MONTH => Self::GMonth,
+            OType::XSD_G_DAY => Self::GDay,
+            OType::XSD_G_MONTH_DAY => Self::GMonthDay,
+            _ => return None,
+        })
+    }
+
+    /// Identify the datatype of an encoded literal's
+    /// [`ObjKind`](crate::value_id::ObjKind).
+    pub fn from_obj_kind(kind: crate::value_id::ObjKind) -> Option<Self> {
+        use crate::value_id::ObjKind;
+        Some(match kind {
+            ObjKind::DATE_TIME => Self::DateTime,
+            ObjKind::DATE => Self::Date,
+            ObjKind::TIME => Self::Time,
+            ObjKind::G_YEAR => Self::GYear,
+            ObjKind::G_YEAR_MONTH => Self::GYearMonth,
+            ObjKind::G_MONTH => Self::GMonth,
+            ObjKind::G_DAY => Self::GDay,
+            ObjKind::G_MONTH_DAY => Self::GMonthDay,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod calendar_field_tests {
+    use super::CalendarField::{Day, Hour, Minute, Month, Second, Year};
+    use super::*;
+    use crate::o_type::OType;
+    use crate::value_id::ObjKind;
+
+    /// The fields each datatype genuinely carries, spelled out independently of
+    /// `carries`'s own match arms so a typo there cannot pass by agreeing with
+    /// itself.
+    const CARRIED: &[(TemporalKind, &[CalendarField])] = &[
+        (
+            TemporalKind::DateTime,
+            &[Year, Month, Day, Hour, Minute, Second],
+        ),
+        // xsd:date carries the time fields by the midnight convention.
+        (
+            TemporalKind::Date,
+            &[Year, Month, Day, Hour, Minute, Second],
+        ),
+        (TemporalKind::Time, &[Hour, Minute, Second]),
+        (TemporalKind::GYear, &[Year]),
+        (TemporalKind::GYearMonth, &[Year, Month]),
+        (TemporalKind::GMonth, &[Month]),
+        (TemporalKind::GDay, &[Day]),
+        (TemporalKind::GMonthDay, &[Month, Day]),
+    ];
+
+    #[test]
+    fn carries_matches_the_declared_table() {
+        const ALL: &[CalendarField] = &[Year, Month, Day, Hour, Minute, Second];
+        for (kind, carried) in CARRIED {
+            for field in ALL {
+                assert_eq!(
+                    kind.carries(*field),
+                    carried.contains(field),
+                    "{kind:?}.carries({field:?})"
+                );
+            }
+        }
+    }
+
+    /// The fabrications this table exists to stop: a year-only value has no
+    /// month or day, and a month/day-only value has no year to report.
+    #[test]
+    fn absent_fields_are_not_carried() {
+        assert!(!TemporalKind::GYear.carries(Month));
+        assert!(!TemporalKind::GYear.carries(Day));
+        assert!(!TemporalKind::GYearMonth.carries(Day));
+        assert!(!TemporalKind::GMonth.carries(Year));
+        assert!(!TemporalKind::GDay.carries(Year));
+        assert!(!TemporalKind::GMonthDay.carries(Year));
+        assert!(!TemporalKind::Time.carries(Year));
+    }
+
+    /// The two index representations must classify the same datatype the same
+    /// way, or the fast and generic lanes disagree about what is carried.
+    #[test]
+    fn o_type_and_obj_kind_classify_alike() {
+        for (o_type, obj_kind) in [
+            (OType::XSD_DATE_TIME, ObjKind::DATE_TIME),
+            (OType::XSD_DATE, ObjKind::DATE),
+            (OType::XSD_TIME, ObjKind::TIME),
+            (OType::XSD_G_YEAR, ObjKind::G_YEAR),
+            (OType::XSD_G_YEAR_MONTH, ObjKind::G_YEAR_MONTH),
+            (OType::XSD_G_MONTH, ObjKind::G_MONTH),
+            (OType::XSD_G_DAY, ObjKind::G_DAY),
+            (OType::XSD_G_MONTH_DAY, ObjKind::G_MONTH_DAY),
+        ] {
+            let from_o_type = TemporalKind::from_o_type(o_type);
+            assert!(from_o_type.is_some(), "{o_type:?} unclassified");
+            assert_eq!(
+                from_o_type,
+                TemporalKind::from_obj_kind(obj_kind),
+                "{o_type:?} vs {obj_kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_temporal_types_are_unclassified() {
+        assert_eq!(TemporalKind::from_o_type(OType::XSD_STRING), None);
+        assert_eq!(TemporalKind::from_obj_kind(ObjKind::NUM_BIG), None);
+    }
+
+    #[test]
+    fn flake_values_classify_by_variant() {
+        let gy = GYear::parse("2005").expect("parse gYear");
+        assert_eq!(
+            TemporalKind::from_flake_value(&crate::value::FlakeValue::GYear(Box::new(gy))),
+            Some(TemporalKind::GYear)
+        );
+        assert_eq!(
+            TemporalKind::from_flake_value(&crate::value::FlakeValue::String("x".into())),
+            None
+        );
+        // A bare Long is the numeric gYear encoding; its datatype, not its
+        // value, settles the kind, so this helper declines it.
+        assert_eq!(
+            TemporalKind::from_flake_value(&crate::value::FlakeValue::Long(2005)),
+            None
+        );
+    }
+
+    /// The promotion filler, which is exactly what `carries` keeps out of an
+    /// answer. 1970 is the epoch's year and has no relation to any value.
+    #[test]
+    fn promotion_defaults_are_the_epoch_origin() {
+        assert_eq!(Year.promotion_default(), 1970);
+        assert_eq!(Month.promotion_default(), 1);
+        assert_eq!(Day.promotion_default(), 1);
+        assert_eq!(Hour.promotion_default(), 0);
+        assert_eq!(Minute.promotion_default(), 0);
+        assert_eq!(Second.promotion_default(), 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
