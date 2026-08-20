@@ -2045,6 +2045,20 @@ mem:fact-01kwsmdy5pms38yy81d0bdxprb a mem:Fact ;
     mem:branch "feature/merge-preview-changes" ;
     mem:createdAt "2026-07-05T17:15:17.046896+00:00"^^xsd:dateTime .
 
+mem:fact-01m0cs8ax1gv4kedajb8ff9yj2 a mem:Fact ;
+    mem:content "NameServiceLookup has three read depths, all backend-agnostic: get_ref(id, RefKind) → RefValue (one head; Dynamo = 1 GetItem, file = main JSON only), heads(id) → LedgerHeads{commit,index} (Dynamo = 1 projected Query over sk BETWEEN head AND index; file/S3 = main+index file via ns_format::merge_heads; Raft/Memory = 1 lock), lookup(id) → full NsRecord (4 Dynamo items + config/context parsing). Use the shallowest that answers the question. `None` from get_ref/heads = unknown, and on Raft also retracted (tombstone); only lookup surfaces retracted:true. LedgerHeads converts into NsRecordSnapshot for rollback capture." ;
+    mem:tag "api" ;
+    mem:tag "dynamodb" ;
+    mem:tag "nameservice" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-nameservice/src/lib.rs" ;
+    mem:artifactRef "fluree-db-nameservice/src/ns_format.rs" ;
+    mem:artifactRef "fluree-db-storage-aws/src/dynamodb/mod.rs" ;
+    mem:branch "feature/nameservice-heads-read" ;
+    mem:createdAt "2026-08-19T10:32:16.033424+00:00"^^xsd:dateTime ;
+    mem:rationale "External callers (Lambda query backend etc.) asked for the cheapest head read; the answer is the existing trait, not a new type or HTTP endpoint." .
+
 mem:decision-01kx0v325fhgme9a3yfn7cjqtq a mem:Decision ;
     mem:content "Policy condition unification (user-decided 2026-07): state graph IRIs are f:preState/f:postState (NOT f:pre/f:post); every f:query condition is an ASK contract regardless of language — JSON-LD gains the existing `{\"ask\": ...}` query form as preferred spelling (parse/mod.rs already parses ask; policy parser must accept it), SPARQL ASK/SELECT as-is, Cypher reserved via f:cypher datatype (read-only MATCH, ≥1 row = allow, $this/$identity/$value as native Cypher parameters). Per-policy f:queryState selector = whole-condition state switch for graph-less languages; SPARQL GRAPH f:postState for in-query mixing. Design doc: docs/design/policy-condition-languages.md." ;
     mem:tag "ask" ;
@@ -2956,6 +2970,83 @@ mem:fact-01kzdveh3fna6wddbkmkeabmxn a mem:Fact ;
     mem:artifactRef "fluree-db-iceberg/src/scan/send_planner.rs" ;
     mem:branch "main" ;
     mem:createdAt "2026-08-07T10:14:08.751291+00:00"^^xsd:dateTime .
+
+mem:fact-01m0brdwgvvsnqtd63q7nt2qx9 a mem:Fact ;
+    mem:content "#1652 case 1 FIXED: GroupByObjectStarTopKOperator now carries bag multiplicity — the merge-join lane consumes whole filter-subject runs into (s, count) groups, the multi-pred lane folds filter predicates into a subject→product-of-counts FxHashMap, and AggStateStar::observe takes a mult param (COUNT += mult; MIN/MAX/SAMPLE stay duplicate-insensitive). The operator also stamps fast-path outcomes at site \"group_by_object_star_topk\" (proceed/gate_declined). Pinned by it_fastpath_1652_regression.rs (must-fire + hand-pinned values) and a group_by_object_star_topk case in the differential harness." ;
+    mem:tag "bag-semantics" ;
+    mem:tag "correctness" ;
+    mem:tag "count" ;
+    mem:tag "fast-path" ;
+    mem:tag "group-by" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_differential_fastpath.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_fastpath_1652_regression.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_group_count_firsts.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-19T00:58:34.907610+00:00"^^xsd:dateTime ;
+    mem:updatedAt "2026-08-19T02:42:34.108217+00:00"^^xsd:dateTime ;
+    mem:rationale "Original bug: filter triples treated as existence semi-join (subject dedup/set intersection), losing the star join's multiplicity — fast 2 vs generic 5 on 20 triples. Any change to this operator must keep bag multiplicity of every non-group star triple." .
+
+mem:fact-01m0bre5qrbr1kfpxvq97hhy7p a mem:Fact ;
+    mem:content "#1652 case 2 FIXED: PostObjectGroupCountIter now carries an object group across POST leaflet/batch boundaries (cur_key/cur_count, mirroring PsotSubjectCountIter) so each o_key is emitted once with its full count — execute_chain's forward-only PSOT seek no longer drops the second fragment. Homogeneous non-IRI leaflets are now SKIPPED instead of terminating the stream (the old early-None cut off every IRI group sorting after them; POST o_type order is inline(<0x8000) < STRING 0x8000 < IRI 0x8007 < NUM_BIG 0x800B < langstring 0xC000+). Overlay chain lane (psot_weighted_*) always carried correctly. Pinned at leaflet_rows=3 in it_fastpath_1652_regression.rs." ;
+    mem:tag "chain-fold" ;
+    mem:tag "correctness" ;
+    mem:tag "count" ;
+    mem:tag "fast-path" ;
+    mem:tag "leaflet-boundary" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_fastpath_1652_regression.rs" ;
+    mem:artifactRef "fluree-db-query/src/count_plan_exec.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_path_common.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-19T00:58:44.344326+00:00"^^xsd:dateTime ;
+    mem:updatedAt "2026-08-19T02:42:45.324959+00:00"^^xsd:dateTime ;
+    mem:rationale "Any streaming group iterator over leaflet batches must carry the open group across refills — PsotSubjectCountIter/CursorSubjectCountStream are the reference pattern. Repro trick: reindex with IndexerConfig::with_leaflet_rows(3) forces boundary-straddling groups at tiny scale." .
+
+mem:fact-01m0dazrcw355c6c1dkpdsgr8z a mem:Fact ;
+    mem:content "#1652 follow-up: detect_group_by_object_star_topk (execute/operator_tree.rs) now requires filter object vars to be PAIRWISE DISTINCT. The operator folds filters as a product of per-subject counts, which is the join multiplicity only when they range independently — two filter triples sharing an object var join on it, so the true multiplicity is their per-subject value INTERSECTION. Shared var returned inflated counts plus phantom groups (subjects whose filter values are disjoint drop out generically). Distinct vars over the SAME predicate stay eligible: that product is correct. Probed both ways in it_fastpath_1652_regression.rs (must-not-fire + must-fire)." ;
+    mem:tag "correctness" ;
+    mem:tag "count" ;
+    mem:tag "fast-path" ;
+    mem:tag "group-by" ;
+    mem:tag "star-topk" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_fastpath_1652_regression.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-19T15:12:04.000000+00:00"^^xsd:dateTime ;
+    mem:rationale "The detector destructured (sv, pred, ov) but pushed only pred into filter_preds, discarding ov — so nothing ever compared filter object vars to each other. The pre-existing existence semantics mis-answered this shape too; the product fold made it a certified-lane divergence, which is why the fix is a decline, not a new counting rule." .
+
+mem:fact-01m0fxp7rvjkyvvkvka3dd24zh a mem:Fact ;
+    mem:content "Fast-path routing is observable for ANY operator built on FastPathOperator: its open() stamps `fast-path outcome` with the operator label as the `site` (fast_path_common.rs), so grepping a file for stamp_fast_path UNDERSTATES coverage — fast_predicate_scalar_agg has zero direct calls yet its lanes stamp as `SUM(DAY)`, `SUM(YEAR)`, `AVG numeric`, `COUNT(DISTINCT)`. Assert routing in tests via span_capture find_events(`fast-path outcome`) filtered on outcome=proceed. This matters because a silently disabled fast lane produces the SAME answer via its fallback: value assertions cannot see it, only the stamp can." ;
+    mem:tag "fast-path" ;
+    mem:tag "instrumentation" ;
+    mem:tag "routing-stamp" ;
+    mem:tag "testing" ;
+    mem:tag "tracing" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_datetime_component_presence.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_path_common.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_path_outcome.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-20T10:14:02.000000+00:00"^^xsd:dateTime ;
+    mem:rationale "A #1667 review item asked to add a stamp to the fused scalar-agg operator on the basis that it had none; the stamp already existed one layer up, so the fix was a test-side assertion and no production change. Check the FastPathOperator layer before concluding a lane is unstamped." .
+
+mem:fact-01m0bredy3qtxvftbwass43qkc a mem:Fact ;
+    mem:content "#1652 case 3 FIXED: count_composite_join_pairs now gates via predicate_unsafe_for_cross_predicate_o_key_join (fast_path_common) — declines when either predicate's POST leaflets hold NUM_BIG_OVERFLOW objects (per-predicate arena handles, not value identity) OR list rows (HAS_O_I flag; list elems never match plain refs, aligned duplicate lists pair per-row — not expressible in an (s,o_type,o_key) key). Metadata-first: o_type_const point check, key-range bound for mixed leaflets, exact o_type-column decode ONLY when the range straddles 0x800B. Overlay lane: CursorSoIter declines row-level on live o_i (novelty lists). Pinned in it_fastpath_1652_regression.rs incl. must-fire on clean data." ;
+    mem:tag "composite-join" ;
+    mem:tag "correctness" ;
+    mem:tag "count" ;
+    mem:tag "fast-path" ;
+    mem:tag "numbig" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_fastpath_1652_regression.rs" ;
+    mem:artifactRef "fluree-db-query/src/count_plan_exec.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_path_common.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-19T00:58:52.739403+00:00"^^xsd:dateTime ;
+    mem:updatedAt "2026-08-19T02:42:56.706679+00:00"^^xsd:dateTime ;
+    mem:rationale "Two traps for any cross-predicate o_key comparison: NumBig handles are per-predicate, and o_i list rows join by rules the composite key can't express. The exact-membership decode matters — a plain int+string+langstring mixed leaflet straddles NUM_BIG's o_type range without containing one, and a range-only gate silently loses the fast path." .
 
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;

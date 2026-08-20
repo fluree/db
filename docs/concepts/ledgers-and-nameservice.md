@@ -151,6 +151,21 @@ let record = nameservice.lookup("mydb:main").await?;
 // Returns: NsRecord with commit_id, index_id, timestamps, etc.
 ```
 
+Three read depths exist on every backend, all on `NameServiceLookup`. Pick the
+shallowest that answers the question — the deeper reads cost extra items on
+DynamoDB and extra files plus config/context parsing on file and S3:
+
+| Call | Returns | Use when |
+|------|---------|----------|
+| `get_ref(id, RefKind::CommitHead)` | `RefValue { id, t }` | "has this ledger moved?" — one head |
+| `heads(id)` | `LedgerHeads { commit, index }` | both heads; converts to `NsRecordSnapshot` for rollback |
+| `lookup(id)` | full `NsRecord` | branch metadata, config, retraction flag |
+
+`heads` is one round trip on DynamoDB (a projected query over the two ref
+items), the main + index file on file/S3, and a single lock on the in-memory
+and Raft backends. `None` means unknown (and, on Raft, retracted) — the same
+rule as `get_ref`; only `lookup` surfaces `retracted: true`.
+
 #### Publishing
 
 Record new commits and indexes:

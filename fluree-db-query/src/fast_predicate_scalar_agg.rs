@@ -30,6 +30,7 @@ use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::{BinaryIndexStore, ColumnProjection, ColumnSet};
 use fluree_db_core::o_type::{DecodeKind, OType};
+use fluree_db_core::temporal::{CalendarField, TemporalKind};
 use fluree_db_core::value_id::ObjKey;
 use fluree_db_core::{FlakeValue, GraphId, Sid};
 use std::sync::Arc;
@@ -66,7 +67,8 @@ impl SumExprI64 {
     fn constant_for_otype(self, o_type: u16) -> Option<i64> {
         match self {
             Self::Identity | Self::AddSelf => None,
-            Self::DateComponent(component) => constant_component_for_otype(o_type, component),
+            Self::DateComponent(component) => constant_component_for_otype(o_type, component)
+                .and_then(ComponentFold::sum_contribution),
             Self::NumericUnary(_) => None,
         }
     }
@@ -91,7 +93,9 @@ impl SumExprI64 {
                 // consistent with the overall overflow strategy.
                 Some(ObjKey::from_u64(o_key).decode_i64().saturating_mul(2))
             }
-            Self::DateComponent(component) => component_from_otype_okey(o_type, o_key, component),
+            Self::DateComponent(component) => {
+                component_from_otype_okey(o_type, o_key, component).sum_contribution()
+            }
             Self::NumericUnary(func) => {
                 let ot = OType::from_u16(o_type);
                 if ot.decode_kind() != DecodeKind::I64 {
@@ -554,69 +558,107 @@ pub(crate) fn scan_predicate_scalar_agg_overlay(
 // Decode helpers
 // ---------------------------------------------------------------------------
 
-fn constant_component_for_otype(o_type: u16, component: DateComponentFn) -> Option<i64> {
-    let ot = OType::from_u16(o_type);
-    match component {
-        DateComponentFn::Year => None,
-        DateComponentFn::Month => {
-            if ot == OType::XSD_G_YEAR || ot == OType::XSD_G_DAY {
-                Some(1)
-            } else {
-                None
-            }
-        }
-        DateComponentFn::Day => {
-            if ot == OType::XSD_G_YEAR || ot == OType::XSD_G_YEAR_MONTH || ot == OType::XSD_G_MONTH
-            {
-                Some(1)
-            } else {
-                None
-            }
+/// What one row contributes to a fused date-component fold.
+///
+/// `Absent` is the case that matters: the value's datatype does not carry the
+/// field (`DAY` of an `xsd:gYear`), so the per-row expression is unbound. SUM
+/// skips unbound, hence [`Self::sum_contribution`] scores it 0 — but any future
+/// non-SUM consumer (an AVG that must not count the row, a COUNT that must not
+/// either) has to make that decision for itself rather than inherit a silent 0.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ComponentFold {
+    Value(i64),
+    Absent,
+    /// The datatype is not one this fold can read at all — decline the fast path.
+    Unsupported,
+}
+
+impl ComponentFold {
+    /// Contribution to a SUM, or `None` to decline the fast path.
+    fn sum_contribution(self) -> Option<i64> {
+        match self {
+            Self::Value(v) => Some(v),
+            Self::Absent => Some(0),
+            Self::Unsupported => None,
         }
     }
 }
 
-fn component_from_otype_okey(o_type: u16, o_key: u64, component: DateComponentFn) -> Option<i64> {
+impl DateComponentFn {
+    fn field(self) -> CalendarField {
+        match self {
+            Self::Year => CalendarField::Year,
+            Self::Month => CalendarField::Month,
+            Self::Day => CalendarField::Day,
+        }
+    }
+}
+
+/// The fold for a whole leaflet, when its homogeneous `o_type` settles the
+/// field without reading a single column.
+///
+/// A field the datatype does not carry is `Absent` for every row — the whole
+/// leaflet folds to nothing, with no IO. (Before #1652's sibling fix this
+/// returned the promotion's `1` here, which is precisely how a year-only
+/// leaflet came to contribute a day per row.)
+fn constant_component_for_otype(o_type: u16, component: DateComponentFn) -> Option<ComponentFold> {
+    let kind = TemporalKind::from_o_type(OType::from_u16(o_type))?;
+    if !kind.carries(component.field()) {
+        return Some(ComponentFold::Absent);
+    }
+    // Carried fields are constant only where the datatype pins them: a gMonth's
+    // month varies per row, but a gYear has no month to vary.
+    None
+}
+
+fn component_from_otype_okey(o_type: u16, o_key: u64, component: DateComponentFn) -> ComponentFold {
     let ot = OType::from_u16(o_type);
+    let Some(kind) = TemporalKind::from_o_type(ot) else {
+        return ComponentFold::Unsupported;
+    };
+    if !kind.carries(component.field()) {
+        return ComponentFold::Absent;
+    }
     let key = ObjKey::from_u64(o_key);
 
-    // Defaulting semantics match helpers.rs promotion:
-    // - gYear → Jan 1, 00:00:00
-    // - gYearMonth → day=1
-    // - gMonth/gDay/gMonthDay → year=1970, missing parts default to 1
-    const DEFAULT_YEAR: i64 = 1970;
-    const DEFAULT_MONTH: i64 = 1;
-
-    let (year, month, day) = if ot == OType::XSD_G_YEAR {
-        (key.decode_g_year() as i64, 1, 1)
+    let parts = if ot == OType::XSD_G_YEAR {
+        Some((key.decode_g_year() as i64, 0, 0))
     } else if ot == OType::XSD_G_YEAR_MONTH {
         let (y, m) = key.decode_g_year_month();
-        (y as i64, m as i64, 1)
+        Some((y as i64, m as i64, 0))
     } else if ot == OType::XSD_G_MONTH {
-        (DEFAULT_YEAR, key.decode_g_month() as i64, 1)
+        Some((0, key.decode_g_month() as i64, 0))
     } else if ot == OType::XSD_G_DAY {
-        (DEFAULT_YEAR, DEFAULT_MONTH, key.decode_g_day() as i64)
+        Some((0, 0, key.decode_g_day() as i64))
     } else if ot == OType::XSD_G_MONTH_DAY {
         let (m, d) = key.decode_g_month_day();
-        (DEFAULT_YEAR, m as i64, d as i64)
+        Some((0, m as i64, d as i64))
     } else if ot == OType::XSD_DATE {
         // xsd:date: days since Unix epoch (1970-01-01)
-        let days = key.decode_date() as i64;
-        let base = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
-        let dt = base.checked_add_signed(chrono::Duration::days(days))?;
-        (dt.year() as i64, dt.month() as i64, dt.day() as i64)
+        chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .and_then(|base| {
+                base.checked_add_signed(chrono::Duration::days(key.decode_date() as i64))
+            })
+            .map(|dt| (dt.year() as i64, dt.month() as i64, dt.day() as i64))
     } else if ot == OType::XSD_DATE_TIME {
-        // xsd:dateTime: epoch micros; interpret in UTC for component extraction.
-        let micros = key.decode_datetime();
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)?;
-        (dt.year() as i64, dt.month() as i64, dt.day() as i64)
+        // xsd:dateTime: epoch micros. Offsets are normalized to UTC at ingest,
+        // so reading the components in UTC matches the generic pipeline.
+        chrono::DateTime::<chrono::Utc>::from_timestamp_micros(key.decode_datetime())
+            .map(|dt| (dt.year() as i64, dt.month() as i64, dt.day() as i64))
     } else {
-        return None;
+        // xsd:time carries no date fields, and `carries` already returned above
+        // for those; anything else this fold cannot read.
+        None
     };
 
-    match component {
-        DateComponentFn::Year => Some(year),
-        DateComponentFn::Month => Some(month),
-        DateComponentFn::Day => Some(day),
+    // Only carried fields are read, so the zero placeholders above are never
+    // the value selected here.
+    match parts {
+        Some((year, month, day)) => ComponentFold::Value(match component {
+            DateComponentFn::Year => year,
+            DateComponentFn::Month => month,
+            DateComponentFn::Day => day,
+        }),
+        None => ComponentFold::Unsupported,
     }
 }
