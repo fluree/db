@@ -1919,6 +1919,23 @@ impl FlureeBuilder {
         self
     }
 
+    /// Set how often the background indexer re-sweeps for stalled ledgers.
+    ///
+    /// `Duration::ZERO` disables the re-sweep. The sweep the worker performs at
+    /// start-up always runs — see [`fluree_db_indexer::IndexerConfig::catchup_interval`].
+    ///
+    /// No-op unless background indexing is enabled, since it configures the
+    /// worker; call it after `with_indexing*`.
+    pub fn with_indexer_catchup_interval(mut self, interval: std::time::Duration) -> Self {
+        if let Some(cfg) = self.indexing_config.take() {
+            self.indexing_config = Some(IndexingBuilderConfig {
+                indexer_config: cfg.indexer_config.with_catchup_interval(interval),
+                index_config: cfg.index_config,
+            });
+        }
+        self
+    }
+
     /// Set novelty backpressure thresholds without enabling background indexing.
     ///
     /// Use this for short-lived processes (CLI, one-shot scripts) that need

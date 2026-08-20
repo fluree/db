@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use fluree_db_binary_index::LeafletCache;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Resolves the ledger's effective configured full-text property list at
 /// index-build time.
@@ -181,6 +182,27 @@ pub struct IndexerConfig {
     /// queries might still be using.
     /// Default: 30 minutes
     pub gc_min_time_mins: u32,
+
+    /// How often the worker re-sweeps for ledgers whose indexing has stalled.
+    ///
+    /// A ledger is swept only if it is behind (`commit_t > index_t`) **and** its
+    /// `commit_t` has not moved since the previous sweep. A ledger that is still
+    /// committing is already served by the post-commit trigger; one that is
+    /// stuck is frozen by definition. Without the second condition a periodic
+    /// sweep would force an extra index build per behind ledger per interval,
+    /// because `catch_up_sweep`'s predicate alone matches most ledgers on a
+    /// busy deployment.
+    ///
+    /// The sweep costs one `all_records()` listing per tick, which is O(ledgers)
+    /// rather than O(1): a directory walk for file storage, a LIST plus a read
+    /// per branch for object stores.
+    ///
+    /// `Duration::ZERO` disables the periodic re-sweep. It does **not** disable
+    /// the sweep [`BackgroundIndexerWorker::run`] performs at start-up — that
+    /// one is a deadlock fix, not a tuning knob.
+    ///
+    /// Default: 300 s.
+    pub catchup_interval: Duration,
 
     /// Memory budget (bytes) for the run-sort buffer during index building.
     ///
@@ -386,6 +408,15 @@ pub const DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY: usize = 16;
 /// before deferring to full rebuild (issue #1266 ref/class-stat re-attribution).
 pub const DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS: usize = 100_000;
 
+/// Default interval for the worker's stalled-ledger re-sweep.
+///
+/// A safety net, not a scheduler: healthy ledgers are indexed on commit long
+/// before a sweep would notice them, and the stall condition needs two
+/// observations, so detection is up to twice this. Kept well above the 30 s
+/// retry-backoff ceiling so a sweep never races a build that is already
+/// retrying.
+pub const DEFAULT_CATCHUP_INTERVAL_SECS: u64 = 300;
+
 impl Default for IndexerConfig {
     fn default() -> Self {
         Self {
@@ -395,6 +426,7 @@ impl Default for IndexerConfig {
             branch_max_children: 200,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -431,6 +463,7 @@ impl IndexerConfig {
             branch_max_children,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -460,6 +493,7 @@ impl IndexerConfig {
             branch_max_children: 40,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -489,6 +523,7 @@ impl IndexerConfig {
             branch_max_children: 400,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -551,6 +586,15 @@ impl IndexerConfig {
 
     pub fn with_leaflets_per_leaf(mut self, n: usize) -> Self {
         self.leaflets_per_leaf = n.max(1);
+        self
+    }
+
+    /// Builder method to set the stalled-ledger re-sweep interval.
+    ///
+    /// [`Duration::ZERO`] disables the periodic re-sweep; the start-up sweep
+    /// runs regardless. See [`IndexerConfig::catchup_interval`].
+    pub fn with_catchup_interval(mut self, interval: Duration) -> Self {
+        self.catchup_interval = interval;
         self
     }
 

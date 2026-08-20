@@ -506,7 +506,11 @@ async fn build_direct_fluree(
         let max_bytes = config
             .reindex_max_bytes
             .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes);
-        builder = builder.with_indexing_thresholds(config.reindex_min_bytes, max_bytes);
+        builder = builder
+            .with_indexing_thresholds(config.reindex_min_bytes, max_bytes)
+            .with_indexer_catchup_interval(std::time::Duration::from_secs(
+                config.indexer_catchup_interval_secs,
+            ));
     } else {
         // Peer / external-indexer mode: skip spawning a background
         // indexer, but still set novelty thresholds so backpressure

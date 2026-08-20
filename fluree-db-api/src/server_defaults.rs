@@ -26,6 +26,19 @@ pub const DEFAULT_QUERY_REFRESH_TTL_MS: u64 = 1000;
 // ── Indexing ────────────────────────────────────────────────────────
 
 pub const DEFAULT_INDEXING_ENABLED: bool = true;
+
+/// Re-exported from `fluree-db-indexer` so the server can reference it under
+/// DEFAULT features.
+///
+/// `fluree-db-server` takes `fluree-db-indexer` as an OPTIONAL dependency, gated
+/// behind the `raft` feature, which the default feature set does not enable. So
+/// naming `fluree_db_indexer::` directly in `fluree-db-server/src/config.rs`
+/// compiles under `--all-features` and fails the default build with E0433.
+/// `fluree-db-api` depends on the indexer unconditionally, and the server already
+/// sources its other clap defaults from this module, so routing it here keeps one
+/// definition and one import path.
+pub const DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS: u64 =
+    fluree_db_indexer::DEFAULT_CATCHUP_INTERVAL_SECS;
 // 100 bytes — effectively reindex after every commit (any commit's novelty
 // exceeds this), so the persisted index tracks the head with minimal lag.
 pub const DEFAULT_REINDEX_MIN_BYTES: usize = 100;
