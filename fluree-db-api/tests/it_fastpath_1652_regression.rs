@@ -60,6 +60,12 @@ const N_B: usize = 25;
 /// (0–2 string objects) as filter-star predicates. Subjects with `i % 4 == 0`
 /// have a type but NO signatures, pinning that they drop out of the
 /// signature-star group counts entirely.
+///
+/// `refA` / `refB` are the shared-object-variable probe: every subject carries
+/// two of each with exactly one value in common, so a filter pair joined on one
+/// variable has per-subject multiplicity 1 while the product of counts is 4.
+/// Every 17th subject gets disjoint values instead — generically it drops out
+/// of the join, while a product of counts still credits it.
 fn star_turtle() -> String {
     let mut buf = String::from(
         "@prefix ex: <http://example.org/ns/> .\n\
@@ -87,6 +93,13 @@ fn star_turtle() -> String {
         }
         if i % 11 == 0 {
             buf.push_str("; ex:bibtexType ex:Misc ");
+        }
+        if i % 17 == 0 {
+            // Disjoint refA/refB: the generic join drops these subjects
+            // entirely, where a product of counts still contributes.
+            buf.push_str("; ex:refA ex:r-0 ; ex:refB ex:r-2 ");
+        } else {
+            buf.push_str("; ex:refA ex:r-0, ex:r-1 ; ex:refB ex:r-1, ex:r-2 ");
         }
         buf.push_str(" .\n");
     }
@@ -302,6 +315,42 @@ fn cases() -> Vec<Case> {
                 "[\"ex:Book\",15,\"ex:pub-0001\",\"ex:pub-0057\"]",
                 "[\"ex:Incollection\",30,\"ex:pub-0002\",\"ex:pub-0058\"]",
                 "[\"ex:Misc\",9,\"ex:pub-0011\",\"ex:pub-0055\"]",
+            ],
+            routing: MustFire(STAR_SITE),
+        },
+        // Two filter triples sharing an object variable are a join on it, so
+        // the per-subject multiplicity is the size of the refA/refB value
+        // intersection (1), not the product of their counts (4). The operator
+        // has no way to express that, so the detector must decline.
+        Case {
+            name: "star topk shared filter object var declines",
+            ledger: Star,
+            sparql: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
+                     ?s ex:bibtexType ?o1 . ?s ex:refA ?x . ?s ex:refB ?x .\n\
+                     } GROUP BY ?o1 ORDER BY DESC(?count) LIMIT 10",
+            expected: &[
+                "[\"ex:Article\",14]",
+                "[\"ex:Book\",14]",
+                "[\"ex:Incollection\",14]",
+                "[\"ex:Inproceedings\",14]",
+                "[\"ex:Misc\",5]",
+            ],
+            routing: MustNotFire(STAR_SITE),
+        },
+        // Distinct object vars over filter predicates stay eligible — there the
+        // product of per-subject counts IS the join multiplicity.
+        Case {
+            name: "star topk distinct filter object vars keep the lane",
+            ledger: Star,
+            sparql: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
+                     ?s ex:bibtexType ?o1 . ?s ex:refA ?x . ?s ex:refB ?y .\n\
+                     } GROUP BY ?o1 ORDER BY DESC(?count) LIMIT 10",
+            expected: &[
+                "[\"ex:Article\",57]",
+                "[\"ex:Book\",57]",
+                "[\"ex:Incollection\",57]",
+                "[\"ex:Inproceedings\",57]",
+                "[\"ex:Misc\",21]",
             ],
             routing: MustFire(STAR_SITE),
         },
