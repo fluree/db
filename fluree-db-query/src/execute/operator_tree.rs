@@ -764,6 +764,12 @@ fn detect_predicate_group_by_object_count_topk(
 /// Detect `GROUP BY ?o` top-k where WHERE is a same-subject star join:
 /// `?s <p_group> ?o . ?s <p_filter1> ?x1 . ...`
 ///
+/// The filter object vars must be pairwise distinct, as written: the operator
+/// folds them as a product of per-subject counts, which is the join
+/// multiplicity only when they range independently. Sharing one makes the
+/// filters a join on it, whose multiplicity is their value intersection —
+/// not expressible in the fold, so the shape declines.
+///
 /// Supports subject aggregates: MIN(?s), MAX(?s), SAMPLE(?s) in addition to COUNT.
 #[allow(clippy::type_complexity)]
 fn detect_group_by_object_star_topk(
