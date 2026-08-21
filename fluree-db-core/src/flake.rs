@@ -37,6 +37,19 @@ pub struct FlakeMeta {
     pub i: Option<i32>,
 }
 
+/// Canonical form of a BCP 47 language tag: ASCII-lowercased. RDF 1.1 defines
+/// the value space of language tags as lowercase and compares them
+/// case-insensitively, so `"x"@EN` and `"x"@en` are one term. Every tag that
+/// enters a [`FlakeMeta`], a language dictionary, or a query constraint goes
+/// through here so a single lexical form is stored and looked up.
+pub fn normalize_lang_tag(tag: &str) -> std::borrow::Cow<'_, str> {
+    if tag.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(tag.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(tag)
+    }
+}
+
 impl FlakeMeta {
     /// Create empty metadata
     pub fn new() -> Self {
@@ -46,8 +59,20 @@ impl FlakeMeta {
     /// Create metadata with language tag
     pub fn with_lang(lang: impl Into<String>) -> Self {
         Self {
-            lang: Some(lang.into()),
+            lang: Some(normalize_lang_tag(&lang.into()).into_owned()),
             i: None,
+        }
+    }
+
+    /// Metadata for a value with an optional language tag and/or list
+    /// position; the tag is normalized like [`with_lang`](Self::with_lang).
+    pub fn from_parts(lang: Option<&str>, i: Option<i32>) -> Option<Self> {
+        match (lang, i) {
+            (None, None) => None,
+            (lang, i) => Some(Self {
+                lang: lang.map(|l| normalize_lang_tag(l).into_owned()),
+                i,
+            }),
         }
     }
 

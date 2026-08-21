@@ -395,8 +395,15 @@ impl PatternOptionalBuilder {
                             // Use Term::Iri so scan can encode for each target ledger
                             pattern.o = Term::Iri(iri.clone());
                         }
-                        Binding::Lit { val, .. } => {
+                        Binding::Lit { val, dtc, .. } => {
                             pattern.o = Term::Value(val.clone());
+                            // A string binding is one RDF term: `"bob"`,
+                            // `"bob"@en` and `"bob"@fr` must not probe each
+                            // other's rows. Numeric/other constraints are left
+                            // off so cross-subtype matching stays as before.
+                            if crate::binding::is_string_term_constraint(dtc) {
+                                pattern.dtc = Some(dtc.clone());
+                            }
                         }
                         Binding::EncodedLit { .. } => {
                             // Late materialized literal: no decode context here; leave unbound.

@@ -2124,6 +2124,20 @@ impl BinaryIndexStore {
     /// and delegates to [`decode_value_v3`](Self::decode_value_v3).
     ///
     /// Used by `Binding::EncodedLit` which stores `(o_kind, dt_id, lang_id)`.
+    /// The V3 `o_type` a late-materialized `(o_kind, dt_id, lang_id)` triple
+    /// resolves to — the same resolution `decode_value_from_kind` performs,
+    /// exposed so callers can recover the literal's datatype / language tag
+    /// (`resolve_datatype_sid`, `resolve_lang_tag`) without decoding.
+    pub fn o_type_from_kind(&self, o_kind: u8, dt_id: u16, lang_id: u16) -> u16 {
+        OTypeRegistry::builtin_only()
+            .resolve(
+                ObjKind::from_u8(o_kind),
+                DatatypeDictId::from_u16(dt_id),
+                lang_id,
+            )
+            .as_u16()
+    }
+
     pub fn decode_value_from_kind(
         &self,
         o_kind: u8,

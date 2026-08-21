@@ -704,15 +704,7 @@ mod inner {
             let dt = dtc.datatype().clone();
             let lang = dtc.lang_tag().map(std::string::ToString::to_string);
 
-            let meta = match (&lang, list_index) {
-                (Some(l), Some(i)) => Some(FlakeMeta {
-                    lang: Some(l.clone()),
-                    i: Some(i),
-                }),
-                (Some(l), None) => Some(FlakeMeta::with_lang(l)),
-                (None, Some(i)) => Some(FlakeMeta::with_index(i)),
-                (None, None) => None,
-            };
+            let meta = FlakeMeta::from_parts(lang.as_deref(), list_index);
 
             // Late hard guard: reject (FlakeValue, datatype) shapes that would
             // produce corrupt flakes (e.g. scalar object key with VECTOR_ID
