@@ -191,8 +191,11 @@ impl BinaryCursor {
     /// key range: ops outside the window cost an O(overlay) merge walk per
     /// cursor and defeat leaflet pre-skips.
     pub fn set_overlay_ops_window(&mut self, ops: Arc<[OverlayOp]>, start: usize, end: usize) {
+        debug_assert!(start <= end && end <= ops.len());
         debug_assert!(
-            ops.windows(2).all(|w| w[0].fact_key() != w[1].fact_key()),
+            ops[start..end]
+                .windows(2)
+                .all(|w| w[0].fact_key() != w[1].fact_key()),
             "overlay ops contain duplicate fact keys — caller must resolve \
              assert/retract lifecycles via resolve_overlay_ops() before set_overlay_ops()"
         );
@@ -216,7 +219,6 @@ impl BinaryCursor {
              in the cursor projection; got {:?}",
             self.projection
         );
-        debug_assert!(start <= end && end <= ops.len());
         self.overlay_ops = ops;
         self.overlay_pos = start;
         self.overlay_end = end;
@@ -708,7 +710,7 @@ impl BinaryCursor {
         let mut out_o_i: Vec<u32> = Vec::new();
         let mut out_t: Vec<u32> = Vec::new();
 
-        while self.overlay_pos < self.overlay_ops.len() {
+        while self.overlay_pos < self.overlay_end {
             let ov = &self.overlay_ops[self.overlay_pos];
             self.overlay_pos += 1;
 

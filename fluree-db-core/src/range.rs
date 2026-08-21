@@ -348,6 +348,17 @@ fn collect_overlay_only<O: OverlayProvider + ?Sized>(
     remove_stale_flakes(flakes)
 }
 
+/// Resolve a mixed bag of assert/retract flakes to the currently-asserted
+/// set: sort in `index` order (which places the newest `t` last within a
+/// fact key), keep the newest op per fact key, drop retractions. This is the
+/// same lifecycle rule the overlay-only range path applies; callers that
+/// merge base rows with a raw overlay walk themselves use it to get
+/// identical results to [`range_with_overlay`].
+pub fn resolve_current_flakes(mut flakes: Vec<Flake>, index: IndexType) -> Vec<Flake> {
+    flakes.sort_by(index.comparator());
+    remove_stale_flakes(flakes)
+}
+
 /// Remove stale flakes from an owned vector.
 ///
 /// Iterates in reverse (newest first for identical facts), keeps only the
