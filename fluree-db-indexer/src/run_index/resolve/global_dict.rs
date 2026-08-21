@@ -938,7 +938,9 @@ impl LanguageTagDict {
     /// Returns 0 if `tag` is None.
     pub fn get_or_insert(&mut self, tag: Option<&str>) -> u16 {
         match tag {
-            Some(t) => self.inner.assign_or_lookup(t),
+            Some(t) => self
+                .inner
+                .assign_or_lookup(&fluree_db_core::normalize_lang_tag(t)),
             None => 0,
         }
     }
@@ -964,7 +966,20 @@ impl LanguageTagDict {
     ///
     /// Returns `None` if the tag is not in the dictionary.
     pub fn find_id(&self, tag: &str) -> Option<u16> {
-        self.inner.find(tag)
+        self.find_normalized(tag)
+    }
+
+    /// Case-insensitive reverse lookup: the dictionary stores normalized
+    /// (lowercase) tags, but a dictionary persisted before normalization may
+    /// still hold the tag as written, so an exact miss falls back to a scan.
+    fn find_normalized(&self, tag: &str) -> Option<u16> {
+        let norm = fluree_db_core::normalize_lang_tag(tag);
+        self.inner.find(&norm).or_else(|| {
+            self.inner
+                .iter()
+                .find(|(_, t)| t.eq_ignore_ascii_case(&norm))
+                .map(|(id, _)| id)
+        })
     }
 
     /// Iterator over (id, tag) pairs.

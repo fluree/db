@@ -1690,7 +1690,12 @@ impl BinaryScanOperator {
                         return;
                     }
                     if let Some(lang) = bound_lang {
-                        if f.m.as_ref().and_then(|m| m.lang.as_deref()) != Some(lang) {
+                        if !f
+                            .m
+                            .as_ref()
+                            .and_then(|m| m.lang.as_deref())
+                            .is_some_and(|l| l.eq_ignore_ascii_case(lang))
+                        {
                             return;
                         }
                     }
@@ -2397,7 +2402,9 @@ impl Operator for BinaryScanOperator {
                             && p_sid.as_ref().is_none_or(|p| &f.p == p)
                             && self.bound_o.as_ref().is_none_or(|o| &f.o == o)
                             && bound_lang.is_none_or(|lang| {
-                                f.m.as_ref().and_then(|m| m.lang.as_deref()) == Some(lang)
+                                f.m.as_ref()
+                                    .and_then(|m| m.lang.as_deref())
+                                    .is_some_and(|l| l.eq_ignore_ascii_case(lang))
                             })
                             && self.object_bounds.as_ref().is_none_or(|b| b.matches(&f.o))
                     })

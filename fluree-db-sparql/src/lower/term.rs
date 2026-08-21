@@ -52,6 +52,15 @@ pub(super) fn parse_big_integer_value(
         .map_err(|_| LowerError::invalid_integer(value, span))
 }
 
+/// Language tags compare case-insensitively (BCP 47); store and match the
+/// canonical lowercase form so `"x"@EN` finds `"x"@en`.
+fn normalized_lang_arc(lang: &Arc<str>) -> Arc<str> {
+    match fluree_db_core::normalize_lang_tag(lang) {
+        std::borrow::Cow::Borrowed(_) => Arc::clone(lang),
+        std::borrow::Cow::Owned(s) => Arc::from(s),
+    }
+}
+
 impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Register a SPARQL variable with the variable registry.
     pub(super) fn register_var(&mut self, v: &Var) -> VarId {
@@ -248,7 +257,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             ),
             LiteralValue::LangTagged { value, lang } => (
                 FlakeValue::String(value.to_string()),
-                DatatypeConstraint::LangTag(lang.clone()),
+                DatatypeConstraint::LangTag(normalized_lang_arc(lang)),
             ),
             LiteralValue::Typed { value, datatype } => {
                 let fv = self.lower_typed_literal(value, datatype)?;

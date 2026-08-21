@@ -158,11 +158,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // excluding the row) — D-EBV, PR-X2
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-9",
-    // dawg-lang-3: pattern-object language tag dropped on the scan path
-    // (`?x :p "string"@EN` matches every lexical "string" regardless of @lang)
-    // — the tag now reaches the scan; the residual is tag CASE ("EN" vs stored
-    // "en" — BCP 47 tags compare case-insensitively).
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-3",
     // dawg-langMatches-4: `!langMatches(lang(?v),"*")` where ?v is an IRI —
     // LANG of a non-literal must raise a type error that excludes the row (the
     // negation of an error is an error), not evaluate to "" — PR-X2 follow-up

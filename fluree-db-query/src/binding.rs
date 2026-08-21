@@ -298,9 +298,14 @@ impl Binding {
             !matches!(val, FlakeValue::Ref(_)),
             "Lit cannot contain Ref - use Binding::Sid"
         );
+        let lang: Arc<str> = lang.into();
+        let lang = match fluree_db_core::normalize_lang_tag(&lang) {
+            std::borrow::Cow::Borrowed(_) => lang,
+            std::borrow::Cow::Owned(s) => Arc::from(s),
+        };
         Binding::Lit {
             val,
-            dtc: DatatypeConstraint::LangTag(lang.into()),
+            dtc: DatatypeConstraint::LangTag(lang),
             t: None,
             op: None,
             p_id: None,

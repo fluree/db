@@ -208,3 +208,70 @@ async fn bare_numeric_literals_stay_lenient_across_subtypes() {
     .await;
     assert_eq!(got, json!([["ex:a"], ["ex:b"], ["ex:c"]]));
 }
+
+/// BCP 47 tags are case-insensitive: a value written as `@EN` is stored,
+/// matched and reported as `en`, whether the query writes `@en` or `@EN`.
+#[tokio::test]
+async fn language_tags_are_case_insensitive() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let id = "it/literal-identity-case:main";
+            let ledger = fluree.create_ledger(id).await.unwrap();
+            let data = json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": [
+                {"@id": "ex:upper", "ex:name": {"@value": "chat", "@language": "EN"}},
+                {"@id": "ex:lower", "ex:name": {"@value": "chat", "@language": "en"}},
+                {"@id": "ex:fr", "ex:name": {"@value": "chat", "@language": "fr-CA"}}
+            ]});
+            let r = fluree.insert(ledger, &data).await.unwrap();
+
+            for phase in ["novelty", "indexed"] {
+                if phase == "indexed" {
+                    trigger_index_and_wait_outcome(&handle, id, r.receipt.t).await;
+                }
+                let view = fluree.ledger(id).await.unwrap();
+                for q in [
+                    r#"SELECT ?s WHERE { ?s ex:name "chat"@en } ORDER BY ?s"#,
+                    r#"SELECT ?s WHERE { ?s ex:name "chat"@EN } ORDER BY ?s"#,
+                ] {
+                    assert_eq!(
+                        sparql(&fluree, &view, q).await,
+                        json!([["ex:lower"], ["ex:upper"]]),
+                        "{phase}: {q}"
+                    );
+                }
+                assert_eq!(
+                    sparql(&fluree, &view, r#"SELECT ?s WHERE { ?s ex:name "chat"@FR-ca }"#).await,
+                    json!([["ex:fr"]]),
+                    "{phase}: region subtag case"
+                );
+                // LANG() reports the canonical lowercase form for every row.
+                assert_eq!(
+                    sparql(
+                        &fluree,
+                        &view,
+                        "SELECT ?s (LANG(?n) AS ?l) WHERE { ?s ex:name ?n } ORDER BY ?s"
+                    )
+                    .await,
+                    json!([["ex:fr", "fr-ca"], ["ex:lower", "en"], ["ex:upper", "en"]]),
+                    "{phase}: LANG() canonical"
+                );
+                let jl = json!({"@context": {"ex": "http://example.org/ns/"}, "select": "?s",
+                                "where": {"@id": "?s", "ex:name": {"@value": "chat", "@language": "En"}}});
+                let mut got = query_jsonld_formatted(&fluree, &view, &jl).await.unwrap();
+                got.as_array_mut().unwrap().sort_by_key(std::string::ToString::to_string);
+                assert_eq!(got, json!(["ex:lower", "ex:upper"]), "{phase}: json-ld @language case");
+            }
+        })
+        .await;
+}
