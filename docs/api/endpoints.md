@@ -352,7 +352,7 @@ If `Idempotency-Key` is provided, servers MAY treat `POST /push/*ledger` as idem
 JSON object:
 
 - `commits`: array of base64-encoded commit v2 blobs (oldest → newest)
-- `blobs` (optional): map of `{ cid: base64Bytes }` for referenced blobs (currently: `commit.txn` when present)
+- `blobs` (optional): map of `{ cid: base64Bytes }` for referenced blobs (currently: `commit.txn` when present). Provided blobs must hash-verify against their CID. A referenced txn blob that is *not* provided is accepted with a warning — the source may itself have a provenance gap (see `missing_blobs` on export), and the commit's flakes do not depend on it.
 
 **Response Body (200 OK):**
 
@@ -531,6 +531,7 @@ Authorization: Bearer <token>   (requires fluree.storage.* claims)
   "head_t": 42,
   "commits": ["<base64>", "<base64>"],
   "blobs": { "bafy...txnBlob": "<base64>" },
+  "missing_blobs": [],
   "newest_t": 42,
   "oldest_t": 41,
   "next_cursor_id": "bafy...prevCommit",
@@ -541,6 +542,7 @@ Authorization: Bearer <token>   (requires fluree.storage.* claims)
 
 - `commits`: Raw commit v2 blobs, newest → oldest within each page.
 - `blobs`: Referenced txn blobs keyed by CID string.
+- `missing_blobs`: Txn CIDs referenced by commits in this page that the server could not read (omitted when empty). The commits are still exported; run `fluree verify` on the source to locate the referencing commit.
 - `next_cursor_id`: CID cursor for the next page; `null` when genesis is reached.
 - `effective_limit`: Actual limit used (after server clamping).
 

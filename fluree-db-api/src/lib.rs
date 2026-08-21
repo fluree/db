@@ -99,6 +99,7 @@ pub mod validate;
 pub mod vector_worker;
 #[cfg(feature = "aws")]
 pub mod vended_credentials;
+pub mod verify;
 pub mod view;
 pub mod wire;
 
@@ -196,6 +197,7 @@ pub use tx::{
     TransactResultRef,
 };
 pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged};
+pub use verify::{LedgerVerifyReport, VerifyProblem};
 pub use view::{
     ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput,
     ReasoningModePrecedence, StreamDatasetPlan, StreamQueryPlan,

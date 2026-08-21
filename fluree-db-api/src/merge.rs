@@ -657,7 +657,18 @@ impl crate::Fluree {
                 let Some(ref txn_cid) = envelope.txn else {
                     return Ok(());
                 };
-                let txn_bytes = source_store.get(txn_cid).await?;
+                let txn_bytes = match source_store.get(txn_cid).await {
+                    Ok(bytes) => bytes,
+                    Err(fluree_db_core::Error::NotFound(_)) => {
+                        tracing::warn!(
+                            commit = %cid,
+                            %txn_cid,
+                            "commit references a txn blob that is missing from storage; merging without it"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 storage
                     .content_write_bytes_with_hash(
                         ContentKind::Txn,

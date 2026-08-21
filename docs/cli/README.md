@@ -67,6 +67,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`history`](history.md) | Show change history for an entity |
 | [`export`](export.md) | Export ledger data |
 | [`log`](log.md) | Show commit log |
+| [`verify`](verify.md) | Verify commit-chain integrity and referenced objects |
 | [`show`](show.md) | Show decoded commit contents (flakes with resolved IRIs) |
 | [`index`](index.md) | Build or update the binary index (incremental) |
 | [`reindex`](reindex.md) | Full reindex from commit history |

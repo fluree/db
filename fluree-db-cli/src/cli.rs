@@ -970,6 +970,21 @@ pub enum Commands {
         remote: Option<String>,
     },
 
+    /// Verify a ledger's commit chain: every commit decodes, parents exist,
+    /// `t` is contiguous, and referenced txn blobs / index root are present
+    Verify {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Stop after checking this many commits (newest first)
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show the contents of a commit (decoded flakes with resolved IRIs)
     Show {
         /// Commit identifier: t:<N>, hex-digest prefix (min 6 chars), or full CID
