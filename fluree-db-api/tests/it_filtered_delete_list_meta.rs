@@ -61,25 +61,45 @@ async fn list_values(
     ledger: &fluree_db_api::LedgerState,
     subject: &str,
 ) -> Vec<String> {
+    list_items(fluree, ledger, subject, "ex:items").await
+}
+
+/// Items of `subject`'s `pred` list; language-tagged entries render as
+/// `value@lang` so two tags on the same lexical form stay distinguishable.
+async fn list_items(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    subject: &str,
+    pred: &str,
+) -> Vec<String> {
     let q = json!({
         "@context": ctx(),
-        "select": {"?s": ["ex:items"]},
+        "select": {"?s": [pred]},
         "where": {"@id": "?s"},
         "values": ["?s", [{"@id": subject}]]
     });
     let rows = query_jsonld_formatted(fluree, ledger, &q)
         .await
         .expect("list query");
+    let render = |v: &serde_json::Value| -> Option<String> {
+        match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => {
+                let val = o.get("@value")?.as_str()?;
+                Some(match o.get("@language").and_then(|l| l.as_str()) {
+                    Some(lang) => format!("{val}@{lang}"),
+                    None => val.to_string(),
+                })
+            }
+            _ => None,
+        }
+    };
     rows.as_array()
         .and_then(|a| a.first())
-        .and_then(|node| node.get("ex:items"))
+        .and_then(|node| node.get(pred))
         .map(|v| match v {
-            serde_json::Value::Array(items) => items
-                .iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect(),
-            serde_json::Value::String(s) => vec![s.clone()],
-            _ => vec![],
+            serde_json::Value::Array(items) => items.iter().filter_map(render).collect(),
+            other => render(other).into_iter().collect(),
         })
         .unwrap_or_default()
 }
@@ -153,7 +173,7 @@ async fn no_list_ledger_records_flag_and_deletes_cleanly() {
 /// after indexing, novelty flips its bit on the first list commit, and a
 /// filtered delete of one value removes exactly one positional entry per
 /// WHERE binding — for a base-indexed list, a novelty-only list, and a
-/// base list whose entry was re-asserted in novelty.
+/// base list with an entry retracted and re-asserted in novelty.
 #[tokio::test]
 async fn list_ledger_hydrates_positions_across_base_and_novelty() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -202,6 +222,36 @@ async fn list_ledger_hydrates_positions_across_base_and_novelty() {
                 .await
                 .unwrap();
             let ledger = fluree.ledger(ledger_id).await.unwrap();
+
+            // Lifecycle over the base: retract `ex:base2`'s trailing "d"
+            // (a novelty retract of a base-indexed list row), then re-assert
+            // the whole list so "d" comes back at position 2 as a novelty
+            // assert. The merged base+overlay view must resolve that fact
+            // key to its newest op (live) when hydrating below.
+            let retract_d = json!({
+                "@context": ctx(),
+                "where": [{"@id": "ex:base2", "ex:items": "d"}],
+                "delete": [{"@id": "ex:base2", "ex:items": "d"}]
+            });
+            let r = fluree
+                .update_with_opts(ledger, &retract_d, TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 1);
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(list_values(&fluree, &ledger, "ex:base2").await, vec!["b", "b"]);
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:base2", "ex:items": {"@list": ["b", "b", "d"]}}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(list_values(&fluree, &ledger, "ex:base2").await, vec!["b", "b", "d"]);
             assert_eq!(list_values(&fluree, &ledger, "ex:base1").await, vec!["a", "b", "c"]);
             assert_eq!(list_values(&fluree, &ledger, "ex:nov1").await, vec!["b", "e"]);
 
@@ -224,6 +274,98 @@ async fn list_ledger_hydrates_positions_across_base_and_novelty() {
             assert_eq!(list_values(&fluree, &ledger, "ex:base2").await, vec!["b", "d"]);
             assert_eq!(list_values(&fluree, &ledger, "ex:nov1").await, vec!["e"]);
             assert_eq!(list_values(&fluree, &ledger, "ex:f7").await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// Language-tagged list entries carry `m = { lang, i }`. A retraction bound
+/// from a tagged value arrives with `{ lang, i: None }` and must still get
+/// its position hydrated — and from the candidate with the SAME tag, so
+/// identical lexical forms under different languages are not confused.
+#[tokio::test]
+async fn language_tagged_list_entries_hydrate_by_tag() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/list-meta-lang:main";
+            let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+
+            let labels = |id: &str| {
+                json!({"@id": id, "ex:labels": {"@list": [
+                    {"@value": "b", "@language": "en"},
+                    {"@value": "b", "@language": "fr"},
+                    {"@value": "c", "@language": "en"}
+                ]}})
+            };
+            // `ex:base` is indexed; `ex:nov` lives only in novelty.
+            let r = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@graph": [labels("ex:base")]}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            trigger_index_and_wait_outcome(&handle, ledger_id, r.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(ledger.snapshot.has_list_meta, Some(true));
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@graph": [labels("ex:nov")]}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            for id in ["ex:base", "ex:nov"] {
+                assert_eq!(
+                    list_items(&fluree, &ledger, id, "ex:labels").await,
+                    vec!["b@en", "b@fr", "c@en"]
+                );
+            }
+
+            // Delete only the French "b". The English "b" shares its lexical
+            // form and datatype; matching on language must pick position 1,
+            // not position 0.
+            let del = json!({
+                "@context": ctx(),
+                "where": [{"@id": "?s", "ex:labels": {"@value": "b", "@language": "fr"}}],
+                "delete": [{"@id": "?s", "ex:labels": {"@value": "b", "@language": "fr"}}]
+            });
+            let r = fluree
+                .update_with_opts(
+                    ledger,
+                    &del,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 2, "one entry per subject");
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            for id in ["ex:base", "ex:nov"] {
+                assert_eq!(
+                    list_items(&fluree, &ledger, id, "ex:labels").await,
+                    vec!["b@en", "c@en"],
+                    "{id}"
+                );
+            }
         })
         .await;
 }

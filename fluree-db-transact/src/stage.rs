@@ -1627,8 +1627,10 @@ async fn hydrate_list_index_meta_for_retractions(
     // Group candidates by (graph, subject, predicate).
     let mut groups: HashMap<(GraphId, Sid, Sid), Vec<usize>> = HashMap::new();
     for (idx, flake) in retractions.iter().enumerate() {
-        // Only retractions with no metadata are candidates.
-        if flake.op || flake.m.is_some() {
+        // Only retractions lacking a list position are candidates. A
+        // language-tagged binding already carries `m = { lang, i: None }`
+        // and still needs its position filled in.
+        if flake.op || flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
             continue;
         }
         let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
@@ -1716,13 +1718,17 @@ async fn hydrate_list_index_meta_for_retractions(
 
         for idx in members {
             let flake = &mut retractions[idx];
-            if let Some(candidates) = metas.get(&flake.o) {
-                if let Some((_, m)) = candidates
-                    .iter()
-                    .find(|(dt, _)| fluree_db_core::dt_compatible(&flake.dt, dt))
-                {
-                    flake.m = Some(m.clone());
-                }
+            let Some(candidates) = metas.get(&flake.o) else {
+                continue;
+            };
+            // Same lexical value under different language tags are distinct
+            // facts: the candidate must match the retraction's tag (absent
+            // on both for plain literals) as well as its datatype.
+            let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
+            if let Some((_, m)) = candidates.iter().find(|(dt, m)| {
+                fluree_db_core::dt_compatible(&flake.dt, dt) && m.lang.as_deref() == lang
+            }) {
+                flake.m = Some(m.clone());
             }
         }
     }

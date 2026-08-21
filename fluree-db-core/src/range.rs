@@ -412,6 +412,58 @@ fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
 mod tests {
     use super::*;
 
+    fn fact(s: &str, o: &str, t: i64, op: bool, i: Option<i32>) -> Flake {
+        let m = i.map(|i| FlakeMeta {
+            lang: None,
+            i: Some(i),
+        });
+        Flake {
+            s: Sid::new(1, s),
+            p: Sid::new(2, "p"),
+            o: FlakeValue::String(o.to_string()),
+            dt: Sid::new(3, "string"),
+            t,
+            op,
+            m,
+            g: None,
+        }
+    }
+
+    #[test]
+    fn resolve_current_flakes_newest_op_wins_and_retracts_drop() {
+        // Out of order on purpose: the resolver must sort first.
+        let flakes = vec![
+            fact("a", "x", 3, false, None), // retract at t=3 …
+            fact("a", "x", 1, true, None),  // … of an assert at t=1
+            fact("a", "y", 2, true, None),  // untouched assert
+            fact("b", "x", 2, false, None), // retract at t=2 …
+            fact("b", "x", 4, true, None),  // … re-asserted later → live
+        ];
+        let out = resolve_current_flakes(flakes, IndexType::Spot);
+        let keys: Vec<(String, String)> = out
+            .iter()
+            .map(|f| (f.s.name.to_string(), format!("{:?}", f.o)))
+            .collect();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|f| f.op));
+        assert!(keys.contains(&("a".into(), format!("{:?}", FlakeValue::String("y".into())))));
+        assert!(keys.contains(&("b".into(), format!("{:?}", FlakeValue::String("x".into())))));
+    }
+
+    #[test]
+    fn resolve_current_flakes_list_positions_are_distinct_facts() {
+        // Same (s, p, o, dt) at two list positions; retracting position 1
+        // must leave position 0 live — `m` is part of the fact key.
+        let flakes = vec![
+            fact("a", "x", 1, true, Some(0)),
+            fact("a", "x", 1, true, Some(1)),
+            fact("a", "x", 2, false, Some(1)),
+        ];
+        let out = resolve_current_flakes(flakes, IndexType::Spot);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].m.as_ref().and_then(|m| m.i), Some(0));
+    }
+
     #[test]
     fn test_range_match_builders() {
         let s = Sid::new(1, "test");
