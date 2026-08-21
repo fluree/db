@@ -438,15 +438,20 @@ fn cases() -> Vec<Case> {
             expected: &["[9]"],
             routing: MustNotFire(PLAN_SITE),
         },
-        // List rows (`o_i`): the generic pipeline's list-element join
-        // semantics are not expressible in an (s, o_type, o_key) key, so the
-        // lane must decline and agree with whatever the generic join yields.
+        // List rows (`o_i`): every list element is its own fact, so a
+        // var-object join is a bag join over them — s2's two `q-1` entries on
+        // each side pair up 2×2 = 4, s3 pairs its single shared `r-1` once,
+        // and s1 never matches (see the fixture). The count lane cannot
+        // express that in an (s, o_type, o_key) key, so it must decline and
+        // agree with the generic join. (The membership lane used to answer
+        // this shape as a semi-join — one row per driving row, 3 — which the
+        // planner's driving-size gate now keeps it away from.)
         Case {
             name: "composite join, list rows (declines to generic)",
             ledger: CompositeList,
             sparql:
                 "SELECT (COUNT(*) AS ?count) WHERE { ?s ex:createdBy ?o . ?s ex:authoredBy ?o }",
-            expected: &["[3]"],
+            expected: &["[5]"],
             routing: MustNotFire(PLAN_SITE),
         },
     ]
@@ -494,8 +499,10 @@ async fn setup_turtle(
 }
 
 /// The list ledger needs JSON-LD (`@list` has no Turtle surface for `o_i`).
-/// s1: list-vs-plain (generic: no match). s2: aligned duplicate lists
-/// (generic: 2). s3: same value at different positions (generic: 1).
+/// Bare strings inside the `@list` arrays are string literals (the terms are
+/// not `@type: @id`), while s1's `ex:authoredBy` is an IRI — so s1 never
+/// joins (string vs IRI). s2: duplicate lists on both sides (bag join: 2×2 =
+/// 4). s3: one shared value at different positions (1).
 async fn setup_list_ledger(alias: &str) -> (tempfile::TempDir, Fluree) {
     let dir = tempfile::tempdir().expect("tmpdir");
     let path = dir.path().to_string_lossy().to_string();
