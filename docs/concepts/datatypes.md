@@ -174,6 +174,8 @@ Beyond XSD, Fluree supports RDF-specific datatypes:
 
 **rdf:langString** represents strings with language tags. This is distinct from plain strings and enables language-aware queries.
 
+> **Matching a string literal in a query.** `"bob"`, `"bob"@en` and `"bob"@fr` are three different RDF terms. In SPARQL a constant object matches only its own term: `?s ex:name "bob"@en` returns just the English value, `?s ex:name "bob"` (an `xsd:string`) does not match tagged values, and a variable bound to a tagged string joins only against the same tag. In a JSON-LD query, `{"@value": "bob", "@language": "en"}` and `{"@value": "bob", "@type": "xsd:string"}` are likewise exact, while a bare JSON string (`"ex:name": "bob"`) matches the lexical value under any string datatype or language tag. Bare numeric literals (`25`) match the value under any numeric subtype in both surfaces.
+
 > **Annotating literal values.** Any literal — plain, typed, or language-tagged — can carry statement-level metadata (source, confidence, timestamp) via an edge annotation. Because a JSON scalar has no room for sibling keys, an annotated literal must be written in value-object form (`@value` plus `@annotation`); language-tagged annotations are language-pinned, so `"chat"@fr` and `"chat"@en` annotate independently. See [Edge annotations → Annotating literal-valued edges](edge-annotations.md#annotating-literal-valued-edges).
 
 ### JSON Data

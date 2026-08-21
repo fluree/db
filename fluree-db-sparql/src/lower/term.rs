@@ -206,6 +206,34 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
     }
 
+    /// Object lowering for ordinary triple patterns and property-path
+    /// endpoints. String literals carry their exact term identity — plain
+    /// `"bob"` is `xsd:string`, `"bob"@en` is that one language tag, and
+    /// `"bob"^^xsd:string` is explicit — so the scan matches the RDF term
+    /// the query wrote. Without the constraint all three collapsed to one
+    /// string-dictionary key and matched each other. Bare numerics,
+    /// booleans and dates stay unconstrained so `25` keeps matching a stored
+    /// `"25"^^xsd:int` as before; tightening numeric subtypes is a separate
+    /// decision.
+    pub(super) fn lower_object_with_term_constraint(
+        &mut self,
+        term: &ObjectTerm,
+    ) -> Result<(Term, Option<DatatypeConstraint>)> {
+        match term {
+            SparqlTerm::Literal(lit)
+                if matches!(
+                    lit.value,
+                    LiteralValue::Simple(_)
+                        | LiteralValue::LangTagged { .. }
+                        | LiteralValue::Typed { .. }
+                ) =>
+            {
+                self.lower_literal_with_constraint(lit)
+            }
+            other => Ok((self.lower_object(other)?, None)),
+        }
+    }
+
     /// Like [`Self::lower_literal`] but also returns the
     /// datatype/language constraint that pins the lexical value to a
     /// specific RDF datatype or language tag.

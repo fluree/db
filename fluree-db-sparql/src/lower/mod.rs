@@ -1052,6 +1052,88 @@ mod tests {
         );
     }
 
+    fn first_triple(query: &Query) -> &fluree_db_query::ir::TriplePattern {
+        query
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Triple(tp) => Some(tp),
+                _ => None,
+            })
+            .expect("a triple pattern")
+    }
+
+    /// String objects carry their term identity into the scan; bare
+    /// numerics stay unconstrained (lenient across numeric subtypes).
+    #[test]
+    fn triple_object_literals_carry_string_term_constraints() {
+        use fluree_db_core::DatatypeConstraint;
+        use fluree_vocab::{namespaces::XSD, xsd_names};
+
+        let tagged = lower_query(
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"bob\"@en }",
+        )
+        .unwrap();
+        assert_eq!(
+            first_triple(&tagged).dtc,
+            Some(DatatypeConstraint::LangTag("en".into()))
+        );
+
+        let plain =
+            lower_query("PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"bob\" }")
+                .unwrap();
+        assert_eq!(
+            first_triple(&plain).dtc,
+            Some(DatatypeConstraint::Explicit(Sid::new(
+                XSD,
+                xsd_names::STRING
+            )))
+        );
+
+        let typed = lower_query(
+            "PREFIX ex: <http://example.org/> \
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             SELECT ?s WHERE { ?s ex:name \"bob\"^^xsd:string }",
+        )
+        .unwrap();
+        assert_eq!(
+            first_triple(&typed).dtc,
+            Some(DatatypeConstraint::Explicit(Sid::new(
+                XSD,
+                xsd_names::STRING
+            )))
+        );
+
+        let numeric =
+            lower_query("PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:age 25 }")
+                .unwrap();
+        assert_eq!(first_triple(&numeric).dtc, None);
+
+        // Property-path endpoints take the same rule.
+        fn walk<'a>(ps: &'a [Pattern], out: &mut Vec<&'a fluree_db_query::ir::TriplePattern>) {
+            for p in ps {
+                match p {
+                    Pattern::Triple(tp) => out.push(tp),
+                    Pattern::Union(arms) => arms.iter().for_each(|a| walk(a, out)),
+                    _ => {}
+                }
+            }
+        }
+        let path = lower_query(
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:a|ex:b \"bob\"@fr }",
+        )
+        .unwrap();
+        let mut triples = Vec::new();
+        walk(&path.patterns, &mut triples);
+        assert!(
+            triples.len() >= 2,
+            "both alternation arms lowered to triples"
+        );
+        for tp in triples {
+            assert_eq!(tp.dtc, Some(DatatypeConstraint::LangTag("fr".into())));
+        }
+    }
+
     fn lower_query(sparql: &str) -> Result<Query> {
         lower_query_with_vars(sparql).map(|(q, _)| q)
     }

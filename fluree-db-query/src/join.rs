@@ -945,8 +945,15 @@ impl NestedLoopJoinOperator {
                             // Use Term::Iri so scan can encode for each target ledger
                             pattern.o = Term::Iri(iri.clone());
                         }
-                        Binding::Lit { val, .. } => {
+                        Binding::Lit { val, dtc, .. } => {
                             pattern.o = Term::Value(val.clone());
+                            // A string binding is one RDF term: `"bob"`,
+                            // `"bob"@en` and `"bob"@fr` must not probe each
+                            // other's rows. Numeric/other constraints are left
+                            // off so cross-subtype matching stays as before.
+                            if crate::binding::is_string_term_constraint(dtc) {
+                                pattern.dtc = Some(dtc.clone());
+                            }
                         }
                         Binding::EncodedLit {
                             o_kind,
@@ -978,6 +985,23 @@ impl NestedLoopJoinOperator {
                                         ))
                                     })?;
                                 pattern.o = Term::Value(val);
+                                // Same term-identity rule as the `Lit` arm:
+                                // a string binding probes only rows with its
+                                // exact tag / `xsd:string` datatype.
+                                let store = gv.store();
+                                let o_type = store.o_type_from_kind(*o_kind, *dt_id, *lang_id);
+                                let dtc = match store.resolve_lang_tag(o_type) {
+                                    Some(tag) => Some(fluree_db_core::DatatypeConstraint::LangTag(
+                                        Arc::from(tag),
+                                    )),
+                                    None => store
+                                        .resolve_datatype_sid(o_type)
+                                        .map(fluree_db_core::DatatypeConstraint::Explicit)
+                                        .filter(crate::binding::is_string_term_constraint),
+                                };
+                                if dtc.is_some() {
+                                    pattern.dtc = dtc;
+                                }
                             }
                             // Otherwise leave as variable
                         }
