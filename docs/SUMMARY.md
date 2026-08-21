@@ -24,6 +24,7 @@
   - [export](cli/export.md)
   - [context](cli/context.md)
   - [log](cli/log.md)
+  - [verify](cli/verify.md)
   - [show](cli/show.md)
   - [index](cli/index.md)
   - [reindex](cli/reindex.md)

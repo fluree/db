@@ -770,12 +770,22 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
         if let Some(txn_cid) = &commit.txn {
             let txn_key = txn_cid.to_string();
             if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
-                let txn_bytes = content_store.get(txn_cid).await.map_err(|e| {
-                    CliError::Config(format!(
-                        "commit references txn blob '{txn_key}' but it is not readable locally: {e}"
-                    ))
-                })?;
-                e.insert(fluree_db_api::Base64Bytes(txn_bytes));
+                match content_store.get(txn_cid).await {
+                    Ok(txn_bytes) => {
+                        e.insert(fluree_db_api::Base64Bytes(txn_bytes));
+                    }
+                    Err(fluree_db_core::Error::NotFound(_)) => {
+                        eprintln!(
+                            "  warning: commit t={} references txn blob '{txn_key}' which is missing locally; pushing without it",
+                            commit.t
+                        );
+                    }
+                    Err(e) => {
+                        return Err(CliError::Config(format!(
+                            "commit references txn blob '{txn_key}' but it is not readable locally: {e}"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -943,12 +953,22 @@ pub async fn run_publish(
         if let Some(txn_cid) = &commit.txn {
             let txn_key = txn_cid.to_string();
             if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
-                let txn_bytes = content_store.get(txn_cid).await.map_err(|e| {
-                    CliError::Config(format!(
-                        "commit references txn blob '{txn_key}' but it is not readable locally: {e}"
-                    ))
-                })?;
-                e.insert(fluree_db_api::Base64Bytes(txn_bytes));
+                match content_store.get(txn_cid).await {
+                    Ok(txn_bytes) => {
+                        e.insert(fluree_db_api::Base64Bytes(txn_bytes));
+                    }
+                    Err(fluree_db_core::Error::NotFound(_)) => {
+                        eprintln!(
+                            "  warning: commit t={} references txn blob '{txn_key}' which is missing locally; pushing without it",
+                            commit.t
+                        );
+                    }
+                    Err(e) => {
+                        return Err(CliError::Config(format!(
+                            "commit references txn blob '{txn_key}' but it is not readable locally: {e}"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -1579,16 +1599,28 @@ pub async fn run_clone_origin(
             if !no_txns {
                 if let Some(txn_cid) = &envelope.txn {
                     if !content_store.has(txn_cid).await.unwrap_or(false) {
-                        let txn_bytes = fetcher.fetch(txn_cid, &ledger_id).await.map_err(|e| {
-                            CliError::Config(format!("clone failed (fetch txn blob): {e}"))
-                        })?;
-                        // Txn blobs use full-bytes SHA-256, so put_with_id is safe.
-                        content_store
-                            .put_with_id(txn_cid, &txn_bytes)
-                            .await
-                            .map_err(|e| {
-                                CliError::Config(format!("clone failed (store txn blob): {e}"))
-                            })?;
+                        // A txn blob the origin cannot serve is a provenance
+                        // gap on the source, not a reason to abandon the
+                        // clone — the commit itself carries the flakes.
+                        match fetcher.fetch(txn_cid, &ledger_id).await {
+                            Ok(txn_bytes) => {
+                                // Txn blobs use full-bytes SHA-256, so put_with_id is safe.
+                                content_store
+                                    .put_with_id(txn_cid, &txn_bytes)
+                                    .await
+                                    .map_err(|e| {
+                                        CliError::Config(format!(
+                                            "clone failed (store txn blob): {e}"
+                                        ))
+                                    })?;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  warning: commit t={} references txn blob {txn_cid} which the origin could not serve ({e}); continuing without it",
+                                    envelope.t
+                                );
+                            }
+                        }
                     }
                 }
             }

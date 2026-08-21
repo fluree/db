@@ -886,6 +886,11 @@ fn preflight_strict_next_t_and_prev(
     Ok(())
 }
 
+/// Check the txn blobs a push bundle carries against what its commits
+/// reference. A referenced blob the client did not provide is tolerated
+/// (logged): the source may itself have a dangling reference, and refusing
+/// the push would make that ledger impossible to replicate. Blobs that ARE
+/// provided must hash-verify.
 fn validate_required_blobs(
     decoded: &[PushCommitDecoded],
     provided: &HashMap<String, Base64Bytes>,
@@ -899,9 +904,11 @@ fn validate_required_blobs(
 
     for addr in &required {
         if !provided.contains_key(addr) {
-            return Err(PushError::Invalid(format!(
-                "missing required blob for referenced address: {addr}"
-            )));
+            tracing::warn!(
+                txn_cid = %addr,
+                "pushed commit references a txn blob the client did not provide; accepting commit without it"
+            );
+            continue;
         }
     }
 
@@ -1061,11 +1068,10 @@ where
             )));
         }
 
-        let bytes = provided
-            .get(addr)
-            .ok_or_else(|| PushError::Invalid(format!("missing required blob: {addr}")))?
-            .0
-            .clone();
+        let Some(bytes) = provided.get(addr).map(|b| b.0.clone()) else {
+            // Tolerated — see `validate_required_blobs`.
+            continue;
+        };
 
         // Integrity: server MUST re-hash bytes and verify the derived CID.
         if !txn_id.verify(&bytes) {
@@ -1268,6 +1274,12 @@ pub struct ExportCommitsResponse {
     /// Referenced blobs (txn blobs) keyed by CID string.
     #[serde(default)]
     pub blobs: HashMap<String, Base64Bytes>,
+    /// Txn CIDs referenced by commits in this page that the source could
+    /// not read (dangling provenance). The commits themselves are intact
+    /// and exported; consumers should carry the reference without the
+    /// bytes rather than refuse the chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_blobs: Vec<String>,
     /// Highest `t` in this page.
     pub newest_t: i64,
     /// Lowest `t` in this page.
@@ -1340,6 +1352,7 @@ impl Fluree {
 
         let mut commits = Vec::with_capacity(effective_limit);
         let mut blobs: HashMap<String, Base64Bytes> = HashMap::new();
+        let mut missing_blobs: Vec<String> = Vec::new();
         let mut newest_t: Option<i64> = None;
         let mut oldest_t: Option<i64> = None;
         let mut frontier = vec![start_cid];
@@ -1384,14 +1397,30 @@ impl Fluree {
 
             commits.push(Base64Bytes(raw_bytes));
 
-            // Collect referenced txn blob via ContentStore.
+            // Collect referenced txn blob via ContentStore. A missing blob is
+            // a provenance gap, not a chain break: report it and keep going.
             if let Some(ref txn_cid) = env.txn {
                 let txn_key = txn_cid.to_string();
                 if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
-                    let txn_bytes = content_store.get(txn_cid).await.map_err(|e| {
-                        ApiError::internal(format!("failed to read txn blob {txn_key}: {e}"))
-                    })?;
-                    e.insert(Base64Bytes(txn_bytes));
+                    match content_store.get(txn_cid).await {
+                        Ok(txn_bytes) => {
+                            e.insert(Base64Bytes(txn_bytes));
+                        }
+                        Err(fluree_db_core::Error::NotFound(_)) => {
+                            tracing::warn!(
+                                commit = %current_cid,
+                                t,
+                                txn_cid = %txn_key,
+                                "commit references a txn blob that is missing from storage; exporting without it"
+                            );
+                            missing_blobs.push(txn_key);
+                        }
+                        Err(e) => {
+                            return Err(ApiError::internal(format!(
+                                "failed to read txn blob {txn_key}: {e}"
+                            )));
+                        }
+                    }
                 }
             }
 
@@ -1412,6 +1441,7 @@ impl Fluree {
             head_t,
             commits,
             blobs,
+            missing_blobs,
             newest_t: newest_t.unwrap_or(0),
             oldest_t: oldest_t.unwrap_or(0),
             next_cursor_id,
