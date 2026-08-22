@@ -565,8 +565,16 @@ Under the `raft` feature, which gates `openraft`:
 
 - `config` — `FlureeRaftConfig`, the constrained openraft profile every
   group shares (pins `NodeId`, `Node`, `Entry`, `SnapshotData`,
-  `Responder`). Blanket-implemented; applications still write their own
+  `Responder`, `AsyncRuntime`, leaving only `D`/`R` open).
+  Blanket-implemented; applications still write their own
   `declare_raft_types!`.
+- `state_machine` — the application seam: `AppStateMachine` for
+  deterministic reduction, `StateMachineObserver` for effects captured
+  under the state lock and published after it drops, a versioned
+  snapshot codec, and the adapter that drives openraft from the pair
+- `runtime` — `RaftGroup::bootstrap`, `RaftGroupConfig`, and the
+  leader-only task lifecycle (cancellation with bounded graceful
+  shutdown, then abort)
 - `log_adapter` — `LogAdapter<C, S>`, openraft's `RaftLogStorage` over
   the storage traits
 - `network` — `RaftTransportConfig`, the HTTP+postcard RPC client, and a
@@ -575,6 +583,14 @@ Under the `raft` feature, which gates `openraft`:
   `add-learner`, `change-membership`, `status`
 - `forward` — follower→leader middleware, generic over a `LeaderView`
   source rather than tied to `Raft` directly
+
+And under `testing`:
+
+- `testing` — a conformance fixture any openraft state-machine adapter
+  can be run through (snapshot persist-before-swap, boot restore,
+  membership bookkeeping, one response per entry). Deliberately not
+  specific to this crate's adapter: the point is to hold a bespoke
+  adapter to the same contract.
 
 **Depends on**: nothing in the workspace. Without the `raft` feature
 there is no `openraft` dependency either: storage payloads are opaque

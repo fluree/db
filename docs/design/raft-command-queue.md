@@ -29,7 +29,7 @@ The Raft consensus crate (`fluree-db-consensus/src/raft/`) is structured as a se
 | `commit_worker::Worker`             | `commit_worker.rs`                                       | Leader-only. Drains per-branch queues, stages work, proposes `ApplyHead`.                                  |
 | `EvictionScheduler`        | `eviction_scheduler.rs`                                  | Leader-only. Periodically proposes `EvictIdempotency` to age out the cache.                                |
 | `RaftNameService`          | `nameservice.rs`                                         | The replicated `NameService` impl. Reads observe `NameServiceState`; writes propose log entries.            |
-| `WaiterMap`                | `waiter.rs`                                              | Per-process oneshot registry keyed by `queue_id`. Bridges propose and apply.                                |
+| `WaiterMap`                | `waiter.rs`                                              | Per-process registry of *local interest*. Armed by `request_cid` before proposing, bound to a `queue_id` when this node applies the enqueue. Only local proposals are tracked, so a follower's map stays empty. |
 | `StagedReceiptMap`         | `staged_receipt.rs`                                      | Per-process map carrying typed apply receipts (flake counts, tally, conflict resolution) from worker to transactor on the same node. |
 
 Three of these (`commit_worker::Worker`, `EvictionScheduler`, follower-forward middleware) are gated on leadership: the integration's leader watcher spawns / stops them in response to `current_leader()` changes.
@@ -46,15 +46,18 @@ Client → POST /api/transact
    └─ this node is follower → HTTP forward to leader's client_addr
         ↓
 [QueuedTransactor on leader]
-   1. write QueuedRequest envelope to CAS  → envelope_cid
-   2. register oneshot waiter on WaiterMap → rx
-   3. propose Command::EnqueueCommand { envelope_cid, body_hash, kind, idempotency_key? }
+   1. write QueuedRequest envelope to CAS  → request_cid
+   2. arm interest on WaiterMap keyed by request_cid → ticket
+      (before proposing: the queue_id does not exist yet, and arming
+       first is what lets a fast worker's ApplyHead find a waiter)
+   3. propose Command::EnqueueCommand { request_cid, body_hash, kind, idempotency_key? }
         ↓
 [Raft consensus]
    4. leader appends to log, replicates to quorum
    5. on quorum, state machine applies on every node:
         - state.queues[branch].push_back(QueueEntry { queue_id, envelope_cid, ... })
-        - leader records waiter assignment
+        - each node binds any locally-armed interest for request_cid to
+          queue_id; a follower has none, so this is a no-op there
         ↓
 [commit_worker::Worker on leader]
    6. polls state.queues[branch].front()
@@ -68,10 +71,12 @@ Client → POST /api/transact
   12. on quorum, state machine applies on every node:
         - state.refs[branch].head = head_cid
         - state.queues[branch].pop_front()
-        - leader: take StagedReceiptMap[queue_id] → resolve WaiterMap[queue_id] with receipt
+        - take StagedReceiptMap[queue_id] → resolve WaiterMap[queue_id]
+          with the receipt. No local waiter (every follower) → dropped,
+          not buffered
         ↓
 [QueuedTransactor on leader]
-  13. rx returns receipt → return to client
+  13. ticket.wait() returns the receipt → return to client
         ↓
 [follower-forward middleware (if forwarded)]
   14. relay response verbatim to client
