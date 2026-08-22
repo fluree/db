@@ -260,7 +260,7 @@ impl RaftIntegration {
             );
         }
 
-        let http_client = raft_network::build_client(&config.network_config.transport)?;
+        let http_client = raft_network::build_client(&config.network_config.http_client)?;
         let network_config = config.network_config.clone();
         let factory = HttpRaftNetworkFactory::with_client(
             http_client.clone(),

@@ -2696,7 +2696,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -3386,6 +3385,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "xxhash-rust",
 ]

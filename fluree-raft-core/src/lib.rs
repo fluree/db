@@ -24,17 +24,32 @@
 //! - [`http`] — hop-by-hop header classification for request
 //!   forwarding.
 //!
+//! Under the `raft` feature, which gates `openraft`:
+//!
+//! - [`config`] — [`FlureeRaftConfig`], the constrained openraft profile
+//!   every group shares. Applications still write their own
+//!   `declare_raft_types!`; a blanket impl covers what it produces.
+//! - [`state_machine`] — the application seam: deterministic reduction
+//!   in `AppStateMachine`, effects in `StateMachineObserver`, and the
+//!   adapter that drives openraft from the pair.
+//! - [`log_adapter`], [`network`], [`admin`], [`forward`] — the
+//!   openraft-facing adapters: log storage, HTTP transport, membership
+//!   administration, and follower→leader forwarding.
+//! - [`runtime`] — group bootstrap and the leader-only task lifecycle.
+//!
+//! And under `testing`, [`testing`] — a conformance fixture any
+//! `AppStateMachine` can be run through.
+//!
 //! ## What is deliberately not here
 //!
-//! No `openraft` dependency. The current surface does not need one:
-//! storage payloads are opaque bytes, and [`ClusterNode`] satisfies
-//! openraft's blanket `Node` impl through its derives alone. The
-//! openraft-facing adapters (log storage, HTTP transport, membership
-//! admin, leader forwarding, the state-machine seam) land here next;
-//! until then this crate compiles for consumers that only want its
-//! storage or hashing pieces.
-//!
 //! No `fluree-db-*` dependency, and no domain types.
+//!
+//! Without the `raft` feature there is no `openraft` dependency either:
+//! storage payloads are opaque bytes and [`ClusterNode`] satisfies
+//! openraft's blanket `Node` impl through its derives alone. That is
+//! what keeps monolithic Fluree builds — which reach this crate through
+//! `fluree-db-consensus` for [`http::is_hop_by_hop`] — from compiling or
+//! linking openraft.
 
 pub mod group;
 pub mod http;

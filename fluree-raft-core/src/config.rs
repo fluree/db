@@ -1,11 +1,12 @@
 //! The constrained openraft profile every Fluree Raft group shares.
 //!
-//! openraft's [`RaftTypeConfig`] leaves eight associated types open. The
+//! openraft's [`RaftTypeConfig`](openraft::RaftTypeConfig) leaves eight
+//! associated types open. The
 //! adapters in this crate do not need that much freedom, and threading
 //! the full set of bounds through every `impl` makes each one unreadable.
-//! [`FlureeRaftConfig`] pins the four that are genuinely fixed across all
-//! Fluree groups and leaves `D`, `R`, `AsyncRuntime`, and `Responder` to
-//! the application.
+//! [`FlureeRaftConfig`] pins the five that are genuinely fixed across all
+//! Fluree groups, leaving only `D` and `R` — the application's command
+//! and response — to the application.
 //!
 //! Each application still writes its own `declare_raft_types!`; this trait
 //! is a bound, not a replacement. The blanket impl means a type config
@@ -46,6 +47,14 @@
 //!   is what `declare_raft_types!` defaults to, so pinning it costs
 //!   applications nothing and buys a comprehensible error when someone
 //!   overrides it.
+//! - `AsyncRuntime = TokioRuntime` — openraft drives network and storage
+//!   futures on `C::AsyncRuntime`, and everything this crate supplies to
+//!   it is Tokio-bound: `reqwest` for the transport, `tokio::fs` for the
+//!   filesystem backend, `tokio::spawn` for leader tasks. Leaving the
+//!   runtime open would let a config compile and then panic at runtime
+//!   on the first IO. A different runtime is a real thing to want, but
+//!   it needs its own transport and storage backends first — at which
+//!   point this pin is the right place to relax.
 //!
 //! `D` and `R` already carry `Serialize + DeserializeOwned` through
 //! openraft's `AppData` / `AppDataResponse` supertraits under the `serde`
@@ -64,6 +73,7 @@ pub trait FlureeRaftConfig:
     Entry = openraft::Entry<Self>,
     SnapshotData = Cursor<Vec<u8>>,
     Responder = OneshotResponder<Self>,
+    AsyncRuntime = openraft::TokioRuntime,
 >
 {
 }
@@ -75,6 +85,7 @@ impl<C> FlureeRaftConfig for C where
         Entry = openraft::Entry<C>,
         SnapshotData = Cursor<Vec<u8>>,
         Responder = OneshotResponder<C>,
+        AsyncRuntime = openraft::TokioRuntime,
     >
 {
 }

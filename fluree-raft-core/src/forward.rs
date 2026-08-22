@@ -1,17 +1,18 @@
 //! Follower-forwarding middleware for leader-only client requests.
 //!
-//! Only the Raft leader can accept [`Committer`](crate::Committer)
-//! writes (the state machine's `AdvanceRef` proposal has to
-//! originate there). When a client load balancer happens to land on
-//! a follower for `POST /api/transact` (or any other leader-only
-//! route), the follower transparently HTTP-forwards the request to
-//! the leader and relays the leader's response back. From the
-//! client's perspective it's a single round-trip; the extra hop
-//! lives entirely inside the cluster (VPC-internal, fast).
+//! Only the leader can propose, so any route that ends in a proposal
+//! is leader-only. When a client load balancer lands on a follower for
+//! one of those routes, the follower transparently HTTP-forwards the
+//! request to the leader and relays the response back. From the
+//! client's perspective it is a single round-trip; the extra hop stays
+//! inside the cluster.
 //!
 //! This module gives you the primitives:
 //!
-//! - [`LeaderForwarder`]: per-node state — the Raft handle, this
+//! - [`LeaderView`]: what the routing decision actually needs — who
+//!   leads, and the membership addresses. Implemented for
+//!   `openraft::Raft<C>`, so production wiring is a no-op.
+//! - [`LeaderForwarder`]: per-node state — a [`LeaderView`], this
 //!   node's id, and a pooled `reqwest::Client`.
 //! - [`forward_to_leader`]: an axum middleware that intercepts a
 //!   request, checks leadership, and either calls `next.run(...)`
@@ -21,13 +22,13 @@
 //!
 //! # Resolving the leader's client URL
 //!
-//! [`ClusterNode`](crate::raft::ClusterNode) — the type config's
+//! [`ClusterNode`] — the type config's
 //! `Node` — carries both `raft_addr` (the inter-node RPC URL) and
 //! `client_addr` (the client-facing URL). The membership openraft
 //! replicates therefore already contains every voter's and
 //! learner's client URL; the forwarder reads it from the current
 //! membership snapshot on each request, so a peer added at runtime
-//! via [`super::admin::RaftAdmin::add_learner`] is immediately
+//! via [`crate::admin::RaftAdmin::add_learner`] is immediately
 //! reachable for forwarding on every other node — no restart.
 
 use crate::config::FlureeRaftConfig;
@@ -326,8 +327,9 @@ enum ForwardDecision {
 
 /// Axum middleware: if this node is the leader, fall through to the
 /// inner handler; otherwise forward the request to the leader's
-/// client port and return its response verbatim. Mount it as a
-/// layer over the leader-only routes (transact, branch admin, etc.).
+/// client port and return its response verbatim. Mount it as a layer
+/// over the routes that end in a proposal — leave read-only routes off
+/// it, since any node can serve those from its local state.
 ///
 /// Example:
 /// ```ignore
@@ -336,7 +338,7 @@ enum ForwardDecision {
 ///
 /// let forwarder = Arc::new(LeaderForwarder::new(raft, id, client));
 /// let app = Router::new()
-///     .route("/api/transact", axum::routing::post(transact_handler))
+///     .route("/write", axum::routing::post(write_handler))
 ///     .layer(middleware::from_fn_with_state(forwarder, forward_to_leader));
 /// ```
 pub async fn forward_to_leader<L: LeaderView>(

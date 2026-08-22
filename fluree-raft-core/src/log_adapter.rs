@@ -12,7 +12,7 @@
 //! concrete, because `NodeId` is pinned to `u64` by the profile.
 //!
 //! The log entry payload — an [`openraft::Entry<C>`] — is serialized
-//! via postcard to bytes for storage in [`LogEntry`] and deserialized
+//! via postcard to bytes for storage in [`OurLogEntry`] and deserialized
 //! back on read. Round-tripping costs one allocation per entry;
 //! entries are small so this isn't on a hot path.
 

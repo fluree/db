@@ -14,16 +14,20 @@
 use std::time::Duration;
 
 pub use fluree_raft_core::network::{
-    build_client, router, HttpRaftNetwork, HttpRaftNetworkFactory, RaftTransportConfig,
+    build_client, router, HttpClientConfig, HttpRaftNetwork, HttpRaftNetworkFactory,
+    RaftTransportConfig,
 };
 
 /// Transport tuning for a nameservice Raft group: the generic
 /// [`RaftTransportConfig`] plus this crate's own cross-node RPCs.
 #[derive(Clone, Debug)]
 pub struct NetworkConfig {
-    /// Knobs shared by every Raft group — timeouts and the body caps
-    /// for openraft's own three routes plus leader forwarding.
+    /// Knobs shared by every Raft group — per-request timeouts and the
+    /// body caps for openraft's own three routes plus leader forwarding.
     pub transport: RaftTransportConfig,
+    /// Settings baked into the shared `reqwest::Client`. Process-level:
+    /// they cannot vary between groups sharing one client.
+    pub http_client: HttpClientConfig,
     /// Per-request timeout for the worker-initiated cross-node
     /// `apply_staged_commit` / `apply_queue_poison` forwards.
     /// Larger than [`RaftTransportConfig::rpc_timeout`] because the
@@ -55,6 +59,7 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             transport: RaftTransportConfig::default(),
+            http_client: HttpClientConfig::default(),
             cross_node_propose_timeout: Duration::from_secs(10),
             apply_staged_commit_max_body_bytes: 16 * 1024 * 1024,
             apply_queue_poison_max_body_bytes: 1024 * 1024,

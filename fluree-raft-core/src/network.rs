@@ -78,9 +78,6 @@ pub struct RaftTransportConfig {
     /// Per-request timeout for install-snapshot. Snapshots can be
     /// large; size this larger than `rpc_timeout`.
     pub snapshot_timeout: Duration,
-    /// HTTP connect timeout. Independent of the request timeout so a
-    /// dead peer fails fast rather than blocking the replication tick.
-    pub connect_timeout: Duration,
     /// Maximum buffered body size accepted on the `vote` route.
     /// `VoteRequest` is a fixed-size record (a few dozen postcard-
     /// encoded bytes); a tighter cap than the other two RPCs keeps a
@@ -115,11 +112,36 @@ impl Default for RaftTransportConfig {
         Self {
             rpc_timeout: Duration::from_millis(500),
             snapshot_timeout: Duration::from_secs(30),
-            connect_timeout: Duration::from_millis(250),
             vote_max_body_bytes: 1024 * 1024,
             append_entries_max_body_bytes: 64 * 1024 * 1024,
             install_snapshot_max_body_bytes: 1024 * 1024 * 1024,
             forward_max_body_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+/// Settings baked into the shared `reqwest::Client`.
+///
+/// Separate from [`RaftTransportConfig`] because these are properties
+/// of the *client*, not of a request: once a client exists they cannot
+/// vary per group. Keeping them on their own struct means a co-hosted
+/// deployment configures them once, rather than each group declaring a
+/// connect timeout and silently getting whichever group's value
+/// happened to build the shared client.
+#[derive(Clone, Debug)]
+pub struct HttpClientConfig {
+    /// TCP connect timeout. Independent of the per-request timeout so a
+    /// dead peer fails fast rather than blocking the replication tick.
+    pub connect_timeout: Duration,
+    /// How long an idle pooled connection is kept before being closed.
+    pub pool_idle_timeout: Duration,
+}
+
+impl Default for HttpClientConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_millis(250),
+            pool_idle_timeout: Duration::from_secs(90),
         }
     }
 }
@@ -151,11 +173,17 @@ impl<C> Clone for HttpRaftNetworkFactory<C> {
 }
 
 impl<C> HttpRaftNetworkFactory<C> {
-    /// Construct with a fresh `reqwest::Client` configured against
-    /// `config`'s timeouts. Errors only if the reqwest builder
-    /// rejects the configuration (very rare).
-    pub fn new(config: RaftTransportConfig) -> Result<Self, reqwest::Error> {
-        let client = build_client(&config)?;
+    /// Construct with a fresh `reqwest::Client`. Prefer
+    /// [`Self::with_client`] when the process hosts more than one group,
+    /// so they share a connection pool.
+    ///
+    /// Errors only if the reqwest builder rejects the configuration
+    /// (very rare).
+    pub fn new(
+        config: RaftTransportConfig,
+        client_config: &HttpClientConfig,
+    ) -> Result<Self, reqwest::Error> {
+        let client = build_client(client_config)?;
         Ok(Self {
             client,
             config,
@@ -175,19 +203,18 @@ impl<C> HttpRaftNetworkFactory<C> {
     }
 }
 
-/// Build a `reqwest::Client` configured for raft HTTP transport:
-/// `config`'s connect timeout, a 90 s pool idle timeout, and redirects
-/// disabled (closes SSRF via 302 to internal addresses such as the EC2
-/// instance-metadata service).
+/// Build a `reqwest::Client` configured for raft HTTP transport, with
+/// redirects disabled — which closes SSRF via a 302 to an internal
+/// address such as a cloud instance-metadata endpoint.
 ///
 /// Free rather than an associated function on the factory: the client
 /// is independent of the type config, and one client is meant to be
 /// shared across every group in the process. Making callers name a `C`
 /// just to build it would imply otherwise.
-pub fn build_client(config: &RaftTransportConfig) -> Result<reqwest::Client, reqwest::Error> {
+pub fn build_client(config: &HttpClientConfig) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .connect_timeout(config.connect_timeout)
-        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .pool_idle_timeout(Some(config.pool_idle_timeout))
         .redirect(reqwest::redirect::Policy::none())
         .build()
 }
@@ -703,8 +730,11 @@ mod tests {
 
     #[test]
     fn factory_builds_with_default_config() {
-        let _ = HttpRaftNetworkFactory::<TestConfig>::new(RaftTransportConfig::default())
-            .expect("reqwest client builds with default timeouts");
+        let _ = HttpRaftNetworkFactory::<TestConfig>::new(
+            RaftTransportConfig::default(),
+            &HttpClientConfig::default(),
+        )
+        .expect("reqwest client builds with default timeouts");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::admin::{self, RaftAdmin};
 use crate::config::FlureeRaftConfig;
 use crate::group::GroupId;
 use crate::log_adapter::LogAdapter;
-use crate::network::{self, RaftTransportConfig};
+use crate::network::{self, HttpClientConfig, RaftTransportConfig};
 use crate::node::NodeId;
 use crate::state_machine::{
     AppStateMachine, SharedState, StateMachineAdapter, StateMachineObserver,
@@ -50,8 +50,15 @@ pub struct RaftGroupConfig {
     /// openraft tuning. [`default_raft_config`] derives a safe one from
     /// the transport settings.
     pub raft: RaftConfig,
-    /// Inter-node HTTP transport tuning.
+    /// Inter-node HTTP transport tuning: timeouts and body caps applied
+    /// per request, so these may differ between co-hosted groups.
     pub transport: RaftTransportConfig,
+    /// Settings for the HTTP client this group builds *if it builds its
+    /// own*. Ignored when a client is supplied through
+    /// [`RaftGroup::bootstrap_with_client`], because those settings are
+    /// baked in at client construction and cannot vary per group — which
+    /// is exactly why they live on their own struct.
+    pub http_client: HttpClientConfig,
 }
 
 impl RaftGroupConfig {
@@ -64,6 +71,7 @@ impl RaftGroupConfig {
             storage_root: storage_root.into(),
             raft: default_raft_config(&transport),
             transport,
+            http_client: HttpClientConfig::default(),
         }
     }
 
@@ -165,7 +173,13 @@ pub struct RaftGroup<A: AppStateMachine> {
 }
 
 impl<A: AppStateMachine> RaftGroup<A> {
-    /// Assemble a group over an already-opened storage backend.
+    /// Assemble a group over an already-opened storage backend, building
+    /// a dedicated HTTP client from
+    /// [`RaftGroupConfig::http_client`](RaftGroupConfig).
+    ///
+    /// A process hosting several groups should build one client and use
+    /// [`Self::bootstrap_with_client`] instead, so the groups share a
+    /// connection pool rather than opening one each to every peer.
     ///
     /// The returned node belongs to no cluster yet. An operator then
     /// either initializes it (one node, once, forming a fresh cluster —
@@ -190,8 +204,11 @@ impl<A: AppStateMachine> RaftGroup<A> {
 
     /// As [`Self::bootstrap`], reusing an existing HTTP client.
     ///
-    /// Co-hosted groups should share one client so they share a
-    /// connection pool rather than opening N to every peer.
+    /// The client's own settings — connect and pool-idle timeouts —
+    /// come from whatever [`HttpClientConfig`] built it;
+    /// [`RaftGroupConfig::http_client`](RaftGroupConfig) is unused on
+    /// this path. Per-request timeouts and body caps still come from
+    /// this group's [`RaftTransportConfig`].
     pub async fn bootstrap_with_client<O, S>(
         config: RaftGroupConfig,
         storage: Arc<S>,
@@ -217,7 +234,7 @@ impl<A: AppStateMachine> RaftGroup<A> {
 
         let client = match client {
             Some(c) => c,
-            None => network::build_client(&config.transport)?,
+            None => network::build_client(&config.http_client)?,
         };
         let factory =
             network::HttpRaftNetworkFactory::with_client(client.clone(), config.transport.clone());

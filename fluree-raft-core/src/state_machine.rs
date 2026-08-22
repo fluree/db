@@ -100,7 +100,7 @@ impl SnapshotCodecError {
 /// to tell an old snapshot from a corrupt one. This prefixes a magic
 /// tag and an explicit `u16` version, so a node that meets a snapshot it
 /// cannot read says so precisely, and an application that wants to
-/// migrate can branch on [`peek_version`].
+/// migrate can branch on [`codec::peek_version`].
 ///
 /// Layout: `b"FRCS"` ++ `u16` little-endian version ++ postcard body.
 pub mod codec {

@@ -11,11 +11,10 @@ repository.workspace = true
 # consumer (the nameservice group today; workflow / entity-resolution
 # groups next) instantiates it against its own state machine.
 #
-# Also, deliberately, no `openraft` dependency yet. Nothing in this
-# crate's current surface needs one: the storage traits are defined in
-# terms of opaque `Vec<u8>` payloads, and `ClusterNode` satisfies
-# openraft's blanket `Node` impl through its derives alone. openraft
-# arrives with the log/network/admin adapters.
+# `openraft` is gated behind the `raft` feature. Without it the storage
+# traits (opaque `Vec<u8>` payloads), node/group identity, and rendezvous
+# ownership all compile on their own — which is what keeps monolithic
+# Fluree builds from linking openraft.
 
 [features]
 default = []
