@@ -42,5 +42,19 @@ pub mod node;
 pub mod ownership;
 pub mod storage;
 
+#[cfg(feature = "raft")]
+pub mod admin;
+#[cfg(feature = "raft")]
+pub mod config;
+#[cfg(feature = "raft")]
+pub mod forward;
+#[cfg(feature = "raft")]
+pub mod log_adapter;
+#[cfg(feature = "raft")]
+pub mod network;
+
 pub use group::{GroupId, GroupIdError};
 pub use node::{ClusterNode, NodeId};
+
+#[cfg(feature = "raft")]
+pub use config::FlureeRaftConfig;

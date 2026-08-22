@@ -561,13 +561,37 @@ began inside `fluree-db-consensus::raft`.
   without a consensus round
 - `http` — hop-by-hop header classification for request forwarding
 
-**Depends on**: nothing in the workspace. Deliberately no `openraft`
-dependency either: storage payloads are opaque bytes, and `ClusterNode`
-satisfies openraft's blanket `Node` bound through its derives alone.
+Under the `raft` feature, which gates `openraft`:
+
+- `config` — `FlureeRaftConfig`, the constrained openraft profile every
+  group shares (pins `NodeId`, `Node`, `Entry`, `SnapshotData`,
+  `Responder`). Blanket-implemented; applications still write their own
+  `declare_raft_types!`.
+- `log_adapter` — `LogAdapter<C, S>`, openraft's `RaftLogStorage` over
+  the storage traits
+- `network` — `RaftTransportConfig`, the HTTP+postcard RPC client, and a
+  **relative** router for `append-entries` / `vote` / `install-snapshot`
+- `admin` — `RaftAdmin<C>` and a relative router for `initialize`,
+  `add-learner`, `change-membership`, `status`
+- `forward` — follower→leader middleware, generic over a `LeaderView`
+  source rather than tied to `Raft` directly
+
+**Depends on**: nothing in the workspace. Without the `raft` feature
+there is no `openraft` dependency either: storage payloads are opaque
+bytes, and `ClusterNode` satisfies openraft's blanket `Node` bound
+through its derives alone. That keeps monolithic Fluree builds — which
+reach this crate through `fluree-db-consensus` for `http::is_hop_by_hop`
+— from compiling or linking openraft.
 
 **Note**: `ownership`'s hash is effectively a wire format — nodes compute
 ownership locally and independently, so two nodes that disagree can both
 claim the same key. See the module docs before touching it.
+
+**Routing**: the `network` and `admin` routers carry no prefix of their
+own. The host nests them — at `/raft` and `/cluster` for a single group,
+or under a `GroupId` when several share a process — which is what lets an
+existing group keep the paths already recorded in its replicated
+membership.
 
 ### fluree-db-consensus
 

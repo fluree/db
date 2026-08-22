@@ -95,12 +95,9 @@
 //! the load-bearing assumption is intentionally not duplicated
 //! per-endpoint.
 
-pub mod admin;
 pub mod commit_worker;
 pub mod eviction_scheduler;
-pub mod forward;
 pub mod liveness_monitor;
-pub mod log_adapter;
 pub mod nameservice;
 pub mod network;
 pub mod ownership;
@@ -115,6 +112,9 @@ pub use state_machine::{Command, Response};
 // Moved to `fluree-raft-core`. Re-exported at their historical
 // paths so downstream `fluree_db_consensus::raft::storage::...`,
 // `::NodeId`, and `::ClusterNode` imports keep resolving.
+pub use fluree_raft_core::admin;
+pub use fluree_raft_core::forward;
+pub use fluree_raft_core::log_adapter;
 pub use fluree_raft_core::storage;
 pub use fluree_raft_core::{ClusterNode, NodeId};
 

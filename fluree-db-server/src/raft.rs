@@ -69,7 +69,7 @@ pub struct RaftIntegration {
     pub id: NodeId,
     /// Follower-forward middleware state. Cloned into the
     /// client-facing router's middleware layer.
-    pub forwarder: Arc<LeaderForwarder>,
+    pub forwarder: Arc<LeaderForwarder<Raft<TypeConfig>>>,
     /// Shared replicated state-machine handle. Hand off to a
     /// `RaftNameService` for follower-side read paths so they observe
     /// committed log state without going through the openraft RPC
@@ -164,7 +164,7 @@ impl RaftIntegration {
         } = transport;
         let forwarder = Arc::new(
             LeaderForwarder::new(Arc::clone(&raft), id, http_client.clone())
-                .with_max_body_bytes(network_config.forward_max_body_bytes),
+                .with_max_body_bytes(network_config.transport.forward_max_body_bytes),
         );
         let nameservice = Arc::new(
             RaftNameService::new(shared_state.clone(), Arc::clone(&raft))
@@ -249,7 +249,7 @@ impl RaftIntegration {
         // an operator who has deliberately tuned for a fast link isn't
         // hard-blocked; `default_raft_config` keeps the shipped default
         // safe.
-        let rpc_timeout_ms = config.network_config.rpc_timeout.as_millis() as u64;
+        let rpc_timeout_ms = config.network_config.transport.rpc_timeout.as_millis() as u64;
         if raft_cfg.election_timeout_min <= rpc_timeout_ms {
             tracing::warn!(
                 election_timeout_min = raft_cfg.election_timeout_min,
@@ -260,10 +260,12 @@ impl RaftIntegration {
             );
         }
 
-        let http_client = HttpRaftNetworkFactory::build_client(&config.network_config)?;
+        let http_client = raft_network::build_client(&config.network_config.transport)?;
         let network_config = config.network_config.clone();
-        let factory =
-            HttpRaftNetworkFactory::with_client(http_client.clone(), config.network_config);
+        let factory = HttpRaftNetworkFactory::with_client(
+            http_client.clone(),
+            config.network_config.transport,
+        );
 
         let raft = Raft::new(config.node_id, raft_cfg, factory, log, sm).await?;
 
@@ -297,7 +299,7 @@ impl RaftIntegration {
     /// and `apply_queue_poison` endpoints follower-owned workers
     /// POST to.
     pub fn raft_rpc_router(&self) -> Router {
-        raft_network::router(Arc::clone(&self.raft), &self.network_config)
+        raft_network::router(Arc::clone(&self.raft), &self.network_config.transport)
             .merge(apply_staged_commit_router(
                 Arc::clone(&self.nameservice),
                 &self.network_config,
@@ -409,7 +411,7 @@ impl RaftBootstrapConfig {
 /// at runtime so an override of *either* config that breaks it is
 /// caught even when this constructor isn't used.
 fn default_raft_config(network: &NetworkConfig) -> RaftConfig {
-    let rpc_ms = network.rpc_timeout.as_millis() as u64;
+    let rpc_ms = network.transport.rpc_timeout.as_millis() as u64;
     let election_timeout_min = rpc_ms.saturating_mul(2).max(750);
     RaftConfig {
         election_timeout_min,

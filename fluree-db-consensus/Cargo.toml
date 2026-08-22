@@ -11,7 +11,7 @@ default = []
 # Enables the Raft-replicated `Committer` implementation. Off by default
 # so that monolithic users don't compile (or link) openraft and its
 # transitive dependencies.
-raft = ["dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum", "dep:http-body-util", "dep:futures", "dep:xxhash-rust", "dep:tokio-util"]
+raft = ["fluree-raft-core/raft", "dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum", "dep:http-body-util", "dep:futures", "dep:xxhash-rust", "dep:tokio-util"]
 
 [dependencies]
 fluree-db-api = { path = "../fluree-db-api" }

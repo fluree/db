@@ -29,7 +29,8 @@
 //! ACL); embedders can layer their own auth on top of the returned
 //! [`axum::Router`].
 
-use crate::raft::{ClusterNode, NodeId, TypeConfig};
+use crate::config::FlureeRaftConfig;
+use crate::node::{ClusterNode, NodeId};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -159,16 +160,16 @@ pub enum AdminError {
 
 /// Admin surface for cluster bootstrap and membership changes.
 ///
-/// Cheap to construct from the same `Arc<Raft<TypeConfig>>` that
-/// [`super::RaftCommitter`] holds. Multiple instances can share the
-/// underlying handle safely.
+/// Cheap to construct from the same `Arc<Raft<C>>` the application
+/// already holds. Multiple instances can share the underlying handle
+/// safely.
 #[derive(Clone)]
-pub struct RaftAdmin {
-    raft: Arc<Raft<TypeConfig>>,
+pub struct RaftAdmin<C: FlureeRaftConfig> {
+    raft: Arc<Raft<C>>,
 }
 
-impl RaftAdmin {
-    pub fn new(raft: Arc<Raft<TypeConfig>>) -> Self {
+impl<C: FlureeRaftConfig> RaftAdmin<C> {
+    pub fn new(raft: Arc<Raft<C>>) -> Self {
         Self { raft }
     }
 
@@ -276,7 +277,8 @@ fn map_client_write_err(
 // HTTP router
 // ============================================================================
 
-/// Build an `axum::Router` exposing the admin endpoints against the
+/// Build a **relative** `axum::Router` exposing the admin endpoints
+/// against the
 /// supplied [`Raft`] handle. Mount on the **private** listener
 /// (same one [`super::network::router`] is mounted on) — never on
 /// the public client-facing port.
@@ -286,12 +288,12 @@ fn map_client_write_err(
 /// - `POST <base>/add-learner`
 /// - `POST <base>/change-membership`
 /// - `GET  <base>/status`
-pub fn router(raft: Arc<Raft<TypeConfig>>) -> Router {
+pub fn router<C: FlureeRaftConfig>(raft: Arc<Raft<C>>) -> Router {
     Router::new()
-        .route("/initialize", post(handle_initialize))
-        .route("/add-learner", post(handle_add_learner))
-        .route("/change-membership", post(handle_change_membership))
-        .route("/status", get(handle_status))
+        .route("/initialize", post(handle_initialize::<C>))
+        .route("/add-learner", post(handle_add_learner::<C>))
+        .route("/change-membership", post(handle_change_membership::<C>))
+        .route("/status", get(handle_status::<C>))
         .with_state(RaftAdmin::new(raft))
 }
 
@@ -305,8 +307,8 @@ fn admin_error_response(err: AdminError) -> Response {
     (status, body).into_response()
 }
 
-async fn handle_initialize(
-    State(admin): State<RaftAdmin>,
+async fn handle_initialize<C: FlureeRaftConfig>(
+    State(admin): State<RaftAdmin<C>>,
     Json(req): Json<InitializeRequest>,
 ) -> Response {
     match admin.initialize(req.members).await {
@@ -315,8 +317,8 @@ async fn handle_initialize(
     }
 }
 
-async fn handle_add_learner(
-    State(admin): State<RaftAdmin>,
+async fn handle_add_learner<C: FlureeRaftConfig>(
+    State(admin): State<RaftAdmin<C>>,
     Json(req): Json<AddLearnerRequest>,
 ) -> Response {
     match admin
@@ -328,8 +330,8 @@ async fn handle_add_learner(
     }
 }
 
-async fn handle_change_membership(
-    State(admin): State<RaftAdmin>,
+async fn handle_change_membership<C: FlureeRaftConfig>(
+    State(admin): State<RaftAdmin<C>>,
     Json(req): Json<ChangeMembershipRequest>,
 ) -> Response {
     match admin.change_membership(req.members, req.retain).await {
@@ -338,7 +340,7 @@ async fn handle_change_membership(
     }
 }
 
-async fn handle_status(State(admin): State<RaftAdmin>) -> Response {
+async fn handle_status<C: FlureeRaftConfig>(State(admin): State<RaftAdmin<C>>) -> Response {
     let status = admin.status();
     (StatusCode::OK, Json(status)).into_response()
 }

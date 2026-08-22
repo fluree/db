@@ -17,6 +17,16 @@ repository.workspace = true
 # openraft's blanket `Node` impl through its derives alone. openraft
 # arrives with the log/network/admin adapters.
 
+[features]
+default = []
+# Gates `openraft` and the adapters built on it (log storage, HTTP
+# transport, membership admin, leader forwarding). Off by default so
+# consumers that only want the storage traits, node/group identity, or
+# rendezvous ownership — and monolithic Fluree builds, which reach this
+# crate through `fluree-db-consensus` for `http::is_hop_by_hop` — do not
+# compile or link openraft.
+raft = ["dep:openraft", "dep:axum", "dep:reqwest", "dep:http-body-util"]
+
 [dependencies]
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -35,6 +45,21 @@ tokio = { workspace = true }
 # must agree on hash values, so this cannot be `std`'s randomly-seeded
 # `DefaultHasher`. xxh64 is stable across releases of the crate.
 xxhash-rust = { workspace = true, features = ["xxh64"] }
+
+# Gated behind `raft` — only the openraft-facing adapters need these.
+# Pinned to a current release line; bumping should be tracked alongside
+# any state-machine / storage-format changes.
+openraft = { version = "0.9", optional = true, features = [
+    "serde",
+    "storage-v2",
+    "single-term-leader",
+] }
+# HTTP server for the inter-node RPC layer; consumers nest the returned
+# `axum::Router` under whatever path they want.
+axum = { workspace = true, optional = true }
+# HTTP client for the same layer, and for follower->leader forwarding.
+reqwest = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

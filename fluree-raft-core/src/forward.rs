@@ -30,9 +30,11 @@
 //! via [`super::admin::RaftAdmin::add_learner`] is immediately
 //! reachable for forwarding on every other node — no restart.
 
+use crate::config::FlureeRaftConfig;
 use crate::http::is_hop_by_hop;
-use crate::raft::network::NetworkConfig;
-use crate::raft::{ClusterNode, NodeId, TypeConfig};
+use crate::network::RaftTransportConfig;
+use crate::node::{ClusterNode, NodeId};
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -74,32 +76,77 @@ const MAX_FORWARD_HOPS: u32 = 2;
 // State
 // ============================================================================
 
+/// What [`LeaderForwarder`] needs to know about the cluster.
+///
+/// Implemented for `openraft::Raft<C>`, which is what every group uses
+/// in production. It exists as a trait so forwarding can be exercised
+/// without standing up a Raft instance — the decision logic (leader
+/// resolution, the SSRF guard, loopback detection) is the part most
+/// worth testing, and it has nothing to do with consensus.
+#[async_trait]
+pub trait LeaderView: Send + Sync + 'static {
+    /// Currently-known leader id. `None` during an election.
+    async fn current_leader(&self) -> Option<NodeId>;
+
+    /// Every known member with its address pair, from the local
+    /// membership snapshot.
+    fn membership_nodes(&self) -> Vec<(NodeId, ClusterNode)>;
+}
+
+#[async_trait]
+impl<C: FlureeRaftConfig> LeaderView for Raft<C> {
+    async fn current_leader(&self) -> Option<NodeId> {
+        Raft::current_leader(self).await
+    }
+
+    fn membership_nodes(&self) -> Vec<(NodeId, ClusterNode)> {
+        self.metrics()
+            .borrow()
+            .membership_config
+            .nodes()
+            .map(|(id, node)| (*id, node.clone()))
+            .collect()
+    }
+}
+
 /// Per-node forwarding state, mounted as axum middleware state.
-#[derive(Clone)]
-pub struct LeaderForwarder {
-    raft: Arc<Raft<TypeConfig>>,
+pub struct LeaderForwarder<L: LeaderView> {
+    raft: Arc<L>,
     id: NodeId,
     client: reqwest::Client,
     /// Upper bound on the request body buffered before relaying —
     /// a follower shouldn't be coerced into allocating arbitrary
     /// memory by a hostile caller. Bodies beyond the cap are
     /// refused with 413 Payload Too Large before any relay. See
-    /// [`NetworkConfig::forward_max_body_bytes`] for how to size it.
+    /// [`RaftTransportConfig::forward_max_body_bytes`] for how to size it.
     max_body_bytes: usize,
 }
 
-impl LeaderForwarder {
-    pub fn new(raft: Arc<Raft<TypeConfig>>, id: NodeId, client: reqwest::Client) -> Self {
+// Hand-written: `#[derive(Clone)]` would demand `L: Clone`, but `L` is
+// only ever held behind an `Arc`.
+impl<L: LeaderView> Clone for LeaderForwarder<L> {
+    fn clone(&self) -> Self {
+        Self {
+            raft: Arc::clone(&self.raft),
+            id: self.id,
+            client: self.client.clone(),
+            max_body_bytes: self.max_body_bytes,
+        }
+    }
+}
+
+impl<L: LeaderView> LeaderForwarder<L> {
+    pub fn new(raft: Arc<L>, id: NodeId, client: reqwest::Client) -> Self {
         Self {
             raft,
             id,
             client,
-            max_body_bytes: NetworkConfig::default().forward_max_body_bytes,
+            max_body_bytes: RaftTransportConfig::default().forward_max_body_bytes,
         }
     }
 
     /// Cap the request body buffered before relaying (see
-    /// [`NetworkConfig::forward_max_body_bytes`]).
+    /// [`RaftTransportConfig::forward_max_body_bytes`]).
     pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
         self.max_body_bytes = max_body_bytes;
         self
@@ -123,14 +170,7 @@ impl LeaderForwarder {
         if leader_id == self.id {
             return ForwardDecision::Local;
         }
-        let nodes: Vec<(NodeId, ClusterNode)> = self
-            .raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .nodes()
-            .map(|(id, node)| (*id, node.clone()))
-            .collect();
+        let nodes: Vec<(NodeId, ClusterNode)> = self.raft.membership_nodes();
         let allow_loopback = nodes
             .iter()
             .find(|(id, _)| *id == self.id)
@@ -182,7 +222,12 @@ impl LeaderForwarder {
 /// a literal SSRF address into the membership record; an active
 /// adversary controlling DNS for cluster hostnames is out of scope
 /// of this check and needs to be addressed at a different layer.
-pub(crate) fn is_valid_leader_url(url: &str, allow_loopback: bool) -> bool {
+///
+/// Public because applications that relay to the leader over their own
+/// RPCs (rather than through [`forward_to_leader`]) need the same guard
+/// on the same membership-sourced URLs; a second, drifting copy of this
+/// check is exactly what should not happen.
+pub fn is_valid_leader_url(url: &str, allow_loopback: bool) -> bool {
     match url_host(url) {
         Some(host) => !is_ssrf_host(&host, allow_loopback),
         None => false,
@@ -192,7 +237,7 @@ pub(crate) fn is_valid_leader_url(url: &str, allow_loopback: bool) -> bool {
 /// True iff this node's own reported `client_addr` is on loopback
 /// (or the literal `"localhost"`). The forwarder uses this to opt
 /// into accepting loopback peer URLs — see [`is_valid_leader_url`].
-pub(crate) fn self_addr_is_loopback(url: &str) -> bool {
+pub fn self_addr_is_loopback(url: &str) -> bool {
     url_host(url).is_some_and(|h| is_loopback_host(&h))
 }
 
@@ -260,6 +305,7 @@ fn is_ssrf_host(host: &str, allow_loopback: bool) -> bool {
     }
 }
 
+#[derive(Debug)]
 enum ForwardDecision {
     /// This node is the leader — process locally.
     Local,
@@ -293,8 +339,8 @@ enum ForwardDecision {
 ///     .route("/api/transact", axum::routing::post(transact_handler))
 ///     .layer(middleware::from_fn_with_state(forwarder, forward_to_leader));
 /// ```
-pub async fn forward_to_leader(
-    State(forwarder): State<Arc<LeaderForwarder>>,
+pub async fn forward_to_leader<L: LeaderView>(
+    State(forwarder): State<Arc<LeaderForwarder<L>>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -525,12 +571,120 @@ fn status_from_reqwest(s: reqwest::StatusCode) -> StatusCode {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests cover the header-scrubbing + status-mapping
-    //! helpers. The end-to-end leader-forward flow (membership
-    //! lookup → outbound HTTP → response relay) needs a live Raft
+    //! Unit tests cover the routing decision (via a stub
+    //! [`LeaderView`]) plus the header-scrubbing and status-mapping
+    //! helpers. Only the outbound HTTP relay itself still needs a live
     //! cluster; that's exercised in the multi-node integration test.
 
     use super::*;
+
+    /// A [`LeaderView`] with no Raft behind it.
+    struct StubView {
+        leader: Option<NodeId>,
+        nodes: Vec<(NodeId, ClusterNode)>,
+    }
+
+    #[async_trait]
+    impl LeaderView for StubView {
+        async fn current_leader(&self) -> Option<NodeId> {
+            self.leader
+        }
+        fn membership_nodes(&self) -> Vec<(NodeId, ClusterNode)> {
+            self.nodes.clone()
+        }
+    }
+
+    /// `self_id` is node 1 throughout; `nodes` lists `(id, client_addr)`.
+    fn forwarder(leader: Option<NodeId>, nodes: &[(NodeId, &str)]) -> LeaderForwarder<StubView> {
+        let view = StubView {
+            leader,
+            nodes: nodes
+                .iter()
+                .map(|(id, addr)| (*id, ClusterNode::new(format!("{addr}/raft"), *addr)))
+                .collect(),
+        };
+        LeaderForwarder::new(Arc::new(view), 1, reqwest::Client::new())
+    }
+
+    #[tokio::test]
+    async fn no_leader_during_election() {
+        let f = forwarder(None, &[(1, "http://10.0.0.1:8080")]);
+        assert!(matches!(f.decide().await, ForwardDecision::NoLeader));
+    }
+
+    #[tokio::test]
+    async fn self_is_leader_runs_locally() {
+        let f = forwarder(Some(1), &[(1, "http://10.0.0.1:8080")]);
+        assert!(matches!(f.decide().await, ForwardDecision::Local));
+    }
+
+    #[tokio::test]
+    async fn forwards_to_the_leader_client_addr() {
+        let f = forwarder(
+            Some(2),
+            &[(1, "http://10.0.0.1:8080"), (2, "http://10.0.0.2:8080")],
+        );
+        match f.decide().await {
+            ForwardDecision::Forward(url) => assert_eq!(url, "http://10.0.0.2:8080"),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    /// A leader id with no membership entry is a stale snapshot, not a
+    /// reason to guess an address.
+    #[tokio::test]
+    async fn leader_missing_from_membership_is_unknown() {
+        let f = forwarder(Some(9), &[(1, "http://10.0.0.1:8080")]);
+        assert!(matches!(
+            f.decide().await,
+            ForwardDecision::UnknownLeader(9)
+        ));
+    }
+
+    /// The SSRF guard: when this node is on a routable address, a
+    /// loopback peer URL is refused rather than dialed.
+    #[tokio::test]
+    async fn loopback_leader_rejected_when_self_is_routable() {
+        let f = forwarder(
+            Some(2),
+            &[(1, "http://10.0.0.1:8080"), (2, "http://127.0.0.1:8080")],
+        );
+        assert!(matches!(
+            f.decide().await,
+            ForwardDecision::UnknownLeader(2)
+        ));
+    }
+
+    /// ...but a single-host dev/test cluster, where this node is itself
+    /// on loopback, still forwards.
+    #[tokio::test]
+    async fn loopback_leader_allowed_when_self_is_loopback() {
+        let f = forwarder(
+            Some(2),
+            &[(1, "http://127.0.0.1:8080"), (2, "http://127.0.0.1:8081")],
+        );
+        match f.decide().await {
+            ForwardDecision::Forward(url) => assert_eq!(url, "http://127.0.0.1:8081"),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    /// Link-local (cloud instance-metadata) is refused even on a
+    /// loopback-permissive node — it is never a valid client target.
+    #[tokio::test]
+    async fn link_local_leader_always_rejected() {
+        let f = forwarder(
+            Some(2),
+            &[
+                (1, "http://127.0.0.1:8080"),
+                (2, "http://169.254.169.254:80"),
+            ],
+        );
+        assert!(matches!(
+            f.decide().await,
+            ForwardDecision::UnknownLeader(2)
+        ));
+    }
 
     #[test]
     fn hop_by_hop_headers_are_dropped() {

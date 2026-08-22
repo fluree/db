@@ -3376,7 +3376,11 @@ name = "fluree-raft-core"
 version = "4.1.6"
 dependencies = [
  "async-trait",
+ "axum",
+ "http-body-util",
+ "openraft",
  "postcard",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
