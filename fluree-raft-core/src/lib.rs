@@ -53,6 +53,8 @@ pub mod log_adapter;
 #[cfg(feature = "raft")]
 pub mod network;
 #[cfg(feature = "raft")]
+pub mod runtime;
+#[cfg(feature = "raft")]
 pub mod state_machine;
 #[cfg(feature = "testing")]
 pub mod testing;
