@@ -318,11 +318,32 @@ impl Default for KvPolicy {
 }
 
 impl KvPolicy {
+    /// Validate a key against the size limit.
+    ///
+    /// Every key-bearing command checks this, not just
+    /// [`KvCommand::Put`]: an oversized key can never have been stored,
+    /// so a `Delete` or `TakeOnce` carrying one is a guaranteed no-op
+    /// that would still be replicated, persisted, and snapshotted as an
+    /// oversized log entry on every node.
+    pub fn check_key(&self, key: &str) -> Result<(), KvRejection> {
+        let bytes = key.len() as u64;
+        if bytes > self.max_key_bytes {
+            return Err(KvRejection::KeyTooLarge {
+                bytes,
+                max: self.max_key_bytes,
+            });
+        }
+        Ok(())
+    }
+
     /// Validate a put's shape and resolve its expiry instant.
     ///
     /// Call this before proposing. [`apply`] calls the same function,
     /// so a client-side pre-check and the replicated decision cannot
-    /// disagree.
+    /// disagree on *validity*. The `expires_at_ms` it returns is
+    /// advisory client-side: `apply` recomputes it from
+    /// `max(now_ms, fragment.time_floor())`, which a proposer cannot
+    /// know.
     ///
     /// TTLs are **rejected, never clamped**: silently shortening one
     /// turns "why did my entry vanish" into an incident, and a clamp on
@@ -334,13 +355,7 @@ impl KvPolicy {
         ttl_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<Option<u64>, KvRejection> {
-        let key_bytes = key.len() as u64;
-        if key_bytes > self.max_key_bytes {
-            return Err(KvRejection::KeyTooLarge {
-                bytes: key_bytes,
-                max: self.max_key_bytes,
-            });
-        }
+        self.check_key(key)?;
         let value_bytes = value.len() as u64;
         if value_bytes > self.max_value_bytes {
             return Err(KvRejection::ValueTooLarge {
@@ -407,22 +422,64 @@ impl Record {
     }
 }
 
+/// What actually crosses a snapshot: the records and the logical-time
+/// floor. `expiring` and `bytes` are rebuilt from `entries` on the way
+/// in, so a fragment cannot be deserialized into an inconsistent state
+/// — see [`KvFragment`].
+#[derive(Serialize, Deserialize)]
+struct KvFragmentWire {
+    entries: BTreeMap<String, Record>,
+    time_floor: u64,
+}
+
+impl From<KvFragment> for KvFragmentWire {
+    fn from(fragment: KvFragment) -> Self {
+        Self {
+            entries: fragment.entries,
+            time_floor: fragment.time_floor,
+        }
+    }
+}
+
+impl From<KvFragmentWire> for KvFragment {
+    fn from(wire: KvFragmentWire) -> Self {
+        let mut fragment = KvFragment {
+            entries: BTreeMap::new(),
+            expiring: BTreeSet::new(),
+            bytes: 0,
+            time_floor: wire.time_floor,
+        };
+        for (key, record) in wire.entries {
+            fragment.insert(key, record);
+        }
+        fragment
+    }
+}
+
 /// The replicated state. Embed one per fragment in the application's
 /// state machine.
 ///
 /// `expiring` and `bytes` are denormalizations of `entries` — a
 /// secondary index so a sweep is a range query rather than O(n) in the
-/// map, and a running byte total so a quota check is O(1). Both are
-/// maintained by [`apply`] and nothing else may write them;
-/// [`KvFragment::check_invariants`] recomputes both and is what a test
-/// should assert after a mutation sequence.
+/// map, and a running byte total so a quota check is O(1). They are
+/// **not serialized**: a snapshot carries only the records and the
+/// time floor, and both are rebuilt on decode. Validating them instead
+/// would leave a corrupt or wrongly-migrated snapshot able to underflow
+/// `bytes` or arm a stale expiry entry that deletes a live record;
+/// rebuilding makes that unrepresentable, and costs one pass per
+/// install.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "KvFragmentWire", into = "KvFragmentWire")]
 pub struct KvFragment {
     entries: BTreeMap<String, Record>,
     /// `(expires_at_ms, key, version)` for every record that has an
     /// expiry. Immortal records are absent.
     expiring: BTreeSet<(u64, String, u64)>,
     bytes: u64,
+    /// The latest instant at which this fragment destroyed
+    /// information by reclaiming an expired record — see
+    /// [`KvFragment::time_floor`].
+    time_floor: u64,
 }
 
 /// A denormalization that drifted from `entries`. Never expected;
@@ -444,11 +501,53 @@ impl KvFragment {
         Self::default()
     }
 
+    /// The fragment's logical-time floor: the latest instant at which
+    /// it has reclaimed an expired record.
+    ///
+    /// Reclamation destroys information. Once the record expiring at
+    /// 100 is gone, nothing distinguishes "expired" from "never
+    /// existed" — so if a later command carries `now_ms: 50`, from a
+    /// leader whose clock rolled back or skews low, the reclaimed
+    /// record reads absent while a record with the *same* expiry that
+    /// the sweep did not reach reads live. `Evict` is bounded, so
+    /// partial sweeps are the normal case and that split is reachable
+    /// whenever clocks disagree: which records a caller can see starts
+    /// depending on how far the last sweep got. That is the
+    /// "eviction is semantically invisible" invariant breaking.
+    ///
+    /// So every reclamation raises this floor to the instant it acted
+    /// at, and every later decision — reads included — is made at
+    /// `max(now_ms, time_floor)`. Logical time within a fragment cannot
+    /// run backwards, which is the strongest available guarantee here:
+    /// a record already treated as expired can never be treated as live
+    /// again, and a lapsed lease cannot be renewed back into existence
+    /// by a slow clock.
+    ///
+    /// What it does *not* do is make a rolled-back clock harmless in
+    /// wall-clock terms. Once a leader has asserted that time reached
+    /// 100, a lease advertised to expire at 100 is expired, and a
+    /// takeover at wall-clock 50 is allowed. No state machine can do
+    /// better without a trusted clock; this is the same reason TTL is
+    /// documented as a liveness knob and the fence as the safety one.
+    ///
+    /// The floor moves only on reclamation, not on every command, so a
+    /// single far-future `now_ms` from one bad clock cannot mass-expire
+    /// a fragment that had nothing to reclaim.
+    pub fn time_floor(&self) -> u64 {
+        self.time_floor
+    }
+
+    /// The instant a decision is actually made at.
+    fn at(&self, now_ms: u64) -> u64 {
+        now_ms.max(self.time_floor)
+    }
+
     /// The live record at `key`, or `None` if absent or expired.
     ///
     /// Observers must be able to read the current fence without
     /// proposing, which is what this is for.
     pub fn get_at(&self, key: &str, now_ms: u64) -> Option<KvRecordRef<'_>> {
+        let now_ms = self.at(now_ms);
         self.entries
             .get(key)
             .filter(|record| !record.expired_at(now_ms))
@@ -457,6 +556,7 @@ impl KvFragment {
 
     /// Every live record, in key order.
     pub fn iter_at(&self, now_ms: u64) -> impl Iterator<Item = (&str, KvRecordRef<'_>)> {
+        let now_ms = self.at(now_ms);
         self.entries
             .iter()
             .filter(move |(_, record)| !record.expired_at(now_ms))
@@ -479,7 +579,7 @@ impl KvFragment {
     /// Whether any record has expired at or before `cutoff_ms`. Lets a
     /// ticker skip proposing a sweep that would do nothing.
     pub fn has_expired_at(&self, cutoff_ms: u64) -> bool {
-        self.expired_range(cutoff_ms).next().is_some()
+        self.expired_range(self.at(cutoff_ms)).next().is_some()
     }
 
     /// Recompute both denormalizations and compare. Test aid — an
@@ -537,20 +637,26 @@ impl KvFragment {
         Some(record)
     }
 
-    fn insert(&mut self, key: &str, record: Record) {
-        self.bytes += record.footprint(key);
+    fn insert(&mut self, key: String, record: Record) {
+        self.bytes += record.footprint(&key);
         if let Some(at) = record.expires_at_ms {
-            self.expiring.insert((at, key.to_string(), record.version));
+            self.expiring.insert((at, key.clone(), record.version));
         }
-        self.entries.insert(key.to_string(), record);
+        self.entries.insert(key, record);
+    }
+
+    /// Raise the floor to an instant at which information was just
+    /// destroyed.
+    fn note_reclaimed_at(&mut self, now_ms: u64) {
+        self.time_floor = self.time_floor.max(now_ms);
     }
 
     /// Physically reclaim `key` if it is present but expired.
     ///
     /// Every mutation path calls this first, so a key a caller touches
     /// never lingers waiting for the sweep. It cannot change any
-    /// answer — an expired record is already logically absent — so it
-    /// keeps sweep timing invisible rather than making it observable.
+    /// answer — an expired record is already logically absent — as long
+    /// as the floor moves with it.
     fn reclaim_if_expired(&mut self, key: &str, now_ms: u64) {
         if self
             .entries
@@ -558,6 +664,7 @@ impl KvFragment {
             .is_some_and(|record| record.expired_at(now_ms))
         {
             self.take(key);
+            self.note_reclaimed_at(now_ms);
         }
     }
 
@@ -583,6 +690,10 @@ impl KvFragment {
 /// Pure and deterministic: the only clock is the one carried by the
 /// command, and `log_index` — the index of the entry that carried it —
 /// becomes the version of whatever it writes.
+///
+/// Every command's instant is taken as
+/// `max(now_ms, fragment.time_floor())`, so logical time within a
+/// fragment never runs backwards. See [`KvFragment::time_floor`].
 ///
 /// Takes the command by reference to match `AppStateMachine::apply`,
 /// which costs one clone of the key and value on a successful put.
@@ -615,8 +726,8 @@ pub fn apply(
             key,
             expect,
             now_ms,
-        } => delete(fragment, key, expect, *now_ms),
-        KvCommand::TakeOnce { key, now_ms } => take_once(fragment, key, *now_ms),
+        } => delete(fragment, key, expect, *now_ms, policy),
+        KvCommand::TakeOnce { key, now_ms } => take_once(fragment, key, *now_ms, policy),
         KvCommand::Evict { cutoff_ms, limit } => {
             evict(fragment, *cutoff_ms, policy.evict_batch(*limit))
         }
@@ -646,6 +757,8 @@ fn put(
         ttl_ms,
         now_ms,
     } = args;
+    let now_ms = fragment.at(now_ms);
+
     let expires_at_ms = match policy.check_put(key, value, ttl_ms, now_ms) {
         Ok(at) => at,
         Err(rejection) => return KvResponse::Rejected(rejection),
@@ -693,14 +806,24 @@ fn put(
     }
 
     fragment.take(key);
-    fragment.insert(key, record);
+    fragment.insert(key.to_string(), record);
     KvResponse::Written {
         version: log_index,
         expires_at_ms,
     }
 }
 
-fn delete(fragment: &mut KvFragment, key: &str, expect: &Expect, now_ms: u64) -> KvResponse {
+fn delete(
+    fragment: &mut KvFragment,
+    key: &str,
+    expect: &Expect,
+    now_ms: u64,
+    policy: &KvPolicy,
+) -> KvResponse {
+    if let Err(rejection) = policy.check_key(key) {
+        return KvResponse::Rejected(rejection);
+    }
+    let now_ms = fragment.at(now_ms);
     let live_version = fragment.live(key, now_ms).map(|record| record.version);
     let satisfied = match expect {
         Expect::Any => true,
@@ -718,7 +841,11 @@ fn delete(fragment: &mut KvFragment, key: &str, expect: &Expect, now_ms: u64) ->
     KvResponse::Deleted { removed }
 }
 
-fn take_once(fragment: &mut KvFragment, key: &str, now_ms: u64) -> KvResponse {
+fn take_once(fragment: &mut KvFragment, key: &str, now_ms: u64, policy: &KvPolicy) -> KvResponse {
+    if let Err(rejection) = policy.check_key(key) {
+        return KvResponse::Rejected(rejection);
+    }
+    let now_ms = fragment.at(now_ms);
     fragment.reclaim_if_expired(key, now_ms);
     let record = fragment
         .live(key, now_ms)
@@ -734,6 +861,7 @@ fn take_once(fragment: &mut KvFragment, key: &str, now_ms: u64) -> KvResponse {
 }
 
 fn evict(fragment: &mut KvFragment, cutoff_ms: u64, limit: u32) -> KvResponse {
+    let cutoff_ms = fragment.at(cutoff_ms);
     // Collect first: the range borrows `expiring`, which the removals
     // mutate. `limit` bounds the collection, so this is bounded work.
     let doomed: Vec<String> = fragment
@@ -747,37 +875,43 @@ fn evict(fragment: &mut KvFragment, cutoff_ms: u64, limit: u32) -> KvResponse {
             removed += 1;
         }
     }
+    if removed > 0 {
+        fragment.note_reclaimed_at(cutoff_ms);
+    }
     KvResponse::Evicted {
         removed,
-        more_expired: fragment.has_expired_at(cutoff_ms),
+        more_expired: fragment.expired_range(cutoff_ms).next().is_some(),
     }
 }
 
-// ---------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------
-
+/// Helpers shared by this module's test submodules.
 #[cfg(test)]
-mod tests {
+mod tests_support {
     use super::*;
 
-    const HOUR: u64 = 60 * 60 * 1000;
+    pub const HOUR: u64 = 60 * 60 * 1000;
 
-    fn policy() -> KvPolicy {
+    pub fn policy() -> KvPolicy {
         KvPolicy::default()
     }
 
     /// Every mutation goes through here, so a path that leaks an expiry
     /// index entry or miscounts bytes fails at the point it happens
     /// rather than as a mystery later.
-    fn step(f: &mut KvFragment, cmd: KvCommand, p: &KvPolicy, index: u64) -> KvResponse {
+    pub fn step(f: &mut KvFragment, cmd: KvCommand, p: &KvPolicy, index: u64) -> KvResponse {
         let response = apply(f, &cmd, p, index);
         f.check_invariants()
             .unwrap_or_else(|v| panic!("{cmd:?} at index {index} broke an invariant: {v:?}"));
         response
     }
 
-    fn put(key: &str, value: &[u8], expect: Expect, ttl_ms: Option<u64>, now_ms: u64) -> KvCommand {
+    pub fn put_cmd(
+        key: &str,
+        value: &[u8],
+        expect: Expect,
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> KvCommand {
         KvCommand::Put {
             key: key.into(),
             value: value.to_vec(),
@@ -787,10 +921,10 @@ mod tests {
         }
     }
 
-    fn acquire(f: &mut KvFragment, key: &str, holder: &[u8], now_ms: u64, index: u64) -> u64 {
+    pub fn acquire(f: &mut KvFragment, key: &str, holder: &[u8], now_ms: u64, index: u64) -> u64 {
         match step(
             f,
-            put(key, holder, Expect::Absent, Some(HOUR), now_ms),
+            put_cmd(key, holder, Expect::Absent, Some(HOUR), now_ms),
             &policy(),
             index,
         ) {
@@ -798,6 +932,12 @@ mod tests {
             other => panic!("acquire failed: {other:?}"),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::*;
+    use super::*;
 
     // -----------------------------------------------------------------
     // The fence
@@ -834,7 +974,7 @@ mod tests {
         let v1 = acquire(&mut f, "lease", b"holder-1", 0, 10);
         let KvResponse::Written { version: v2, .. } = step(
             &mut f,
-            put("lease", b"holder-1", Expect::Version(v1), Some(HOUR), 1_000),
+            put_cmd("lease", b"holder-1", Expect::Version(v1), Some(HOUR), 1_000),
             &p,
             11,
         ) else {
@@ -859,7 +999,7 @@ mod tests {
 
         let response = step(
             &mut f,
-            put(
+            put_cmd(
                 "lease",
                 b"holder-1",
                 Expect::Version(held),
@@ -887,9 +1027,9 @@ mod tests {
     #[test]
     fn eviction_is_semantically_invisible() {
         let probes: Vec<KvCommand> = vec![
-            put("k", b"new", Expect::Absent, Some(HOUR), HOUR),
-            put("k", b"new", Expect::Version(5), Some(HOUR), HOUR),
-            put("k", b"new", Expect::Any, Some(HOUR), HOUR),
+            put_cmd("k", b"new", Expect::Absent, Some(HOUR), HOUR),
+            put_cmd("k", b"new", Expect::Version(5), Some(HOUR), HOUR),
+            put_cmd("k", b"new", Expect::Any, Some(HOUR), HOUR),
             KvCommand::Delete {
                 key: "k".into(),
                 expect: Expect::Any,
@@ -1019,7 +1159,7 @@ mod tests {
         // The renewal that commits but whose response never arrives.
         step(
             &mut f,
-            put("lease", b"holder-1", Expect::Version(v1), Some(HOUR), 100),
+            put_cmd("lease", b"holder-1", Expect::Version(v1), Some(HOUR), 100),
             &p,
             21,
         );
@@ -1027,7 +1167,7 @@ mod tests {
         // The retry, still carrying the stale version.
         let retry = step(
             &mut f,
-            put("lease", b"holder-1", Expect::Version(v1), Some(HOUR), 200),
+            put_cmd("lease", b"holder-1", Expect::Version(v1), Some(HOUR), 200),
             &p,
             22,
         );
@@ -1051,7 +1191,7 @@ mod tests {
         assert_eq!(
             step(
                 &mut f,
-                put("k", b"v", Expect::Version(3), Some(HOUR), 0),
+                put_cmd("k", b"v", Expect::Version(3), Some(HOUR), 0),
                 &p,
                 9
             ),
@@ -1151,7 +1291,7 @@ mod tests {
         // nothing anywhere claims version 6.
         let KvResponse::Written { version, .. } = step(
             &mut f,
-            put("k", b"v2", Expect::Absent, Some(HOUR), 0),
+            put_cmd("k", b"v2", Expect::Absent, Some(HOUR), 0),
             &p,
             7,
         ) else {
@@ -1173,18 +1313,23 @@ mod tests {
         };
 
         assert_eq!(
-            step(&mut f, put("k", b"v", Expect::Any, Some(0), 0), &p, 1),
+            step(&mut f, put_cmd("k", b"v", Expect::Any, Some(0), 0), &p, 1),
             KvResponse::Rejected(KvRejection::TtlZero),
         );
         assert_eq!(
-            step(&mut f, put("k", b"v", Expect::Any, Some(1_001), 0), &p, 2),
+            step(
+                &mut f,
+                put_cmd("k", b"v", Expect::Any, Some(1_001), 0),
+                &p,
+                2
+            ),
             KvResponse::Rejected(KvRejection::TtlAboveMax {
                 ttl_ms: 1_001,
                 max_ttl_ms: 1_000,
             }),
         );
         assert_eq!(
-            step(&mut f, put("k", b"v", Expect::Any, None, 0), &p, 3),
+            step(&mut f, put_cmd("k", b"v", Expect::Any, None, 0), &p, 3),
             KvResponse::Rejected(KvRejection::ImmortalNotAllowed),
         );
         assert!(
@@ -1201,7 +1346,7 @@ mod tests {
         assert_eq!(
             step(
                 &mut f,
-                put("k", b"v", Expect::Any, Some(u64::MAX), 10),
+                put_cmd("k", b"v", Expect::Any, Some(u64::MAX), 10),
                 &wide,
                 4
             ),
@@ -1222,7 +1367,7 @@ mod tests {
         let KvResponse::Written {
             expires_at_ms: None,
             ..
-        } = step(&mut f, put("cfg", b"v", Expect::Any, None, 0), &p, 1)
+        } = step(&mut f, put_cmd("cfg", b"v", Expect::Any, None, 0), &p, 1)
         else {
             panic!("an immortal put must report no expiry");
         };
@@ -1266,7 +1411,7 @@ mod tests {
         ];
         for (key, value, ttl) in cases {
             let mut f = KvFragment::new();
-            let applied = step(&mut f, put(key, value, Expect::Any, ttl, 0), &p, 1);
+            let applied = step(&mut f, put_cmd(key, value, Expect::Any, ttl, 0), &p, 1);
             match (p.check_put(key, value, ttl, 0), applied) {
                 (Ok(_), KvResponse::Written { .. }) => {}
                 (Err(pre), KvResponse::Rejected(post)) => assert_eq!(
@@ -1289,7 +1434,7 @@ mod tests {
         for i in 0..10u64 {
             step(
                 &mut f,
-                put(&format!("k{i:02}"), b"v", Expect::Absent, Some(HOUR), 0),
+                put_cmd(&format!("k{i:02}"), b"v", Expect::Absent, Some(HOUR), 0),
                 &p,
                 100 + i,
             );
@@ -1347,13 +1492,13 @@ mod tests {
         let p = policy();
         step(
             &mut f,
-            put("soon", b"v", Expect::Absent, Some(1_000), 0),
+            put_cmd("soon", b"v", Expect::Absent, Some(1_000), 0),
             &p,
             1,
         );
         step(
             &mut f,
-            put("later", b"v", Expect::Absent, Some(HOUR), 0),
+            put_cmd("later", b"v", Expect::Absent, Some(HOUR), 0),
             &p,
             2,
         );
@@ -1405,7 +1550,12 @@ mod tests {
     fn has_expired_at_lets_a_ticker_skip_a_pointless_sweep() {
         let mut f = KvFragment::new();
         let p = policy();
-        step(&mut f, put("k", b"v", Expect::Absent, Some(HOUR), 0), &p, 1);
+        step(
+            &mut f,
+            put_cmd("k", b"v", Expect::Absent, Some(HOUR), 0),
+            &p,
+            1,
+        );
         assert!(!f.has_expired_at(HOUR - 1));
         assert!(f.has_expired_at(HOUR));
     }
@@ -1421,15 +1571,35 @@ mod tests {
             ..policy()
         };
         let mut f = KvFragment::new();
-        step(&mut f, put("a", b"v", Expect::Absent, Some(HOUR), 0), &p, 1);
-        step(&mut f, put("b", b"v", Expect::Absent, Some(HOUR), 0), &p, 2);
+        step(
+            &mut f,
+            put_cmd("a", b"v", Expect::Absent, Some(HOUR), 0),
+            &p,
+            1,
+        );
+        step(
+            &mut f,
+            put_cmd("b", b"v", Expect::Absent, Some(HOUR), 0),
+            &p,
+            2,
+        );
         assert_eq!(
-            step(&mut f, put("c", b"v", Expect::Absent, Some(HOUR), 0), &p, 3),
+            step(
+                &mut f,
+                put_cmd("c", b"v", Expect::Absent, Some(HOUR), 0),
+                &p,
+                3
+            ),
             KvResponse::Rejected(KvRejection::EntryQuotaExceeded { entries: 3, max: 2 }),
         );
         // Overwriting an existing key is not a new entry.
         assert!(matches!(
-            step(&mut f, put("a", b"w", Expect::Any, Some(HOUR), 0), &p, 4),
+            step(
+                &mut f,
+                put_cmd("a", b"w", Expect::Any, Some(HOUR), 0),
+                &p,
+                4
+            ),
             KvResponse::Written { .. }
         ));
     }
@@ -1444,7 +1614,7 @@ mod tests {
         let mut f = KvFragment::new();
         step(
             &mut f,
-            put("k", b"123456789", Expect::Absent, Some(HOUR), 0),
+            put_cmd("k", b"123456789", Expect::Absent, Some(HOUR), 0),
             &p,
             1,
         );
@@ -1454,7 +1624,7 @@ mod tests {
         assert!(matches!(
             step(
                 &mut f,
-                put("k", b"987654321", Expect::Any, Some(HOUR), 0),
+                put_cmd("k", b"987654321", Expect::Any, Some(HOUR), 0),
                 &p,
                 2
             ),
@@ -1463,7 +1633,7 @@ mod tests {
         assert_eq!(
             step(
                 &mut f,
-                put("k", b"0123456789", Expect::Any, Some(HOUR), 0),
+                put_cmd("k", b"0123456789", Expect::Any, Some(HOUR), 0),
                 &p,
                 3
             ),
@@ -1484,7 +1654,7 @@ mod tests {
         let mut f = KvFragment::new();
         step(
             &mut f,
-            put("k", b"123456789", Expect::Absent, Some(HOUR), 0),
+            put_cmd("k", b"123456789", Expect::Absent, Some(HOUR), 0),
             &p,
             1,
         );
@@ -1492,7 +1662,7 @@ mod tests {
             matches!(
                 step(
                     &mut f,
-                    put("k", b"987654321", Expect::Absent, Some(HOUR), HOUR),
+                    put_cmd("k", b"987654321", Expect::Absent, Some(HOUR), HOUR),
                     &p,
                     2
                 ),
@@ -1513,15 +1683,15 @@ mod tests {
     fn the_same_log_reduces_to_the_same_bytes() {
         let p = policy();
         let script: Vec<KvCommand> = vec![
-            put("zeta", b"1", Expect::Any, Some(HOUR), 0),
-            put("alpha", b"2", Expect::Any, Some(2 * HOUR), 0),
-            put("mu", b"3", Expect::Any, Some(HOUR), 0),
+            put_cmd("zeta", b"1", Expect::Any, Some(HOUR), 0),
+            put_cmd("alpha", b"2", Expect::Any, Some(2 * HOUR), 0),
+            put_cmd("mu", b"3", Expect::Any, Some(HOUR), 0),
             KvCommand::Delete {
                 key: "zeta".into(),
                 expect: Expect::Any,
                 now_ms: 0,
             },
-            put("alpha", b"4", Expect::Any, Some(3 * HOUR), 10),
+            put_cmd("alpha", b"4", Expect::Any, Some(3 * HOUR), 10),
             KvCommand::Evict {
                 cutoff_ms: HOUR,
                 limit: 2,
@@ -1632,8 +1802,13 @@ mod tests {
             allow_immortal: true,
             ..policy()
         };
-        step(&mut f, put("a", b"1", Expect::Any, Some(HOUR), 0), &p, 1);
-        step(&mut f, put("b", b"2", Expect::Any, None, 0), &p, 2);
+        step(
+            &mut f,
+            put_cmd("a", b"1", Expect::Any, Some(HOUR), 0),
+            &p,
+            1,
+        );
+        step(&mut f, put_cmd("b", b"2", Expect::Any, None, 0), &p, 2);
 
         let bytes = postcard::to_allocvec(&f).expect("encodes");
         let restored: KvFragment = postcard::from_bytes(&bytes).expect("decodes");
@@ -1652,13 +1827,370 @@ mod tests {
         };
         let mut f = KvFragment::new();
         assert_eq!(
-            step(&mut f, put("abcd", b"v", Expect::Any, Some(HOUR), 0), &p, 1),
+            step(
+                &mut f,
+                put_cmd("abcd", b"v", Expect::Any, Some(HOUR), 0),
+                &p,
+                1
+            ),
             KvResponse::Rejected(KvRejection::KeyTooLarge { bytes: 4, max: 3 }),
         );
         assert_eq!(
-            step(&mut f, put("a", b"vvvv", Expect::Any, Some(HOUR), 0), &p, 2),
+            step(
+                &mut f,
+                put_cmd("a", b"vvvv", Expect::Any, Some(HOUR), 0),
+                &p,
+                2
+            ),
             KvResponse::Rejected(KvRejection::ValueTooLarge { bytes: 4, max: 3 }),
         );
         assert_eq!(f.physical_len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod monotonic_time {
+    use super::tests_support::*;
+    use super::*;
+
+    /// A partial sweep must not split the expired set.
+    ///
+    /// `Evict` is bounded, so a backlog is reclaimed a batch at a time
+    /// and survivors sit alongside the records already gone. If a later
+    /// command carrying a rolled-back `now_ms` sees the survivors as
+    /// live while the reclaimed ones are absent, then which records a
+    /// caller can see depends on how far the last sweep happened to
+    /// get — the eviction-invisibility invariant, broken by exactly the
+    /// clock skew that makes it reachable.
+    #[test]
+    fn a_partial_sweep_does_not_split_the_expired_set() {
+        let p = policy();
+        let mut f = KvFragment::new();
+        for i in 0..10u64 {
+            step(
+                &mut f,
+                put_cmd(&format!("k{i:02}"), b"v", Expect::Absent, Some(1_000), 0),
+                &p,
+                i + 1,
+            );
+        }
+        step(
+            &mut f,
+            KvCommand::Evict {
+                cutoff_ms: 1_000,
+                limit: 4,
+            },
+            &p,
+            20,
+        );
+        assert_eq!(f.physical_len(), 6, "the sweep must be partial");
+        assert_eq!(f.time_floor(), 1_000);
+
+        // A rolled-back clock, well before every record's expiry.
+        for i in 0..10u64 {
+            let key = format!("k{i:02}");
+            assert_eq!(
+                f.get_at(&key, 500),
+                None,
+                "{key} must read as absent whether or not the sweep reached it",
+            );
+        }
+        assert_eq!(f.iter_at(500).count(), 0);
+    }
+
+    /// Once a record has been treated as expired, no later command may
+    /// treat it as live again. A lease that lapsed — and whose
+    /// successor may already be at work — must not come back.
+    #[test]
+    fn a_rolled_back_clock_cannot_resurrect_an_expired_record() {
+        let p = policy();
+        let mut f = KvFragment::new();
+        acquire(&mut f, "lease", b"holder-a", 0, 5);
+        // Some other key is reclaimed at HOUR, which is what moves the
+        // floor — the lease itself is untouched and still physically
+        // present.
+        step(
+            &mut f,
+            put_cmd("scratch", b"v", Expect::Absent, Some(HOUR), 0),
+            &p,
+            6,
+        );
+        step(
+            &mut f,
+            KvCommand::Delete {
+                key: "scratch".into(),
+                expect: Expect::Any,
+                now_ms: HOUR,
+            },
+            &p,
+            7,
+        );
+        assert_eq!(f.time_floor(), HOUR);
+        assert_eq!(f.physical_len(), 1, "the lapsed lease is still stored");
+
+        assert!(
+            f.get_at("lease", 0).is_none(),
+            "a lapsed lease must not read as live at a rolled-back clock",
+        );
+        assert_eq!(
+            step(
+                &mut f,
+                put_cmd("lease", b"holder-a", Expect::Version(5), Some(HOUR), 0),
+                &p,
+                8
+            ),
+            KvResponse::Conflict { current: None },
+            "and its holder must not be able to renew it back into existence",
+        );
+    }
+
+    /// The floor must survive a snapshot, or a restart re-opens the
+    /// same window it exists to close.
+    #[test]
+    fn the_floor_survives_a_snapshot() {
+        let p = policy();
+        let mut f = KvFragment::new();
+        step(
+            &mut f,
+            put_cmd("k", b"v", Expect::Absent, Some(HOUR), 0),
+            &p,
+            1,
+        );
+        step(
+            &mut f,
+            KvCommand::Evict {
+                cutoff_ms: HOUR,
+                limit: 4,
+            },
+            &p,
+            2,
+        );
+        assert_eq!(f.time_floor(), HOUR);
+
+        let bytes = postcard::to_allocvec(&f).expect("encodes");
+        let restored: KvFragment = postcard::from_bytes(&bytes).expect("decodes");
+        assert_eq!(restored.time_floor(), HOUR);
+        assert_eq!(restored, f);
+    }
+
+    /// Reclaiming inline — the path a plain `Delete` takes — raises the
+    /// floor too. Only `Evict` doing so would leave the same hole open
+    /// through every other command.
+    #[test]
+    fn inline_reclamation_also_raises_the_floor() {
+        let p = policy();
+        let mut f = KvFragment::new();
+        step(
+            &mut f,
+            put_cmd("k", b"v", Expect::Absent, Some(HOUR), 0),
+            &p,
+            1,
+        );
+        step(
+            &mut f,
+            KvCommand::Delete {
+                key: "k".into(),
+                expect: Expect::Any,
+                now_ms: HOUR,
+            },
+            &p,
+            2,
+        );
+        assert_eq!(f.time_floor(), HOUR);
+    }
+
+    /// A command that reclaims nothing must not move the floor — else a
+    /// single far-future `now_ms` would mass-expire a fragment that had
+    /// nothing to reclaim, turning a clock skew into an outage.
+    #[test]
+    fn a_command_that_reclaims_nothing_leaves_the_floor_alone() {
+        let p = policy();
+        let mut f = KvFragment::new();
+        step(
+            &mut f,
+            put_cmd("k", b"v", Expect::Absent, Some(HOUR), 100 * HOUR),
+            &p,
+            1,
+        );
+        assert_eq!(f.time_floor(), 0, "a plain write is not a reclamation");
+        assert!(
+            f.get_at("other", 0).is_none() && f.get_at("k", 0).is_some(),
+            "and nothing else expired as a side effect",
+        );
+    }
+
+    /// A write made after the floor moved must get an expiry beyond it,
+    /// not one that is already in the past.
+    #[test]
+    fn a_write_after_the_floor_expires_relative_to_the_floor() {
+        let p = policy();
+        let mut f = KvFragment::new();
+        step(
+            &mut f,
+            put_cmd("a", b"v", Expect::Absent, Some(HOUR), 0),
+            &p,
+            1,
+        );
+        step(
+            &mut f,
+            KvCommand::Evict {
+                cutoff_ms: HOUR,
+                limit: 4,
+            },
+            &p,
+            2,
+        );
+
+        let KvResponse::Written {
+            expires_at_ms: Some(at),
+            ..
+        } = step(
+            &mut f,
+            put_cmd("b", b"v", Expect::Absent, Some(1_000), 50),
+            &p,
+            3,
+        )
+        else {
+            panic!("the write must land");
+        };
+        assert_eq!(
+            at,
+            HOUR + 1_000,
+            "ttl must run from the floor, not from a stale clock",
+        );
+        assert!(f.get_at("b", 50).is_some(), "and the entry must be live");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_integrity {
+    use super::tests_support::*;
+    use super::*;
+
+    /// A snapshot carries records and the floor, and nothing else: the
+    /// expiry index and byte total are rebuilt on the way in, so a
+    /// corrupt or wrongly-migrated snapshot cannot arrive holding a
+    /// stale index entry that would delete a live record, or a byte
+    /// total that underflows on the next delete.
+    #[test]
+    fn denormalizations_are_rebuilt_not_trusted() {
+        let p = KvPolicy {
+            allow_immortal: true,
+            ..policy()
+        };
+        let mut f = KvFragment::new();
+        for i in 0..5 {
+            step(
+                &mut f,
+                put_cmd(&format!("k{i}"), b"value", Expect::Absent, Some(HOUR), 0),
+                &p,
+                i as u64 + 1,
+            );
+        }
+        step(
+            &mut f,
+            put_cmd("forever", b"v", Expect::Any, None, 0),
+            &p,
+            10,
+        );
+
+        // Encode the *wire* form directly, so the decoded fragment's
+        // index and byte total can only have come from the rebuild —
+        // round-tripping a fragment that was already consistent would
+        // pass whether or not anything is rebuilt.
+        let wire = KvFragmentWire::from(f.clone());
+        let bytes = postcard::to_allocvec(&wire).expect("encodes");
+        let restored: KvFragment = postcard::from_bytes(&bytes).expect("decodes");
+
+        restored
+            .check_invariants()
+            .expect("a decoded fragment is consistent by construction");
+        assert_eq!(restored, f);
+        assert_eq!(restored.physical_bytes(), f.physical_bytes());
+        assert!(
+            restored.physical_bytes() > 0 && !restored.expiring.is_empty(),
+            "the rebuild must actually have produced both denormalizations",
+        );
+        // The rebuilt index still drives eviction correctly.
+        let mut restored = restored;
+        assert_eq!(
+            step(
+                &mut restored,
+                KvCommand::Evict {
+                    cutoff_ms: HOUR,
+                    limit: 64
+                },
+                &p,
+                20
+            ),
+            KvResponse::Evicted {
+                removed: 5,
+                more_expired: false,
+            },
+        );
+        assert_eq!(restored.physical_len(), 1, "the immortal entry survives");
+    }
+
+    /// The wire form is exactly `{entries, time_floor}` — two fields,
+    /// not four. Serializing the denormalizations would put them back
+    /// in a consumer's snapshot and back on the trust boundary.
+    #[test]
+    fn the_wire_form_carries_no_denormalizations() {
+        let p = policy();
+        let mut f = KvFragment::new();
+        step(
+            &mut f,
+            put_cmd("k", b"v", Expect::Absent, Some(HOUR), 0),
+            &p,
+            7,
+        );
+
+        let bytes = postcard::to_allocvec(&f).expect("encodes");
+        // seq len 1, key "k" (len 1), value (len 1), version 7,
+        // Some(expires_at = 3600000), then time_floor 0.
+        assert_eq!(
+            bytes,
+            vec![1, 1, b'k', 1, b'v', 7, 1, 0x80, 0xdd, 0xdb, 0x01, 0],
+        );
+    }
+}
+
+#[cfg(test)]
+mod key_limits {
+    use super::tests_support::*;
+    use super::*;
+
+    /// The key limit is documented as an apply-time limit, so it has to
+    /// hold for every key-bearing command — not only the one that
+    /// stores a key.
+    #[test]
+    fn every_key_bearing_command_enforces_the_key_limit() {
+        let p = KvPolicy {
+            max_key_bytes: 3,
+            ..policy()
+        };
+        let oversized = "abcd";
+        let expected = KvResponse::Rejected(KvRejection::KeyTooLarge { bytes: 4, max: 3 });
+
+        let commands = vec![
+            put_cmd(oversized, b"v", Expect::Any, Some(HOUR), 0),
+            KvCommand::Delete {
+                key: oversized.into(),
+                expect: Expect::Any,
+                now_ms: 0,
+            },
+            KvCommand::TakeOnce {
+                key: oversized.into(),
+                now_ms: 0,
+            },
+        ];
+        for command in commands {
+            let mut f = KvFragment::new();
+            assert_eq!(
+                step(&mut f, command.clone(), &p, 1),
+                expected,
+                "{command:?} must refuse an oversized key",
+            );
+        }
     }
 }

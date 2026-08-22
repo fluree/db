@@ -36,9 +36,9 @@ use tokio_util::sync::CancellationToken;
 async fn three_node_counter_cluster_replicates_and_tracks_membership() {
     let group_id = GroupId::new("counter").expect("valid group id");
     let nodes: Vec<CounterNode> = vec![
-        start_node(1, &group_id).await,
-        start_node(2, &group_id).await,
-        start_node(3, &group_id).await,
+        start_node(1, &group_id, |_| {}).await,
+        start_node(2, &group_id, |_| {}).await,
+        start_node(3, &group_id, |_| {}).await,
     ];
     form_cluster(&nodes).await;
 
@@ -80,9 +80,9 @@ async fn three_node_counter_cluster_replicates_and_tracks_membership() {
 async fn live_raft_satisfies_the_leader_view_the_forwarder_needs() {
     let group_id = GroupId::new("view").expect("valid group id");
     let nodes: Vec<CounterNode> = vec![
-        start_node(1, &group_id).await,
-        start_node(2, &group_id).await,
-        start_node(3, &group_id).await,
+        start_node(1, &group_id, |_| {}).await,
+        start_node(2, &group_id, |_| {}).await,
+        start_node(3, &group_id, |_| {}).await,
     ];
     form_cluster(&nodes).await;
 
@@ -138,7 +138,7 @@ async fn live_raft_satisfies_the_leader_view_the_forwarder_needs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leader_tasks_start_on_election_and_stop_on_shutdown() {
     let group_id = GroupId::new("ticker").expect("valid group id");
-    let node: CounterNode = start_node(1, &group_id).await;
+    let node: CounterNode = start_node(1, &group_id, |_| {}).await;
     node.group
         .admin
         .initialize(BTreeMap::from([(node.id, node.addrs())]))
@@ -197,7 +197,7 @@ async fn a_task_that_ignores_cancellation_is_aborted_after_the_grace_period() {
     const GRACE: Duration = Duration::from_millis(200);
 
     let group_id = GroupId::new("straggler").expect("valid group id");
-    let node: CounterNode = start_node(1, &group_id).await;
+    let node: CounterNode = start_node(1, &group_id, |_| {}).await;
     node.group
         .admin
         .initialize(BTreeMap::from([(node.id, node.addrs())]))

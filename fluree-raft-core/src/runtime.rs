@@ -59,6 +59,18 @@ pub struct RaftGroupConfig {
     /// baked in at client construction and cannot vary per group — which
     /// is exactly why they live on their own struct.
     pub http_client: HttpClientConfig,
+    /// Largest encoded command this application can propose, if it has
+    /// a bound. When set, [`RaftGroup::bootstrap`] caps
+    /// `raft.max_payload_entries` so a full catch-up batch still fits
+    /// [`RaftTransportConfig::append_entries_max_body_bytes`] — see
+    /// [`cap_payload_entries`] for what goes wrong without it.
+    ///
+    /// `None` means "unbounded, and I accept the consequence." An
+    /// application whose commands are uniformly small (the nameservice)
+    /// is safe leaving it unset; one embedding [`kv`](crate::kv) should
+    /// set it from its policies' `max_key_bytes + max_value_bytes` plus
+    /// the command envelope.
+    pub max_command_bytes: Option<u64>,
 }
 
 impl RaftGroupConfig {
@@ -72,6 +84,7 @@ impl RaftGroupConfig {
             raft: default_raft_config(&transport),
             transport,
             http_client: HttpClientConfig::default(),
+            max_command_bytes: None,
         }
     }
 
@@ -108,6 +121,53 @@ pub fn default_raft_config(transport: &RaftTransportConfig) -> RaftConfig {
         election_timeout_max: election_timeout_min.saturating_mul(2),
         ..RaftConfig::default()
     }
+}
+
+/// Cap `max_payload_entries` so a full catch-up batch still fits the
+/// append-entries body limit, returning the cap applied.
+///
+/// openraft batches up to `max_payload_entries` (300 by default) into
+/// one append-entries RPC, and 0.9 does **not** shrink a batch that the
+/// peer refuses. So if `max_payload_entries × max_command_bytes`
+/// exceeds [`RaftTransportConfig::append_entries_max_body_bytes`], a
+/// follower that has fallen far enough behind receives a 413, the
+/// transport reports it as a network error, and openraft retries the
+/// same oversized batch forever: that follower never catches up, and
+/// the wedge only appears once commands get large enough — which for
+/// [`kv`](crate::kv) is well inside its default 1 MiB value limit.
+///
+/// Clamping rather than warning, because the failure is silent, total,
+/// and only reachable from a node that is already degraded. A smaller
+/// batch costs catch-up throughput; the alternative costs the follower.
+pub fn cap_payload_entries(
+    raft: &mut RaftConfig,
+    transport: &RaftTransportConfig,
+    max_command_bytes: u64,
+) -> u64 {
+    let budget = transport.append_entries_max_body_bytes as u64;
+    // At least one entry per batch: a command too large to ever fit is
+    // an application-level misconfiguration, and refusing to replicate
+    // it at all would be worse than trying.
+    let fits = (budget / max_command_bytes.max(1)).max(1);
+    if raft.max_payload_entries > fits {
+        tracing::info!(
+            requested = raft.max_payload_entries,
+            capped_to = fits,
+            max_command_bytes,
+            append_entries_max_body_bytes = budget,
+            "capping max_payload_entries so a catch-up batch fits the append body limit"
+        );
+        raft.max_payload_entries = fits;
+    }
+    if max_command_bytes > budget {
+        tracing::warn!(
+            max_command_bytes,
+            append_entries_max_body_bytes = budget,
+            "a single maximum-size command exceeds the append-entries body limit; \
+             a lagging follower will not be able to catch up"
+        );
+    }
+    raft.max_payload_entries
 }
 
 /// Warn if `election_timeout_min <= rpc_timeout` — the livelock
@@ -220,7 +280,11 @@ impl<A: AppStateMachine> RaftGroup<A> {
         O: StateMachineObserver<A>,
         S: RaftStorage,
     {
-        let raft_config = Arc::new(config.raft.validate()?);
+        let mut raft = config.raft.validate()?;
+        if let Some(max_command_bytes) = config.max_command_bytes {
+            cap_payload_entries(&mut raft, &config.transport, max_command_bytes);
+        }
+        let raft_config = Arc::new(raft);
         check_election_timeout(&raft_config, &config.transport);
 
         let log = LogAdapter::new(Arc::clone(&storage));
@@ -542,5 +606,130 @@ mod tests {
             &RaftConfig::default(),
             &RaftTransportConfig::default()
         ));
+    }
+}
+
+#[cfg(test)]
+mod payload_headroom_tests {
+    use super::*;
+    use crate::node::ClusterNode;
+    use crate::state_machine::{codec, AppStateMachine, SnapshotCodecError};
+
+    // Smallest thing that satisfies the seam, so the bootstrap test can
+    // stand a group up without dragging in a real application.
+    openraft::declare_raft_types!(
+        pub TinyConfig:
+            D = u64,
+            R = u64,
+            NodeId = NodeId,
+            Node = ClusterNode,
+            Entry = openraft::Entry<TinyConfig>,
+            SnapshotData = std::io::Cursor<Vec<u8>>,
+            AsyncRuntime = openraft::TokioRuntime,
+    );
+
+    pub struct TinyApp;
+
+    impl AppStateMachine for TinyApp {
+        type Config = TinyConfig;
+        type Command = u64;
+        type Response = u64;
+        type State = u64;
+
+        fn initial_state() -> u64 {
+            0
+        }
+        fn apply(state: &mut u64, command: &u64, _log_index: u64) -> u64 {
+            *state += command;
+            *state
+        }
+        fn noop_response() -> u64 {
+            0
+        }
+        fn encode_snapshot(state: &u64) -> Result<Vec<u8>, SnapshotCodecError> {
+            codec::encode(1, state)
+        }
+        fn decode_snapshot(bytes: &[u8]) -> Result<u64, SnapshotCodecError> {
+            codec::decode(bytes, 1)
+        }
+    }
+
+    fn transport(append_cap: usize) -> RaftTransportConfig {
+        RaftTransportConfig {
+            append_entries_max_body_bytes: append_cap,
+            ..RaftTransportConfig::default()
+        }
+    }
+
+    /// openraft's stock batch of 300 against `kv`'s default 1 MiB value
+    /// limit is ~300 MiB, well over the 64 MiB append cap — and 0.9
+    /// does not shrink a refused batch, so the follower that needed the
+    /// catch-up is the one that never gets it.
+    #[test]
+    fn the_stock_batch_would_not_fit_a_kv_sized_command() {
+        let mut raft = RaftConfig::default();
+        assert_eq!(raft.max_payload_entries, 300, "openraft's stock batch");
+
+        let transport = transport(64 * 1024 * 1024);
+        let capped = cap_payload_entries(&mut raft, &transport, 1024 * 1024);
+
+        assert_eq!(capped, 64, "64 MiB / 1 MiB");
+        assert_eq!(raft.max_payload_entries, 64);
+        assert!(
+            capped * 1024 * 1024 <= transport.append_entries_max_body_bytes as u64,
+            "a full batch must fit the body limit it will be sent against",
+        );
+    }
+
+    /// Small commands are the nameservice's case: nothing to cap, and
+    /// catch-up keeps openraft's full batch.
+    #[test]
+    fn a_batch_that_already_fits_is_left_alone() {
+        let mut raft = RaftConfig::default();
+        let before = raft.max_payload_entries;
+        cap_payload_entries(&mut raft, &transport(64 * 1024 * 1024), 4 * 1024);
+        assert_eq!(raft.max_payload_entries, before);
+    }
+
+    /// A command too large to ever fit is an application
+    /// misconfiguration. Capping to zero would stop replication
+    /// entirely, which is worse than sending one and letting the
+    /// operator see the warning.
+    #[test]
+    fn a_command_larger_than_the_body_limit_still_replicates_one_at_a_time() {
+        let mut raft = RaftConfig::default();
+        assert_eq!(cap_payload_entries(&mut raft, &transport(1024), 4096), 1);
+    }
+
+    /// The cap runs during bootstrap, not only when called directly —
+    /// otherwise it protects nobody.
+    #[tokio::test]
+    async fn bootstrap_applies_the_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = RaftGroupConfig::new(
+            crate::group::GroupId::new("capped").expect("valid"),
+            1,
+            dir.path(),
+        );
+        config.max_command_bytes = Some(1024 * 1024);
+
+        let storage = Arc::new(
+            crate::storage::fs::FsRaftStorage::open(config.group_storage_root())
+                .await
+                .expect("storage opens"),
+        );
+        let group = RaftGroup::<TinyApp>::bootstrap(
+            config,
+            storage,
+            crate::state_machine::NoObserver::default(),
+        )
+        .await
+        .expect("bootstraps");
+
+        assert_eq!(
+            group.raft.config().max_payload_entries,
+            64,
+            "bootstrap must cap the batch from max_command_bytes",
+        );
     }
 }

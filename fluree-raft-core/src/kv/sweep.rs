@@ -37,6 +37,14 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// whatever is left waits for the next tick.
 pub const DEFAULT_MAX_ROUNDS: u32 = 8;
 
+/// Floor on the sweep interval.
+///
+/// A zero interval is a caller mistake with no useful reading: it turns
+/// the ticker into a spin loop, and — because the pre-check is a local
+/// read — into a continuous stream of proposals the moment anything
+/// expires.
+pub const MIN_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+
 /// How an application reaches one fragment: a local read to decide
 /// whether a sweep is worth proposing, and a way to put an `Evict`
 /// through its own command type.
@@ -87,6 +95,36 @@ impl Default for SweepConfig {
     }
 }
 
+impl SweepConfig {
+    /// The config actually used, with degenerate values raised to a
+    /// usable floor and the substitution logged.
+    ///
+    /// Clamped rather than rejected, on the same reasoning as
+    /// [`KvPolicy::evict_batch`](super::KvPolicy::evict_batch): these
+    /// are throughput knobs with no observable semantics, and failing a
+    /// leader task at spawn time — the only place a rejection could
+    /// land — would disable eviction entirely on the node best placed
+    /// to do it. A TTL is the opposite case, and is rejected.
+    pub fn sanitized(&self) -> Self {
+        let interval = self.interval.max(MIN_SWEEP_INTERVAL);
+        let max_rounds = self.max_rounds.max(1);
+        if interval != self.interval || max_rounds != self.max_rounds {
+            tracing::warn!(
+                requested_interval_ms = self.interval.as_millis() as u64,
+                requested_max_rounds = self.max_rounds,
+                interval_ms = interval.as_millis() as u64,
+                max_rounds,
+                "kv sweep: unusable configuration raised to the minimum"
+            );
+        }
+        Self {
+            interval,
+            batch: self.batch,
+            max_rounds,
+        }
+    }
+}
+
 /// What one tick did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SweepOutcome {
@@ -111,6 +149,7 @@ pub async fn sweep_once<T: SweepTarget>(
     cutoff_ms: u64,
     cancel: &CancellationToken,
 ) -> SweepOutcome {
+    let config = &config.sanitized();
     let mut outcome = SweepOutcome::default();
     if !target.has_expired(cutoff_ms).await {
         // Nothing to reclaim: say drained and, crucially, write nothing
@@ -175,6 +214,7 @@ where
     T: SweepTarget,
     C: Fn() -> u64 + Send + Sync,
 {
+    let config = config.sanitized();
     let (target, config, clock) = (&target, &config, &clock);
     let inner = cancel.clone();
     let inner = &inner;
@@ -193,7 +233,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::kv::{apply, Expect, KvCommand, KvFragment, KvPolicy};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -203,7 +243,7 @@ mod tests {
 
     /// A real fragment behind the trait, so the responses the driver
     /// reacts to are the ones `kv::apply` actually produces.
-    struct Fragment {
+    pub(super) struct Fragment {
         state: Mutex<KvFragment>,
         policy: KvPolicy,
         /// `(cutoff_ms, limit)` for every proposal attempted.
@@ -216,7 +256,7 @@ mod tests {
     }
 
     impl Fragment {
-        fn with(expired: usize, live: usize) -> Self {
+        pub(super) fn with(expired: usize, live: usize) -> Self {
             let policy = KvPolicy::default();
             let mut state = KvFragment::new();
             for i in 0..expired {
@@ -449,4 +489,54 @@ mod tests {
             .expect("run_sweep must stop promptly on cancellation")
             .expect("sweep task must not panic");
     }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// A zero interval turns the ticker into a spin loop and, once
+    /// anything expires, into a continuous stream of proposals. A zero
+    /// round budget silently sweeps nothing at all — the worse of the
+    /// two, because it looks like it is working.
+    #[test]
+    fn degenerate_configurations_are_raised_to_a_usable_floor() {
+        let sane = SweepConfig {
+            interval: Duration::ZERO,
+            batch: 8,
+            max_rounds: 0,
+        }
+        .sanitized();
+        assert_eq!(sane.interval, MIN_SWEEP_INTERVAL);
+        assert_eq!(sane.max_rounds, 1);
+        assert_eq!(sane.batch, 8, "the batch has its own clamp at apply time");
+
+        let untouched = SweepConfig::default();
+        assert_eq!(untouched.sanitized(), untouched);
+    }
+
+    /// `sweep_once` sanitizes too, not just the ticker — the round
+    /// budget is enforced there, so a zero budget passed directly must
+    /// still make progress rather than return an empty success.
+    #[tokio::test]
+    async fn a_zero_round_budget_still_makes_progress() {
+        let target = Fragment::with(3, 0);
+        let outcome = sweep_once(
+            &target,
+            &SweepConfig {
+                interval: Duration::from_millis(5),
+                batch: 8,
+                max_rounds: 0,
+            },
+            HOUR,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome.rounds, 1);
+        assert_eq!(outcome.removed, 3);
+        assert!(outcome.drained);
+    }
+
+    use super::tests::Fragment;
+    const HOUR: u64 = 60 * 60 * 1000;
 }

@@ -34,9 +34,18 @@ impl<A: AppStateMachine> Node<A> {
 
 /// Bring up one node: storage in a temp dir, a group, and an axum
 /// server exposing its two routers under the group prefix.
-pub async fn start_node<A: AppStateMachine>(id: NodeId, group_id: &GroupId) -> Node<A> {
+/// `tune` adjusts the group config before bootstrap — the way an
+/// application declares `max_command_bytes`. Pass `|_| {}` for the
+/// defaults.
+pub async fn start_node<A: AppStateMachine>(
+    id: NodeId,
+    group_id: &GroupId,
+    tune: impl FnOnce(&mut RaftGroupConfig),
+) -> Node<A> {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = RaftGroupConfig::new(group_id.clone(), id, dir.path());
+    let mut config = RaftGroupConfig::new(group_id.clone(), id, dir.path());
+    tune(&mut config);
+    let config = config;
     let storage = Arc::new(
         FsRaftStorage::open(config.group_storage_root())
             .await

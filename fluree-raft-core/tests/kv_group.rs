@@ -54,15 +54,54 @@ fn fence(response: KvResponse) -> u64 {
     }
 }
 
+/// The largest command this app can propose: the biggest key and value
+/// any tenant's policy admits, plus room for the command envelope.
+/// Declaring it caps openraft's catch-up batch so a full one still fits
+/// the append-entries body limit — without it, a follower far enough
+/// behind receives a 413 and openraft retries the same oversized batch
+/// forever.
+fn max_command_bytes() -> u64 {
+    let p = leases::policy(Tenant::Config);
+    p.max_key_bytes + p.max_value_bytes + 4096
+}
+
 async fn cluster(name: &str) -> Vec<Node<Leases>> {
     let group_id = GroupId::new(name).expect("valid group id");
+    let tune = |config: &mut fluree_raft_core::runtime::RaftGroupConfig| {
+        config.max_command_bytes = Some(max_command_bytes());
+    };
     let nodes = vec![
-        start_node(1, &group_id).await,
-        start_node(2, &group_id).await,
-        start_node(3, &group_id).await,
+        start_node(1, &group_id, tune).await,
+        start_node(2, &group_id, tune).await,
+        start_node(3, &group_id, tune).await,
     ];
     form_cluster(&nodes).await;
     nodes
+}
+
+/// A group that declares its command size must end up with a catch-up
+/// batch that fits the body limit it will be sent against. Otherwise a
+/// lagging follower can never rejoin — the failure is silent, total,
+/// and only reachable from a node that is already degraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catch_up_batch_fits_the_append_body_limit() {
+    let nodes = cluster("headroom").await;
+    let config = nodes[0].group.raft.config();
+    let transport = fluree_raft_core::network::RaftTransportConfig::default();
+
+    assert!(
+        config.max_payload_entries < 300,
+        "openraft's stock batch must have been capped, got {}",
+        config.max_payload_entries,
+    );
+    assert!(
+        config.max_payload_entries * max_command_bytes()
+            <= transport.append_entries_max_body_bytes as u64,
+        "a full batch ({} x {} bytes) must fit the {}-byte append limit",
+        config.max_payload_entries,
+        max_command_bytes(),
+        transport.append_entries_max_body_bytes,
+    );
 }
 
 /// Read a lease's live record from one node's local state.
