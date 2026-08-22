@@ -17,8 +17,28 @@ use fluree_raft_core::node::NodeId;
 use fluree_raft_core::ownership::{digest_parts, owner_for_digest, RENDEZVOUS_SEED};
 use xxhash_rust::xxh64::xxh64;
 
+/// The seed as it shipped, written out rather than imported.
+///
+/// Importing `RENDEZVOUS_SEED` here would make the reference track the
+/// implementation: changing the production seed would change most of
+/// what this file expects, and the comparison tests would keep passing
+/// while every existing cluster's ownership map silently moved.
+const REFERENCE_SEED: u64 = 0x6661_6566_5246_4252;
+
+/// Guards the constant the rest of this file is written against. If this
+/// fails, the seed changed — which is a full-cluster-stop change, not a
+/// rolling one.
+#[test]
+fn published_seed_matches_the_frozen_reference() {
+    assert_eq!(
+        RENDEZVOUS_SEED, REFERENCE_SEED,
+        "RENDEZVOUS_SEED changed; ownership moves for every existing \
+         cluster and a rolling upgrade will split branch ownership",
+    );
+}
+
 fn reference_key_digest(ledger_name: &str, branch: &str) -> u64 {
-    let hash = xxh64(ledger_name.as_bytes(), RENDEZVOUS_SEED);
+    let hash = xxh64(ledger_name.as_bytes(), REFERENCE_SEED);
     let hash = xxh64(b":", hash);
     xxh64(branch.as_bytes(), hash)
 }

@@ -27,6 +27,28 @@ pub const MAX_GROUP_ID_LEN: usize = 64;
 /// outright is cheaper than teaching every backend to detect it.
 const RESERVED_GROUP_IDS: &[&str] = &["log", "snapshots", "vote", "committed", "last_purged"];
 
+/// Names Windows reserves as character devices.
+///
+/// These are unusable as path components on Windows regardless of
+/// directory, so `storage_root` would hand back a path that cannot be
+/// created. The filesystem backend supports Windows (`fsync_dir` has a
+/// documented non-Unix branch), so this is reachable.
+///
+/// Rejected on every platform, not just Windows: a group id is
+/// operator-supplied configuration that is replicated through
+/// membership, so a mixed-OS cluster has to agree on what is valid.
+/// Accepting `aux` on Linux and failing on Windows would turn a config
+/// typo into a node that cannot start.
+///
+/// Windows matches these case-insensitively and also reserves them with
+/// any extension (`con.txt`). Only the bare lowercase spelling can reach
+/// this check — the charset rule above already rejects uppercase and
+/// `.` — so the bare lowercase list is complete.
+const RESERVED_DEVICE_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com0", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+    "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
 /// Why a candidate group id was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GroupIdError {
@@ -42,6 +64,8 @@ pub enum GroupIdError {
     InvalidStart { id: String },
     #[error("group id {id:?} is reserved by the storage layout")]
     Reserved { id: String },
+    #[error("group id {id:?} is a reserved device name on Windows")]
+    ReservedDeviceName { id: String },
 }
 
 /// Validated identifier for one Raft group within a process.
@@ -81,6 +105,9 @@ impl GroupId {
         }
         if RESERVED_GROUP_IDS.contains(&id.as_str()) {
             return Err(GroupIdError::Reserved { id });
+        }
+        if RESERVED_DEVICE_NAMES.contains(&id.as_str()) {
+            return Err(GroupIdError::ReservedDeviceName { id });
         }
 
         Ok(Self(id))
@@ -195,6 +222,36 @@ mod tests {
                 matches!(GroupId::new(*id), Err(GroupIdError::Reserved { .. })),
                 "{id} must be reserved",
             );
+        }
+    }
+
+    #[test]
+    fn rejects_windows_device_names() {
+        for id in RESERVED_DEVICE_NAMES {
+            assert!(
+                matches!(
+                    GroupId::new(*id),
+                    Err(GroupIdError::ReservedDeviceName { .. })
+                ),
+                "{id} must be rejected as a Windows device name",
+            );
+        }
+    }
+
+    /// The device-name rule is exact, not a prefix match: `console` and
+    /// `com10` are ordinary names and must stay usable.
+    #[test]
+    fn device_name_rejection_is_exact_not_prefix() {
+        for id in [
+            "console",
+            "com10",
+            "com",
+            "lpt",
+            "auxiliary",
+            "nullable",
+            "prnt",
+        ] {
+            assert!(GroupId::new(id).is_ok(), "{id} should be accepted");
         }
     }
 
