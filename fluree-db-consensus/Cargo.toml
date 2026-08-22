@@ -19,6 +19,7 @@ fluree-db-core = { path = "../fluree-db-core" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-transact = { path = "../fluree-db-transact" }
 fluree-db-ledger = { path = "../fluree-db-ledger" }
+fluree-raft-core = { path = "../fluree-raft-core" }
 
 async-trait = { workspace = true }
 hex = { workspace = true }

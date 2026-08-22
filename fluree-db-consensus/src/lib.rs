@@ -23,7 +23,10 @@
 //! outcome. Callers who don't need those guarantees may omit the key.
 
 pub mod caching;
-pub mod http;
+// Moved to `fluree-raft-core`; re-exported so
+// `fluree_db_consensus::http::is_hop_by_hop` keeps resolving for
+// the server's peer-mode forwarder, which does not enable `raft`.
+pub use fluree_raft_core::http;
 pub mod local;
 #[cfg(feature = "raft")]
 pub mod raft;

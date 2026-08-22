@@ -56,6 +56,10 @@ fluree-db/
 │   ├── fluree-sse/                # Server-Sent Events parser
 │   └── fluree-db-peer/            # SSE protocol for peer mode
 │
+├── Consensus
+│   ├── fluree-raft-core/          # Generic Raft substrate (storage, node/group identity, ownership)
+│   └── fluree-db-consensus/       # Committer traits + the Raft-replicated nameservice
+│
 └── Top-Level
     ├── fluree-db-api/             # Public API and high-level operations
     ├── fluree-db-bolt/            # Bolt protocol codec + session machine
@@ -537,6 +541,51 @@ fluree-db/
 
 **Dependencies:**
 - fluree-sse
+
+## Consensus Crates
+
+### fluree-raft-core
+
+**Purpose**: Application-agnostic Raft substrate — the generic half of what
+began inside `fluree-db-consensus::raft`.
+
+**Key modules**:
+
+- `storage` — durable log/vote/snapshot traits, with filesystem
+  (atomic write → fsync → rename) and in-memory backends
+- `node` — `NodeId` and `ClusterNode`, the raft/client address pair that
+  travels through membership changes
+- `group` — `GroupId`, the validated name of one group within a process
+  (a group's storage lives at `<root>/<group_id>/`)
+- `ownership` — rendezvous (HRW) hashing for assigning work to members
+  without a consensus round
+- `http` — hop-by-hop header classification for request forwarding
+
+**Depends on**: nothing in the workspace. Deliberately no `openraft`
+dependency either: storage payloads are opaque bytes, and `ClusterNode`
+satisfies openraft's blanket `Node` bound through its derives alone.
+
+**Note**: `ownership`'s hash is effectively a wire format — nodes compute
+ownership locally and independently, so two nodes that disagree can both
+claim the same key. See the module docs before touching it.
+
+### fluree-db-consensus
+
+**Purpose**: The `Committer` abstraction for submitting transactions, plus
+the Raft-replicated nameservice state machine.
+
+**Key types**: `Committer`, `LocalCommitter`, `CachingCommitter`,
+`Command`/`Response`, `NameServiceState`, `RaftNameService`,
+`QueuedTransactor`, `commit_worker::Worker`.
+
+**Feature flags**: `raft` (non-default) gates `openraft` so monolithic
+users don't compile or link it.
+
+**Depends on**: fluree-raft-core, fluree-db-api, fluree-db-core,
+fluree-db-nameservice, fluree-db-transact, fluree-db-ledger
+
+**See also**: `docs/design/raft-command-queue.md`,
+`docs/operations/raft-clusters.md`
 
 ## Top-Level Crates
 

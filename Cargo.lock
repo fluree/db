@@ -2680,6 +2680,7 @@ dependencies = [
  "fluree-db-ledger",
  "fluree-db-nameservice",
  "fluree-db-transact",
+ "fluree-raft-core",
  "futures",
  "hex",
  "http-body-util",
@@ -3368,6 +3369,21 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "winnow 0.7.14",
+]
+
+[[package]]
+name = "fluree-raft-core"
+version = "4.1.6"
+dependencies = [
+ "async-trait",
+ "postcard",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]

@@ -1,0 +1,46 @@
+[package]
+name = "fluree-raft-core"
+description = "Application-agnostic Raft substrate: durable log/snapshot storage, node identity, and rendezvous ownership"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No `fluree-db-*` dependencies, by design: this crate is the generic
+# half of what used to live in `fluree-db-consensus::raft`, and every
+# consumer (the nameservice group today; workflow / entity-resolution
+# groups next) instantiates it against its own state machine.
+#
+# Also, deliberately, no `openraft` dependency yet. Nothing in this
+# crate's current surface needs one: the storage traits are defined in
+# terms of opaque `Vec<u8>` payloads, and `ClusterNode` satisfies
+# openraft's blanket `Node` impl through its derives alone. openraft
+# arrives with the log/network/admin adapters.
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Wire and on-disk encoding for log entries, vote, and snapshot
+# metadata in the filesystem backend.
+postcard = { workspace = true }
+
+# `tokio::fs` + `AsyncWriteExt` for the filesystem backend's
+# write-fsync-rename discipline.
+tokio = { workspace = true }
+
+# Deterministic, fixed-seed hash for rendezvous ownership. Every node
+# must agree on hash values, so this cannot be `std`'s randomly-seeded
+# `DefaultHasher`. xxh64 is stable across releases of the crate.
+xxhash-rust = { workspace = true, features = ["xxh64"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+serde_json = { workspace = true }
+tempfile = "3.19"
+xxhash-rust = { workspace = true, features = ["xxh64"] }
+
+[lints]
+workspace = true

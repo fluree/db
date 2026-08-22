@@ -14,14 +14,14 @@ The design splits the work: the Raft log replicates **decisions** (branch head m
 
 ## Component map
 
-The Raft consensus crate (`fluree-db-consensus/src/raft/`) is structured as a set of cooperating components:
+The Raft consensus crate (`fluree-db-consensus/src/raft/`) is structured as a set of cooperating components. The application-agnostic pieces — durable log/snapshot storage, node identity, rendezvous ownership — have been extracted to `fluree-raft-core` so other replicated groups can reuse them; paths below say which crate a component lives in when it is not `fluree-db-consensus`:
 
 | Component                  | Lives where                                              | Job                                                                                                         |
 | -------------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `Command`, `Response`      | `state_machine.rs`                                       | The log entry types. ~20 variants spanning transaction flow, ledger lifecycle, and metadata.                |
 | `NameServiceState`         | `state_machine.rs`                                       | The replicated in-memory state: branch heads, ledger registry, per-branch queues, idempotency cache.        |
 | `StateMachineAdapter`      | `state_machine_adapter.rs`                               | openraft's `RaftStateMachine` impl. Applies entries, takes/installs snapshots, resolves waiters.            |
-| `LogStore`, `SnapshotStore`| `log_adapter.rs`, `storage/{fs,memory}.rs`               | openraft's `RaftLogStorage`/`RaftLogReader`/`RaftSnapshotBuilder`. Local-disk persistence.                                          |
+| `LogStore`, `SnapshotStore`| `log_adapter.rs`; `fluree-raft-core` `storage/{fs,memory}.rs` | openraft's `RaftLogStorage`/`RaftLogReader`/`RaftSnapshotBuilder`. Local-disk persistence. The backends are openraft-free — they store opaque `Vec<u8>` payloads. |
 | `HttpRaftNetworkFactory`   | `network.rs`                                             | Inter-node RPC (`/raft/vote`, `/raft/append-entries`, `/raft/install-snapshot`) over HTTP.                  |
 | `RaftAdmin` / `/cluster/*` | `admin.rs`                                               | Operator-facing membership endpoints (`initialize`, `add-learner`, `change-membership`, `status`).         |
 | Follower-forward middleware| `forward.rs`                                             | Axum middleware that proxies leader-only client requests to the current leader.                            |
