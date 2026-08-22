@@ -394,9 +394,13 @@ If no leader is currently elected (mid-election), follower nodes return `503 Ser
 
 **Symptom:** Peer logs report `413 Payload Too Large` from the Raft listener.
 
-**When it happens:** The per-route body limits on the Raft port are **hard-coded** (vote 1 MiB, append-entries 64 MiB, install-snapshot 1 GiB). A real append-entries batch that exceeds 64 MiB is unusual; reaching it usually means an oversized commit blob was somehow encoded inline (it shouldn't be — commit payloads ride CAS, not the log).
+**When it happens:** Two distinct causes, and they need different responses.
 
-**Operator action:** Investigate the leader's queue for an over-sized envelope. There is no operator knob for these limits in the current build.
+*An oversized single request.* The per-route body limits come from `RaftTransportConfig::default` (vote 1 MiB, append-entries 64 MiB, install-snapshot 1 GiB) — configurable in principle, though the server binary exposes no flag for them. A real append-entries batch over 64 MiB is unusual; reaching it usually means an oversized commit blob was somehow encoded inline, which it should not be — commit payloads ride CAS, not the log.
+
+*A catch-up batch that cannot fit.* This one is worse, because it does not resolve on its own. openraft batches up to `max_payload_entries` (300 by default) into a single append-entries RPC and, in 0.9, does **not** shrink a batch the peer refuses. If `max_payload_entries × the largest command the application proposes` exceeds the append-entries limit, a follower that has fallen far enough behind gets a 413, the transport reports it as a network error, and openraft retries the same oversized batch indefinitely. That follower never rejoins. The symptom is a single node stuck lagging while the rest of the cluster is healthy.
+
+**Operator action:** For the first, investigate the leader's queue for an over-sized envelope. For the second, the fix is a configuration one at integration time: the group must declare `RaftGroupConfig::max_command_bytes`, which makes bootstrap cap `max_payload_entries` so a full batch fits. The nameservice group's commands are uniformly small — heads, queue entries, and admin operations, all far under the limit — so it leaves this unset and cannot reach this state. A group embedding [`kv`](../design/raft-core.md#the-kv-fragment), whose default value limit is 1 MiB, must set it. See [Catch-up batch sizing](../design/raft-core.md#catch-up-batch-sizing).
 
 ### Mixed-version cluster
 

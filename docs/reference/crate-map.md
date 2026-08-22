@@ -592,10 +592,13 @@ openraft):
   own state machine, not a service and not its own group. A lease fences
   the work it guards only if both are ordered by the same log. An
   entry's version is the **Raft log index** of the write that created
-  it, so a fencing token can never repeat; expiry is logical absence, so
-  sweep timing is invisible; every CAS failure returns the current
+  it, so a fencing token can never repeat; expiry is logical absence,
+  kept invisible across partial sweeps by a monotonic logical-time floor
+  that every reclamation raises; every CAS failure returns the current
   record, which is also the recovery path for a lost response. TTLs are
-  rejected rather than clamped. Tenancy is the application's
+  rejected rather than clamped, and a fragment's expiry index and byte
+  total are rebuilt on snapshot decode rather than trusted. Tenancy is
+  the application's
   composition — `BTreeMap<Tenant, KvFragment>` keyed by an
   **append-only** enum, because postcard is positional: appending a
   struct field breaks every existing snapshot, while appending an enum
@@ -608,6 +611,8 @@ openraft):
   the sweep), and **propose nothing when nothing has expired** (an idle
   ticker that still writes grows the log on every node forever). Spawn
   `run_sweep` from `spawn_leader_watcher`'s task factory.
+
+Full design rationale: `docs/design/raft-core.md`.
 
 And under `testing`:
 

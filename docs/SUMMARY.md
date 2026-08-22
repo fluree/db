@@ -104,6 +104,7 @@
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
   - [Cross-ledger model enforcement](design/cross-ledger-model-enforcement.md)
   - [Storage traits](design/storage-traits.md)
+  - [Raft substrate (`fluree-raft-core`)](design/raft-core.md)
   - [Raft command queue and replicated state machine](design/raft-command-queue.md)
 
 - [HTTP API (fluree-db-server)](api/README.md)
