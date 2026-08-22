@@ -26,6 +26,10 @@ default = []
 # crate through `fluree-db-consensus` for `http::is_hop_by_hop` — do not
 # compile or link openraft.
 raft = ["dep:openraft", "dep:axum", "dep:reqwest", "dep:http-body-util"]
+# Conformance fixture for `AppStateMachine` implementations. Separate
+# from `raft` so it can be enabled as a dev-dependency by consumers
+# without shipping the fixture in their release builds.
+testing = ["raft"]
 
 [dependencies]
 async-trait = { workspace = true }

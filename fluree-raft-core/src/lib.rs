@@ -52,6 +52,10 @@ pub mod forward;
 pub mod log_adapter;
 #[cfg(feature = "raft")]
 pub mod network;
+#[cfg(feature = "raft")]
+pub mod state_machine;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use group::{GroupId, GroupIdError};
 pub use node::{ClusterNode, NodeId};
