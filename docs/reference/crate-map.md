@@ -590,7 +590,9 @@ And under `testing`:
   can be run through (snapshot persist-before-swap, boot restore,
   membership bookkeeping, one response per entry). Deliberately not
   specific to this crate's adapter: the point is to hold a bespoke
-  adapter to the same contract.
+  adapter to the same contract. Both adapters in the tree run it — the
+  generic one in `fluree-raft-core/tests/state_machine_seam.rs`, the
+  nameservice's in `fluree-db-consensus/tests/it_adapter_conformance.rs`.
 
 **Depends on**: nothing in the workspace. Without the `raft` feature
 there is no `openraft` dependency either: storage payloads are opaque
@@ -619,7 +621,10 @@ the Raft-replicated nameservice state machine.
 `QueuedTransactor`, `commit_worker::Worker`.
 
 **Feature flags**: `raft` (non-default) gates `openraft` so monolithic
-users don't compile or link it.
+users don't compile or link it. `testing` (implies `raft`) pulls in
+`fluree-raft-core`'s conformance fixture and runs the bespoke
+`StateMachineAdapter` through it; test-only, so it is off outside
+`--all-features`.
 
 **Depends on**: fluree-raft-core, fluree-db-api, fluree-db-core,
 fluree-db-nameservice, fluree-db-transact, fluree-db-ledger

@@ -13,6 +13,11 @@ default = []
 # transitive dependencies.
 raft = ["fluree-raft-core/raft", "dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum", "dep:http-body-util", "dep:futures", "dep:tokio-util"]
 
+# Runs the bespoke nameservice adapter through `fluree-raft-core`'s
+# shared adapter-conformance fixture. Test-only: it pulls the fixture
+# into the build, so it stays off outside `--all-features` runs.
+testing = ["raft", "fluree-raft-core/testing"]
+
 [dependencies]
 fluree-db-api = { path = "../fluree-db-api" }
 fluree-db-core = { path = "../fluree-db-core" }
