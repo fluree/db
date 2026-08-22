@@ -252,6 +252,20 @@ where
 /// subscribers (the parked waiters' senders' receivers) can't
 /// reenter apply.
 enum WaiterResolution {
+    /// This node applied an `EnqueueCommand`. If a local proposer
+    /// armed interest in its `request_cid`, bind that interest to the
+    /// `queue_id` the state machine just assigned.
+    ///
+    /// Ordered with the resolutions below rather than done inline,
+    /// because a single apply batch can carry both the enqueue and its
+    /// terminal command — the bind has to land first.
+    ///
+    /// A follower has nothing armed, so this is a no-op there. That is
+    /// the whole reason a follower's waiter map stays empty.
+    Bind {
+        request_cid: ContentId,
+        queue_id: u64,
+    },
     /// `ApplyHead` advanced the head — wake the parked transactor
     /// with the new head identity.
     Applied {
@@ -278,6 +292,13 @@ enum WaiterResolution {
 /// resolved by whichever earlier event popped it).
 fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterResolution> {
     match (cmd, response) {
+        (
+            Command::EnqueueCommand(args),
+            Response::Enqueued { queue_id, .. } | Response::InFlight { queue_id, .. },
+        ) => Some(WaiterResolution::Bind {
+            request_cid: args.request_cid.clone(),
+            queue_id: *queue_id,
+        }),
         (
             Command::ApplyHead(args),
             Response::HeadApplied {
@@ -530,6 +551,10 @@ where
         if let Some(waiters) = self.waiter_map.as_ref() {
             for resolution in resolutions {
                 match resolution {
+                    WaiterResolution::Bind {
+                        request_cid,
+                        queue_id,
+                    } => waiters.bind(&request_cid, queue_id),
                     WaiterResolution::Applied {
                         queue_id,
                         commit_id,
@@ -744,6 +769,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Outcomes are delivered synchronously by `apply`; this only
+    /// bounds a genuine failure.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
     use crate::raft::state_machine::NewLedger;
     use crate::raft::storage::memory::MemoryRaftStorage;
     use crate::raft::Command as RaftCommand;
@@ -1338,7 +1367,12 @@ mod tests {
             .with_waiter_map(Arc::clone(&waiter_map))
             .with_staged_receipts(Arc::clone(&staged));
 
-        let parked_rx = waiter_map.register(100, RefKey::new("test/db", "main"));
+        let mut bound = waiter_map.arm_bound(cid(210), RefKey::new("test/db", "main"), 100);
+        // A submission that was proposed but whose enqueue has not
+        // applied here yet — still an interest, no queue_id.
+        let mut unbound = waiter_map.arm(cid(211), RefKey::new("test/db", "main"));
+        // A terminal apply for an id no local proposer is waiting on —
+        // every such apply on a follower. It must leave nothing behind.
         waiter_map.resolve_applied(
             101,
             AppliedReceipt::Minimal {
@@ -1356,7 +1390,11 @@ mod tests {
                 tally: None,
             }),
         );
-        assert_eq!(waiter_map.len(), 2);
+        assert_eq!(
+            waiter_map.len(),
+            2,
+            "one bound waiter and one armed interest; the unmatched resolve tracks nothing",
+        );
         assert_eq!(staged.len(), 1);
 
         target
@@ -1364,12 +1402,17 @@ mod tests {
             .await
             .unwrap();
 
-        // Parked waiter is aborted with SnapshotInstalled.
+        // Both the bound waiter and the armed interest are abandoned:
+        // the snapshot replaced the state wholesale, so neither the
+        // queue entry nor the pending enqueue can be trusted to exist.
         assert!(matches!(
-            parked_rx.await.unwrap(),
+            bound.wait(WAIT).await.unwrap(),
             WaiterOutcome::Aborted(AbortReason::SnapshotInstalled)
         ));
-        // Buffered Applied is dropped, not preserved.
+        assert!(matches!(
+            unbound.wait(WAIT).await.unwrap(),
+            WaiterOutcome::Aborted(AbortReason::SnapshotInstalled)
+        ));
         assert!(waiter_map.is_empty());
         // Stashed receipts cleared.
         assert!(staged.is_empty());
@@ -1471,7 +1514,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rx = waiters.register(0, RefKey::new("test/db", "main"));
+        let mut rx = waiters.arm_bound(cid(20), RefKey::new("test/db", "main"), 0);
         adapter
             .apply([apply_head_entry(3, "test/db", "main", 0, cid(42), 10)])
             .await
@@ -1480,7 +1523,7 @@ mod tests {
         // No StagedReceiptMap is configured on the adapter, so the
         // resolution falls back to Minimal — confirming the absent-
         // entry path delivers commit_id / commit_t without panicking.
-        match rx.await.expect("receive") {
+        match rx.wait(WAIT).await.expect("receive") {
             WaiterOutcome::Applied(AppliedReceipt::Minimal {
                 commit_id,
                 commit_t,
@@ -1510,7 +1553,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rx = waiter_map.register(0, RefKey::new("test/db", "main"));
+        let mut rx = waiter_map.arm_bound(cid(20), RefKey::new("test/db", "main"), 0);
         staged.stash(
             0,
             RefKey::new("test/db", "main"),
@@ -1526,7 +1569,7 @@ mod tests {
             .await
             .unwrap();
 
-        match rx.await.expect("receive") {
+        match rx.wait(WAIT).await.expect("receive") {
             WaiterOutcome::Applied(AppliedReceipt::Transact(r)) => {
                 assert_eq!(r.commit_id, cid(42));
                 assert_eq!(r.commit_t, 10);
@@ -1548,7 +1591,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rx = waiters.register(0, RefKey::new("test/db", "main"));
+        let mut rx = waiters.arm_bound(cid(20), RefKey::new("test/db", "main"), 0);
         adapter
             .apply([poison_entry(
                 3,
@@ -1562,7 +1605,7 @@ mod tests {
             .await
             .unwrap();
 
-        match rx.await.expect("receive") {
+        match rx.wait(WAIT).await.expect("receive") {
             WaiterOutcome::Aborted(AbortReason::Poisoned(PoisonReason::BodyMalformed {
                 error,
             })) => assert_eq!(error, "bad turtle"),
@@ -1586,8 +1629,8 @@ mod tests {
             .await
             .unwrap();
 
-        let rx_a = waiters.register(0, RefKey::new("test/db", "main"));
-        let rx_b = waiters.register(1, RefKey::new("test/db", "main"));
+        let mut rx_a = waiters.arm_bound(cid(20), RefKey::new("test/db", "main"), 0);
+        let mut rx_b = waiters.arm_bound(cid(21), RefKey::new("test/db", "main"), 1);
 
         adapter
             .apply([drop_branch_entry(4, "test/db", "main")])
@@ -1595,11 +1638,11 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            rx_a.await.unwrap(),
+            rx_a.wait(WAIT).await.unwrap(),
             WaiterOutcome::Aborted(AbortReason::BranchDropped)
         ));
         assert!(matches!(
-            rx_b.await.unwrap(),
+            rx_b.wait(WAIT).await.unwrap(),
             WaiterOutcome::Aborted(AbortReason::BranchDropped)
         ));
     }
@@ -1616,7 +1659,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rx = waiters.register(0, RefKey::new("test/db", "main"));
+        let mut rx = waiters.arm_bound(cid(20), RefKey::new("test/db", "main"), 0);
         adapter
             .apply([Entry {
                 log_id: log_id(1, 3),
@@ -1636,7 +1679,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            rx.await.unwrap(),
+            rx.wait(WAIT).await.unwrap(),
             WaiterOutcome::Aborted(AbortReason::BranchHeadReset)
         ));
     }

@@ -153,6 +153,12 @@ impl QueuedTransactor {
         let full_ledger_id = format!("{}:{}", args.ledger_id, args.branch);
         let cmd = SmCommand::EnqueueCommand(args);
         let attempts_allowed = if retry_eligible { self.max_retries } else { 1 };
+        // Arm interest *before* proposing. The queue_id does not exist
+        // yet, so the waiter is keyed by request_cid until this node
+        // applies the enqueue and binds it — which is what lets a fast
+        // worker's ApplyHead find a waiter, and what keeps followers
+        // from tracking anything at all. Dropped on every return path.
+        let mut ticket = self.waiter_map.arm(request_cid.clone(), ref_key);
         for attempt in 0..attempts_allowed {
             let response = match self.raft.client_write(cmd.clone()).await {
                 Ok(response) => response,
@@ -193,21 +199,17 @@ impl QueuedTransactor {
                 }
             };
             match response.data {
-                SmResponse::Enqueued { queue_id, .. } | SmResponse::InFlight { queue_id, .. } => {
-                    let rx = self.waiter_map.register(queue_id, ref_key.clone());
-                    match tokio::time::timeout(self.wait_timeout, rx).await {
-                        Ok(Ok(outcome)) => return Ok(SubmissionOutcome::Waiter(outcome)),
-                        Ok(Err(_recv)) => {
-                            // The sender for this queue_id was
-                            // dropped — most likely a duplicate
-                            // `register` overrode it. Treat the same
-                            // as a timeout: retry if eligible, error
-                            // otherwise.
-                            if attempt + 1 >= attempts_allowed {
-                                return Err(self.stranded_error(retry_eligible));
-                            }
-                        }
-                        Err(_elapsed) => {
+                SmResponse::Enqueued { .. } | SmResponse::InFlight { .. } => {
+                    // The adapter bound the ticket while applying this
+                    // enqueue, so there is nothing to register here.
+                    // On a retry the response is `InFlight` for the same
+                    // entry and the ticket is already bound to it.
+                    match ticket.wait(self.wait_timeout).await {
+                        Ok(outcome) => return Ok(SubmissionOutcome::Waiter(outcome)),
+                        // Displaced (a duplicate submission took the
+                        // slot) and timed-out are handled the same:
+                        // retry if eligible, error otherwise.
+                        Err(_) => {
                             if attempt + 1 >= attempts_allowed {
                                 return Err(self.stranded_error(retry_eligible));
                             }
