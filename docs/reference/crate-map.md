@@ -600,6 +600,14 @@ openraft):
   **append-only** enum, because postcard is positional: appending a
   struct field breaks every existing snapshot, while appending an enum
   variant does not.
+- `kv::sweep` (`kv` + `raft`) — the leader-only eviction driver.
+  `Evict` is bounded on purpose, so something has to notice
+  `more_expired` and come back. Two details live here rather than in
+  each consumer: re-propose **immediately with the same cutoff** (a
+  fresh clock read per round lets a steadily-expiring fragment outrun
+  the sweep), and **propose nothing when nothing has expired** (an idle
+  ticker that still writes grows the log on every node forever). Spawn
+  `run_sweep` from `spawn_leader_watcher`'s task factory.
 
 And under `testing`:
 

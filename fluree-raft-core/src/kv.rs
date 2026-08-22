@@ -107,6 +107,9 @@
 //! nodes diverges the cluster. Per-tenant policy also means a churny
 //! tenant cannot starve another's sweep.
 
+#[cfg(feature = "raft")]
+pub mod sweep;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;

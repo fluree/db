@@ -13,139 +13,29 @@
 
 #![cfg(feature = "testing")]
 
-mod support;
+#[path = "support/cluster.rs"]
+mod cluster;
+#[path = "support/counter.rs"]
+mod counter;
 
-use fluree_raft_core::admin::NodeAddrs;
+use cluster::{eventually, form_cluster, leader, start_node, Node};
+
+type CounterNode = Node<Counter>;
+use counter::{Counter, CounterCommand};
 use fluree_raft_core::forward::LeaderView;
 use fluree_raft_core::group::GroupId;
-use fluree_raft_core::node::{ClusterNode, NodeId};
-use fluree_raft_core::runtime::{
-    run_periodic, spawn_leader_watcher, RaftGroup, RaftGroupConfig, DEFAULT_LEADER_TASK_GRACE,
-};
-use fluree_raft_core::state_machine::NoObserver;
-use fluree_raft_core::storage::fs::FsRaftStorage;
+use fluree_raft_core::node::NodeId;
+use fluree_raft_core::runtime::{run_periodic, spawn_leader_watcher, DEFAULT_LEADER_TASK_GRACE};
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use support::{Counter, CounterCommand};
 use tokio_util::sync::CancellationToken;
-
-type Group = RaftGroup<Counter>;
-
-struct Node {
-    id: NodeId,
-    group: Arc<Group>,
-    addr: ClusterNode,
-    /// Held so the storage directory outlives the node.
-    _dir: tempfile::TempDir,
-}
-
-impl Node {
-    fn addrs(&self) -> NodeAddrs {
-        NodeAddrs {
-            raft_addr: self.addr.raft_addr.clone(),
-            client_addr: self.addr.client_addr.clone(),
-        }
-    }
-
-    async fn value(&self) -> i64 {
-        self.group.state.read().await.value
-    }
-}
-
-/// Bring up one node: storage in a temp dir, a group, and an axum
-/// server exposing its two routers under the group prefix.
-async fn start_node(id: NodeId, group_id: &GroupId) -> Node {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = RaftGroupConfig::new(group_id.clone(), id, dir.path());
-    let storage = Arc::new(
-        FsRaftStorage::open(config.group_storage_root())
-            .await
-            .expect("storage opens"),
-    );
-    let group = Arc::new(
-        Group::bootstrap(config, storage, NoObserver::default())
-            .await
-            .expect("group bootstraps"),
-    );
-
-    // Group-prefixed mounts — the multi-group shape. A single-group
-    // deployment nests the same routers at bare /raft and /cluster,
-    // which is how an existing group keeps the addresses already
-    // recorded in its replicated membership.
-    let app = axum::Router::new()
-        .nest(&format!("/raft/{group_id}"), group.raft_router())
-        .nest(&format!("/cluster/{group_id}"), group.admin_router());
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let port = listener.local_addr().expect("local addr").port();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    Node {
-        id,
-        group,
-        addr: ClusterNode::new(
-            format!("http://127.0.0.1:{port}/raft/{group_id}"),
-            format!("http://127.0.0.1:{port}"),
-        ),
-        _dir: dir,
-    }
-}
-
-/// Poll an async predicate until it holds, or panic after ~10s.
-async fn eventually<F, Fut>(what: &str, mut check: F)
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    for _ in 0..1000 {
-        if check().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
-
-/// Single-voter bootstrap on node 1, then grow to the full set.
-async fn form_cluster(nodes: &[Node]) {
-    nodes[0]
-        .group
-        .admin
-        .initialize(BTreeMap::from([(nodes[0].id, nodes[0].addrs())]))
-        .await
-        .expect("initialize");
-    eventually("node 1 to elect itself", || async {
-        nodes[0].group.is_leader()
-    })
-    .await;
-
-    for n in &nodes[1..] {
-        nodes[0]
-            .group
-            .admin
-            .add_learner(n.id, n.addrs(), true)
-            .await
-            .unwrap_or_else(|e| panic!("add learner {}: {e}", n.id));
-    }
-    nodes[0]
-        .group
-        .admin
-        .change_membership(nodes.iter().map(|n| n.id).collect(), false)
-        .await
-        .expect("change membership");
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_counter_cluster_replicates_and_tracks_membership() {
     let group_id = GroupId::new("counter").expect("valid group id");
-    let nodes = vec![
+    let nodes: Vec<CounterNode> = vec![
         start_node(1, &group_id).await,
         start_node(2, &group_id).await,
         start_node(3, &group_id).await,
@@ -164,7 +54,7 @@ async fn three_node_counter_cluster_replicates_and_tracks_membership() {
     for node in &nodes {
         let id = node.id;
         eventually(&format!("node {id} to converge on 10"), || async {
-            node.value().await == 10
+            node.group.state.read().await.value == 10
         })
         .await;
     }
@@ -189,16 +79,19 @@ async fn three_node_counter_cluster_replicates_and_tracks_membership() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_raft_satisfies_the_leader_view_the_forwarder_needs() {
     let group_id = GroupId::new("view").expect("valid group id");
-    let nodes = vec![
+    let nodes: Vec<CounterNode> = vec![
         start_node(1, &group_id).await,
         start_node(2, &group_id).await,
         start_node(3, &group_id).await,
     ];
     form_cluster(&nodes).await;
 
+    // Wait for the election before classifying anyone: without this,
+    // "not the leader" is also true of every node during a campaign.
+    let elected = leader(&nodes).await.id;
     let follower = nodes
         .iter()
-        .find(|n| !n.group.is_leader())
+        .find(|n| n.id != elected)
         .expect("a follower exists");
 
     // Every node agrees who leads, including from a follower's view —
@@ -245,7 +138,7 @@ async fn live_raft_satisfies_the_leader_view_the_forwarder_needs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leader_tasks_start_on_election_and_stop_on_shutdown() {
     let group_id = GroupId::new("ticker").expect("valid group id");
-    let node = start_node(1, &group_id).await;
+    let node: CounterNode = start_node(1, &group_id).await;
     node.group
         .admin
         .initialize(BTreeMap::from([(node.id, node.addrs())]))
@@ -304,7 +197,7 @@ async fn a_task_that_ignores_cancellation_is_aborted_after_the_grace_period() {
     const GRACE: Duration = Duration::from_millis(200);
 
     let group_id = GroupId::new("straggler").expect("valid group id");
-    let node = start_node(1, &group_id).await;
+    let node: CounterNode = start_node(1, &group_id).await;
     node.group
         .admin
         .initialize(BTreeMap::from([(node.id, node.addrs())]))

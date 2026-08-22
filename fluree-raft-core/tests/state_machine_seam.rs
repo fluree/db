@@ -10,8 +10,13 @@
 
 #![cfg(feature = "testing")]
 
-mod support;
+#[path = "support/counter.rs"]
+mod counter;
 
+use counter::{
+    Counter, CounterCommand, CounterConfig, CounterResponse, CounterState, CounterStateV1,
+    SNAPSHOT_V2,
+};
 use fluree_raft_core::node::{ClusterNode, NodeId};
 use fluree_raft_core::state_machine::{
     codec, AppStateMachine, MembershipView, ReadOnlyState, SnapshotCodecError, SnapshotLoad,
@@ -29,10 +34,6 @@ use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
 use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
-use support::{
-    Counter, CounterCommand, CounterConfig, CounterResponse, CounterState, CounterStateV1,
-    SNAPSHOT_V2,
-};
 
 // ============================================================================
 // The observer

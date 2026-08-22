@@ -1,4 +1,4 @@
-//! The toy application both integration tests drive.
+//! The toy application the seam tests drive.
 //!
 //! A counter is enough to exercise every part of the seam — state
 //! reduction, a membership-derived field, a snapshot format with a
