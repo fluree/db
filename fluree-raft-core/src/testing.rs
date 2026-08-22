@@ -1,52 +1,78 @@
-//! Conformance fixture for [`StateMachineAdapter`] implementations.
+//! Conformance fixture for openraft state-machine adapters.
 //!
 //! The adapter's contract has parts that are easy to state and easy to
 //! get subtly wrong — persist before swapping, restore before replaying,
 //! keep membership bookkeeping openraft can read back, publish effects
 //! only after the lock drops. This module runs an
-//! [`AppStateMachine`] through all of them.
+//! adapter through all of them.
 //!
 //! It exists because the extraction leaves two adapters in the tree for
-//! a while: the generic one here and the nameservice's bespoke one.
-//! Running both through the same fixture is what keeps them from
-//! quietly diverging. Application-specific behavior — waiter
+//! a while: the generic
+//! [`StateMachineAdapter`](crate::state_machine::StateMachineAdapter)
+//! and the nameservice's bespoke one. Running both through the same
+//! fixture is what keeps them from quietly diverging — so
+//! [`ConformanceHarness::Adapter`] is any `RaftStateMachine`, not this
+//! crate's. Application-specific behavior — waiter
 //! resolution, receipt stashing, cache watermarks — stays in each
 //! application's own tests; this covers only what every adapter owes
 //! openraft.
 //!
 //! Available under the `testing` feature.
 
-use crate::state_machine::{AppStateMachine, StateMachineAdapter, StateMachineObserver};
+use crate::config::FlureeRaftConfig;
 use crate::storage::RaftStorage;
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership, SnapshotMeta};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Cursor;
 use std::sync::Arc;
 
 /// What the fixture needs from a caller: how to build a fresh adapter
 /// over a given storage handle, and a couple of sample commands.
 pub trait ConformanceHarness: Send + Sync + 'static {
-    type App: AppStateMachine;
-    type Observer: StateMachineObserver<Self::App>;
+    /// The openraft type config the adapter is wired into.
+    type Config: FlureeRaftConfig;
+    /// The adapter under test.
+    ///
+    /// Deliberately any `RaftStateMachine`, not this crate's
+    /// [`StateMachineAdapter`](crate::state_machine::StateMachineAdapter)
+    /// — the fixture exists so a bespoke adapter can be held to the same
+    /// contract as the generic one.
+    type Adapter: RaftStateMachine<Self::Config>;
     type Storage: RaftStorage;
 
     /// A fresh storage backend. Each call must yield an independent
-    /// one — the fixture opens two adapters over separate stores to
+    /// one — the fixture opens adapters over separate stores to
     /// exercise snapshot transfer.
     fn storage(&self) -> Arc<Self::Storage>;
 
-    /// A fresh observer.
-    fn observer(&self) -> Self::Observer;
+    /// A storage backend whose *snapshot writes fail*.
+    ///
+    /// `None` skips [`install_persists_before_it_swaps`], which cannot
+    /// be checked without one: a swap-first implementation is
+    /// indistinguishable from a persist-first one unless the persist
+    /// can be made to fail.
+    fn failing_snapshot_storage(&self) -> Option<Arc<Self::Storage>> {
+        None
+    }
+
+    /// Open an adapter over `storage`, restoring from its current
+    /// snapshot as a restart would.
+    fn open(&self, storage: Arc<Self::Storage>) -> impl Future<Output = Self::Adapter> + Send;
 
     /// A command whose effect on the state is observable through
     /// [`Self::probe`]. Called with an increasing index so the fixture
     /// can apply several distinguishable commands.
-    fn command(&self, n: u64) -> <Self::App as AppStateMachine>::Command;
+    fn command(&self, n: u64) -> <Self::Config as openraft::RaftTypeConfig>::D;
 
-    /// Summarize the state as a comparable value. Two states that
-    /// probe equal must be interchangeable for the application.
-    fn probe(&self, state: &<Self::App as AppStateMachine>::State) -> u64;
+    /// Summarize an adapter's current state as a comparable value. Two
+    /// states that probe equal must be interchangeable.
+    fn probe(&self, adapter: &Self::Adapter) -> impl Future<Output = u64> + Send;
+
+    /// Summarize an encoded snapshot the same way [`Self::probe`]
+    /// summarizes live state, so the two can be compared.
+    fn probe_snapshot(&self, bytes: &[u8]) -> u64;
 }
 
 fn log_id(term: u64, index: u64) -> LogId<u64> {
@@ -56,24 +82,11 @@ fn log_id(term: u64, index: u64) -> LogId<u64> {
     }
 }
 
-fn normal<H: ConformanceHarness>(h: &H, term: u64, index: u64) -> Entry<AppConfig<H>> {
+fn normal<H: ConformanceHarness>(h: &H, term: u64, index: u64) -> Entry<H::Config> {
     Entry {
         log_id: log_id(term, index),
         payload: EntryPayload::Normal(h.command(index)),
     }
-}
-
-type AppConfig<H> = <<H as ConformanceHarness>::App as AppStateMachine>::Config;
-type Adapter<H> = StateMachineAdapter<
-    <H as ConformanceHarness>::App,
-    <H as ConformanceHarness>::Observer,
-    <H as ConformanceHarness>::Storage,
->;
-
-async fn open<H: ConformanceHarness>(h: &H, storage: Arc<H::Storage>) -> Adapter<H> {
-    StateMachineAdapter::open(storage, h.observer())
-        .await
-        .expect("adapter opens")
 }
 
 /// Run every conformance check. Panics with a description on failure.
@@ -82,6 +95,7 @@ pub async fn run_all<H: ConformanceHarness>(h: &H) {
     boot_restore_resumes_after_the_snapshot(h).await;
     snapshot_is_point_in_time(h).await;
     install_persists_before_it_swaps(h).await;
+    install_is_durable(h).await;
     install_failure_leaves_state_untouched(h).await;
     membership_survives_restart(h).await;
     blank_and_membership_entries_still_answer(h).await;
@@ -91,7 +105,7 @@ pub async fn run_all<H: ConformanceHarness>(h: &H) {
 /// `applied_state` must report the last entry seen, or openraft replays
 /// from the wrong place after a restart.
 pub async fn applied_state_tracks_the_last_entry<H: ConformanceHarness>(h: &H) {
-    let mut sm = open(h, h.storage()).await;
+    let mut sm = h.open(h.storage()).await;
     assert!(
         sm.applied_state().await.expect("applied_state").0.is_none(),
         "a fresh adapter has applied nothing",
@@ -114,19 +128,19 @@ pub async fn applied_state_tracks_the_last_entry<H: ConformanceHarness>(h: &H) {
 pub async fn boot_restore_resumes_after_the_snapshot<H: ConformanceHarness>(h: &H) {
     let storage = h.storage();
     let expected = {
-        let mut sm = open(h, Arc::clone(&storage)).await;
+        let mut sm = h.open(Arc::clone(&storage)).await;
         sm.apply(vec![normal(h, 1, 1), normal(h, 1, 2), normal(h, 1, 3)])
             .await
             .expect("apply");
         let mut builder = sm.get_snapshot_builder().await;
         builder.build_snapshot().await.expect("build snapshot");
-        h.probe(&*sm.shared_state().read().await)
+        h.probe(&sm).await
     };
 
     // Simulate a restart over the same storage.
-    let mut reopened = open(h, storage).await;
+    let mut reopened = h.open(storage).await;
     assert_eq!(
-        h.probe(&*reopened.shared_state().read().await),
+        h.probe(&reopened).await,
         expected,
         "boot restore must reload the snapshot's state",
     );
@@ -142,9 +156,9 @@ pub async fn boot_restore_resumes_after_the_snapshot<H: ConformanceHarness>(h: &
 /// whenever the build happens to finish — otherwise its `last_log_id`
 /// would describe state it does not contain.
 pub async fn snapshot_is_point_in_time<H: ConformanceHarness>(h: &H) {
-    let mut sm = open(h, h.storage()).await;
+    let mut sm = h.open(h.storage()).await;
     sm.apply(vec![normal(h, 1, 1)]).await.expect("apply");
-    let at_snapshot = h.probe(&*sm.shared_state().read().await);
+    let at_snapshot = h.probe(&sm).await;
 
     let mut builder = sm.get_snapshot_builder().await;
     // More applies land between obtaining the builder and building.
@@ -158,22 +172,70 @@ pub async fn snapshot_is_point_in_time<H: ConformanceHarness>(h: &H) {
         Some(1),
         "snapshot meta must describe the builder's instant",
     );
-    let decoded =
-        <H::App as AppStateMachine>::decode_snapshot(snap.snapshot.get_ref()).expect("decode");
     assert_eq!(
-        h.probe(&decoded),
+        h.probe_snapshot(snap.snapshot.get_ref()),
         at_snapshot,
         "snapshot contents must match the builder's instant, not the latest state",
     );
 }
 
-/// Install must persist the bytes before swapping the live state. A
-/// node that swaps first and dies restarts claiming a `last_applied`
-/// it has no snapshot for.
+/// Install must persist the snapshot before swapping the live state.
+///
+/// The only way to tell the two orderings apart is to make the persist
+/// *fail*: a swap-first implementation has already replaced the state by
+/// then and cannot put it back, while a persist-first one never touched
+/// it. A success-path test passes either way, which is why this one
+/// needs [`ConformanceHarness::failing_snapshot_storage`] and skips when
+/// the harness cannot supply one.
+///
+/// The stakes: a node that swaps first and dies restarts advertising a
+/// `last_applied` it has no snapshot for.
 pub async fn install_persists_before_it_swaps<H: ConformanceHarness>(h: &H) {
+    let Some(failing) = h.failing_snapshot_storage() else {
+        return;
+    };
+
+    // A genuinely valid snapshot, built from a healthy node.
+    let (meta, bytes) = {
+        let mut sm = h.open(h.storage()).await;
+        sm.apply(vec![normal(h, 1, 1), normal(h, 1, 2)])
+            .await
+            .expect("apply");
+        let mut builder = sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("build snapshot");
+        (snap.meta.clone(), snap.snapshot.into_inner())
+    };
+
+    let mut target = h.open(failing).await;
+    target.apply(vec![normal(h, 1, 1)]).await.expect("apply");
+    let before_probe = h.probe(&target).await;
+    let before_applied = target.applied_state().await.expect("applied_state").0;
+
+    let result = target
+        .install_snapshot(&meta, Box::new(Cursor::new(bytes)))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "install must fail when the snapshot cannot be persisted",
+    );
+    assert_eq!(
+        h.probe(&target).await,
+        before_probe,
+        "a snapshot that could not be persisted must not have been swapped in",
+    );
+    assert_eq!(
+        target.applied_state().await.expect("applied_state").0,
+        before_applied,
+        "a failed persist must not advance last_applied",
+    );
+}
+
+/// The success path: an installed snapshot is durable, not merely live.
+pub async fn install_is_durable<H: ConformanceHarness>(h: &H) {
     let source = h.storage();
     let (meta, bytes) = {
-        let mut sm = open(h, Arc::clone(&source)).await;
+        let mut sm = h.open(Arc::clone(&source)).await;
         sm.apply(vec![normal(h, 1, 1), normal(h, 1, 2)])
             .await
             .expect("apply");
@@ -183,7 +245,7 @@ pub async fn install_persists_before_it_swaps<H: ConformanceHarness>(h: &H) {
     };
 
     let target_storage = h.storage();
-    let mut target = open(h, Arc::clone(&target_storage)).await;
+    let mut target = h.open(Arc::clone(&target_storage)).await;
     target
         .install_snapshot(&meta, Box::new(Cursor::new(bytes)))
         .await
@@ -191,7 +253,7 @@ pub async fn install_persists_before_it_swaps<H: ConformanceHarness>(h: &H) {
 
     // Durable, not just live: a fresh adapter over the same storage
     // must come back with the installed state.
-    let mut reopened = open(h, target_storage).await;
+    let mut reopened = h.open(target_storage).await;
     let (last, _) = reopened.applied_state().await.expect("applied_state");
     assert_eq!(
         last.map(|id| id.index),
@@ -199,8 +261,8 @@ pub async fn install_persists_before_it_swaps<H: ConformanceHarness>(h: &H) {
         "an installed snapshot must be durable before the state swap",
     );
     assert_eq!(
-        h.probe(&*reopened.shared_state().read().await),
-        h.probe(&*target.shared_state().read().await),
+        h.probe(&reopened).await,
+        h.probe(&target).await,
         "the persisted snapshot must match the state that was swapped in",
     );
 }
@@ -208,9 +270,9 @@ pub async fn install_persists_before_it_swaps<H: ConformanceHarness>(h: &H) {
 /// A snapshot that cannot be decoded must leave the node exactly as it
 /// was — a half-installed state machine is worse than a lagging one.
 pub async fn install_failure_leaves_state_untouched<H: ConformanceHarness>(h: &H) {
-    let mut sm = open(h, h.storage()).await;
+    let mut sm = h.open(h.storage()).await;
     sm.apply(vec![normal(h, 1, 1)]).await.expect("apply");
-    let before_probe = h.probe(&*sm.shared_state().read().await);
+    let before_probe = h.probe(&sm).await;
     let before_applied = sm.applied_state().await.expect("applied_state").0;
 
     let meta = SnapshotMeta {
@@ -225,7 +287,7 @@ pub async fn install_failure_leaves_state_untouched<H: ConformanceHarness>(h: &H
 
     assert!(result.is_err(), "an undecodable snapshot must be refused");
     assert_eq!(
-        h.probe(&*sm.shared_state().read().await),
+        h.probe(&sm).await,
         before_probe,
         "a refused install must not disturb the published state",
     );
@@ -254,7 +316,7 @@ pub async fn membership_survives_restart<H: ConformanceHarness>(h: &H) {
     let membership = Membership::new(vec![[1u64, 2, 3].into_iter().collect()], nodes);
 
     {
-        let mut sm = open(h, Arc::clone(&storage)).await;
+        let mut sm = h.open(Arc::clone(&storage)).await;
         sm.apply(vec![
             normal(h, 1, 1),
             Entry {
@@ -276,7 +338,7 @@ pub async fn membership_survives_restart<H: ConformanceHarness>(h: &H) {
         builder.build_snapshot().await.expect("build snapshot");
     }
 
-    let mut reopened = open(h, storage).await;
+    let mut reopened = h.open(storage).await;
     let (_, stored) = reopened.applied_state().await.expect("applied_state");
     assert_eq!(
         stored.membership().voter_ids().collect::<Vec<_>>(),
@@ -289,7 +351,7 @@ pub async fn membership_survives_restart<H: ConformanceHarness>(h: &H) {
 /// entry each new leader commits and membership changes. Returning
 /// fewer desynchronizes openraft's response routing.
 pub async fn blank_and_membership_entries_still_answer<H: ConformanceHarness>(h: &H) {
-    let mut sm = open(h, h.storage()).await;
+    let mut sm = h.open(h.storage()).await;
     let responses = sm
         .apply(vec![
             Entry {
@@ -323,7 +385,7 @@ pub async fn blank_and_membership_entries_still_answer<H: ConformanceHarness>(h:
 /// where the validation lives — a memory backend has no paths and
 /// rightly does not check.
 pub async fn snapshot_ids_are_path_safe<H: ConformanceHarness>(h: &H) {
-    let mut sm = open(h, h.storage()).await;
+    let mut sm = h.open(h.storage()).await;
     sm.apply(vec![normal(h, 1, 1)]).await.expect("apply");
     let mut builder = sm.get_snapshot_builder().await;
     let snap = builder.build_snapshot().await.expect("build snapshot");

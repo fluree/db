@@ -33,7 +33,7 @@
 
 use crate::config::FlureeRaftConfig;
 use crate::http::is_hop_by_hop;
-use crate::network::RaftTransportConfig;
+use crate::network::{RaftHttpClient, RaftTransportConfig};
 use crate::node::{ClusterNode, NodeId};
 use async_trait::async_trait;
 use axum::body::Body;
@@ -137,11 +137,16 @@ impl<L: LeaderView> Clone for LeaderForwarder<L> {
 }
 
 impl<L: LeaderView> LeaderForwarder<L> {
-    pub fn new(raft: Arc<L>, id: NodeId, client: reqwest::Client) -> Self {
+    /// Takes a [`RaftHttpClient`] rather than a bare `reqwest::Client`:
+    /// this is the path that dials a membership-supplied URL, so the
+    /// no-redirects guarantee is load-bearing here. See
+    /// [`is_valid_leader_url`] for what the guard does and does not
+    /// cover.
+    pub fn new(raft: Arc<L>, id: NodeId, client: RaftHttpClient) -> Self {
         Self {
             raft,
             id,
-            client,
+            client: client.inner().clone(),
             max_body_bytes: RaftTransportConfig::default().forward_max_body_bytes,
         }
     }
@@ -605,7 +610,12 @@ mod tests {
                 .map(|(id, addr)| (*id, ClusterNode::new(format!("{addr}/raft"), *addr)))
                 .collect(),
         };
-        LeaderForwarder::new(Arc::new(view), 1, reqwest::Client::new())
+        LeaderForwarder::new(
+            Arc::new(view),
+            1,
+            crate::network::build_client(&crate::network::HttpClientConfig::default())
+                .expect("client builds"),
+        )
     }
 
     #[tokio::test]

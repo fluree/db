@@ -14,10 +14,15 @@ mod support;
 
 use fluree_raft_core::node::{ClusterNode, NodeId};
 use fluree_raft_core::state_machine::{
-    codec, AppStateMachine, MembershipView, SnapshotCodecError, SnapshotLoad, StateMachineAdapter,
-    StateMachineObserver,
+    codec, AppStateMachine, MembershipView, ReadOnlyState, SnapshotCodecError, SnapshotLoad,
+    StateMachineAdapter, StateMachineObserver,
 };
-use fluree_raft_core::storage::memory::MemoryRaftStorage;
+use fluree_raft_core::storage::memory::{
+    MemoryRaftLogStore, MemoryRaftSnapshotStore, MemoryRaftStorage,
+};
+use fluree_raft_core::storage::{
+    RaftSnapshotStore, RaftStorage, SnapshotId, SnapshotMeta, StorageError,
+};
 use fluree_raft_core::testing::{run_all, ConformanceHarness};
 use openraft::storage::RaftStateMachine;
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership};
@@ -50,7 +55,7 @@ struct Recorder {
     lock_free_at_publish: Mutex<Vec<bool>>,
     /// Set after construction so `publish` can probe the same handle
     /// the adapter writes through.
-    state: Mutex<Option<Arc<tokio::sync::RwLock<CounterState>>>>,
+    state: Mutex<Option<ReadOnlyState<Counter>>>,
 }
 
 impl Recorder {
@@ -159,29 +164,101 @@ fn add(index: u64, n: i64) -> Entry<CounterConfig> {
 // Conformance
 // ============================================================================
 
+/// Memory storage whose snapshot writes can be made to fail.
+///
+/// Needed by the persist-before-swap check: a swap-first install is
+/// indistinguishable from a persist-first one unless the persist can be
+/// made to fail while the snapshot itself stays perfectly valid.
+struct FaultySnapshotStore {
+    inner: MemoryRaftSnapshotStore,
+    fail_writes: bool,
+}
+
+#[async_trait::async_trait]
+impl RaftSnapshotStore for FaultySnapshotStore {
+    async fn write(&self, meta: &SnapshotMeta, data: Vec<u8>) -> Result<(), StorageError> {
+        if self.fail_writes {
+            return Err(StorageError::io("injected snapshot write failure"));
+        }
+        self.inner.write(meta, data).await
+    }
+    async fn read(&self, id: &SnapshotId) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.read(id).await
+    }
+    async fn current(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, StorageError> {
+        self.inner.current().await
+    }
+}
+
+struct FaultyStorage {
+    log: MemoryRaftLogStore,
+    snapshots: FaultySnapshotStore,
+}
+
+impl FaultyStorage {
+    fn new(fail_writes: bool) -> Self {
+        Self {
+            log: MemoryRaftLogStore::new(),
+            snapshots: FaultySnapshotStore {
+                inner: MemoryRaftSnapshotStore::new(),
+                fail_writes,
+            },
+        }
+    }
+}
+
+impl RaftStorage for FaultyStorage {
+    type LogStore = MemoryRaftLogStore;
+    type SnapshotStore = FaultySnapshotStore;
+
+    fn log(&self) -> &Self::LogStore {
+        &self.log
+    }
+    fn snapshots(&self) -> &Self::SnapshotStore {
+        &self.snapshots
+    }
+}
+
 struct CounterHarness;
 
 impl ConformanceHarness for CounterHarness {
-    type App = Counter;
-    type Observer = RecordingObserver;
-    type Storage = MemoryRaftStorage;
+    type Config = CounterConfig;
+    type Adapter = StateMachineAdapter<Counter, RecordingObserver, FaultyStorage>;
+    type Storage = FaultyStorage;
 
     fn storage(&self) -> Arc<Self::Storage> {
-        Arc::new(MemoryRaftStorage::new())
+        Arc::new(FaultyStorage::new(false))
     }
-    fn observer(&self) -> Self::Observer {
-        RecordingObserver(Arc::new(Recorder::default()))
+
+    fn failing_snapshot_storage(&self) -> Option<Arc<Self::Storage>> {
+        Some(Arc::new(FaultyStorage::new(true)))
     }
+
+    async fn open(&self, storage: Arc<Self::Storage>) -> Self::Adapter {
+        StateMachineAdapter::open(storage, RecordingObserver(Arc::new(Recorder::default())))
+            .await
+            .expect("adapter opens")
+    }
+
     fn command(&self, n: u64) -> CounterCommand {
         CounterCommand::Add(n as i64)
     }
-    fn probe(&self, state: &CounterState) -> u64 {
-        // Folds value and apply count so a state that differs in either
-        // probes differently.
-        (state.value as u64)
-            .wrapping_mul(31)
-            .wrapping_add(state.applies)
+
+    async fn probe(&self, adapter: &Self::Adapter) -> u64 {
+        probe_state(&*adapter.shared_state().read().await)
     }
+
+    fn probe_snapshot(&self, bytes: &[u8]) -> u64 {
+        probe_state(&Counter::decode_snapshot(bytes).expect("snapshot decodes"))
+    }
+}
+
+/// Folds value and apply count, so a state differing in either probes
+/// differently.
+fn probe_state(state: &CounterState) -> u64 {
+    (state.value as u64)
+        .wrapping_mul(31)
+        .wrapping_add(state.applies)
 }
 
 #[tokio::test]

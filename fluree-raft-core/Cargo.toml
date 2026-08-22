@@ -69,6 +69,7 @@ tokio-util = { version = "0.7", optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 serde_json = { workspace = true }
+async-trait = { workspace = true }
 tempfile = "3.19"
 axum = { workspace = true }
 tokio-util = { version = "0.7" }

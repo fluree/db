@@ -365,8 +365,42 @@ fn membership_view(m: &openraft::Membership<NodeId, ClusterNode>) -> MembershipV
 // Adapter
 // ============================================================================
 
-/// Read handle to the local state. Cheap to clone.
-pub type SharedState<A> = Arc<RwLock<<A as AppStateMachine>::State>>;
+/// Read-only handle to the local state. Cheap to clone.
+///
+/// Read-only by construction, not by convention. A writable handle
+/// would let a consumer mutate replicated state outside the log — and
+/// since a snapshot is built by cloning this state under the current
+/// `last_applied`, that mutation would be persisted and shipped to
+/// peers as though the log had produced it. The result is replica
+/// divergence with no failed write to point at.
+///
+/// Everything that must change the state goes through a command.
+pub struct ReadOnlyState<A: AppStateMachine> {
+    inner: Arc<RwLock<A::State>>,
+}
+
+impl<A: AppStateMachine> Clone for ReadOnlyState<A> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<A: AppStateMachine> ReadOnlyState<A> {
+    /// Borrow the state, waiting for any in-progress apply to finish.
+    pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, A::State> {
+        self.inner.read().await
+    }
+
+    /// Borrow the state if no apply currently holds the write lock;
+    /// returns `Err` rather than waiting.
+    pub fn try_read(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, A::State>, tokio::sync::TryLockError> {
+        self.inner.try_read()
+    }
+}
 
 /// openraft's `RaftStateMachine` over an [`AppStateMachine`].
 pub struct StateMachineAdapter<A, O, S>
@@ -375,7 +409,9 @@ where
     O: StateMachineObserver<A>,
     S: RaftStorage,
 {
-    state: SharedState<A>,
+    /// Writable only from inside the adapter; readers get a
+    /// [`ReadOnlyState`] from [`Self::shared_state`].
+    state: Arc<RwLock<A::State>>,
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, ClusterNode>,
     storage: Arc<S>,
@@ -396,15 +432,14 @@ where
     ///
     /// Tests and fresh-cluster bootstrap only — restart paths must use
     /// [`Self::open`], or committed state is silently lost (see there).
+    ///
+    /// The adapter owns the state it creates; readers obtain a
+    /// [`ReadOnlyState`] from [`Self::shared_state`] afterwards. There
+    /// is deliberately no constructor taking a caller-supplied state
+    /// handle, because such a handle would be writable.
     pub fn new(storage: Arc<S>, observer: O) -> Self {
-        Self::with_state(storage, observer, Arc::new(RwLock::new(A::initial_state())))
-    }
-
-    /// Fresh adapter sharing an existing state handle. Use when the
-    /// same state must be visible to a reader constructed alongside.
-    pub fn with_state(storage: Arc<S>, observer: O, state: SharedState<A>) -> Self {
         Self {
-            state,
+            state: Arc::new(RwLock::new(A::initial_state())),
             last_applied: None,
             last_membership: StoredMembership::default(),
             storage,
@@ -429,17 +464,6 @@ where
     /// tolerate replay — this is at-least-once, not exactly-once.
     pub async fn open(storage: Arc<S>, observer: O) -> Result<Self, StorageError<NodeId>> {
         let mut adapter = Self::new(storage, observer);
-        adapter.restore_from_snapshot().await?;
-        Ok(adapter)
-    }
-
-    /// As [`Self::open`], sharing an existing state handle.
-    pub async fn open_with_state(
-        storage: Arc<S>,
-        observer: O,
-        state: SharedState<A>,
-    ) -> Result<Self, StorageError<NodeId>> {
-        let mut adapter = Self::with_state(storage, observer, state);
         adapter.restore_from_snapshot().await?;
         Ok(adapter)
     }
@@ -473,8 +497,10 @@ where
     }
 
     /// Read handle to the local state — advisory, see the module docs.
-    pub fn shared_state(&self) -> SharedState<A> {
-        Arc::clone(&self.state)
+    pub fn shared_state(&self) -> ReadOnlyState<A> {
+        ReadOnlyState {
+            inner: Arc::clone(&self.state),
+        }
     }
 
     /// The observer, for callers that need to reach it after handing

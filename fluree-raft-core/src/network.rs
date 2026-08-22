@@ -183,7 +183,7 @@ impl<C> HttpRaftNetworkFactory<C> {
         config: RaftTransportConfig,
         client_config: &HttpClientConfig,
     ) -> Result<Self, reqwest::Error> {
-        let client = build_client(client_config)?;
+        let client = build_client(client_config)?.0;
         Ok(Self {
             client,
             config,
@@ -194,29 +194,54 @@ impl<C> HttpRaftNetworkFactory<C> {
     /// Construct from an externally-built client. Use when the
     /// embedder wants to share connection pools / proxy config /
     /// custom TLS roots across raft traffic and other HTTP traffic.
-    pub fn with_client(client: reqwest::Client, config: RaftTransportConfig) -> Self {
+    pub fn with_client(client: RaftHttpClient, config: RaftTransportConfig) -> Self {
         Self {
-            client,
+            client: client.0,
             config,
             _config: PhantomData,
         }
     }
 }
 
-/// Build a `reqwest::Client` configured for raft HTTP transport, with
-/// redirects disabled — which closes SSRF via a 302 to an internal
-/// address such as a cloud instance-metadata endpoint.
+/// A `reqwest::Client` known to have redirects disabled.
+///
+/// The SSRF guard on peer URLs validates the address a request is
+/// *sent* to. If the client then follows a 302, the address it actually
+/// reaches was never checked — a peer whose `client_addr` is honest can
+/// still redirect a forwarded request at a cloud instance-metadata
+/// endpoint. Disabling redirects is what closes that, and it can only
+/// be set when the client is built.
+///
+/// So the type is the guarantee: it can only be produced by
+/// [`build_client`], and every API that forwards to a
+/// membership-supplied URL takes this rather than a bare
+/// `reqwest::Client`. Handing one in from outside is not a thing you
+/// can do.
+#[derive(Clone, Debug)]
+pub struct RaftHttpClient(reqwest::Client);
+
+impl RaftHttpClient {
+    /// The underlying client, for requests that are not
+    /// membership-directed and so are not covered by the guarantee.
+    pub fn inner(&self) -> &reqwest::Client {
+        &self.0
+    }
+}
+
+/// Build the shared HTTP client for raft traffic.
 ///
 /// Free rather than an associated function on the factory: the client
 /// is independent of the type config, and one client is meant to be
 /// shared across every group in the process. Making callers name a `C`
 /// just to build it would imply otherwise.
-pub fn build_client(config: &HttpClientConfig) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .connect_timeout(config.connect_timeout)
-        .pool_idle_timeout(Some(config.pool_idle_timeout))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+pub fn build_client(config: &HttpClientConfig) -> Result<RaftHttpClient, reqwest::Error> {
+    Ok(RaftHttpClient(
+        reqwest::Client::builder()
+            .connect_timeout(config.connect_timeout)
+            .pool_idle_timeout(Some(config.pool_idle_timeout))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?,
+    ))
 }
 
 impl<C: FlureeRaftConfig> RaftNetworkFactory<C> for HttpRaftNetworkFactory<C> {

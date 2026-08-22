@@ -123,7 +123,9 @@ pub struct RaftIntegration {
 /// Shared HTTP transport: a `reqwest::Client` paired with the
 /// `NetworkConfig` it was built from.
 pub struct HttpTransport {
-    pub client: reqwest::Client,
+    /// Carries the no-redirects guarantee the SSRF guard relies on;
+    /// build it through `raft_network::build_client`.
+    pub client: raft_network::RaftHttpClient,
     pub config: NetworkConfig,
 }
 

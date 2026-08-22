@@ -4,7 +4,7 @@
 //! associated types open. The
 //! adapters in this crate do not need that much freedom, and threading
 //! the full set of bounds through every `impl` makes each one unreadable.
-//! [`FlureeRaftConfig`] pins the five that are genuinely fixed across all
+//! [`FlureeRaftConfig`] pins the six that are genuinely fixed across all
 //! Fluree groups, leaving only `D` and `R` — the application's command
 //! and response — to the application.
 //!

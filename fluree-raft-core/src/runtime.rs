@@ -11,10 +11,10 @@ use crate::admin::{self, RaftAdmin};
 use crate::config::FlureeRaftConfig;
 use crate::group::GroupId;
 use crate::log_adapter::LogAdapter;
-use crate::network::{self, HttpClientConfig, RaftTransportConfig};
+use crate::network::{self, HttpClientConfig, RaftHttpClient, RaftTransportConfig};
 use crate::node::NodeId;
 use crate::state_machine::{
-    AppStateMachine, SharedState, StateMachineAdapter, StateMachineObserver,
+    AppStateMachine, ReadOnlyState, StateMachineAdapter, StateMachineObserver,
 };
 use crate::storage::RaftStorage;
 use openraft::{Config as RaftConfig, Raft};
@@ -164,11 +164,12 @@ pub struct RaftGroup<A: AppStateMachine> {
     pub node_id: NodeId,
     pub raft: Arc<Raft<A::Config>>,
     /// Local read model — advisory. See the `state_machine` module docs.
-    pub state: SharedState<A>,
+    pub state: ReadOnlyState<A>,
     pub admin: RaftAdmin<A::Config>,
     /// Shared across every group in the process; hand the same one to
-    /// [`crate::forward::LeaderForwarder`].
-    pub client: reqwest::Client,
+    /// [`crate::forward::LeaderForwarder`]. Its type carries the
+    /// no-redirects guarantee the SSRF guard depends on.
+    pub client: RaftHttpClient,
     transport: RaftTransportConfig,
 }
 
@@ -213,7 +214,7 @@ impl<A: AppStateMachine> RaftGroup<A> {
         config: RaftGroupConfig,
         storage: Arc<S>,
         observer: O,
-        client: Option<reqwest::Client>,
+        client: Option<RaftHttpClient>,
     ) -> Result<Self, BootstrapError>
     where
         O: StateMachineObserver<A>,

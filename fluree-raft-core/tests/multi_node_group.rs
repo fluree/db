@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use support::{Counter, CounterCommand};
 use tokio_util::sync::CancellationToken;
 
@@ -289,5 +289,72 @@ async fn leader_tasks_start_on_election_and_stop_on_shutdown() {
         ticks.load(Ordering::Relaxed),
         settled,
         "leader tasks must be stopped once shutdown returns",
+    );
+}
+
+/// The bounded-abort half of shutdown: a leader task that ignores its
+/// cancellation token must not be able to hang the watcher.
+///
+/// Without the abort, `shutdown` would await such a task forever and a
+/// node could never relinquish leadership cleanly. Without the grace
+/// period, a well-behaved task would be killed mid-cleanup. This pins
+/// both halves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_that_ignores_cancellation_is_aborted_after_the_grace_period() {
+    const GRACE: Duration = Duration::from_millis(200);
+
+    let group_id = GroupId::new("straggler").expect("valid group id");
+    let node = start_node(1, &group_id).await;
+    node.group
+        .admin
+        .initialize(BTreeMap::from([(node.id, node.addrs())]))
+        .await
+        .expect("initialize");
+
+    let ticks = Arc::new(AtomicU64::new(0));
+    let watcher = {
+        let ticks = Arc::clone(&ticks);
+        spawn_leader_watcher(
+            Arc::clone(&node.group.raft),
+            node.id,
+            GRACE,
+            move |_cancel: CancellationToken| {
+                // Deliberately never checks the token.
+                let ticks = Arc::clone(&ticks);
+                vec![tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        ticks.fetch_add(1, Ordering::Relaxed);
+                    }
+                })]
+            },
+        )
+    };
+
+    eventually("the straggler to start ticking", || async {
+        ticks.load(Ordering::Relaxed) > 0
+    })
+    .await;
+
+    let started = Instant::now();
+    watcher.shutdown().await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= GRACE,
+        "shutdown returned in {elapsed:?}, before the {GRACE:?} grace period — a \
+         well-behaved task would be killed mid-cleanup",
+    );
+    assert!(
+        elapsed < GRACE * 5,
+        "shutdown took {elapsed:?}; a task ignoring cancellation must be aborted, not waited on",
+    );
+
+    let settled = ticks.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        ticks.load(Ordering::Relaxed),
+        settled,
+        "an aborted straggler must actually be stopped once shutdown returns",
     );
 }

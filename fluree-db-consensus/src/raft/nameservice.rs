@@ -152,15 +152,20 @@ impl RaftNameService {
     /// `request_timeout` is the per-request cap on those POSTs —
     /// typically threaded through from
     /// [`NetworkConfig::cross_node_propose_timeout`](crate::raft::network::NetworkConfig::cross_node_propose_timeout).
+    /// Takes a
+    /// [`RaftHttpClient`](crate::raft::network::RaftHttpClient) rather
+    /// than a bare `reqwest::Client`: these POSTs go to a
+    /// membership-supplied URL, so the no-redirects guarantee is what
+    /// keeps the SSRF check on that URL meaningful.
     pub fn with_forwarding(
         mut self,
         id: NodeId,
-        http_client: reqwest::Client,
+        http_client: crate::raft::network::RaftHttpClient,
         request_timeout: std::time::Duration,
     ) -> Self {
         self.forwarding = Some(ForwardingConfig {
             id,
-            http_client,
+            http_client: http_client.inner().clone(),
             request_timeout,
         });
         self

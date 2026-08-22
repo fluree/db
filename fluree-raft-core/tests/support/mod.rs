@@ -4,8 +4,6 @@
 //! reduction, a membership-derived field, a snapshot format with a
 //! version to migrate from — without any of it being about counting.
 
-#![allow(dead_code)]
-
 use fluree_raft_core::node::{ClusterNode, NodeId};
 use fluree_raft_core::state_machine::{codec, AppStateMachine, MembershipView, SnapshotCodecError};
 use serde::{Deserialize, Serialize};

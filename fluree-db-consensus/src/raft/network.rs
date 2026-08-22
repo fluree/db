@@ -15,7 +15,7 @@ use std::time::Duration;
 
 pub use fluree_raft_core::network::{
     build_client, router, HttpClientConfig, HttpRaftNetwork, HttpRaftNetworkFactory,
-    RaftTransportConfig,
+    RaftHttpClient, RaftTransportConfig,
 };
 
 /// Transport tuning for a nameservice Raft group: the generic
