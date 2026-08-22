@@ -270,11 +270,13 @@ an installed snapshot is durable, a failed install leaves state untouched,
 membership survives a restart, blank and membership entries still answer, and
 generated snapshot ids are path-safe.
 
-It takes *any* adapter, not just this crate's, because two live in the tree:
-the generic `StateMachineAdapter` and the nameservice's bespoke one. Both run it —
-`fluree-raft-core/tests/state_machine_seam.rs` and
-`fluree-db-consensus/tests/it_adapter_conformance.rs` — which is what keeps them
-from quietly diverging.
+It takes *any* openraft adapter rather than only this crate's, which is what let
+the nameservice's bespoke adapter be held to the same contract while it still
+existed. It is now gone — the nameservice reduces through the generic seam like
+any other consumer — but the bound is still the right one: a future consumer that
+needs its own adapter can be checked against the same nine properties. Both
+consumers run the fixture today, in `fluree-raft-core/tests/state_machine_seam.rs`
+and `fluree-db-consensus/tests/it_adapter_conformance.rs`.
 
 The persist-before-swap check needs a storage backend whose snapshot writes can be
 made to fail; without one a swap-first implementation is indistinguishable from a
