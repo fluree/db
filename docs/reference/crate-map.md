@@ -584,6 +584,23 @@ Under the `raft` feature, which gates `openraft`:
 - `forward` — follower→leader middleware, generic over a `LeaderView`
   source rather than tied to `Raft` directly
 
+And under `kv` (independent of `raft` — pure state plus a pure
+reduction, so a consumer can hold the semantics without linking
+openraft):
+
+- `kv` — a replicated key/value *fragment* an application embeds in its
+  own state machine, not a service and not its own group. A lease fences
+  the work it guards only if both are ordered by the same log. An
+  entry's version is the **Raft log index** of the write that created
+  it, so a fencing token can never repeat; expiry is logical absence, so
+  sweep timing is invisible; every CAS failure returns the current
+  record, which is also the recovery path for a lost response. TTLs are
+  rejected rather than clamped. Tenancy is the application's
+  composition — `BTreeMap<Tenant, KvFragment>` keyed by an
+  **append-only** enum, because postcard is positional: appending a
+  struct field breaks every existing snapshot, while appending an enum
+  variant does not.
+
 And under `testing`:
 
 - `testing` — a conformance fixture any openraft state-machine adapter

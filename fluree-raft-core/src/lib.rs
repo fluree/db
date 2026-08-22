@@ -57,6 +57,9 @@ pub mod node;
 pub mod ownership;
 pub mod storage;
 
+#[cfg(feature = "kv")]
+pub mod kv;
+
 #[cfg(feature = "raft")]
 pub mod admin;
 #[cfg(feature = "raft")]

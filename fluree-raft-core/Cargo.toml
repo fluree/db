@@ -29,6 +29,10 @@ raft = ["dep:openraft", "dep:axum", "dep:reqwest", "dep:http-body-util", "dep:to
 # from `raft` so it can be enabled as a dev-dependency by consumers
 # without shipping the fixture in their release builds.
 testing = ["raft"]
+# Replicated key/value fragment (`kv`). Independent of `raft`: it is
+# pure state plus a pure reduction, so a consumer can depend on the
+# semantics without linking openraft.
+kv = []
 
 [dependencies]
 async-trait = { workspace = true }
