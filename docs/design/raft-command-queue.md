@@ -143,13 +143,27 @@ Snapshot ids are validated against a path-traversal guard before any disk path i
 
 Inter-node RPC is plain HTTP over `reqwest`, with:
 
-- `connect_timeout`: 250 ms (default)
+Per-request settings live on `fluree_raft_core::network::RaftTransportConfig`:
+
 - `rpc_timeout` (vote, append): 500 ms (default)
 - `snapshot_timeout`: 30 s (default)
-- Redirects disabled (SSRF guard against 302s to internal addresses).
-- Per-route body size limits: vote 1 MiB, append-entries 64 MiB, install-snapshot 1 GiB.
+- Per-route body size limits: vote 1 MiB, append-entries 64 MiB, install-snapshot 1 GiB
+- `forward_max_body_bytes`: 64 MiB — what a follower buffers before relaying
 
-These are exposed on `NetworkConfig` and can be overridden at integration time, though the server binary doesn't currently expose tuning knobs for them.
+Client settings live on `HttpClientConfig`, separately, because they are baked
+into the shared `reqwest::Client` and cannot vary per request or per group:
+
+- `connect_timeout`: 250 ms (default)
+- `pool_idle_timeout`: 90 s (default)
+- Redirects disabled (SSRF guard against 302s to internal addresses). The
+  `RaftHttpClient` newtype carries that guarantee in its type, so an injected
+  client cannot quietly reinstate them.
+
+The nameservice's own `NetworkConfig` embeds both as `transport` and
+`http_client`, and adds the fields only it needs (`cross_node_propose_timeout`,
+the staged-commit and queue-poison body caps). All are overridable at
+integration time, though the server binary doesn't currently expose tuning
+knobs for them.
 
 Why plain HTTP rather than gRPC or a custom protocol? Two reasons:
 

@@ -456,16 +456,23 @@ Clients that need stricter at-most-once semantics must keep their retry windows 
 
 ### Network transport defaults
 
+Per-request settings come from `fluree_raft_core::network::RaftTransportConfig`;
+client settings from `HttpClientConfig`, which is separate because it is baked
+into the shared `reqwest::Client` and so cannot vary per group. The
+nameservice's `NetworkConfig` embeds both.
+
 | Setting                       | Default        | Source                                              |
 | ----------------------------- | -------------- | --------------------------------------------------- |
-| RPC timeout (vote, append)    | 500 ms         | `NetworkConfig::default`                            |
-| Snapshot install timeout      | 30 s           | `NetworkConfig::default`                            |
-| Connect timeout               | 250 ms         | `NetworkConfig::default`                            |
-| Vote body limit               | 1 MiB          | per-route hard limit                                 |
-| Append-entries body limit     | 64 MiB         | per-route hard limit                                 |
-| Install-snapshot body limit   | 1 GiB          | per-route hard limit                                 |
-| Follower → leader forward     | 60 s           | hard-coded in the forwarder                          |
-| Forward hop limit             | 2              | hard-coded in the forwarder                          |
+| RPC timeout (vote, append)    | 500 ms         | `RaftTransportConfig::default`                       |
+| Snapshot install timeout      | 30 s           | `RaftTransportConfig::default`                       |
+| Vote body limit               | 1 MiB          | `RaftTransportConfig::default`                       |
+| Append-entries body limit     | 64 MiB         | `RaftTransportConfig::default`                       |
+| Install-snapshot body limit   | 1 GiB          | `RaftTransportConfig::default`                       |
+| Follower forward body limit   | 64 MiB         | `RaftTransportConfig::default`                       |
+| Connect timeout               | 250 ms         | `HttpClientConfig::default`                          |
+| Pool idle timeout             | 90 s           | `HttpClientConfig::default`                          |
+| Follower → leader forward     | 60 s           | `FORWARD_REQUEST_TIMEOUT`, hard-coded                |
+| Forward hop limit             | 2              | `MAX_FORWARD_HOPS`, hard-coded                       |
 | Per-attempt waiter timeout    | 8 s            | `QueuedTransactor` default                           |
 | Idempotency cache TTL         | 1 h            | `EvictionScheduler` default                          |
 
