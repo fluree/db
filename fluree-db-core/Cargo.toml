@@ -31,6 +31,9 @@ multihash = { workspace = true }
 tokio = { workspace = true, features = ["fs", "sync"], optional = true }
 fs2 = { version = "0.4", optional = true }
 xxhash-rust = { workspace = true }
+# Per-process token in `FileStorage` staging-file names. The pid alone
+# is unique per host, not across hosts sharing a mount.
+rand = { workspace = true }
 moka = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 

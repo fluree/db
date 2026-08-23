@@ -2722,6 +2722,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "postcard",
+ "rand 0.8.5",
  "rustc-hash",
  "serde",
  "serde_json",
