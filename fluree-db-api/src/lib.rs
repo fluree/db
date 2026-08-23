@@ -3272,7 +3272,12 @@ impl Fluree {
     ///
     /// Set from `FlureeBuilder::with_indexing_thresholds()` for builder paths,
     /// or derived from `ConnectionConfig::defaults.indexing` for JSON-LD paths.
-    pub(crate) fn default_index_config(&self) -> IndexConfig {
+    ///
+    /// Public so a process that runs the Raft commit workers alongside
+    /// this engine can hand them the same thresholds. A worker staging
+    /// against different thresholds than the engine's novelty
+    /// backpressure silently diverges the two.
+    pub fn default_index_config(&self) -> IndexConfig {
         self.index_config.clone()
     }
 

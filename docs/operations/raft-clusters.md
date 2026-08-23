@@ -52,6 +52,20 @@ Each node listens on **two ports**:
 
 The client port is the public surface and behaves identically to a non-Raft `fluree-server` — reads work on every node, writes are accepted but transparently forwarded to the current leader by middleware. The Raft port is for inter-node openraft traffic plus operator-facing cluster admin; expose it only on a trusted network segment.
 
+### Embedding without `fluree-server`
+
+Everything above is reachable from a process that embeds the engine
+directly. `fluree_db_consensus::raft::integration::RaftIntegration::bootstrap`
+builds the consensus half; `FlureeBuilder::build_client_with_nameservice`
+builds the engine against the replicated nameservice;
+`fluree_db_consensus::raft::embedded::EmbeddedRaftNode::attach` wires the
+two and starts the per-node tasks. The routers carry no path prefix, so the
+host nests them wherever it likes — `/raft/nameservice` beside other groups
+on one listener, say — and registers that prefix as the node's raft address
+in membership. Writes must go through `EmbeddedRaftNode::committer`, not the
+engine handle. `fluree-db-consensus/tests/it_embedded_node.rs` is a complete
+worked example with no server dependency.
+
 ### Submission flow (writes)
 
 Writes follow a four-stage path inside the cluster. The first two stages run wherever the request lands (follower or leader); the latter two run only on the leader:
