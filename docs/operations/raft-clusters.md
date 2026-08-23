@@ -68,14 +68,14 @@ worked example with no server dependency.
 
 ### Submission flow (writes)
 
-Writes follow a four-stage path inside the cluster. The first two stages run wherever the request lands (follower or leader); the latter two run only on the leader:
+Writes follow a four-stage path inside the cluster. Only one of the four is tied to the leader; the heavy one is deliberately not:
 
 1. **Forward.** The follower-forward middleware reads `raft.current_leader()`; if this node is not the leader, the request is re-issued as an HTTP call against the leader's `client_addr` (looked up from the membership the cluster replicates) and the leader's response is relayed back to the client verbatim.
-2. **Enqueue.** On the leader, the `QueuedTransactor` builds a `QueuedRequest` envelope (the full request body), writes it to the shared CAS, and proposes a `Command::EnqueueCommand` carrying the envelope's CID + body hash. The state machine appends a `QueueEntry` to the target branch's FIFO and assigns a `queue_id`. The transactor registers a oneshot waiter on the per-process `WaiterMap`.
-3. **Stage and commit.** The leader-only `CommitWorker` polls per-branch queues, fetches the envelope from CAS, stages the work via the in-process `Fluree` API, writes the resulting commit blob to CAS, stashes a typed `AppliedReceipt` in the per-process `StagedReceiptMap`, and proposes `Command::ApplyHead` to advance the head.
-4. **Apply and resolve.** The state-machine adapter applies `ApplyHead` on every node (advancing the replicated head), and on the leader signals the waiter with the stashed receipt. The transactor's `await` returns the typed receipt to the client.
+2. **Enqueue.** On the leader, the `QueuedTransactor` builds a `QueuedRequest` envelope (the full request body), writes it to the shared CAS, and proposes a `Command::EnqueueCommand` carrying the envelope's CID + body hash. The state machine appends a `QueueEntry` to the target branch's FIFO and assigns a `queue_id`. The transactor arms interest on the per-process `WaiterMap`.
+3. **Stage and commit — on whichever node owns the branch.** Every node runs a worker supervisor. Each branch is assigned to one node by rendezvous hashing its key over the worker-eligible voters (`fluree_raft_core::ownership`), so a follower routinely owns branches. The owning node's worker polls that branch's queue, fetches the envelope from CAS, stages the work via its in-process `Fluree` API, writes the resulting commit blob — which can be large — **directly to the shared CAS**, stashes a typed `AppliedReceipt` in its `StagedReceiptMap`, and publishes the head advance. On the leader that is a local `Command::ApplyHead` proposal; on a follower it is ferried to the leader over `POST /raft/apply_staged_commit`, carrying only the CID.
+4. **Apply and resolve.** The state-machine adapter applies `ApplyHead` on every node (advancing the replicated head), and on the node that armed interest — the one the client's request landed on — signals the waiter with the stashed receipt. The transactor's `await` returns the typed receipt to the client.
 
-The reason for the queue + worker split is that **only the leader can propose log entries**, but the heavy work of staging a transaction (parsing, policy evaluation, indexing) must happen *before* the head moves. Decoupling proposal from staging keeps the openraft commit path free of blocking work, makes idempotent retries cheap (the second `EnqueueCommand` with the same idempotency key hits the cache and skips staging), and lets a leader change abandon in-flight stages without losing the queue.
+Two things are load-bearing here. **Only the leader can propose log entries**, but the heavy work of staging (parsing, policy evaluation, writing the blob) must happen *before* the head moves — so proposal and staging are decoupled, which keeps the openraft commit path free of blocking work, makes idempotent retries cheap (the second `EnqueueCommand` with the same idempotency key hits the cache and skips staging), and lets a leader change abandon in-flight stages without losing the queue. And **the blob never passes through consensus**: the log carries a CID, and the node that staged the commit is the one that wrote the bytes. Distributing staging across nodes is what lets that scale — were staging leader-only, the leader would be the write bottleneck for the whole cluster and the narrow log would buy nothing.
 
 ### Storage layering
 
@@ -83,7 +83,7 @@ The reason for the queue + worker split is that **only the leader can propose lo
 | ------------------------------ | ---------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Raft log + vote + snapshots    | Per node         | Local disk at `--raft-storage-path`                                       | Postcard-encoded, atomic writes (write-to-temp → fsync → rename → fsync parent). Losing this directory on one node is recoverable as long as a quorum survives. |
 | Replicated state machine       | Per node, in-memory | `NameServiceState` (branch heads, ledger registry, idempotency cache, per-branch queues) | Persisted via openraft snapshots into `--raft-storage-path/snapshots/`. Restored on restart so log replay starts at `last_applied + 1`. |
-| Ledger CAS (commit blobs, envelopes, index artifacts) | Cluster-wide | Whatever `--connection-config` / `--storage-path` resolves to (S3, file, memory) | Must be reachable from every node. The leader writes, every node reads. |
+| Ledger CAS (commit blobs, envelopes, index artifacts) | Cluster-wide | Whatever `--connection-config` / `--storage-path` resolves to (S3, file, memory) | Must be reachable **read-write** from every node: whichever node owns a branch writes its commit blobs, the leader writes index artifacts, every node reads. |
 
 `--raft-storage-path` and `--storage-path` must point at **disjoint** filesystem subtrees. Validation rejects overlapping paths at startup because the Raft log/snapshot tree and the ledger CAS each manage their own layout; overlapping them lets either side blow away the other's files on compaction and tends to surface only after a restart corrupts state.
 
@@ -138,7 +138,7 @@ CLI / env override file values; file values override defaults.
 
 ### Storage backend choice
 
-Raft mode is orthogonal to the content-addressed storage choice. In production we recommend shared cloud storage so the **commit blobs the leader writes are immediately visible to every follower's reads** through the same backend. Concretely:
+Raft mode is orthogonal to the content-addressed storage choice. In production we recommend shared cloud storage so the **commit blobs any node writes are immediately visible to every other node's reads** through the same backend. Plan the store as multi-writer: commit staging is distributed across nodes by branch ownership, not confined to the leader. Concretely:
 
 - **AWS** — point all nodes at the same S3 bucket(s) via `--connection-config /etc/fluree/s3.jsonld`. Use a shared DynamoDB nameservice for non-Raft profiles; in Raft mode the **DynamoDB nameservice's writes are unused** (the Raft state machine is the authoritative nameservice), but the storage half stays shared.
 - **On-prem** — point all nodes at the same NFS / object-store mount via `--storage-path /shared/fluree`.
