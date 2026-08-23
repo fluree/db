@@ -56,6 +56,15 @@ pub struct S3Config {
     pub prefix: Option<String>,
     /// Optional endpoint override (e.g. LocalStack/MinIO, or custom AWS endpoint)
     pub endpoint: Option<String>,
+    /// Address the bucket in the URL path (`http://host/bucket/key`)
+    /// rather than as a virtual host (`http://bucket.host/key`).
+    ///
+    /// Required for S3-compatible stores that do not resolve
+    /// bucket-subdomains — MinIO without wildcard DNS in front of it
+    /// being the common case. An endpoint override alone is not enough:
+    /// the SDK still emits virtual-hosted URLs against it, and a plain
+    /// `http://minio:9000` rejects those.
+    pub force_path_style: Option<bool>,
     /// Operation timeout in milliseconds (optional)
     pub timeout_ms: Option<u64>,
     /// Max retries (retries *after* the initial attempt)
@@ -140,6 +149,9 @@ impl S3Storage {
         // Apply endpoint override if configured (e.g. LocalStack/MinIO)
         if let Some(endpoint) = &config.endpoint {
             s3_config_builder = s3_config_builder.endpoint_url(endpoint);
+        }
+        if let Some(path_style) = config.force_path_style {
+            s3_config_builder = s3_config_builder.force_path_style(path_style);
         }
 
         // Apply retry overrides
@@ -1209,6 +1221,62 @@ mod tests {
         // Edge cases
         assert!(!S3Storage::is_express_bucket(""));
         assert!(!S3Storage::is_express_bucket("--x-s3"));
+    }
+
+    /// The whole point of the knob is the URL shape the SDK emits, so
+    /// observe that directly: presigning builds the real request URL
+    /// without touching the network.
+    #[tokio::test]
+    async fn force_path_style_changes_the_url_shape() {
+        use aws_sdk_s3::presigning::PresigningConfig;
+        use std::time::Duration;
+
+        let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::for_tests())
+            .load()
+            .await;
+        let presign = PresigningConfig::expires_in(Duration::from_secs(60)).expect("presign");
+
+        let url_for = |path_style: Option<bool>| {
+            let sdk = sdk.clone();
+            let presign = presign.clone();
+            async move {
+                let storage = S3Storage::new(
+                    &sdk,
+                    S3Config {
+                        bucket: "fluree".into(),
+                        endpoint: Some("http://minio:9000".into()),
+                        force_path_style: path_style,
+                        ..S3Config::default()
+                    },
+                )
+                .await
+                .expect("builds");
+                storage
+                    .client
+                    .get_object()
+                    .bucket("fluree")
+                    .key("k")
+                    .presigned(presign)
+                    .await
+                    .expect("presigns")
+                    .uri()
+                    .to_string()
+            }
+        };
+
+        let path_style = url_for(Some(true)).await;
+        assert!(
+            path_style.starts_with("http://minio:9000/fluree/k"),
+            "path-style must put the bucket in the path: {path_style}",
+        );
+
+        let virtual_hosted = url_for(None).await;
+        assert!(
+            virtual_hosted.starts_with("http://fluree.minio:9000/k"),
+            "unset must leave the SDK default, bucket as a virtual host: {virtual_hosted}",
+        );
     }
 
     #[test]
