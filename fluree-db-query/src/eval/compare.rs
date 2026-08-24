@@ -25,6 +25,19 @@ use std::cmp::Ordering;
 use super::helpers::check_min_arity;
 use super::value::{ComparableValue, ComparisonError};
 
+/// Outcome of the IRI-binding fast equality probe.
+///
+/// `Eq(bool)` is a definitive equality verdict (`!=` flips it). The two
+/// unbound variants preserve the caller-specific semantics of an unbound
+/// operand: `=`/`!=` treat either side's unbound as `false` for both
+/// operators, while `IN` treats an unbound TEST value as an overall `false`
+/// but an unbound ELEMENT as merely "no match, keep looking".
+pub(super) enum FastEqOutcome {
+    Eq(bool),
+    TestUnbound,
+    OtherUnbound,
+}
+
 fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
     op: CompareOp,
     args: &[Expression],
@@ -41,6 +54,62 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
         return Ok(None);
     };
 
+    // Try both orientations: (?var EncodedSid) op (const IRI/Sid) OR swapped.
+    for (var_side, other_side) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+        if let Some(outcome) =
+            fast_eq_iri_binding_directional(var_side, other_side, row, ctx, store)?
+        {
+            let out = match outcome {
+                FastEqOutcome::Eq(eq) => match op {
+                    CompareOp::Eq => eq,
+                    CompareOp::Ne => !eq,
+                    _ => unreachable!(),
+                },
+                // An unbound operand compares as `false` for both `=` and `!=`
+                // (mirrors the generic path's `eval_to_comparable → None`).
+                FastEqOutcome::TestUnbound | FastEqOutcome::OtherUnbound => false,
+            };
+            return Ok(Some(out));
+        }
+    }
+    Ok(None)
+}
+
+/// Per-element entry for `IN`: probe `test IN (.. elem ..)` through the same
+/// encoded/Sid/IRI representations the `=` fast path uses, without
+/// materializing the test value. Directional only — `test` must be the
+/// variable side — so the caller can tell WHICH side was unbound.
+///
+/// Without this, `?x IN (<iri>)` on an index-encoded binding fell through to
+/// `rdf_term_equal`, whose Resource arm compares representations, not
+/// resources — an `EncodedSid`/`Sid` row value vs a constant `Iri` silently
+/// evaluated to "not equal" and the filter dropped every row.
+pub(super) fn fast_in_membership_for_iri_bindings<R: RowAccess>(
+    test: &Expression,
+    elem: &Expression,
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<FastEqOutcome>> {
+    let Some(ctx) = ctx else {
+        return Ok(None);
+    };
+    let Some(store) = ctx.binary_store.as_deref() else {
+        return Ok(None);
+    };
+    fast_eq_iri_binding_directional(test, elem, row, ctx, store)
+}
+
+/// One directional probe of the IRI-binding fast equality: `var_expr` must be
+/// a variable whose binding is resource-flavored (`EncodedSid`, `Sid`, `Iri`/
+/// `IriMatch`, or `EncodedPid`); `other_expr` is the comparand. Returns
+/// `Ok(None)` when this pair must fall back to the generic comparable path.
+fn fast_eq_iri_binding_directional<R: RowAccess>(
+    var_expr: &Expression,
+    other_expr: &Expression,
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+    store: &fluree_db_binary_index::BinaryIndexStore,
+) -> Result<Option<FastEqOutcome>> {
     let sid_to_iri = |sid: &fluree_db_core::Sid| {
         store
             .sid_to_iri(sid)
@@ -54,239 +123,188 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
         }
     };
 
-    let try_side = |var_expr: &Expression, other_expr: &Expression| -> Result<Option<bool>> {
-        let Expression::Var(v) = var_expr else {
-            return Ok(None);
-        };
-        let Some(binding) = row.get(*v) else {
-            return Ok(Some(false));
-        };
+    let Expression::Var(v) = var_expr else {
+        return Ok(None);
+    };
+    let Some(binding) = row.get(*v) else {
+        return Ok(Some(FastEqOutcome::TestUnbound));
+    };
 
-        // Single-ledger fast path: when the bound side is a subject encoded by
-        // the binary index, its internal `s_id` is directly comparable to the
-        // other side's `s_id` within a single ledger — so compare ids and skip
-        // resolving to IRI strings. Cross-ledger `s_id`s are NOT comparable, so
-        // gated on `!is_multi_ledger`; everything else falls through unchanged.
-        if !ctx.is_multi_ledger() {
-            if let Binding::EncodedSid { s_id, .. } = binding {
-                // var = var: both sides EncodedSid → compare raw s_ids directly.
-                if let Expression::Var(ov) = other_expr {
-                    if let Some(Binding::EncodedSid { s_id: rhs_s_id, .. }) = row.get(*ov) {
-                        let eq = s_id == rhs_s_id;
-                        let out = match op {
-                            CompareOp::Eq => eq,
-                            CompareOp::Ne => !eq,
-                            _ => unreachable!(),
-                        };
-                        return Ok(Some(out));
-                    }
+    // Single-ledger fast path: when the bound side is a subject encoded by
+    // the binary index, its internal `s_id` is directly comparable to the
+    // other side's `s_id` within a single ledger — so compare ids and skip
+    // resolving to IRI strings. Cross-ledger `s_id`s are NOT comparable, so
+    // gated on `!is_multi_ledger`; everything else falls through unchanged.
+    if !ctx.is_multi_ledger() {
+        if let Binding::EncodedSid { s_id, .. } = binding {
+            // var = var: both sides EncodedSid → compare raw s_ids directly.
+            if let Expression::Var(ov) = other_expr {
+                if let Some(Binding::EncodedSid { s_id: rhs_s_id, .. }) = row.get(*ov) {
+                    return Ok(Some(FastEqOutcome::Eq(s_id == rhs_s_id)));
                 }
+            }
 
-                // var = const: a variable-free operand resolves to the same s_id
-                // on every row, so resolve it once and memoize by the operand
-                // expression's identity — skipping the per-row eval_to_comparable
-                // and IRI re-encode (`canonical_split` / namespace lookup). The
-                // memo is consulted by pointer first, so the (cheap) variable-free
-                // check only runs on the first row for each operand.
-                let key =
-                    crate::context::ConstSidKey::ExprPtr(other_expr as *const Expression as usize);
-                let resolved: Option<Option<u64>> = {
+            // var = const: a variable-free operand resolves to the same s_id
+            // on every row, so resolve it once and memoize by the operand
+            // expression's identity — skipping the per-row eval_to_comparable
+            // and IRI re-encode (`canonical_split` / namespace lookup). The
+            // memo is consulted by pointer first, so the (cheap) variable-free
+            // check only runs on the first row for each operand.
+            let key =
+                crate::context::ConstSidKey::ExprPtr(other_expr as *const Expression as usize);
+            let resolved: Option<Option<u64>> = {
+                let cached = ctx
+                    .const_sid_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&key)
+                    .copied();
+                match cached {
+                    Some(v) => Some(v),
+                    None if other_expr.referenced_vars().is_empty() => {
+                        let v = match other_expr.eval_to_comparable(row, Some(ctx))? {
+                            Some(ComparableValue::Sid(sid)) => {
+                                subject_ref_to_s_id(ctx.active_snapshot, store, &Ref::Sid(sid))?
+                            }
+                            Some(ComparableValue::Iri(iri)) => {
+                                subject_ref_to_s_id(ctx.active_snapshot, store, &Ref::Iri(iri))?
+                            }
+                            _ => None,
+                        };
+                        ctx.const_sid_cache
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(key, v);
+                        Some(v)
+                    }
+                    None => None,
+                }
+            };
+            if let Some(Some(rhs_s_id)) = resolved {
+                return Ok(Some(FastEqOutcome::Eq(*s_id == rhs_s_id)));
+            }
+            // `Some(None)` (constant not an indexed subject) or `None`
+            // (operand has variables) both fall through to the paths below.
+        }
+    }
+
+    let Some(other) = other_expr.eval_to_comparable(row, Some(ctx))? else {
+        return Ok(Some(FastEqOutcome::OtherUnbound));
+    };
+
+    match binding {
+        Binding::EncodedSid { s_id, .. } => {
+            // Single-ledger fast path for `?var = <const IRI>` / `?var = Sid`
+            // (e.g. BSBM's `FILTER (<product> != ?p)`): reduce the constant
+            // side to its internal `s_id` and compare u64s, skipping the
+            // costly `resolve_subject_iri` string materialization of the
+            // bound side. Cross-ledger `s_id`s aren't comparable, so gate on
+            // `!is_multi_ledger`. A `None` reduction (subject not indexed, or
+            // an IRI-normalization mismatch) falls through to the IRI-string
+            // path below, which stays conservative.
+            if !ctx.is_multi_ledger() {
+                let other_ref = match &other {
+                    ComparableValue::Sid(sid) => Some(Ref::Sid(sid.clone())),
+                    ComparableValue::Iri(iri) => Some(Ref::Iri(iri.clone())),
+                    _ => None,
+                };
+                if let Some(r) = other_ref {
+                    // The constant operand resolves to the same `s_id` on
+                    // every row, so memoize it per query instead of doing a
+                    // dictionary reverse-lookup (`find_subject_id_by_parts`)
+                    // per row — the dominant cost of this filter at scale.
+                    let key = match &r {
+                        Ref::Iri(iri) => crate::context::ConstSidKey::Iri(iri.as_ref().into()),
+                        Ref::Sid(sid) => crate::context::ConstSidKey::Sid(
+                            sid.namespace_code,
+                            sid.name.as_ref().into(),
+                        ),
+                        Ref::Var(_) => unreachable!("other_ref is never a Var"),
+                    };
                     let cached = ctx
                         .const_sid_cache
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get(&key)
                         .copied();
-                    match cached {
-                        Some(v) => Some(v),
-                        None if other_expr.referenced_vars().is_empty() => {
-                            let v = match other_expr.eval_to_comparable(row, Some(ctx))? {
-                                Some(ComparableValue::Sid(sid)) => {
-                                    subject_ref_to_s_id(ctx.active_snapshot, store, &Ref::Sid(sid))?
-                                }
-                                Some(ComparableValue::Iri(iri)) => {
-                                    subject_ref_to_s_id(ctx.active_snapshot, store, &Ref::Iri(iri))?
-                                }
-                                _ => None,
-                            };
+                    let rhs = match cached {
+                        Some(v) => v,
+                        None => {
+                            let v = subject_ref_to_s_id(ctx.active_snapshot, store, &r)?;
                             ctx.const_sid_cache
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .insert(key, v);
-                            Some(v)
+                            v
                         }
-                        None => None,
-                    }
-                };
-                if let Some(Some(rhs_s_id)) = resolved {
-                    let eq = *s_id == rhs_s_id;
-                    let out = match op {
-                        CompareOp::Eq => eq,
-                        CompareOp::Ne => !eq,
-                        _ => unreachable!(),
                     };
-                    return Ok(Some(out));
-                }
-                // `Some(None)` (constant not an indexed subject) or `None`
-                // (operand has variables) both fall through to the paths below.
-            }
-        }
-
-        let Some(other) = other_expr.eval_to_comparable(row, Some(ctx))? else {
-            return Ok(Some(false));
-        };
-
-        match binding {
-            Binding::EncodedSid { s_id, .. } => {
-                // Single-ledger fast path for `?var = <const IRI>` / `?var = Sid`
-                // (e.g. BSBM's `FILTER (<product> != ?p)`): reduce the constant
-                // side to its internal `s_id` and compare u64s, skipping the
-                // costly `resolve_subject_iri` string materialization of the
-                // bound side. Cross-ledger `s_id`s aren't comparable, so gate on
-                // `!is_multi_ledger`. A `None` reduction (subject not indexed, or
-                // an IRI-normalization mismatch) falls through to the IRI-string
-                // path below, which stays conservative.
-                if !ctx.is_multi_ledger() {
-                    let other_ref = match &other {
-                        ComparableValue::Sid(sid) => Some(Ref::Sid(sid.clone())),
-                        ComparableValue::Iri(iri) => Some(Ref::Iri(iri.clone())),
-                        _ => None,
-                    };
-                    if let Some(r) = other_ref {
-                        // The constant operand resolves to the same `s_id` on
-                        // every row, so memoize it per query instead of doing a
-                        // dictionary reverse-lookup (`find_subject_id_by_parts`)
-                        // per row — the dominant cost of this filter at scale.
-                        let key = match &r {
-                            Ref::Iri(iri) => crate::context::ConstSidKey::Iri(iri.as_ref().into()),
-                            Ref::Sid(sid) => crate::context::ConstSidKey::Sid(
-                                sid.namespace_code,
-                                sid.name.as_ref().into(),
-                            ),
-                            Ref::Var(_) => unreachable!("other_ref is never a Var"),
-                        };
-                        let cached = ctx
-                            .const_sid_cache
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .get(&key)
-                            .copied();
-                        let rhs = match cached {
-                            Some(v) => v,
-                            None => {
-                                let v = subject_ref_to_s_id(ctx.active_snapshot, store, &r)?;
-                                ctx.const_sid_cache
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .insert(key, v);
-                                v
-                            }
-                        };
-                        if let Some(rhs_s_id) = rhs {
-                            let eq = *s_id == rhs_s_id;
-                            let out = match op {
-                                CompareOp::Eq => eq,
-                                CompareOp::Ne => !eq,
-                                _ => unreachable!(),
-                            };
-                            return Ok(Some(out));
-                        }
+                    if let Some(rhs_s_id) = rhs {
+                        return Ok(Some(FastEqOutcome::Eq(*s_id == rhs_s_id)));
                     }
                 }
+            }
 
-                let Some(lhs_iri) = ctx
-                    .resolve_subject_iri(*s_id)
-                    .transpose()
-                    .map_err(|e| QueryError::Internal(format!("resolve_subject_iri: {e}")))?
-                else {
-                    return Ok(None);
-                };
-                let Some(rhs_iri) = comparable_to_subject_iri(other) else {
-                    return Ok(None);
-                };
+            let Some(lhs_iri) = ctx
+                .resolve_subject_iri(*s_id)
+                .transpose()
+                .map_err(|e| QueryError::Internal(format!("resolve_subject_iri: {e}")))?
+            else {
+                return Ok(None);
+            };
+            let Some(rhs_iri) = comparable_to_subject_iri(other) else {
+                return Ok(None);
+            };
 
-                let eq = lhs_iri == rhs_iri;
-                let out = match op {
-                    CompareOp::Eq => eq,
-                    CompareOp::Ne => !eq,
-                    _ => unreachable!(),
-                };
-                Ok(Some(out))
-            }
-            Binding::Sid { sid, .. } => {
-                let eq = match other {
-                    ComparableValue::Sid(rhs) => {
-                        if sid == &rhs {
-                            true
-                        } else {
-                            let (Some(lhs_iri), Some(rhs_iri)) =
-                                (sid_to_iri(sid), sid_to_iri(&rhs))
-                            else {
-                                return Ok(None);
-                            };
-                            lhs_iri == rhs_iri
-                        }
-                    }
-                    ComparableValue::Iri(iri) => {
-                        let Some(lhs_iri) = sid_to_iri(sid) else {
-                            return Ok(None);
-                        };
-                        lhs_iri == iri.as_ref()
-                    }
-                    _ => return Ok(None),
-                };
-                let out = match op {
-                    CompareOp::Eq => eq,
-                    CompareOp::Ne => !eq,
-                    _ => unreachable!(),
-                };
-                Ok(Some(out))
-            }
-            Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
-                let eq = match other {
-                    ComparableValue::Sid(rhs) => {
-                        let Some(rhs_iri) = sid_to_iri(&rhs) else {
-                            return Ok(None);
-                        };
-                        iri.as_ref() == rhs_iri
-                    }
-                    ComparableValue::Iri(rhs) => iri.as_ref() == rhs.as_ref(),
-                    _ => return Ok(None),
-                };
-                let out = match op {
-                    CompareOp::Eq => eq,
-                    CompareOp::Ne => !eq,
-                    _ => unreachable!(),
-                };
-                Ok(Some(out))
-            }
-            Binding::EncodedPid { p_id } => {
-                let rhs_p_id_opt = match other {
-                    ComparableValue::Sid(sid) => store.sid_to_p_id(&sid),
-                    ComparableValue::Iri(iri) => store.find_predicate_id(iri.as_ref()),
-                    _ => return Ok(None),
-                };
-
-                let eq = rhs_p_id_opt.is_some_and(|rhs| rhs == *p_id);
-                let out = match op {
-                    CompareOp::Eq => eq,
-                    CompareOp::Ne => !eq,
-                    _ => unreachable!(),
-                };
-                Ok(Some(out))
-            }
-            _ => Ok(None),
+            Ok(Some(FastEqOutcome::Eq(lhs_iri == rhs_iri)))
         }
-    };
-
-    // Try both orientations: (?var EncodedSid) op (const IRI/Sid) OR swapped.
-    if let Some(v) = try_side(&args[0], &args[1])? {
-        return Ok(Some(v));
+        Binding::Sid { sid, .. } => {
+            let eq = match other {
+                ComparableValue::Sid(rhs) => {
+                    if sid == &rhs {
+                        true
+                    } else {
+                        let (Some(lhs_iri), Some(rhs_iri)) = (sid_to_iri(sid), sid_to_iri(&rhs))
+                        else {
+                            return Ok(None);
+                        };
+                        lhs_iri == rhs_iri
+                    }
+                }
+                ComparableValue::Iri(iri) => {
+                    let Some(lhs_iri) = sid_to_iri(sid) else {
+                        return Ok(None);
+                    };
+                    lhs_iri == iri.as_ref()
+                }
+                _ => return Ok(None),
+            };
+            Ok(Some(FastEqOutcome::Eq(eq)))
+        }
+        Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
+            let eq = match other {
+                ComparableValue::Sid(rhs) => {
+                    let Some(rhs_iri) = sid_to_iri(&rhs) else {
+                        return Ok(None);
+                    };
+                    iri.as_ref() == rhs_iri
+                }
+                ComparableValue::Iri(rhs) => iri.as_ref() == rhs.as_ref(),
+                _ => return Ok(None),
+            };
+            Ok(Some(FastEqOutcome::Eq(eq)))
+        }
+        Binding::EncodedPid { p_id } => {
+            let rhs_p_id_opt = match other {
+                ComparableValue::Sid(sid) => store.sid_to_p_id(&sid),
+                ComparableValue::Iri(iri) => store.find_predicate_id(iri.as_ref()),
+                _ => return Ok(None),
+            };
+            Ok(Some(FastEqOutcome::Eq(
+                rhs_p_id_opt.is_some_and(|rhs| rhs == *p_id),
+            )))
+        }
+        _ => Ok(None),
     }
-    if let Some(v) = try_side(&args[1], &args[0])? {
-        return Ok(Some(v));
-    }
-    Ok(None)
 }
 
 impl CompareOp {

@@ -88,10 +88,110 @@ pub fn eval_xor<R: RowAccess>(
     Ok(Some(ComparableValue::Bool(acc)))
 }
 
+/// Shared outcome of the IN-list membership test.
+enum Membership {
+    /// The test value is unbound (`IN` → false, `NOT IN` → vacuously true).
+    TestUnbound,
+    /// Some element matched the test value.
+    Found,
+    /// No element matched and no comparison errored.
+    NotFound,
+    /// No element matched but a comparison raised a demotable error
+    /// (§17.4.1.9 OR semantics: a definitive match discards it, a no-match
+    /// result surfaces it).
+    Error(QueryError),
+}
+
+/// Membership core shared by `IN` and `NOT IN`.
+///
+/// Runs the resource fast path first, element by element, BEFORE
+/// materializing the test value: an index-encoded binding (`EncodedSid`/
+/// `Sid`) is a different representation of the same resource as a constant
+/// `<iri>` element, and `rdf_term_equal`'s Resource arm compares
+/// representations — so without this, `?ref IN (<iri>)` silently matched
+/// nothing (and `NOT IN` kept everything). Mirrors the `=`/`!=` fast path
+/// (same helper, same per-query const-sid memoization). Elements the fast
+/// path cannot decide fall back to the generic comparable path.
+fn eval_membership<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+    operator: &'static str,
+) -> Result<Membership> {
+    use super::compare::{fast_in_membership_for_iri_bindings, FastEqOutcome};
+
+    let mut unresolved: Vec<&Expression> = Vec::new();
+    for v in &args[1..] {
+        match fast_in_membership_for_iri_bindings(&args[0], v, row, ctx) {
+            // A definitive resource match wins outright (OR semantics).
+            Ok(Some(FastEqOutcome::Eq(true))) => return Ok(Membership::Found),
+            // Definitive non-match for this element — keep looking.
+            Ok(Some(FastEqOutcome::Eq(false))) => {}
+            Ok(Some(FastEqOutcome::TestUnbound)) => return Ok(Membership::TestUnbound),
+            // Unbound element = no match (matches `E = unbound` = false).
+            Ok(Some(FastEqOutcome::OtherUnbound)) => {}
+            // This pair needs the generic comparable path — either the fast
+            // path can't decide it, or its element eval raised a demotable
+            // error that must stay pending (a later match discards it).
+            Ok(None) => unresolved.push(v),
+            Err(err) if err.can_demote_in_expression() => unresolved.push(v),
+            // Fatal (dict / fuel / cancel) propagates.
+            Err(err) => return Err(err),
+        }
+    }
+    if unresolved.is_empty() {
+        return Ok(Membership::NotFound);
+    }
+
+    let Some(tv) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(Membership::TestUnbound);
+    };
+
+    let mut pending_error: Option<QueryError> = None;
+    for v in unresolved {
+        match v.eval_to_comparable(row, ctx) {
+            // Value equality (rdf_term_equal), so `1 IN (1.0)` matches
+            // like `1 = 1.0` — not the variant-exact derived `==`.
+            Ok(Some(cv)) => match rdf_term_equal(&cv, &tv) {
+                EqOutcome::Eq => return Ok(Membership::Found),
+                EqOutcome::Ne => {}
+                // Incomparable datatypes → the same `Comparison` type
+                // error `=`/`!=` raise (demotes to unbound in Extend /
+                // false in FILTER); kept pending so a later match wins.
+                EqOutcome::TypeError => {
+                    pending_error = Some(
+                        ComparisonError::TypeMismatch {
+                            operator,
+                            left_type: tv.type_name(),
+                            right_type: cv.type_name(),
+                        }
+                        .into(),
+                    );
+                }
+            },
+            // Unbound element = no match (matches `E = unbound` = false).
+            Ok(None) => {}
+            // A demotable element-eval error (e.g. `1/0`) is kept pending,
+            // not swallowed, so a no-match result becomes an error.
+            Err(err) if err.can_demote_in_expression() => pending_error = Some(err),
+            // Fatal (dict / fuel / cancel) propagates.
+            Err(err) => return Err(err),
+        }
+    }
+    match pending_error {
+        Some(err) => Ok(Membership::Error(err)),
+        None => Ok(Membership::NotFound),
+    }
+}
+
 /// Evaluate IN expression
 ///
 /// First argument is the test value, remaining arguments are the set values.
 /// Returns true if test value equals any set value.
+///
+/// §17.4.1.9: `E IN (E1..En)` ≡ `(E=E1) || … || (E=En)` under OR three-valued
+/// logic — `true` if any element matches by value equality; else an error if
+/// any comparison errored; else `false`.
 pub fn eval_in<R: RowAccess>(
     args: &[Expression],
     row: &R,
@@ -100,58 +200,11 @@ pub fn eval_in<R: RowAccess>(
     if args.is_empty() {
         return Ok(Some(ComparableValue::Bool(false)));
     }
-
-    let test_val = args[0].eval_to_comparable(row, ctx)?;
-    match test_val {
-        Some(tv) => {
-            // §17.4.1.9: `E IN (E1..En)` ≡ `(E=E1) || … || (E=En)` under OR
-            // three-valued logic — `true` if any element matches by value
-            // equality; else an error if any comparison errored; else `false`.
-            // A definitive match short-circuits and discards any pending error.
-            let mut found = false;
-            let mut pending_error: Option<QueryError> = None;
-            for v in &args[1..] {
-                match v.eval_to_comparable(row, ctx) {
-                    // Value equality (rdf_term_equal), so `1 IN (1.0)` matches
-                    // like `1 = 1.0` — not the variant-exact derived `==`.
-                    Ok(Some(cv)) => match rdf_term_equal(&cv, &tv) {
-                        EqOutcome::Eq => {
-                            found = true;
-                            break;
-                        }
-                        EqOutcome::Ne => {}
-                        // Incomparable datatypes → the same `Comparison` type
-                        // error `=`/`!=` raise (demotes to unbound in Extend /
-                        // false in FILTER); kept pending so a later match wins.
-                        EqOutcome::TypeError => {
-                            pending_error = Some(
-                                ComparisonError::TypeMismatch {
-                                    operator: "IN",
-                                    left_type: tv.type_name(),
-                                    right_type: cv.type_name(),
-                                }
-                                .into(),
-                            );
-                        }
-                    },
-                    // Unbound element = no match (matches `E = unbound` = false).
-                    Ok(None) => {}
-                    // A demotable element-eval error (e.g. `1/0`) is kept pending,
-                    // not swallowed, so a no-match result becomes an error.
-                    Err(err) if err.can_demote_in_expression() => pending_error = Some(err),
-                    // Fatal (dict / fuel / cancel) propagates.
-                    Err(err) => return Err(err),
-                }
-            }
-            if found {
-                Ok(Some(ComparableValue::Bool(true)))
-            } else if let Some(err) = pending_error {
-                Err(err)
-            } else {
-                Ok(Some(ComparableValue::Bool(false)))
-            }
-        }
-        None => Ok(Some(ComparableValue::Bool(false))), // Unbound value -> not in list
+    match eval_membership(args, row, ctx, "IN")? {
+        Membership::Found => Ok(Some(ComparableValue::Bool(true))),
+        // Unbound value -> not in list
+        Membership::NotFound | Membership::TestUnbound => Ok(Some(ComparableValue::Bool(false))),
+        Membership::Error(err) => Err(err),
     }
 }
 
@@ -159,6 +212,9 @@ pub fn eval_in<R: RowAccess>(
 ///
 /// First argument is the test value, remaining arguments are the set values.
 /// Returns true if test value does not equal any set value.
+///
+/// `E NOT IN L` ≡ `NOT(E IN L)`: `false` if any element matches, else an
+/// error if any comparison errored (NOT of error is error), else `true`.
 pub fn eval_not_in<R: RowAccess>(
     args: &[Expression],
     row: &R,
@@ -167,57 +223,11 @@ pub fn eval_not_in<R: RowAccess>(
     if args.is_empty() {
         return Ok(Some(ComparableValue::Bool(true)));
     }
-
-    let test_val = args[0].eval_to_comparable(row, ctx)?;
-    match test_val {
-        Some(tv) => {
-            // `E NOT IN L` ≡ `NOT(E IN L)`: `false` if any element matches, else
-            // an error if any comparison errored (NOT of error is error), else
-            // `true`. A definitive match short-circuits and discards the error.
-            let mut found = false;
-            let mut pending_error: Option<QueryError> = None;
-            for v in &args[1..] {
-                match v.eval_to_comparable(row, ctx) {
-                    // Value equality (rdf_term_equal), so `1 IN (1.0)` matches
-                    // like `1 = 1.0` — not the variant-exact derived `==`.
-                    Ok(Some(cv)) => match rdf_term_equal(&cv, &tv) {
-                        EqOutcome::Eq => {
-                            found = true;
-                            break;
-                        }
-                        EqOutcome::Ne => {}
-                        // Incomparable datatypes → the same `Comparison` type
-                        // error `=`/`!=` raise (demotes to unbound in Extend /
-                        // false in FILTER); kept pending so a later match wins.
-                        EqOutcome::TypeError => {
-                            pending_error = Some(
-                                ComparisonError::TypeMismatch {
-                                    operator: "NOT IN",
-                                    left_type: tv.type_name(),
-                                    right_type: cv.type_name(),
-                                }
-                                .into(),
-                            );
-                        }
-                    },
-                    // Unbound element = no match (matches `E = unbound` = false).
-                    Ok(None) => {}
-                    // A demotable element-eval error (e.g. `1/0`) is kept pending,
-                    // not swallowed, so a no-match result becomes an error.
-                    Err(err) if err.can_demote_in_expression() => pending_error = Some(err),
-                    // Fatal (dict / fuel / cancel) propagates.
-                    Err(err) => return Err(err),
-                }
-            }
-            if found {
-                Ok(Some(ComparableValue::Bool(false)))
-            } else if let Some(err) = pending_error {
-                Err(err)
-            } else {
-                Ok(Some(ComparableValue::Bool(true)))
-            }
-        }
-        None => Ok(Some(ComparableValue::Bool(true))), // Unbound value -> not in list (vacuously true)
+    match eval_membership(args, row, ctx, "NOT IN")? {
+        Membership::Found => Ok(Some(ComparableValue::Bool(false))),
+        // Unbound value -> not in list (vacuously true)
+        Membership::NotFound | Membership::TestUnbound => Ok(Some(ComparableValue::Bool(true))),
+        Membership::Error(err) => Err(err),
     }
 }
 
