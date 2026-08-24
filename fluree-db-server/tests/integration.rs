@@ -3632,3 +3632,170 @@ async fn sparql_graph_pattern_named_graph_without_from_named() {
         "Expected GRAPH ?g discovery to surface 'urn:probegraph', got: {json}"
     );
 }
+
+/// `/sync` HTTP contract (what `fluree sync --remote` depends on): delta
+/// commit, no-op resync, dry-run report shape, and the 400 guards.
+#[tokio::test]
+async fn sync_route_contract() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "sync:test" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let graph = "urn%3Aexample%3Aontology";
+    let post = |uri: String, body: String, ct: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", ct)
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let v1 = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            { "@id": "ex:alice", "ex:name": "Alice", "ex:role": "engineer" },
+            { "@id": "ex:bob", "ex:name": "Bob" }
+        ]
+    })
+    .to_string();
+    let v2 = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            { "@id": "ex:alice", "ex:name": "Alice", "ex:role": "manager" },
+            { "@id": "ex:carol", "ex:name": "Carol" }
+        ]
+    })
+    .to_string();
+
+    // First sync populates the graph: a real commit at t=1.
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                format!("/v1/fluree/sync/sync:test?graph={graph}"),
+                v1.clone(),
+                "application/json",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(1));
+
+    // Identical payload: success, no new commit (t unchanged).
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                format!("/v1/fluree/sync/sync:test?graph={graph}"),
+                v1.clone(),
+                "application/json",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json.get("t").and_then(serde_json::Value::as_i64),
+        Some(1),
+        "identical resync must not advance t: {json}"
+    );
+
+    // Dry run reports the delta in the report shape and commits nothing.
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                format!("/v1/fluree/sync/sync:test?graph={graph}&dryRun=true"),
+                v2.clone(),
+                "application/json",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["asserted"], 2);
+    assert_eq!(json["retracted"], 2);
+    assert_eq!(json["committed"], false);
+    assert_eq!(json["dryRun"], true);
+    assert_eq!(json["t"], 1);
+
+    // Real delta run: one commit.
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                format!("/v1/fluree/sync/sync:test?graph={graph}"),
+                v2,
+                "application/json",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(2));
+
+    // Guards: missing graph, empty payload without allowEmpty, malformed
+    // graph IRI, and a Turtle body are all 400s.
+    for (uri, body, ct) in [
+        (
+            "/v1/fluree/sync/sync:test".to_string(),
+            v1.clone(),
+            "application/json",
+        ),
+        (
+            format!("/v1/fluree/sync/sync:test?graph={graph}"),
+            serde_json::json!({ "@graph": [] }).to_string(),
+            "application/json",
+        ),
+        (
+            "/v1/fluree/sync/sync:test?graph=relative%2Fgraph".to_string(),
+            v1.clone(),
+            "application/json",
+        ),
+        (
+            format!("/v1/fluree/sync/sync:test?graph={graph}"),
+            "@prefix ex: <http://example.org/> . ex:a ex:b \"c\" .".to_string(),
+            "text/turtle",
+        ),
+    ] {
+        let (status, json) = json_body(
+            app.clone()
+                .oneshot(post(uri.clone(), body, ct))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+    }
+
+    // allowEmpty clears the graph (3 retracts at t=3).
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                format!("/v1/fluree/sync/sync:test?graph={graph}&allowEmpty=true"),
+                serde_json::json!({ "@graph": [] }).to_string(),
+                "application/json",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(3));
+}

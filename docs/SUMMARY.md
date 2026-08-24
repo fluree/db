@@ -14,6 +14,7 @@
   - [graph](cli/graph.md)
   - [insert](cli/insert.md)
   - [upsert](cli/upsert.md)
+  - [sync](cli/sync.md)
   - [update](cli/update.md)
   - [load](cli/load.md)
   - [query](cli/query.md)

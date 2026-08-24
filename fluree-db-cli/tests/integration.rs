@@ -1376,6 +1376,89 @@ fn upsert_turtle() {
         .stdout(predicate::str::contains("Committed t=1"));
 }
 
+#[test]
+fn sync_graph_commits_only_the_delta() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "syncdb"])
+        .assert()
+        .success();
+    let graph = "urn:example:ontology";
+
+    let v1 = r#"{"@context": {"ex": "http://example.org/"}, "@graph": [
+        {"@id": "ex:alice", "ex:name": "Alice", "ex:role": "engineer"},
+        {"@id": "ex:bob", "ex:name": "Bob"}]}"#;
+    // First sync populates the graph: 3 asserts, nothing to retract.
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdb", "--graph", graph, "-e", v1])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+3 asserted, -0 retracted (t=1)"));
+
+    // Identical payload is a no-op: no commit, t unchanged.
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdb", "--graph", graph, "-e", v1])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already matches the payload"));
+
+    // Dry run of a delta reports the counts without committing (still t=1).
+    let v2 = "@prefix ex: <http://example.org/> .\nex:alice ex:name \"Alice\" ; ex:role \"manager\" .\nex:carol ex:name \"Carol\" .";
+    fluree_cmd(&tmp)
+        .args([
+            "sync",
+            "syncdb",
+            "--graph",
+            graph,
+            "--dry-run",
+            "--json",
+            "-e",
+            v2,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"asserted\": 2"))
+        .stdout(predicate::str::contains("\"retracted\": 2"))
+        .stdout(predicate::str::contains("\"committed\": false"))
+        .stdout(predicate::str::contains("\"t\": 1"));
+
+    // Real run from Turtle (converted client-side): one commit for the delta.
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdb", "--graph", graph, "-e", v2])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+2 asserted, -2 retracted (t=2)"));
+
+    // Empty payload is refused without --allow-empty ...
+    fluree_cmd(&tmp)
+        .args([
+            "sync",
+            "syncdb",
+            "--graph",
+            graph,
+            "-e",
+            r#"{"@graph": []}"#,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--allow-empty"));
+    // ... and clears the graph with it.
+    fluree_cmd(&tmp)
+        .args([
+            "sync",
+            "syncdb",
+            "--graph",
+            graph,
+            "--allow-empty",
+            "-e",
+            r#"{"@graph": []}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+0 asserted, -3 retracted (t=3)"));
+}
+
 // ============================================================================
 // v1.1 — CSV output tests
 // ============================================================================

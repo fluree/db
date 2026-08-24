@@ -1944,6 +1944,20 @@ mem:decision-01m0svwaqmb1h9dweex82pcxd7 a mem:Decision ;
     mem:rationale "Whole-graph ops that materialize scans + payload are the CLEAR-class memory profile; chunked staging remains the known follow-up. Bnode stability = deterministic graph-scoped skolem_txn_id (sync+doc_scope(doc_id)) set in stage_sync_transaction_tracked — label-unstable exporters (Protégé genid) still churn; RDFC canonicalization is the designed seam." ;
     mem:alternatives "GraphMgmtOp::Sync variant; CLEAR+INSERT relying on accumulator (no explicit no-op detection); offline export/external-sort/diff pipeline (v2 scale path)" .
 
+mem:decision-01m0t021b2wwasg494g0yxre7w a mem:Decision ;
+    mem:content "`fluree sync` CLI grammar: top-level verb (not `graph sync`), target graph is the constant (`--graph <IRI>` required), the SOURCE of desired contents is pluggable via `commands/graph_sync.rs::SyncSource` (today RdfText; an R2RML-over-Iceberg/CSV/Excel source is one new variant that materializes to the same JSON-LD payload). Turtle converts client-side (endpoint is JSON-LD only). `--dry-run --json` is the scripting pre-flight; `--json` output = the server dry-run report shape on both local and remote paths. NOTE: `commands/sync.rs` already exists (fetch/pull/push/publish replication) — never reuse that name." ;
+    mem:tag "cli" ;
+    mem:tag "command-grammar" ;
+    mem:tag "graph-sync" ;
+    mem:tag "r2rml" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/cli/server-integration.md" ;
+    mem:artifactRef "docs/cli/sync.md" ;
+    mem:artifactRef "fluree-db-cli/src/commands/graph_sync.rs" ;
+    mem:branch "feature/graph-sync-delta" ;
+    mem:createdAt "2026-08-24T13:41:17.282471+00:00"^^xsd:dateTime ;
+    mem:rationale "User wants sync to later drive from Iceberg/CSV/Excel via R2RML (\"latest downstream\"); keeping the source a client-side seam means no new server endpoint or command per source, and --remote only moves where materialization happens." .
+
 mem:fact-01m0svwr4r77f4v4xy9k7w5q6e a mem:Fact ;
     mem:content "CommitReceipt now carries assert_count/retract_count (count_ops in commit.rs, populated in finalize_state_with_base from commit_record.flakes). Raft-applied receipts report 0/0 — AppliedReceipt/idempotency records don't persist the split (raft wire-format stability), so sync reports over raft lack the convenience counts. Sync's HTTP dry-run path computes counts locally instead. New verbs need ALL of: TransactionBody variant + operation_tag + body_hash domain tag + BodyKind + BOTH appliers (local.rs and raft/commit_worker.rs body dispatch) + server route family + tx_builder TransactOperation/OpPlan/stage_plan arms + BOTH no-op skip conditions (tx_builder owned execute + commit_and_finalize, and the three tx.rs transact paths)." ;
     mem:tag "commit-receipt" ;
