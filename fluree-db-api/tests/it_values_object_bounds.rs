@@ -251,3 +251,62 @@ async fn filter_not_in_excludes_encoded_iri_bindings() {
     );
     assert_eq!(rows[0]["b"]["value"], entity_c());
 }
+
+/// Row-drain work must be visible to fuel accounting. Leaflet touches are
+/// thousands of rows coarse, so before scan-emission and VALUES-join charges
+/// existed, a query that drained and materialized a whole predicate extent
+/// reported floor-level fuel (~1.0) — invisible to `max_fuel` limits.
+#[tokio::test]
+async fn drained_rows_are_visible_to_fuel() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree).await;
+    let b = entity_b();
+
+    let fuel_of = |q: String| {
+        let fluree = &fluree;
+        async move {
+            let result = fluree
+                .query_from()
+                .sparql(&q)
+                .track_all()
+                .execute_tracked()
+                .await
+                .expect("query should succeed");
+            assert_eq!(result.status, 200);
+            result.fuel.expect("fuel")
+        }
+    };
+
+    // A star that emits every subject: N rows through the scan lane.
+    let star_fuel = fuel_of(format!(
+        "PREFIX ns: <http://example.org/ns#>\n\
+         SELECT ?a ?b FROM <{LEDGER_ID}> WHERE {{\n\
+           ?ev ns:entity1 ?a ; ns:entity2 ?b ; ns:snap ?snap }}"
+    ))
+    .await;
+    assert!(
+        star_fuel > 2.0,
+        "star drained ~{N} rows but charged only {star_fuel} fuel; \
+         scan-emission charges regressed and the lane is invisible to max_fuel"
+    );
+    assert!(
+        star_fuel < 100.0,
+        "star fuel ({star_fuel}) blew past the per-row schedule"
+    );
+
+    // A declined (UNDEF) VALUES joins the full stream through ValuesOperator:
+    // its per-input-row charge stacks on the scan-emission charge.
+    let values_join_fuel = fuel_of(format!(
+        "PREFIX ns: <http://example.org/ns#>\n\
+         SELECT ?b FROM <{LEDGER_ID}> WHERE {{\n\
+           VALUES ?b {{ <{b}> UNDEF }}\n\
+           ?ev ns:entity1 ?a ; ns:entity2 ?b ; ns:snap ?snap }}"
+    ))
+    .await;
+    assert!(
+        values_join_fuel > star_fuel + 1.0,
+        "VALUES join over the same stream charged {values_join_fuel} vs bare star \
+         {star_fuel}; the ValuesOperator per-input-row charge regressed"
+    );
+}

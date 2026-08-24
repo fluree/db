@@ -2646,6 +2646,35 @@ mem:fact-01kynrrhdfqt0n6rx1wpcv5843 a mem:Fact ;
     mem:createdAt "2026-07-29T01:45:24.655252+00:00"^^xsd:dateTime ;
     mem:rationale "Answers \"would batching help existing-subject upserts?\" with measurements — avoids speculative batching work; documents the store-cached p_sid_table invariant (store immutable behind Arc → OnceLock safe)." .
 
+mem:fact-01m0srrpntk3mxseprnpcvey08 a mem:Fact ;
+    mem:content "Star-block VALUES on non-subject vars lower to FILTER(?v IN ...) at block assembly (convert_star_values_to_membership_filters, fix/values-object-scan-constraint): a deferred multi-row VALUES constrained NOTHING about the fused star scan (full-extent drain + materialize, 1600x vs the identical filter — BUG-values-join-planner). Declines preserve join semantics: UNDEF (match-any), duplicate rows (multiplicity), multi-var (correlation), literal cells, subject VALUES (seeds instead), and mixed blocks are all-or-nothing — a partially converted block routes leftover VALUES down the sequential path, which seeds them at the base (the cartesian the deferral prevents)." ;
+    mem:tag "membership-filter" ;
+    mem:tag "performance" ;
+    mem:tag "planner" ;
+    mem:tag "star-join" ;
+    mem:tag "values" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/design/performance.md" ;
+    mem:artifactRef "fluree-db-api/tests/it_values_object_bounds.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:branch "fix/values-object-scan-constraint" ;
+    mem:createdAt "2026-08-24T11:33:51.418875+00:00"^^xsd:dateTime ;
+    mem:rationale "Anyone touching split_values_seeding_star or the inner-join block builder must know why conversion is all-or-nothing and which shapes must keep the ValuesOperator." .
+
+mem:fact-01m0srrz87xpy9dy11z0b084hv a mem:Fact ;
+    mem:content "IN/NOT IN over resources needed the same encoded-vs-IRI fast path as =/!= (fixed on fix/values-object-scan-constraint): eval_in fell through to rdf_term_equal, whose Resource arm compares representations, so ?ref IN (&lt;iri&gt;) against an EncodedSid/Sid binding silently matched nothing and NOT IN kept everything. Fix = shared eval_membership probing each element via fast_eq_iri_binding_directional (three-way outcome: Eq(bool)/TestUnbound/OtherUnbound — IN needs to know WHICH side was unbound; =/!= treats both as false). This was the 10th mixed-representation equality surface beyond the 9 fixed in 17472650e." ;
+    mem:tag "correctness" ;
+    mem:tag "eval" ;
+    mem:tag "filter" ;
+    mem:tag "in-operator" ;
+    mem:tag "mixed-representation" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/eval/compare.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/logical.rs" ;
+    mem:branch "fix/values-object-scan-constraint" ;
+    mem:createdAt "2026-08-24T11:34:00.199726+00:00"^^xsd:dateTime ;
+    mem:rationale "Any new equality-shaped eval surface (e.g. CASE, coalesce comparisons) must consult the IRI-binding fast path or it silently misses encoded resources." .
+
 mem:constraint-01kyke812e1np5c9ag45ac7580 a mem:Constraint ;
     mem:content "The WHERE early-dedup gate (`where_dedup_safe`) must check BOTH that every aggregate is `duplicate_insensitive()` AND that every var in `VariableDeps::required_aggregate_vars` is a GROUP BY key or an aggregate output. A non-key var surviving the grouping stage is emitted as `Binding::Grouped` — a per-group LIST (JSON-LD-only feature; SPARQL rejects the shape) that observes row multiplicity. Note `aggregates()` is EMPTY for a dedup-only `GROUP BY ?g`, so the aggregate check alone is vacuously true there." ;
     mem:tag "aggregates" ;
