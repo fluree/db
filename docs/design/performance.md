@@ -224,8 +224,9 @@ generic RDF cardinality math gets badly wrong:
 
 ### Pre-planning rewrites
 
-Two rewrites run over a pattern list before `reorder_patterns` sees it, so both
-ordering and the scan layer work from the narrower form:
+Three rewrites narrow a pattern list before the scan layer works from it. The
+first two run before `reorder_patterns`; the third runs at inner-join block
+assembly, after ordering:
 
 - **Redundant `rdf:type` elision** — drop `?s rdf:type <C>` when stats prove
   every subject of a co-occurring predicate is a `C` (`elide_redundant_type_filters`).
@@ -243,6 +244,19 @@ ordering and the scan layer work from the narrower form:
   scan layer, subject/predicate positions keep the existing seeding path, and
   compound patterns are rewrite boundaries because MINUS/EXISTS semantics can
   change when a shared variable disappears before the retained VALUES binds it.
+- **Multi-row VALUES membership lowering** — a multi-row VALUES binding a
+  non-subject variable of a fusable star lowers to the equivalent
+  `FILTER(?v IN (...))` when the block is assembled
+  (`convert_star_values_to_membership_filters`). A deferred multi-row VALUES
+  constrains nothing about the scan — the star drains its driving predicate's
+  whole extent, materializes every row, and the two-row VALUES filters
+  afterwards — while the identical membership filter inlines into the fused
+  star and prunes rows before materialization (1,600x on a 129k-edge
+  two-bound-endpoint join; BUG-values-join-planner). Declines preserve exact
+  join semantics: UNDEF cells (match-any), duplicate rows (multiplicity),
+  multi-var VALUES (column correlation), literal cells, a VALUES on the star
+  subject (seeding beats filtering), and mixed blocks (all-or-nothing so an
+  unconvertible sibling keeps today's plan).
 
 ### Cost constants are coupled and tested
 
