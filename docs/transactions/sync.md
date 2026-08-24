@@ -51,7 +51,7 @@ Query parameters:
 |---|---|
 | `ledger` | Target ledger (`name:branch`) |
 | `graph` | **Required.** Target graph IRI — the sync scope |
-| `dryRun=true` | Stage and report the delta (`asserted`/`retracted` counts) without committing |
+| `dryRun=true` | Stage and report the delta (`asserted`/`retracted` counts) without committing — under the same policy, header, and inline-constraint inputs the real run uses, so it reports what the real run would do (or fails the way it would) |
 | `allowEmpty=true` | Confirm an explicitly empty payload (`"@graph": []`), which clears the graph |
 
 The payload is JSON-LD (`application/json`). Convert Turtle exports
@@ -76,9 +76,14 @@ let report = fluree
 assert!(report.committed || (report.asserted == 0 && report.retracted == 0));
 ```
 
-`SyncGraphOpts { dry_run, allow_empty }` mirror the query parameters. The
-builder form `fluree.stage(&handle).sync_graph(graph_iri, &payload)` is also
-available (note: the builder does not apply the `allow_empty` gate).
+`SyncGraphOpts { dry_run, allow_empty }` mirror the query parameters;
+`sync_named_graph_with` additionally takes explicit `TxnOpts` and a
+`PolicyContext`. The builder form
+`fluree.stage(&handle).sync_graph(graph_iri, &payload)` is also available
+(note: the builder does not apply the `allow_empty` gate). Its consensus
+terminal `build_commit()` returns `Ok(None)` for a no-change sync. Target
+validation (absolute IRI, no system graphs) is enforced at staging, so it
+applies on every entry point.
 
 ## Safety rails
 

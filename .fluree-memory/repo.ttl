@@ -1897,6 +1897,35 @@ mem:fact-01kv6sahj5se39hv5hkmjytznz a mem:Fact ;
     mem:createdAt "2026-06-15T23:19:32.677756+00:00"^^xsd:dateTime ;
     mem:rationale "Serial writes (summed S3 round-trips) blew the 15-min Lambda cap on a real 21 GB/74k-artifact DBLP restore; user chose the parallelize-writes fix. Sequential-stream-read ceiling is still unaddressed." .
 
+mem:constraint-01m0sy4avrsbj4xs4tnaxw3xnr a mem:Constraint ;
+    mem:content "Every new TransactOperation variant MUST get an arm in `stage_under_lock` (tx_builder.rs), not only stage_plan / owned execute / owned stage. stage_under_lock is the path Raft (`build_commit_with_handle`) and every policy-gated, pre-built, SPARQL and Cypher local commit takes, and its JSON-like fallthrough silently stages an unknown op as `TxnType::Insert` into the default graph — the sync verb shipped that way until review." ;
+    mem:tag "new-verb-checklist" ;
+    mem:tag "raft" ;
+    mem:tag "stage-under-lock" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/src/tx_builder.rs" ;
+    mem:branch "feature/graph-sync-delta" ;
+    mem:createdAt "2026-08-24T13:07:35.420277+00:00"^^xsd:dateTime ;
+    mem:rationale "Local no-policy tests pass via the optimistic path, so the gap is invisible until raft or policy is involved; pinned by policy_gated_sync_targets_the_named_graph." .
+
+mem:constraint-01m0sy4gbwwx44d2yc3kepwv5a a mem:Constraint ;
+    mem:content "`BodyKind` and `TransactionBody` are postcard-positional in persisted Raft state (`QueueEntry.body_kind` in state snapshots): append new variants at the END only (pinned by body_kind_ordinals_are_append_only). Separately, `RefTransactBuilder::build_commit` returns `Ok(None)` for a zero-flake update/upsert/sync that registers no graph; the raft worker republishes the current head with `install: None` (mirroring revert NoOp). Before this, a no-change write under Raft failed with EmptyTransaction and poisoned the queued request." ;
+    mem:tag "consensus" ;
+    mem:tag "no-op" ;
+    mem:tag "postcard" ;
+    mem:tag "raft" ;
+    mem:tag "wire-format" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/src/tx_builder.rs" ;
+    mem:artifactRef "fluree-db-consensus/src/lib.rs" ;
+    mem:artifactRef "fluree-db-consensus/src/raft/commit_worker.rs" ;
+    mem:branch "feature/graph-sync-delta" ;
+    mem:createdAt "2026-08-24T13:07:41.052490+00:00"^^xsd:dateTime ;
+    mem:rationale "Mid-enum insertion shifts every later ordinal so existing snapshots/mixed-version nodes decode the wrong operation; the no-op terminal is the only way consensus can express committed=false." .
+
 mem:decision-01m0svwaqmb1h9dweex82pcxd7 a mem:Decision ;
     mem:content "Graph sync (feature/graph-sync-delta) = Insert-typed Txn + `sync_graph: Option<IRI>` directive: staging adds a wave after the upsert wave pushing every scanned target-graph flake as a retraction; FlakeAccumulator::mixed nets A∩B to zero so the commit is exactly the delta. Chosen over a GraphMgmtOp variant (payload doesn't fit SPARQL-shaped ops) and over the materialize.rs text-diff pipeline (needs a built binary index + bulk-import path drops retractions; the accumulator path works on any live ledger and inherits policy/SHACL/cascade/no-op machinery). Retraction scan follows CLEAR's policy model (not view-filtered, O4). Zero-staged sync joins the Update|Upsert no-op skip via StageResult.sync_graph." ;
     mem:tag "delta" ;

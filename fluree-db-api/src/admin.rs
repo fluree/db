@@ -1032,8 +1032,32 @@ impl crate::Fluree {
         data: &serde_json::Value,
         opts: SyncGraphOpts,
     ) -> Result<SyncGraphReport> {
+        self.sync_named_graph_with(
+            ledger_id,
+            graph_iri,
+            data,
+            opts,
+            fluree_db_transact::TxnOpts::default(),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::sync_named_graph`] with explicit transaction options and an
+    /// optional policy context — the form the HTTP layer uses so a dry run
+    /// stages under exactly the policy / inline-constraint inputs the real
+    /// (consensus-submitted) run will, and therefore reports the same delta
+    /// or fails the same way. `policy: None` runs as root.
+    pub async fn sync_named_graph_with(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+        data: &serde_json::Value,
+        opts: SyncGraphOpts,
+        txn_opts: fluree_db_transact::TxnOpts,
+        policy: Option<crate::PolicyContext>,
+    ) -> Result<SyncGraphReport> {
         use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
-        use fluree_db_transact::TxnOpts;
 
         let bad_request = |msg: String| ApiError::Http {
             status: 400,
@@ -1082,15 +1106,18 @@ impl crate::Fluree {
         if opts.dry_run {
             let snap = handle.snapshot().await;
             let ledger_state = snap.to_ledger_state();
+            // Report the `t` of the state the delta was actually computed
+            // against, not a separately-read head.
+            let staged_against_t = ledger_state.t();
             let stage_result = self
                 .stage_sync_transaction_tracked(
                     ledger_state,
                     graph_iri,
                     data,
-                    TxnOpts::default(),
+                    txn_opts,
                     None,
                     None,
-                    None,
+                    policy.as_ref(),
                 )
                 .await?;
             let flakes = stage_result.view.staged_flakes();
@@ -1103,16 +1130,29 @@ impl crate::Fluree {
                 retracted,
                 committed: false,
                 dry_run: true,
-                t: pre_t,
+                t: staged_against_t,
             });
         }
 
-        let result = self
+        let mut builder = self
             .stage(&handle)
             .sync_graph(graph_iri, data)
-            .execute()
-            .await?;
-        let committed = result.receipt.t > pre_t;
+            .txn_opts(txn_opts);
+        if let Some(policy) = policy {
+            builder = builder.policy(policy);
+        }
+        let result = builder.execute().await?;
+        // A delta commit always carries flakes. The only zero-flake commit a
+        // sync can produce is a registration-only one (an explicitly empty
+        // payload into a never-registered graph), which advances `t` under a
+        // real commit id; a no-change sync returns either the no-op sentinel
+        // id (local path) or the unchanged head (consensus path). Keying on
+        // the flake count first keeps the common cases exact even when an
+        // unrelated writer advances the head concurrently.
+        let noop_sentinel =
+            fluree_db_core::ContentId::new(fluree_db_core::ContentKind::Commit, &[]);
+        let committed = result.receipt.flake_count > 0
+            || (result.receipt.t > pre_t && result.receipt.commit_id != noop_sentinel);
         let t = if committed { result.receipt.t } else { pre_t };
 
         info!(

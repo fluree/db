@@ -1278,17 +1278,50 @@ async fn sync_local(
 
         if query_params.dry_run {
             // Dry run: stage + count locally, commit nothing. Safe outside
-            // consensus — it is a read of the delta, not a write.
+            // consensus — it is a read of the delta, not a write. It stages
+            // under the SAME inputs the real run would (header-injected
+            // opts, governance-derived policy context built from the ledger
+            // state, inline shapes / unique properties), so a restricted
+            // writer sees policy-filtered counts and a run that would fail
+            // policy / SHACL / uniqueness fails here too.
+            let prepared = prepare_transaction_body(
+                &state,
+                &ledger_id,
+                body_json,
+                &headers,
+                author.as_deref(),
+            )
+            .await;
+            let txn_opts = txn_opts_from_body(&prepared.body, &span)?;
+            let handle = state
+                .fluree
+                .ledger_cached(&ledger_id)
+                .await
+                .map_err(ServerError::from)?;
+            let snap = handle.snapshot().await;
+            let policy = fluree_db_api::build_transact_policy_context(
+                &state.fluree,
+                &snap.snapshot,
+                snap.novelty.as_ref(),
+                Some(snap.novelty.as_ref()),
+                snap.t,
+                &prepared.governance,
+            )
+            .await
+            .map_err(ServerError::from)?;
+            drop(snap);
             let report = state
                 .fluree
-                .sync_named_graph(
+                .sync_named_graph_with(
                     &ledger_id,
                     &graph_iri,
-                    &body_json,
+                    &prepared.body,
                     fluree_db_api::SyncGraphOpts {
                         dry_run: true,
                         allow_empty: query_params.allow_empty,
                     },
+                    txn_opts,
+                    policy,
                 )
                 .await
                 .map_err(ServerError::from)?;
@@ -1634,6 +1667,77 @@ fn is_misrouted_cypher_envelope(body: &JsonValue) -> bool {
             .all(|k| !obj.contains_key(*k))
 }
 
+/// Derive the `TxnOpts` the HTTP layer surfaces from a JSON-LD body's
+/// `opts` block (`shapes`, `uniqueProperties`). Shared by the consensus
+/// submission path and the sync dry-run path so both stage under the same
+/// inline constraints.
+fn txn_opts_from_body(body: &JsonValue, span: &tracing::Span) -> Result<TxnOpts> {
+    // Pick up `opts.shapes` and `opts.uniqueProperties` from the body
+    // so inline SHACL shapes and unique-property constraints reach the
+    // staging path. Other `TxnOpts` fields are not yet surfaced over
+    // HTTP (branch/context/etc. come from headers or query params);
+    // add them here if a use case lands.
+    let mut txn_opts = TxnOpts::default();
+    if let Some(shapes) = body.get("opts").and_then(|o| o.get("shapes")) {
+        // Validate at the boundary: `shapes` must be a JSON-LD
+        // document (object) or an array of JSON-LD documents.
+        // Letting scalars / nulls fall through to
+        // `fluree_graph_json_ld::expand` surfaces as a fuzzy
+        // internal parse error rather than the precise 400
+        // the caller deserves.
+        match shapes {
+            JsonValue::Object(_) => {}
+            JsonValue::Array(arr) => {
+                for (idx, item) in arr.iter().enumerate() {
+                    if !item.is_object() {
+                        set_span_error_code(span, "error:BadRequest");
+                        return Err(ServerError::bad_request(format!(
+                            "opts.shapes[{idx}] must be a JSON-LD object; got {item}"
+                        )));
+                    }
+                }
+            }
+            _ => {
+                set_span_error_code(span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "opts.shapes must be a JSON-LD object or array of objects",
+                ));
+            }
+        }
+        txn_opts.shapes = Some(shapes.clone());
+    }
+    if let Some(unique_props_raw) = body.get("opts").and_then(|o| o.get("uniqueProperties")) {
+        // Must be a JSON array. A scalar (or null) is a type
+        // error, not "empty list".
+        let Some(arr) = unique_props_raw.as_array() else {
+            set_span_error_code(span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "opts.uniqueProperties must be an array of property IRI strings",
+            ));
+        };
+        // Every element must be a string. `filter_map` would
+        // silently drop integers/bools/etc. — that's the silent-
+        // weakening pattern we deliberately don't want here.
+        let mut iris: Vec<String> = Vec::with_capacity(arr.len());
+        for (idx, v) in arr.iter().enumerate() {
+            let Some(s) = v.as_str() else {
+                set_span_error_code(span, "error:BadRequest");
+                return Err(ServerError::bad_request(format!(
+                    "opts.uniqueProperties[{idx}] must be a string IRI; got {v}"
+                )));
+            };
+            iris.push(s.to_string());
+        }
+        // Empty array is intentionally treated as "no inline
+        // constraints" rather than an error — operators may build
+        // the array dynamically and end up with zero entries.
+        if !iris.is_empty() {
+            txn_opts.unique_properties = Some(iris);
+        }
+    }
+    Ok(txn_opts)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_transaction(
     state: &AppState,
@@ -1716,77 +1820,7 @@ async fn execute_transaction(
                 .with_received_at(chrono::Utc::now().to_rfc3339());
         }
 
-        // Pick up `opts.shapes` and `opts.uniqueProperties` from the body
-        // so inline SHACL shapes and unique-property constraints reach the
-        // staging path. Other `TxnOpts` fields are not yet surfaced over
-        // HTTP (branch/context/etc. come from headers or query params);
-        // add them here if a use case lands.
-        let mut txn_opts = TxnOpts::default();
-        if let Some(shapes) = prepared_transaction
-            .body
-            .get("opts")
-            .and_then(|o| o.get("shapes"))
-        {
-            // Validate at the boundary: `shapes` must be a JSON-LD
-            // document (object) or an array of JSON-LD documents.
-            // Letting scalars / nulls fall through to
-            // `fluree_graph_json_ld::expand` surfaces as a fuzzy
-            // internal parse error rather than the precise 400
-            // the caller deserves.
-            match shapes {
-                JsonValue::Object(_) => {}
-                JsonValue::Array(arr) => {
-                    for (idx, item) in arr.iter().enumerate() {
-                        if !item.is_object() {
-                            set_span_error_code(&span, "error:BadRequest");
-                            return Err(ServerError::bad_request(format!(
-                                "opts.shapes[{idx}] must be a JSON-LD object; got {item}"
-                            )));
-                        }
-                    }
-                }
-                _ => {
-                    set_span_error_code(&span, "error:BadRequest");
-                    return Err(ServerError::bad_request(
-                        "opts.shapes must be a JSON-LD object or array of objects",
-                    ));
-                }
-            }
-            txn_opts.shapes = Some(shapes.clone());
-        }
-        if let Some(unique_props_raw) = prepared_transaction
-            .body
-            .get("opts")
-            .and_then(|o| o.get("uniqueProperties"))
-        {
-            // Must be a JSON array. A scalar (or null) is a type
-            // error, not "empty list".
-            let Some(arr) = unique_props_raw.as_array() else {
-                set_span_error_code(&span, "error:BadRequest");
-                return Err(ServerError::bad_request(
-                    "opts.uniqueProperties must be an array of property IRI strings",
-                ));
-            };
-            // Every element must be a string. `filter_map` would
-            // silently drop integers/bools/etc. — that's the silent-
-            // weakening pattern we deliberately don't want here.
-            let mut iris: Vec<String> = Vec::with_capacity(arr.len());
-            for (idx, v) in arr.iter().enumerate() {
-                let Some(s) = v.as_str() else {
-                    set_span_error_code(&span, "error:BadRequest");
-                    return Err(ServerError::bad_request(format!(
-                        "opts.uniqueProperties[{idx}] must be a string IRI; got {v}"
-                    )));
-                };
-                iris.push(s.to_string());
-            }
-            // Empty array is intentionally treated as "no inline
-            // constraints" rather than an error — operators may build
-            // the array dynamically and end up with zero entries.
-            if !iris.is_empty() {
-                txn_opts.unique_properties = Some(iris);
-            }
-        }
+        let txn_opts = txn_opts_from_body(&prepared_transaction.body, &span)?;
 
         // Every JSON-LD transaction goes through consensus. Policy context,
         // tracking, and execution are all handled by the submission layer;

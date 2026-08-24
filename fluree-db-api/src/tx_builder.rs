@@ -1093,9 +1093,16 @@ impl<'a> RefTransactBuilder<'a> {
     /// what consensus-coordinated committers
     /// (e.g. `fluree-db-consensus::RaftCommitter`) use to produce a
     /// commit they then carry through Raft consensus themselves.
+    ///
+    /// Returns `Ok(None)` for a no-change transaction — a zero-flake
+    /// update/upsert, or a graph sync whose payload already matches the
+    /// graph — that registers nothing new. Nothing is written and the
+    /// write guard is released; the caller reports the unchanged head.
+    /// Without this, a no-change sync under consensus would surface as an
+    /// `EmptyTransaction` failure instead of `committed: false`.
     pub async fn build_commit(
         self,
-    ) -> Result<(LedgerWriteGuard, fluree_db_transact::StagedCommit)> {
+    ) -> Result<Option<(LedgerWriteGuard, fluree_db_transact::StagedCommit)>> {
         self.fluree
             .build_commit_with_handle(self.handle, self.core)
             .await
@@ -1368,6 +1375,30 @@ impl Fluree {
             return Ok((stage_result, TxnType::Insert, commit_opts, None));
         }
 
+        // Graph sync: dedicated staging (whole-graph retraction wave). Must
+        // be dispatched before the JSON-like fallthrough, which would
+        // otherwise stage the payload as a plain default-graph insert.
+        if let TransactOperation::SyncGraph { graph_iri, json } = op {
+            let stage_result = self
+                .stage_sync_transaction_tracked(
+                    ledger_state,
+                    graph_iri,
+                    json,
+                    core.txn_opts,
+                    Some(index_config),
+                    tracker_ref,
+                    core.policy.as_ref(),
+                )
+                .await?;
+            let commit_opts = self.maybe_spawn_txn_upload(
+                core.commit_opts,
+                &ledger_id,
+                json.clone(),
+                store_raw_txn,
+            );
+            return Ok((stage_result, TxnType::Insert, commit_opts, None));
+        }
+
         // JSON-like operation: parse, extracting TriG metadata + named graphs.
         let txn_type = op.txn_type();
         let parsed = op.to_json_with_trig_meta()?;
@@ -1585,7 +1616,7 @@ impl Fluree {
         &self,
         ledger: &LedgerHandle,
         mut core: TransactCore<'_>,
-    ) -> Result<(LedgerWriteGuard, fluree_db_transact::StagedCommit)> {
+    ) -> Result<Option<(LedgerWriteGuard, fluree_db_transact::StagedCommit)>> {
         core.validate().map_err(ApiError::Builder)?;
 
         let index_config = core
@@ -1603,7 +1634,7 @@ impl Fluree {
         // The dry-run/consensus path has no response channel for a trailing
         // Cypher RETURN — callers reject RETURN-carrying sequential
         // statements before submission.
-        let (stage_result, _txn_type, commit_opts, _cypher_return) = self
+        let (stage_result, txn_type, commit_opts, _cypher_return) = self
             .stage_under_lock(
                 write_guard.clone_state(),
                 core,
@@ -1618,8 +1649,24 @@ impl Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
-            sync_graph: _,
+            sync_graph,
         } = stage_result;
+        // Same no-op rule as `commit_and_finalize`: a registration-only
+        // transaction must still build a commit; a zero-flake
+        // update/upsert/sync that registers nothing is a no-change outcome.
+        let registers_new_graph = graph_delta.values().any(|iri| {
+            view.base()
+                .snapshot
+                .graph_registry
+                .graph_id_for_iri(iri)
+                .is_none()
+        });
+        if !view.has_staged()
+            && !registers_new_graph
+            && (matches!(txn_type, TxnType::Update | TxnType::Upsert) || sync_graph.is_some())
+        {
+            return Ok(None);
+        }
         let mut commit_opts = commit_opts
             .with_txn_meta(txn_meta)
             .with_graph_delta(graph_delta.into_iter().collect());
@@ -1698,7 +1745,7 @@ impl Fluree {
             staged.tally = tracker.tally();
         }
 
-        Ok((write_guard, staged))
+        Ok(Some((write_guard, staged)))
     }
 
     /// Stage and commit a transaction against a cached ledger handle.

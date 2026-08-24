@@ -695,15 +695,32 @@ pub async fn stage(
         // first population — nothing to retract (`None` scan). Reserved
         // system graphs are refused the same way CLEAR refuses them.
         let sync_scan: Option<(GraphId, Sid)> = match &txn.sync_graph {
-            Some(iri) => match ledger.snapshot.graph_registry.graph_id_for_iri(iri) {
-                Some(g_id) if g_id < FIRST_USER_GRAPH_ID => {
+            Some(iri) => {
+                // Guard the target by shape, independent of registration:
+                // every entry point (builder, consensus applier, HTTP) meets
+                // this check, so a malformed IRI can't be registered as a
+                // graph and the ledger's own system-graph IRIs are refused
+                // even on a ledger whose registry never seeded them.
+                fluree_db_core::graph_registry::validate_absolute_graph_iri(iri)
+                    .map_err(|msg| TransactError::Parse(format!("sync target: {msg}")))?;
+                let ledger_id = ledger.snapshot.ledger_id.as_ref();
+                if *iri == fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id)
+                    || *iri == fluree_db_core::graph_registry::config_graph_iri(ledger_id)
+                {
                     return Err(TransactError::ReservedGraphTarget {
                         graph_iri: iri.clone(),
                     });
                 }
-                Some(g_id) => Some((g_id, ns_registry.sid_for_iri(iri))),
-                None => None,
-            },
+                match ledger.snapshot.graph_registry.graph_id_for_iri(iri) {
+                    Some(g_id) if g_id < FIRST_USER_GRAPH_ID => {
+                        return Err(TransactError::ReservedGraphTarget {
+                            graph_iri: iri.clone(),
+                        });
+                    }
+                    Some(g_id) => Some((g_id, ns_registry.sid_for_iri(iri))),
+                    None => None,
+                }
+            }
             None => None,
         };
 
