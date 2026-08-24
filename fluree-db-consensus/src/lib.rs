@@ -172,6 +172,10 @@ pub enum TransactionBody {
     JsonLdUpsert(JsonValue),
     /// JSON-LD document staged as an update (general retract + assert).
     JsonLdUpdate(JsonValue),
+    /// JSON-LD document staged as a graph sync: `graph_iri`'s contents
+    /// become exactly the document, committing only the delta (whole-graph
+    /// retraction wave + accumulator cancellation).
+    JsonLdGraphSync { graph_iri: String, body: JsonValue },
     /// Plain Turtle text (`text/turtle`) staged as pure insert.
     TurtleInsert(String),
     /// Plain Turtle text (`text/turtle`) staged with upsert semantics.
@@ -205,6 +209,7 @@ impl TransactionBody {
             Self::JsonLdInsert(_) | Self::TurtleInsert(_) => "insert",
             Self::JsonLdUpsert(_) | Self::TurtleUpsert(_) | Self::TrigUpsert(_) => "upsert",
             Self::JsonLdUpdate(_) => "update",
+            Self::JsonLdGraphSync { .. } => "graph-sync",
             Self::Sparql(_) => "sparql-update",
             Self::Cypher { .. } => "cypher",
         }
@@ -236,6 +241,12 @@ impl TransactionBody {
             Self::JsonLdUpdate(json) => {
                 hasher.update(b"jsonld-update");
                 hasher.update(json.to_string().as_bytes());
+            }
+            Self::JsonLdGraphSync { graph_iri, body } => {
+                hasher.update(b"jsonld-graph-sync");
+                hasher.update(graph_iri.as_bytes());
+                hasher.update([0u8]);
+                hasher.update(body.to_string().as_bytes());
             }
             Self::TurtleInsert(text) => {
                 hasher.update(b"turtle-insert");
@@ -281,6 +292,8 @@ pub enum BodyKind {
     JsonLdInsert,
     JsonLdUpsert,
     JsonLdUpdate,
+    /// Graph sync (delta-only whole-graph replacement).
+    JsonLdGraphSync,
     TurtleInsert,
     TurtleUpsert,
     TrigUpsert,
@@ -312,6 +325,7 @@ impl From<&TransactionBody> for BodyKind {
             TransactionBody::JsonLdInsert(_) => BodyKind::JsonLdInsert,
             TransactionBody::JsonLdUpsert(_) => BodyKind::JsonLdUpsert,
             TransactionBody::JsonLdUpdate(_) => BodyKind::JsonLdUpdate,
+            TransactionBody::JsonLdGraphSync { .. } => BodyKind::JsonLdGraphSync,
             TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
             TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
             TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,

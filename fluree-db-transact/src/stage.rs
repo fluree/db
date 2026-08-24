@@ -690,6 +690,23 @@ pub async fn stage(
             }
         }
 
+        // Graph-sync target: resolve the g_id + graph Sid now, before the
+        // generator takes `ns_registry` mutably. An unregistered target is a
+        // first population — nothing to retract (`None` scan). Reserved
+        // system graphs are refused the same way CLEAR refuses them.
+        let sync_scan: Option<(GraphId, Sid)> = match &txn.sync_graph {
+            Some(iri) => match ledger.snapshot.graph_registry.graph_id_for_iri(iri) {
+                Some(g_id) if g_id < FIRST_USER_GRAPH_ID => {
+                    return Err(TransactError::ReservedGraphTarget {
+                        graph_iri: iri.clone(),
+                    });
+                }
+                Some(g_id) => Some((g_id, ns_registry.sid_for_iri(iri))),
+                None => None,
+            },
+            None => None,
+        };
+
         let mut generator = FlakeGenerator::new(new_t, &mut ns_registry, txn_id)
             .with_graph_sids(graph_sids.clone());
 
@@ -752,6 +769,45 @@ pub async fn stage(
                 "upsert deletions generated"
             );
             acc.push_retractions(upsert_retractions);
+        }
+
+        // Graph-sync wave: push every currently-asserted flake of the target
+        // graph as a retraction (see [`Txn::sync_graph`]). The accumulator
+        // nets retract+assert of the same fact to nothing, so what survives
+        // `finalize()` is exactly `current − payload` retractions plus
+        // `payload − current` assertions — the delta. Scanned flakes carry
+        // correct `m` from storage, so (like the upsert wave) no hydration
+        // is needed.
+        //
+        // Policy model follows CLEAR (roadmap O4): the scan is not
+        // view-policy filtered — sync is an authoritative whole-graph
+        // replacement, and a view-filtered scan would leave rows the caller
+        // cannot see in place, breaking "the graph now equals the payload".
+        // Modify-policy is still enforced on the resulting flakes below.
+        //
+        // Scale note: like CLEAR/COPY/MOVE, this materializes the whole
+        // graph's flakes at staging time; backpressure is the pre-check
+        // above plus `NoveltyWouldExceed` sizing at commit (which sees only
+        // the surviving delta). Chunked staging for whole-graph ops is the
+        // same known follow-up flagged on `scan_graph_flakes`.
+        if let Some((sync_g_id, sync_graph_sid)) = &sync_scan {
+            let mut sync_retractions =
+                scan_graph_flakes(&ledger, *sync_g_id, options.tracker).await?;
+            for f in &mut sync_retractions {
+                // Stamp the graph explicitly: accumulator buckets key on
+                // `flake.g`, and the payload's assertions carry the graph
+                // Sid — both sides must agree for the unchanged-fact
+                // cancellation to fire.
+                f.g = Some(sync_graph_sid.clone());
+                f.op = false;
+                f.t = new_t;
+            }
+            tracing::debug!(
+                graph_id = sync_g_id,
+                scanned = sync_retractions.len(),
+                "graph-sync retractions generated"
+            );
+            acc.push_retractions(sync_retractions);
         }
 
         let retraction_count = stream_stats.retraction_count;

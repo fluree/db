@@ -1897,6 +1897,38 @@ mem:fact-01kv6sahj5se39hv5hkmjytznz a mem:Fact ;
     mem:createdAt "2026-06-15T23:19:32.677756+00:00"^^xsd:dateTime ;
     mem:rationale "Serial writes (summed S3 round-trips) blew the 15-min Lambda cap on a real 21 GB/74k-artifact DBLP restore; user chose the parallelize-writes fix. Sequential-stream-read ceiling is still unaddressed." .
 
+mem:decision-01m0svwaqmb1h9dweex82pcxd7 a mem:Decision ;
+    mem:content "Graph sync (feature/graph-sync-delta) = Insert-typed Txn + `sync_graph: Option<IRI>` directive: staging adds a wave after the upsert wave pushing every scanned target-graph flake as a retraction; FlakeAccumulator::mixed nets A∩B to zero so the commit is exactly the delta. Chosen over a GraphMgmtOp variant (payload doesn't fit SPARQL-shaped ops) and over the materialize.rs text-diff pipeline (needs a built binary index + bulk-import path drops retractions; the accumulator path works on any live ledger and inherits policy/SHACL/cascade/no-op machinery). Retraction scan follows CLEAR's policy model (not view-filtered, O4). Zero-staged sync joins the Update|Upsert no-op skip via StageResult.sync_graph." ;
+    mem:tag "delta" ;
+    mem:tag "graph-sync" ;
+    mem:tag "named-graph" ;
+    mem:tag "staging" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/transactions/sync.md" ;
+    mem:artifactRef "fluree-db-api/src/admin.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_sync_graph.rs" ;
+    mem:artifactRef "fluree-db-transact/src/parse/jsonld.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "feature/graph-sync-delta" ;
+    mem:createdAt "2026-08-24T12:28:15.988437+00:00"^^xsd:dateTime ;
+    mem:rationale "Whole-graph ops that materialize scans + payload are the CLEAR-class memory profile; chunked staging remains the known follow-up. Bnode stability = deterministic graph-scoped skolem_txn_id (sync+doc_scope(doc_id)) set in stage_sync_transaction_tracked — label-unstable exporters (Protégé genid) still churn; RDFC canonicalization is the designed seam." ;
+    mem:alternatives "GraphMgmtOp::Sync variant; CLEAR+INSERT relying on accumulator (no explicit no-op detection); offline export/external-sort/diff pipeline (v2 scale path)" .
+
+mem:fact-01m0svwr4r77f4v4xy9k7w5q6e a mem:Fact ;
+    mem:content "CommitReceipt now carries assert_count/retract_count (count_ops in commit.rs, populated in finalize_state_with_base from commit_record.flakes). Raft-applied receipts report 0/0 — AppliedReceipt/idempotency records don't persist the split (raft wire-format stability), so sync reports over raft lack the convenience counts. Sync's HTTP dry-run path computes counts locally instead. New verbs need ALL of: TransactionBody variant + operation_tag + body_hash domain tag + BodyKind + BOTH appliers (local.rs and raft/commit_worker.rs body dispatch) + server route family + tx_builder TransactOperation/OpPlan/stage_plan arms + BOTH no-op skip conditions (tx_builder owned execute + commit_and_finalize, and the three tx.rs transact paths)." ;
+    mem:tag "commit-receipt" ;
+    mem:tag "consensus" ;
+    mem:tag "new-verb-checklist" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/tx_builder.rs" ;
+    mem:artifactRef "fluree-db-consensus/src/lib.rs" ;
+    mem:artifactRef "fluree-db-transact/src/commit.rs" ;
+    mem:branch "feature/graph-sync-delta" ;
+    mem:createdAt "2026-08-24T12:28:29.720563+00:00"^^xsd:dateTime ;
+    mem:rationale "The verb-seam checklist is easy to miss partially (a missed applier silently breaks the verb under raft only)." .
+
 mem:fact-01kzemcff3b773aq7yckej9dhk a mem:Fact ;
     mem:content "Local-filesystem Iceberg support (commit 15ca56807, E2E-verified against a real pyiceberg table): Direct table_location accepts file:///, file:/, and bare absolute paths. Adds FileIcebergStorage and an IcebergStorageBackend enum (S3|File) threaded through the api scan surface, session caches, and lazy path; the version-hint fallback lists metadata/ via a new list_files trait method. GOTCHA the E2E test caught: Direct location validation lives in TWO places — fluree_db_iceberg::config and fluree-db-api graph_source/config.rs validate() — and both must accept a new scheme." ;
     mem:tag "direct-mode" ;

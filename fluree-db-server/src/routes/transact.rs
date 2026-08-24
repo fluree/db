@@ -51,6 +51,15 @@ use tracing::Instrument;
 pub struct TransactQueryParams {
     /// Target ledger (format: name:branch)
     pub ledger: Option<String>,
+    /// Sync target graph IRI (`/sync` only).
+    pub graph: Option<String>,
+    /// Sync: compute and report the delta without committing (`/sync` only).
+    #[serde(rename = "dryRun", default)]
+    pub dry_run: bool,
+    /// Sync: allow an explicitly empty payload, which clears the graph
+    /// (`/sync` only).
+    #[serde(rename = "allowEmpty", default)]
+    pub allow_empty: bool,
 }
 
 /// Commit information in transaction response
@@ -698,6 +707,7 @@ async fn update_local(
             &state,
             &ledger_id,
             TxnType::Update,
+            None,
             body_json,
             &credential,
             author.as_deref(),
@@ -862,6 +872,7 @@ async fn update_ledger_local(
             &state,
             &ledger_id,
             TxnType::Update,
+            None,
             body_json,
             &credential,
             author.as_deref(),
@@ -1008,6 +1019,7 @@ async fn insert_local(
             &state,
             &ledger_id,
             TxnType::Insert,
+            None,
             body_json,
             &credential,
             author.as_deref(),
@@ -1154,6 +1166,149 @@ async fn upsert_local(
             &state,
             &ledger_id,
             TxnType::Upsert,
+            None,
+            body_json,
+            &credential,
+            author.as_deref(),
+            &headers,
+        )
+        .await
+    }
+    .instrument(span)
+    .await
+}
+
+/// Synchronize a named graph: make its contents exactly the JSON-LD payload,
+/// committing only the delta.
+///
+/// POST /sync?ledger=name:branch&graph=<iri>[&dryRun=true][&allowEmpty=true]
+/// In peer mode, forwards the request to the transaction server.
+pub async fn sync(
+    State(state): State<Arc<AppState>>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    sync_local(state, bearer, None, request)
+        .await
+        .into_response()
+}
+
+/// Synchronize a named graph with ledger in path.
+///
+/// POST /:ledger/sync?graph=<iri>
+pub async fn sync_ledger(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    sync_local(state, bearer, Some(ledger), request)
+        .await
+        .into_response()
+}
+
+/// Local implementation of graph sync.
+async fn sync_local(
+    state: Arc<AppState>,
+    bearer: Option<crate::extract::DataPrincipal>,
+    path_ledger: Option<String>,
+    request: Request,
+) -> Result<Response> {
+    let query_params = extract_query_params(&request);
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+    let credential = MaybeCredential::extract(request).await?;
+    let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
+
+    let span = create_request_span(
+        "sync",
+        request_id.as_deref(),
+        extract_trace_id(&credential.headers).as_deref(),
+        None,
+        None,
+        Some("json-ld"),
+    );
+    async move {
+        let span = tracing::Span::current();
+        tracing::info!(status = "start", "graph sync requested");
+
+        // v1 is JSON-LD only; Turtle/TriG bodies are not accepted here.
+        if credential.is_turtle_or_trig() {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "sync accepts application/json (JSON-LD); convert Turtle payloads client-side",
+            ));
+        }
+
+        let Some(graph_iri) = query_params.graph.clone() else {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "sync requires a `graph` query parameter naming the target graph IRI",
+            ));
+        };
+
+        let body_json = credential.body_json()?;
+        let ledger_id = match path_ledger {
+            Some(l) => l,
+            None => get_ledger_id(None, &query_params, &headers, &body_json)?,
+        };
+        span.record("ledger_id", ledger_id.as_str());
+
+        enforce_write_access(&state, &ledger_id, bearer.as_ref(), &credential)?;
+        let author = effective_author(&credential, bearer.as_ref());
+
+        // Empty-payload gate: an explicitly empty payload clears the graph.
+        // Enforced here (not only in `sync_named_graph`) because the
+        // consensus submission below calls the builder directly.
+        let explicitly_empty = body_json
+            .get("@graph")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if explicitly_empty && !query_params.allow_empty {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "sync payload is empty; this would clear the graph — pass allowEmpty=true to confirm",
+            ));
+        }
+
+        if query_params.dry_run {
+            // Dry run: stage + count locally, commit nothing. Safe outside
+            // consensus — it is a read of the delta, not a write.
+            let report = state
+                .fluree
+                .sync_named_graph(
+                    &ledger_id,
+                    &graph_iri,
+                    &body_json,
+                    fluree_db_api::SyncGraphOpts {
+                        dry_run: true,
+                        allow_empty: query_params.allow_empty,
+                    },
+                )
+                .await
+                .map_err(ServerError::from)?;
+            return Ok(axum::Json(serde_json::json!({
+                "ledger": report.ledger_id,
+                "graph": report.graph_iri,
+                "asserted": report.asserted,
+                "retracted": report.retracted,
+                "committed": report.committed,
+                "dryRun": report.dry_run,
+                "t": report.t,
+            }))
+            .into_response());
+        }
+
+        execute_transaction(
+            &state,
+            &ledger_id,
+            TxnType::Insert,
+            Some(&graph_iri),
             body_json,
             &credential,
             author.as_deref(),
@@ -1301,6 +1456,7 @@ async fn insert_ledger_local(
             &state,
             &ledger_id,
             TxnType::Insert,
+            None,
             body_json,
             &credential,
             author.as_deref(),
@@ -1448,6 +1604,7 @@ async fn upsert_ledger_local(
             &state,
             &ledger_id,
             TxnType::Upsert,
+            None,
             body_json,
             &credential,
             author.as_deref(),
@@ -1477,10 +1634,12 @@ fn is_misrouted_cypher_envelope(body: &JsonValue) -> bool {
             .all(|k| !obj.contains_key(*k))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_transaction(
     state: &AppState,
     ledger_id: &str,
     txn_type: TxnType,
+    sync_graph: Option<&str>,
     body: JsonValue,
     credential: &MaybeCredential,
     author: Option<&str>,
@@ -1633,10 +1792,16 @@ async fn execute_transaction(
         // tracking, and execution are all handled by the submission layer;
         // policy is built there from the ledger state the transaction
         // actually stages against.
-        let body = match txn_type {
-            TxnType::Insert => TransactionBody::JsonLdInsert(prepared_transaction.body),
-            TxnType::Upsert => TransactionBody::JsonLdUpsert(prepared_transaction.body),
-            TxnType::Update => TransactionBody::JsonLdUpdate(prepared_transaction.body),
+        let body = match sync_graph {
+            Some(graph_iri) => TransactionBody::JsonLdGraphSync {
+                graph_iri: graph_iri.to_string(),
+                body: prepared_transaction.body,
+            },
+            None => match txn_type {
+                TxnType::Insert => TransactionBody::JsonLdInsert(prepared_transaction.body),
+                TxnType::Upsert => TransactionBody::JsonLdUpsert(prepared_transaction.body),
+                TxnType::Update => TransactionBody::JsonLdUpdate(prepared_transaction.body),
+            },
         };
         let request = TransactionRequest {
             idempotency_key,

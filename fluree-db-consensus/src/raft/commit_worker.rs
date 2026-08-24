@@ -634,6 +634,9 @@ impl Worker {
             TransactionBody::JsonLdInsert(json) => staged.insert(json),
             TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
             TransactionBody::JsonLdUpdate(json) => staged.update(json),
+            TransactionBody::JsonLdGraphSync { graph_iri, body } => {
+                staged.sync_graph(graph_iri.as_str(), body)
+            }
             TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
             TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
                 staged.upsert_turtle(text.as_str())

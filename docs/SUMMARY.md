@@ -134,6 +134,7 @@
   - [Overview](transactions/overview.md)
   - [Insert](transactions/insert.md)
   - [Upsert](transactions/upsert.md)
+  - [Sync (graph synchronization)](transactions/sync.md)
   - [Update (WHERE/DELETE/INSERT)](transactions/update-where-delete-insert.md)
   - [Conditional updates (atomic / compare-and-swap)](transactions/conditional-updates.md)
   - [Retractions](transactions/retractions.md)
