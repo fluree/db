@@ -240,3 +240,31 @@ jobs:
           cargo run -p fluree-bench-support --bin bench-baseline -- \
             compare --baseline bench-baselines/guardrails-pre.json \
             --allow-host-mismatch
+
+  # Keeps the wasm32-unknown-unknown build honest: the whole engine stack must
+  # keep compiling for the browser target (fluree-db-api pulls every wasm-path
+  # crate), and the parse layer must keep compiling with NO default features
+  # (the parse-only Lambda/WASM consumer contract). Runs on the same pinned
+  # toolchain as the native jobs. Job-level RUSTFLAGS: the workflow-global
+  # mold linker flag doesn't apply to wasm, and setting RUSTFLAGS here would
+  # otherwise mask the target-scoped `getrandom_backend` cfg from
+  # .cargo/config.toml — so the cfg is restated explicitly.
+  wasm32:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check engine stack (wasm32)
+        run: cargo check --target wasm32-unknown-unknown -p fluree-db-api --no-default-features
+
+      - name: Check parse layer, no default features (wasm32)
+        run: cargo check --target wasm32-unknown-unknown --no-default-features -p fluree-vocab -p fluree-graph-ir -p fluree-graph-turtle -p fluree-graph-json-ld -p fluree-db-sparql
