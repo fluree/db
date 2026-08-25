@@ -6831,6 +6831,10 @@ where
             // later defensive drop carries the sticky bit forward
             // and stays out of the bootstrap path.
             had_annotation_arena: false,
+            // Bulk import does not observe list positions at root
+            // assembly; leave the flag untracked so the write path keeps
+            // hydrating until the first full rebuild records it exactly.
+            has_list_meta: None,
             ns_split_mode: input.ns_split_mode,
         };
 

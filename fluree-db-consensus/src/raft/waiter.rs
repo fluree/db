@@ -99,6 +99,12 @@ struct Interest {
 struct Waiter {
     ref_key: RefKey,
     sender: oneshot::Sender<WaiterOutcome>,
+    /// The `Arc` this waiter's ticket holds. Both maps are keyed by
+    /// something a second submission can collide on — `request_cid` for
+    /// interests, `queue_id` for waiters — so a displaced ticket must
+    /// compare identity before removing, or its `Drop` deletes the
+    /// entry that displaced it.
+    bound: Arc<OnceLock<u64>>,
 }
 
 /// Handle a proposer holds while it waits.
@@ -156,12 +162,23 @@ impl WaiterTicket {
 
 impl Drop for WaiterTicket {
     fn drop(&mut self) {
+        // Remove only this ticket's own entry. A displaced ticket still
+        // names the slot it briefly held — the same `queue_id`, or the
+        // same `request_cid` — so removing by key alone would delete the
+        // binding the *current* holder is waiting on, and its outcome
+        // would be dropped on the floor when the terminal apply lands.
+        // The `bound` `Arc` is shared between a ticket and whichever
+        // entry it owns, so pointer identity settles it.
         match self.bound.get() {
             Some(queue_id) => {
-                self.map.waiters.remove(queue_id);
+                self.map
+                    .waiters
+                    .remove_if(queue_id, |_, w| Arc::ptr_eq(&w.bound, &self.bound));
             }
             None => {
-                self.map.interests.remove(&self.request_cid);
+                self.map
+                    .interests
+                    .remove_if(&self.request_cid, |_, i| Arc::ptr_eq(&i.bound, &self.bound));
             }
         }
     }
@@ -234,6 +251,7 @@ impl WaiterMap {
             Waiter {
                 ref_key: interest.ref_key,
                 sender: interest.sender,
+                bound: interest.bound,
             },
         );
     }
@@ -525,12 +543,45 @@ mod tests {
             ),
             "displaced waiter must report it",
         );
+
+        // The displaced ticket is bound to the same `queue_id` as the
+        // ticket that displaced it. Its cleanup must not take the live
+        // binding with it, or the current holder's outcome is dropped
+        // on the floor and it times out on a commit that applied.
+        drop(first);
+        assert_eq!(map.len(), 1, "second's binding must survive first's drop");
+
         map.resolve_applied(5, receipt());
         assert!(matches!(
             second
                 .wait(std::time::Duration::from_secs(5))
                 .await
                 .expect("current waiter resolved"),
+            WaiterOutcome::Applied(_)
+        ));
+    }
+
+    /// Same identity rule on the interests map: re-arming a
+    /// `request_cid` before either ticket binds displaces the first,
+    /// whose drop must leave the second's armed interest in place —
+    /// otherwise nothing is left to bind when the enqueue applies and
+    /// the terminal apply has nowhere to go.
+    #[tokio::test]
+    async fn dropping_a_displaced_interest_leaves_the_live_one_armed() {
+        let map = Arc::new(WaiterMap::new());
+        let first = map.arm(cid(21), key("db", "main"));
+        let mut second = map.arm(cid(21), key("db", "main"));
+
+        drop(first);
+        assert_eq!(map.len(), 1, "second's interest must survive first's drop");
+
+        map.bind(&cid(21), 9);
+        map.resolve_applied(9, receipt());
+        assert!(matches!(
+            second
+                .wait(std::time::Duration::from_secs(5))
+                .await
+                .expect("current interest bound and resolved"),
             WaiterOutcome::Applied(_)
         ));
     }

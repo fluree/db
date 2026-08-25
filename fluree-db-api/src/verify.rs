@@ -24,6 +24,10 @@ pub enum VerifyProblem {
         referenced_by: ContentId,
         referenced_by_t: i64,
     },
+    /// The commit the nameservice points at as the head is not in storage.
+    /// Nothing references it from within the chain, so it has no
+    /// `referenced_by` — the whole chain is unreachable.
+    MissingHead { commit_id: ContentId },
     /// A commit blob exists but cannot be decoded.
     UnreadableCommit { commit_id: ContentId, error: String },
     /// A commit references a raw-transaction blob that is not in storage.
@@ -43,6 +47,40 @@ pub enum VerifyProblem {
     },
     /// The nameservice points at an index root that is not in storage.
     MissingIndexRoot { index_id: ContentId, index_t: i64 },
+}
+
+/// How badly a problem compromises the ledger.
+///
+/// The split is the one this crate's replication paths already make: a
+/// missing txn blob costs provenance but every replication path tolerates
+/// it (export, pack, push, merge, clone all warn and continue), while a
+/// broken chain or a missing index root stops them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifySeverity {
+    /// No problems found.
+    Healthy,
+    /// Provenance is incomplete; state and replication are intact.
+    Provenance,
+    /// The commit chain or the index root is broken.
+    Chain,
+}
+
+impl VerifyProblem {
+    /// Classify this problem. See [`VerifySeverity`].
+    pub fn severity(&self) -> VerifySeverity {
+        match self {
+            // State is intact and every replication path tolerates it.
+            VerifyProblem::MissingTxnBlob { .. } => VerifySeverity::Provenance,
+            VerifyProblem::MissingCommit { .. }
+            | VerifyProblem::MissingHead { .. }
+            | VerifyProblem::UnreadableCommit { .. }
+            | VerifyProblem::TGap { .. }
+            // Clone requests the index in its pack by default, so a missing
+            // root breaks replication, not just local query performance.
+            | VerifyProblem::MissingIndexRoot { .. } => VerifySeverity::Chain,
+        }
+    }
 }
 
 /// Result of [`crate::Fluree::verify_ledger`].
@@ -65,6 +103,16 @@ pub struct LedgerVerifyReport {
 impl LedgerVerifyReport {
     pub fn is_healthy(&self) -> bool {
         self.problems.is_empty()
+    }
+
+    /// The worst severity among the problems found — what an automation
+    /// gate should branch on.
+    pub fn severity(&self) -> VerifySeverity {
+        self.problems
+            .iter()
+            .map(VerifyProblem::severity)
+            .max()
+            .unwrap_or(VerifySeverity::Healthy)
     }
 }
 
@@ -98,13 +146,14 @@ pub async fn verify_commit_chain<C: ContentStore + ?Sized>(
         let bytes = match store.get(&cid).await {
             Ok(bytes) => bytes,
             Err(fluree_db_core::Error::NotFound(_)) => {
-                let (referenced_by, referenced_by_t) = referenced_by
-                    .map(|(id, t, _)| (id, t))
-                    .unwrap_or_else(|| (cid.clone(), -1));
-                problems.push(VerifyProblem::MissingCommit {
-                    commit_id: cid,
-                    referenced_by,
-                    referenced_by_t,
+                problems.push(match referenced_by {
+                    Some((id, t, _)) => VerifyProblem::MissingCommit {
+                        commit_id: cid,
+                        referenced_by: id,
+                        referenced_by_t: t,
+                    },
+                    // Only the head enters the walk unreferenced.
+                    None => VerifyProblem::MissingHead { commit_id: cid },
                 });
                 continue;
             }
@@ -147,7 +196,12 @@ pub async fn verify_commit_chain<C: ContentStore + ?Sized>(
                 });
             }
         }
-        for (idx, parent) in env.parents.iter().enumerate() {
+        // Pushed in reverse so the primary parent is popped first: the
+        // frontier is a stack, and walking the primary lineage first keeps
+        // `--limit` on the newest-first path and reaches a shared ancestor
+        // by its primary edge (where the `t` contiguity check applies)
+        // rather than marking it visited via a merge edge.
+        for (idx, parent) in env.parents.iter().enumerate().rev() {
             frontier.push((parent.clone(), Some((cid.clone(), env.t, idx == 0))));
         }
     }
