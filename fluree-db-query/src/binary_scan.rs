@@ -847,8 +847,12 @@ impl BinaryScanOperator {
                     continue;
                 }
                 if let Some(tag) = dtc.lang_tag() {
+                    // Case-insensitive like the overlay filters: a flake
+                    // replayed from a commit written before tag normalization
+                    // carries the tag as authored (`FlakeMeta.lang` is a plain
+                    // deserialized field), while `tag` is always normalized.
                     let flake_lang = flake.m.as_ref().and_then(|m| m.lang.as_ref());
-                    if flake_lang.map(std::string::String::as_str) != Some(tag) {
+                    if !flake_lang.is_some_and(|l| l.eq_ignore_ascii_case(tag)) {
                         continue;
                     }
                 }
@@ -1652,6 +1656,8 @@ impl BinaryScanOperator {
         // `(s, p, o, dt, m)` independently, and an (s, p, o) equality filter
         // either keeps or drops a fact's entries as a whole — so it can never
         // separate an assertion from the retraction that cancels it.
+        // A tagged bound object matches only flakes carrying the same tag.
+        let bound_lang = self.pattern.dtc.as_ref().and_then(|d| d.lang_tag());
         let bounds = self.overlay_walk_bounds(s_sid, p_sid);
         let (first, rhs) = match bounds.as_ref() {
             Some((f, r)) => (Some(f), Some(r)),
@@ -1686,6 +1692,16 @@ impl BinaryScanOperator {
                 if let Some(o) = self.bound_o.as_ref() {
                     if &f.o != o {
                         return;
+                    }
+                    if let Some(lang) = bound_lang {
+                        if !f
+                            .m
+                            .as_ref()
+                            .and_then(|m| m.lang.as_deref())
+                            .is_some_and(|l| l.eq_ignore_ascii_case(lang))
+                        {
+                            return;
+                        }
                     }
                 }
                 flakes.push(f.clone());
@@ -2378,6 +2394,9 @@ impl Operator for BinaryScanOperator {
                     Ref::Sid(p) => Some(p.clone()),
                     _ => None,
                 };
+                // Raw (untranslatable) novelty flakes carry their tag in
+                // `FlakeMeta`; a tagged bound object must match it.
+                let bound_lang = self.pattern.dtc.as_ref().and_then(|d| d.lang_tag());
 
                 let untranslated: Vec<_> = translated
                     .untranslated
@@ -2386,6 +2405,11 @@ impl Operator for BinaryScanOperator {
                         s_sid.as_ref().is_none_or(|s| &f.s == s)
                             && p_sid.as_ref().is_none_or(|p| &f.p == p)
                             && self.bound_o.as_ref().is_none_or(|o| &f.o == o)
+                            && bound_lang.is_none_or(|lang| {
+                                f.m.as_ref()
+                                    .and_then(|m| m.lang.as_deref())
+                                    .is_some_and(|l| l.eq_ignore_ascii_case(lang))
+                            })
                             && self.object_bounds.as_ref().is_none_or(|b| b.matches(&f.o))
                     })
                     .cloned()

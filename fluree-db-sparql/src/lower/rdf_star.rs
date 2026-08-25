@@ -94,9 +94,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 other => self.lower_subject(other)?,
             };
             let p = self.lower_predicate(&tp.predicate)?;
-            // Constraint-preserving object lowering ONLY on the
-            // annotation path (see `lower_object_with_constraint` —
-            // plain-triple scan semantics must not change).
+            // Full constraint-preserving object lowering on the annotation
+            // path (see `lower_object_with_constraint`); plain triples keep
+            // only language-tag / explicit-datatype constraints (see
+            // `lower_object_with_term_constraint`).
             let with_constraint = tp.annotation.is_some();
             let (o, dtc) = self.lower_object_desugared(
                 &tp.object,

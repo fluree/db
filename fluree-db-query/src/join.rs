@@ -23,7 +23,7 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
+use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -412,6 +412,21 @@ fn is_batched_subject_exists_eligible(
 /// When a shared variable is `Unbound` on the left (e.g., from VALUES with UNDEF),
 /// `combine_rows` falls back to the right-side value so the concrete binding
 /// propagates through the join.
+/// `xsd:string` as a term constraint, built once.
+///
+/// The `EncodedLit` probe arm tags every plain-string binding with this, once
+/// per driving row; `Sid::new` allocates an `Arc<str>` per call, a clone is a
+/// refcount bump.
+fn xsd_string_sid() -> &'static Sid {
+    static SID: std::sync::OnceLock<Sid> = std::sync::OnceLock::new();
+    SID.get_or_init(|| {
+        Sid::new(
+            fluree_vocab::namespaces::XSD,
+            fluree_vocab::xsd_names::STRING,
+        )
+    })
+}
+
 pub struct NestedLoopJoinOperator {
     /// Left (driving) operator
     left: Box<dyn Operator>,
@@ -945,8 +960,15 @@ impl NestedLoopJoinOperator {
                             // Use Term::Iri so scan can encode for each target ledger
                             pattern.o = Term::Iri(iri.clone());
                         }
-                        Binding::Lit { val, .. } => {
+                        Binding::Lit { val, dtc, .. } => {
                             pattern.o = Term::Value(val.clone());
+                            // A string binding is one RDF term: `"bob"`,
+                            // `"bob"@en` and `"bob"@fr` must not probe each
+                            // other's rows. Numeric/other constraints are left
+                            // off so cross-subtype matching stays as before.
+                            if crate::binding::is_string_term_constraint(dtc) {
+                                pattern.dtc = Some(dtc.clone());
+                            }
                         }
                         Binding::EncodedLit {
                             o_kind,
@@ -978,6 +1000,31 @@ impl NestedLoopJoinOperator {
                                         ))
                                     })?;
                                 pattern.o = Term::Value(val);
+                                // Same term-identity rule as the `Lit` arm:
+                                // a string binding probes only rows with its
+                                // exact tag / `xsd:string` datatype.
+                                //
+                                // Read straight off the encoded triple: the
+                                // datatype id already says which of the two it
+                                // is, so this needs neither an `OTypeRegistry`
+                                // (a 15-element `Vec`, and `decode_value_from_kind`
+                                // above builds one already) nor a fresh datatype
+                                // `Sid` — both were per-driving-row allocations.
+                                let dt = DatatypeDictId::from_u16(*dt_id);
+                                let dtc = if dt == DatatypeDictId::LANG_STRING {
+                                    gv.store().lang_tag_for_id(*lang_id).map(|tag| {
+                                        fluree_db_core::DatatypeConstraint::LangTag(Arc::from(tag))
+                                    })
+                                } else if dt == DatatypeDictId::STRING {
+                                    Some(fluree_db_core::DatatypeConstraint::Explicit(
+                                        xsd_string_sid().clone(),
+                                    ))
+                                } else {
+                                    None
+                                };
+                                if dtc.is_some() {
+                                    pattern.dtc = dtc;
+                                }
                             }
                             // Otherwise leave as variable
                         }

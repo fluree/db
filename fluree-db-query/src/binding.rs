@@ -258,6 +258,19 @@ const _: () = assert!(
     "size_of::<Binding>() regressed past 88 bytes — box the large variant instead of widening the enum"
 );
 
+/// Whether a literal constraint pins a *string* term (`xsd:string` or a
+/// language tag). Probe substitution carries exactly these onto the scan
+/// pattern so string bindings match by RDF term identity.
+pub fn is_string_term_constraint(dtc: &DatatypeConstraint) -> bool {
+    match dtc {
+        DatatypeConstraint::LangTag(_) => true,
+        DatatypeConstraint::Explicit(sid) => {
+            sid.namespace_code == fluree_vocab::namespaces::XSD
+                && sid.name_str() == fluree_vocab::xsd_names::STRING
+        }
+    }
+}
+
 impl Binding {
     /// Create a new literal binding
     ///
@@ -285,9 +298,14 @@ impl Binding {
             !matches!(val, FlakeValue::Ref(_)),
             "Lit cannot contain Ref - use Binding::Sid"
         );
+        let lang: Arc<str> = lang.into();
+        let lang = match fluree_db_core::normalize_lang_tag(&lang) {
+            std::borrow::Cow::Borrowed(_) => lang,
+            std::borrow::Cow::Owned(s) => Arc::from(s),
+        };
         Binding::Lit {
             val,
-            dtc: DatatypeConstraint::LangTag(lang.into()),
+            dtc: DatatypeConstraint::LangTag(lang),
             t: None,
             op: None,
             p_id: None,
