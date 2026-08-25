@@ -1,8 +1,9 @@
-# WASM spike: zstd-sys (C code) needs a wasm32-capable clang; Apple clang has no
-# WebAssembly backend, so point cc at Homebrew LLVM for the wasm target only.
+# wasm32 C toolchain (zstd-sys): route through in-repo shims that pick a
+# wasm32-capable clang per platform (Homebrew LLVM on macOS — Apple clang has
+# no WebAssembly backend — plain clang on Linux/CI). Scoped to the wasm target.
 [env]
-CC_wasm32-unknown-unknown = "/opt/homebrew/opt/llvm/bin/clang"
-AR_wasm32-unknown-unknown = "/opt/homebrew/opt/llvm/bin/llvm-ar"
+CC_wasm32-unknown-unknown = { value = "scripts/wasm-clang.sh", relative = true }
+AR_wasm32-unknown-unknown = { value = "scripts/wasm-ar.sh", relative = true }
 
 [target.wasm32-unknown-unknown]
 rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
