@@ -265,6 +265,18 @@ pub struct BinaryIndexStore {
     p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
 }
 
+/// Lowercase the root's language tags, preserving position.
+///
+/// `lang_id` indexes this vec, so the mapping must stay 1:1 — case-variant
+/// entries are kept as separate ids, not folded. Read-side compares
+/// (`binary_scan`) normalize the query's tag, so a root written before tag
+/// normalization would otherwise fail every tagged match against its own data.
+fn normalize_root_lang_tags(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .map(|t| fluree_db_core::normalize_lang_tag(t).into_owned())
+        .collect()
+}
+
 impl BinaryIndexStore {
     /// Decode FIR6 bytes and load the store.
     pub async fn load_from_root_bytes(
@@ -383,7 +395,7 @@ impl BinaryIndexStore {
             remote_leaf_open_counts: RwLock::new(HashMap::new()),
             max_t: root.index_t,
             base_t: root.base_t,
-            language_tags: root.language_tags.clone(),
+            language_tags: normalize_root_lang_tags(&root.language_tags),
             lex_sorted_string_ids: root.lex_sorted_string_ids,
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
@@ -3030,6 +3042,28 @@ pub(crate) mod tests {
             self.range_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.get_range(id, range).await
         }
+    }
+
+    /// A root written before tag normalization holds tags as authored. The
+    /// read-side compares in `binary_scan` normalize the query's tag, so the
+    /// store's copy has to be normalized too or every tagged match against
+    /// that ledger's own data fails. Positions are the `lang_id` mapping and
+    /// must survive untouched — case variants stay distinct ids.
+    #[test]
+    fn root_lang_tags_are_normalized_positionally() {
+        let tags = vec![
+            "en-US".to_string(),
+            "fr-CA".to_string(),
+            "de".to_string(),
+            "en-us".to_string(),
+        ];
+        let got = normalize_root_lang_tags(&tags);
+        assert_eq!(got, vec!["en-us", "fr-ca", "de", "en-us"]);
+        assert_eq!(
+            got.len(),
+            tags.len(),
+            "lang_id indexes this vec; no folding"
+        );
     }
 
     pub(crate) fn temp_cache_dir() -> PathBuf {
