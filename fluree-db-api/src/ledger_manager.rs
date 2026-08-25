@@ -451,6 +451,7 @@ impl LedgerHandle {
             has_annotations: root.has_annotations,
             annotation_index: root.annotation_index.clone(),
             had_annotation_arena: root.had_annotation_arena,
+            has_list_meta: root.has_list_meta,
         };
         let db = LedgerSnapshot::new_meta(meta)
             .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;

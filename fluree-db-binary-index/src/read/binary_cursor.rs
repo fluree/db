@@ -191,8 +191,11 @@ impl BinaryCursor {
     /// key range: ops outside the window cost an O(overlay) merge walk per
     /// cursor and defeat leaflet pre-skips.
     pub fn set_overlay_ops_window(&mut self, ops: Arc<[OverlayOp]>, start: usize, end: usize) {
+        debug_assert!(start <= end && end <= ops.len());
         debug_assert!(
-            ops.windows(2).all(|w| w[0].fact_key() != w[1].fact_key()),
+            ops[start..end]
+                .windows(2)
+                .all(|w| w[0].fact_key() != w[1].fact_key()),
             "overlay ops contain duplicate fact keys — caller must resolve \
              assert/retract lifecycles via resolve_overlay_ops() before set_overlay_ops()"
         );
@@ -216,7 +219,6 @@ impl BinaryCursor {
              in the cursor projection; got {:?}",
             self.projection
         );
-        debug_assert!(start <= end && end <= ops.len());
         self.overlay_ops = ops;
         self.overlay_pos = start;
         self.overlay_end = end;
@@ -708,7 +710,7 @@ impl BinaryCursor {
         let mut out_o_i: Vec<u32> = Vec::new();
         let mut out_t: Vec<u32> = Vec::new();
 
-        while self.overlay_pos < self.overlay_ops.len() {
+        while self.overlay_pos < self.overlay_end {
             let ov = &self.overlay_ops[self.overlay_pos];
             self.overlay_pos += 1;
 
@@ -1066,6 +1068,55 @@ mod tests {
 
         let (start, end) = compute_overlay_window(&ops, &leaf_key, None, RunSortOrder::Spot, true);
         assert_eq!((start, end), (0, 0));
+    }
+
+    /// `emit_overlay_only` must stop at `overlay_end`, not at
+    /// `overlay_ops.len()`: the window is the cursor's share of an `Arc`
+    /// slice held in common with every other cursor over the same overlay.
+    /// Today's callers all narrow via `overlay_window_for_range`, whose
+    /// out-of-window ops are filtered anyway, so the tail was cost rather
+    /// than wrong rows — O(overlay) per novelty-only point lookup. Nothing
+    /// below the api tests pins the window itself.
+    #[test]
+    fn overlay_only_emits_exactly_the_window() {
+        use crate::format::branch::BranchManifest;
+        use crate::read::binary_index_store::tests::{empty_store, temp_cache_dir};
+        use crate::read::column_types::{BinaryFilter, ColumnProjection};
+        use fluree_db_core::{ContentStore, MemoryContentStore};
+
+        let cs: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let store = Arc::new(empty_store(cs, temp_cache_dir()));
+        // No leaves: `next_batch` goes straight to the overlay-only path.
+        let branch = Arc::new(BranchManifest { leaves: Vec::new() });
+        let ops: Arc<[OverlayOp]> = vec![
+            make_op(1, 1),
+            make_op(2, 1),
+            make_op(3, 1),
+            make_op(4, 1),
+            make_op(5, 1),
+        ]
+        .into();
+
+        let mut cursor = BinaryCursor::scan_all(
+            store,
+            RunSortOrder::Spot,
+            branch,
+            BinaryFilter::default(),
+            ColumnProjection::all(),
+        );
+        cursor.set_overlay_ops_window(Arc::clone(&ops), 1, 3);
+
+        let batch = cursor.next_batch().unwrap().expect("overlay-only batch");
+        assert_eq!(batch.row_count, 2, "window is [1, 3), not the whole slice");
+        let ColumnData::Block(s_ids) = &batch.s_id else {
+            panic!("expected materialized s_id block");
+        };
+        assert_eq!(
+            &s_ids[..],
+            &[2, 3],
+            "the window's ops, not a prefix of the slice"
+        );
+        assert!(cursor.next_batch().unwrap().is_none(), "cursor exhausted");
     }
 
     /// An OPST batch in sort order (o_type, o_key, ...): a filter binding
