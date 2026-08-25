@@ -369,3 +369,190 @@ async fn language_tagged_list_entries_hydrate_by_tag() {
         })
         .await;
 }
+
+/// The `!ledger.novelty.has_list_meta` half of the skip guard.
+///
+/// An indexed root that observed no list rows (`Some(false)`) can still have
+/// a `@list` arrive in novelty afterwards. Only the novelty bit distinguishes
+/// that from a genuinely list-free ledger, so dropping it from the guard
+/// skips hydration and the positional entry silently survives its retraction.
+/// The reload leg pins the other half: novelty replayed from the commit chain
+/// must carry the bit forward, or the guard is wrong again after a restart.
+#[tokio::test]
+async fn novelty_list_over_indexed_no_list_root_still_hydrates() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(dir.clone()).build().unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/list-meta-novelty-only:main";
+            let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+
+            // Base carries `ex:items` as PLAIN values only — no `@list`
+            // anywhere, so the full build records `Some(false)`.
+            let graph: Vec<_> = (0..50)
+                .map(|n| json!({"@id": format!("ex:b{n}"), "ex:items": "b", "ex:name": format!("b{n}")}))
+                .collect();
+            let r = fluree
+                .insert_with_opts(ledger, &json!({"@context": ctx(), "@graph": graph}), TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            assert!(!fluree.ledger(ledger_id).await.unwrap().novelty.has_list_meta);
+            trigger_index_and_wait_outcome(&handle, ledger_id, r.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert!(ledger.snapshot.range_provider.is_some());
+            assert_eq!(ledger.snapshot.has_list_meta, Some(false), "full build observed no list rows");
+
+            // Now a `@list` lands in novelty. Root still says `Some(false)`:
+            // the novelty bit is the only thing keeping hydration alive.
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:nov1", "ex:items": {"@list": ["a", "b", "c"]}}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(ledger.snapshot.has_list_meta, Some(false), "root unchanged");
+            assert!(ledger.novelty.has_list_meta, "novelty saw the list position");
+            assert_eq!(list_values(&fluree, &ledger, "ex:nov1").await, vec!["a", "b", "c"]);
+
+            let del = json!({
+                "@context": ctx(),
+                "where": [{"@id": "?s", "ex:items": "b"}],
+                "delete": [{"@id": "?s", "ex:items": "b"}]
+            });
+            let r = fluree
+                .update_with_opts(ledger, &del, TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 51, "50 plain base rows + the list entry");
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_values(&fluree, &ledger, "ex:nov1").await,
+                vec!["a", "c"],
+                "novelty list entry retracted at its hydrated position"
+            );
+            assert_eq!(count(&fluree, &ledger, "ex:items").await, 2, "only ex:nov1's a and c remain");
+            assert_eq!(count(&fluree, &ledger, "ex:name").await, 50, "base subjects survive");
+
+            // Reload: novelty is replayed from the commit chain on top of the
+            // same `Some(false)` root, and must carry the bit — otherwise the
+            // guard skips hydration for every write after a restart.
+            drop(fluree);
+            let reloaded = FlureeBuilder::file(dir).build().unwrap();
+            let ledger = reloaded.ledger(ledger_id).await.unwrap();
+            assert_eq!(ledger.snapshot.has_list_meta, Some(false));
+            assert!(ledger.novelty.has_list_meta, "replayed novelty carries the bit");
+            assert_eq!(list_values(&reloaded, &ledger, "ex:nov1").await, vec!["a", "c"]);
+
+            // And it is load-bearing on the reloaded handle, not just present.
+            let del_c = json!({
+                "@context": ctx(),
+                "where": [{"@id": "?s", "ex:items": "c"}],
+                "delete": [{"@id": "?s", "ex:items": "c"}]
+            });
+            let r = reloaded
+                .update_with_opts(ledger, &del_c, TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 1);
+            let ledger = reloaded.ledger(ledger_id).await.unwrap();
+            assert_eq!(list_values(&reloaded, &ledger, "ex:nov1").await, vec!["a"]);
+        })
+        .await;
+}
+
+/// A retracted base list row must not out-vote the live novelty one.
+///
+/// Hydration copies the FIRST list-carrying meta indexed per object value,
+/// and the base seek's rows land before the overlay's. Delete `"b"` from an
+/// indexed `["b"]`, re-assert as `["x", "b"]`, then delete `"b"` again: the
+/// stale base candidate is `b@0` and the live one is `b@1`, so without
+/// `resolve_current_flakes` dropping the retracted key the retraction is
+/// hydrated to position 0 and the real entry survives.
+#[tokio::test]
+async fn stale_base_list_candidate_resolves_before_hydration() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/list-meta-stale:main";
+            let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+
+            // Base: "b" at position 0, indexed.
+            let r = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:stale", "ex:items": {"@list": ["b"]}}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            trigger_index_and_wait_outcome(&handle, ledger_id, r.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(ledger.snapshot.has_list_meta, Some(true));
+            assert_eq!(list_values(&fluree, &ledger, "ex:stale").await, vec!["b"]);
+
+            let del_b = json!({
+                "@context": ctx(),
+                "where": [{"@id": "ex:stale", "ex:items": "b"}],
+                "delete": [{"@id": "ex:stale", "ex:items": "b"}]
+            });
+            let _ = fluree
+                .update_with_opts(ledger, &del_b, TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(list_values(&fluree, &ledger, "ex:stale").await, Vec::<String>::new());
+
+            // Re-assert with "b" moved to position 1. The base's `b@0` is now
+            // a retracted key that still sorts ahead of the live `b@1`.
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:stale", "ex:items": {"@list": ["x", "b"]}}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(list_values(&fluree, &ledger, "ex:stale").await, vec!["x", "b"]);
+
+            let r = fluree
+                .update_with_opts(ledger, &del_b, TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 1);
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_values(&fluree, &ledger, "ex:stale").await,
+                vec!["x"],
+                "hydrated from the live b@1, not the retracted base b@0"
+            );
+        })
+        .await;
+}
