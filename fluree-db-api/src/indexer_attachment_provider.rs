@@ -33,10 +33,14 @@
 
 use std::sync::{Arc, OnceLock};
 
+#[cfg(not(target_arch = "wasm32"))]
 use async_trait::async_trait;
+#[cfg(not(target_arch = "wasm32"))]
 use fluree_db_indexer::{AttachmentEventCoverage, AttachmentEventsProvider};
 
-use crate::ledger_manager::{LedgerManager, RunningCoverage};
+use crate::ledger_manager::LedgerManager;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::ledger_manager::RunningCoverage;
 
 /// Shared late-binding cell for the api's running `LedgerManager`.
 pub(crate) type LedgerManagerCell = Arc<OnceLock<Arc<LedgerManager>>>;
@@ -45,10 +49,12 @@ pub(crate) type LedgerManagerCell = Arc<OnceLock<Arc<LedgerManager>>>;
 /// snapshotted attachment overlay for the requested ledger and
 /// returns its event-pair view, suitable for direct use as
 /// `IndexerConfig.attachment_events`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ApiAttachmentEventsProvider {
     pub(crate) manager: LedgerManagerCell,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for ApiAttachmentEventsProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiAttachmentEventsProvider").finish()
@@ -60,10 +66,12 @@ impl std::fmt::Debug for ApiAttachmentEventsProvider {
 /// reads from, so the background indexer can warm-on-write into that exact
 /// cache. Yields `None` until the manager cell is filled (and always for a
 /// separate-machine indexer, which has no local manager).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct LedgerManagerWarmCache {
     pub(crate) manager: LedgerManagerCell,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for LedgerManagerWarmCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LedgerManagerWarmCache")
@@ -72,12 +80,14 @@ impl std::fmt::Debug for LedgerManagerWarmCache {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl fluree_db_indexer::WarmCacheSource for LedgerManagerWarmCache {
     fn warm_cache(&self) -> Option<Arc<fluree_db_binary_index::LeafletCache>> {
         self.manager.get().and_then(|m| m.leaflet_cache().cloned())
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
     async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {

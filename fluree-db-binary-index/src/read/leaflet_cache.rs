@@ -25,6 +25,8 @@
 //! - `DictLeaf`: keyed by `xxh3_128(cas_address)`. Content-addressed and
 //!   immutable — no epoch/time dimension needed.
 
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_compat::memmap2;
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::read::types::OverlayOp;
 use fluree_db_core::subject_id::SubjectIdColumn;
@@ -427,11 +429,18 @@ impl std::fmt::Debug for LeafletCache {
 /// Callers MUST peek the cache first (non-blocking `get`) and only enter this
 /// region on a miss, so plain cache hits never pay the conversion cost (every
 /// scan flows through these methods).
+#[cfg(not(target_arch = "wasm32"))]
 fn in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
         _ => f(),
     }
+}
+
+/// wasm32 is single-threaded: there is no worker to convert, run inline.
+#[cfg(target_arch = "wasm32")]
+fn in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 macro_rules! region_cache_methods {

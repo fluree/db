@@ -4,6 +4,8 @@
 //! - `o_type` table for decode dispatch
 //! - `ColumnBatch` output
 
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_compat::memmap2;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
@@ -80,6 +82,7 @@ pub(crate) fn cas_sync_timeout() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn shared_cas_helper_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
     static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 
@@ -95,6 +98,7 @@ fn shared_cas_helper_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
     .map_err(|e| io::Error::other(e.clone()))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_on_shared_cas_helper_thread<T, Fut>(fut: Fut) -> io::Result<T>
 where
     T: Send + 'static,
@@ -131,6 +135,7 @@ where
 /// re-injects the fetch onto the outer runtime with no `block_in_place`; on a
 /// small (e.g. 2-worker) runtime every worker can then park in `recv` with no
 /// thread left to drive the reactor, so the fetch never completes — a hard wedge.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn run_sync_on_runtime<T, Fut>(fut: Fut) -> io::Result<T>
 where
     T: Send + 'static,
@@ -166,6 +171,21 @@ where
     }
 }
 
+/// wasm32: no threads and no `block_on` — a sync-context CAS fetch cannot be
+/// bridged. Reads must be served from already-resident bytes (cache hit); the
+/// async load path must fetch-and-cache before sync access. SEAM(wasm).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn run_sync_on_runtime<T, Fut>(fut: Fut) -> io::Result<T>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = io::Result<T>> + Send + 'static,
+{
+    let _ = fut;
+    Err(io::Error::other(
+        "sync CAS fetch bridge unavailable on wasm32; bytes must be pre-cached",
+    ))
+}
+
 // ============================================================================
 // Per-graph V3 index data
 // ============================================================================
@@ -174,7 +194,7 @@ struct GraphIndex {
     orders: HashMap<RunSortOrder, Arc<BranchManifest>>,
     numbig: HashMap<u32, crate::arena::numbig::NumBigArena>,
     vectors: HashMap<u32, crate::arena::vector::LazyVectorArena>,
-    spatial: HashMap<u32, Arc<dyn fluree_db_spatial::SpatialIndexProvider>>,
+    spatial: HashMap<u32, Arc<dyn crate::wasm_compat::SpatialIndexProvider>>,
     /// Fulltext arenas keyed by `(p_id, lang_id)` — one arena per language
     /// on each property. `@fulltext`-datatype and configured-English content
     /// both resolve to the dict-assigned id for `"en"` and share a bucket.
@@ -1956,7 +1976,7 @@ impl BinaryIndexStore {
     /// Spatial provider map for query context configuration.
     pub fn spatial_provider_map(
         &self,
-    ) -> HashMap<String, Arc<dyn fluree_db_spatial::SpatialIndexProvider>> {
+    ) -> HashMap<String, Arc<dyn crate::wasm_compat::SpatialIndexProvider>> {
         let mut map = HashMap::new();
         for (g_id, gi) in &self.graph_indexes {
             for (p_id, provider) in &gi.spatial {
@@ -2754,7 +2774,7 @@ async fn build_dictionary_set(
 struct LoadedArenas {
     numbig: HashMap<u32, crate::arena::numbig::NumBigArena>,
     vectors: HashMap<u32, crate::arena::vector::LazyVectorArena>,
-    spatial: HashMap<u32, Arc<dyn fluree_db_spatial::SpatialIndexProvider>>,
+    spatial: HashMap<u32, Arc<dyn crate::wasm_compat::SpatialIndexProvider>>,
     /// Keyed by `(p_id, lang_id)` — one bucket per language on each property.
     fulltext: HashMap<(u32, u16), Arc<crate::arena::fulltext::FulltextArena>>,
 }
@@ -2819,7 +2839,11 @@ async fn load_per_graph_arenas(
         }
 
         // Spatial and fulltext arenas.
+        #[allow(unused_mut)]
         let mut spatial = HashMap::new();
+        // Spatial search is unsupported on wasm32 (s2 geometry stack is
+        // native-only); the provider map stays empty. SEAM(wasm).
+        #[cfg(not(target_arch = "wasm32"))]
         for sp_ref in &ga.spatial {
             let root_bytes =
                 fetch_cached_bytes(cs.as_ref(), &sp_ref.root_cid, cache_dir, "spr").await?;
@@ -2851,7 +2875,7 @@ async fn load_per_graph_arenas(
                         format!("spatial snapshot load: {e}"),
                     )
                 })?;
-            let provider: Arc<dyn fluree_db_spatial::SpatialIndexProvider> =
+            let provider: Arc<dyn crate::wasm_compat::SpatialIndexProvider> =
                 Arc::new(fluree_db_spatial::EmbeddedSpatialProvider::new(snapshot));
             spatial.insert(sp_ref.p_id, provider);
         }

@@ -241,6 +241,7 @@ impl FlureeDir {
     /// `dirs::config_local_dir()/fluree` and data goes to
     /// `dirs::data_local_dir()/fluree` (XDG-split on Linux; unified on
     /// macOS and Windows where both resolve to the same directory).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn global() -> Option<Self> {
         if let Ok(p) = std::env::var("FLUREE_HOME") {
             return Some(Self::unified(PathBuf::from(p)));
@@ -248,6 +249,12 @@ impl FlureeDir {
         let config = dirs::config_local_dir().map(|d| d.join("fluree"))?;
         let data = dirs::data_local_dir().map(|d| d.join("fluree"))?;
         Some(Self::split(config, data))
+    }
+
+    /// wasm32: no home directory or platform config dirs.
+    #[cfg(target_arch = "wasm32")]
+    pub fn global() -> Option<Self> {
+        None
     }
 }
 

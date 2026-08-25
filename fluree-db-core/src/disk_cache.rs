@@ -205,6 +205,10 @@ impl DiskArtifactCache {
             };
         }
 
+        // No filesystem on wasm32: budget 0 disables cache writes, reads miss.
+        #[cfg(target_arch = "wasm32")]
+        let available: u64 = 0;
+        #[cfg(not(target_arch = "wasm32"))]
         let available = fs2::available_space(&root).unwrap_or_else(|err| {
             tracing::warn!(
                 cache_dir = %root.display(),

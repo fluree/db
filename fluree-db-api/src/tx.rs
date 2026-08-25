@@ -15,7 +15,7 @@ use fluree_db_core::{
     range_with_overlay, ContentId, ContentKind, FlakeValue, GraphId, IndexType, RangeMatch,
     RangeOptions, RangeTest, Sid,
 };
-use fluree_db_indexer::IndexerHandle;
+use crate::wasm_compat::IndexerHandle;
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_novelty::TxnMetaEntry;
 #[cfg(feature = "shacl")]

@@ -33,6 +33,7 @@
 //! let db = GraphDb::from_ledger_state(&ledger);
 //! ```
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod admin;
 pub mod block_fetch;
 pub mod bm25_worker;
@@ -61,15 +62,19 @@ pub mod graph_query_builder;
 pub mod graph_snapshot;
 pub mod graph_source;
 pub mod graph_transact_builder;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod import;
 pub mod import_source;
 mod indexer_attachment_provider;
+#[cfg(not(target_arch = "wasm32"))]
 mod indexer_fulltext_provider;
+pub mod wasm_compat;
 mod inline_ontology;
 #[cfg(feature = "shacl")]
 mod inline_shapes;
 mod ledger;
 pub mod ledger_info;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod materialize;
 #[cfg(feature = "iceberg")]
 pub mod materialize_worker;
@@ -101,6 +106,7 @@ pub mod vector_worker;
 pub mod vended_credentials;
 pub mod verify;
 pub mod view;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod wire;
 
 // Ledger caching and management
@@ -110,6 +116,7 @@ pub mod ledger_view;
 // Search service integration (embedded adapter, remote client)
 pub mod search;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use admin::{
     BranchDropReport,
     DropMode,
@@ -157,6 +164,7 @@ pub use graph_source::{
     FlureeIndexProvider, SnapshotSelection,
 };
 pub use graph_transact_builder::{GraphTransactBuilder, StagedGraph};
+#[cfg(not(target_arch = "wasm32"))]
 pub use import::{
     is_bulk_import_file, scan_directory_format, CreateBuilder, DirectoryFormat,
     EffectiveImportSettings, ImportBuilder, ImportConfig, ImportError, ImportPhase, ImportResult,
@@ -261,11 +269,14 @@ pub use graph_source::{
 pub use search::EmbeddedBm25SearchProvider;
 
 // Re-export indexer types for background indexing setup
+#[cfg(not(target_arch = "wasm32"))]
 pub use fluree_db_indexer::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
     IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation, IndexStatusSnapshot,
     IndexerConfig, IndexerHandle, SweepPlan, SweepResult,
 };
+#[cfg(target_arch = "wasm32")]
+pub use wasm_compat::{IndexerConfig, IndexerHandle};
 
 // Re-export commonly used types from child crates
 pub use fluree_db_connection::{ConnectionConfig, StorageType};
@@ -1217,8 +1228,8 @@ fn is_indexing_enabled(config: &ConnectionConfig) -> bool {
 }
 
 /// Build IndexerConfig from connection defaults, falling back to defaults.
-fn build_indexer_config(config: &ConnectionConfig) -> fluree_db_indexer::IndexerConfig {
-    let mut indexer_config = fluree_db_indexer::IndexerConfig::default();
+fn build_indexer_config(config: &ConnectionConfig) -> wasm_compat::IndexerConfig {
+    let mut indexer_config = wasm_compat::IndexerConfig::default();
 
     // Apply gc_max_old_indexes from config if present
     if let Some(max_old) = config
@@ -2754,6 +2765,7 @@ impl FlureeBuilder {
     /// Spawn the background indexer worker if configured.
     ///
     /// Must be called within a tokio runtime context.
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_background_indexing<N>(
         &self,
         backend: &StorageBackend,
@@ -2777,10 +2789,26 @@ impl FlureeBuilder {
         Arc::new(std::sync::OnceLock::new())
     }
 
+    /// wasm32: background indexing has no meaning in a browser peer — run in
+    /// the existing "external indexer" mode (`IndexingMode::Disabled`).
+    #[cfg(target_arch = "wasm32")]
+    fn start_background_indexing<N>(
+        &self,
+        _backend: &StorageBackend,
+        _nameservice: &N,
+        _cell: &indexer_attachment_provider::LedgerManagerCell,
+    ) -> tx::IndexingMode
+    where
+        N: NameServiceLookup + BranchLifecycle + fluree_db_nameservice::Publisher + Clone + 'static,
+    {
+        tx::IndexingMode::Disabled
+    }
+
     /// Spawn the background indexer with an already-`Arc`'d nameservice.
     ///
     /// Used by AWS paths where the nameservice is already type-erased behind
     /// an `Arc<dyn ReadWriteNameService>`.
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_background_indexing_dyn(
         &self,
         backend: &StorageBackend,
@@ -3566,6 +3594,7 @@ impl Fluree {
     /// already attaches one of these automatically; external callers
     /// invoking `fluree_db_indexer::build_index_for_ledger` directly should
     /// attach their own by calling this method.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn fulltext_config_provider(&self) -> Arc<dyn fluree_db_indexer::FulltextConfigProvider> {
         Arc::new(
             crate::indexer_fulltext_provider::ApiFulltextConfigProvider {
@@ -3595,6 +3624,7 @@ impl Fluree {
     /// callers invoking `fluree_db_indexer::build_index_for_ledger`
     /// directly (e.g. the CLI's `index` command) need to attach
     /// theirs by calling this method.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn attachment_events_provider(
         &self,
     ) -> Option<Arc<dyn fluree_db_indexer::AttachmentEventsProvider>> {
@@ -3688,6 +3718,7 @@ impl Fluree {
     /// let view = fluree.db("mydb").await?;
     /// let qr = fluree.query(&view, "SELECT * WHERE { ?s ?p ?o } LIMIT 10").await?;
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create(&self, ledger_id: &str) -> import::CreateBuilder<'_> {
         import::CreateBuilder::new(self, ledger_id.to_string())
     }

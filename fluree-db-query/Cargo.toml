@@ -17,8 +17,6 @@ fluree-search-protocol = { path = "../fluree-search-protocol" }
 fluree-vocab = { path = "../fluree-vocab" }
 fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
-fluree-db-spatial = { path = "../fluree-db-spatial" }
-memmap2 = "0.9"
 futures = { workspace = true }
 async-trait = { workspace = true }
 rayon = { workspace = true }
@@ -58,8 +56,6 @@ xxhash-rust = "0.8"
 percent-encoding = "2"
 # HashSet raw entry API for DISTINCT (avoid per-row allocations)
 hashbrown = { workspace = true }
-# Async runtime - needed for block_in_place in policy evaluation
-tokio = { workspace = true }
 # GeoRust ecosystem for WKT parsing and geometry types (S2 search)
 geo = "0.29"
 geo-types = "0.7"
@@ -82,6 +78,7 @@ vector = ["dep:usearch"]
 cancel-checks-off = []
 
 [dev-dependencies]
+tokio = { workspace = true }
 fluree-db-indexer = { path = "../fluree-db-indexer" }
 # tokio is now a regular dependency
 criterion = "0.5"
@@ -93,3 +90,13 @@ harness = false
 
 [lints]
 workspace = true
+
+# Real spatial provider (s2 geometry stack) is native-only; wasm32 uses the
+# stub trait re-exported through fluree-db-binary-index::wasm_compat.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# rand/uuid need a JS randomness source on wasm32-unknown-unknown
+getrandom = { version = "0.2", features = ["js"] }
+uuid = { version = "1", features = ["js"] }

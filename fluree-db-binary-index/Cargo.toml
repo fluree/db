@@ -7,8 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fluree-db-core = { path = "../fluree-db-core", features = ["native"] }
-fluree-db-spatial = { path = "../fluree-db-spatial" }
+fluree-db-core = { path = "../fluree-db-core" }
 fluree-vocab = { path = "../fluree-vocab" }
 
 # Core dependencies
@@ -16,17 +15,14 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio.workspace = true
 
 # Index format dependencies
 zstd.workspace = true
-memmap2 = "0.9"
 rustc-hash = "2"
 ciborium = "0.2"
 
 # Cache
 moka.workspace = true
-fs2 = "0.4"
 
 # Concurrency
 once_cell.workspace = true
@@ -58,3 +54,16 @@ fluree-db-novelty = { path = "../fluree-db-novelty" }
 
 [lints]
 workspace = true
+
+# Native: full tokio + mmap + real spatial provider; core's filesystem backends.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fluree-db-core = { path = "../fluree-db-core", features = ["native"] }
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+tokio = { workspace = true }
+memmap2 = "0.9"
+
+# wasm32: single-threaded, no mmap/threads; tokio limited to wasm-supported features.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time"] }
+# moka's uuid needs a JS randomness source on wasm32-unknown-unknown
+uuid = { version = "1", default-features = false, features = ["js"] }

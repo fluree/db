@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 default = ["native"]
-native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "dep:sysinfo"]
+native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "fluree-db-connection/native", "dep:sysinfo"]
 # Enable AWS-backed storage support (S3, storage-backed nameservice,
 # vended-credential minting).
 aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts"]
@@ -46,18 +46,15 @@ fluree-db-core = { path = "../fluree-db-core" }
 parking_lot = "0.12"
 lru = { workspace = true }
 fluree-db-crypto = { path = "../fluree-db-crypto", features = ["nameservice"] }
-fluree-db-connection = { path = "../fluree-db-connection" }
+fluree-db-connection = { path = "../fluree-db-connection", default-features = false }
 fluree-db-policy = { path = "../fluree-db-policy" }
 fluree-db-query = { path = "../fluree-db-query" }
 fluree-db-ledger = { path = "../fluree-db-ledger" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
-fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
-fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-db-cypher = { path = "../fluree-db-cypher" }
-fluree-db-spatial = { path = "../fluree-db-spatial" }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
 fluree-db-tabular = { path = "../fluree-db-tabular" }
@@ -86,7 +83,6 @@ serde.workspace = true
 serde_json.workspace = true
 # SHA-256 of the R2RML mapping for the materialize twin's completion stamp.
 sha2.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 # Used for fast xxh3_128 hashing in streaming dictionary merge.
 xxhash-rust.workspace = true
@@ -112,7 +108,6 @@ aws-sdk-sts = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 
 # Platform directory resolution (XDG on Linux, Application Support on macOS)
-dirs = "5"
 
 # System memory detection for import memory budget auto-sizing (native only)
 sysinfo = { workspace = true, optional = true }
@@ -521,3 +516,15 @@ required-features = ["native"]
 name = "it_fast_stats_1391_regression"
 path = "tests/it_fast_stats_1391_regression.rs"
 required-features = ["native"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
+fluree-db-indexer = { path = "../fluree-db-indexer" }
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+tokio = { workspace = true }
+# Platform directory resolution (XDG on Linux, Application Support on macOS)
+dirs = "5"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+fluree-db-transact = { path = "../fluree-db-transact" }
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "io-util"] }
