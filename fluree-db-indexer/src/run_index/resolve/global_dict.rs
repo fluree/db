@@ -995,7 +995,17 @@ impl LanguageTagDict {
     /// Reconstruct from an ordered list of tags (e.g., from `IndexRoot`).
     ///
     /// Tag at index `i` gets ID `i + 1` (base_id=1; 0 = "no tag").
+    ///
+    /// Tags are normalized on the way in. `get_or_insert` normalizes, so a
+    /// verbatim seed from a pre-normalization root would miss on an
+    /// already-present tag and append a second id for the same language —
+    /// splitting `en-US` from `en-us` in the rebuilt root and shifting every
+    /// later `lang_id` when the store dedups them at load.
     pub fn from_ordered_tags(tags: Vec<std::sync::Arc<str>>) -> Self {
+        let tags: Vec<std::sync::Arc<str>> = tags
+            .iter()
+            .map(|t| std::sync::Arc::from(&*fluree_db_core::normalize_lang_tag(t)))
+            .collect();
         Self {
             inner: VecBiDict::from_ordered_vec(1, tags),
         }
@@ -1299,6 +1309,25 @@ impl GlobalDicts {
 
 #[cfg(test)]
 mod tests {
+
+    /// Seeding from a pre-normalization root must not split a tag. The
+    /// resolver seeds from `IndexRoot.language_tags` and then `get_or_insert`s
+    /// the (normalized) tag coming off novelty; a verbatim seed makes that an
+    /// exact miss, so the rebuilt root would carry both `en-US` and `en-us`
+    /// and every later `lang_id` shifts when the store dedups them at load.
+    #[test]
+    fn ordered_seed_normalizes_so_reindex_does_not_split_a_tag() {
+        let mut d = super::LanguageTagDict::from_ordered_tags(vec!["en-US".into(), "fr".into()]);
+        assert_eq!(d.resolve(1), Some("en-us"), "seed stored normalized");
+        assert_eq!(
+            d.get_or_insert(Some("en-US")),
+            1,
+            "no second id for the same tag"
+        );
+        assert_eq!(d.get_or_insert(Some("en-us")), 1);
+        assert_eq!(d.len(), 2, "still exactly the seeded tags");
+        assert_eq!(d.find_id("fr"), Some(2), "later ids keep their position");
+    }
     use super::*;
     use fluree_db_core::DatatypeDictId;
 

@@ -847,8 +847,12 @@ impl BinaryScanOperator {
                     continue;
                 }
                 if let Some(tag) = dtc.lang_tag() {
+                    // Case-insensitive like the overlay filters: a flake
+                    // replayed from a commit written before tag normalization
+                    // carries the tag as authored (`FlakeMeta.lang` is a plain
+                    // deserialized field), while `tag` is always normalized.
                     let flake_lang = flake.m.as_ref().and_then(|m| m.lang.as_ref());
-                    if flake_lang.map(std::string::String::as_str) != Some(tag) {
+                    if !flake_lang.is_some_and(|l| l.eq_ignore_ascii_case(tag)) {
                         continue;
                     }
                 }
