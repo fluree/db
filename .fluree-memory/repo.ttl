@@ -2455,6 +2455,36 @@ mem:fact-01kta3264pg54aabvt97spk5qt a mem:Fact ;
     mem:createdAt "2026-06-04T19:51:46.070663+00:00"^^xsd:dateTime ;
     mem:rationale "A reviewer flagged \"use resolver fallback instead of sid_to_iri for novelty subjects\" as a major data-loss bug; it is a false positive due to the Sid-vs-integer-ID distinction." .
 
+mem:fact-01m0ghz0w7m3hhpnb8797vqjwj a mem:Fact ;
+    mem:content "Planner bound-subject/bound-object fan-out (`estimate_triple_row_count`, planner.rs) is FRACTIONAL: `max(count/ndv, 1.0)` — no `ceil`. v4.1.6 regression (dblp `optional-join-3-star-2` 2.4x): `ceil` made `rdf:type` at 1.96/subject and `signatureDblpName` at 1.004/subject tie at 2 → seed ranking fell to source order. HLL256 (σ≈6.5%) puts a 1-per-subject predicate's ratio anywhere in ~[0.9,1.1], so `ceil` flipped plans on sketch noise (v4.1.2 had ndv_subjects > flake count for that reason; neither ndv was \"wrong\"). Estimate feeds rank_seed_candidates, HashJoinPlanner driving_est product, and the membership-join gate." ;
+    mem:tag "cardinality" ;
+    mem:tag "hll" ;
+    mem:tag "planner" ;
+    mem:tag "regression" ;
+    mem:tag "reorder" ;
+    mem:tag "star-join" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/planner.rs" ;
+    mem:branch "fix/planner-fanout-and-membership-gate" ;
+    mem:createdAt "2026-08-20T21:41:48.551569+00:00"^^xsd:dateTime ;
+    mem:rationale "Prevents re-adding integer rounding to the estimate and explains why plan flips can follow import stats rather than planner code." .
+
+mem:fact-01m0ghz4x5xpbcvsvh8rsdb88m a mem:Fact ;
+    mem:content "Membership-join lane gate (`membership_join_key_vars`) treats an UNKNOWN driving estimate as large and drains the whole build predicate. `DatasetOperator::estimated_rows()` and `NestedLoopJoinOperator` (maps left's None) return None, so a plain scan chain looked unbounded: BSBM Q10 at 1M (~21 offers of one product, then `?offer publisher ?v` with both vars bound) hashed the full dc:publisher extension — 0.66ms → 9.6ms warm in v4.1.6 (flat at 100M only because the build exceeded the 250k ceiling). Fix: `build_scan_or_join` falls back to `HashJoinPlanner::step_est()` (the EXPLAIN `driving-est`) when the operator has no estimate. Not caused by the GROUP BY star top-k decline commit; Q10 has no GROUP BY." ;
+    mem:tag "bsbm" ;
+    mem:tag "estimated_rows" ;
+    mem:tag "membership-join" ;
+    mem:tag "planner" ;
+    mem:tag "q10" ;
+    mem:tag "regression" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/hash_join.rs" ;
+    mem:artifactRef "fluree-db-query/src/membership_join.rs" ;
+    mem:branch "fix/planner-fanout-and-membership-gate" ;
+    mem:createdAt "2026-08-20T21:41:52.677880+00:00"^^xsd:dateTime ;
+    mem:rationale "Operators lacking estimated_rows silently trip \"unknown = large\" gates; future lanes gated on driving size must use the planner estimate, not operator.estimated_rows()." .
+
 mem:fact-01kwzz0ynexdgwfrw9vvsd7xfe a mem:Fact ;
     mem:content "f:query / f:rule are language-discriminated by RDF datatype: @json or bare string → JSON-LD (legacy); `f:sparql` (https://ns.flur.ee/db#sparql; f:cypher reserved) → SPARQL. PolicyQuery = { source, language: PolicyQueryLanguage (non_exhaustive) }; WirePolicyValue::Query { source, language }. SPARQL policies must be ASK/SELECT (no grouping), evaluated as existence checks; SPARQL rules must be CONSTRUCT...WHERE with BGP + comparison FILTERs only (OPTIONAL/UNION/paths → rule skipped with warning). Build-time parse validation preserves fail-closed deny. Tests: it_policy_sparql.rs (grp_policy), it_datalog_rules_sparql.rs (grp_reasoning)." ;
     mem:tag "datalog" ;

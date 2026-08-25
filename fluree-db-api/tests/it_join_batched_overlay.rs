@@ -233,7 +233,21 @@ async fn probe_helpers_merge_novelty() {
             {"@id": "ex:bob",   "ex:age": 25, "ex:name": "Bob", "ex:city": "Berlin"},
             {"@id": "ex:dave",  "ex:age": 30, "ex:name": "Dave", "ex:city": "Lyon"},
             {"@id": "ex:frank", "ex:age": 40, "ex:name": "Frank", "ex:city": "Oslo"},
-            {"@id": "ex:lonely", "ex:age": 99}
+            {"@id": "ex:lonely", "ex:age": 99},
+            // Age-only filler sharing one value. The EXISTS cases below need
+            // `ex:X ex:knows ?b` to win the seed race against the `?b ex:age N`
+            // check: both estimates are means (knows count/ndv_subjects vs age
+            // count/ndv_values), and with every age distinct the two land within
+            // 0.1 of each other, so the check seeds instead and the exists lane
+            // never runs — a miss only the span assertion catches.
+            {"@id": "ex:pad-0", "ex:age": 50},
+            {"@id": "ex:pad-1", "ex:age": 50},
+            {"@id": "ex:pad-2", "ex:age": 50},
+            {"@id": "ex:pad-3", "ex:age": 50},
+            {"@id": "ex:pad-4", "ex:age": 50},
+            {"@id": "ex:pad-5", "ex:age": 50},
+            {"@id": "ex:pad-6", "ex:age": 50},
+            {"@id": "ex:pad-7", "ex:age": 50}
         ]
     });
     let receipt = fluree.insert(ledger, &base).await.expect("base insert");
