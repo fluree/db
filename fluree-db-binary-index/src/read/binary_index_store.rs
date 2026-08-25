@@ -2942,7 +2942,7 @@ impl super::leaf_access::RangeReadFetcher for ContentStoreRangeFetcher {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use async_trait::async_trait;
     use fluree_db_core::content_kind::ContentKind;
@@ -3018,7 +3018,7 @@ mod tests {
         }
     }
 
-    fn temp_cache_dir() -> PathBuf {
+    pub(crate) fn temp_cache_dir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let suffix = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -3030,7 +3030,10 @@ mod tests {
         path
     }
 
-    fn empty_store(cs: Arc<dyn ContentStore>, cache_dir: PathBuf) -> BinaryIndexStore {
+    /// Field-complete store with no graphs, dicts, or leaves. Shared with
+    /// `binary_cursor`'s tests, which need an `Arc<BinaryIndexStore>` to build
+    /// a cursor but never read through it.
+    pub(crate) fn empty_store(cs: Arc<dyn ContentStore>, cache_dir: PathBuf) -> BinaryIndexStore {
         BinaryIndexStore {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             dicts: DictionarySet {

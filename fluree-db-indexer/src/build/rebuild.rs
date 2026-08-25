@@ -1127,6 +1127,7 @@ where
                 total_commit_size,
                 total_asserts,
                 total_retracts,
+                saw_list_meta: shared.saw_list_meta,
                 db_stats: Some(db_stats),
                 db_schema,
                 sketch_ref,

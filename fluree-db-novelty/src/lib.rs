@@ -496,6 +496,11 @@ pub struct Novelty {
     /// enforcement reuse the previously compiled shapes when nothing
     /// shape-affecting changed.
     pub shacl_epoch: u64,
+    /// Sticky: some flake in this overlay carried an RDF-list position
+    /// (`m.i`). Lets filtered-DELETE staging skip list-meta hydration when
+    /// both the index root and novelty report no list rows. Never cleared —
+    /// a trimmed overlay keeps the bit; the indexed root takes over.
+    pub has_list_meta: bool,
 
     /// Highest `commit_t` at which the ledger config graph (`CONFIG_GRAPH_ID`)
     /// received a write. Monotonic within a novelty window; resets to 0 when
@@ -522,6 +527,11 @@ pub struct Novelty {
 /// `0` uniquely means "empty since construction".
 static NEXT_CONTENT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+#[inline]
+fn flake_has_list_meta(flake: &Flake) -> bool {
+    flake.m.as_ref().is_some_and(|m| m.i.is_some())
+}
+
 impl Novelty {
     /// Create a new empty novelty overlay
     pub fn new(t: i64) -> Self {
@@ -534,6 +544,7 @@ impl Novelty {
             content_version: 0,
             schema_epoch: 0,
             shacl_epoch: 0,
+            has_list_meta: false,
             config_write_t: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
@@ -884,6 +895,7 @@ impl Novelty {
             // SHACL-vocabulary flake invalidates the compiled-shapes cache.
             schema_touched |= fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p);
             shacl_touched |= fluree_db_core::namespaces::is_shacl_affecting_flake(&flake);
+            self.has_list_meta |= flake_has_list_meta(&flake);
             per_graph.entry(g_id).or_default().push(flake);
         }
         if schema_touched {
@@ -984,6 +996,7 @@ impl Novelty {
                 if fluree_db_core::namespaces::is_shacl_affecting_flake(&flake) {
                     self.shacl_epoch += 1;
                 }
+                self.has_list_meta |= flake_has_list_meta(&flake);
                 per_graph.entry(g_id).or_default().push(flake);
             }
         }
