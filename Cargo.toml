@@ -45,6 +45,7 @@ members = [
     "fluree-bench-alloc",
     "fluree-bench-virtual",
     "fluree-db-consensus",
+    "fluree-raft-core",
 ]
 exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load"]
 
