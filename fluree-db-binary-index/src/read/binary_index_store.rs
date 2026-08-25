@@ -1515,16 +1515,24 @@ impl BinaryIndexStore {
     pub fn resolve_lang_tag(&self, o_type: u16) -> Option<&str> {
         let ot = OType::from_u16(o_type);
         if ot.is_lang_string() {
-            let lang_id = ot.lang_id()? as usize;
-            if lang_id == 0 {
-                return None; // lang_id=0 means "no tag"
-            }
-            self.language_tags
-                .get(lang_id - 1)
-                .map(std::string::String::as_str)
+            self.lang_tag_for_id(ot.lang_id()?)
         } else {
             None
         }
+    }
+
+    /// Borrowed tag for a 1-based `lang_id` (`None` for the 0 sentinel).
+    ///
+    /// Same source as [`Self::resolve_lang_tag`], reachable without first
+    /// resolving an `OType` — callers holding the encoded triple would
+    /// otherwise build an `OTypeRegistry` per row just to get here.
+    pub fn lang_tag_for_id(&self, lang_id: u16) -> Option<&str> {
+        if lang_id == 0 {
+            return None;
+        }
+        self.language_tags
+            .get(lang_id as usize - 1)
+            .map(std::string::String::as_str)
     }
 
     /// Resolve o_type to a datatype Sid (for materializing datatype IRIs in output).
