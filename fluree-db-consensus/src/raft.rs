@@ -116,6 +116,7 @@ pub use state_machine::{Command, Response};
 pub use fluree_raft_core::admin;
 pub use fluree_raft_core::forward;
 pub use fluree_raft_core::log_adapter;
+pub use fluree_raft_core::runtime;
 pub use fluree_raft_core::storage;
 pub use fluree_raft_core::{ClusterNode, NodeId};
 

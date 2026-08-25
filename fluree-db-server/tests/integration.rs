@@ -755,6 +755,7 @@ async fn push_endpoint_accepts_single_commit_and_advances_head() {
     let push_req = PushCommitsRequest {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
     };
 
     let resp = app
@@ -833,6 +834,7 @@ async fn push_rejects_first_commit_t_mismatch_with_409() {
     let push_req = PushCommitsRequest {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
     };
 
     let resp = app
@@ -879,6 +881,7 @@ async fn push_rejects_retraction_without_existing_assertion_with_422() {
     let push_req = PushCommitsRequest {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
     };
 
     let resp = app
@@ -937,6 +940,7 @@ async fn push_rejects_list_retraction_missing_meta_with_422() {
     let push_req = PushCommitsRequest {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
     };
     let resp = app
         .clone()
@@ -965,6 +969,7 @@ async fn push_rejects_list_retraction_missing_meta_with_422() {
     let push_req = PushCommitsRequest {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
     };
     let resp = app
         .oneshot(
@@ -3116,6 +3121,7 @@ async fn create_and_push_commits(
         let push_req = PushCommitsRequest {
             commits: vec![fluree_db_api::Base64Bytes(bytes)],
             blobs: std::collections::HashMap::new(),
+            missing_blobs: Vec::new(),
         };
 
         let resp = app
@@ -3258,6 +3264,7 @@ async fn commits_endpoint_cursor_stability() {
     let push_req = PushCommitsRequest {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
     };
     let resp = app
         .clone()
