@@ -91,9 +91,6 @@ pub(crate) struct BuildState {
     base: LedgerState,
     new_t: i64,
     flake_count: usize,
-    /// CID of raw-txn JSON if it was uploaded during build; carried
-    /// so a publish failure can release the orphaned blob.
-    txn_id_for_release: Option<ContentId>,
 }
 
 /// Options for commit operation
@@ -248,9 +245,9 @@ impl CommitOpts {
     /// The upload runs concurrently with staging CPU work. The caller of
     /// [`build_commit`] awaits the handle just before staging completes,
     /// so durability is preserved but the serial latency on the caller's
-    /// path is reduced. On error paths that drop `CommitOpts` without
-    /// awaiting, the pending upload's Drop guard releases any content
-    /// that was stored.
+    /// path is reduced. Error paths that drop `CommitOpts` cancel an
+    /// in-flight upload; a blob that already landed is never deleted
+    /// inline (see `raw_txn_upload` module docs).
     pub fn with_raw_txn_spawned(
         mut self,
         content_store: Arc<dyn fluree_db_core::ContentStore>,
@@ -676,13 +673,6 @@ pub async fn build_commit(
         ));
     }
 
-    // The caller is responsible for uploading the raw-txn JSON
-    // (if any) before invoking this function — the result is
-    // passed in as `txn_id`. We retain it for both the commit
-    // record (`with_txn`) and the release-on-failure path that
-    // `StagedCommit::apply` uses if publish fails.
-    let txn_id_for_release: Option<ContentId> = txn_id.clone();
-
     let head_commit_id = base.head_commit_id.clone();
     let ledger_id_for_publish = base.ledger_id().to_string();
     let ns_split_mode_for_genesis = if base.head_commit_id.is_none() {
@@ -747,7 +737,6 @@ pub async fn build_commit(
             base,
             new_t,
             flake_count,
-            txn_id_for_release,
         },
     })
 }
@@ -766,9 +755,13 @@ impl StagedCommit {
     /// `ApplyHead` path, rebase's batched replay publish) use
     /// [`Self::finalize_state`] instead.
     ///
-    /// On publish failure, the raw-txn blob uploaded during
-    /// [`build_commit`] is released — that CID is no longer referenced
-    /// by any durable commit record.
+    /// On publish failure the raw-txn blob uploaded during
+    /// [`build_commit`] is deliberately left in place: it is
+    /// content-addressed and may be shared with a commit that did
+    /// publish, so deleting it here could dangle that commit's
+    /// `txn` pointer. The orphan is not reclaimed by anything today —
+    /// see the `raw_txn_upload` module docs for why no collector covers
+    /// txn blobs yet.
     ///
     /// Durability of the blob and the head ref is the content store's and
     /// nameservice's to provide: S3 acknowledges after replication, and the
@@ -831,7 +824,6 @@ where
         base,
         new_t,
         flake_count,
-        txn_id_for_release,
     } = build_state;
 
     let commit_cid = commit_record
@@ -848,6 +840,7 @@ where
                 .put_with_id(cid, bytes)
                 .instrument(tracing::debug_span!("commit_write_referenced_blob"))
                 .await?;
+            tracing::debug!(%cid, bytes = bytes.len(), "referenced blob stored");
         }
         {
             let span = tracing::debug_span!("commit_write_commit_blob");
@@ -873,7 +866,18 @@ where
             .instrument(tracing::debug_span!("commit_publish_nameservice"))
             .await?;
         match publish_result {
-            CasResult::Updated => {}
+            CasResult::Updated => {
+                // The one INFO event on the commit path: a durable state
+                // change, one line per commit. The surrounding phase
+                // breadcrumbs are `debug!` — see `commit_write_commit_blob`
+                // and the `tx_builder` phases — so a steady write load does
+                // not pay for them.
+                tracing::info!(
+                    ledger_id = %ledger_id_for_publish,
+                    t = new_t,
+                    "commit head published"
+                );
+            }
             CasResult::Conflict { actual } => {
                 return Err(TransactError::PublishLostRace {
                     ledger_id: ledger_id_for_publish.clone(),
@@ -890,22 +894,7 @@ where
         Ok::<_, TransactError>(())
     };
 
-    if let Err(e) = write_and_publish.await {
-        // Release raw-txn if its upload preceded a failed publish.
-        if let Some(cid) = &txn_id_for_release {
-            if let Err(release_err) = content_store.release(cid).await {
-                tracing::warn!(
-                    error = %release_err,
-                    raw_txn_cid = %cid,
-                    "failed to release raw txn after commit failure"
-                );
-            }
-        }
-        return Err(e);
-    }
-    // Commit published — raw_txn is durably referenced. The
-    // `txn_id_for_release` value falls out of scope.
-    let _ = txn_id_for_release;
+    write_and_publish.await?;
 
     finalize_state_with_base(commit_record, commit_cid, new_t, flake_count, base)
 }
@@ -1092,12 +1081,8 @@ where
     );
 
     async move {
-        // Run the cheap pre-checks before awaiting the raw-txn upload.
-        // If lookup or sequencing fails, the still-pending upload is
-        // dropped here; `PendingRawTxnUpload`'s Drop guard releases any
-        // blob the upload already landed in CAS. Awaiting `finish()`
-        // first would have promoted the blob to a referenced CID with
-        // no caller obligated to release it.
+        // Run the cheap pre-checks before awaiting the raw-txn upload
+        // so a sequencing failure doesn't wait on storage I/O.
         let current = nameservice
             .lookup(view.base().ledger_id())
             .instrument(tracing::debug_span!("commit_nameservice_lookup"))
@@ -1120,14 +1105,7 @@ where
             opts.raw_txn_id.take()
         };
 
-        // `build_commit` consumes `txn_id` but its early-return paths
-        // (EmptyTransaction, NoveltyAtMax/WouldExceed, envelope-delta
-        // failure, serialize failure) all return before installing
-        // `txn_id_for_release` on the staged commit's `BuildState`.
-        // Release here so an early build error doesn't orphan the
-        // blob we just resolved.
-        let txn_id_for_cleanup = txn_id.clone();
-        let staged = match build_commit(
+        let staged = build_commit(
             view,
             ns_registry,
             expected_head_ref,
@@ -1135,36 +1113,11 @@ where
             index_config,
             opts,
         )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                release_raw_txn_after_build_err(content_store, txn_id_for_cleanup.as_ref()).await;
-                return Err(e);
-            }
-        };
+        .await?;
         staged.apply(content_store, nameservice).await
     }
     .instrument(commit_span)
     .await
-}
-
-/// Release a raw-txn blob whose CID was resolved before a failed
-/// [`build_commit`]. A failed release is logged but not propagated —
-/// the caller is already returning an error and shouldn't have its
-/// failure mode replaced.
-pub async fn release_raw_txn_after_build_err<C>(content_store: &C, txn_id: Option<&ContentId>)
-where
-    C: ContentStore + ?Sized,
-{
-    let Some(cid) = txn_id else { return };
-    if let Err(release_err) = content_store.release(cid).await {
-        tracing::warn!(
-            error = %release_err,
-            raw_txn_cid = %cid,
-            "failed to release raw txn after build_commit failure"
-        );
-    }
 }
 
 fn commit_head_ref(record: &fluree_db_nameservice::NsRecord) -> RefValue {
@@ -1704,14 +1657,13 @@ mod tests {
         }
     }
 
-    /// Regression: `build_commit`'s early-return paths
-    /// (`EmptyTransaction`, novelty caps, envelope-delta failure,
-    /// serialize failure) all return before installing the
-    /// `txn_id_for_release` machinery, so a leftover raw-txn upload
-    /// would orphan its blob in CAS. The fix moves the upload await
-    /// below the pre-checks AND releases on `build_commit` err.
+    /// A failed commit must NOT delete the raw-txn blob: the blob is
+    /// content-addressed, so an identical body (retry / redelivery)
+    /// that already committed references the same CID. `EmptyTransaction`
+    /// on a duplicate redelivery was one concrete way a published commit's
+    /// `txn` pointer got dangled in production.
     #[tokio::test]
-    async fn empty_transaction_does_not_orphan_raw_txn() {
+    async fn empty_transaction_keeps_raw_txn_blob() {
         let storage = MemoryStorage::new();
         let db = LedgerSnapshot::genesis("test:main");
         let novelty = Novelty::new(0);
@@ -1743,10 +1695,9 @@ mod tests {
             "expected EmptyTransaction, got {result:?}"
         );
 
-        // The blob the upload landed in CAS must be released.
         assert!(
-            cs.get(&expected_cid).await.is_err(),
-            "raw_txn blob must be released after EmptyTransaction error"
+            cs.get(&expected_cid).await.is_ok(),
+            "raw_txn blob must survive an EmptyTransaction error (may be shared)"
         );
     }
 

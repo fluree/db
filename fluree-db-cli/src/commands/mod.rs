@@ -46,3 +46,4 @@ pub mod upstream;
 pub mod use_cmd;
 #[cfg(feature = "shacl")]
 pub mod validate;
+pub mod verify;

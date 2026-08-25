@@ -510,6 +510,15 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             .await
         }
 
+        Commands::Verify {
+            ledger,
+            limit,
+            json,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::verify::run(ledger.as_deref(), limit, json, &fluree_dir).await
+        }
+
         Commands::Show {
             commit,
             ledger,

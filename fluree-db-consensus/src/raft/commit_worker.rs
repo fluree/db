@@ -841,6 +841,9 @@ impl Worker {
                 .into_iter()
                 .map(|(k, v)| (k, Base64Bytes(v)))
                 .collect(),
+            // The staged bundle carries every blob it resolved; a gap it
+            // could not resolve is not distinguished here yet.
+            missing_blobs: Vec::new(),
         };
         let StagedPush {
             accepted,

@@ -1464,6 +1464,7 @@ impl Fluree {
                 .ensure_head_temporal(store.as_ref())
                 .await
                 .map_err(fluree_db_transact::TransactError::from)?;
+            tracing::debug!(ledger = %ledger.id(), "head commit temporal resolved");
         }
 
         // Resolve the raw-txn CID before invoking the build phase
@@ -1479,7 +1480,9 @@ impl Fluree {
             commit_opts.raw_txn_upload.take();
             Some(cid)
         } else if let Some(pending) = commit_opts.raw_txn_upload.take() {
-            Some(pending.finish().await.map_err(ApiError::from)?)
+            let cid = pending.finish().await.map_err(ApiError::from)?;
+            tracing::debug!(ledger = %ledger.id(), raw_txn_cid = %cid, "raw txn upload finished");
+            Some(cid)
         } else {
             None
         };
@@ -1497,13 +1500,10 @@ impl Fluree {
                     t: view.base().t(),
                 });
 
-        // `build_commit` consumes `txn_id`; its early-return paths
-        // (EmptyTransaction / NoveltyAtMax / NoveltyWouldExceed /
-        // envelope-delta / serialize) return before installing
-        // `txn_id_for_release` on the staged commit, so release here
-        // to avoid orphaning the raw-txn blob.
-        let txn_id_for_cleanup = txn_id.clone();
-        let mut staged = match fluree_db_transact::build_commit(
+        // A failed build never deletes the raw-txn blob: it is
+        // content-addressed and may be shared with an already-published
+        // commit (see `fluree_db_transact::raw_txn_upload`).
+        let mut staged = fluree_db_transact::build_commit(
             view,
             ns_registry,
             expected_head_ref,
@@ -1512,18 +1512,14 @@ impl Fluree {
             commit_opts,
         )
         .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                let content_store = self.content_store(ledger.id());
-                fluree_db_transact::release_raw_txn_after_build_err(
-                    content_store.as_ref(),
-                    txn_id_for_cleanup.as_ref(),
-                )
-                .await;
-                return Err(ApiError::from(e));
-            }
-        };
+        .map_err(ApiError::from)?;
+        tracing::debug!(
+            ledger = %ledger.id(),
+            t = staged.commit.t,
+            commit_bytes = staged.commit_bytes.len(),
+            referenced_blobs = staged.referenced_bytes.len(),
+            "commit record built"
+        );
 
         if tracker.is_enabled() {
             staged.tally = tracker.tally();
