@@ -10,7 +10,7 @@ description = "Runtime-agnostic core library for Fluree DB queries"
 # Default to runtime-agnostic behavior.
 # Enable `native` for filesystem-backed implementations that depend on tokio.
 default = []
-native = ["tokio", "moka", "dashmap", "fs2"]
+native = ["tokio", "moka", "dashmap", "fs2", "dep:rand"]
 credential = ["dep:fluree-db-credential"]
 
 [dependencies]
@@ -33,7 +33,7 @@ fs2 = { version = "0.4", optional = true }
 xxhash-rust = { workspace = true }
 # Per-process token in `FileStorage` staging-file names. The pid alone
 # is unique per host, not across hosts sharing a mount.
-rand = { workspace = true }
+rand = { workspace = true, optional = true }
 moka = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 
