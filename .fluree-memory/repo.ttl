@@ -2647,19 +2647,20 @@ mem:fact-01kynrrhdfqt0n6rx1wpcv5843 a mem:Fact ;
     mem:rationale "Answers \"would batching help existing-subject upserts?\" with measurements — avoids speculative batching work; documents the store-cached p_sid_table invariant (store immutable behind Arc → OnceLock safe)." .
 
 mem:fact-01m0srrpntk3mxseprnpcvey08 a mem:Fact ;
-    mem:content "Star-block VALUES on non-subject vars lower to FILTER(?v IN ...) at block assembly (convert_star_values_to_membership_filters, fix/values-object-scan-constraint): a deferred multi-row VALUES constrained NOTHING about the fused star scan (full-extent drain + materialize, 1600x vs the identical filter — BUG-values-join-planner). Declines preserve join semantics: UNDEF (match-any), duplicate rows (multiplicity), multi-var (correlation), literal cells, subject VALUES (seeds instead), and mixed blocks are all-or-nothing — a partially converted block routes leftover VALUES down the sequential path, which seeds them at the base (the cartesian the deferral prevents)." ;
-    mem:tag "membership-filter" ;
+    mem:content "REVERTED, do not re-land as written: lowering star-block VALUES to FILTER(?v IN ...) at block assembly (convert_star_values_to_membership_filters) did not work. inline_singleton_values_objects rewrites a singleton VALUES into the triple object but RETAINS the VALUES pattern, so its var is no longer produced by any star triple, membership_filter_from_values declines it, and the all-or-nothing gate declines the whole block — which is exactly the two-VALUES repro shape. Measured: 0 firings across the 6 tests that shipped with it, 1 across the whole 349-test SPARQL group. Where it does fire it is SLOWER: Function::In yields no range constraint from extract_range_constraints, so the block carries no object_bounds, has_selective_anchor is false, and it leaves the fused PropertyJoinOperator for the NLJ chain. Push the constraint down as a SEED that keeps the star anchored, not a filter that unanchors it." ;
     mem:tag "performance" ;
     mem:tag "planner" ;
+    mem:tag "reverted" ;
     mem:tag "star-join" ;
     mem:tag "values" ;
     mem:scope mem:repo ;
-    mem:artifactRef "docs/design/performance.md" ;
     mem:artifactRef "fluree-db-api/tests/it_values_object_bounds.rs" ;
     mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/planner.rs" ;
     mem:branch "fix/values-object-scan-constraint" ;
     mem:createdAt "2026-08-24T11:33:51.418875+00:00"^^xsd:dateTime ;
-    mem:rationale "Anyone touching split_values_seeding_star or the inner-join block builder must know why conversion is all-or-nothing and which shapes must keep the ValuesOperator." .
+    mem:updatedAt "2026-08-25T23:36:20.896572+00:00"^^xsd:dateTime ;
+    mem:rationale "The approach looks obviously right and was already tried and reverted; the singleton-fold interaction and the missing object_bounds are the two things that kill it." .
 
 mem:fact-01m0srrz87xpy9dy11z0b084hv a mem:Fact ;
     mem:content "IN/NOT IN over resources needed the same encoded-vs-IRI fast path as =/!= (fixed on fix/values-object-scan-constraint): eval_in fell through to rdf_term_equal, whose Resource arm compares representations, so ?ref IN (&lt;iri&gt;) against an EncodedSid/Sid binding silently matched nothing and NOT IN kept everything. Fix = shared eval_membership probing each element via fast_eq_iri_binding_directional (three-way outcome: Eq(bool)/TestUnbound/OtherUnbound — IN needs to know WHICH side was unbound; =/!= treats both as false). This was the 10th mixed-representation equality surface beyond the 9 fixed in 17472650e." ;
@@ -3062,6 +3063,22 @@ mem:fact-01m0bre5qrbr1kfpxvq97hhy7p a mem:Fact ;
     mem:updatedAt "2026-08-19T02:42:45.324959+00:00"^^xsd:dateTime ;
     mem:rationale "Any streaming group iterator over leaflet batches must carry the open group across refills — PsotSubjectCountIter/CursorSubjectCountStream are the reference pattern. Repro trick: reindex with IndexerConfig::with_leaflet_rows(3) forces boundary-straddling groups at tiny scale." .
 
+mem:fact-01m0bredy3qtxvftbwass43qkc a mem:Fact ;
+    mem:content "#1652 case 3 FIXED: count_composite_join_pairs now gates via predicate_unsafe_for_cross_predicate_o_key_join (fast_path_common) — declines when either predicate's POST leaflets hold NUM_BIG_OVERFLOW objects (per-predicate arena handles, not value identity) OR list rows (HAS_O_I flag; list elems never match plain refs, aligned duplicate lists pair per-row — not expressible in an (s,o_type,o_key) key). Metadata-first: o_type_const point check, key-range bound for mixed leaflets, exact o_type-column decode ONLY when the range straddles 0x800B. Overlay lane: CursorSoIter declines row-level on live o_i (novelty lists). Pinned in it_fastpath_1652_regression.rs incl. must-fire on clean data." ;
+    mem:tag "composite-join" ;
+    mem:tag "correctness" ;
+    mem:tag "count" ;
+    mem:tag "fast-path" ;
+    mem:tag "numbig" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_fastpath_1652_regression.rs" ;
+    mem:artifactRef "fluree-db-query/src/count_plan_exec.rs" ;
+    mem:artifactRef "fluree-db-query/src/fast_path_common.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-08-19T00:58:52.739403+00:00"^^xsd:dateTime ;
+    mem:updatedAt "2026-08-19T02:42:56.706679+00:00"^^xsd:dateTime ;
+    mem:rationale "Two traps for any cross-predicate o_key comparison: NumBig handles are per-predicate, and o_i list rows join by rules the composite key can't express. The exact-membership decode matters — a plain int+string+langstring mixed leaflet straddles NUM_BIG's o_type range without containing one, and a range-only gate silently loses the fast path." .
+
 mem:fact-01m0dazrcw355c6c1dkpdsgr8z a mem:Fact ;
     mem:content "#1652 follow-up: detect_group_by_object_star_topk (execute/operator_tree.rs) now requires filter object vars to be PAIRWISE DISTINCT. The operator folds filters as a product of per-subject counts, which is the join multiplicity only when they range independently — two filter triples sharing an object var join on it, so the true multiplicity is their per-subject value INTERSECTION. Shared var returned inflated counts plus phantom groups (subjects whose filter values are disjoint drop out generically). Distinct vars over the SAME predicate stay eligible: that product is correct. Probed both ways in it_fastpath_1652_regression.rs (must-not-fire + must-fire)." ;
     mem:tag "correctness" ;
@@ -3090,22 +3107,6 @@ mem:fact-01m0fxp7rvjkyvvkvka3dd24zh a mem:Fact ;
     mem:branch "main" ;
     mem:createdAt "2026-08-20T10:14:02.000000+00:00"^^xsd:dateTime ;
     mem:rationale "A #1667 review item asked to add a stamp to the fused scalar-agg operator on the basis that it had none; the stamp already existed one layer up, so the fix was a test-side assertion and no production change. Check the FastPathOperator layer before concluding a lane is unstamped." .
-
-mem:fact-01m0bredy3qtxvftbwass43qkc a mem:Fact ;
-    mem:content "#1652 case 3 FIXED: count_composite_join_pairs now gates via predicate_unsafe_for_cross_predicate_o_key_join (fast_path_common) — declines when either predicate's POST leaflets hold NUM_BIG_OVERFLOW objects (per-predicate arena handles, not value identity) OR list rows (HAS_O_I flag; list elems never match plain refs, aligned duplicate lists pair per-row — not expressible in an (s,o_type,o_key) key). Metadata-first: o_type_const point check, key-range bound for mixed leaflets, exact o_type-column decode ONLY when the range straddles 0x800B. Overlay lane: CursorSoIter declines row-level on live o_i (novelty lists). Pinned in it_fastpath_1652_regression.rs incl. must-fire on clean data." ;
-    mem:tag "composite-join" ;
-    mem:tag "correctness" ;
-    mem:tag "count" ;
-    mem:tag "fast-path" ;
-    mem:tag "numbig" ;
-    mem:scope mem:repo ;
-    mem:artifactRef "fluree-db-api/tests/it_fastpath_1652_regression.rs" ;
-    mem:artifactRef "fluree-db-query/src/count_plan_exec.rs" ;
-    mem:artifactRef "fluree-db-query/src/fast_path_common.rs" ;
-    mem:branch "main" ;
-    mem:createdAt "2026-08-19T00:58:52.739403+00:00"^^xsd:dateTime ;
-    mem:updatedAt "2026-08-19T02:42:56.706679+00:00"^^xsd:dateTime ;
-    mem:rationale "Two traps for any cross-predicate o_key comparison: NumBig handles are per-predicate, and o_i list rows join by rules the composite key can't express. The exact-membership decode matters — a plain int+string+langstring mixed leaflet straddles NUM_BIG's o_type range without containing one, and a range-only gate silently loses the fast path." .
 
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;

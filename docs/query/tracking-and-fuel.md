@@ -108,6 +108,14 @@ What this changes:
 - **Per-flake (`0.001`), subject-resolve, object-decode, and dict-touch (`0.010`) fuel** all scale with the number of selected predicates rather than the subject's total predicate count.
 
 What this does **not** change:
+> **Known gap — the subject-seeded lane is not charged.** A star whose
+> SUBJECT is bound by a `VALUES` clause is seeded rather than joined, and the
+> rows it expands cross none of the charging surfaces above. Measured: a
+> 400-subject `VALUES ?ev { ... } ?ev :p1 ?a ; :p2 ?b ; :snap ?s` returns 400
+> rows and reports 1.001 fuel — floor level, and invisible to `max_fuel`.
+> Charge it at the lane's own batch boundary, the way the scan, VALUES-join,
+> and property-join lanes are.
+
 - **Index leaflet touches (`0.010` each)** still scale with the cursor's scanned subject range. For K ≥ 2 the cursor opens `SPOT(s,*,*)` and pays one `INDEX_TOUCH` per leaflet batch returned, the same as a full crawl over the subject — the filter narrows which rows get *materialized*, not how many leaflets get *read*. For K = 1 the cursor opens `SPOT(s,p,*)` directly via `RangeMatch::subject_predicate`, which narrows the leaflet key-range to the `(s, p)` prefix — same `INDEX_TOUCH` count for small subjects (one batch either way), strictly fewer touches for subjects whose flakes span multiple batches.
 
 Wildcard projections (`select: {"?x": ["*"]}`) take the unchanged decode-everything path — every flake on the subject is materialized and charged. Refinements on a wildcard level (e.g. `{"ex:friend": ["*"]}` inside a `["*", ...]` selection) keep the parent level wildcard; only the explicit-list form opts into the filter.

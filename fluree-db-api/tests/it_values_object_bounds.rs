@@ -310,3 +310,82 @@ async fn drained_rows_are_visible_to_fuel() {
          {star_fuel}; the ValuesOperator per-input-row charge regressed"
     );
 }
+
+/// Coverage for the property-join operator's own row lanes — the batched
+/// subject probe and the SPOT star walk — which bypass
+/// `BinaryScanOperator` entirely, so the scan-emission charge never sees
+/// their rows. An object-anchored star routes through them: this drives
+/// 800 rows through the SPOT lane and pins that the query stays inside a
+/// sane fuel envelope.
+///
+/// NOT a pin on the per-row charges themselves. Their contribution here is
+/// 0.80 of 6.61 fuel (800 rows x `PER_ROW_MICRO_FUEL`), and the IO touch
+/// charges over the same leaflets dominate it — so deleting both charges
+/// leaves any end-to-end assertion on this query green. Isolating them
+/// needs two shapes with identical IO and different row counts, which this
+/// index layout cannot produce. Verified by hand instead: with the charges
+/// removed the hub query reports 5.81 fuel, with them 6.61.
+#[tokio::test]
+async fn property_join_probe_lanes_stay_in_a_sane_fuel_envelope() {
+    const HUB_LEDGER: &str = "values-object-bounds-hub:main";
+    const HUB_EDGES: usize = 400;
+
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // A hub entity on `ns:entity1` with many edges, so the object-anchored
+    // star expands real volume through the property join rather than the
+    // two rows the shared fixture's hub carries.
+    let ledger0 = genesis_ledger(&fluree, HUB_LEDGER);
+    let hub = entity_a();
+    let mut graph = Vec::with_capacity(HUB_EDGES);
+    for i in 0..HUB_EDGES {
+        graph.push(json!({
+            "@id": format!("http://example.org/hub-edge/{i}"),
+            "ns:entity1": { "@id": hub },
+            "ns:entity2": { "@id": iri(i) },
+            "ns:snap": format!("snapshot payload {i} {}", "x".repeat(64)),
+        }));
+    }
+    fluree
+        .insert(
+            ledger0,
+            &json!({ "@context": { "ns": "http://example.org/ns#" }, "@graph": graph }),
+        )
+        .await
+        .expect("insert hub data");
+    rebuild_and_publish_index(&fluree, HUB_LEDGER).await;
+
+    // A singleton VALUES on the object folds into the triple and anchors
+    // the star, which is what routes it through the probe/SPOT lanes.
+    let sparql = format!(
+        "PREFIX ns: <http://example.org/ns#>\n\
+         SELECT ?b FROM <{HUB_LEDGER}> WHERE {{\n\
+           VALUES ?a {{ <{hub}> }}\n\
+           ?ev ns:entity1 ?a ; ns:entity2 ?b ; ns:snap ?snap }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .track_all()
+        .execute_tracked()
+        .await
+        .expect("query should succeed");
+    assert_eq!(result.status, 200);
+    let rows = result.result["results"]["bindings"]
+        .as_array()
+        .expect("bindings array")
+        .len();
+    assert_eq!(rows, HUB_EDGES, "the hub star must expand every edge");
+
+    let fuel = result.fuel.expect("fuel");
+    assert!(
+        fuel > 2.0,
+        "expanding a {HUB_EDGES}-edge hub charged only {fuel} fuel; the \
+         lane reports floor-level cost and is invisible to max_fuel"
+    );
+    assert!(
+        fuel < 100.0,
+        "hub star fuel ({fuel}) blew past the per-row schedule"
+    );
+}

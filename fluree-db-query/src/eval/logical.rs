@@ -118,7 +118,17 @@ fn eval_membership<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
     operator: &'static str,
 ) -> Result<Membership> {
-    use super::compare::{fast_in_membership_for_iri_bindings, FastEqOutcome};
+    use super::compare::{
+        fast_in_membership_for_iri_bindings, iri_fast_path_can_decide, FastEqOutcome,
+    };
+
+    // The probe can only reach a verdict for a resource-flavored test
+    // binding. Asking once, up front, keeps a literal-bound `?v IN (...)`
+    // from evaluating every element twice and collecting them all into a
+    // per-row `Vec` on its way to the generic path.
+    if !iri_fast_path_can_decide(&args[0], row, ctx) {
+        return generic_membership(&args[0], args[1..].iter(), row, ctx, operator);
+    }
 
     let mut unresolved: Vec<&Expression> = Vec::new();
     for v in &args[1..] {
@@ -143,12 +153,29 @@ fn eval_membership<R: RowAccess>(
         return Ok(Membership::NotFound);
     }
 
-    let Some(tv) = args[0].eval_to_comparable(row, ctx)? else {
+    generic_membership(&args[0], unresolved.into_iter(), row, ctx, operator)
+}
+
+/// The comparable-value membership loop: `rdf_term_equal` against every
+/// element, holding a demotable error pending so a later definitive match
+/// discards it (SPARQL 1.1 §17.4.1.9 OR semantics).
+///
+/// Shared by both entries into it — the whole element list when the
+/// resource fast path cannot apply, and the undecided remainder when it
+/// can — so the two paths cannot drift in their error semantics.
+fn generic_membership<'a, R: RowAccess, I: Iterator<Item = &'a Expression>>(
+    test: &Expression,
+    elements: I,
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+    operator: &'static str,
+) -> Result<Membership> {
+    let Some(tv) = test.eval_to_comparable(row, ctx)? else {
         return Ok(Membership::TestUnbound);
     };
 
     let mut pending_error: Option<QueryError> = None;
-    for v in unresolved {
+    for v in elements {
         match v.eval_to_comparable(row, ctx) {
             // Value equality (rdf_term_equal), so `1 IN (1.0)` matches
             // like `1 = 1.0` — not the variant-exact derived `==`.
