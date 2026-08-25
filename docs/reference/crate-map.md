@@ -619,10 +619,10 @@ And under `testing`:
 - `testing` — a conformance fixture any openraft state-machine adapter
   can be run through (snapshot persist-before-swap, boot restore,
   membership bookkeeping, one response per entry). Deliberately not
-  specific to this crate's adapter: the point is to hold a bespoke
-  adapter to the same contract. Both adapters in the tree run it — the
-  generic one in `fluree-raft-core/tests/state_machine_seam.rs`, the
-  nameservice's in `fluree-db-consensus/tests/it_adapter_conformance.rs`.
+  specific to this crate's adapter: any openraft `RaftStateMachine` can
+  be held to the same contract. Both consumers run it — the toy counter
+  in `fluree-raft-core/tests/state_machine_seam.rs` and the nameservice
+  in `fluree-db-consensus/tests/it_adapter_conformance.rs`.
 
 **Depends on**: nothing in the workspace. Without the `raft` feature
 there is no `openraft` dependency either: storage payloads are opaque
@@ -647,13 +647,23 @@ membership.
 the Raft-replicated nameservice state machine.
 
 **Key types**: `Committer`, `LocalCommitter`, `CachingCommitter`,
-`Command`/`Response`, `NameServiceState`, `RaftNameService`,
-`QueuedTransactor`, `commit_worker::Worker`.
+`Command`/`Response`, `NameServiceState`, `NameServiceApp`,
+`NameServiceObserver`, `RaftNameService`, `QueuedTransactor`,
+`commit_worker::Worker`.
+
+**Raft state machine**: `raft::app` holds both halves of the
+nameservice's contribution — `NameServiceApp` (the pure reduction) and
+`NameServiceObserver` (event bus, waiters, staged receipts, releases,
+ledger-cache watermark). The generic bookkeeping is
+`fluree_raft_core::state_machine::StateMachineAdapter`, and
+`raft::state_machine_adapter` is just their composition, kept at its
+historical path. `publish` runs in two phases: every commit-head
+watermark reaches the ledger cache before any event reaches the bus.
 
 **Feature flags**: `raft` (non-default) gates `openraft` so monolithic
 users don't compile or link it. `testing` (implies `raft`) pulls in
-`fluree-raft-core`'s conformance fixture and runs the bespoke
-`StateMachineAdapter` through it; test-only, so it is off outside
+`fluree-raft-core`'s conformance fixture and runs the nameservice's
+state machine through it; test-only, so it is off outside
 `--all-features`.
 
 **Depends on**: fluree-raft-core, fluree-db-api, fluree-db-core,

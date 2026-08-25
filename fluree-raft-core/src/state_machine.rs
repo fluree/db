@@ -400,6 +400,20 @@ impl<A: AppStateMachine> ReadOnlyState<A> {
     ) -> Result<tokio::sync::RwLockReadGuard<'_, A::State>, tokio::sync::TryLockError> {
         self.inner.try_read()
     }
+
+    /// A read-only view of state something else owns.
+    ///
+    /// Narrowing only: it removes the ability to write, never grants
+    /// it. That is what separates it from handing a writable handle to
+    /// a *live* adapter, which would let something race `apply` and
+    /// diverge one replica with no failed write to point at.
+    ///
+    /// For a consumer that needs to stand a state view up itself —
+    /// a test seeding a scenario, most often — rather than receiving
+    /// one from [`StateMachineAdapter::shared_state`].
+    pub fn view_of(inner: Arc<RwLock<A::State>>) -> Self {
+        Self { inner }
+    }
 }
 
 /// openraft's `RaftStateMachine` over an [`AppStateMachine`].

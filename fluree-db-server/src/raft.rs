@@ -32,7 +32,7 @@ use fluree_db_consensus::raft::{
     network::{self as raft_network, HttpRaftNetworkFactory, NetworkConfig},
     runtime,
     staged_receipt::StagedReceiptMap,
-    state_machine_adapter::{SharedState, StateMachineAdapter},
+    state_machine_adapter::{NameServiceObserver, SharedState, StateMachineAdapter},
     storage::{fs::FsRaftStorage, StorageError},
     waiter::WaiterMap,
 };
@@ -232,14 +232,16 @@ impl RaftIntegration {
         // from `last_applied + 1` instead of index 0 (the latter
         // would silently lose committed state after a snapshot +
         // log purge under the default `SnapshotPolicy`).
-        let sm = StateMachineAdapter::open(Arc::clone(&storage))
-            .await?
+        let observer = NameServiceObserver::new()
             .with_event_bus(Arc::clone(&event_bus))
             .with_waiter_map(Arc::clone(&waiter_map))
             .with_staged_receipts(Arc::clone(&staged_receipts))
             .with_release_sender(release_tx);
+        // Taken before the observer is handed off; server assembly
+        // fills it once `Fluree` exists.
+        let ledger_manager = observer.ledger_manager_cell();
+        let sm = StateMachineAdapter::open(Arc::clone(&storage), observer).await?;
         let shared_state = sm.shared_state();
-        let ledger_manager = sm.ledger_manager_cell();
 
         let raft_cfg = Arc::new(config.raft_config.validate()?);
 

@@ -1992,11 +1992,26 @@ mod tests {
         ContentId::new(ContentKind::Commit, &[seed])
     }
 
-    fn fresh_state() -> SharedState {
+    /// State a test owns and drives directly.
+    ///
+    /// Production state is written only by `apply`, so the code under
+    /// test receives the read-only [`view`] of this rather than the
+    /// handle itself — a scenario is set up by owning the other half,
+    /// not by widening what consumers can do.
+    fn fresh_state() -> Arc<RwLock<NameServiceState>> {
         Arc::new(RwLock::new(NameServiceState::default()))
     }
 
-    async fn apply_cmd(state: &SharedState, cmd: Command, index: u64) -> Response {
+    /// The read-only view of a test's state, as a consumer sees it.
+    fn view(state: &Arc<RwLock<NameServiceState>>) -> SharedState {
+        SharedState::view_of(Arc::clone(state))
+    }
+
+    async fn apply_cmd(
+        state: &Arc<RwLock<NameServiceState>>,
+        cmd: Command,
+        index: u64,
+    ) -> Response {
         let mut guard = state.write().await;
         crate::raft::state_machine::apply(&mut guard, cmd, index)
     }
@@ -2070,12 +2085,12 @@ mod tests {
     /// not the openraft consensus loop.
     async fn stub_raft() -> Arc<Raft<crate::raft::TypeConfig>> {
         use crate::raft::log_adapter::LogAdapter;
-        use crate::raft::state_machine_adapter::StateMachineAdapter;
+        use crate::raft::state_machine_adapter::{NameServiceObserver, StateMachineAdapter};
         use crate::raft::storage::memory::MemoryRaftStorage;
 
         let storage = Arc::new(MemoryRaftStorage::new());
         let log = LogAdapter::new(Arc::clone(&storage));
-        let sm = StateMachineAdapter::new(Arc::clone(&storage));
+        let sm = StateMachineAdapter::new(Arc::clone(&storage), NameServiceObserver::new());
         let config = Arc::new(Config::default().validate().expect("config validates"));
         Arc::new(
             Raft::new(1, config, StubFactory, log, sm)
@@ -2945,7 +2960,7 @@ mod tests {
 
     #[tokio::test]
     async fn publishing_ledger_id_echoes_input() {
-        let ns = RaftNameService::new(fresh_state(), stub_raft().await);
+        let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
         assert_eq!(
             ns.publishing_ledger_id("test/db:main"),
             Some("test/db:main".to_string())
@@ -2960,7 +2975,7 @@ mod tests {
     /// through the queue. Used by lookup-side tests that need a
     /// populated head but aren't exercising the apply pipeline.
     async fn seed_head(
-        state: &SharedState,
+        state: &Arc<RwLock<NameServiceState>>,
         ledger_id: &str,
         branch: &str,
         head: ContentId,
@@ -3001,13 +3016,13 @@ mod tests {
     /// and the CLI report success with no index head published.
     #[tokio::test]
     async fn publish_index_swallows_not_leader() {
-        let ns = RaftNameService::new(fresh_state(), stub_raft().await);
+        let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
         assert!(ns.publish_index("test/db:main", 1, &cid(1)).await.is_ok());
     }
 
     #[tokio::test]
     async fn publish_index_allow_equal_surfaces_not_leader() {
-        let ns = RaftNameService::new(fresh_state(), stub_raft().await);
+        let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
         let err = ns
             .publish_index_allow_equal("test/db:main", 1, &cid(1))
             .await
@@ -3020,7 +3035,7 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_returns_none_when_ledger_missing() {
-        let ns = RaftNameService::new(fresh_state(), stub_raft().await);
+        let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
         assert!(ns.lookup("test/db:main").await.unwrap().is_none());
     }
 
@@ -3030,7 +3045,7 @@ mod tests {
         let _ = apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         seed_head(&state, "test/db", "main", cid(5), 7).await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.ledger_id, "test/db:main");
         assert_eq!(record.commit_head_id, Some(cid(5)));
@@ -3075,7 +3090,7 @@ mod tests {
         .await;
         assert_eq!(resp, Response::ConfigUpdated);
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         assert_eq!(
             ns.get_status("test/db").await.unwrap(),
             Some(pushed_status.clone())
@@ -3100,7 +3115,7 @@ mod tests {
         apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         seed_head(&state, "test/db", "main", cid(9), 3).await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let ref_value = ns
             .get_ref("test/db:main", RefKind::CommitHead)
             .await
@@ -3124,7 +3139,7 @@ mod tests {
         apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         seed_head(&state, "test/db", "main", cid(9), 3).await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let heads = ns.heads("test/db:main").await.unwrap().expect("heads");
         assert_eq!(
             heads.commit,
@@ -3139,7 +3154,7 @@ mod tests {
 
     /// Convenience for the index-head tests: create a ledger and
     /// seed its commit head + t. Returns the shared state.
-    async fn ledger_at_commit(commit_head: u8, commit_t: i64) -> SharedState {
+    async fn ledger_at_commit(commit_head: u8, commit_t: i64) -> Arc<RwLock<NameServiceState>> {
         let state = fresh_state();
         let _ = apply_cmd(&state, init_cmd("test/db", "main"), 1).await;
         seed_head(&state, "test/db", "main", cid(commit_head), commit_t).await;
@@ -3162,7 +3177,7 @@ mod tests {
         )
         .await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.commit_head_id, Some(cid(7)));
         assert_eq!(record.commit_t, 10);
@@ -3186,7 +3201,7 @@ mod tests {
         )
         .await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let ref_value = ns
             .get_ref("test/db:main", RefKind::IndexHead)
             .await
@@ -3217,7 +3232,7 @@ mod tests {
         .await;
         seed_head(&state, "test/db", "main", cid(8), 20).await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let record = ns.lookup("test/db:main").await.unwrap().expect("record");
         assert_eq!(record.commit_head_id, Some(cid(8)));
         assert_eq!(record.commit_t, 20);
@@ -3232,7 +3247,7 @@ mod tests {
         apply_cmd(&state, init_cmd("a/db", "main"), 1).await;
         seed_head(&state, "a/db", "feat", cid(1), 1).await;
 
-        let ns = RaftNameService::new(state, stub_raft().await);
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
         let mut ids: Vec<_> = ns
             .all_records()
             .await

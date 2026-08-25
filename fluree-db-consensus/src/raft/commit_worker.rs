@@ -1806,7 +1806,7 @@ mod tests {
             "feature",
             vec![enqueued_entry(9, cid(3), BodyKind::Sparql)],
         );
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         let main_front = snapshot_front_for_test(&shared, &RefKey::new("test/db", "main"))
             .await
@@ -1825,7 +1825,7 @@ mod tests {
     async fn snapshot_front_is_none_when_empty_or_missing() {
         let mut state = NameServiceState::default();
         install_queue(&mut state, "test/db", "empty", vec![]);
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         assert!(
             snapshot_front_for_test(&shared, &RefKey::new("test/db", "empty"))
@@ -1853,7 +1853,7 @@ mod tests {
             vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
         install_queue(&mut state, "test/db", "feature", vec![]);
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         let desired = desired_owners_under_lock(&shared, 1, &[1]).await;
         assert_eq!(desired.len(), 2);
@@ -1871,7 +1871,7 @@ mod tests {
         for i in 0..50 {
             install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
         }
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         let voters = vec![1u64, 2, 3, 4];
 
         let mut union = HashSet::new();
@@ -1904,7 +1904,7 @@ mod tests {
             "main",
             vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         let desired = desired_owners_under_lock(&shared, 1, &[]).await;
         assert!(desired.is_empty());
@@ -1924,7 +1924,7 @@ mod tests {
         // only {1, 2} should host workers, and 3 must own nothing.
         state.configured_voters = [1, 2, 3].into_iter().collect();
         state.worker_eligible_voters = [1, 2].into_iter().collect();
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         let fallback = vec![1u64, 2, 3];
 
         // The demoted voter claims nothing despite still being in
@@ -1963,7 +1963,7 @@ mod tests {
             install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
         }
         // `worker_eligible_voters` deliberately left empty.
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         let fallback = vec![1u64, 2, 3];
 
         // Each of the three fallback voters covers a share of the
@@ -1995,7 +1995,7 @@ mod tests {
             vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
         state.worker_eligible_voters = [1, 2].into_iter().collect();
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         // Voter 3 is in the fallback, but not in the eligible set.
         let desired = desired_owners_under_lock(&shared, 3, &[1, 2, 3]).await;
         assert!(desired.is_empty());

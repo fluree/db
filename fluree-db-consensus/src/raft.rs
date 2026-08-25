@@ -95,6 +95,7 @@
 //! the load-bearing assumption is intentionally not duplicated
 //! per-endpoint.
 
+pub mod app;
 pub mod commit_worker;
 pub mod eviction_scheduler;
 pub mod liveness_monitor;

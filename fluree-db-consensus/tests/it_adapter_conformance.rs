@@ -1,15 +1,13 @@
-//! The nameservice's bespoke adapter, held to the same contract as the
-//! generic one.
+//! The nameservice's state machine, held to the adapter contract.
 //!
-//! The extraction leaves two openraft `RaftStateMachine` adapters in the
-//! tree: `fluree_raft_core::state_machine::StateMachineAdapter`, which
-//! reduces through the generic `AppStateMachine` seam, and this crate's
-//! [`StateMachineAdapter`], which reduces through
-//! [`state_machine::apply`] and carries nameservice-specific effects
-//! (event bus, waiter map, staged receipts, release channel). They are
-//! independent code, so nothing structural stops them from drifting on
-//! the parts openraft actually depends on — persist before swap, restore
-//! before replay, one response per entry.
+//! The nameservice reduces through `fluree_raft_core`'s generic
+//! `StateMachineAdapter`, so most of what openraft depends on — persist
+//! before swap, restore before replay, one response per entry — is
+//! generic code the counter group already exercises. What is *not*
+//! generic is this application's own contribution: the reduction in
+//! `NameServiceApp`, its membership mirroring, and above all its
+//! snapshot codec, which is bare postcard rather than the versioned
+//! envelope the counter uses.
 //!
 //! `fluree_raft_core::testing::run_all` is the shared fixture that
 //! pins those. Running the bespoke adapter through it is what makes
@@ -26,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use fluree_db_consensus::raft::state_machine::{Command, NameServiceState, NewLedger};
-use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
+use fluree_db_consensus::raft::state_machine_adapter::{NameServiceObserver, StateMachineAdapter};
 use fluree_db_consensus::raft::TypeConfig;
 use fluree_raft_core::storage::memory::{MemoryRaftLogStore, MemoryRaftSnapshotStore};
 use fluree_raft_core::storage::{
@@ -106,7 +104,7 @@ impl ConformanceHarness for NameServiceHarness {
     }
 
     async fn open(&self, storage: Arc<Self::Storage>) -> Self::Adapter {
-        StateMachineAdapter::open(storage)
+        StateMachineAdapter::open(storage, NameServiceObserver::new())
             .await
             .expect("adapter opens")
     }
