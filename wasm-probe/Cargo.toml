@@ -1,0 +1,21 @@
+[package]
+name = "fluree-wasm-probe"
+version = "0.0.0"
+edition = "2021"
+
+# Opt out of the parent workspace: this is a spike measurement harness.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fluree-db-api = { path = "../fluree-db-api", default-features = false }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

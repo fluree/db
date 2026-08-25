@@ -67,3 +67,14 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+# wasm32: disk_cache compiles (std::fs stubs + tokio::sync::broadcast); reads
+# behave as misses at runtime. Only the wasm-supported tokio features.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync"] }
+# Central JS-randomness unification for the whole wasm graph (feature
+# unification applies per-target): rand/rand_core need getrandom/js,
+# moka's uuid needs uuid/js. Declared once here since core is in every graph.
+getrandom = { version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+uuid = { version = "1", default-features = false, features = ["js"] }

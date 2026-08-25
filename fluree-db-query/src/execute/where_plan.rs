@@ -2640,6 +2640,7 @@ pub fn build_where_operators_seeded_with_needed(
                 i += 1;
             }
 
+            #[cfg(not(target_arch = "wasm32"))]
             Pattern::S2Search(s2p) => {
                 // S2 spatial search against spatial index sidecar
                 let child = get_or_empty_seed(operator.take());
@@ -2651,6 +2652,13 @@ pub fn build_where_operators_seeded_with_needed(
                         .with_out_schema(augmented_ref),
                 ));
                 i += 1;
+            }
+            // Spatial search is unsupported on wasm32 (s2 stack is native-only).
+            #[cfg(target_arch = "wasm32")]
+            Pattern::S2Search(_) => {
+                return Err(crate::error::QueryError::Internal(
+                    "spatial (S2) search is unsupported on wasm32".into(),
+                ));
             }
 
             Pattern::Graph {

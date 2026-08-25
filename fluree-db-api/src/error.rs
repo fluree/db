@@ -460,7 +460,7 @@ pub enum ApiError {
 
     /// Indexer crate errors
     #[error("Indexer error: {0}")]
-    Indexer(#[from] fluree_db_indexer::IndexerError),
+    Indexer(#[from] crate::wasm_compat::IndexerError),
 
     /// Builder validation errors (one or more problems with builder configuration)
     #[error("{0}")]
@@ -607,7 +607,7 @@ impl ApiError {
             ApiError::NoveltyDeferred { .. } => 503,
             ApiError::IndexingDisabled => 400, // Bad Request
             ApiError::Indexer(e) => {
-                use fluree_db_indexer::IndexerError;
+                use crate::wasm_compat::IndexerError;
                 match e {
                     IndexerError::LedgerNotFound(_) => 404,
                     IndexerError::NoCommits => 400,

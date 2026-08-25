@@ -9,6 +9,8 @@
 //!   immediately; defers remote packs to lazy fetch on first lookup.
 //! - **`from_memory`**: In-memory constructor for testing.
 
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_compat::memmap2;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

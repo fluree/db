@@ -5,6 +5,7 @@
 //! binary indexes. It is the dependency for `fluree-db-query` (instead of
 //! depending on the full `fluree-db-indexer` build pipeline).
 
+pub mod wasm_compat;
 pub mod analyzer;
 pub mod error;
 pub mod types;

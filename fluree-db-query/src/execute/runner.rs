@@ -20,7 +20,7 @@ use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, QueryCancellation, Tracker};
 use fluree_db_reasoner::DerivedFactsOverlay;
-use fluree_db_spatial::SpatialIndexProvider;
+use fluree_db_binary_index::wasm_compat::SpatialIndexProvider;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;

@@ -13,6 +13,8 @@
 //! Both handles produce identical [`ColumnBatch`] output — the choice of handle
 //! is invisible to the cursor and cache layers.
 
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_compat::memmap2;
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
