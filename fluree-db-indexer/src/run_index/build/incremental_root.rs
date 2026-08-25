@@ -277,6 +277,17 @@ impl IncrementalRootBuilder {
         self.root.annotation_index = new_index;
     }
 
+    /// Fold this pass's list-row observation into the sticky
+    /// `has_list_meta` state. Seeing a list row is conclusive (`Some(true)`)
+    /// regardless of the inherited state; seeing none only preserves what
+    /// the base root already knew — an untracked legacy root stays
+    /// untracked until a full rebuild observes every row.
+    pub fn note_list_meta(&mut self, saw_list_meta: bool) {
+        if saw_list_meta {
+            self.root.has_list_meta = Some(true);
+        }
+    }
+
     /// Add to cumulative commit stats.
     pub fn add_commit_stats(&mut self, size: u64, asserts: u64, retracts: u64) {
         self.root.total_commit_size += size;
@@ -382,6 +393,7 @@ mod tests {
             has_annotations: false,
             annotation_index: None,
             had_annotation_arena: false,
+            has_list_meta: None,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: NsSplitMode::default(),
         }

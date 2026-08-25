@@ -438,14 +438,19 @@ fn cases() -> Vec<Case> {
             expected: &["[9]"],
             routing: MustNotFire(PLAN_SITE),
         },
-        // List rows (`o_i`): every list element is its own fact, so a
-        // var-object join is a bag join over them — s2's two `q-1` entries on
-        // each side pair up 2×2 = 4, s3 pairs its single shared `r-1` once,
-        // and s1 never matches (see the fixture). The count lane cannot
-        // express that in an (s, o_type, o_key) key, so it must decline and
-        // agree with the generic join. (The membership lane used to answer
-        // this shape as a semi-join — one row per driving row, 3 — which the
-        // planner's driving-size gate now keeps it away from.)
+        // List rows (`o_i`): the generic join treats every list element as its
+        // own fact, so a var-object join is a bag join over them today — s2's
+        // two `q-1` entries on each side pair up 2×2 = 4, s3 pairs its single
+        // shared `r-1` once, and s1 never matches (see the fixture). This pins
+        // what the generic pipeline yields, not a ruling: whether list
+        // position belongs to a literal's identity is still open (#1676), and
+        // settling it may change this number. What the case does assert is
+        // that the count lane cannot express the shape in an
+        // (s, o_type, o_key) key, so it must decline and agree with whatever
+        // the generic join answers. (The membership lane would answer as a
+        // semi-join — one row per driving row, 3 — which the planner's
+        // driving-size gate now keeps it away from at this fixture's size;
+        // the lane's answer at or above the gate is unpinned.)
         Case {
             name: "composite join, list rows (declines to generic)",
             ledger: CompositeList,

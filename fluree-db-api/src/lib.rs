@@ -197,7 +197,7 @@ pub use tx::{
     TransactResultRef,
 };
 pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged};
-pub use verify::{LedgerVerifyReport, VerifyProblem};
+pub use verify::{LedgerVerifyReport, VerifyProblem, VerifySeverity};
 pub use view::{
     ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput,
     ReasoningModePrecedence, StreamDatasetPlan, StreamQueryPlan,
