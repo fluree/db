@@ -35,6 +35,24 @@
 //! Within phase two, order is the order effects were recorded: a waiter
 //! bind lands before the terminal command that resolves it, because a
 //! single apply batch can carry both.
+//!
+//! ## What the tests do and do not hold
+//!
+//! Only one of those two orderings has a test. Binds-before-terminals
+//! does: `apply` a batch carrying both an enqueue and its `ApplyHead`,
+//! and a terminals-first pass strands the waiter until it times out.
+//!
+//! **Watermarks-before-events is structural, not tested.** `publish` is
+//! synchronous, so once it returns both phases have run and the order
+//! they ran in is no longer observable — only a reader racing the call
+//! could see the difference, which no deterministic test can arrange
+//! against a `broadcast` bus we cannot intercept.
+//! `every_head_advancing_effect_reaches_the_watermark` pins *coverage*
+//! (every head-carrying effect variant updates the cache, so a new
+//! variant is not silently missed), not order: it stays green if the
+//! watermark is reported per-event after `bus.notify`. The phase split
+//! is the only thing holding the ordering, so a refactor that folds the
+//! phases together will not be caught here — check it by reading.
 
 use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
 use crate::raft::state_machine::{self, Command, NameServiceState, RefKey, Response};
@@ -77,8 +95,13 @@ impl AppStateMachine for NameServiceApp {
     }
 
     fn apply(state: &mut NameServiceState, command: &Command, log_index: u64) -> Response {
-        // `state_machine::apply` consumes the command — it moves fields
-        // out of the payloads rather than cloning them per arm.
+        // The seam hands us `&Command` so an app CAN avoid a clone here.
+        // The nameservice does not: `state_machine::apply` consumes the
+        // command, moving fields out of the payloads rather than cloning
+        // them per arm. Making the reducer borrow is a wide edit across
+        // those arms, so this clone stays — same one the old adapter
+        // made, at the same spot. Don't read the seam's contract as a
+        // claim that this path is clone-free.
         state_machine::apply(state, command.clone(), log_index)
     }
 
@@ -1449,6 +1472,11 @@ mod tests {
     /// head, or a cache keyed on the old value never revalidates. The
     /// failure mode is a new event variant carrying a head that nobody
     /// remembers to add here.
+    ///
+    /// Coverage only — this does **not** pin watermarks-before-events.
+    /// `publish` returns with both phases done, so this stays green even
+    /// if the watermark is reported per-event after `bus.notify`. See
+    /// the module docs: that ordering is held by the phase split alone.
     #[tokio::test]
     async fn every_head_advancing_effect_reaches_the_watermark() {
         let observer = NameServiceObserver::new();
