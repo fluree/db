@@ -148,16 +148,23 @@ async fn driver_serves_cache_jobs_end_to_end() {
         permit: None,
     })
     .unwrap();
-    // Write-behind: give the put task a moment.
-    TimeoutFuture::new(200).await;
-
-    let (tx, rx) = oneshot::channel();
-    io.send(IoJob::CacheGet {
-        key: key.clone(),
-        reply: tx,
-    })
-    .unwrap();
-    let hit = rx.await.unwrap().expect("persisted through the driver");
+    // Write-behind is async: poll until the put lands instead of trusting
+    // a fixed sleep (CI boxes are slow).
+    let mut hit = None;
+    for _ in 0..40 {
+        TimeoutFuture::new(50).await;
+        let (tx, rx) = oneshot::channel();
+        io.send(IoJob::CacheGet {
+            key: key.clone(),
+            reply: tx,
+        })
+        .unwrap();
+        if let Some(bytes) = rx.await.unwrap() {
+            hit = Some(bytes);
+            break;
+        }
+    }
+    let hit = hit.expect("persisted through the driver within 2s");
     assert_eq!(&hit[..], &payload[..]);
 
     io.shutdown();

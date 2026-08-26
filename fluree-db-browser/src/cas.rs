@@ -181,10 +181,11 @@ impl BrowserCasStorage {
         }
     }
 
-    /// Mark a query as in flight for the guard's lifetime; eviction from
-    /// the residency tier is frozen while any guard is alive. The retry
-    /// loop holds one across a query's rounds so every observed byte stays
-    /// resident (the engine's fetch-pins contract).
+    /// Mark a query as in flight for the guard's lifetime; the residency
+    /// tier then evicts only entries provably unobservable by any live
+    /// query (the epoch-tick rule — see `residency`). The retry loop holds
+    /// one across a query's rounds so every observed byte stays resident
+    /// (the engine's fetch-pins contract).
     pub fn query_guard(&self) -> QueryGuard {
         self.inner.residency.begin_query()
     }
