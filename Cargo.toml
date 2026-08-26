@@ -34,6 +34,7 @@ members = [
     "fluree-db-peer",
     "fluree-sse",
     "fluree-db-nameservice-sync",
+    "fluree-db-browser",
     "fluree-search-protocol",
     "fluree-search-service",
     "fluree-search-httpd",
