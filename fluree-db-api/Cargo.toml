@@ -404,6 +404,10 @@ name = "transact_filtered_delete"
 harness = false
 
 [[bench]]
+name = "query_overlay_only_range"
+harness = false
+
+[[bench]]
 name = "query_cold_reload"
 harness = false
 
@@ -455,6 +459,11 @@ harness = false
 [[bench]]
 name = "annotation_planner"
 harness = false
+
+[[test]]
+name = "it_batched_refs_overlay_lifecycle"
+path = "tests/it_batched_refs_overlay_lifecycle.rs"
+required-features = ["native"]
 
 [[test]]
 name = "it_filtered_delete_list_meta"
