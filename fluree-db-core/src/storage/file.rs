@@ -112,6 +112,173 @@ fn is_tmp_artifact(name: &str) -> bool {
     name.ends_with(TMP_SUFFIX)
 }
 
+/// The process token embedded in a staging name, for names shaped the way
+/// [`tmp_sibling`] writes them (`<name>.<pid>.<token>.<seq>.tmp`).
+///
+/// Returns `None` for anything else ending in `.tmp` — a file an operator
+/// dropped there, or one written by an older version of this code. The sweep
+/// treats an unparseable name as *not* ours, which is the safe direction: it
+/// still has to clear the age threshold before anything happens to it.
+fn staging_token(name: &str) -> Option<&str> {
+    let rest = name.strip_suffix(TMP_SUFFIX)?;
+    let (head, _seq) = rest.rsplit_once('.')?;
+    let (_prefix, token) = head.rsplit_once('.')?;
+    Some(token)
+}
+
+/// How long a staging file must have gone untouched before a sweep may
+/// reclaim it.
+///
+/// A staging file's entire life is one [`stage_bytes`] call: create, write one
+/// in-memory buffer, optionally fsync, then rename or link immediately. There
+/// is no legitimate case where that takes a long time, which is what makes an
+/// age threshold a sound discriminator here — unlike an index build (#1635),
+/// whose duration grows with the ledger and so can never be bounded by a
+/// constant. A day is orders of magnitude past any real staging write and
+/// swamps NTP-scale clock skew between hosts sharing a mount.
+const STALE_STAGING_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Directory entries one sweep will look at before giving up.
+///
+/// The walk runs on the construction path, so it must not turn opening a large
+/// volume into a startup stall. Exhausting the budget leaves the rest of the
+/// tree for the next start rather than delaying this one — orphans are inert,
+/// so deferring them costs nothing but the disk they sit on.
+const SWEEP_ENTRY_BUDGET: usize = 100_000;
+
+/// What one sweep did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StagingSweep {
+    /// Staging files unlinked.
+    reclaimed: usize,
+    /// Staging files deliberately left alone — this process's own, too young,
+    /// or refusing to be removed.
+    kept: usize,
+    /// The entry budget ran out before the walk finished, so part of the tree
+    /// was never looked at.
+    truncated: bool,
+}
+
+/// Unlink staging files left behind by writes that never finished.
+///
+/// A crash between the `File::create` in [`stage_bytes`] and the rename that
+/// follows leaves a full copy of the object on disk under a `.tmp` name.
+/// `list_prefix` filters those out, so one can never be served as content —
+/// which is also precisely why nothing ever removed them. They accumulate, and
+/// the crash loop that produces them is often a disk-exhaustion crash loop, so
+/// the growth lands on the volume that can least afford it.
+///
+/// # What this will not delete
+///
+/// Storage is shared by more than one process in a multi-instance deployment,
+/// so a sweep that guessed wrong would pull a live writer's file out from under
+/// it. Two rules stop that:
+///
+/// 1. **Never this process's own.** The staging name carries a 64-bit token
+///    drawn once per process, so a name bearing our token is ours — in flight
+///    or already leaked, and a directory entry cannot tell those apart. Both
+///    are left alone. This rule is exact, not a heuristic.
+/// 2. **Never a file touched recently.** Anything modified within `older_than`
+///    is left for whoever is writing it. This rule *is* a heuristic: it reads
+///    the writer's clock through ours, and it assumes no legitimate staging
+///    write stays open that long. See [`STALE_STAGING_AGE`] for why that
+///    assumption holds for staging files specifically.
+///
+/// Anything the sweep cannot classify — a name it cannot parse, an entry it
+/// cannot stat, an mtime in the future — is kept. Every unknown resolves
+/// toward leaving the file alone.
+///
+/// If both rules were somehow beaten, the damage is bounded: on POSIX the
+/// writer keeps its open descriptor, so its `write_all` and `sync_all` still
+/// succeed against the now-unlinked inode and only the final rename fails. The
+/// write reports an error; nothing partial is ever published under a content
+/// address.
+fn sweep_orphaned_staging_files(
+    base: &Path,
+    older_than: std::time::Duration,
+    budget: usize,
+) -> StagingSweep {
+    let mut sweep = StagingSweep::default();
+    let own_token = format!("{:016x}", process_token());
+    let now = std::time::SystemTime::now();
+    let mut budget = budget;
+    let mut dirs = vec![base.to_path_buf()];
+
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                sweep.truncated = true;
+                return sweep;
+            }
+            budget -= 1;
+
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                dirs.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !is_tmp_artifact(&name) {
+                continue;
+            }
+            // Rule 1: ours, whatever its age.
+            if staging_token(&name) == Some(own_token.as_str()) {
+                sweep.kept += 1;
+                continue;
+            }
+            // Rule 2: young enough that someone may still be writing it. An
+            // mtime we cannot read, or one in the future, counts as young —
+            // `duration_since` fails on a future timestamp, and a clock the
+            // sweep does not understand is not grounds for deleting data.
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= older_than);
+            if !stale {
+                sweep.kept += 1;
+                continue;
+            }
+
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => sweep.reclaimed += 1,
+                // Someone else got there first, or the platform refuses to
+                // unlink a file another process still holds open (Windows).
+                // Both are fine outcomes for a best-effort reclaim.
+                Err(_) => sweep.kept += 1,
+            }
+        }
+    }
+    sweep
+}
+
+/// Base paths this process has already swept.
+///
+/// `FileStorage::new` runs once per connection, once per nameservice and again
+/// for the API's own handle, frequently on the same directory. Only the first
+/// walk can find anything; the rest would re-walk the tree to look at exactly
+/// the files the first one declined to touch.
+fn claim_sweep(base: &Path) -> bool {
+    static SWEPT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SWEPT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(base.to_path_buf())
+}
+
 /// Write `bytes` to a staging sibling of `path`, returning the staging path.
 ///
 /// Under [`Durability::Sync`] the contents are flushed before returning, so a
@@ -244,11 +411,66 @@ impl FileStorage {
     /// Durability defaults to [`Durability::Sync`], overridable for this
     /// process by [`Durability::ENV_VAR`] or per instance by
     /// [`Self::with_durability`].
+    ///
+    /// Constructing the storage also reclaims staging files orphaned by an
+    /// earlier crash — see [`sweep_orphaned_staging_files`] for what it will
+    /// and will not delete, and [`Self::SWEEP_ENV_VAR`] to turn it off. The
+    /// walk is bounded and runs at most once per base path per process.
     pub fn new(base_path: impl Into<std::path::PathBuf>) -> Self {
+        let base_path = base_path.into();
+        Self::sweep_on_construction(&base_path);
         Self {
-            base_path: base_path.into(),
+            base_path,
             durability: Durability::from_env(),
             fsyncs: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Set to a falsey value (`0`, `false`, `off`, `no`) to skip the
+    /// startup sweep of orphaned staging files.
+    ///
+    /// The escape hatch exists because the sweep walks the storage tree, and
+    /// an operator who knows their volume is enormous — or who wants a crash's
+    /// leftovers preserved for a post-mortem — should be able to say so
+    /// without patching the binary.
+    pub const SWEEP_ENV_VAR: &'static str = "FLUREE_STORAGE_TMP_SWEEP";
+
+    /// Whether [`Self::SWEEP_ENV_VAR`] asks for the sweep to be skipped.
+    fn sweep_disabled_by_env() -> bool {
+        std::env::var(Self::SWEEP_ENV_VAR)
+            .ok()
+            .is_some_and(|v| Self::env_says_off(&v))
+    }
+
+    /// Pure half of [`Self::sweep_disabled_by_env`], so the accepted spellings
+    /// are testable without touching process environment. Same spellings
+    /// [`Durability::ENV_VAR`] accepts — one convention for the whole storage
+    /// backend, not one per switch.
+    fn env_says_off(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    }
+
+    /// Reclaim orphaned staging files under `base_path`, at most once per path
+    /// per process.
+    fn sweep_on_construction(base_path: &Path) {
+        if Self::sweep_disabled_by_env() || !claim_sweep(base_path) {
+            return;
+        }
+        let sweep = sweep_orphaned_staging_files(base_path, STALE_STAGING_AGE, SWEEP_ENTRY_BUDGET);
+        // Silence is the normal case, and a startup log line per storage would
+        // be noise. Say something only when there was debris to report or a
+        // walk that did not finish.
+        if sweep.reclaimed > 0 || sweep.truncated {
+            tracing::info!(
+                base_path = %base_path.display(),
+                reclaimed = sweep.reclaimed,
+                kept = sweep.kept,
+                truncated = sweep.truncated,
+                "reclaimed staging files orphaned by an interrupted write"
+            );
         }
     }
 
@@ -855,6 +1077,8 @@ impl StorageCas for FileStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::time::{Duration, SystemTime};
 
     fn storage() -> (tempfile::TempDir, FileStorage) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1264,6 +1488,218 @@ mod tests {
             .filter(|n| is_tmp_artifact(n))
             .collect();
         assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Orphaned staging files
+    // ---------------------------------------------------------------------
+
+    /// Plant a staging file the way a crashed write would leave one, aged
+    /// `age` by setting its mtime rather than by waiting. `token` stands in
+    /// for the writing process, so a test can plant one that looks like
+    /// another instance's or like our own.
+    fn plant_staging_file(dir: &Path, name: &str, token: &str, age: Duration) -> PathBuf {
+        let path = dir.join(format!("{name}.4242.{token}.0{TMP_SUFFIX}"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"half a leaf").unwrap();
+        // Age the file by stamping its mtime, not by sleeping — the threshold
+        // is the thing under test, and a test that waits for a real clock is
+        // both slow and a flake waiting to happen.
+        file.set_modified(SystemTime::now() - age).unwrap();
+        assert!(path.exists());
+        path
+    }
+
+    fn own_token() -> String {
+        format!("{:016x}", process_token())
+    }
+
+    /// A crash between `File::create` and the rename leaves a full copy of the
+    /// object behind, and `list_prefix` hides it from every reader — which is
+    /// exactly why nothing ever removed it. Opening the storage has to.
+    #[test]
+    fn construction_reclaims_an_orphaned_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = plant_staging_file(
+            &dir.path().join("a/b"),
+            "leaf.json",
+            "0123456789abcdef",
+            STALE_STAGING_AGE * 2,
+        );
+
+        let _storage = FileStorage::new(dir.path());
+
+        assert!(
+            !orphan.exists(),
+            "an orphan older than the threshold survived construction: {}",
+            orphan.display()
+        );
+    }
+
+    /// THE ONE THAT MATTERS. Storage is shared in a multi-instance deployment,
+    /// so a sweep that deletes a staging file another process is still writing
+    /// takes that process's rename out from under it. A file young enough to
+    /// belong to a live write is not the sweep's business at any age policy.
+    #[test]
+    fn construction_leaves_a_live_looking_staging_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        // Another instance's token, written a moment ago — the shape of a
+        // write that is in flight right now.
+        let live = plant_staging_file(
+            dir.path(),
+            "commit.json",
+            "fedcba9876543210",
+            Duration::from_secs(0),
+        );
+
+        let _storage = FileStorage::new(dir.path());
+
+        assert!(
+            live.exists(),
+            "the sweep deleted a staging file a concurrent writer may still hold: {}",
+            live.display()
+        );
+    }
+
+    /// A file bearing our own token is either in flight on another task or
+    /// already leaked, and a directory entry cannot tell those apart. Age is
+    /// not allowed to break the tie: even with the threshold at zero, the
+    /// exact rule wins.
+    #[test]
+    fn our_own_staging_file_is_never_reclaimed_however_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = plant_staging_file(
+            dir.path(),
+            "mine.json",
+            &own_token(),
+            STALE_STAGING_AGE * 100,
+        );
+
+        let sweep = sweep_orphaned_staging_files(dir.path(), Duration::ZERO, SWEEP_ENTRY_BUDGET);
+
+        assert!(
+            ours.exists(),
+            "the sweep deleted this process's own staging file: {}",
+            ours.display()
+        );
+        assert_eq!(sweep.reclaimed, 0);
+        assert_eq!(sweep.kept, 1);
+    }
+
+    /// The token in the name is what separates our files from every other
+    /// writer's, so the sweep must read it out of a real `tmp_sibling` name
+    /// rather than a shape a test invented.
+    #[test]
+    fn staging_token_reads_what_tmp_sibling_writes() {
+        let name = tmp_sibling(Path::new("/data/a.json.gz"))
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(staging_token(&name), Some(own_token().as_str()), "{name}");
+
+        // Anything not shaped like a staging name is not ours, which is the
+        // safe answer: it still has to clear the age threshold.
+        assert_eq!(staging_token("plain.tmp"), None);
+        assert_eq!(staging_token("leaf.json"), None);
+        assert_ne!(staging_token("leaf.json.999.0.tmp"), Some(own_token().as_str()));
+    }
+
+    /// The threshold is the only thing standing between a foreign in-flight
+    /// write and deletion, so it has to be the age that decides — not merely
+    /// "is this file ours".
+    #[test]
+    fn only_files_past_the_threshold_are_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let threshold = Duration::from_secs(3600);
+        let young = plant_staging_file(dir.path(), "young.json", "aaaa", threshold / 2);
+        let old = plant_staging_file(dir.path(), "old.json", "bbbb", threshold * 2);
+
+        let sweep = sweep_orphaned_staging_files(dir.path(), threshold, SWEEP_ENTRY_BUDGET);
+
+        assert!(young.exists(), "a file inside the threshold was reclaimed");
+        assert!(!old.exists(), "a file past the threshold survived");
+        assert_eq!((sweep.reclaimed, sweep.kept), (1, 1));
+    }
+
+    /// An mtime in the future means the writer's clock and ours disagree, and
+    /// a clock the sweep does not understand is not grounds for deleting data.
+    #[test]
+    fn a_future_mtime_is_treated_as_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("skewed.json.7.cccc.0{TMP_SUFFIX}"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"partial").unwrap();
+        file.set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+
+        let sweep = sweep_orphaned_staging_files(dir.path(), Duration::ZERO, SWEEP_ENTRY_BUDGET);
+
+        assert!(path.exists(), "a future-dated staging file was reclaimed");
+        assert_eq!((sweep.reclaimed, sweep.kept), (0, 1));
+    }
+
+    /// Content is not staging debris. The sweep must not touch a real object
+    /// however old it is — content-addressed blobs are written once and then
+    /// sit there for the life of the ledger.
+    #[tokio::test]
+    async fn the_sweep_never_touches_content() {
+        let (dir, storage) = storage();
+        storage.write_bytes("a/b/real.json", b"content").await.unwrap();
+        let real = storage.resolve_path("a/b/real.json").unwrap();
+        // `futimens` needs a writable descriptor, so this cannot be a plain
+        // `File::open`.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&real)
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_STAGING_AGE * 10)
+            .unwrap();
+
+        let sweep = sweep_orphaned_staging_files(dir.path(), Duration::ZERO, SWEEP_ENTRY_BUDGET);
+
+        assert_eq!(sweep.reclaimed, 0, "the sweep reclaimed real content");
+        assert_eq!(storage.read_bytes("a/b/real.json").await.unwrap(), b"content");
+    }
+
+    /// The walk is on the construction path, so a huge volume must not turn
+    /// opening a ledger into a startup stall. Running out of budget stops the
+    /// walk and says so, rather than running to completion.
+    #[test]
+    fn the_walk_is_bounded_by_its_entry_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            plant_staging_file(dir.path(), &format!("o{i}.json"), "dddd", STALE_STAGING_AGE * 2);
+        }
+
+        let sweep = sweep_orphaned_staging_files(dir.path(), Duration::ZERO, 3);
+
+        assert!(sweep.truncated, "the budget did not stop the walk");
+        assert_eq!(sweep.reclaimed, 3, "the walk went past its budget");
+    }
+
+    /// One walk per base path per process. `FileStorage::new` runs once per
+    /// connection, once per nameservice and again for the API's own handle,
+    /// often on the same directory; re-walking the tree each time would only
+    /// re-examine the files the first walk declined to touch.
+    #[test]
+    fn a_base_path_is_swept_at_most_once_per_process() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(claim_sweep(dir.path()), "first claim must win");
+        assert!(!claim_sweep(dir.path()), "second claim must be refused");
+    }
+
+    /// Same spellings the durability switch accepts — one convention for the
+    /// storage backend, not one per environment variable.
+    #[test]
+    fn sweep_env_var_accepts_the_durability_spellings() {
+        for v in ["0", "false", "off", "no", "OFF", " false "] {
+            assert!(FileStorage::env_says_off(v), "{v:?}");
+        }
+        for v in ["1", "true", "on", "", "nonsense"] {
+            assert!(!FileStorage::env_says_off(v), "{v:?}");
+        }
     }
 
     /// Write a zero-length file directly, bypassing the storage API — which is

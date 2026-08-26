@@ -385,6 +385,37 @@ in place: nameservice head refs and ledger config.
 Configuration details: [Connection config (JSON-LD)](../reference/connection-config-jsonld.md#durability)
 and [Configuration](configuration.md).
 
+### Staging files left by a crash
+
+Because writes stage alongside the destination, a process killed between
+staging the bytes and moving them into place leaves the staged copy behind,
+named `<file>.<pid>.<token>.<seq>.tmp`. These are never served — listings skip
+them, so they can't be read back as content — but they are a full copy of the
+object being written, and a crash loop produces one per attempt.
+
+Opening a file-backed storage reclaims them. The sweep is deliberately timid,
+because in a multi-instance deployment the directory it is walking may have
+another process writing into it right now:
+
+- A staging file carrying **this process's token** is never removed, at any
+  age. In flight and already-leaked look identical from a directory entry.
+- A staging file **modified within the last 24 hours** is never removed. A
+  staging write is a single write of one in-memory buffer, so a day is far past
+  any real one.
+- Anything the sweep can't classify — an unparseable name, an entry it can't
+  stat, an mtime in the future — is kept.
+
+What this does *not* do is coordinate with other processes. It is an age
+heuristic, not a lease: it compares another host's clock against this one's,
+and a foreign staging write that somehow stayed open for over a day would be
+unlinked. Even then nothing is corrupted — on POSIX the writer keeps its open
+descriptor, so only its final rename fails and the write reports an error.
+
+The walk is bounded (100,000 directory entries) and runs at most once per
+directory per process; whatever it doesn't reach is picked up on a later start.
+Set `FLUREE_STORAGE_TMP_SWEEP=0` to skip it entirely — worth doing if you want
+a crash's leftovers preserved for a post-mortem.
+
 ## AWS Storage Details
 
 ### S3 Structure
