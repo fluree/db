@@ -142,6 +142,39 @@ impl std::fmt::Display for NeedFetch {
 
 impl std::error::Error for NeedFetch {}
 
+/// Opaque RAII handle marking a query in flight against a store's residency
+/// tier.
+///
+/// While any guard is alive the tier must not evict resident bytes — the
+/// no-eviction-while-in-flight policy that keeps the fetch-pins contract
+/// true across a retry loop's rounds (every byte a round observed stays
+/// resident for the re-run, so progress is monotone). A retry loop obtains
+/// one via [`crate::ContentStore::query_guard`] before its first attempt and
+/// holds it until the final round completes; dropping it ends the in-flight
+/// window.
+///
+/// The payload is store-defined (e.g. an in-flight counter decrement on
+/// drop); composing wrappers hold every inner guard.
+pub struct InFlightGuard(#[allow(dead_code)] Box<dyn std::any::Any + Send>);
+
+impl InFlightGuard {
+    pub fn new(hold: impl std::any::Any + Send) -> Self {
+        Self(Box::new(hold))
+    }
+
+    /// Compose several guards (e.g. a branched store's ancestry chain) into
+    /// one handle whose drop releases them all.
+    pub fn join(guards: Vec<InFlightGuard>) -> Self {
+        Self(Box::new(guards))
+    }
+}
+
+impl std::fmt::Debug for InFlightGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InFlightGuard")
+    }
+}
+
 /// Store-level record of residency misses: the wants a retry frame drains.
 ///
 /// Sync read paths record into it on every miss — and, where a caller knows
