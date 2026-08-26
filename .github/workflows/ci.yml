@@ -262,9 +262,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          workspaces: |
+            . -> target
+            wasm-probe -> target
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
 
       - name: Check engine stack (wasm32)
         run: cargo check --target wasm32-unknown-unknown -p fluree-db-api --no-default-features
 
       - name: Check parse layer, no default features (wasm32)
         run: cargo check --target wasm32-unknown-unknown --no-default-features -p fluree-vocab -p fluree-graph-ir -p fluree-graph-turtle -p fluree-graph-json-ld -p fluree-db-sparql
+
+      # Compiling is not running: wasm32-unknown-unknown panics at RUNTIME on
+      # Instant::now / SystemTime::now, thread spawns, and moka construction,
+      # none of which the check above can see. The probe drives the real
+      # memory-ledger create -> insert -> SPARQL query path under Node and
+      # exits 0 only on the future's own Ok (see wasm-probe/README.md).
+      - name: Runtime smoke (wasm32 under Node)
+        run: node wasm-probe/run-node.mjs
