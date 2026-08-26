@@ -34,7 +34,13 @@ async fn run() -> Result<usize, String> {
         .query(&view, "SELECT ?name WHERE { ?s <http://example.org/ns/name> ?name }")
         .await
         .map_err(|e| e.to_string())?;
-    Ok(format!("{result:?}").len())
+    // Positive ran-marker: the two inserted names must round-trip. An empty
+    // result exiting 0 would make the smoke vacuous.
+    let rendered = format!("{result:?}");
+    if !(rendered.contains("Alice") && rendered.contains("Bob")) {
+        return Err(format!("query result missing inserted names: {rendered}"));
+    }
+    Ok(rendered.len())
 }
 
 fn noop_waker() -> Waker {
