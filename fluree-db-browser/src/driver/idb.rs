@@ -353,6 +353,13 @@ impl IdbCache {
             }
         };
         if value.is_undefined() || value.is_null() {
+            // Store miss with a stale index entry (another tab's eviction,
+            // a failed transaction): drop the entry, or put()'s
+            // already-persisted skip would refuse to re-persist this block
+            // forever.
+            if self.index.borrow_mut().remove(&k).is_some() {
+                self.dirty.borrow_mut().remove(&k);
+            }
             return None;
         }
         let bytes = Bytes::from(Uint8Array::new(&value).to_vec());
@@ -386,13 +393,32 @@ impl IdbCache {
                 self.config.low_water_bytes(),
             )
         };
+        // Apply the eviction to the in-memory index BEFORE awaiting the
+        // transaction: the access-time flusher can run in that window, and
+        // consulting the un-updated index would let it resurrect meta for a
+        // victim the transaction just deleted (an orphan that inflates the
+        // rebuilt index at next open). The NEW key enters the index only
+        // after the transaction commits, so the flusher can never write
+        // meta for a block that might not land.
+        {
+            let mut index = self.index.borrow_mut();
+            index.apply_eviction(&victims);
+        }
+        {
+            let mut dirty = self.dirty.borrow_mut();
+            for victim in &victims {
+                dirty.remove(victim);
+            }
+        }
         match self.write(&k, &bytes, size, now, &victims).await {
             Ok(()) => {
-                let mut index = self.index.borrow_mut();
-                index.apply_eviction(&victims);
-                index.insert(k, size, now);
+                self.index.borrow_mut().insert(k, size, now);
             }
             Err(e) => {
+                // Victims are already gone from the index; if their blocks
+                // survived the failed transaction, get() re-adopts them
+                // (self-healing). The new block is in neither store nor
+                // index — consistent.
                 tracing::warn!(key = %k, error = %js_text(e), "IndexedDB put failed");
             }
         }

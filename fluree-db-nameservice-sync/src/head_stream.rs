@@ -193,6 +193,10 @@ pub async fn run_head_stream(
             Err(SseConnectError::Retryable(reason)) => {
                 sink.on_event(RemoteEvent::Disconnected { reason }).await;
                 let delay = backoff.next_delay();
+                tracing::info!(
+                    reconnect_in_ms = delay.as_millis() as u64,
+                    "head stream reconnecting"
+                );
                 if until_stopped(sleeper.sleep(delay), &mut stop)
                     .await
                     .is_none()
@@ -239,6 +243,10 @@ pub async fn run_head_stream(
                     backoff.reset();
                 }
                 let delay = backoff.next_delay();
+                tracing::info!(
+                    reconnect_in_ms = delay.as_millis() as u64,
+                    "head stream reconnecting"
+                );
                 if until_stopped(sleeper.sleep(delay), &mut stop)
                     .await
                     .is_none()

@@ -117,8 +117,8 @@ pub struct ResidencyTier {
     budget: usize,
     inner: Mutex<Inner>,
     in_flight: AtomicUsize,
-    /// Notified when room may have appeared: the last in-flight query
-    /// finished, or resident bytes were removed.
+    /// Notified when room may have appeared: any query guard dropped
+    /// (which can advance the eviction epoch), or resident bytes removed.
     released: Notify,
 }
 

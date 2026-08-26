@@ -113,13 +113,34 @@ pub async fn run(
         )),
     };
 
-    let _ = ready.send(Ok(()));
+    if ready.send(Ok(())).is_err() {
+        // The connect attempt was abandoned before headers arrived (pump
+        // stopped): do not stream into the void.
+        let _ = reader.cancel();
+        controller.abort();
+        return;
+    }
 
     loop {
-        let chunk = match JsFuture::from(reader.read()).await {
-            Ok(chunk) => chunk,
-            Err(e) => {
+        // Race each read against the consumer going away: an IDLE stream
+        // (no frames arriving) whose receiver was dropped must release its
+        // connection immediately, not on the next chunk — otherwise a
+        // stopped pump leaves a zombie request occupying one of the
+        // browser's few per-host connection slots.
+        let read = JsFuture::from(reader.read());
+        let closed = chunks.closed();
+        futures::pin_mut!(read);
+        futures::pin_mut!(closed);
+        let chunk = match futures::future::select(read, closed).await {
+            futures::future::Either::Left((Ok(chunk), _)) => chunk,
+            futures::future::Either::Left((Err(e), _)) => {
                 let _ = chunks.send(Err(js_error_text(&e)));
+                return;
+            }
+            futures::future::Either::Right(_) => {
+                // Consumer stopped: cancel the stream and abort the fetch.
+                let _ = reader.cancel();
+                controller.abort();
                 return;
             }
         };
@@ -136,7 +157,7 @@ pub async fn run(
         };
         let bytes = Bytes::from(Uint8Array::new(&value).to_vec());
         if chunks.send(Ok(bytes)).is_err() {
-            // Consumer stopped: cancel the stream and abort the fetch.
+            // Consumer stopped between reads.
             let _ = reader.cancel();
             controller.abort();
             return;

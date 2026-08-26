@@ -72,7 +72,12 @@ impl BrowserIoConfig {
             ((max_memory_bytes / 10) as u64).clamp(8 * 1024 * 1024, 128 * 1024 * 1024);
         let width = (max_memory_bytes / (64 * 1024 * 1024)).clamp(2, 16);
         Self {
-            residency_budget_bytes: max_memory_bytes / 100 * 55,
+            // Divide-before-multiply is deliberate: `* 55` first would
+            // overflow a 32-bit usize for ceilings above ~78 MiB. The
+            // 32 MiB floor keeps a tiny ceiling degraded (small cache,
+            // more refetching) rather than bricked — below it, ordinary
+            // leaflets already fail ObjectExceedsBudget.
+            residency_budget_bytes: (max_memory_bytes / 100 * 55).max(32 * 1024 * 1024),
             write_behind_budget_bytes: write_behind,
             max_concurrent_fetches: width,
             ..Default::default()
@@ -140,5 +145,10 @@ mod tests {
         let small = BrowserIoConfig::from_max_memory(64 * 1024 * 1024);
         assert_eq!(small.write_behind_budget_bytes, 8 * 1024 * 1024);
         assert_eq!(small.max_concurrent_fetches, 2);
+
+        // A tiny ceiling hits the residency floor: degraded (more
+        // refetching), never bricked on ordinary leaflet sizes.
+        let tiny = BrowserIoConfig::from_max_memory(16 * 1024 * 1024);
+        assert_eq!(tiny.residency_budget_bytes, 32 * 1024 * 1024);
     }
 }
