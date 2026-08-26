@@ -2439,10 +2439,28 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
     // `t` and replace the head's content lineage with a non-
     // descendant. Push the popped entry back at the front so the
     // worker retries once its local view catches up.
-    // The read borrows only `.t` (a `Copy`), so it ends before the
-    // `state.queues` push-back below.
-    if let Some(current_t) = state.refs.get(&ref_key).map(|r| r.t) {
-        if commit_t <= current_t {
+    //
+    // One deliberate exception: the no-op completion. A worker that
+    // staged a zero-change transaction completes its queue entry by
+    // republishing the branch's CURRENT head unchanged (the
+    // commit worker's no-change arm), which arrives here as
+    // `commit_t == current_t` with `commit_id` equal to the stored
+    // head. That is not a stale writer — it is the designed way an
+    // entry that advances nothing leaves the queue. Rejecting it
+    // (as this guard once did) pushed the entry back and stranded
+    // the submission in a re-stage → reject loop, since re-staging
+    // a no-op can only ever reproduce the same unchanged head.
+    // The read copies `.t` and the head comparison out, so the
+    // borrow ends before the `state.queues` push-back below.
+    let mut noop_completion = false;
+    if let Some((current_t, head_matches)) = state
+        .refs
+        .get(&ref_key)
+        .map(|r| (r.t, r.head == commit_id))
+    {
+        if commit_t == current_t && head_matches {
+            noop_completion = true;
+        } else if commit_t <= current_t {
             state
                 .queues
                 .get_mut(&ref_key)
@@ -2471,27 +2489,30 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
     // Advance the branch's `RefEntry`. Mutate the existing entry in
     // place so its index pointer + lineage (source/child count) stay
     // put without cloning them out and rebuilding; only a fresh
-    // branch (no entry yet) takes the insert path.
-    match state.refs.get_mut(&ref_key) {
-        Some(existing) => {
-            existing.head = commit_id.clone();
-            existing.t = commit_t;
-            existing.last_advanced_at_millis = applied_at_millis;
-            existing.last_advanced_index = log_index;
-        }
-        None => {
-            state.refs.insert(
-                ref_key.clone(),
-                RefEntry {
-                    head: commit_id.clone(),
-                    t: commit_t,
-                    last_advanced_at_millis: applied_at_millis,
-                    last_advanced_index: log_index,
-                    index: None,
-                    source_branch: None,
-                    branches: 0,
-                },
-            );
+    // branch (no entry yet) takes the insert path. A no-op
+    // completion advances nothing — the ref already IS this head.
+    if !noop_completion {
+        match state.refs.get_mut(&ref_key) {
+            Some(existing) => {
+                existing.head = commit_id.clone();
+                existing.t = commit_t;
+                existing.last_advanced_at_millis = applied_at_millis;
+                existing.last_advanced_index = log_index;
+            }
+            None => {
+                state.refs.insert(
+                    ref_key.clone(),
+                    RefEntry {
+                        head: commit_id.clone(),
+                        t: commit_t,
+                        last_advanced_at_millis: applied_at_millis,
+                        last_advanced_index: log_index,
+                        index: None,
+                        source_branch: None,
+                        branches: 0,
+                    },
+                );
+            }
         }
     }
 
@@ -4244,6 +4265,81 @@ mod tests {
                 },
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn apply_head_completes_a_no_op_republish_of_the_current_head() {
+        // The commit worker's no-change arm completes a zero-change
+        // transaction by republishing the branch's CURRENT head
+        // unchanged. Equal `t` + equal commit id is that completion,
+        // not a stale writer: the entry must be consumed and the ref
+        // left untouched. Refusing it (as the monotonic guard once
+        // did) pushed the entry back and stranded the submission in a
+        // re-stage → reject loop — a no-op can only ever reproduce
+        // the same unchanged head.
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let qid1 = match apply(&mut state, enqueue("test/db", "main", 7, None), 2) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid1, cid(20), 20),
+            3,
+        );
+
+        let key = body_kid("noop");
+        let qid2 = match apply(
+            &mut state,
+            enqueue("test/db", "main", 8, Some(key.clone())),
+            4,
+        ) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        // Same commit id AND same t as the current head: the no-op
+        // completion.
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid2, cid(20), 20),
+            5,
+        );
+        match resp {
+            Response::HeadApplied {
+                commit_id,
+                commit_t,
+                ..
+            } => {
+                assert_eq!(commit_id, cid(20));
+                assert_eq!(commit_t, 20);
+            }
+            other => panic!("expected HeadApplied, got {other:?}"),
+        }
+
+        // Entry consumed — the queue drained (and was dropped empty).
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(state
+            .queues
+            .get(&ref_key)
+            .map(VecDeque::is_empty)
+            .unwrap_or(true));
+
+        // Ref untouched: same head, same t, and the advance stamp
+        // still points at the REAL advance (log index 3), not the
+        // no-op's apply.
+        let entry = state.refs.get(&ref_key).expect("ref present");
+        assert_eq!(entry.head, cid(20));
+        assert_eq!(entry.t, 20);
+        assert_eq!(entry.last_advanced_index, 3);
+
+        // The keyed no-op is idempotency-cached like any completion,
+        // so a retry of the same submission dedups instead of
+        // re-queueing.
+        assert!(matches!(
+            state.idempotency.get(&key),
+            Some(ApplyOutcome::Applied(_))
         ));
     }
 
