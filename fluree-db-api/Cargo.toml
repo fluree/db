@@ -424,6 +424,14 @@ harness = false
 name = "query_hot_bsbm"
 harness = false
 
+# Same-subject star with a fan-out predicate whose object var is unprojected —
+# the shape `PropertyJoinOperator`'s semijoin demotion serves. Its own fixture:
+# BSBM has no multi-valued same-subject predicate and adding one would move
+# `query_hot_bsbm`'s committed baseline for unrelated cases.
+[[bench]]
+name = "query_hot_fanout_star"
+harness = false
+
 [[bench]]
 name = "query_overlay_matrix"
 harness = false
