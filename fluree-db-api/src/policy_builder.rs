@@ -400,6 +400,12 @@ async fn build_policy_context_from_opts_inner(
     // Policies need the full novelty-aware class/property view so `f:onClass`
     // restrictions apply even when novelty adds properties without restating
     // the subject's `@type` in the same transaction.
+    //
+    // Deliberately the ESTIMATE merge (#1391): policy enforcement reads which
+    // properties a class *has*, never how many facts carry them, so a
+    // duplicate re-assert inflating a count changes no enforcement decision —
+    // and this builder runs uncached on every governed query, where per-fact
+    // base probes would be a real cost.
     let stats: Option<IndexStats> = if let Some(novelty) = novelty_for_stats {
         let indexed = snapshot.stats.clone().unwrap_or_default();
         let lookup = PolicyStatsLookup { overlay };

@@ -55,6 +55,25 @@ pub(crate) fn cached_stats_view_for_db(
                 store: binary_store.map(std::convert::AsRef::as_ref),
                 runtime_small_dicts: db.runtime_small_dicts,
             };
+            // Deliberately the ESTIMATE merge (`NoveltyMerge::Estimate`), not
+            // the base-reconciled one the user-facing count surfaces use
+            // (#1391). Two reasons this lane keeps the blind +1/-1 delta log:
+            //
+            // 1. Nothing here answers a user's COUNT. Every count-serving fast
+            //    path gates on `fast_path_store`, which declines outright when
+            //    the overlay can still contribute flakes — so with non-empty
+            //    novelty the exact answer always comes from the generic
+            //    pipeline, which reads through the overlay and sees set
+            //    semantics. These numbers only order joins.
+            // 2. This view is rebuilt on every overlay epoch bump (i.e. every
+            //    commit) and reconciliation costs one base probe per
+            //    `(graph, subject, predicate)` in the window — which would make
+            //    accumulating a novelty window quadratic in its own size.
+            //
+            // A duplicate re-assert therefore still inflates planner
+            // cardinality estimates by one until the next reindex. That is the
+            // same class of imprecision `ndv_*` and `last_modified_t` already
+            // carry here.
             assemble_fast_stats(
                 &indexed,
                 db.snapshot,

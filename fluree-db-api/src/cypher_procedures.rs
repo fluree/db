@@ -12,8 +12,11 @@
 //! like any other Cypher read.
 //!
 //! Answers come from the HEAD-index stats merged with novelty
-//! ([`assemble_fast_stats`]), so labels and types written since the last
-//! index build are visible. Like Neo4j's own catalog procedures, the
+//! ([`assemble_fast_stats_with`]), so labels and types written since the
+//! last index build are visible. That merge runs in
+//! [`NoveltyMerge::Reconciled`] mode: these numbers are read by people and by
+//! schema-introspecting tooling, so a novelty assertion that restates an
+//! already-indexed fact must not be counted twice (#1391). Like Neo4j's own catalog procedures, the
 //! answers are lenient about tombstones: a label or key whose every fact
 //! was later retracted may keep appearing until a reindex.
 //!
@@ -31,7 +34,7 @@ use fluree_db_cypher::ast::{
     Expr, Literal, ProcedureCall, ProjectionItem, Query, ReadClause, ReturnClause, Variable,
     WithClause,
 };
-use fluree_db_novelty::{assemble_fast_stats, Novelty};
+use fluree_db_novelty::{assemble_fast_stats_with, Novelty, NoveltyDeltaResolver, NoveltyMerge};
 use fluree_db_query::policy::QueryPolicyEnforcer;
 
 use crate::error::ApiError;
@@ -251,6 +254,13 @@ fn meta_data_rows(
 
     // Source 2: novelty attribution. Pass A collects subject classes from
     // novelty `rdf:type`; pass B attributes novelty property flakes to them.
+    //
+    // Pass B's per-flake delta comes from a `NoveltyDeltaResolver`, not from
+    // `flake.op`: source 1 above already counted every fact the base index
+    // holds, so a novelty assertion restating one of them must charge zero or
+    // this row reports a fact twice (#1391). Pass A needs no such treatment —
+    // it tracks class *membership*, where a duplicate re-assert of a type it
+    // already has is idempotent by construction.
     if let Some(novelty) = overlay.and_then(|o| o.as_any().downcast_ref::<Novelty>()) {
         let mut subject_classes: HashMap<Sid, BTreeSet<Sid>> = HashMap::new();
         for flake in novelty.iter_flakes(IndexType::Post) {
@@ -266,6 +276,8 @@ fn meta_data_rows(
                 }
             }
         }
+        let mut deltas =
+            NoveltyDeltaResolver::new(&indexed, snapshot, novelty, NoveltyMerge::Reconciled);
         for flake in novelty.iter_flakes(IndexType::Post) {
             if !meta_include(flake) || is_rdf_type(&flake.p) {
                 continue;
@@ -273,7 +285,10 @@ fn meta_data_rows(
             let Some(classes) = subject_classes.get(&flake.s) else {
                 continue;
             };
-            let delta = if flake.op { 1 } else { -1 };
+            let delta = deltas.delta_for(flake);
+            if delta == 0 {
+                continue;
+            }
             for class in classes {
                 let key = (class.clone(), flake.p.clone());
                 if let FlakeValue::Ref(target) = &flake.o {
@@ -291,6 +306,7 @@ fn meta_data_rows(
                 }
             }
         }
+        deltas.finish();
     }
 
     // Render: one row per (label, property, type) for node properties, one
@@ -582,10 +598,24 @@ fn predicate_denied(enforcer: &QueryPolicyEnforcer, p: &Sid) -> bool {
 /// HEAD-index stats merged with novelty, so labels/types/keys written since
 /// the last index build are visible. Non-`Novelty` overlays (policy views)
 /// contribute no new schema, so the indexed stats stand alone there.
+///
+/// Merged with [`NoveltyMerge::Reconciled`]: `apoc.meta.data` renders these
+/// counts to users and to schema-introspecting tooling, so a novelty
+/// assertion that merely restates a fact already in the base index must not
+/// be charged twice (#1391). The reconciliation costs one bounded base-index
+/// probe per `(graph, subject, predicate)` novelty touched — a per-request
+/// catalog call, not a hot path.
 fn merged_stats(snapshot: &LedgerSnapshot, overlay: Option<&dyn OverlayProvider>) -> IndexStats {
     let indexed = snapshot.stats.clone().unwrap_or_default();
     match overlay.and_then(|o| o.as_any().downcast_ref::<Novelty>()) {
-        Some(novelty) => assemble_fast_stats(&indexed, snapshot, novelty, i64::MAX, None),
+        Some(novelty) => assemble_fast_stats_with(
+            &indexed,
+            snapshot,
+            novelty,
+            i64::MAX,
+            None,
+            NoveltyMerge::Reconciled,
+        ),
         None => indexed,
     }
 }
