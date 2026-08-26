@@ -34,9 +34,13 @@ async fn run() -> Result<usize, String> {
         .query(&view, "SELECT ?name WHERE { ?s <http://example.org/ns/name> ?name }")
         .await
         .map_err(|e| e.to_string())?;
-    // Positive ran-marker: the two inserted names must round-trip. An empty
-    // result exiting 0 would make the smoke vacuous.
-    let rendered = format!("{result:?}");
+    // Positive ran-marker: the two inserted names must round-trip in the
+    // FORMATTED result (Debug shows encoded bindings, not literals). An
+    // empty result exiting 0 would make the smoke vacuous.
+    let rendered = result
+        .to_sparql_json(&view.snapshot)
+        .map_err(|e| e.to_string())?
+        .to_string();
     if !(rendered.contains("Alice") && rendered.contains("Bob")) {
         return Err(format!("query result missing inserted names: {rendered}"));
     }
