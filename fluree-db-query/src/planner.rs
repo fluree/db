@@ -1240,6 +1240,64 @@ struct DeferredPattern {
     orig_index: usize,
     required_vars: HashSet<VarId>,
     pattern: Pattern,
+    /// May this pattern be nested INTO a preceding compound (UNION / GRAPH /
+    /// SERVICE) once it becomes ready — see [`try_nest_deferred`]?
+    ///
+    /// True for the dependency-placed FILTER/BIND/subquery cases, where nesting
+    /// is the whole point (filter pushdown into each branch). False for a
+    /// pattern deferred purely to preserve WRITTEN ORDER: nesting it inside a
+    /// container that was itself placed early puts it back above the pattern
+    /// the barrier exists to keep it below (#1690).
+    nestable: bool,
+}
+
+/// Must a `VALUES` at this position stay behind the patterns written before it?
+///
+/// True when some PRECEDING `Pattern::Optional` *introduces* one of the VALUES
+/// variables — binds it where nothing ahead of that OPTIONAL already did.
+///
+/// `Join(LeftJoin(P, O), V)` and `LeftJoin(Join(P, V), O)` are the same query
+/// only when `V` binds nothing `O` introduces. When `O` does introduce one of
+/// `V`'s variables, hoisting `V` seeds that variable before the left join even
+/// runs; the left join then matches on the seeded value and — being a left join,
+/// so dropping nothing — lets every driving row out carrying it (#1690).
+///
+/// A variable already bound ahead of the OPTIONAL is deliberately NOT counted:
+/// there the OPTIONAL only *restricts* a required variable, and restricting a
+/// required variable commutes across the left join. So `VALUES ?ev` over an
+/// `?ev` a preceding triple binds keeps its seed, and with it the
+/// exact-cardinality seed race that `values_seed_beats_disconnected_class_anchor`
+/// pins (the 21k-row UNWIND cliff).
+///
+/// Scope note: only `Optional` siblings in this group are inspected, matching
+/// the MINUS/EXISTS arm's altitude. An OPTIONAL nested inside a preceding
+/// `Graph`/`Service` container is not covered here.
+fn values_needs_optional_barrier(
+    values_vars: &[VarId],
+    preceding: &[Pattern],
+    initial_bound_vars: &HashSet<VarId>,
+) -> bool {
+    if values_vars.is_empty() {
+        return false;
+    }
+    let wanted: HashSet<VarId> = values_vars.iter().copied().collect();
+    // Variables bound REQUIREDLY before the OPTIONAL under test. An OPTIONAL
+    // contributes nothing here — it binds nothing unconditionally.
+    let mut required_before: HashSet<VarId> = initial_bound_vars.clone();
+    for p in preceding {
+        if let Pattern::Optional(inner) = p {
+            if inner
+                .iter()
+                .flat_map(super::ir::Pattern::produced_vars)
+                .any(|v| wanted.contains(&v) && !required_before.contains(&v))
+            {
+                return true;
+            }
+        } else {
+            required_before.extend(p.produced_vars());
+        }
+    }
+    false
 }
 
 /// Reorder all pattern types for optimal join order.
@@ -1300,10 +1358,17 @@ pub fn reorder_patterns(
     // VALUES vars into the anchor set lets the existing class-anchor
     // demotion fire at seed time; genuinely class-only queries keep their
     // seed via the demotion's non-empty-pool fallback.
+    //
+    // A VALUES held behind an OPTIONAL barrier (see
+    // [`values_needs_optional_barrier`]) is deliberately excluded: it is not
+    // seeding anything, so letting it demote a class anchor would cost that
+    // anchor its seed with nothing taking its place.
     let mut seed_anchor_vars: HashSet<VarId> = subquery_output_vars.clone();
-    for p in patterns {
+    for (i, p) in patterns.iter().enumerate() {
         if let Pattern::Values { vars, .. } = p {
-            seed_anchor_vars.extend(vars.iter().copied());
+            if !values_needs_optional_barrier(vars, &patterns[..i], initial_bound_vars) {
+                seed_anchor_vars.extend(vars.iter().copied());
+            }
         }
     }
 
@@ -1336,8 +1401,52 @@ pub fn reorder_patterns(
                 orig_index: i,
                 required_vars: required,
                 pattern: pattern.clone(),
+                nestable: true,
             });
             continue;
+        }
+
+        // A VALUES is order-sensitive for exactly the same reason MINUS is
+        // whenever a PRECEDING OPTIONAL introduces one of its variables.
+        //
+        // `Pattern::Values` is otherwise an exact-cardinality *source* and wins
+        // the seed race outright (see `seed_anchor_vars` above), which rewrites
+        // `Join(LeftJoin(P, O), V)` into `LeftJoin(Join(P, V), O)`. Those are
+        // NOT the same query: with `V` seeded first the left join matches
+        // against an already-bound variable and, dropping nothing, lets every
+        // driving row out carrying the seeded value. A row whose OPTIONAL bound
+        // `?b` to `ns:X0` is then reported as `?b = ns:B` — a fabricated
+        // binding, not merely an extra row (#1690).
+        //
+        // Deferring on the preceding patterns' produced vars — which include
+        // the OPTIONAL's own, per `Pattern::produced_vars` — lands the VALUES
+        // immediately after the OPTIONAL, i.e. the plan the post-query
+        // `} VALUES …` spelling already gets and the one W3C `bindings/values07`
+        // pins.
+        //
+        // The barrier does NOT turn the VALUES into a filter. Per SPARQL 1.1
+        // §18.2.4 this stays `Join(…, ToMultiSet(data))`, and a solution whose
+        // OPTIONAL left the variable UNBOUND is *compatible* with every VALUES
+        // row: it SURVIVES and ADOPTS the VALUES binding. `FILTER(?b = …)` is
+        // not the equivalent rewrite — FILTER drops unbound rows, VALUES adopts
+        // them.
+        //
+        // `nestable: false` because the barrier is about WRITTEN ORDER: letting
+        // the VALUES be folded into a preceding UNION/GRAPH/SERVICE that the
+        // greedy loop placed early would put it back above the OPTIONAL.
+        if let Pattern::Values { vars, .. } = pattern {
+            if values_needs_optional_barrier(vars, &patterns[..i], initial_bound_vars) {
+                deferred.push(DeferredPattern {
+                    orig_index: i,
+                    required_vars: patterns[..i]
+                        .iter()
+                        .flat_map(super::ir::Pattern::produced_vars)
+                        .collect(),
+                    pattern: pattern.clone(),
+                    nestable: false,
+                });
+                continue;
+            }
         }
 
         // A CORRELATED subquery — one whose SELECT list shares variables with
@@ -1358,6 +1467,7 @@ pub fn reorder_patterns(
                     orig_index: i,
                     required_vars: corr,
                     pattern: pattern.clone(),
+                    nestable: true,
                 });
                 continue;
             }
@@ -1374,6 +1484,7 @@ pub fn reorder_patterns(
                     orig_index: i,
                     required_vars: needs,
                     pattern: pattern.clone(),
+                    nestable: true,
                 });
                 continue;
             }
@@ -1431,6 +1542,7 @@ pub fn reorder_patterns(
                     orig_index: i,
                     required_vars,
                     pattern: pattern.clone(),
+                    nestable: true,
                 });
             }
         }
@@ -1879,9 +1991,10 @@ fn drain_ready_deferred(
         ready.sort_by_key(|dp| dp.orig_index);
 
         for dp in ready {
-            let nested = result
-                .last_mut()
-                .is_some_and(|last| try_nest_deferred(last, &dp));
+            let nested = dp.nestable
+                && result
+                    .last_mut()
+                    .is_some_and(|last| try_nest_deferred(last, &dp));
 
             // A deferred pattern's produced variables must enter the bound set
             // so later patterns referencing them place after and correlate.
@@ -4173,6 +4286,85 @@ mod tests {
         assert!(
             matches!(ordered[0], Pattern::Values { .. }),
             "the exact-cardinality VALUES must seed, not the class anchor: {ordered:?}"
+        );
+    }
+
+    /// One-row VALUES over a variable an `OPTIONAL` introduces.
+    fn optional_shadowed_values_group() -> (Pattern, Pattern, Pattern) {
+        let (ev, a, b) = (VarId(0), VarId(1), VarId(2));
+        let anchor = Pattern::Triple(make_pattern(ev, "entity1", a));
+        let optional = Pattern::Optional(vec![Pattern::Triple(make_pattern(ev, "entity2", b))]);
+        let values = Pattern::Values {
+            vars: vec![b],
+            rows: vec![vec![crate::binding::Binding::lit(
+                FlakeValue::Long(1),
+                Sid::new(2, "long"),
+            )]],
+        };
+        (anchor, optional, values)
+    }
+
+    #[test]
+    fn values_after_optional_is_not_hoisted_above_it() {
+        // `?ev :entity1 ?a . OPTIONAL { ?ev :entity2 ?b } . VALUES ?b { … }`.
+        // Seeding the VALUES rewrites `Join(LeftJoin(P, O), V)` as
+        // `LeftJoin(Join(P, V), O)`: the left join then drops nothing and every
+        // driving row exits carrying the seeded value — a binding the data
+        // never had for it (#1690).
+        let (anchor, optional, values) = optional_shadowed_values_group();
+        let ordered = reorder_patterns(&[anchor, optional, values], None, &HashSet::new());
+
+        let optional_at = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Optional(_)))
+            .expect("OPTIONAL survives the reorder");
+        let values_at = ordered
+            .iter()
+            .position(|p| matches!(p, Pattern::Values { .. }))
+            .expect("VALUES survives the reorder");
+        assert!(
+            values_at > optional_at,
+            "VALUES over an OPTIONAL-introduced var must stay below it: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn values_before_optional_still_seeds() {
+        // The barrier is positional: written FIRST, the same VALUES is the
+        // correct seed and keeps it.
+        let (anchor, optional, values) = optional_shadowed_values_group();
+        let ordered = reorder_patterns(&[values, anchor, optional], None, &HashSet::new());
+        assert!(
+            matches!(ordered[0], Pattern::Values { .. }),
+            "a VALUES written before the OPTIONAL still seeds: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn values_on_a_required_var_still_seeds_past_an_optional() {
+        // The OPTIONAL only RESTRICTS `?ev` — a preceding triple already binds
+        // it — so restricting it commutes across the left join and the seed is
+        // kept. Without this carve-out every OPTIONAL mentioning the seed
+        // variable would cost the exact-cardinality seed (the 21k-row UNWIND
+        // cliff `values_seed_beats_disconnected_class_anchor` pins).
+        let (ev, a, b) = (VarId(0), VarId(1), VarId(2));
+        let anchor = Pattern::Triple(make_pattern(ev, "entity1", a));
+        let optional = Pattern::Optional(vec![Pattern::Triple(make_pattern(ev, "entity2", b))]);
+        let values = Pattern::Values {
+            vars: vec![ev],
+            rows: (0..3)
+                .map(|i| {
+                    vec![crate::binding::Binding::lit(
+                        FlakeValue::Long(i),
+                        Sid::new(2, "long"),
+                    )]
+                })
+                .collect(),
+        };
+        let ordered = reorder_patterns(&[anchor, optional, values], None, &HashSet::new());
+        assert!(
+            matches!(ordered[0], Pattern::Values { .. }),
+            "VALUES over a var the OPTIONAL only restricts must keep its seed: {ordered:?}"
         );
     }
 

@@ -621,6 +621,144 @@ async fn trailing_values_keeps_minus_correlated() {
     assert_eq!(rows, normalize_rows(&json!([])));
 }
 
+// --- a trailing VALUES over an OPTIONAL-bound variable (#1690) -------------
+//
+// `{ P . OPTIONAL { O } . VALUES ?v { … } }` is `Join(LeftJoin(P, O), V)`.
+// Hoisting the VALUES to seed position makes it `LeftJoin(Join(P, V), O)` —
+// the left join then matches an already-bound `?v` and, dropping nothing, lets
+// every driving row out carrying the seeded value. The answer is not merely
+// too big: rows report a binding the data never had for them.
+//
+// The correct answer is NOT the FILTER rewrite. Per SPARQL 1.1 §18.2.4 this is
+// a JOIN, and a solution whose OPTIONAL left `?v` UNBOUND is compatible with
+// every VALUES row: it SURVIVES and ADOPTS the value. W3C
+// `sparql11/bindings/values07` pins exactly this three-way outcome, and the
+// fixture below reproduces it:
+//
+//   * `ex:cam` / `ex:liam` — OPTIONAL bound `?f` to `ex:alice`     → KEPT
+//   * `ex:alice`           — OPTIONAL bound `?f` to `ex:brian`     → DROPPED
+//   * `ex:brian` / `ex:nikola` — no `ex:friend` at all, `?f` UNBOUND
+//                                                     → KEPT, ADOPTS `ex:alice`
+
+const OPTIONAL_THEN_VALUES: &str = "SELECT ?s ?f WHERE { ?s schema:name ?name . \
+     OPTIONAL { ?s ex:friend ?f } VALUES ?f { ex:alice } }";
+
+#[tokio::test]
+async fn trailing_values_over_an_optional_var_joins_instead_of_seeding() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    let rows = sparql_rows(&fluree, &ledger, OPTIONAL_THEN_VALUES).await;
+
+    // `ex:alice`'s only friend is `ex:brian`, so no solution may report her
+    // with `?f = ex:alice`. That row is the fabricated binding the hoist
+    // invented — it used to be here, and its absence is the whole fix.
+    let fabricated = normalize_rows(&json!([["ex:alice", "ex:alice"]]));
+    assert!(
+        !rows.iter().any(|r| fabricated.contains(r)),
+        "ex:alice has no ex:friend ex:alice; the VALUES must not fabricate one: {rows:?}"
+    );
+
+    assert_eq!(
+        rows,
+        normalize_rows(&json!([
+            // bound and compatible — kept with the binding the data gave them
+            ["ex:cam", "ex:alice"],
+            ["ex:liam", "ex:alice"],
+            // UNBOUND — compatible with every VALUES row, so kept AND bound
+            ["ex:brian", "ex:alice"],
+            ["ex:nikola", "ex:alice"]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn in_group_values_matches_the_post_query_spelling() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    // The two spellings of the same query. The post-query form (`} VALUES …`)
+    // has always planned correctly; it is the reference answer.
+    let in_group = sparql_rows(&fluree, &ledger, OPTIONAL_THEN_VALUES).await;
+    let post_query = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?f WHERE { ?s schema:name ?name . \
+         OPTIONAL { ?s ex:friend ?f } } VALUES ?f { ex:alice }",
+    )
+    .await;
+
+    assert_eq!(in_group, post_query);
+}
+
+#[tokio::test]
+async fn trailing_values_is_a_join_not_a_filter() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    // Pins the §18.2.4 distinction so the fix is never "simplified" into the
+    // FILTER semantics: FILTER evaluates `?f = ex:alice` to an error on an
+    // unbound `?f` and drops the row; VALUES joins, and an unbound `?f` is
+    // compatible with the VALUES row, so the solution survives and adopts it.
+    let with_values = sparql_rows(&fluree, &ledger, OPTIONAL_THEN_VALUES).await;
+    let with_filter = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?f WHERE { ?s schema:name ?name . \
+         OPTIONAL { ?s ex:friend ?f } FILTER(?f = ex:alice) }",
+    )
+    .await;
+
+    assert_eq!(
+        with_filter,
+        normalize_rows(&json!([["ex:cam", "ex:alice"], ["ex:liam", "ex:alice"]])),
+        "FILTER drops the rows the OPTIONAL left unbound"
+    );
+    assert_ne!(
+        with_values, with_filter,
+        "VALUES adopts the unbound rows FILTER drops — they are not interchangeable"
+    );
+}
+
+#[tokio::test]
+async fn jsonld_values_after_optional_joins_instead_of_seeding() {
+    // Parity twin: the JSON-LD `["values", …]` after `["optional", …]` lowers
+    // to the same IR, so it clobbered identically and must now agree.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    let ctx = json!({
+        "schema": "http://schema.org/",
+        "ex": "http://example.com/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let query = json!({
+        "@context": ctx,
+        "select": ["?s", "?f"],
+        "where": [
+            {"@id": "?s", "schema:name": "?name"},
+            ["optional", {"@id": "?s", "ex:friend": "?f"}],
+            ["values", ["?f", [{"@type": "@id", "@value": "ex:alice"}]]]
+        ]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+
+    assert_eq!(
+        normalize_rows(&json_rows),
+        normalize_rows(&json!([
+            ["ex:cam", "ex:alice"],
+            ["ex:liam", "ex:alice"],
+            ["ex:brian", "ex:alice"],
+            ["ex:nikola", "ex:alice"]
+        ]))
+    );
+}
+
 #[tokio::test]
 async fn trailing_values_keeps_not_exists_correlated() {
     let fluree = FlureeBuilder::memory().build_memory();

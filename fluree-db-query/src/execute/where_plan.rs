@@ -3595,6 +3595,47 @@ mod tests {
         );
     }
 
+    /// #1690: a VALUES over a variable a preceding OPTIONAL introduces must
+    /// build ABOVE that OPTIONAL.
+    ///
+    /// Seeded below it, the VALUES binds `?b` before the left join runs; the
+    /// left join then matches an already-bound `?b` and — dropping nothing —
+    /// lets every driving row out carrying the seeded value, so rows whose
+    /// OPTIONAL bound `?b` to something else are reported with a value the data
+    /// never had. `plan_ops` is root-first, so "above" is the smaller index.
+    #[test]
+    fn values_after_optional_builds_above_the_optional() {
+        use crate::binding::Binding;
+
+        // ?ev <ex:entity1> ?a . OPTIONAL { ?ev <ex:entity2> ?b } . VALUES ?b { <ex:B> }
+        let (ev, a, b) = (VarId(0), VarId(1), VarId(2));
+        let patterns = vec![
+            Pattern::Triple(make_pattern(ev, "entity1", a)),
+            Pattern::Optional(vec![Pattern::Triple(make_pattern(ev, "entity2", b))]),
+            Pattern::Values {
+                vars: vec![b],
+                rows: vec![vec![Binding::iri("ex:B")]],
+            },
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        let values_at = ops
+            .iter()
+            .position(|o| *o == "ValuesOperator")
+            .unwrap_or_else(|| panic!("the VALUES must be applied somewhere: {ops:?}"));
+        let optional_at = ops
+            .iter()
+            .position(|o| o.contains("Optional"))
+            .unwrap_or_else(|| panic!("the OPTIONAL must survive planning: {ops:?}"));
+        assert!(
+            values_at < optional_at,
+            "ValuesOperator must sit ABOVE the OPTIONAL, not be seeded below it: {ops:?}"
+        );
+    }
+
     // --- single-row VALUES object inlining --------------------------------
 
     fn object_terms(patterns: &[Pattern]) -> Vec<Term> {
