@@ -41,6 +41,7 @@ use fluree_db_core::{
     CODEC_FLUREE_INDEX_ROOT, CODEC_FLUREE_LEDGER_CONFIG, CODEC_FLUREE_SPATIAL_INDEX,
     CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
 };
+use bytes::Bytes;
 use http::StatusCode;
 use serde::Serialize;
 use std::fmt::Debug;
@@ -104,7 +105,11 @@ struct BlockRequest {
 ///
 /// Returns `(cid, ledger_alias)` on success, or `None` if the format
 /// is unrecognized (in which case the caller should fall back to address-based).
-fn cid_and_ledger_from_address(address: &str) -> Option<(ContentId, String)> {
+///
+/// Public so cache layers wrapping [`ProxyStorage`] (the browser peer's
+/// CAS cache) can key by CID without re-implementing the address layout;
+/// the mapping is pinned by the round-trip tests in this module.
+pub fn cid_and_ledger_from_address(address: &str) -> Option<(ContentId, String)> {
     // Strip `fluree:{method}://` prefix
     let rest = address.strip_prefix("fluree:")?;
     let sep_pos = rest.find("://")?;
@@ -329,7 +334,13 @@ impl ProxyStorage {
 
     /// Fetch canonical CAS bytes via `GET /storage/objects/{cid}` and verify
     /// them against the CID before returning.
-    async fn fetch_raw_object(&self, address: &str) -> Result<Vec<u8>> {
+    ///
+    /// Always uses the raw object endpoint regardless of [`ProxyReadMode`]
+    /// (it is what [`ProxyReadMode::Raw`] reads dispatch to). Returns the
+    /// transport's buffer without copying; callers that need an owned
+    /// `Vec<u8>` convert at their own boundary — a cache layer that keeps
+    /// the bytes resident (the browser peer) takes the [`Bytes`] directly.
+    pub async fn read_object_bytes(&self, address: &str) -> Result<Bytes> {
         let (cid, ledger) = cid_and_ledger_from_address(address).ok_or_else(|| {
             CoreError::storage(format!("Cannot derive CID from address: {address}"))
         })?;
@@ -352,7 +363,7 @@ impl ProxyStorage {
                         "Integrity verification failed for {address} (cid {cid})"
                     )));
                 }
-                Ok(bytes.to_vec())
+                Ok(bytes)
             }
             // 403 → NotFound parity with the server's no-existence-leak behavior
             StatusCode::NOT_FOUND | StatusCode::FORBIDDEN => Err(CoreError::not_found(address)),
@@ -477,7 +488,7 @@ impl StorageRead for ProxyStorage {
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         match self.mode {
             // Raw mode: canonical CAS bytes, CID-verified client-side.
-            ProxyReadMode::Raw => self.fetch_raw_object(address).await,
+            ProxyReadMode::Raw => self.read_object_bytes(address).await.map(|b| b.to_vec()),
             // Filtered mode: flakes-first negotiation for deterministic
             // behavior across block types:
             // - Leaves → FLKB (policy-filtered flakes)
@@ -571,7 +582,7 @@ impl StorageRead for ProxyStorage {
         match self.mode {
             // Raw mode always returns canonical bytes; the FLKB preference
             // only applies to the filtered tier.
-            ProxyReadMode::Raw => self.fetch_raw_object(address).await,
+            ProxyReadMode::Raw => self.read_object_bytes(address).await.map(|b| b.to_vec()),
             ProxyReadMode::Filtered => match hint {
                 ReadHint::AnyBytes => self.read_bytes(address).await,
                 ReadHint::PreferLeafFlakes => self.fetch_prefer_flakes(address).await,
