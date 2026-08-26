@@ -1245,11 +1245,15 @@ fn print_preview_local(p: &fluree_db_api::MergePreview) {
         }
     );
     for k in &p.conflicts.keys {
+        // `g` is `Option<Sid>`; Debug-printing the Option leaked `Some("…")`
+        // into the listing while `s`/`p` beside it rendered plain IRIs. A
+        // conflict with no graph is in the default graph — say so.
         println!(
-            "  - s={} p={} g={:?}",
+            "  - s={} p={} g={}",
             k.s,
             k.p,
-            k.g.as_ref().map(ToString::to_string)
+            k.g.as_ref()
+                .map_or_else(|| "<default>".to_string(), ToString::to_string)
         );
     }
     if !p.conflicts.details.is_empty() {
