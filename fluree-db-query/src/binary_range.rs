@@ -1501,11 +1501,26 @@ fn overlay_only_flakes_bounded(
     Ok(resolved)
 }
 
-/// Overlay-only results when no branch exists for the requested order.
+/// Overlay-only results when the persisted index cannot contribute a row.
 ///
-/// Collects flakes directly from the overlay provider, applies match filtering
-/// and options (offset/limit). Used at genesis or before first indexing when
-/// no persisted branch exists for the requested sort order.
+/// Reached whenever a bound component of `match_val` has no persisted id
+/// (a novelty-only subject, predicate, or object), or no branch manifest
+/// exists for the requested order (genesis / pre-first-index).
+///
+/// The overlay is a **log**, not a current-state view: an assert at `t=2`
+/// and its retraction at `t=3` both sit in novelty. So retractions are kept
+/// through the walk and the whole matching set is lifecycle-resolved
+/// (newest op per fact identity wins, retracted keys drop out) before
+/// options are applied — the same rule the cursor path gets from
+/// `resolve_overlay_ops` and the bounded twin gets from
+/// `resolve_latest_ops_keep_asserts`. Filtering to `op == true` inside the
+/// walk instead silently resurrects every fact whose assert AND retract
+/// both live in novelty.
+///
+/// This also rules out an early exit at `limit`: the retraction that
+/// cancels an already-collected assert can arrive after the limit is
+/// reached. `for_each_overlay_flake` walks the graph's whole overlay
+/// regardless, so the exit only ever saved clones of matching flakes.
 fn overlay_only_flakes(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
@@ -1518,9 +1533,6 @@ fn overlay_only_flakes(
     let limit = opts.flake_limit.or(opts.limit).unwrap_or(usize::MAX);
     let offset = opts.offset.unwrap_or(0);
 
-    // Use Cell for early-exit: once we've collected offset+limit, stop cloning.
-    let mut skipped = 0usize;
-    let mut collected = 0usize;
     let mut flakes = Vec::new();
 
     overlay.for_each_overlay_flake(
@@ -1531,17 +1543,9 @@ fn overlay_only_flakes(
         true,
         effective_to_t,
         &mut |flake| {
-            // Early exit: already have enough results.
-            if collected >= limit {
-                return;
-            }
-
-            // Only include asserts (op=true).
-            if !flake.op {
-                return;
-            }
-
-            // Filter by match components.
+            // Filter by match components. A retraction carries the same
+            // subject/predicate/object as the assert it cancels, so these
+            // gates keep both halves of a fact together.
             if let Some(ref s_sid) = match_val.s {
                 if flake.s != *s_sid {
                     return;
@@ -1568,23 +1572,24 @@ fn overlay_only_flakes(
                 }
             }
 
-            // Apply object bounds (same as persisted path).
-            if let Some(ref bounds) = opts.object_bounds {
-                if !bounds.matches(&flake.o) {
-                    return;
-                }
-            }
-
-            // Apply offset.
-            if skipped < offset {
-                skipped += 1;
-                return;
-            }
-
+            // Keep both asserts and retracts; resolve lifecycles below.
             flakes.push(flake.clone());
-            collected += 1;
         },
     );
 
-    Ok(flakes)
+    let mut resolved = resolve_latest_ops_keep_asserts(flakes, index);
+
+    // Options apply to the resolved current state, not to the log.
+    if let Some(ref bounds) = opts.object_bounds {
+        resolved.retain(|f| bounds.matches(&f.o));
+    }
+    if offset > 0 && !resolved.is_empty() {
+        let n = offset.min(resolved.len());
+        resolved.drain(0..n);
+    }
+    if resolved.len() > limit {
+        resolved.truncate(limit);
+    }
+
+    Ok(resolved)
 }
