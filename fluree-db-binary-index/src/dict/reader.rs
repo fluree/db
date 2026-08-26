@@ -416,11 +416,58 @@ impl DictTreeReader {
         Ok(results)
     }
 
+    /// wasm32 leaf load: no filesystem and no sync→async bridge — serve the
+    /// global cache, then the content store's residency tier
+    /// (`resolve_cached_bytes`), surfacing a typed
+    /// [`crate::read::need_fetch::NeedFetch`] miss for an async caller to
+    /// fetch and retry.
+    #[cfg(target_arch = "wasm32")]
+    fn load_leaf(&self, address: &str) -> io::Result<Arc<[u8]>> {
+        use crate::read::need_fetch::{resident_or_need_fetch, FetchKind};
+        match &self.leaf_source {
+            LeafSource::InMemory(map) => {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                map.get(address).cloned().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("dict tree: no in-memory leaf for {address}"),
+                    )
+                })
+            }
+            LeafSource::LocalFiles(_) => Err(io::Error::other(
+                "dict tree: local-file leaf source unsupported on wasm32",
+            )),
+            LeafSource::CasOnDemand {
+                cs, remote_cids, ..
+            } => {
+                let cid = remote_cids.get(address).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("dict tree: no CID mapping for leaf {address}"),
+                    )
+                })?;
+                if let Some(cache) = &self.global_cache {
+                    let cache_key = xxhash_rust::xxh3::xxh3_128(address.as_bytes());
+                    if let Some(bytes) = cache.get_dict_leaf(cache_key) {
+                        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                    self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                    let bytes = resident_or_need_fetch(cs.as_ref(), cid, FetchKind::DictLeaf)?;
+                    cache.try_get_or_load_dict_leaf(cache_key, move || Ok(bytes))
+                } else {
+                    resident_or_need_fetch(cs.as_ref(), cid, FetchKind::DictLeaf)
+                }
+            }
+        }
+    }
+
     /// Load leaf bytes from the configured source.
     ///
     /// For `LocalFiles` with a global cache: uses the cache (keyed by
     /// `xxh3_128(cas_address)`) to avoid repeated disk reads.
     /// Without a cache: reads directly from disk.
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_leaf(&self, address: &str) -> io::Result<Arc<[u8]>> {
         fn read_disk_cached_leaf(
             disk_cache_dir: Option<&PathBuf>,
