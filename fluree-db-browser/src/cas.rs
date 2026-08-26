@@ -512,6 +512,17 @@ impl StorageRead for BrowserCasStorage {
     fn miss_register(&self) -> Option<&MissRegister> {
         Some(&self.inner.register)
     }
+
+    /// The engine-facing form of [`BrowserCasStorage::query_guard`]: the
+    /// api retry loop holds this across a query's rounds (through
+    /// `StorageContentStore`), which freezes eviction so progress is
+    /// monotone — the same guard the crate's own callers use, wrapped in
+    /// the opaque core handle.
+    fn query_guard(&self) -> Option<fluree_db_core::storage::residency::InFlightGuard> {
+        Some(fluree_db_core::storage::residency::InFlightGuard::new(
+            self.query_guard(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -561,6 +572,25 @@ impl StorageMethod for BrowserCasStorage {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod tests {
+    #[tokio::test]
+    async fn trait_level_query_guard_freezes_the_tier_until_dropped() {
+        // The api retry loop only ever sees `dyn StorageRead` — the freeze
+        // must survive the opaque InFlightGuard wrapping, not just the
+        // concrete QueryGuard path.
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let (storage, io, driver) = storage_with(&state, &config());
+        let dyn_storage: &dyn fluree_db_core::StorageRead = &storage;
+        assert_eq!(storage.residency().queries_in_flight(), 0);
+        let guard = dyn_storage
+            .query_guard()
+            .expect("browser storage must participate in query guarding");
+        assert_eq!(storage.residency().queries_in_flight(), 1);
+        drop(guard);
+        assert_eq!(storage.residency().queries_in_flight(), 0);
+        io.shutdown();
+        driver.await.expect("driver exits");
+    }
+
     use super::*;
     use crate::bridge::{IoReceiver, WasmFetchTransport};
     use crate::config::CacheConfig;
