@@ -2533,6 +2533,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wasm-bindgen-futures",
  "xxhash-rust",
  "zstd",
 ]
@@ -2718,6 +2719,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "hex",
  "libc",
+ "lru 0.12.5",
  "moka",
  "multihash",
  "num-bigint",
@@ -2736,6 +2738,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "web-time",
  "xxhash-rust",
  "zstd",
 ]

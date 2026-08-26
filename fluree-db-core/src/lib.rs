@@ -28,6 +28,7 @@ pub mod address;
 pub mod address_path;
 pub mod annotation_index;
 pub mod cancellation;
+pub mod clock;
 pub mod coerce;
 pub mod commit;
 pub mod comparator;
@@ -83,6 +84,10 @@ pub mod tracking;
 pub mod value;
 pub mod value_id;
 pub mod vec_bi_dict;
+// moka stand-in for wasm32 (clock-free LRU); compiled on native only for its
+// unit tests. See module docs.
+#[cfg(any(target_arch = "wasm32", test))]
+pub mod wasm_cache;
 
 // Re-export main types
 pub use address::{
