@@ -2955,6 +2955,7 @@ dependencies = [
  "fluree-db-storage-aws",
  "fluree-sse",
  "futures",
+ "http 1.4.0",
  "parking_lot",
  "rand 0.8.5",
  "reqwest",
