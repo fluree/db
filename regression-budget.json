@@ -24,6 +24,11 @@
         "small": 5.0,
         "medium": 5.0
       },
+      "transact_filtered_delete": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
       "query_cold_reload": {
         "tiny": 10.0,
         "small": 5.0,

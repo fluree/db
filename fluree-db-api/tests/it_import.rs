@@ -1092,7 +1092,10 @@ ex:bob   ex:worksFor ex:acme ; ex:name 'Bob' .
         .expect("plain import should succeed");
     assert!(result.root_id.is_some(), "index should have been built");
 
-    let ledger = fluree.ledger(ledger_id).await.expect("load imported ledger");
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load imported ledger");
     assert_eq!(
         ledger.snapshot.has_list_meta,
         Some(false),
@@ -1133,7 +1136,10 @@ ex:alice ex:items ( 'a' 'b' 'c' ) .
         .expect("list-bearing import should succeed");
     assert!(result.root_id.is_some(), "index should have been built");
 
-    let ledger = fluree.ledger(ledger_id).await.expect("load imported ledger");
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load imported ledger");
     assert_eq!(
         ledger.snapshot.has_list_meta,
         Some(true),
@@ -1148,9 +1154,10 @@ ex:alice ex:items ( 'a' 'b' 'c' ) .
             .and_then(|a| a.first())
             .and_then(|node| node.get("ex:items"))
             .map(|v| match v {
-                serde_json::Value::Array(a) => {
-                    a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
-                }
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect(),
                 other => other.as_str().map(str::to_string).into_iter().collect(),
             })
             .unwrap_or_default()

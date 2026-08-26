@@ -400,6 +400,10 @@ name = "transact_commit"
 harness = false
 
 [[bench]]
+name = "transact_filtered_delete"
+harness = false
+
+[[bench]]
 name = "query_cold_reload"
 harness = false
 
