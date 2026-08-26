@@ -1685,7 +1685,7 @@ impl Fluree {
                 .ensure_head_temporal(store.as_ref())
                 .await
                 .map_err(fluree_db_transact::TransactError::from)?;
-            tracing::info!("head commit temporal resolved");
+            tracing::debug!(ledger = %ledger.id(), "head commit temporal resolved");
         }
 
         // Resolve the raw-txn CID before invoking the build phase
@@ -1702,7 +1702,7 @@ impl Fluree {
             Some(cid)
         } else if let Some(pending) = commit_opts.raw_txn_upload.take() {
             let cid = pending.finish().await.map_err(ApiError::from)?;
-            tracing::info!(raw_txn_cid = %cid, "raw txn upload finished");
+            tracing::debug!(ledger = %ledger.id(), raw_txn_cid = %cid, "raw txn upload finished");
             Some(cid)
         } else {
             None
@@ -1734,7 +1734,8 @@ impl Fluree {
         )
         .await
         .map_err(ApiError::from)?;
-        tracing::info!(
+        tracing::debug!(
+            ledger = %ledger.id(),
             t = staged.commit.t,
             commit_bytes = staged.commit_bytes.len(),
             referenced_blobs = staged.referenced_bytes.len(),

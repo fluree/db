@@ -192,7 +192,7 @@ async fn duplicate_body_failure_keeps_first_commits_txn_blob() {
 /// reports the gap instead of failing the whole export).
 #[tokio::test]
 async fn verify_and_export_tolerate_missing_txn_blob() {
-    use fluree_db_api::{ExportCommitsRequest, VerifyProblem};
+    use fluree_db_api::{ExportCommitsRequest, VerifyProblem, VerifySeverity};
 
     let ledger_id = "it/raw-txn:missing-blob";
     let fluree = FlureeBuilder::memory().build_memory();
@@ -232,6 +232,9 @@ async fn verify_and_export_tolerate_missing_txn_blob() {
         }]
     );
     assert!(!report.is_healthy());
+    // Provenance-only: state and every replication path still work, so the
+    // CLI exits 3 (gate-able) rather than 4 (chain broken).
+    assert_eq!(report.severity(), VerifySeverity::Provenance);
 
     let handle = fluree.ledger_cached(ledger_id).await.expect("handle");
     let export = fluree
@@ -248,4 +251,118 @@ async fn verify_and_export_tolerate_missing_txn_blob() {
     assert_eq!(export.count, 1);
     assert!(export.blobs.is_empty());
     assert_eq!(export.missing_blobs, vec![txn_cid.to_string()]);
+}
+
+/// The receiving side of the same gap: a push whose commits reference a txn
+/// blob the sender cannot supply is accepted, whether the sender declares
+/// the gap or (as a sender predating `missing_blobs` would) leaves it
+/// undeclared. Refusing it is what made the incident ledger unreplicable.
+#[tokio::test]
+async fn push_accepts_commits_whose_txn_blob_is_missing() {
+    use fluree_db_api::{
+        ExportCommitsRequest, GovernanceOptions, PushCommitsRequest, VerifyProblem, VerifySeverity,
+    };
+
+    async fn export_with_gap(
+        fluree: &fluree_db_api::Fluree,
+        ledger_id: &str,
+    ) -> (Vec<fluree_db_api::Base64Bytes>, Vec<String>) {
+        let ledger0 = LedgerState::new(LedgerSnapshot::genesis(ledger_id), Novelty::new(0));
+        let result = fluree
+            .transact(
+                ledger0,
+                TxnType::Upsert,
+                &upsert_alice(),
+                IrTxnOpts::default().store_raw_txn(true),
+                CommitOpts::default(),
+                &raw_txn_config(),
+            )
+            .await
+            .expect("commit succeeds");
+        let txn_cid = txn_cid_of(fluree, ledger_id, &result.receipt.commit_id).await;
+        fluree
+            .content_store(ledger_id)
+            .release(&txn_cid)
+            .await
+            .expect("release");
+
+        let handle = fluree.ledger_cached(ledger_id).await.expect("handle");
+        let export = fluree
+            .export_commit_range(
+                &handle,
+                &ExportCommitsRequest {
+                    cursor: None,
+                    cursor_id: None,
+                    limit: Some(10),
+                },
+            )
+            .await
+            .expect("export tolerates the gap");
+        assert_eq!(export.missing_blobs, vec![txn_cid.to_string()]);
+
+        // Export returns newest → oldest; push needs oldest → newest.
+        let mut commits = export.commits;
+        commits.reverse();
+        (commits, export.missing_blobs)
+    }
+
+    let index_config = raw_txn_config();
+
+    // Declared: the sender names the CID it could not supply.
+    {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let (commits, missing_blobs) =
+            export_with_gap(&fluree, "it/raw-txn:push-src-declared").await;
+
+        let tgt = "it/raw-txn:push-tgt-declared";
+        fluree.create_ledger(tgt).await.expect("create target");
+        let resp = fluree
+            .push_commits(
+                tgt,
+                PushCommitsRequest {
+                    commits,
+                    blobs: Default::default(),
+                    missing_blobs,
+                },
+                &GovernanceOptions::default(),
+                &index_config,
+            )
+            .await
+            .expect("push must not fail on a declared txn-blob gap");
+        assert_eq!(resp.accepted, 1);
+        assert_eq!(resp.head.t, 1);
+
+        // The gap replicated as a gap: verify names it, and classifies it as
+        // provenance-only so `fluree verify` exits 3 rather than 4.
+        let report = fluree.verify_ledger(tgt, None).await.expect("verify runs");
+        assert_eq!(report.severity(), VerifySeverity::Provenance);
+        assert!(matches!(
+            report.problems.as_slice(),
+            [VerifyProblem::MissingTxnBlob { t: 1, .. }]
+        ));
+    }
+
+    // Undeclared: a sender that predates `missing_blobs` sends the same
+    // bundle with an empty declaration. Still accepted (logged as a warning).
+    {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let (commits, _) = export_with_gap(&fluree, "it/raw-txn:push-src-undeclared").await;
+
+        let tgt = "it/raw-txn:push-tgt-undeclared";
+        fluree.create_ledger(tgt).await.expect("create target");
+        let resp = fluree
+            .push_commits(
+                tgt,
+                PushCommitsRequest {
+                    commits,
+                    blobs: Default::default(),
+                    missing_blobs: Vec::new(),
+                },
+                &GovernanceOptions::default(),
+                &index_config,
+            )
+            .await
+            .expect("push must not fail on an undeclared txn-blob gap");
+        assert_eq!(resp.accepted, 1);
+    }
 }

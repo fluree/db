@@ -22,7 +22,25 @@
 //! `commit.txn` pointer (observed in production: a retry's Drop-guard delete
 //! landed after the winning attempt's no-op re-put). So a dropped pending
 //! upload only cancels the in-flight task; a blob that already landed is left
-//! in place as a harmless orphan for reachability-based GC.
+//! in place as an orphan.
+//!
+//! # No reclaim exists yet
+//!
+//! **Nothing currently deletes an orphaned txn blob.** The only collector in
+//! the workspace is `fluree-db-indexer/src/gc/`, and its storage sweep
+//! deliberately excludes this content kind (`gc/sweep.rs` — "Commits,
+//! transactions, and config blobs are deliberately excluded"). The upload is
+//! spawned before staging, so every distinct body that fails validation,
+//! policy, or the novelty cap leaves a blob behind permanently. That is a
+//! known, accepted cost of removing the unsafe inline delete — not a solved
+//! problem.
+//!
+//! Reclaiming them safely needs a collector rooted in the commit chain
+//! (`fluree_db_api::verify_commit_chain` is the root-set walk), and it cannot
+//! simply sweep the `txn/` prefix: the raft queued transactor writes its
+//! in-flight `QueuedRequest` envelopes under `ContentKind::Txn` into the same
+//! per-ledger prefix and releases them itself, so a prefix sweep that only
+//! knows about commit-referenced CIDs would delete live queue entries.
 
 use crate::error::{Result, TransactError};
 use fluree_db_core::{ContentId, ContentKind, ContentStore};

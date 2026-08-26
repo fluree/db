@@ -385,6 +385,7 @@ JSON object:
 
 - `commits`: array of base64-encoded commit v2 blobs (oldest → newest)
 - `blobs` (optional): map of `{ cid: base64Bytes }` for referenced blobs (currently: `commit.txn` when present). Provided blobs must hash-verify against their CID. A referenced txn blob that is *not* provided is accepted with a warning — the source may itself have a provenance gap (see `missing_blobs` on export), and the commit's flakes do not depend on it.
+- `missing_blobs` (optional): array of CID strings the sender knows it cannot supply. Mirrors `missing_blobs` on the export response, so a sender declares a provenance gap instead of leaving the receiver to infer it from an absent `blobs` key. Undeclared gaps are still accepted today (a sender predating this field cannot declare one) but are logged at `warn` rather than `debug`.
 
 **Response Body (200 OK):**
 

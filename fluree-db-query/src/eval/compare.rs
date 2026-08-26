@@ -99,6 +99,55 @@ pub(super) fn fast_in_membership_for_iri_bindings<R: RowAccess>(
     fast_eq_iri_binding_directional(test, elem, row, ctx, store)
 }
 
+/// Whether the IRI-binding fast path can decide anything about `test`.
+///
+/// `fast_eq_iri_binding_directional` only reaches a verdict when the test
+/// side is a variable bound to a resource-flavored binding; every other
+/// binding falls out of its trailing `_ => Ok(None)` arm — but only
+/// *after* it has evaluated the element operand. Checking the flavor once,
+/// before any element is touched, lets `IN` over a literal-bound variable
+/// skip the probe loop entirely instead of evaluating every element twice
+/// (once here, once on the generic path) and collecting them all into a
+/// per-row `Vec`.
+///
+/// An unbound test variable answers `false` here and is handled by the
+/// generic path's own unbound check, which reports `TestUnbound` — the
+/// same answer the probe gives.
+pub(super) fn iri_fast_path_can_decide<R: RowAccess>(
+    test: &Expression,
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> bool {
+    let Some(ctx) = ctx else {
+        return false;
+    };
+    if ctx.binary_store.is_none() {
+        return false;
+    }
+    let Expression::Var(v) = test else {
+        return false;
+    };
+    row.get(*v).is_some_and(binding_is_resource_flavored)
+}
+
+/// The binding flavors `fast_eq_iri_binding_directional` has a match arm
+/// for. Every other flavor reaches its trailing `_ => Ok(None)`.
+///
+/// Kept beside that match on purpose: the two must list the same variants,
+/// or a new resource-flavored `Binding` either loses the fast path (listed
+/// there, missing here) or pays the double evaluation this check exists to
+/// avoid (listed here, missing there).
+fn binding_is_resource_flavored(binding: &Binding) -> bool {
+    matches!(
+        binding,
+        Binding::EncodedSid { .. }
+            | Binding::Sid { .. }
+            | Binding::Iri(_)
+            | Binding::IriMatch { .. }
+            | Binding::EncodedPid { .. }
+    )
+}
+
 /// One directional probe of the IRI-binding fast equality: `var_expr` must be
 /// a variable whose binding is resource-flavored (`EncodedSid`, `Sid`, `Iri`/
 /// `IriMatch`, or `EncodedPid`); `other_expr` is the comparand. Returns
@@ -659,6 +708,50 @@ fn try_coerce_temporal_string_cmp(left: &FlakeValue, right: &FlakeValue) -> Opti
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// The flavor gate must admit exactly the bindings
+    /// `fast_eq_iri_binding_directional` can decide. A literal test value
+    /// has to answer `false`: on the `IN` path a `true` here costs every
+    /// element an extra evaluation and the row a `Vec` allocation on the
+    /// way to the generic path that would have handled it anyway.
+    #[test]
+    fn resource_flavored_bindings_are_exactly_the_fast_path_arms() {
+        use crate::binding::Binding;
+        use fluree_db_core::datatype_constraint::DatatypeConstraint;
+        use fluree_db_core::Sid;
+
+        assert!(binding_is_resource_flavored(&Binding::Sid {
+            sid: Sid::new(1, Arc::from("alice")),
+            t: None,
+            op: None,
+        }));
+        assert!(binding_is_resource_flavored(&Binding::EncodedSid {
+            s_id: 7,
+            t: None,
+            op: None,
+        }));
+        assert!(binding_is_resource_flavored(&Binding::Iri(Arc::from(
+            "http://example.org/a"
+        ))));
+        assert!(binding_is_resource_flavored(&Binding::EncodedPid {
+            p_id: 3
+        }));
+
+        // Literals and the unbound flavors take the generic path.
+        let lit = |val| Binding::Lit {
+            val,
+            dtc: DatatypeConstraint::Explicit(fluree_db_core::xsd_string_datatype_sid()),
+            t: None,
+            op: None,
+            p_id: None,
+        };
+        assert!(!binding_is_resource_flavored(&lit(FlakeValue::String(
+            "alice".to_string()
+        ))));
+        assert!(!binding_is_resource_flavored(&lit(FlakeValue::Long(1))));
+        assert!(!binding_is_resource_flavored(&Binding::Unbound));
+        assert!(!binding_is_resource_flavored(&Binding::Poisoned));
+    }
 
     #[test]
     fn test_cmp_longs() {

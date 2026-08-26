@@ -770,7 +770,9 @@ impl StagedCommit {
     /// [`build_commit`] is deliberately left in place: it is
     /// content-addressed and may be shared with a commit that did
     /// publish, so deleting it here could dangle that commit's
-    /// `txn` pointer. Orphans are reclaimed by reachability GC.
+    /// `txn` pointer. The orphan is not reclaimed by anything today —
+    /// see the `raw_txn_upload` module docs for why no collector covers
+    /// txn blobs yet.
     ///
     /// Durability of the blob and the head ref is the content store's and
     /// nameservice's to provide: S3 acknowledges after replication, and the
@@ -876,7 +878,16 @@ where
             .await?;
         match publish_result {
             CasResult::Updated => {
-                tracing::info!(t = new_t, "commit head published");
+                // The one INFO event on the commit path: a durable state
+                // change, one line per commit. The surrounding phase
+                // breadcrumbs are `debug!` — see `commit_write_commit_blob`
+                // and the `tx_builder` phases — so a steady write load does
+                // not pay for them.
+                tracing::info!(
+                    ledger_id = %ledger_id_for_publish,
+                    t = new_t,
+                    "commit head published"
+                );
             }
             CasResult::Conflict { actual } => {
                 return Err(TransactError::PublishLostRace {

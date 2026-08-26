@@ -756,6 +756,9 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
     let mut commits = Vec::with_capacity(to_push_cids.len());
     let mut blobs: std::collections::HashMap<String, fluree_db_api::Base64Bytes> =
         std::collections::HashMap::new();
+    // A gap we already know about is declared to the receiver rather than
+    // left for it to infer from an absent key.
+    let mut missing_blobs: Vec<String> = Vec::new();
 
     for cid in &to_push_cids {
         use fluree_db_core::ContentStore;
@@ -779,6 +782,7 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
                             "  warning: commit t={} references txn blob '{txn_key}' which is missing locally; pushing without it",
                             commit.t
                         );
+                        missing_blobs.push(txn_key.clone());
                     }
                     Err(e) => {
                         return Err(CliError::Config(format!(
@@ -790,7 +794,11 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
         }
     }
 
-    let req = fluree_db_api::PushCommitsRequest { commits, blobs };
+    let req = fluree_db_api::PushCommitsRequest {
+        commits,
+        blobs,
+        missing_blobs,
+    };
     let resp = client
         .push_commits(remote_ledger_id, &req)
         .await
@@ -939,6 +947,9 @@ pub async fn run_publish(
     let mut commits = Vec::with_capacity(to_push_cids.len());
     let mut blobs: std::collections::HashMap<String, fluree_db_api::Base64Bytes> =
         std::collections::HashMap::new();
+    // A gap we already know about is declared to the receiver rather than
+    // left for it to infer from an absent key.
+    let mut missing_blobs: Vec<String> = Vec::new();
 
     for cid in &to_push_cids {
         use fluree_db_core::ContentStore;
@@ -962,6 +973,7 @@ pub async fn run_publish(
                             "  warning: commit t={} references txn blob '{txn_key}' which is missing locally; pushing without it",
                             commit.t
                         );
+                        missing_blobs.push(txn_key.clone());
                     }
                     Err(e) => {
                         return Err(CliError::Config(format!(
@@ -975,7 +987,11 @@ pub async fn run_publish(
 
     eprint!("  Pushing {} commit(s)...\r", commits.len());
 
-    let req = fluree_db_api::PushCommitsRequest { commits, blobs };
+    let req = fluree_db_api::PushCommitsRequest {
+        commits,
+        blobs,
+        missing_blobs,
+    };
     let resp = client
         .push_commits(&remote_ledger_id, &req)
         .await
@@ -1599,9 +1615,13 @@ pub async fn run_clone_origin(
             if !no_txns {
                 if let Some(txn_cid) = &envelope.txn {
                     if !content_store.has(txn_cid).await.unwrap_or(false) {
-                        // A txn blob the origin cannot serve is a provenance
+                        // A txn blob the origin does not HAVE is a provenance
                         // gap on the source, not a reason to abandon the
-                        // clone — the commit itself carries the flakes.
+                        // clone — the commit itself carries the flakes. Only
+                        // a genuine all-origins 404 is tolerated: an auth
+                        // failure, a 5xx, a network blip, or an integrity
+                        // failure still aborts, so a transient fault can't
+                        // masquerade as a provenance gap.
                         match fetcher.fetch(txn_cid, &ledger_id).await {
                             Ok(txn_bytes) => {
                                 // Txn blobs use full-bytes SHA-256, so put_with_id is safe.
@@ -1614,11 +1634,16 @@ pub async fn run_clone_origin(
                                         ))
                                     })?;
                             }
-                            Err(e) => {
+                            Err(fluree_db_nameservice_sync::SyncError::NotFound(_)) => {
                                 eprintln!(
-                                    "  warning: commit t={} references txn blob {txn_cid} which the origin could not serve ({e}); continuing without it",
+                                    "  warning: commit t={} references txn blob {txn_cid} which no origin has; continuing without it",
                                     envelope.t
                                 );
+                            }
+                            Err(e) => {
+                                return Err(CliError::Config(format!(
+                                    "clone failed (fetch txn blob {txn_cid}): {e}"
+                                )));
                             }
                         }
                     }

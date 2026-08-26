@@ -453,6 +453,11 @@ name = "annotation_planner"
 harness = false
 
 [[test]]
+name = "it_filtered_delete_list_meta"
+path = "tests/it_filtered_delete_list_meta.rs"
+required-features = ["native"]
+
+[[test]]
 name = "it_literal_identity"
 path = "tests/it_literal_identity.rs"
 required-features = ["native"]

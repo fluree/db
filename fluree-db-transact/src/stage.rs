@@ -1690,17 +1690,20 @@ async fn hydrate_list_index_meta_for_retractions(
 ) -> Result<()> {
     use std::collections::BTreeMap;
 
-    // Group candidates by (graph, subject, predicate): one range lookup per
-    // group, not one per retraction. Every `range_with_overlay` call pays a
-    // full overlay translation of the graph's novelty (walk + translate +
-    // sort), so per-flake lookups make filtered-DELETE staging
-    // O(matched_triples × novelty log novelty) — observed as a >900s livelock
-    // for ~21k matched triples on a novelty-heavy ledger. Grouped, the cost
-    // scales with distinct (subject, predicate) pairs instead.
+    // Nothing to copy when neither the indexed base nor novelty holds a
+    // single `@list` position. `Some(false)` is an exact observation by the
+    // indexer; `None` (legacy root, bulk import) must fall through.
+    if ledger.snapshot.has_list_meta == Some(false) && !ledger.novelty.has_list_meta {
+        return Ok(());
+    }
+
+    // Group candidates by (graph, subject, predicate).
     let mut groups: HashMap<(GraphId, Sid, Sid), Vec<usize>> = HashMap::new();
     for (idx, flake) in retractions.iter().enumerate() {
-        // Only retractions with no metadata are candidates.
-        if flake.op || flake.m.is_some() {
+        // Only retractions lacking a list position are candidates. A
+        // language-tagged binding already carries `m = { lang, i: None }`
+        // and still needs its position filled in.
+        if flake.op || flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
             continue;
         }
         let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
@@ -1709,32 +1712,70 @@ async fn hydrate_list_index_meta_for_retractions(
             .or_default()
             .push(idx);
     }
+    if groups.is_empty() {
+        return Ok(());
+    }
+
+    let to_t = ledger.t();
+
+    // Novelty side: ONE SPOT walk per touched graph, keeping every op on a
+    // requested (subject, predicate) pair. `range_with_overlay` per group
+    // would instead translate (or walk) the graph's entire overlay once per
+    // group — O(groups × novelty), observed as a multi-minute-to-never
+    // filtered DELETE once both are in the tens of thousands.
+    let mut wanted: HashMap<GraphId, HashSet<(&Sid, &Sid)>> = HashMap::new();
+    for (g_id, s, p) in groups.keys() {
+        wanted.entry(*g_id).or_default().insert((s, p));
+    }
+    let mut overlay_by_key: HashMap<(GraphId, Sid, Sid), Vec<Flake>> = HashMap::new();
+    for (g_id, pairs) in &wanted {
+        ledger.novelty.for_each_overlay_flake(
+            *g_id,
+            IndexType::Spot,
+            None,
+            None,
+            true,
+            to_t,
+            &mut |f| {
+                if f.t <= to_t && pairs.contains(&(&f.s, &f.p)) {
+                    overlay_by_key
+                        .entry((*g_id, f.s.clone(), f.p.clone()))
+                        .or_default()
+                        .push(f.clone());
+                }
+            },
+        );
+    }
 
     for ((g_id, s, p), members) in groups {
-        // Find currently asserted flakes for this (subject, predicate)
-        // (db + novelty overlay) and copy list index meta where present.
+        // Base side: subject + predicate bound against the persisted index
+        // only (`NoOverlay`) — a leaf seek, no overlay translation.
         let rm = fluree_db_core::RangeMatch::new()
-            .with_subject(s)
-            .with_predicate(p);
-
-        let found = fluree_db_core::range_with_overlay(
+            .with_subject(s.clone())
+            .with_predicate(p.clone());
+        let mut found = fluree_db_core::range_with_overlay(
             &ledger.snapshot,
             g_id,
-            ledger.novelty.as_ref(),
-            fluree_db_core::IndexType::Spot,
+            &fluree_db_core::NoOverlay,
+            IndexType::Spot,
             fluree_db_core::RangeTest::Eq,
             rm,
-            fluree_db_core::RangeOptions::new().with_to_t(ledger.t()),
+            fluree_db_core::RangeOptions::new().with_to_t(to_t),
         )
         .await?;
+        if let Some(ops) = overlay_by_key.remove(&(g_id, s, p)) {
+            found.extend(ops);
+        }
+        // Same lifecycle rule `range_with_overlay` applies to its merged
+        // result: newest op per fact key wins, retractions drop out.
+        let found = fluree_db_core::range::resolve_current_flakes(found, IndexType::Spot);
 
         // Index asserted list-carrying metas per object value, in index
         // order. Every matching retraction copies the FIRST dt-compatible
-        // meta — mirroring the per-flake lookup's `.find()` this replaces:
-        // identical duplicates then collapse in the accumulator, so a value
-        // asserted at N list positions loses exactly one entry per distinct
-        // WHERE binding (pinned by the `object-probe-list-retract` case in
-        // `it_join_batched_overlay.rs`).
+        // meta: identical duplicates then collapse in the accumulator, so a
+        // value asserted at N list positions loses exactly one entry per
+        // distinct WHERE binding (pinned by the `object-probe-list-retract`
+        // case in `it_join_batched_overlay.rs`).
         let mut metas: BTreeMap<FlakeValue, Vec<(Sid, fluree_db_core::FlakeMeta)>> =
             BTreeMap::new();
         for f in found {
@@ -1750,13 +1791,17 @@ async fn hydrate_list_index_meta_for_retractions(
 
         for idx in members {
             let flake = &mut retractions[idx];
-            if let Some(candidates) = metas.get(&flake.o) {
-                if let Some((_, m)) = candidates
-                    .iter()
-                    .find(|(dt, _)| fluree_db_core::dt_compatible(&flake.dt, dt))
-                {
-                    flake.m = Some(m.clone());
-                }
+            let Some(candidates) = metas.get(&flake.o) else {
+                continue;
+            };
+            // Same lexical value under different language tags are distinct
+            // facts: the candidate must match the retraction's tag (absent
+            // on both for plain literals) as well as its datatype.
+            let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
+            if let Some((_, m)) = candidates.iter().find(|(dt, m)| {
+                fluree_db_core::dt_compatible(&flake.dt, dt) && m.lang.as_deref() == lang
+            }) {
+                flake.m = Some(m.clone());
             }
         }
     }

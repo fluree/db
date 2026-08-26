@@ -1272,6 +1272,7 @@ pub async fn incremental_index(
 
     let new_pred_sids = build_predicate_sids(&novelty.shared, &new_ns_codes);
     root_builder.set_predicate_sids(new_pred_sids);
+    root_builder.note_list_meta(novelty.shared.saw_list_meta);
 
     let new_graph_iris: Vec<String> = (0..novelty.shared.graphs.len())
         .filter_map(|id| {

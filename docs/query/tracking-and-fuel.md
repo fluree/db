@@ -81,7 +81,8 @@ Cost ladder (per event):
 | Flake returned from a `db.range` call (e.g. SHACL graph reads, graph crawl) | 0.001 |
 | Row emitted by a binary index scan (per row, charged per batch at the scan boundary) | 0.001 |
 | Row joined through a `VALUES` clause (per input row, charged per batch) | 0.001 |
-| Row returned by a property-join batched subject probe / SPOT star walk | 0.001 |
+| Row returned by a batched subject probe / SPOT star walk (charged in the primitive, so property-join and nested-loop-join callers pay alike) | 0.001 |
+| Row matched by a nested-loop join's own leaflet scan (subject-driven and object-driven lanes) | 0.001 |
 | Overlay/novelty row materialized | 0.001 |
 | History row scanned (base + in-range sidecar rows) | 0.001 |
 | R2RML row emitted (Iceberg/Parquet) | 0.001 |

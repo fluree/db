@@ -310,3 +310,197 @@ async fn drained_rows_are_visible_to_fuel() {
          {star_fuel}; the ValuesOperator per-input-row charge regressed"
     );
 }
+
+/// Coverage for the property-join operator's own row lanes — the batched
+/// subject probe and the SPOT star walk — which bypass
+/// `BinaryScanOperator` entirely, so the scan-emission charge never sees
+/// their rows. An object-anchored star routes through them: this drives
+/// 800 rows through the SPOT lane and pins that the query stays inside a
+/// sane fuel envelope.
+///
+/// NOT a pin on the per-row charges themselves. Their contribution here is
+/// 0.80 of 6.61 fuel (800 rows x `PER_ROW_MICRO_FUEL`), and the IO touch
+/// charges over the same leaflets dominate it — so deleting both charges
+/// leaves any end-to-end assertion on this query green. Isolating them
+/// needs two shapes with identical IO and different row counts, which this
+/// index layout cannot produce. Verified by hand instead: with the charges
+/// removed the hub query reports 5.81 fuel, with them 6.61.
+#[tokio::test]
+async fn property_join_probe_lanes_stay_in_a_sane_fuel_envelope() {
+    const HUB_LEDGER: &str = "values-object-bounds-hub:main";
+    const HUB_EDGES: usize = 400;
+
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // A hub entity on `ns:entity1` with many edges, so the object-anchored
+    // star expands real volume through the property join rather than the
+    // two rows the shared fixture's hub carries.
+    let ledger0 = genesis_ledger(&fluree, HUB_LEDGER);
+    let hub = entity_a();
+    let mut graph = Vec::with_capacity(HUB_EDGES);
+    for i in 0..HUB_EDGES {
+        graph.push(json!({
+            "@id": format!("http://example.org/hub-edge/{i}"),
+            "ns:entity1": { "@id": hub },
+            "ns:entity2": { "@id": iri(i) },
+            "ns:snap": format!("snapshot payload {i} {}", "x".repeat(64)),
+        }));
+    }
+    fluree
+        .insert(
+            ledger0,
+            &json!({ "@context": { "ns": "http://example.org/ns#" }, "@graph": graph }),
+        )
+        .await
+        .expect("insert hub data");
+    rebuild_and_publish_index(&fluree, HUB_LEDGER).await;
+
+    // A singleton VALUES on the object folds into the triple and anchors
+    // the star, which is what routes it through the probe/SPOT lanes.
+    let sparql = format!(
+        "PREFIX ns: <http://example.org/ns#>\n\
+         SELECT ?b FROM <{HUB_LEDGER}> WHERE {{\n\
+           VALUES ?a {{ <{hub}> }}\n\
+           ?ev ns:entity1 ?a ; ns:entity2 ?b ; ns:snap ?snap }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .track_all()
+        .execute_tracked()
+        .await
+        .expect("query should succeed");
+    assert_eq!(result.status, 200);
+    let rows = result.result["results"]["bindings"]
+        .as_array()
+        .expect("bindings array")
+        .len();
+    assert_eq!(rows, HUB_EDGES, "the hub star must expand every edge");
+
+    let fuel = result.fuel.expect("fuel");
+    assert!(
+        fuel > 2.0,
+        "expanding a {HUB_EDGES}-edge hub charged only {fuel} fuel; the \
+         lane reports floor-level cost and is invisible to max_fuel"
+    );
+    assert!(
+        fuel < 100.0,
+        "hub star fuel ({fuel}) blew past the per-row schedule"
+    );
+}
+
+/// A nested-loop join reads leaflets itself, through `scan_matches` and the
+/// object-driven flush, so its probe rows cross none of the scan-operator
+/// charging surfaces. Before those lanes were charged, a star whose subject
+/// was seeded by `VALUES` expanded its whole probe side for free: 400
+/// subjects returned 400 rows and reported 1.001 fuel — the query floor and
+/// nothing else, invisible to `max_fuel`.
+///
+/// Pins the charge by proportionality rather than a magic total: the same
+/// query shape over 4 seeded subjects and over 400 must differ by roughly
+/// the row count, which only a per-row charge on that lane can supply.
+#[tokio::test]
+async fn nested_loop_join_probe_rows_are_visible_to_fuel() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree).await;
+
+    let fuel_of = |n: usize| {
+        let fluree = &fluree;
+        async move {
+            let subjects = (0..n)
+                .map(|i| format!("<http://example.org/edge/{i}>"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let result = fluree
+                .query_from()
+                .sparql(&format!(
+                    "PREFIX ns: <http://example.org/ns#>\n\
+                     SELECT ?b FROM <{LEDGER_ID}> WHERE {{\n\
+                       VALUES ?ev {{ {subjects} }}\n\
+                       ?ev ns:entity1 ?a ; ns:entity2 ?b ; ns:snap ?snap }}"
+                ))
+                .track_all()
+                .execute_tracked()
+                .await
+                .expect("query should succeed");
+            assert_eq!(result.status, 200);
+            let rows = result.result["results"]["bindings"]
+                .as_array()
+                .expect("bindings")
+                .len();
+            assert_eq!(rows, n, "every seeded subject must expand");
+            result.fuel.expect("fuel")
+        }
+    };
+
+    let few = fuel_of(4).await;
+    let many = fuel_of(400).await;
+
+    // 400 subjects x 3 predicates = 1200 probe rows at PER_ROW_MICRO_FUEL,
+    // so the gap is ~1.2 fuel. Assert well inside that so the pin survives
+    // unrelated schedule tuning, but far enough above the 4-subject case
+    // that only a per-row charge on this lane can produce it.
+    assert!(
+        many > few + 0.5,
+        "expanding 400 seeded subjects charged {many} fuel vs {few} for 4; \
+         the nested-loop-join probe lanes are uncharged again and the whole \
+         probe side is invisible to max_fuel"
+    );
+}
+
+/// The `IN`-over-resources bug was never SPARQL-specific: JSON-LD `filter`
+/// expressions lower to the same IR and run through the same `eval_in`, so
+/// the encoded-vs-IRI mismatch dropped every row there too. Twin of
+/// `filter_in_matches_encoded_iri_bindings`, per the SPARQL/JSON-LD parity
+/// rule for shared-IR fixes.
+#[tokio::test]
+async fn jsonld_filter_in_matches_encoded_iri_bindings() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree).await;
+    let (b, c) = (entity_b(), entity_c());
+
+    let db = fluree.db(LEDGER_ID).await.expect("db");
+    let rows_for = |expr: String| {
+        let fluree = &fluree;
+        let db = &db;
+        async move {
+            let q = json!({
+                "@context": { "ns": "http://example.org/ns#" },
+                "select": ["?ev"],
+                "where": [
+                    { "@id": "?ev", "ns:entity2": "?b" },
+                    ["filter", expr]
+                ]
+            });
+            fluree
+                .query(db, &q)
+                .await
+                .expect("query")
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("format")
+                .as_array()
+                .expect("rows array")
+                .len()
+        }
+    };
+
+    assert_eq!(
+        rows_for(format!("(in ?b [(iri \"{b}\")])")).await,
+        1,
+        "single-element IN over an encoded ref binding"
+    );
+    assert_eq!(
+        rows_for(format!("(in ?b [(iri \"{b}\") (iri \"{c}\")])")).await,
+        2,
+        "two-element IN over encoded ref bindings"
+    );
+    assert_eq!(
+        rows_for("(in ?b [(iri \"http://example.org/item/none\")])".to_string()).await,
+        0,
+        "absent IRI matches nothing"
+    );
+}

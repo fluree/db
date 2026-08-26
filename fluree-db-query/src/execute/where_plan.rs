@@ -1044,131 +1044,6 @@ fn apply_values(
     operator
 }
 
-/// Rewrite VALUES that bind a non-subject variable of a fusable star block
-/// into equivalent `FILTER(?v IN (...))` membership filters.
-///
-/// `split_values_seeding_star` defers every non-subject VALUES to a post-join
-/// `ValuesOperator` to preserve star fusion — correct, but the deferred VALUES
-/// then constrains NOTHING about the scan: the star drains the whole predicate
-/// extent (materializing every row) and the tiny VALUES filters afterwards.
-/// The equivalent `FILTER ?v IN (...)` — strictly less expressive — inlines
-/// into the fused star and prunes rows before materialization; on a 129k-edge
-/// two-bound-endpoint join the gap measured 1,600x (BUG-values-join-planner).
-/// A single-var VALUES whose rows are distinct, fully-bound resources, over a
-/// variable the star is guaranteed to bind, IS that filter — so lower it to
-/// one and let the block take the filter-aware build path.
-///
-/// Restricted to exactly the shape the deferral hurts:
-/// - fresh block: no upstream seed (a seeded block hash-joins VALUES against
-///   upstream bindings) and no binds/filters of its own (those blocks already
-///   take the filter-aware path with VALUES applied on top — unchanged);
-/// - a fusable star (>= 2 triples in property-join shape);
-/// - no VALUES on the star subject: that one SEEDS the scan (strictly better
-///   than filtering), and converting a sibling VALUES would route the block
-///   off the seeding hot path;
-/// - per VALUES: one variable, bound by a star triple; every row a distinct
-///   bound resource (Sid / IRI). UNDEF cells join as match-any and duplicate
-///   rows multiply solutions — a filter can express neither, so both decline
-///   and keep the `ValuesOperator` join.
-fn convert_star_values_to_membership_filters(block: &mut InnerJoinBlock, has_upstream_seed: bool) {
-    if has_upstream_seed
-        || block.values.is_empty()
-        || !block.binds.is_empty()
-        || !block.filters.is_empty()
-        || block.triples.len() < 2
-        || !is_property_join(&block.triples)
-    {
-        return;
-    }
-    let Some(subject) = block.triples.first().and_then(|tp| tp.s.as_var()) else {
-        return;
-    };
-    if block.values.iter().any(|vp| vp.vars.contains(&subject)) {
-        return;
-    }
-    let star_vars: HashSet<VarId> = block
-        .triples
-        .iter()
-        .flat_map(crate::ir::triple::TriplePattern::produced_vars)
-        .collect();
-
-    // All-or-nothing: a partially-converted block would carry its remaining
-    // VALUES down the filter-aware path, whose sequential fallback seeds them
-    // at the base of the plan — for a disconnected VALUES that is exactly the
-    // cartesian seed the deferral exists to prevent. Convert only when every
-    // VALUES in the block lowers, so mixed blocks keep today's plan.
-    let Some(filters) = block
-        .values
-        .iter()
-        .map(|vp| membership_filter_from_values(vp, &star_vars))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return;
-    };
-    block.values.clear();
-    for (idx, expr) in filters.into_iter().enumerate() {
-        block.filters.push(FilterPattern::new(idx, expr));
-    }
-}
-
-/// Build the `?v IN (...)` expression equivalent to a single-var VALUES, or
-/// `None` when the VALUES is not expressible as a filter (multi-var, var not
-/// bound by the star, UNDEF or literal cells, duplicate rows).
-///
-/// Cells lower exactly as SPARQL lowers the hand-written filter: a known-
-/// namespace `Sid` cell becomes a `Ref` constant, an un-encoded IRI cell
-/// becomes `IRI("<full iri>")` — so the converted block is indistinguishable
-/// from one the user wrote with `FILTER ... IN` themselves.
-fn membership_filter_from_values(
-    vp: &ValuesPattern,
-    star_vars: &HashSet<VarId>,
-) -> Option<Expression> {
-    use crate::binding::Binding;
-    use crate::ir::Function;
-    use fluree_db_core::FlakeValue;
-
-    let [var] = vp.vars[..] else {
-        return None;
-    };
-    if !star_vars.contains(&var) || vp.rows.is_empty() {
-        return None;
-    }
-
-    // Duplicate detection keys on the resource identity, not the Binding
-    // variant, so the same IRI carried once as `Sid` and once as `Iri` still
-    // counts as a duplicate.
-    let mut seen: HashSet<(u16, &str)> = HashSet::with_capacity(vp.rows.len());
-    let mut args = Vec::with_capacity(vp.rows.len() + 1);
-    args.push(Expression::Var(var));
-    for row in &vp.rows {
-        let [cell] = &row[..] else {
-            return None;
-        };
-        let (key, expr) = match cell {
-            Binding::Sid { sid, .. } => (
-                (sid.namespace_code, sid.name.as_ref()),
-                Expression::Const(FlakeValue::Ref(sid.clone())),
-            ),
-            Binding::Iri(iri) | Binding::IriMatch { iri, .. } => (
-                (u16::MAX, iri.as_ref()),
-                Expression::Call {
-                    func: Function::Iri,
-                    args: vec![Expression::Const(FlakeValue::String(iri.to_string()))],
-                },
-            ),
-            _ => return None,
-        };
-        if !seen.insert(key) {
-            return None;
-        }
-        args.push(expr);
-    }
-    Some(Expression::Call {
-        func: Function::In,
-        args,
-    })
-}
-
 /// Split a block's VALUES into those that can seed a same-subject star and the
 /// rest, which must stay behind the triples.
 ///
@@ -2214,14 +2089,6 @@ pub fn build_where_operators_seeded_with_needed(
                 }
                 i = end;
 
-                // Lower eligible non-subject VALUES of a fusable star into
-                // membership FILTERs so they constrain the scan (see
-                // `convert_star_values_to_membership_filters`). Runs before
-                // the hot-path fork: a conversion adds block filters, which
-                // routes the block down the filter-aware path.
-                let mut block = block;
-                convert_star_values_to_membership_filters(&mut block, operator.is_some());
-
                 // Hot path: triples only (no BIND/FILTER).
                 // Skip dependency bookkeeping entirely.
                 if block.binds.is_empty() && block.filters.is_empty() {
@@ -2925,14 +2792,24 @@ pub(crate) fn build_scan_or_join(
             // to amortize it; rows that do not fully ground the pattern keep
             // exact join semantics via a per-row fallback.
             if bounds.is_none() && inline_ops.is_empty() {
-                // The operator's own estimate when it has one (VALUES, subquery
-                // producers); else the planner's running chain estimate, which
-                // is what the hash-join gate below is costed against. Scans and
-                // nested loops report `None`, and reading that as "large" built
-                // a whole-predicate hash set for ~20 driving rows (BSBM Q10).
-                let driving_rows = left
-                    .estimated_rows()
-                    .or_else(|| hash_planner.step_est().map(|e| e.round().max(1.0) as usize));
+                // The planner's running chain estimate — the same number the
+                // hash-join gate below is costed against and EXPLAIN reports as
+                // `driving-est` — with the operator's own estimate as the
+                // fallback for ledgers without statistics.
+                //
+                // Consulting the operator first instead meant the gate rarely
+                // saw the planner at all: `NestedLoopJoinOperator` reports
+                // `left × 10` per hop, so once a VALUES or subquery seeds a
+                // chain, every later probe was weighed against a compounding
+                // heuristic rather than the statistics. Producers are not lost
+                // by preferring `step_est` — `with_left_estimate` folds their
+                // estimate into it. Scans and nested loops over scans report
+                // `None`, and reading that as "large" built a whole-predicate
+                // hash set for ~20 driving rows (BSBM Q10).
+                let driving_rows = hash_planner
+                    .step_est()
+                    .map(|e| e.round().max(1.0) as usize)
+                    .or_else(|| left.estimated_rows());
                 if let Some(key_vars) =
                     membership_join_key_vars(&left_schema, tp, planning, hash_planner, driving_rows)
                 {
@@ -3667,118 +3544,6 @@ mod tests {
         assert!(
             ops.contains(&"PropertyJoinOperator"),
             "the star must keep its fusion when nothing binds its subject: {ops:?}"
-        );
-    }
-
-    /// BUG-values-join-planner: multi-row resource VALUES on a star's object
-    /// vars lower to membership filters, so they constrain the scan exactly
-    /// like the hand-written `FILTER ?v IN (...)` — no post-join
-    /// `ValuesOperator` draining the full predicate extent first.
-    #[test]
-    fn star_object_values_lower_to_membership_filters() {
-        use crate::binding::Binding;
-
-        // VALUES ?a { <ex:a1> <ex:a2> } VALUES ?b { <ex:b1> <ex:b2> }
-        // ?ev <entity1> ?a ; <entity2> ?b ; <snap> ?snap
-        let patterns = vec![
-            Pattern::Values {
-                vars: vec![VarId(1)],
-                rows: vec![vec![Binding::iri("ex:a1")], vec![Binding::iri("ex:a2")]],
-            },
-            Pattern::Values {
-                vars: vec![VarId(2)],
-                rows: vec![vec![Binding::iri("ex:b1")], vec![Binding::iri("ex:b2")]],
-            },
-            Pattern::Triple(make_pattern(VarId(0), "entity1", VarId(1))),
-            Pattern::Triple(make_pattern(VarId(0), "entity2", VarId(2))),
-            Pattern::Triple(make_pattern(VarId(0), "snap", VarId(3))),
-        ];
-
-        let op = build_where_operators(&patterns, None).unwrap();
-        let plan = op.describe();
-        let ops = plan_ops(&plan);
-
-        assert!(
-            !ops.contains(&"ValuesOperator"),
-            "object VALUES must lower to membership filters, not a post-join: {ops:?}"
-        );
-    }
-
-    /// Duplicate VALUES rows multiply solutions (SPARQL join semantics); a
-    /// filter cannot express that, so the conversion declines.
-    #[test]
-    fn duplicate_row_values_keep_the_values_join() {
-        use crate::binding::Binding;
-
-        let patterns = vec![
-            Pattern::Values {
-                vars: vec![VarId(1)],
-                rows: vec![vec![Binding::iri("ex:a1")], vec![Binding::iri("ex:a1")]],
-            },
-            Pattern::Triple(make_pattern(VarId(0), "entity1", VarId(1))),
-            Pattern::Triple(make_pattern(VarId(0), "snap", VarId(2))),
-        ];
-
-        let op = build_where_operators(&patterns, None).unwrap();
-        let plan = op.describe();
-        let ops = plan_ops(&plan);
-
-        assert!(
-            ops.contains(&"ValuesOperator"),
-            "duplicate rows change multiplicity; the VALUES join must stay: {ops:?}"
-        );
-    }
-
-    /// An UNDEF cell joins as match-any; a filter cannot express that, so the
-    /// conversion declines.
-    #[test]
-    fn undef_row_values_keep_the_values_join() {
-        use crate::binding::Binding;
-
-        let patterns = vec![
-            Pattern::Values {
-                vars: vec![VarId(1)],
-                rows: vec![vec![Binding::iri("ex:a1")], vec![Binding::Unbound]],
-            },
-            Pattern::Triple(make_pattern(VarId(0), "entity1", VarId(1))),
-            Pattern::Triple(make_pattern(VarId(0), "snap", VarId(2))),
-        ];
-
-        let op = build_where_operators(&patterns, None).unwrap();
-        let plan = op.describe();
-        let ops = plan_ops(&plan);
-
-        assert!(
-            ops.contains(&"ValuesOperator"),
-            "UNDEF rows join as match-any; the VALUES join must stay: {ops:?}"
-        );
-    }
-
-    /// A multi-var VALUES correlates its columns; per-column filters would
-    /// accept the cross product, so the conversion declines.
-    #[test]
-    fn multi_var_values_keep_the_values_join() {
-        use crate::binding::Binding;
-
-        let patterns = vec![
-            Pattern::Values {
-                vars: vec![VarId(1), VarId(2)],
-                rows: vec![
-                    vec![Binding::iri("ex:a1"), Binding::iri("ex:b1")],
-                    vec![Binding::iri("ex:a2"), Binding::iri("ex:b2")],
-                ],
-            },
-            Pattern::Triple(make_pattern(VarId(0), "entity1", VarId(1))),
-            Pattern::Triple(make_pattern(VarId(0), "entity2", VarId(2))),
-        ];
-
-        let op = build_where_operators(&patterns, None).unwrap();
-        let plan = op.describe();
-        let ops = plan_ops(&plan);
-
-        assert!(
-            ops.contains(&"ValuesOperator"),
-            "a multi-var VALUES correlates columns; the join must stay: {ops:?}"
         );
     }
 
@@ -5826,6 +5591,65 @@ mod tests {
         // 55_700 / 10 = 5_570 driving rows: well above the floor.
         let op = bsbm_q10_prefix(10);
         assert_eq!(op.describe().op, "MembershipJoinOperator");
+    }
+
+    /// `VALUES ?a { 30 rows } . ?a :knows ?b . ?b :knows ?a`.
+    ///
+    /// A producer-seeded chain is the case where the operator estimate and the
+    /// planner disagree: `NestedLoopJoinOperator` reports `left × 10`, so the
+    /// second probe's left says 300 while the statistics say the same 30 rows
+    /// VALUES supplied. Reading the operator first admitted the lane on the
+    /// ×10 heuristic and drained the whole 100k `:knows` extension for 30
+    /// driving rows — under the floor, and not what EXPLAIN's `driving-est`
+    /// reported for the same step.
+    #[test]
+    fn membership_lane_prefers_planner_estimate_over_nested_loop_fanout() {
+        use crate::seed::EmptyOperator;
+        use crate::values::ValuesOperator;
+        use crate::Binding;
+
+        let stats = knows_stats(100_000);
+        let (a, b) = (VarId(0), VarId(1));
+        let rows: Vec<Vec<Binding>> = (0..30)
+            .map(|n| vec![Binding::sid(Sid::new(101, format!("p{n}").as_str()))])
+            .collect();
+        let seed: BoxedOperator = Box::new(ValuesOperator::new(
+            Box::new(EmptyOperator::new()),
+            vec![a],
+            rows,
+        ));
+        assert_eq!(seed.estimated_rows(), Some(30), "VALUES reports its rows");
+
+        let first = make_pattern(a, "knows", b);
+        let second = make_pattern(b, "knows", a);
+        let bounds = HashMap::new();
+        let planning = PlanningContext::current();
+        let mut planner = HashJoinPlanner::new(Some(&stats)).with_left_estimate(Some(30));
+        let mut bound: HashSet<VarId> = HashSet::new();
+        bound.extend(seed.schema().iter().copied());
+
+        let mut op = seed;
+        for tp in [&first, &second] {
+            planner.before_step(tp, &bound);
+            op = build_scan_or_join(
+                Some(op),
+                tp,
+                &bounds,
+                Vec::new(),
+                None,
+                EmitMask::ALL,
+                &[],
+                &planning,
+                &planner,
+            );
+            bound.extend(op.schema().iter().copied());
+        }
+
+        assert_eq!(
+            op.describe().op,
+            "NestedLoopJoinOperator",
+            "30 planner-estimated driving rows must not drain the :knows extension"
+        );
     }
 
     /// The build ceiling still applies independently of the driving side.

@@ -66,6 +66,12 @@ in membership. Writes must go through `EmbeddedRaftNode::committer`, not the
 engine handle. `fluree-db-consensus/tests/it_embedded_node.rs` is a complete
 worked example with no server dependency.
 
+**`cluster_admin_router()` carries no authentication.** It exposes
+membership changes — adding and removing voters. `fluree-server` layers
+`require_admin_token` over `/cluster/*`; an embedding host mounting the
+router itself gets no such protection and must wrap it in its own
+authorization, or mount it only on an interface it trusts.
+
 ### Submission flow (writes)
 
 Writes follow a four-stage path inside the cluster. Only one of the four is tied to the leader; the heavy one is deliberately not:
