@@ -1603,7 +1603,10 @@ mod tests {
         // safe answer: it still has to clear the age threshold.
         assert_eq!(staging_token("plain.tmp"), None);
         assert_eq!(staging_token("leaf.json"), None);
-        assert_ne!(staging_token("leaf.json.999.0.tmp"), Some(own_token().as_str()));
+        assert_ne!(
+            staging_token("leaf.json.999.0.tmp"),
+            Some(own_token().as_str())
+        );
     }
 
     /// The threshold is the only thing standing between a foreign in-flight
@@ -1646,7 +1649,10 @@ mod tests {
     #[tokio::test]
     async fn the_sweep_never_touches_content() {
         let (dir, storage) = storage();
-        storage.write_bytes("a/b/real.json", b"content").await.unwrap();
+        storage
+            .write_bytes("a/b/real.json", b"content")
+            .await
+            .unwrap();
         let real = storage.resolve_path("a/b/real.json").unwrap();
         // `futimens` needs a writable descriptor, so this cannot be a plain
         // `File::open`.
@@ -1660,7 +1666,10 @@ mod tests {
         let sweep = sweep_orphaned_staging_files(dir.path(), Duration::ZERO, SWEEP_ENTRY_BUDGET);
 
         assert_eq!(sweep.reclaimed, 0, "the sweep reclaimed real content");
-        assert_eq!(storage.read_bytes("a/b/real.json").await.unwrap(), b"content");
+        assert_eq!(
+            storage.read_bytes("a/b/real.json").await.unwrap(),
+            b"content"
+        );
     }
 
     /// The walk is on the construction path, so a huge volume must not turn
@@ -1670,7 +1679,12 @@ mod tests {
     fn the_walk_is_bounded_by_its_entry_budget() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..8 {
-            plant_staging_file(dir.path(), &format!("o{i}.json"), "dddd", STALE_STAGING_AGE * 2);
+            plant_staging_file(
+                dir.path(),
+                &format!("o{i}.json"),
+                "dddd",
+                STALE_STAGING_AGE * 2,
+            );
         }
 
         let sweep = sweep_orphaned_staging_files(dir.path(), Duration::ZERO, 3);
