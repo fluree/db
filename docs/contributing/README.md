@@ -131,13 +131,19 @@ More detailed explanation if needed. Wrap at 72 characters.
 Fixes #123
 ```
 
+A `Fixes #123` trailer closes the issue once the commit reaches the default branch, but it does
+not create the *linked pull request* relationship — so put the closing keyword in the **PR body**
+as well (or instead). See [Linking issues from PRs](../../CONTRIBUTING.md#linking-issues-from-prs)
+for the three reference forms and how they behave on stacked PRs.
+
 ### 7. Push and Create PR
 
 ```bash
 git push origin feature/my-feature
 ```
 
-Create pull request on GitHub.
+Create pull request on GitHub. Put `Fixes #N` / `Follow-up: #N` / `Partially addresses #N` in the
+PR body so the reference direction is explicit.
 
 ### 8. Address Review Comments
 
