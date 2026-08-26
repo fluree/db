@@ -14,6 +14,7 @@ fluree-sse = { path = "../fluree-sse" }
 
 async-trait = { workspace = true }
 futures = { workspace = true }
+http = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -28,6 +28,7 @@
 //! currently decodes FLKB leaves — this tier is the transport for future
 //! fine-grained (row-level filtered) peer access.
 
+use crate::transport::{HttpTransport, TransportError, TransportRequest};
 use async_trait::async_trait;
 use fluree_db_core::error::{Error as CoreError, Result};
 use fluree_db_core::format_ledger_id;
@@ -40,9 +41,10 @@ use fluree_db_core::{
     CODEC_FLUREE_INDEX_ROOT, CODEC_FLUREE_LEDGER_CONFIG, CODEC_FLUREE_SPATIAL_INDEX,
     CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
 };
-use reqwest::{Client, StatusCode};
+use http::StatusCode;
 use serde::Serialize;
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How [`ProxyStorage`] fetches ledger content from the origin server.
@@ -59,9 +61,13 @@ pub enum ProxyReadMode {
 }
 
 /// Storage implementation that proxies reads through the transaction server
+///
+/// All network I/O goes through the [`HttpTransport`] seam; the wire
+/// protocol (URLs, address↔CID parsing, status mapping, CID verification)
+/// lives here and is transport-agnostic.
 #[derive(Clone)]
 pub struct ProxyStorage {
-    client: Client,
+    transport: Arc<dyn HttpTransport>,
     api_base: String,
     token: String,
     mode: ProxyReadMode,
@@ -232,13 +238,26 @@ impl ProxyStorage {
     /// [`new`](Self::new) when the API may be mounted under a non-default
     /// prefix.
     pub fn from_api_base(api_base: String, token: String, mode: ProxyReadMode) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60)) // 1 minute for block reads
-            .build()
-            .expect("Failed to create proxy storage client");
+        let transport = Arc::new(crate::transport::ReqwestTransport::with_timeout(
+            Duration::from_secs(60), // 1 minute for block reads
+        ));
+        Self::from_api_base_with_transport(api_base, token, mode, transport)
+    }
 
+    /// Create a proxy storage client over a caller-supplied [`HttpTransport`].
+    ///
+    /// This is the constructor for non-native environments (e.g. a browser
+    /// fetch transport); [`new`](Self::new) and
+    /// [`from_api_base`](Self::from_api_base) are conveniences that plug in
+    /// the default reqwest transport.
+    pub fn from_api_base_with_transport(
+        api_base: String,
+        token: String,
+        mode: ProxyReadMode,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Self {
         Self {
-            client,
+            transport,
             api_base: api_base.trim_end_matches('/').to_string(),
             token,
             mode,
@@ -280,6 +299,34 @@ impl ProxyStorage {
         format!("{}/storage/objects/{}", self.api_base, cid)
     }
 
+    /// Build the object endpoint URL including the `ledger` query parameter.
+    fn object_url_for(&self, cid: &ContentId, ledger: &str) -> String {
+        format!(
+            "{}?ledger={}",
+            self.object_url(cid),
+            urlencoding::encode(ledger)
+        )
+    }
+
+    /// Map a transport failure to the caller-facing storage error, keeping
+    /// the historical message per failure class.
+    fn transport_error(address: &str, err: TransportError) -> CoreError {
+        match err {
+            TransportError::Timeout(e) => {
+                CoreError::io(format!("Storage proxy timeout for {address}: {e}"))
+            }
+            TransportError::Connect(e) => CoreError::io(format!(
+                "Storage proxy connection failed for {address}: {e}"
+            )),
+            TransportError::Request(e) => {
+                CoreError::io(format!("Storage proxy request failed for {address}: {e}"))
+            }
+            TransportError::Body(e) => {
+                CoreError::io(format!("Failed to read response body for {address}: {e}"))
+            }
+        }
+    }
+
     /// Fetch canonical CAS bytes via `GET /storage/objects/{cid}` and verify
     /// them against the CID before returning.
     async fn fetch_raw_object(&self, address: &str) -> Result<Vec<u8>> {
@@ -288,34 +335,18 @@ impl ProxyStorage {
         })?;
         let ledger = self.remote_ledger(ledger);
 
-        let response = match self
-            .client
-            .get(self.object_url(&cid))
-            .query(&[("ledger", ledger.as_str())])
-            .header("Authorization", format!("Bearer {}", self.token))
-            .send()
+        let request = TransportRequest::get(self.object_url_for(&cid, &ledger))
+            .header("authorization", format!("Bearer {}", self.token));
+        let response = self
+            .transport
+            .execute(request)
             .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(if e.is_timeout() {
-                    CoreError::io(format!("Storage proxy timeout for {address}: {e}"))
-                } else if e.is_connect() {
-                    CoreError::io(format!(
-                        "Storage proxy connection failed for {address}: {e}"
-                    ))
-                } else {
-                    CoreError::io(format!("Storage proxy request failed for {address}: {e}"))
-                });
-            }
-        };
+            .map_err(|e| Self::transport_error(address, e))?;
 
-        let status = response.status();
+        let status = response.status;
         match status {
             StatusCode::OK => {
-                let bytes = response.bytes().await.map_err(|e| {
-                    CoreError::io(format!("Failed to read response body for {address}: {e}"))
-                })?;
+                let bytes = response.body;
                 if !crate::origin::verify_object_integrity(&cid, &bytes) {
                     return Err(CoreError::storage(format!(
                         "Integrity verification failed for {address} (cid {cid})"
@@ -394,40 +425,31 @@ impl ProxyStorage {
             cid: cid.to_string(),
             ledger: self.remote_ledger(ledger),
         };
-
-        let response = match self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .header("Accept", accept)
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(r) => r,
+        let body_bytes = match serde_json::to_vec(&body) {
+            Ok(b) => b,
             Err(e) => {
-                let err = if e.is_timeout() {
-                    CoreError::io(format!("Storage proxy timeout for {address}: {e}"))
-                } else if e.is_connect() {
-                    CoreError::io(format!(
-                        "Storage proxy connection failed for {address}: {e}"
-                    ))
-                } else {
-                    CoreError::io(format!("Storage proxy request failed for {address}: {e}"))
-                };
-                return FetchOutcome::Error(err);
+                return FetchOutcome::Error(CoreError::storage(format!(
+                    "Failed to encode block request for {address}: {e}"
+                )));
             }
         };
 
-        let status = response.status();
+        let request = TransportRequest::post(url)
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("accept", accept)
+            .header("content-type", "application/json")
+            .body(body_bytes);
+        let response = match self.transport.execute(request).await {
+            Ok(r) => r,
+            Err(e) => {
+                return FetchOutcome::Error(Self::transport_error(address, e));
+            }
+        };
+
+        let status = response.status;
 
         match status {
-            StatusCode::OK => match response.bytes().await {
-                Ok(bytes) => FetchOutcome::Success(bytes.to_vec()),
-                Err(e) => FetchOutcome::Error(CoreError::io(format!(
-                    "Failed to read response body for {address}: {e}"
-                ))),
-            },
+            StatusCode::OK => FetchOutcome::Success(response.body.to_vec()),
             StatusCode::NOT_FOUND => FetchOutcome::Error(CoreError::not_found(address)),
             StatusCode::NOT_ACCEPTABLE => {
                 // 406 - format not available, signal for retry with different Accept
@@ -485,35 +507,32 @@ impl StorageRead for ProxyStorage {
         })?;
         let ledger = self.remote_ledger(ledger);
 
-        let response = self
-            .client
-            .get(self.object_url(&cid))
-            .query(&[("ledger", ledger.as_str())])
-            .header("Authorization", format!("Bearer {}", self.token))
+        let request = TransportRequest::get(self.object_url_for(&cid, &ledger))
+            .header("authorization", format!("Bearer {}", self.token))
             // HTTP ranges are inclusive; ours are half-open.
-            .header("Range", format!("bytes={}-{}", range.start, range.end - 1))
-            .send()
-            .await
-            .map_err(|e| {
+            .header("range", format!("bytes={}-{}", range.start, range.end - 1));
+        let response = self.transport.execute(request).await.map_err(|e| match e {
+            // This path historically reported all send failures uniformly;
+            // only body-read failures carry their own message.
+            TransportError::Body(e) => {
+                CoreError::io(format!("Failed to read response body for {address}: {e}"))
+            }
+            TransportError::Timeout(e)
+            | TransportError::Connect(e)
+            | TransportError::Request(e) => {
                 CoreError::io(format!("Storage proxy request failed for {address}: {e}"))
-            })?;
+            }
+        })?;
 
-        let status = response.status();
+        let status = response.status;
         match status {
             // Partial payloads can't be CID-verified client-side; the server
             // verifies the full object against the CID before slicing.
-            StatusCode::PARTIAL_CONTENT => {
-                let bytes = response.bytes().await.map_err(|e| {
-                    CoreError::io(format!("Failed to read response body for {address}: {e}"))
-                })?;
-                Ok(bytes.to_vec())
-            }
+            StatusCode::PARTIAL_CONTENT => Ok(response.body.to_vec()),
             // Server ignored the Range header (older server): verify the
             // full object and slice locally.
             StatusCode::OK => {
-                let bytes = response.bytes().await.map_err(|e| {
-                    CoreError::io(format!("Failed to read response body for {address}: {e}"))
-                })?;
+                let bytes = response.body;
                 if !crate::origin::verify_object_integrity(&cid, &bytes) {
                     return Err(CoreError::storage(format!(
                         "Integrity verification failed for {address} (cid {cid})"
@@ -632,6 +651,135 @@ impl fluree_db_core::StorageMethod for ProxyStorage {
 mod tests {
     use super::*;
     use fluree_db_core::ContentKind;
+
+    /// A canned-response transport: records the requests it receives and
+    /// replays a fixed response. This is the injection shape a browser
+    /// (fetch-backed) transport uses, so it doubles as a seam proof.
+    #[derive(Debug)]
+    struct CannedTransport {
+        requests: std::sync::Mutex<Vec<TransportRequest>>,
+        status: StatusCode,
+        body: Vec<u8>,
+    }
+
+    impl CannedTransport {
+        fn new(status: StatusCode, body: Vec<u8>) -> Arc<Self> {
+            Arc::new(Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+                status,
+                body,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl HttpTransport for CannedTransport {
+        async fn execute(
+            &self,
+            req: TransportRequest,
+        ) -> std::result::Result<crate::transport::TransportResponse, TransportError> {
+            self.requests.lock().unwrap().push(req);
+            Ok(crate::transport::TransportResponse {
+                status: self.status,
+                headers: http::HeaderMap::new(),
+                body: bytes::Bytes::from(self.body.clone()),
+            })
+        }
+    }
+
+    /// End-to-end through an injected transport: the raw path forms the
+    /// object URL + bearer header, verifies the payload against the CID,
+    /// and returns the canonical bytes — no reqwest involved.
+    #[tokio::test]
+    async fn raw_read_via_injected_transport_verifies_and_returns_bytes() {
+        let payload = b"commit payload".to_vec();
+        let id = ContentId::new(ContentKind::Txn, &payload);
+        let address = fluree_db_core::content_address(
+            "file",
+            ContentKind::Txn,
+            "mydb:main",
+            &id.digest_hex(),
+        );
+
+        let transport = CannedTransport::new(StatusCode::OK, payload.clone());
+        let storage = ProxyStorage::from_api_base_with_transport(
+            "http://origin.example/v1/fluree".to_string(),
+            "tok".to_string(),
+            ProxyReadMode::Raw,
+            transport.clone(),
+        );
+
+        let bytes = storage.read_bytes(&address).await.expect("raw read");
+        assert_eq!(bytes, payload);
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert_eq!(req.method, crate::transport::TransportMethod::Get);
+        assert_eq!(
+            req.url,
+            format!("http://origin.example/v1/fluree/storage/objects/{id}?ledger=mydb%3Amain")
+        );
+        assert_eq!(
+            req.headers,
+            vec![("authorization", "Bearer tok".to_string())]
+        );
+    }
+
+    /// Integrity failures are detected client-side regardless of transport:
+    /// a payload that doesn't hash to the CID is rejected.
+    #[tokio::test]
+    async fn raw_read_via_injected_transport_rejects_corrupt_bytes() {
+        let payload = b"commit payload".to_vec();
+        let id = ContentId::new(ContentKind::Txn, &payload);
+        let address = fluree_db_core::content_address(
+            "file",
+            ContentKind::Txn,
+            "mydb:main",
+            &id.digest_hex(),
+        );
+
+        let transport = CannedTransport::new(StatusCode::OK, b"tampered bytes".to_vec());
+        let storage = ProxyStorage::from_api_base_with_transport(
+            "http://origin.example/v1/fluree".to_string(),
+            "tok".to_string(),
+            ProxyReadMode::Raw,
+            transport,
+        );
+
+        let err = storage
+            .read_bytes(&address)
+            .await
+            .expect_err("corrupt payload must be rejected");
+        assert!(
+            err.to_string().contains("Integrity verification failed"),
+            "got: {err}"
+        );
+    }
+
+    /// 403 maps to NotFound (no existence leak) through any transport.
+    #[tokio::test]
+    async fn raw_read_via_injected_transport_maps_forbidden_to_not_found() {
+        let payload = b"x".to_vec();
+        let id = ContentId::new(ContentKind::Txn, &payload);
+        let address = fluree_db_core::content_address(
+            "file",
+            ContentKind::Txn,
+            "mydb:main",
+            &id.digest_hex(),
+        );
+
+        let transport = CannedTransport::new(StatusCode::FORBIDDEN, Vec::new());
+        let storage = ProxyStorage::from_api_base_with_transport(
+            "http://origin.example/v1/fluree".to_string(),
+            "tok".to_string(),
+            ProxyReadMode::Raw,
+            transport,
+        );
+
+        let err = storage.read_bytes(&address).await.expect_err("403");
+        assert!(matches!(err, CoreError::NotFound(_)), "got: {err:?}");
+    }
 
     #[test]
     fn test_proxy_storage_debug() {

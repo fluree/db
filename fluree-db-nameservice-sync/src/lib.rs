@@ -29,6 +29,7 @@ pub mod pack_client;
 pub mod proxy_nameservice;
 pub mod proxy_storage;
 mod server_sse;
+pub mod transport;
 #[cfg(feature = "aws")]
 pub mod vended_s3;
 pub mod watch;
@@ -51,6 +52,10 @@ pub use pack_client::{
 };
 pub use proxy_nameservice::ProxyNameService;
 pub use proxy_storage::{ProxyReadMode, ProxyStorage};
+pub use transport::{
+    HttpTransport, ReqwestTransport, TransportError, TransportMethod, TransportRequest,
+    TransportResponse,
+};
 pub use watch::{RemoteEvent, RemoteWatch};
 pub use watch_poll::PollRemoteWatch;
 pub use watch_sse::SseRemoteWatch;
