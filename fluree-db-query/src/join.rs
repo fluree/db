@@ -22,12 +22,12 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
+use fluree_db_core::clock::Instant;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::Instrument;
 
 /// Emit a debug flush summary only when the batched existence probe did non-trivial

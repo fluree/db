@@ -15,6 +15,7 @@
 //! ```
 
 use crate::reasoning::ReasoningOverlay;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
 use fluree_db_core::overlay::OverlayProvider;
@@ -30,7 +31,6 @@ use fluree_vocab::namespaces::FLUREE_DB;
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::error::{QueryError, Result};
 

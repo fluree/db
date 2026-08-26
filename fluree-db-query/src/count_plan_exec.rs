@@ -106,7 +106,7 @@ pub(crate) fn count_plan_operator(
                 overlay,
             };
 
-            let started = std::time::Instant::now();
+            let started = fluree_db_core::clock::Instant::now();
             match execute_plan(&plan.root, &ec)? {
                 Some(count) => {
                     tracing::debug!(
