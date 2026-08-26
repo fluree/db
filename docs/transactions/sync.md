@@ -125,3 +125,12 @@ payload with a small delta is fine; the commit only carries the delta. A huge
 *delta* is bounded by novelty backpressure (`reindex_max_bytes`): the commit
 fails with `NoveltyWouldExceed` rather than overrunning memory, and the graph
 is left unchanged.
+
+A huge *graph* is bounded by `FLUREE_MAX_GRAPH_SCAN_FLAKES` (default
+10,000,000; `0` disables): the whole-graph scan stops there and the
+transaction fails with a resource-limit error naming the knob, instead of
+exhausting memory — an identical resync of a large graph is the worst case,
+since it materializes everything and commits nothing. A dry run trips the
+cap the same way the real run would, and `CLEAR`/`DROP`/`COPY`/`MOVE` share
+it. The follow-up that streams the diff instead of materializing the graph
+is [#1691](https://github.com/fluree/db/issues/1691).

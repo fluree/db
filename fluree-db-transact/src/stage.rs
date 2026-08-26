@@ -1124,6 +1124,32 @@ fn flake_content(f: &Flake) -> FlakeContent {
     )
 }
 
+/// Default for [`whole_graph_scan_limit`]: ~2 GB peak at the accumulator's
+/// two-copies-per-fact profile. Any graph that worked before the limit
+/// existed still works — whole-graph verbs errored outright on
+/// index-resident graphs, and novelty-resident graphs are already bounded
+/// well below this by `reindex_max_bytes`.
+const DEFAULT_MAX_GRAPH_SCAN_FLAKES: usize = 10_000_000;
+
+/// Memory backstop for whole-graph scans (graph sync, CLEAR, DROP, COPY,
+/// MOVE): staging materializes the target graph's currently-asserted
+/// flakes, so peak memory scales with the graph, not the delta — an
+/// identical resync of a huge graph is the worst case, and no other guard
+/// sees it (`NoveltyWouldExceed` measures only the surviving delta, after
+/// materialization). `FLUREE_MAX_GRAPH_SCAN_FLAKES` overrides; `0`
+/// disables. Read per call — once per graph-management op, never per
+/// flake — so tests and embedders can change it at runtime.
+fn whole_graph_scan_limit() -> Option<usize> {
+    match std::env::var("FLUREE_MAX_GRAPH_SCAN_FLAKES") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT_MAX_GRAPH_SCAN_FLAKES),
+        },
+        Err(_) => Some(DEFAULT_MAX_GRAPH_SCAN_FLAKES),
+    }
+}
+
 /// Scan every currently-asserted flake in graph `g_id` (merged snapshot +
 /// novelty view as of the ledger's current `t`), attributed to `g_sid`.
 ///
@@ -1166,10 +1192,22 @@ async fn scan_graph_flakes(
     // rejects every other `RangeTest`, and the genesis (overlay-only) path
     // matches an empty `Eq` against every flake. `Ge` only ever worked on
     // the genesis path, where non-`Eq` tests pass through unfiltered.
+    // `flake_limit` stops the provider's drain loop mid-scan, so the
+    // backstop bounds what is materialized, not just what is returned.
+    let limit = whole_graph_scan_limit();
+    let opts = fluree_db_core::RangeOptions {
+        flake_limit: limit.map(|l| l.saturating_add(1)),
+        ..Default::default()
+    };
     let mut flakes = db_ref
-        .range(IndexType::Spot, RangeTest::Eq, RangeMatch::new())
+        .range_with_opts(IndexType::Spot, RangeTest::Eq, RangeMatch::new(), opts)
         .await
         .map_err(|e| TransactError::FlakeGeneration(format!("graph scan failed: {e}")))?;
+    if let Some(l) = limit {
+        if flakes.len() > l {
+            return Err(TransactError::WholeGraphScanTooLarge { limit: l });
+        }
+    }
     for f in &mut flakes {
         f.g = g_sid.cloned();
     }
