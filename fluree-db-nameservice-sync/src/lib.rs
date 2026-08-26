@@ -51,7 +51,7 @@ pub use pack_client::{
     peek_pack_header, PackIngestResult,
 };
 pub use proxy_nameservice::ProxyNameService;
-pub use proxy_storage::{ProxyReadMode, ProxyStorage};
+pub use proxy_storage::{cid_and_ledger_from_address, ProxyReadMode, ProxyStorage};
 pub use transport::{
     HttpTransport, ReqwestTransport, TransportError, TransportMethod, TransportRequest,
     TransportResponse,
