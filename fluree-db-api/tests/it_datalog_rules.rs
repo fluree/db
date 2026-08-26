@@ -1962,3 +1962,381 @@ async fn datalog_rule_matching_nothing_is_not_flagged() {
         "a rule whose where clause matched nothing must not be flagged, got {noisy:?}"
     );
 }
+
+// =============================================================================
+// Review follow-ups on the #1556 fix
+// =============================================================================
+
+/// Making every Sid-bound variable resolve as an IRI must not start dropping
+/// IRI-valued rows from a filter that tests a *literal*.
+///
+/// SPARQL 1.1 §17.4.1.7 makes RDFterm-equal a type error only when both
+/// operands are literals; an IRI against a literal is simply not the same RDF
+/// term, so `!=` is true and the row is kept. Treating that pairing as a type
+/// error would be fail-closed but wrong — silent under-derivation.
+#[tokio::test]
+async fn datalog_filter_literal_does_not_drop_iri_valued_rows() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-literal-vs-iri");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:copyExceptBobRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "ex:sameAs": {"@id": "?other"}},
+                            {"@id": "?other", "?prop": "?val"},
+                            ["filter", "(!= ?val \"Bob\")"]
+                        ],
+                        "insert": {"@id": "?s", "?prop": "?val"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "ex:name": "Bob", "ex:friend": {"@id": "ex:carol"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?prop", "?val"],
+        "where": {"@id": "ex:alice", "?prop": "?val"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!(["ex:friend", "ex:carol"])),
+        "an IRI-valued property must survive a filter that excludes a literal — \
+         an IRI is not the literal \"Bob\", so (!= ?val \"Bob\") holds, got {results:?}"
+    );
+    assert!(
+        !results.contains(&json!(["ex:name", "Bob"])),
+        "the literal the filter names must still be excluded, got {results:?}"
+    );
+}
+
+/// A filter that quotes an operand containing whitespace must survive
+/// tokenization — the parse error for an unresolvable IRI operand recommends
+/// quoting, so the hatch has to actually work.
+#[tokio::test]
+async fn datalog_filter_quoted_operand_with_whitespace_works() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-quoted-whitespace");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:notJohnRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "ex:name": "?name"},
+                            ["filter", "(!= ?name \"John Smith\")"]
+                        ],
+                        "insert": {"@id": "?s", "ex:screened": true}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:name": "John Smith"},
+            {"@id": "ex:b", "ex:name": "Jane Doe"}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?s",
+        "where": {"@id": "?s", "ex:screened": true},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!("ex:b")),
+        "the non-excluded row must derive, got {results:?}"
+    );
+    assert!(
+        !results.contains(&json!("ex:a")),
+        "a quoted operand containing a space must still exclude its match, \
+         got {results:?}"
+    );
+}
+
+/// A malformed filter must not vanish. If it does, `rule.filters` is empty,
+/// filtering is skipped entirely, and the rule derives everything it was
+/// written to restrict — the #1556 failure mode reached by another route.
+///
+/// All three shapes were silently dropped before: a wrong-length array, a
+/// non-string expression, and a filter keyword whose case does not match.
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_malformed_filter_does_not_silently_vanish() {
+    for (label, filter_element) in [
+        (
+            "wrong arity",
+            json!(["filter", "(!= ?prop ex:ssn)", "oops"]),
+        ),
+        ("wrong case", json!(["FILTER", "(!= ?prop ex:ssn)"])),
+        (
+            "non-string expression",
+            json!(["filter", {"expr": "(!= ?prop ex:ssn)"}]),
+        ),
+    ] {
+        let (store, _guard) = support::span_capture::init_test_tracing();
+
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger0 = genesis_ledger(&fluree, "datalog/malformed-filter");
+
+        let rule_data = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "f": "https://ns.flur.ee/db#"
+            },
+            "@graph": [
+                {
+                    "@id": "ex:copyPropsRule",
+                    "f:rule": {
+                        "@type": "@json",
+                        "@value": {
+                            "@context": {"ex": "http://example.org/"},
+                            "where": [
+                                {"@id": "?s", "ex:sameAs": {"@id": "?other"}},
+                                {"@id": "?other", "?prop": "?val"},
+                                filter_element
+                            ],
+                            "insert": {"@id": "?s", "?prop": "?val"}
+                        }
+                    }
+                }
+            ]
+        });
+        let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+        let data = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [
+                {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}},
+                {"@id": "ex:bob", "ex:name": "Bob", "ex:ssn": "123-45-6789"}
+            ]
+        });
+        let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+        let q = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?prop", "?val"],
+            "where": {"@id": "ex:alice", "?prop": "?val"},
+            "reasoning": "datalog"
+        });
+        let rows = support::query_jsonld(&fluree, &ledger, &q)
+            .await
+            .unwrap()
+            .to_jsonld(&ledger.snapshot)
+            .unwrap();
+        let results = normalize_rows(&rows);
+
+        let rendered = serde_json::to_string(&results).unwrap();
+        assert!(
+            !rendered.contains("123-45-6789"),
+            "[{label}] a malformed filter must not be dropped on the floor — the \
+             rule ran unfiltered and copied the value the filter was meant to \
+             exclude, got {results:?}"
+        );
+
+        let warned = store
+            .all_events()
+            .into_iter()
+            .any(|e| e.level == tracing::Level::WARN);
+        assert!(
+            warned,
+            "[{label}] rejecting a malformed filter must produce a diagnostic"
+        );
+    }
+}
+
+/// The bare-local-name filter form — `(= ?p knows)` — was the only operand
+/// shape that ever matched a bound IRI before #1556 was fixed, so a rule
+/// written as a workaround uses exactly it. It now correctly derives nothing,
+/// because a bare name is a string literal and a string is never an IRI.
+///
+/// The risk is that it does so in silence: RDFterm-equal makes IRI-vs-literal
+/// a clean `False` rather than an `Error`, so the "could not compare its
+/// operands" path cannot see it. A stale rule must still say something.
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_bare_local_name_filter_warns_instead_of_going_quiet() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/bare-local-name-filter");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:staleWorkaroundRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "?p": {"@id": "?o"}},
+                            ["filter", "(= ?p knows)"]
+                        ],
+                        "insert": {"@id": "?s", "ex:derivedKnows": {"@id": "?o"}}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [{"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}}]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?who",
+        "where": {"@id": "ex:alice", "ex:derivedKnows": "?who"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.is_empty(),
+        "a bare local name is a string literal and must not match an IRI \
+         namespace-blindly, got {results:?}"
+    );
+
+    let diagnostics: Vec<String> = store
+        .all_events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .map(|e| e.message().to_string())
+        .collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.contains("compared an IRI against a literal")),
+        "a stale bare-local-name filter must not fail silently — it needs a \
+         diagnostic pointing at the operand form, got {diagnostics:?}"
+    );
+}
+
+/// The converse guard: a filter that legitimately compares an IRI against a
+/// literal and keeps rows must NOT trip the bare-local-name warning. The
+/// signal is only meaningful if it stays quiet on correct usage.
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_iri_versus_literal_filter_that_keeps_rows_is_not_flagged() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/iri-vs-literal-no-warn");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:copyExceptBobRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "ex:sameAs": {"@id": "?other"}},
+                            {"@id": "?other", "?prop": "?val"},
+                            ["filter", "(!= ?val \"Bob\")"]
+                        ],
+                        "insert": {"@id": "?s", "?prop": "?val"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "ex:name": "Bob", "ex:friend": {"@id": "ex:carol"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?prop", "?val"],
+        "where": {"@id": "ex:alice", "?prop": "?val"},
+        "reasoning": "datalog"
+    });
+    let _ = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+
+    let noisy: Vec<String> = store
+        .all_events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .map(|e| e.message().to_string())
+        .filter(|m| m.contains("compared an IRI against a literal"))
+        .collect();
+    assert!(
+        noisy.is_empty(),
+        "an IRI-vs-literal filter that keeps rows is correct usage and must not \
+         be flagged, got {noisy:?}"
+    );
+}

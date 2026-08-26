@@ -283,14 +283,32 @@ fn parse_where_clause(
                     }
                     JsonValue::Array(filter_arr) if is_filter_expression(filter_arr) => {
                         // Filter expression like ["filter", "(>= ?age 62)"]
-                        if let Some(filter) =
-                            parse_filter_expression(filter_arr, context, snapshot)?
-                        {
-                            filters.push(filter);
-                        }
+                        filters.push(parse_filter_expression(filter_arr, context, snapshot)?);
                     }
+                    // A near-miss on the filter keyword — `["FILTER", ...]` —
+                    // is rejected outright. It is unambiguously a filter the
+                    // author meant to apply, and dropping it silently is the
+                    // #1556 failure mode by another route: the filter
+                    // disappears, `rule.filters` is empty, and the rule derives
+                    // everything it was written to restrict.
+                    _ if looks_like_misspelled_filter(item) => {
+                        return Err(QueryError::InvalidQuery(format!(
+                            "Unrecognized element in rule where clause: {item}. \
+                             The filter keyword is lowercase `filter` — this element \
+                             would otherwise be dropped, leaving the rule to derive \
+                             the facts the filter was written to exclude."
+                        )));
+                    }
+                    // Anything else stays tolerated, as it has been. Whether an
+                    // unknown where-clause element should be an outright error
+                    // is a language decision beyond this fix, but it should not
+                    // vanish without a trace.
                     _ => {
-                        // Skip unknown array elements
+                        tracing::warn!(
+                            element = %item,
+                            "unrecognized element in datalog rule where clause — ignored; \
+                             expected a node pattern object or [\"filter\", \"(op ?var value)\"]"
+                        );
                     }
                 }
             }
@@ -311,6 +329,14 @@ fn parse_where_clause(
 /// the head must appear in the body. A rule that breaks it can never derive
 /// anything — `instantiate_pattern` returns `None` for each row — which is the
 /// silent dead end reported in #1560.
+///
+/// Parser-generated names on the where side are deliberately NOT treated as
+/// binding. They are numbered off each clause's own `patterns.len()`, so a
+/// where-side `?__implicit_0` and an unrelated insert-side `?__implicit_0`
+/// would otherwise collide and suppress the diagnostic for exactly the
+/// anonymous-node case it exists to report. An author cannot write one of
+/// these names, so an insert pattern can never legitimately be referring to
+/// the where clause's copy.
 fn unbound_insert_variables(
     where_patterns: &[RuleTriplePattern],
     insert_patterns: &[RuleTriplePattern],
@@ -319,6 +345,7 @@ fn unbound_insert_variables(
     for pattern in where_patterns {
         bind_pattern_vars(pattern, &mut bound);
     }
+    bound.retain(|v| !v.starts_with(IMPLICIT_VAR_PREFIX));
 
     let mut unbound: Vec<Arc<str>> = Vec::new();
     for pattern in insert_patterns {
@@ -383,24 +410,52 @@ fn is_filter_expression(arr: &[JsonValue]) -> bool {
     matches!(arr.first(), Some(JsonValue::String(s)) if s == "filter")
 }
 
+/// Whether a where-clause element is an array whose head is some case variant
+/// of `filter` — i.e. the author meant a filter and the keyword did not match.
+/// Used only to sharpen the rejection message.
+fn looks_like_misspelled_filter(item: &JsonValue) -> bool {
+    matches!(
+        item.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()),
+        Some(s) if s.eq_ignore_ascii_case("filter")
+    )
+}
+
 /// Parse a filter expression like ["filter", "(>= ?age 62)"]
 ///
 /// `context` and `snapshot` are threaded in so an IRI operand can be expanded
 /// and resolved the same way a node-pattern term is (#1556) — without them a
 /// colon-bearing operand was silently demoted to a string and could never
 /// equal the IRI it named.
+///
+/// Every rejection path is an error rather than a quiet `None`. A filter that
+/// fails to parse and disappears leaves `rule.filters` empty, and
+/// [`execute_rule_matching`] then skips filtering entirely — so a malformed
+/// exclusion filter derives exactly the facts it was written to withhold,
+/// which is the #1556 failure mode reached by a different route.
 fn parse_filter_expression(
     arr: &[JsonValue],
     context: &JsonValue,
     snapshot: &LedgerSnapshot,
-) -> Result<Option<RuleFilter>> {
+) -> Result<RuleFilter> {
     if arr.len() != 2 {
-        return Ok(None);
+        return Err(QueryError::InvalidQuery(format!(
+            "A rule filter must have exactly two elements, \
+             [\"filter\", \"(op ?var value)\"], but got {} — refusing to drop the \
+             filter, since a rule that silently loses its filter derives the facts \
+             the filter was written to exclude.",
+            arr.len()
+        )));
     }
 
     let expr = match &arr[1] {
         JsonValue::String(s) => s.as_str(),
-        _ => return Ok(None),
+        other => {
+            return Err(QueryError::InvalidQuery(format!(
+                "A rule filter expression must be a string, but got {other} — \
+                 refusing to drop the filter, since a rule that silently loses its \
+                 filter derives the facts the filter was written to exclude."
+            )));
+        }
     };
 
     // Parse S-expression style filter: "(op arg1 arg2)"
@@ -412,7 +467,7 @@ fn parse_filter_expression(
     }
 
     let inner = &expr[1..expr.len() - 1];
-    let parts: Vec<&str> = inner.split_whitespace().collect();
+    let parts = split_filter_tokens(inner)?;
 
     if parts.len() < 2 {
         return Err(QueryError::InvalidQuery(format!(
@@ -449,6 +504,14 @@ fn parse_filter_expression(
     // never be answered. Reject it here rather than letting it evaluate to
     // "no" per row — a silently-unsatisfiable ordering filter is the same
     // class of invisible failure as the fail-open equality of #1556.
+    //
+    // This parse-time guard is JSON-LD-only: SPARQL rules never reach this
+    // function, and `sparql_lang.rs` lowers a constant IRI to
+    // `RuleTerm::Value(RuleValue::Ref(_))` rather than `RuleTerm::Sid(_)`.
+    // Both paths still fail closed — `compare_values` returns `Error` for IRI
+    // ordering at run time — so the difference is only in the diagnostic: a
+    // JSON-LD author gets a parse error naming the operator, a SPARQL author
+    // gets a per-rule warn from `execute_rule_matching`.
     if !matches!(op, CompareOp::Equal | CompareOp::NotEqual)
         && (matches!(left, RuleTerm::Sid(_)) || matches!(right, RuleTerm::Sid(_)))
     {
@@ -458,7 +521,55 @@ fn parse_filter_expression(
         )));
     }
 
-    Ok(Some(RuleFilter::Compare { op, left, right }))
+    Ok(RuleFilter::Compare { op, left, right })
+}
+
+/// Split a filter's inner S-expression into tokens, keeping a quoted operand
+/// whole.
+///
+/// Plain `split_whitespace` tore `"John Smith"` into `"John` and `Smith"`, so
+/// the quoting escape hatch that [`parse_filter_term`]'s own error message
+/// recommends did not survive a value containing a space — the operand became
+/// the literal string `"John`, leading quote included. Quotes are kept in the
+/// token so `quoted_literal` can still recognise and strip them.
+///
+/// An unterminated quote is an error rather than a silently truncated operand.
+fn split_filter_tokens(inner: &str) -> Result<Vec<&str>> {
+    let bytes = inner.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        let start = i;
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                return Err(QueryError::InvalidQuery(format!(
+                    "Unterminated quote in filter expression: {inner}. \
+                     A quoted operand must close its quote."
+                )));
+            }
+            i += 1; // consume the closing quote
+        } else {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+        tokens.push(&inner[start..i]);
+    }
+
+    Ok(tokens)
 }
 
 /// The prefix of a token shaped like a compact IRI (`prefix:local`).
@@ -895,41 +1006,72 @@ pub async fn execute_rule_matching(
     // Apply filters to eliminate non-matching bindings.
     //
     // A row survives only on an outright `True`. `Error` — an unresolvable
-    // operand or a pair of values with no defined comparison — drops the row,
-    // never keeps it, so no filter can fail open (#1556).
+    // operand or a pair of literals with no defined comparison — drops the row,
+    // never keeps it, so filter *evaluation* cannot fail open (#1556).
     if !rule.filters.is_empty() {
-        let mut errored_rows = 0usize;
+        let rows_before = binding_rows.len();
+        let mut diagnostics = FilterDiagnostics::default();
         binding_rows.retain(|bindings| {
             let mut row_errored = false;
-            let keep = rule
-                .filters
-                .iter()
-                .all(|filter| match evaluate_filter(filter, bindings) {
+            let keep = rule.filters.iter().all(|filter| {
+                match evaluate_filter(filter, bindings, &mut diagnostics) {
                     FilterOutcome::True => true,
                     FilterOutcome::False => false,
                     FilterOutcome::Error => {
                         row_errored = true;
                         false
                     }
-                });
-            errored_rows += row_errored as usize;
+                }
+            });
+            diagnostics.errored_rows += row_errored as usize;
             keep
         });
-        if errored_rows > 0 {
+
+        if diagnostics.errored_rows > 0 {
             // Excluding the row is the safe answer, but silently excluding it
             // is how a mis-typed filter looks exactly like a rule that
             // legitimately matched nothing.
             tracing::warn!(
                 rule = rule.name.as_deref().unwrap_or("<unnamed>"),
                 rule_id = %rule.id,
-                errored_rows,
+                errored_rows = diagnostics.errored_rows,
                 "datalog rule filter could not compare its operands on some binding \
                  rows; those rows were excluded — check the filter's operand types"
+            );
+        } else if rows_before > 0 && binding_rows.is_empty() && diagnostics.iri_vs_literal > 0 {
+            // Every row was eliminated, and at least one comparison put an IRI
+            // against a literal. That is the signature of a filter written
+            // against a bare local name — `(= ?p knows)` — which was the only
+            // operand form that matched a bound IRI before #1556 was fixed, so
+            // it is exactly what a rule authored as a workaround looks like.
+            // Such a rule now correctly derives nothing, and without this it
+            // would do so in complete silence: RDFterm-equal makes IRI-vs-literal
+            // a clean `False`, not an `Error`, so the branch above cannot see it.
+            tracing::warn!(
+                rule = rule.name.as_deref().unwrap_or("<unnamed>"),
+                rule_id = %rule.id,
+                rows_before,
+                "datalog rule filter compared an IRI against a literal and excluded \
+                 every binding row; if the operand was meant to name an IRI, write it \
+                 as a prefixed or absolute IRI (`ex:knows`) rather than a bare local \
+                 name (`knows`) — a bare name is a string literal and never equals an IRI"
             );
         }
     }
 
     Ok(binding_rows)
+}
+
+/// Per-rule tallies gathered while filtering, used only for diagnostics.
+#[derive(Default)]
+struct FilterDiagnostics {
+    /// Rows dropped because some filter could not be evaluated at all.
+    errored_rows: usize,
+    /// Comparisons that put an IRI against a literal. Well-defined (and false)
+    /// per RDFterm-equal, so it never drops a row on its own — but when it
+    /// coincides with "every row eliminated" it is the fingerprint of a stale
+    /// bare-local-name filter.
+    iri_vs_literal: usize,
 }
 
 /// Outcome of evaluating a rule filter against one binding row.
@@ -947,14 +1089,26 @@ enum FilterOutcome {
 }
 
 /// Evaluate a filter expression against a set of bindings
-fn evaluate_filter(filter: &RuleFilter, bindings: &Bindings) -> FilterOutcome {
+///
+/// `diagnostics` accumulates the tallies that make a silently-empty filter
+/// explainable afterwards; evaluation itself does not consult them.
+fn evaluate_filter(
+    filter: &RuleFilter,
+    bindings: &Bindings,
+    diagnostics: &mut FilterDiagnostics,
+) -> FilterOutcome {
     match filter {
         RuleFilter::Compare { op, left, right } => {
             let left_val = resolve_filter_term(left, bindings);
             let right_val = resolve_filter_term(right, bindings);
 
             match (left_val, right_val) {
-                (Some(l), Some(r)) => compare_values(&l, &r, *op),
+                (Some(l), Some(r)) => {
+                    if matches!(l, FlakeValue::Ref(_)) != matches!(r, FlakeValue::Ref(_)) {
+                        diagnostics.iri_vs_literal += 1;
+                    }
+                    compare_values(&l, &r, *op)
+                }
                 // An unbound operand cannot be judged either way.
                 _ => FilterOutcome::Error,
             }
@@ -963,7 +1117,7 @@ fn evaluate_filter(filter: &RuleFilter, bindings: &Bindings) -> FilterOutcome {
         RuleFilter::And(filters) => {
             let mut saw_error = false;
             for f in filters {
-                match evaluate_filter(f, bindings) {
+                match evaluate_filter(f, bindings, diagnostics) {
                     FilterOutcome::False => return FilterOutcome::False,
                     FilterOutcome::Error => saw_error = true,
                     FilterOutcome::True => {}
@@ -979,7 +1133,7 @@ fn evaluate_filter(filter: &RuleFilter, bindings: &Bindings) -> FilterOutcome {
         RuleFilter::Or(filters) => {
             let mut saw_error = false;
             for f in filters {
-                match evaluate_filter(f, bindings) {
+                match evaluate_filter(f, bindings, diagnostics) {
                     FilterOutcome::True => return FilterOutcome::True,
                     FilterOutcome::Error => saw_error = true,
                     FilterOutcome::False => {}
@@ -991,7 +1145,7 @@ fn evaluate_filter(filter: &RuleFilter, bindings: &Bindings) -> FilterOutcome {
                 FilterOutcome::False
             }
         }
-        RuleFilter::Not(inner) => match evaluate_filter(inner, bindings) {
+        RuleFilter::Not(inner) => match evaluate_filter(inner, bindings, diagnostics) {
             FilterOutcome::True => FilterOutcome::False,
             FilterOutcome::False => FilterOutcome::True,
             // Never `True`: negating something uncomparable must not admit the row.
@@ -1078,6 +1232,23 @@ fn compare_values(left: &FlakeValue, right: &FlakeValue, op: CompareOp) -> Filte
                 _ => FilterOutcome::Error,
             };
         }
+        // RDFterm-equal (SPARQL 1.1 §17.4.1.7) is a type error only "if the
+        // arguments are both literal but are not the same RDF term". An IRI
+        // against a literal is not both-literal, so the comparison is
+        // well-defined and simply false — they can never be the same RDF term.
+        // Routing this pair to `Error` instead would drop the row, which is
+        // safe but is silent under-derivation: a copy-properties rule filtering
+        // on a value, `(!= ?val "Bob")`, would discard every IRI-valued
+        // property. Must stay below the `(Ref, Ref)` arm so Sid identity wins
+        // when both sides really are IRIs.
+        (FlakeValue::Ref(_), _) | (_, FlakeValue::Ref(_)) => {
+            return match op {
+                CompareOp::Equal => outcome(false),
+                CompareOp::NotEqual => outcome(true),
+                // Ordering across an IRI and a literal remains undefined.
+                _ => FilterOutcome::Error,
+            };
+        }
         (FlakeValue::Boolean(l), FlakeValue::Boolean(r)) => {
             // Boolean comparison
             return match op {
@@ -1086,7 +1257,9 @@ fn compare_values(left: &FlakeValue, right: &FlakeValue, op: CompareOp) -> Filte
                 _ => FilterOutcome::Error, // Other comparisons don't make sense for booleans
             };
         }
-        _ => return FilterOutcome::Error, // Incompatible types
+        // Both literals, not the same RDF term: a genuine type error per
+        // §17.4.1.7 (e.g. a string against a number).
+        _ => return FilterOutcome::Error,
     };
 
     let cmp = left_str.cmp(right_str);
@@ -1936,12 +2109,61 @@ mod tests {
     }
 
     #[test]
-    fn incomparable_operands_never_fail_open() {
-        // The whole point of #1556: an inequality the engine cannot actually
-        // evaluate must not answer "true" and let the row through. An IRI
-        // against a string is exactly the pairing the old code stringified.
+    fn iri_versus_literal_follows_rdfterm_equal() {
+        // SPARQL 1.1 §17.4.1.7: RDFterm-equal is a type error only when BOTH
+        // operands are literals. An IRI and a literal are simply never the same
+        // RDF term, so `=` is false and `!=` is true — routing this pair to
+        // Error would drop rows the spec says to keep.
         let iri = FlakeValue::Ref(sid(100, "ssn"));
         let text = FlakeValue::String("ex:ssn".to_string());
+
+        assert_eq!(
+            compare_values(&iri, &text, CompareOp::Equal),
+            FilterOutcome::False
+        );
+        assert_eq!(
+            compare_values(&iri, &text, CompareOp::NotEqual),
+            FilterOutcome::True,
+            "an IRI is genuinely not a literal; `!=` must keep the row"
+        );
+        // Direction must not matter.
+        assert_eq!(
+            compare_values(&text, &iri, CompareOp::NotEqual),
+            FilterOutcome::True
+        );
+        // An IRI against a number is the same story.
+        assert_eq!(
+            compare_values(&iri, &FlakeValue::Long(5), CompareOp::NotEqual),
+            FilterOutcome::True
+        );
+        // Ordering across an IRI and a literal stays undefined.
+        for op in [CompareOp::LessThan, CompareOp::GreaterThan] {
+            assert_eq!(compare_values(&iri, &text, op), FilterOutcome::Error);
+        }
+    }
+
+    #[test]
+    fn two_literals_of_different_types_are_a_type_error() {
+        // The other half of §17.4.1.7: both operands literal and not the same
+        // RDF term IS the type-error case.
+        let text = FlakeValue::String("5".to_string());
+        let number = FlakeValue::Long(5);
+        assert_eq!(
+            compare_values(&text, &number, CompareOp::Equal),
+            FilterOutcome::Error
+        );
+        assert_eq!(
+            compare_values(&text, &number, CompareOp::NotEqual),
+            FilterOutcome::Error
+        );
+    }
+
+    #[test]
+    fn incomparable_operands_never_fail_open() {
+        // #1556's invariant, stated over the pairing that is genuinely
+        // undecidable: a type error must never answer "true" and admit the row.
+        let text = FlakeValue::String("5".to_string());
+        let number = FlakeValue::Long(5);
 
         for op in [
             CompareOp::Equal,
@@ -1950,9 +2172,9 @@ mod tests {
             CompareOp::GreaterThan,
         ] {
             assert_ne!(
-                compare_values(&iri, &text, op),
+                compare_values(&text, &number, op),
                 FilterOutcome::True,
-                "IRI vs string must never evaluate true for {op:?}"
+                "a type error must never evaluate true for {op:?}"
             );
         }
     }
@@ -1970,11 +2192,15 @@ mod tests {
         };
 
         assert_eq!(
-            evaluate_filter(&uncomparable, &bindings),
+            evaluate_filter(&uncomparable, &bindings, &mut FilterDiagnostics::default()),
             FilterOutcome::Error
         );
         assert_eq!(
-            evaluate_filter(&RuleFilter::Not(Box::new(uncomparable)), &bindings),
+            evaluate_filter(
+                &RuleFilter::Not(Box::new(uncomparable)),
+                &bindings,
+                &mut FilterDiagnostics::default()
+            ),
             FilterOutcome::Error,
             "negating an error must stay an error, never become True"
         );
@@ -2001,20 +2227,36 @@ mod tests {
 
         // false && error => false; true && error => error
         assert_eq!(
-            evaluate_filter(&RuleFilter::And(vec![falsehood(), error()]), &bindings),
+            evaluate_filter(
+                &RuleFilter::And(vec![falsehood(), error()]),
+                &bindings,
+                &mut FilterDiagnostics::default()
+            ),
             FilterOutcome::False
         );
         assert_eq!(
-            evaluate_filter(&RuleFilter::And(vec![truth(), error()]), &bindings),
+            evaluate_filter(
+                &RuleFilter::And(vec![truth(), error()]),
+                &bindings,
+                &mut FilterDiagnostics::default()
+            ),
             FilterOutcome::Error
         );
         // true || error => true; false || error => error
         assert_eq!(
-            evaluate_filter(&RuleFilter::Or(vec![truth(), error()]), &bindings),
+            evaluate_filter(
+                &RuleFilter::Or(vec![truth(), error()]),
+                &bindings,
+                &mut FilterDiagnostics::default()
+            ),
             FilterOutcome::True
         );
         assert_eq!(
-            evaluate_filter(&RuleFilter::Or(vec![falsehood(), error()]), &bindings),
+            evaluate_filter(
+                &RuleFilter::Or(vec![falsehood(), error()]),
+                &bindings,
+                &mut FilterDiagnostics::default()
+            ),
             FilterOutcome::Error
         );
     }
@@ -2030,6 +2272,52 @@ mod tests {
             Some(FlakeValue::Ref(sid(100, "knows"))),
             "a Sid binding must stay a Ref, not collapse to its local name"
         );
+    }
+
+    #[test]
+    fn quoted_operand_survives_whitespace() {
+        // The escape hatch the parse error recommends has to work for a value
+        // with a space in it; `split_whitespace` used to tear it in half and
+        // leave the operand as the literal `"John`.
+        let tokens = split_filter_tokens(r#"= ?name "John Smith""#).expect("tokenize");
+        assert_eq!(tokens, vec!["=", "?name", "\"John Smith\""]);
+        assert_eq!(quoted_literal(tokens[2]), Some("John Smith"));
+    }
+
+    #[test]
+    fn unterminated_quote_is_rejected() {
+        let err = split_filter_tokens(r#"= ?name "John"#).expect_err("must reject");
+        assert!(
+            format!("{err:?}").contains("Unterminated quote"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plain_tokens_still_split_on_whitespace() {
+        assert_eq!(
+            split_filter_tokens(">=  ?age   62").expect("tokenize"),
+            vec![">=", "?age", "62"]
+        );
+        assert!(split_filter_tokens("   ").expect("tokenize").is_empty());
+    }
+
+    #[test]
+    fn misspelled_filter_keyword_is_recognized_for_the_message() {
+        assert!(looks_like_misspelled_filter(&serde_json::json!([
+            "FILTER",
+            "(!= ?p ex:ssn)"
+        ])));
+        assert!(looks_like_misspelled_filter(&serde_json::json!([
+            "Filter",
+            "(!= ?p ex:ssn)"
+        ])));
+        assert!(!looks_like_misspelled_filter(&serde_json::json!([
+            "bind", "(?x 1)"
+        ])));
+        assert!(!looks_like_misspelled_filter(&serde_json::json!({
+            "@id": "?s"
+        })));
     }
 
     // ------------------------------------------------------------------
@@ -2060,6 +2348,29 @@ mod tests {
             message.contains("?rel"),
             "the diagnostic must name the offending variable, got: {message}"
         );
+    }
+
+    #[test]
+    fn where_side_generated_name_does_not_mask_an_insert_side_one() {
+        // Both clauses number their generated variables from their own
+        // `patterns.len()`, so the names collide at index 0. A where-side
+        // `?__implicit_0` must not be treated as binding the insert-side one,
+        // or the anonymous-node diagnostic is suppressed exactly where it is
+        // needed.
+        let where_patterns = vec![triple(
+            RuleTerm::var("?__implicit_0"),
+            RuleTerm::sid(sid(100, "parent")),
+            RuleTerm::var("?p"),
+        )];
+        let insert_patterns = vec![triple(
+            RuleTerm::var("?__implicit_0"),
+            RuleTerm::sid(sid(100, "ancestor")),
+            RuleTerm::var("?p"),
+        )];
+
+        let message = unsafe_insert_variables_message(&where_patterns, &insert_patterns)
+            .expect("collision must not suppress the diagnostic");
+        assert!(message.contains("@id"), "got: {message}");
     }
 
     #[test]
