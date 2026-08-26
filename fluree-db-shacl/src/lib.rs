@@ -75,9 +75,28 @@
 //!   cannot cover. Cost scales with the number of predicate-targeted
 //!   shapes in the cache, not with data size.
 //!
+//! # SPARQL-based Constraints (`sh:sparql`)
+//!
+//! `sh:sparql` on a node or property shape attaches a `sh:SPARQLConstraint`:
+//! its `sh:select` query runs once per focus node with `$this` pre-bound
+//! (and `$PATH`, on property shapes with a plain predicate path); every
+//! solution row is a violation. `?value` / `?path` / `?message` bindings
+//! populate the matching report fields (`sh:value` defaults to the focus
+//! node), and `sh:message` templates substitute `{?var}` / `{$var}` from the
+//! solution. `sh:prefixes` declarations resolve through `owl:imports`. The
+//! spec's pre-binding restrictions are enforced at shape-compile time; a
+//! query that breaks them (or fails to parse) raises a validation *failure*
+//! — scoped to the shapes that use it — when the shape fires. See
+//! [`sparql`] for the full semantics.
+//!
 //! # Not Yet Supported
 //!
-//! - `sh:sparql` (SPARQL-based constraints).
+//! - SPARQL-based constraint *components* (`sh:ConstraintComponent`,
+//!   `sh:validator`, `sh:parameter`) — declarations are ignored.
+//! - `$shapesGraph` / `$currentShape` in `sh:sparql` queries (optional per
+//!   spec; queries using them raise a failure).
+//! - `sh:sparql` against a literal `sh:targetNode` focus (a literal has no
+//!   graph presence to pre-bind; the constraint is skipped for such targets).
 //!
 //! # Example
 //!
@@ -103,6 +122,7 @@ pub mod constraints;
 pub mod error;
 pub mod path;
 pub mod report_text;
+pub mod sparql;
 pub mod validate;
 
 pub use cache::{ShaclCache, ShaclCacheKey};
@@ -111,6 +131,7 @@ pub use constraints::Constraint;
 pub use error::{Result, ShaclError};
 pub use path::PropertyPath;
 pub use report_text::{format_violations, unresolved_sid, violations_of};
+pub use sparql::SparqlConstraint;
 pub use validate::{
     CrossLedgerMembership, FocusNode, ShaclEngine, ValidationReport, ValidationResult,
 };
