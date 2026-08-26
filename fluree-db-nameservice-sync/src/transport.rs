@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use std::fmt::Debug;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 /// HTTP method for a [`TransportRequest`]. Only the verbs the proxy wire
@@ -158,17 +159,20 @@ pub trait HttpTransport: Debug + Send + Sync {
 // read path.
 
 /// Native transport over a pooled [`reqwest::Client`].
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Debug for ReqwestTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReqwestTransport").finish_non_exhaustive()
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ReqwestTransport {
     /// Build a transport whose requests time out after `timeout`.
     pub fn with_timeout(timeout: Duration) -> Self {
@@ -180,6 +184,7 @@ impl ReqwestTransport {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn execute(&self, req: TransportRequest) -> Result<TransportResponse, TransportError> {
@@ -245,9 +250,13 @@ mod tests {
         let debug = format!("{req:?}");
         assert!(!debug.contains("secret-token"), "got: {debug}");
         assert!(debug.contains("[redacted]"));
-        assert!(debug.contains("application/json"), "other headers stay visible");
+        assert!(
+            debug.contains("application/json"),
+            "other headers stay visible"
+        );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn reqwest_transport_debug_holds_no_secrets() {
         let t = ReqwestTransport::with_timeout(Duration::from_secs(1));
