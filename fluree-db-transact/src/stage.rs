@@ -808,14 +808,13 @@ pub async fn stage(
         // the surviving delta). Chunked staging for whole-graph ops is the
         // same known follow-up flagged on `scan_graph_flakes`.
         if let Some((sync_g_id, sync_graph_sid)) = &sync_scan {
+            // The scan attributes every flake to the graph Sid, matching the
+            // payload's assertions — both sides must agree on `flake.g` for
+            // the accumulator's unchanged-fact cancellation to fire.
             let mut sync_retractions =
-                scan_graph_flakes(&ledger, *sync_g_id, options.tracker).await?;
+                scan_graph_flakes(&ledger, *sync_g_id, Some(sync_graph_sid), options.tracker)
+                    .await?;
             for f in &mut sync_retractions {
-                // Stamp the graph explicitly: accumulator buckets key on
-                // `flake.g`, and the payload's assertions carry the graph
-                // Sid — both sides must agree for the unchanged-fact
-                // cancellation to fire.
-                f.g = Some(sync_graph_sid.clone());
                 f.op = false;
                 f.t = new_t;
             }
@@ -1126,7 +1125,14 @@ fn flake_content(f: &Flake) -> FlakeContent {
 }
 
 /// Scan every currently-asserted flake in graph `g_id` (merged snapshot +
-/// novelty view as of the ledger's current `t`).
+/// novelty view as of the ledger's current `t`), attributed to `g_sid`.
+///
+/// Every flake comes back with `g = g_sid` (`None` for the default graph).
+/// The range provider materializes index-resident rows with `g: None`
+/// regardless of graph — only novelty-resident flakes carry it — and every
+/// caller here routes by `flake.g` (`resolve_flake_graph_id`, where `None`
+/// is the default graph). Without the stamp, retracting an indexed named
+/// graph silently retracted phantoms from the default graph instead.
 ///
 /// Scale note: a whole-graph operation (`CLEAR ALL`, a large COPY/MOVE)
 /// materializes every scanned flake into a `Vec` and re-stages it, and
@@ -1148,17 +1154,26 @@ fn flake_content(f: &Flake) -> FlakeContent {
 async fn scan_graph_flakes(
     ledger: &LedgerState,
     g_id: GraphId,
+    g_sid: Option<&Sid>,
     tracker: Option<&Tracker>,
 ) -> Result<Vec<Flake>> {
     let db_ref = match tracker {
         Some(t) => ledger.as_graph_db_ref(g_id).with_tracker(t),
         None => ledger.as_graph_db_ref(g_id),
     };
-    // Unbounded SPOT scan (empty match, `>= min`) returns the whole graph.
-    db_ref
-        .range(IndexType::Spot, RangeTest::Ge, RangeMatch::new())
+    // `Eq` with an empty match is the whole-graph scan on both range paths:
+    // the V3 provider treats "nothing bound" as a full-index cursor and
+    // rejects every other `RangeTest`, and the genesis (overlay-only) path
+    // matches an empty `Eq` against every flake. `Ge` only ever worked on
+    // the genesis path, where non-`Eq` tests pass through unfiltered.
+    let mut flakes = db_ref
+        .range(IndexType::Spot, RangeTest::Eq, RangeMatch::new())
         .await
-        .map_err(|e| TransactError::FlakeGeneration(format!("graph scan failed: {e}")))
+        .map_err(|e| TransactError::FlakeGeneration(format!("graph scan failed: {e}")))?;
+    for f in &mut flakes {
+        f.g = g_sid.cloned();
+    }
+    Ok(flakes)
 }
 
 /// Resolve the ledger `GraphId` and graph `Sid` for a named graph IRI, if it
@@ -1271,10 +1286,12 @@ async fn stage_graph_mgmt(
                 }
 
                 for (g_id, sid) in targets {
-                    if let Some(sid) = sid {
-                        graph_sids.insert(g_id, sid);
+                    if let Some(sid) = &sid {
+                        graph_sids.insert(g_id, sid.clone());
                     }
-                    for mut f in scan_graph_flakes(&ledger, g_id, options.tracker).await? {
+                    for mut f in
+                        scan_graph_flakes(&ledger, g_id, sid.as_ref(), options.tracker).await?
+                    {
                         f.op = false;
                         f.t = new_t;
                         flakes.push(f);
@@ -1311,7 +1328,7 @@ async fn stage_graph_mgmt(
                 // `from == to` is a spec no-op for ADD/COPY/MOVE.
                 if from != to {
                     // Resolve the source (existing only) and destination.
-                    let (src_g_id, _src_sid): (Option<GraphId>, Option<Sid>) = match from {
+                    let (src_g_id, src_sid): (Option<GraphId>, Option<Sid>) = match from {
                         GraphSel::Default => (Some(0), None),
                         GraphSel::Graph(iri) => {
                             match resolve_named_graph(&ledger, &mut ns_registry, iri) {
@@ -1383,12 +1400,15 @@ async fn stage_graph_mgmt(
                     }
 
                     let src_flakes = match src_g_id {
-                        Some(g) => scan_graph_flakes(&ledger, g, options.tracker).await?,
+                        Some(g) => {
+                            scan_graph_flakes(&ledger, g, src_sid.as_ref(), options.tracker).await?
+                        }
                         None => Vec::new(),
                     };
 
                     let dest_flakes =
-                        scan_graph_flakes(&ledger, dest_g_id, options.tracker).await?;
+                        scan_graph_flakes(&ledger, dest_g_id, dest_sid.as_ref(), options.tracker)
+                            .await?;
 
                     let dest_contents: HashSet<FlakeContent> =
                         dest_flakes.iter().map(flake_content).collect();

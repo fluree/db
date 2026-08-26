@@ -84,6 +84,15 @@ async fn count_in_graph(
     rows_in_graph(fluree, ledger_id, graph_iri).await.len()
 }
 
+/// `(default, ONT_IRI, OTHER_IRI)` row counts.
+async fn graph_counts(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> (usize, usize, usize) {
+    (
+        count_in_graph(fluree, ledger_id, None).await,
+        count_in_graph(fluree, ledger_id, Some(ONT_IRI)).await,
+        count_in_graph(fluree, ledger_id, Some(OTHER_IRI)).await,
+    )
+}
+
 #[tokio::test]
 async fn first_sync_populates_a_new_graph() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -454,4 +463,179 @@ async fn staging_rejects_malformed_and_system_graph_targets() {
         .expect_err("system graph target must be rejected at staging");
     assert!(err.to_string().contains("reserved"), "got: {err}");
     assert_eq!(count_in_graph(&fluree, ledger_id, None).await, 1);
+}
+
+/// An identical resync must still be a no-op after the graph has been
+/// indexed — the case the memory-backed tests cannot reach.
+///
+/// `scan_graph_flakes` reads through the range provider, and
+/// `BinaryRangeProvider` materializes flakes with `g: None`
+/// (`binary_range.rs:753`, `:1393`). The accumulator buckets on `flake.g`,
+/// so without the explicit stamp in the sync wave the retractions land in a
+/// different bucket than the payload's assertions, nothing cancels, and an
+/// unchanged graph is retracted and re-asserted in full. Novelty-resident
+/// flakes carry `g` already, which is why every other test here passes
+/// either way.
+#[tokio::test]
+async fn identical_resync_is_a_noop_against_indexed_data() {
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait_outcome};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/sync-graph/indexed:main";
+            fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
+
+            let first = fluree
+                .sync_named_graph(ledger_id, ONT_IRI, &payload_v1(), SyncGraphOpts::default())
+                .await
+                .expect("first sync");
+            assert_eq!(first.asserted, 3);
+            assert!(first.committed);
+
+            // Push the graph into the persisted index, so the sync wave's
+            // scan is served by the range provider rather than novelty.
+            trigger_index_and_wait_outcome(&handle, ledger_id, first.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+            assert!(
+                ledger.snapshot.range_provider.is_some(),
+                "graph must be index-resident for this test to mean anything"
+            );
+
+            let second = fluree
+                .sync_named_graph(ledger_id, ONT_IRI, &payload_v1(), SyncGraphOpts::default())
+                .await
+                .expect("resync after index");
+            assert_eq!(second.retracted, 0, "indexed rows must still cancel");
+            assert_eq!(second.asserted, 0, "identical payload asserts nothing");
+            assert!(
+                !second.committed,
+                "identical resync of an indexed graph must not commit"
+            );
+            assert_eq!(second.t, first.t, "head t unchanged");
+
+            // And a real delta over indexed data still commits only the delta.
+            let third = fluree
+                .sync_named_graph(ledger_id, ONT_IRI, &payload_v2(), SyncGraphOpts::default())
+                .await
+                .expect("delta sync after index");
+            assert_eq!(third.retracted, 2, "bob's name and alice's old role");
+            assert_eq!(third.asserted, 2, "alice's new role and carol's name");
+            assert!(third.committed);
+            assert_eq!(count_in_graph(&fluree, ledger_id, Some(ONT_IRI)).await, 3);
+        })
+        .await;
+}
+
+/// CLEAR / COPY / MOVE on an index-resident named graph — the same scan sync
+/// rides, and broken the same two ways on `main` before this branch: the
+/// scan issued `RangeTest::Ge`, which the V3 provider rejects, and once it
+/// runs, index-decoded flakes carry `g: None` and route to the default
+/// graph. The receipt then reports a commit while the target is untouched
+/// (CLEAR), or the destination merges instead of replacing (COPY).
+#[tokio::test]
+async fn graph_management_verbs_work_on_indexed_data() {
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait_outcome};
+    use fluree_db_transact::Txn;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/sync-graph/gmgmt-indexed:main";
+            fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            fluree
+                .stage_owned(ledger)
+                .upsert_turtle(&format!(
+                    r#"
+                    @prefix ex: <http://example.org/> .
+                    ex:d ex:name "Default" .
+                    GRAPH <{ONT_IRI}> {{ ex:alice ex:name "Alice" . ex:bob ex:name "Bob" . }}
+                    GRAPH <{OTHER_IRI}> {{ ex:zed ex:name "Zed" . }}
+                    "#
+                ))
+                .execute()
+                .await
+                .expect("seed");
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert!(
+                ledger.snapshot.range_provider.is_some(),
+                "must be index-resident"
+            );
+
+            assert_eq!(graph_counts(&fluree, ledger_id).await, (1, 2, 1));
+
+            // CLEAR empties exactly the target.
+            let r = fluree
+                .stage_owned(ledger)
+                .txn(Txn::clear_graph(ONT_IRI))
+                .execute()
+                .await
+                .expect("CLEAR on indexed graph");
+            assert_eq!(r.receipt.flake_count, 2);
+            assert_eq!(
+                graph_counts(&fluree, ledger_id).await,
+                (1, 0, 1),
+                "CLEAR emptied ont only"
+            );
+
+            // COPY replaces the destination with the source.
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            fluree
+                .stage_owned(ledger)
+                .txn(Txn::copy_graph(OTHER_IRI, ONT_IRI))
+                .execute()
+                .await
+                .expect("COPY on indexed graphs");
+            assert_eq!(
+                graph_counts(&fluree, ledger_id).await,
+                (1, 1, 1),
+                "COPY replaced ont with other"
+            );
+
+            // Index again so MOVE's source and destination are both index-resident.
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            fluree
+                .stage_owned(ledger)
+                .txn(Txn::move_graph(OTHER_IRI, ONT_IRI))
+                .execute()
+                .await
+                .expect("MOVE on indexed graphs");
+            assert_eq!(
+                graph_counts(&fluree, ledger_id).await,
+                (1, 1, 0),
+                "MOVE emptied the source"
+            );
+        })
+        .await;
 }
