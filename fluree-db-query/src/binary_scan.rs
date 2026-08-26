@@ -2463,6 +2463,14 @@ impl Operator for BinaryScanOperator {
             .map(|_| Vec::with_capacity(batch_size))
             .collect();
 
+        // Residency mode: handle a store's ContentStore + retry budget for
+        // the drain/fetch/retry arm in the cursor loop below.
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        let residency_store: Option<std::sync::Arc<dyn fluree_db_core::ContentStore>> =
+            self.store.as_ref().and_then(|s| s.content_store().cloned());
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        let mut residency_budget = fluree_db_binary_index::read::need_fetch::RetryBudget::default();
+
         let mut produced = 0usize;
 
         // Prefer binary cursor (indexed data), then drain any overlay-only fallback flakes.
@@ -2486,6 +2494,23 @@ impl Operator for BinaryScanOperator {
                     break;
                 }
                 Err(e) => {
+                    // Residency mode: the cursor is re-enterable after a
+                    // failed read, so this async frame drains the store's
+                    // miss register, awaits the fetches, and retries the
+                    // SAME leaf in place — no whole-query re-run for scans.
+                    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                    if let Some(cs) = residency_store.as_deref() {
+                        if residency_budget
+                            .after_error(
+                                cs,
+                                fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+                            )
+                            .await
+                            .map_err(|re| QueryError::from_io("residency retry", re))?
+                        {
+                            continue;
+                        }
+                    }
                     return Err(QueryError::from_io("V3 cursor", e));
                 }
             }
@@ -2533,6 +2558,14 @@ impl Operator for BinaryScanOperator {
             return Ok(None);
         }
 
+        // Residency mode: handle a store's ContentStore + retry budget for
+        // the drain/fetch/retry arm in the cursor loop below.
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        let residency_store: Option<std::sync::Arc<dyn fluree_db_core::ContentStore>> =
+            self.store.as_ref().and_then(|s| s.content_store().cloned());
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        let mut residency_budget = fluree_db_binary_index::read::need_fetch::RetryBudget::default();
+
         let mut count: u64 = 0;
         while let Some(cursor) = self.cursor.as_mut() {
             ctx.check_cancelled()?;
@@ -2548,6 +2581,20 @@ impl Operator for BinaryScanOperator {
                     break;
                 }
                 Err(e) => {
+                    // Same residency retry as `next_batch`'s cursor frame.
+                    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                    if let Some(cs) = residency_store.as_deref() {
+                        if residency_budget
+                            .after_error(
+                                cs,
+                                fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+                            )
+                            .await
+                            .map_err(|re| QueryError::from_io("residency retry", re))?
+                        {
+                            continue;
+                        }
+                    }
                     return Err(QueryError::from_io("V3 cursor", e));
                 }
             }
