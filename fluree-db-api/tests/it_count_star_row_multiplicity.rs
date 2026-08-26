@@ -245,6 +245,72 @@ fn jsonld_cases() -> Vec<(&'static str, Value, &'static str)> {
     ]
 }
 
+/// CONSTRUCT shapes over the same multiplicity-bearing fixture.
+///
+/// A CONSTRUCT result is an RDF graph, so the interesting question is the
+/// opposite of the SELECT one: the extra solutions must *not* reach the output.
+/// `?o` appears only in the WHERE clause and never in the template, so a
+/// blank-free template instantiates to the same triple from all 5 solutions and
+/// canonicalizes to 2 nodes — the distinct-subject count, not the row count.
+///
+/// The blank-node case is the exception that makes the rule load-bearing, and
+/// it is a behavior change this fix introduces: SPARQL 1.1 §16.2 instantiates
+/// the template once per *solution*, minting a fresh blank per row, so 5
+/// solutions yield 5 distinct blanks where the pre-fix collapsed sequence
+/// yielded 2. That is the SPARQL-correct number, and nothing pinned it before.
+fn construct_cases() -> Vec<(&'static str, &'static str, ConstructExpect)> {
+    vec![
+        (
+            "blank-free CONSTRUCT collapses to the subject count",
+            "CONSTRUCT { ?s ex:flag \"y\" } WHERE { ?s a ex:Gadget . ?s ex:tag ?o }",
+            ConstructExpect {
+                nodes: 2,
+                distinct_blanks: 0,
+            },
+        ),
+        (
+            "blank-free CONSTRUCT, two-object cartesian, still the subject count",
+            "CONSTRUCT { ?s ex:flag \"y\" } WHERE \
+             { ?s a ex:Gadget . ?s ex:tag ?o . ?s ex:code ?c }",
+            ConstructExpect {
+                nodes: 2,
+                distinct_blanks: 0,
+            },
+        ),
+        (
+            "blank-node template mints one blank per solution",
+            "CONSTRUCT { ?s ex:note [ ex:v \"z\" ] } WHERE { ?s a ex:Gadget . ?s ex:tag ?o }",
+            ConstructExpect {
+                nodes: 7,
+                distinct_blanks: 5,
+            },
+        ),
+    ]
+}
+
+struct ConstructExpect {
+    /// Total nodes in the canonicalized `@graph`.
+    nodes: usize,
+    /// Distinct blank-node identifiers appearing as `@id`.
+    distinct_blanks: usize,
+}
+
+/// Count graph nodes and distinct blank-node ids in a `to_construct` result.
+fn summarize_construct(graph: &Value) -> (usize, usize) {
+    let nodes = graph["@graph"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no @graph in {graph}"));
+    let mut blanks: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for n in nodes {
+        if let Some(id) = n.get("@id").and_then(Value::as_str) {
+            if id.starts_with("_:") {
+                blanks.insert(id.to_string());
+            }
+        }
+    }
+    (nodes.len(), blanks.len())
+}
+
 /// Canonical one-line rendering. A single-row aggregate renders `n=<value>`; a
 /// multi-row result whose every row carries `?n` renders its sorted counts too,
 /// so a grouped `COUNT(*)` is pinned by its per-group values and not merely by
@@ -345,6 +411,27 @@ async fn count_star_counts_joined_rows_not_distinct_subjects() {
                     "[{lane}] {}: got {got}, expected {} (hand-computed from the fixture)",
                     c.name, c.expected
                 ));
+            }
+        }
+
+        for (name, sparql, expect) in &construct_cases() {
+            let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
+            let q = format!("{PREFIX}{sparql}");
+            match fluree.query(&db, q.as_str()).await {
+                Ok(r) => match r.to_construct(&ledger.snapshot) {
+                    Ok(graph) => {
+                        let (nodes, blanks) = summarize_construct(&graph);
+                        if nodes != expect.nodes || blanks != expect.distinct_blanks {
+                            failures.push(format!(
+                                "[{lane}] {name}: got {nodes} nodes / {blanks} blanks, \
+                                 expected {} / {}",
+                                expect.nodes, expect.distinct_blanks
+                            ));
+                        }
+                    }
+                    Err(e) => failures.push(format!("[{lane}] {name}: to_construct ERR:{e}")),
+                },
+                Err(e) => failures.push(format!("[{lane}] {name}: ERR:{e}")),
             }
         }
 

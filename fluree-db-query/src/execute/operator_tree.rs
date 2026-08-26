@@ -2317,6 +2317,44 @@ fn build_operator_tree_folds(
     build_operator_tree_inner(query, stats, true, planning)
 }
 
+/// Whether a CONSTRUCT/DESCRIBE result cannot observe WHERE-output row
+/// multiplicity, and so licenses the same WHERE-level dedup a
+/// `SELECT DISTINCT` does.
+///
+/// A CONSTRUCT result is an RDF **graph**, not a solution bag: several
+/// solutions instantiating the template to the same `(s, p, o)` contribute one
+/// triple (SPARQL 1.1 §16.2). Every output path enforces that or refuses the
+/// query outright — the JSON-LD serializer and RDF/XML both call
+/// `Graph::canonicalize()` (`format/construct.rs`, `format/rdf_xml.rs`),
+/// streaming JSON excludes CONSTRUCT from its eligibility check, and TSV/CSV,
+/// SPARQL-Results XML and the streaming endpoint all reject it. So duplicate
+/// solutions are erased before anyone can see them, and materializing them is
+/// pure cost.
+///
+/// `QueryOutput::restriction()` returns `None` for every non-`Select` output,
+/// so without this the license reads false for all of them and a fan-out join
+/// under a CONSTRUCT builds its full cartesian product only to canonicalize it
+/// back down.
+///
+/// Two shapes are excluded, and both exclusions are load-bearing:
+///
+/// * **A template blank node.** `bnode_vars` variables are minted fresh per
+///   *solution* and shared only within a row (see [`ConstructTemplate`]), so
+///   distinct solutions produce distinct triples and collapsing them changes
+///   the graph. Empty for every JSON-LD/FQL construct and every DESCRIBE, so
+///   this keeps the license for the whole non-SPARQL graph surface.
+/// * **A slice.** `LIMIT`/`OFFSET` cut the solution sequence *before* the
+///   template is instantiated, so collapsing rows first changes which
+///   solutions survive and therefore which triples get built.
+fn construct_result_is_multiplicity_blind(query: &Query) -> bool {
+    match &query.output {
+        QueryOutput::Construct(template) => {
+            template.bnode_vars.is_empty() && query.limit.is_none() && query.offset.is_none()
+        }
+        _ => false,
+    }
+}
+
 fn build_operator_tree_inner(
     query: &Query,
     stats: Option<Arc<StatsView>>,
@@ -3087,7 +3125,9 @@ fn build_operator_tree_inner(
     // aggregate check alone is vacuously true. An outer SELECT DISTINCT does
     // NOT license dedup — it dedups result rows *after* aggregation, so a
     // plain COUNT under it still observes pre-aggregation multiplicity.
-    // Without grouping, SELECT DISTINCT is exactly the license.
+    // Without grouping, SELECT DISTINCT is the license for a SELECT — and a
+    // CONSTRUCT/DESCRIBE carries its own, because its result is an RDF graph
+    // rather than a solution bag. See `construct_result_is_multiplicity_blind`.
     let where_dedup_safe = match query.grouping.as_ref() {
         Some(g) => {
             let aggregates_ok = g
@@ -3106,7 +3146,7 @@ fn build_operator_tree_inner(
             });
             aggregates_ok && no_raw_passthrough
         }
-        None => query.output.is_distinct(),
+        None => query.output.is_distinct() || construct_result_is_multiplicity_blind(query),
     };
 
     let mut operator = build_where_operators_with_needed(
@@ -3872,6 +3912,82 @@ mod tests {
             include_system_facts: false,
             cypher_vocab: None,
         }
+    }
+
+    // --- CONSTRUCT's WHERE-dedup license (#1700 follow-up) -------------------
+
+    /// `CONSTRUCT { ?s <flag> "y" } WHERE { … }` with the given template
+    /// blank-node vars and slice.
+    fn construct_query(
+        bnode_vars: HashSet<VarId>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Query {
+        use crate::ir::ConstructTemplate;
+        let template_tp = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(100, "flag")),
+            Term::Var(VarId(1)),
+        );
+        let mut q = make_simple_query(Vec::new(), Vec::new());
+        q.output = QueryOutput::Construct(ConstructTemplate::with_bnode_vars(
+            vec![template_tp],
+            bnode_vars,
+        ));
+        q.limit = limit;
+        q.offset = offset;
+        q
+    }
+
+    /// A blank-free, unsliced CONSTRUCT result is an RDF graph whose serializers
+    /// canonicalize, so duplicate solutions are unobservable and the WHERE stage
+    /// may collapse them. Without this the license reads false for every
+    /// CONSTRUCT (`restriction()` is `None` for non-`Select` outputs) and a
+    /// fan-out join builds its full cartesian product only to have it
+    /// canonicalized back down — measured at 6.7x for byte-identical output.
+    #[test]
+    fn construct_licenses_where_dedup_when_blank_free_and_unsliced() {
+        assert!(construct_result_is_multiplicity_blind(&construct_query(
+            HashSet::new(),
+            None,
+            None
+        )));
+    }
+
+    /// A template blank node is minted fresh per *solution*, so distinct
+    /// solutions yield distinct triples and collapsing them changes the graph.
+    #[test]
+    fn construct_declines_where_dedup_with_a_template_blank_node() {
+        let bnodes: HashSet<VarId> = [VarId(1)].into_iter().collect();
+        assert!(!construct_result_is_multiplicity_blind(&construct_query(
+            bnodes, None, None
+        )));
+    }
+
+    /// `LIMIT`/`OFFSET` slice the solution sequence *before* the template is
+    /// instantiated, so collapsing rows first changes which solutions survive
+    /// and therefore which triples get built.
+    #[test]
+    fn construct_declines_where_dedup_when_sliced() {
+        assert!(!construct_result_is_multiplicity_blind(&construct_query(
+            HashSet::new(),
+            Some(10),
+            None
+        )));
+        assert!(!construct_result_is_multiplicity_blind(&construct_query(
+            HashSet::new(),
+            None,
+            Some(10)
+        )));
+    }
+
+    /// The license is CONSTRUCT-specific: a plain SELECT keeps `is_distinct()`
+    /// as its only license, so this cannot leak into the bag-semantics surface
+    /// that #1700 was about.
+    #[test]
+    fn select_never_gets_the_construct_license() {
+        let q = make_simple_query(vec![VarId(0)], Vec::new());
+        assert!(!construct_result_is_multiplicity_blind(&q));
     }
 
     #[test]
