@@ -147,6 +147,86 @@ impl LeafHandle for FullBlobLeafHandle {
 }
 
 // ============================================================================
+// SharedBlobLeafHandle (wasm32 residency tier)
+// ============================================================================
+
+/// Leaf handle over shared, already-resident bytes (wasm32 only).
+///
+/// The wasm read path serves whole leaf blobs from the content store's
+/// residency tier (`resolve_cached_bytes`) as `Arc<[u8]>`; this handle is
+/// [`FullBlobLeafHandle`] with shared instead of owned backing, so opening a
+/// resident leaf clones two `Arc`s and decodes the directory — no byte copy.
+#[cfg(target_arch = "wasm32")]
+pub struct SharedBlobLeafHandle {
+    bytes: Arc<[u8]>,
+    dir: DecodedLeafDirV3,
+    sidecar: Option<Arc<[u8]>>,
+    leaf_id: u128,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl SharedBlobLeafHandle {
+    /// Create from resident leaf bytes and optional resident sidecar bytes.
+    ///
+    /// Parses the header and directory from the leaf bytes.
+    pub fn new(bytes: Arc<[u8]>, sidecar: Option<Arc<[u8]>>, leaf_id: u128) -> io::Result<Self> {
+        let header = decode_leaf_header_v3(&bytes)?;
+        let dir = decode_leaf_dir_v3_with_base(&bytes, &header)?;
+        Ok(Self {
+            bytes,
+            dir,
+            sidecar,
+            leaf_id,
+        })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl LeafHandle for SharedBlobLeafHandle {
+    fn dir(&self) -> &DecodedLeafDirV3 {
+        &self.dir
+    }
+
+    fn load_columns(
+        &self,
+        leaflet_idx: usize,
+        projection: &ColumnProjection,
+        order: RunSortOrder,
+    ) -> io::Result<ColumnBatch> {
+        let entry = &self.dir.entries[leaflet_idx];
+        load_leaflet_columns(&self.bytes, entry, self.dir.payload_base, projection, order)
+    }
+
+    fn load_sidecar_segment(&self, leaflet_idx: usize) -> io::Result<Vec<HistEntryV2>> {
+        let entry = &self.dir.entries[leaflet_idx];
+        if entry.history_len == 0 {
+            return Ok(Vec::new());
+        }
+        let sc_bytes = self.sidecar.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "sidecar bytes required for history replay but not available",
+            )
+        })?;
+        let seg = HistorySegmentRef {
+            offset: entry.history_offset,
+            len: entry.history_len,
+            min_t: entry.history_min_t,
+            max_t: entry.history_max_t,
+        };
+        decode_history_segment(sc_bytes, &seg)
+    }
+
+    fn sidecar_bytes(&self) -> Option<&[u8]> {
+        self.sidecar.as_deref()
+    }
+
+    fn leaf_id(&self) -> u128 {
+        self.leaf_id
+    }
+}
+
+// ============================================================================
 // MmapLeafHandle
 // ============================================================================
 

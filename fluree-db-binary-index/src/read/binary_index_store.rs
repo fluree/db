@@ -10,7 +10,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::OnceLock;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use fluree_db_core::ids::DatatypeDictId;
@@ -37,7 +40,9 @@ use crate::format::run_record::RunSortOrder;
 use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid};
 use super::leaflet_cache::LeafletCache;
 
+#[cfg(not(target_arch = "wasm32"))]
 const HOT_REMOTE_LEAF_PROMOTION_TOUCHES: usize = 2;
+#[cfg(not(target_arch = "wasm32"))]
 const CAS_HELPER_RUNTIME_THREADS: usize = 2;
 
 // ============================================================================
@@ -75,6 +80,7 @@ pub(crate) struct DictionarySet {
 /// the storage backend's own request timeout (e.g. S3's 35s send_timeout).
 /// Applied by the leaf, dict, and pack read bridges so a stalled fetch becomes
 /// a bounded error instead of an unbounded block.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn cas_sync_timeout() -> Option<Duration> {
     std::env::var("FLUREE_CAS_SYNC_TIMEOUT_MS")
         .ok()
@@ -172,9 +178,15 @@ where
 }
 
 /// wasm32: no threads and no `block_on` — a sync-context CAS fetch cannot be
-/// bridged. Reads must be served from already-resident bytes (cache hit); the
-/// async load path must fetch-and-cache before sync access. SEAM(wasm).
+/// bridged. Every CAS-backed sync read path short-circuits *before* reaching
+/// this bridge: it serves already-resident bytes via
+/// `ContentStore::resolve_cached_bytes` and surfaces a typed
+/// [`super::need_fetch::NeedFetch`] miss (naming the wanted CID) for an async
+/// caller to fetch and retry. Reaching this stub therefore means a read path
+/// gained a bridge call without a wasm residency arm — keep it an error, not
+/// an `unreachable!`, so that bug degrades to a failed query. SEAM(wasm).
 #[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
 pub(crate) fn run_sync_on_runtime<T, Fut>(fut: Fut) -> io::Result<T>
 where
     T: Send + 'static,
@@ -182,7 +194,8 @@ where
 {
     let _ = fut;
     Err(io::Error::other(
-        "sync CAS fetch bridge unavailable on wasm32; bytes must be pre-cached",
+        "sync CAS fetch bridge unavailable on wasm32; this read path is missing \
+         a residency-tier arm (expected resolve_cached_bytes + NeedFetch)",
     ))
 }
 
@@ -226,6 +239,11 @@ static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub enum SharedLeafBytes {
     Mmap(Arc<memmap2::Mmap>),
     Owned(Vec<u8>),
+    /// Zero-copy view of the content store's resident tier
+    /// (`resolve_cached_bytes`). wasm32-only so native match sites and
+    /// layout stay exactly as they were.
+    #[cfg(target_arch = "wasm32")]
+    Shared(Arc<[u8]>),
 }
 
 impl std::ops::Deref for SharedLeafBytes {
@@ -234,6 +252,8 @@ impl std::ops::Deref for SharedLeafBytes {
         match self {
             SharedLeafBytes::Mmap(mmap) => mmap,
             SharedLeafBytes::Owned(bytes) => bytes,
+            #[cfg(target_arch = "wasm32")]
+            SharedLeafBytes::Shared(bytes) => bytes,
         }
     }
 }
@@ -257,6 +277,7 @@ pub struct BinaryIndexStore {
     cache_dir: PathBuf,
     /// Shared disk artifact cache — kept alive here so the global `CACHE_REGISTRY`
     /// weak ref survives across calls, avoiding repeated dir scans on every write.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     disk_cache: Arc<super::artifact_cache::DiskArtifactCache>,
     leaflet_cache: Option<Arc<LeafletCache>>,
     /// Remote leaf metadata cache keyed by leaf CID.
@@ -268,6 +289,7 @@ pub struct BinaryIndexStore {
     ///
     /// Once a remote leaf is touched repeatedly, we promote it to the local
     /// disk cache so subsequent opens use `FullBlobLeafHandle`.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     remote_leaf_open_counts: RwLock<HashMap<ContentId, usize>>,
     max_t: i64,
     base_t: i64,
@@ -618,6 +640,7 @@ impl BinaryIndexStore {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn note_remote_leaf_open(&self, leaf_cid: &ContentId) -> usize {
         let mut counts = self.remote_leaf_open_counts.write();
         let count = counts.entry(leaf_cid.clone()).or_insert(0);
@@ -632,6 +655,32 @@ impl BinaryIndexStore {
     /// through this instead of [`Self::get_leaf_bytes_sync`], which copies
     /// the full file into a fresh `Vec` on every call.
     pub fn get_leaf_bytes_shared(&self, leaf_cid: &ContentId) -> io::Result<SharedLeafBytes> {
+        #[cfg(target_arch = "wasm32")]
+        return self
+            .resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf)
+            .map(SharedLeafBytes::Shared);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.get_leaf_bytes_shared_native(leaf_cid)
+    }
+
+    /// wasm32 residency tier: serve `cid` from the content store's
+    /// `resolve_cached_bytes` or surface a typed [`super::need_fetch::NeedFetch`]
+    /// miss for an async caller to fetch and retry. No I/O, no blocking.
+    #[cfg(target_arch = "wasm32")]
+    fn resident_leaf_bytes(
+        &self,
+        cid: &ContentId,
+        kind: super::need_fetch::FetchKind,
+    ) -> io::Result<Arc<[u8]>> {
+        let cs = self
+            .cas
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no content store"))?;
+        super::need_fetch::resident_or_need_fetch(cs.as_ref(), cid, kind)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn get_leaf_bytes_shared_native(&self, leaf_cid: &ContentId) -> io::Result<SharedLeafBytes> {
         if let Some(cs) = self.cas.as_ref() {
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
             let mut local = cs.resolve_local_path(leaf_cid);
@@ -665,6 +714,16 @@ impl BinaryIndexStore {
     }
 
     pub fn get_leaf_bytes_sync(&self, leaf_cid: &ContentId) -> io::Result<Vec<u8>> {
+        #[cfg(target_arch = "wasm32")]
+        return self
+            .resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf)
+            .map(|bytes| bytes.to_vec());
+        #[cfg(not(target_arch = "wasm32"))]
+        self.get_leaf_bytes_sync_native(leaf_cid)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn get_leaf_bytes_sync_native(&self, leaf_cid: &ContentId) -> io::Result<Vec<u8>> {
         let cs = self
             .cas
             .as_ref()
@@ -731,6 +790,44 @@ impl BinaryIndexStore {
     /// - Remote (S3/etc): returns `RangeReadLeafHandle` (header+dir only, lazy
     ///   column fetch via byte-range reads)
     pub fn open_leaf_handle(
+        &self,
+        leaf_cid: &ContentId,
+        sidecar_cid: Option<&ContentId>,
+        need_replay: bool,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        #[cfg(target_arch = "wasm32")]
+        return self.open_resident_leaf_handle(leaf_cid, sidecar_cid, need_replay);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay)
+    }
+
+    /// wasm32 leaf open: whole leaf (and sidecar when replaying) must be
+    /// resident; a miss surfaces as `NeedFetch`. The local-path/mmap and
+    /// range-read tiers don't exist here — there is no filesystem, and the
+    /// residency tier already holds full blobs.
+    #[cfg(target_arch = "wasm32")]
+    fn open_resident_leaf_handle(
+        &self,
+        leaf_cid: &ContentId,
+        sidecar_cid: Option<&ContentId>,
+        need_replay: bool,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        use super::need_fetch::FetchKind;
+        let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
+        let bytes = self.resident_leaf_bytes(leaf_cid, FetchKind::IndexLeaf)?;
+        let sidecar = match (need_replay, sidecar_cid) {
+            (true, Some(sc_cid)) => {
+                Some(self.resident_leaf_bytes(sc_cid, FetchKind::HistorySidecar)?)
+            }
+            _ => None,
+        };
+        Ok(Box::new(super::leaf_access::SharedBlobLeafHandle::new(
+            bytes, sidecar, leaf_id,
+        )?))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_leaf_handle_native(
         &self,
         leaf_cid: &ContentId,
         sidecar_cid: Option<&ContentId>,
@@ -847,6 +944,7 @@ impl BinaryIndexStore {
     /// directory served from the shared `LeafletCache`. The raw bytes stay in OS
     /// page cache (only touched pages fault in) — no whole-blob copy, and the
     /// directory is parsed once per leaf CID. See [`super::leaf_access::MmapLeafHandle`].
+    #[cfg(not(target_arch = "wasm32"))]
     fn open_mmapped_leaf(
         &self,
         path: &Path,
@@ -932,8 +1030,15 @@ impl BinaryIndexStore {
             Some(cid) => cid,
             None => return Ok(None),
         };
-        let bytes = self.get_leaf_bytes_sync(sc_cid)?;
-        Ok(Some(bytes))
+        #[cfg(target_arch = "wasm32")]
+        return self
+            .resident_leaf_bytes(sc_cid, super::need_fetch::FetchKind::HistorySidecar)
+            .map(|bytes| Some(bytes.to_vec()));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let bytes = self.get_leaf_bytes_sync(sc_cid)?;
+            Ok(Some(bytes))
+        }
     }
 
     // ── Value decoding ─────────────────────────────────────────────
@@ -2913,6 +3018,7 @@ async fn load_per_graph_arenas(
 /// `BinaryIndexStore::get_leaf_bytes_sync()`.
 struct ContentStoreRangeFetcher {
     cs: Arc<dyn ContentStore>,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     cache_dir: PathBuf,
 }
 
@@ -2924,6 +3030,40 @@ impl ContentStoreRangeFetcher {
 
 impl super::leaf_access::RangeReadFetcher for ContentStoreRangeFetcher {
     fn fetch_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> io::Result<Vec<u8>> {
+        #[cfg(target_arch = "wasm32")]
+        return self.fetch_range_resident(id, range);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.fetch_range_native(id, range)
+    }
+}
+
+impl ContentStoreRangeFetcher {
+    /// wasm32: whole blobs live in the residency tier; serve the range as a
+    /// subslice copy with the same EOF-truncation semantics as the native
+    /// positional read. A miss surfaces as `NeedFetch` for the whole blob.
+    #[cfg(target_arch = "wasm32")]
+    fn fetch_range_resident(
+        &self,
+        id: &ContentId,
+        range: std::ops::Range<u64>,
+    ) -> io::Result<Vec<u8>> {
+        let bytes = super::need_fetch::resident_or_need_fetch(
+            self.cs.as_ref(),
+            id,
+            super::need_fetch::FetchKind::IndexLeaf,
+        )?;
+        let len = bytes.len() as u64;
+        let start = range.start.min(len) as usize;
+        let end = range.end.min(len) as usize;
+        Ok(bytes[start..end].to_vec())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fetch_range_native(
+        &self,
+        id: &ContentId,
+        range: std::ops::Range<u64>,
+    ) -> io::Result<Vec<u8>> {
         fn read_range_from_file(
             path: &Path,
             range: std::ops::Range<u64>,

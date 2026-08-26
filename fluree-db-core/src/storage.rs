@@ -475,6 +475,23 @@ pub trait ContentStore: Debug + Send + Sync {
         None
     }
 
+    /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
+    ///
+    /// This is the sync residency tier for targets without a sync→async
+    /// bridge (`wasm32`): the binary-index read path consults it instead of
+    /// filesystem probes or a bridged CAS fetch, and surfaces a typed
+    /// `NeedFetch` miss when it returns `None` so an async caller can fetch
+    /// and retry. Implementations must not perform I/O or block — a hit is
+    /// an O(1) map lookup returning a shared `Arc` clone (zero copy); on a
+    /// backend with no resident tier the default returns `None`.
+    ///
+    /// Content is immutable (CID-addressed), so implementations may pin and
+    /// serve entries indefinitely without invalidation.
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        let _ = id;
+        None
+    }
+
     /// Signal that this content is no longer needed and may be reclaimed.
     ///
     /// Implementations should make a best effort to free the underlying
@@ -529,6 +546,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
         self.as_ref().resolve_local_path(id)
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        self.as_ref().resolve_cached_bytes(id)
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
@@ -1048,6 +1069,12 @@ impl ContentStore for BranchedContentStore {
         self.branch_store
             .resolve_local_path(id)
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_local_path(id)))
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        self.branch_store
+            .resolve_cached_bytes(id)
+            .or_else(|| self.parents.iter().find_map(|p| p.resolve_cached_bytes(id)))
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
