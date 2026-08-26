@@ -9,6 +9,7 @@
 //! - `4 – 8 GB`  → 40%
 //! - `≥ 8 GB`    → 35%
 
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::info;
 
 /// Default cache size in MB when memory detection is unavailable (WASM/JS)

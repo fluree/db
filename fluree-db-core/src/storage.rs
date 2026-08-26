@@ -26,6 +26,12 @@ pub enum Durability {
     PageCache,
 }
 
+// The env/sync helpers are consumed only by the native `FileStorage` (gated
+// on `native` + non-wasm); the enum itself is part of the portable config API.
+#[cfg_attr(
+    not(all(feature = "native", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
 impl Durability {
     /// Environment variable selecting the default for new `FileStorage`.
     pub const ENV_VAR: &'static str = "FLUREE_STORAGE_FSYNC";
