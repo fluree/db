@@ -643,6 +643,23 @@ async fn trailing_values_keeps_minus_correlated() {
 const OPTIONAL_THEN_VALUES: &str = "SELECT ?s ?f WHERE { ?s schema:name ?name . \
      OPTIONAL { ?s ex:friend ?f } VALUES ?f { ex:alice } }";
 
+/// The spec answer for [`OPTIONAL_THEN_VALUES`] — two kept-as-bound rows and
+/// two unbound-and-adopted rows. `ex:alice` is absent: her only `ex:friend` is
+/// `ex:brian`, so the VALUES join drops that solution.
+fn optional_then_values_rows() -> serde_json::Value {
+    json!([
+        ["ex:cam", "ex:alice"],
+        ["ex:liam", "ex:alice"],
+        ["ex:brian", "ex:alice"],
+        ["ex:nikola", "ex:alice"]
+    ])
+}
+
+/// The row the hoist invented: `ex:alice` reported as her own friend.
+fn fabricated_row() -> Vec<serde_json::Value> {
+    normalize_rows(&json!([["ex:alice", "ex:alice"]]))
+}
+
 #[tokio::test]
 async fn trailing_values_over_an_optional_var_joins_instead_of_seeding() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -653,21 +670,125 @@ async fn trailing_values_over_an_optional_var_joins_instead_of_seeding() {
     // `ex:alice`'s only friend is `ex:brian`, so no solution may report her
     // with `?f = ex:alice`. That row is the fabricated binding the hoist
     // invented — it used to be here, and its absence is the whole fix.
-    let fabricated = normalize_rows(&json!([["ex:alice", "ex:alice"]]));
+    let fabricated = fabricated_row();
     assert!(
         !rows.iter().any(|r| fabricated.contains(r)),
         "ex:alice has no ex:friend ex:alice; the VALUES must not fabricate one: {rows:?}"
     );
 
+    // `ex:cam`/`ex:liam` were bound and compatible — kept with the binding the
+    // data gave them. `ex:brian`/`ex:nikola` have no `ex:friend` at all, so the
+    // OPTIONAL left `?f` UNBOUND: compatible with every VALUES row, therefore
+    // kept AND bound (§18.2.4). A "drop the unbound rows" fix loses those two.
+    assert_eq!(rows, normalize_rows(&optional_then_values_rows()));
+}
+
+/// The ops of a query's planned physical plan, root first.
+async fn physical_plan_ops(ledger: &MemoryLedger, body: &str) -> Vec<String> {
+    let query = format!("{VALUES_PREFIXES}{body}");
+    let plan = fluree_db_api::explain::explain_sparql(&ledger.snapshot, &query)
+        .await
+        .expect("explain should succeed");
+    fn walk(node: &serde_json::Value, out: &mut Vec<String>) {
+        if let Some(op) = node.get("op").and_then(serde_json::Value::as_str) {
+            out.push(op.to_string());
+        }
+        if let Some(children) = node.get("children").and_then(serde_json::Value::as_array) {
+            for edge in children {
+                if let Some(child) = edge.get("node") {
+                    walk(child, out);
+                }
+            }
+        }
+    }
+    let mut ops = Vec::new();
+    walk(&plan["plan"]["physical"], &mut ops);
+    ops
+}
+
+#[tokio::test]
+async fn a_union_binding_the_var_does_not_suppress_the_barrier() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    // One UNION away from the OPTIONAL-only shape. `Union::produced_vars` unions
+    // its branches, so treating it as "already bound" recorded `?f` as
+    // required-bound and SUPPRESSED the barrier for the sibling OPTIONAL that
+    // genuinely introduces it — the VALUES went back to seed position. The
+    // planner now accumulates MUST-bind vars (branch intersection for a UNION),
+    // so `?f` is correctly not required-bound and the barrier fires.
+    //
+    // Asserted on the PLAN, not the rows, and deliberately so: this query's
+    // answer is also wrong for a SECOND, independent reason that this PR does
+    // not touch. `{ ?s schema:name ?name . { {?s ex:friend ?f} UNION
+    // {?s schema:age ?age} } OPTIONAL { ?s ex:friend ?f } }` — no VALUES
+    // anywhere — returns 10 rows where §18.2.4 says 13, identical to the same
+    // query with the OPTIONAL deleted: the left join is a no-op over the rows a
+    // UNION branch left `?f` unbound on, so it never binds `?f = ex:brian` for
+    // `ex:alice`. Pinning rows here would pin that unrelated defect's output.
+    // The row-level §18.2.4 contract is pinned by
+    // `trailing_values_over_an_optional_var_joins_instead_of_seeding` and
+    // `a_subquery_exposing_an_optional_bound_var_still_joins`, whose inputs are
+    // correct.
+    let ops = physical_plan_ops(
+        &ledger,
+        "SELECT ?s ?f WHERE { ?s schema:name ?name . \
+         { { ?s ex:friend ?f } UNION { ?s schema:age ?age } } \
+         OPTIONAL { ?s ex:friend ?f } VALUES ?f { ex:alice } }",
+    )
+    .await;
+
+    let values_at = ops
+        .iter()
+        .position(|o| o == "ValuesOperator")
+        .unwrap_or_else(|| panic!("the VALUES must be applied somewhere: {ops:?}"));
+    let optional_at = ops
+        .iter()
+        .position(|o| o.contains("Optional"))
+        .unwrap_or_else(|| panic!("the OPTIONAL must survive planning: {ops:?}"));
+    assert!(
+        values_at < optional_at,
+        "a UNION branch binding ?f must not suppress the barrier: {ops:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_subquery_exposing_an_optional_bound_var_still_joins() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    // `Subquery::produced_vars` is the SELECT list, so `?f` read as
+    // unconditionally bound even though the body binds it only in an OPTIONAL —
+    // the same may-bind class as the UNION above, reached through the
+    // subquery's outward schema. Unlike the UNION shape this one has a correct
+    // input, so it pins the ANSWER: `ex:brian` has no `ex:friend` at all, so the
+    // subquery emits him with `?f` unbound and he survives and adopts.
+    //
+    // HONEST SCOPE: this shape is already correct without the barrier — the
+    // correlated-subquery deferral keeps the VALUES below the subquery, and this
+    // test stays green under a barrier-disabling mutation. It is a regression
+    // pin on the §18.2.4 answer for the may-bind class, not evidence about the
+    // barrier.
+    let rows = sparql_rows(
+        &fluree,
+        &ledger,
+        "SELECT ?s ?f WHERE { ?s schema:name ?name . \
+         { SELECT ?s ?f WHERE { ?s schema:email ?e . OPTIONAL { ?s ex:friend ?f } } } \
+         VALUES ?f { ex:alice } }",
+    )
+    .await;
+
+    let fabricated = fabricated_row();
+    assert!(
+        !rows.iter().any(|r| fabricated.contains(r)),
+        "ex:alice's only ex:friend is ex:brian; no row may report otherwise: {rows:?}"
+    );
     assert_eq!(
         rows,
         normalize_rows(&json!([
-            // bound and compatible — kept with the binding the data gave them
-            ["ex:cam", "ex:alice"],
-            ["ex:liam", "ex:alice"],
-            // UNBOUND — compatible with every VALUES row, so kept AND bound
-            ["ex:brian", "ex:alice"],
-            ["ex:nikola", "ex:alice"]
+            ["ex:brian", "ex:alice"], // unbound in the subquery, adopts
+            ["ex:cam", "ex:alice"],   // bound to ex:alice, kept
+            ["ex:liam", "ex:alice"]   // bound to ex:alice, kept
         ]))
     );
 }
@@ -709,6 +830,14 @@ async fn trailing_values_is_a_join_not_a_filter() {
     )
     .await;
 
+    // Both sides asserted exactly. An `assert_ne!` alone would be vacuous —
+    // the pre-fix VALUES answer is also unequal to the FILTER answer, so this
+    // test would pass with the barrier reverted and earn none of its name.
+    assert_eq!(
+        with_values,
+        normalize_rows(&optional_then_values_rows()),
+        "VALUES keeps the unbound rows and gives them the value"
+    );
     assert_eq!(
         with_filter,
         normalize_rows(&json!([["ex:cam", "ex:alice"], ["ex:liam", "ex:alice"]])),
