@@ -23,9 +23,9 @@
 //! **Forward file** (`*.fwd`): concatenated raw bytes, no length prefixes.
 //! Requires a corresponding index file for access.
 
+use super::global_dict::{LanguageTagDict, PredicateDict};
 #[cfg(target_arch = "wasm32")]
 use crate::wasm_compat::memmap2;
-use super::global_dict::{LanguageTagDict, PredicateDict};
 use std::io;
 use std::path::Path;
 
