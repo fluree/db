@@ -3531,3 +3531,71 @@ fn skolem_namespace_flag_controls_cross_ledger_blank_node_identity() {
         "--skolem-namespace must reach the import builder on both sides"
     );
 }
+
+// ============================================================================
+// #1466 — table output must never Debug-print an internal binding
+// ============================================================================
+
+/// End-to-end version of the reported repro: an indexed ledger with a subject
+/// whose triples arrived after the index snapshot, joined in through an indexed
+/// literal, rendered as a table.
+///
+/// The bug printed `EncodedSid { s_id: .., t: None, op: None }` in the `kind`
+/// column. The renderer-level guards live in `output.rs`; this pins the whole
+/// pipeline (insert, index, insert, `query --format table`) so a regression
+/// anywhere along it — not just in the resolver — is caught.
+#[test]
+fn table_output_renders_novelty_only_subject_after_index() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "noveltytable"])
+        .assert()
+        .success();
+
+    // Base data, then persist an index over it.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            "<urn:x1> <urn:indexed-prop> \"val1\" . \
+             <urn:s1> <urn:ref> \"val1\" ; <urn:content> \"c1\" ; \
+             a <urn:Probe> .",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index"]).assert().success();
+
+    // Commit again *without* indexing: urn:m9 exists only in novelty.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            "<urn:x2> <urn:indexed-prop> \"val2\" . \
+             <urn:m9> <urn:ref> \"val2\" ; <urn:content> \"probe content\" ; \
+             a <urn:Probe> .",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--format",
+            "table",
+            "--sparql",
+            "SELECT ?m ?kind ?content WHERE { \
+               ?x <urn:indexed-prop> ?v . \
+               ?m <urn:ref> ?v ; <urn:content> ?content ; a ?kind . }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("urn:m9"))
+        .stdout(predicate::str::contains("probe content"))
+        // The reported symptom, and the placeholder that replaced it: neither
+        // belongs in a correct render.
+        .stdout(predicate::str::contains("EncodedSid").not())
+        .stdout(predicate::str::contains("EncodedPid").not())
+        .stdout(predicate::str::contains("EncodedLit").not())
+        .stdout(predicate::str::contains("<unresolved>").not());
+}

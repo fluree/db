@@ -158,6 +158,11 @@ enum SparqlTableFastPath {
     NeedsDisaggregation,
 }
 
+/// Placeholder rendered when an encoded binding cannot be resolved to a
+/// user-facing value (missing graph view, or an ID the dictionaries don't
+/// know). Internal `Debug` representations must never reach user output.
+const UNRESOLVED_CELL: &str = "<unresolved>";
+
 fn strip_question_mark(var_name: &str) -> String {
     var_name.strip_prefix('?').unwrap_or(var_name).to_string()
 }
@@ -183,20 +188,23 @@ fn sparql_table_cell(
 
         Binding::EncodedSid { s_id, .. } => {
             let Some(gv) = gv else {
-                return Ok(format!("{b:?}"));
+                return Ok(UNRESOLVED_CELL.to_string());
             };
-            match gv.store().resolve_subject_iri(*s_id) {
+            // Novelty-aware resolve (parity with the API formatters'
+            // materialization): subjects first seen after the index snapshot
+            // live in DictNovelty, which the store-level resolver can't see.
+            match gv.resolve_subject_iri(*s_id) {
                 Ok(iri) => compact_bnode_strip(compactor.compact_iri_for_display(&iri).ok()),
-                Err(_) => format!("{b:?}"),
+                Err(_) => UNRESOLVED_CELL.to_string(),
             }
         }
         Binding::EncodedPid { p_id } => {
             let Some(gv) = gv else {
-                return Ok(format!("{b:?}"));
+                return Ok(UNRESOLVED_CELL.to_string());
             };
             match gv.store().resolve_predicate_iri(*p_id) {
                 Some(iri) => compact_bnode_strip(compactor.compact_iri_for_display(iri).ok()),
-                None => format!("{b:?}"),
+                None => UNRESOLVED_CELL.to_string(),
             }
         }
         Binding::EncodedLit {
@@ -208,11 +216,11 @@ fn sparql_table_cell(
             ..
         } => {
             let Some(gv) = gv else {
-                return Ok(format!("{b:?}"));
+                return Ok(UNRESOLVED_CELL.to_string());
             };
             match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id) {
                 Ok(v) => flake_value_to_table_cell(&v, compactor),
-                Err(_) => format!("{b:?}"),
+                Err(_) => UNRESOLVED_CELL.to_string(),
             }
         }
 
@@ -501,4 +509,174 @@ fn format_jsonld_table(json: &serde_json::Value, limit: Option<usize>) -> CliRes
         text: table.to_string(),
         total_rows,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Guards for the encoded-binding arms of the table fast path (#1466).
+    //!
+    //! Two properties are pinned here: encoded subject IDs minted *after* the
+    //! index snapshot (novelty-only subjects) must render as their IRI, and an
+    //! encoded binding that cannot be resolved at all must render an explicit
+    //! placeholder — never a Rust `Debug` representation of an internal struct.
+
+    use super::*;
+    use fluree_db_api::LedgerState;
+    use fluree_db_api::{FlureeBuilder, ParsedContext, ReindexOptions};
+    use fluree_db_binary_index::BinaryGraphView;
+    use serde_json::json;
+
+    const LEDGER: &str = "cli/table-novelty:main";
+
+    /// Base data (indexed) plus a subject that lands only in novelty.
+    ///
+    /// Mirrors the reported repro's shape: `ex:m9` is committed after the
+    /// index snapshot, so its subject ID lives in `DictNovelty` and the
+    /// persisted forward packs know nothing about it.
+    async fn indexed_ledger_with_novelty_subject() -> (LedgerState, fluree_db_api::GraphDb) {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = fluree.create_ledger(LEDGER).await.expect("create ledger");
+
+        fluree
+            .insert(
+                ledger,
+                &json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "@graph": [
+                        {"@id": "ex:x1", "ex:indexedProp": "val1"},
+                        {"@id": "ex:s1", "@type": "ex:Probe", "ex:ref": "val1"}
+                    ]
+                }),
+            )
+            .await
+            .expect("base insert");
+
+        // Persist an index: everything above moves into the forward packs.
+        fluree
+            .reindex(LEDGER, ReindexOptions::default())
+            .await
+            .expect("reindex");
+
+        // Commit again *without* reindexing — ex:m9 is novelty-only.
+        let ledger = fluree.ledger(LEDGER).await.expect("post-index ledger");
+        let ledger = fluree
+            .insert(
+                ledger,
+                &json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "@graph": [
+                        {"@id": "ex:x2", "ex:indexedProp": "val2"},
+                        {"@id": "ex:m9", "@type": "ex:Probe", "ex:ref": "val2"}
+                    ]
+                }),
+            )
+            .await
+            .expect("novelty insert")
+            .ledger;
+
+        let db = fluree.db(LEDGER).await.expect("indexed view");
+        (ledger, db)
+    }
+
+    /// The novelty-minted subject ID for `iri`, as the scan layer would emit it.
+    fn novelty_s_id(ledger: &LedgerState, gv: &BinaryGraphView, iri: &str) -> u64 {
+        let sid = gv.store().encode_iri(iri);
+        ledger
+            .dict_novelty
+            .subjects
+            .find_subject(sid.namespace_code, &sid.name)
+            .unwrap_or_else(|| panic!("{iri} was expected in DictNovelty but is not there"))
+    }
+
+    fn compactor_for(db: &fluree_db_api::GraphDb) -> IriCompactor {
+        IriCompactor::new(db.snapshot.shared_namespaces(), &ParsedContext::default())
+    }
+
+    /// #1466: a subject first seen after the index snapshot must resolve
+    /// through the novelty-aware `BinaryGraphView` resolver.
+    ///
+    /// The store-only assertion in the middle keeps this test honest: it fails
+    /// loudly if the fixture stops producing a genuinely novelty-only ID, which
+    /// is the only condition under which the old code path was wrong.
+    #[tokio::test(flavor = "current_thread")]
+    async fn encoded_sid_from_novelty_renders_iri_not_debug_repr() {
+        let (ledger, db) = indexed_ledger_with_novelty_subject().await;
+        let gv = db.binary_graph().expect("indexed view has a binary graph");
+        let compactor = compactor_for(&db);
+
+        let s_id = novelty_s_id(&ledger, &gv, "http://example.org/m9");
+
+        // Non-vacuity: the base-store resolver (what this code used to call)
+        // genuinely cannot see this ID. Without this, a fixture that quietly
+        // stopped being novelty-only would let the test pass against the bug.
+        assert!(
+            gv.store().resolve_subject_iri(s_id).is_err(),
+            "fixture is not exercising the novelty path: the persisted store \
+             already resolves s_id={s_id}"
+        );
+
+        let cell = sparql_table_cell(&Binding::encoded_sid(s_id), &compactor, Some(&gv))
+            .expect("cell renders");
+
+        assert!(
+            cell.ends_with("m9"),
+            "novelty-only subject should render as its IRI, got {cell:?}"
+        );
+        assert!(
+            !cell.contains("EncodedSid"),
+            "internal Debug repr leaked into table output: {cell:?}"
+        );
+        assert_ne!(cell, UNRESOLVED_CELL, "resolvable subject fell back");
+    }
+
+    /// A binding nothing can resolve renders the placeholder — never a
+    /// `Debug` repr. Covers every encoded arm, with and without a graph view.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unresolvable_encoded_bindings_render_placeholder() {
+        let (_ledger, db) = indexed_ledger_with_novelty_subject().await;
+        let gv = db.binary_graph().expect("indexed view has a binary graph");
+        let compactor = compactor_for(&db);
+
+        // IDs above every watermark that were never minted in novelty either.
+        let bogus_sid = Binding::encoded_sid(u64::MAX - 1);
+        let bogus_pid = Binding::EncodedPid { p_id: u32::MAX };
+        let bogus_lit = Binding::EncodedLit {
+            o_kind: fluree_db_core::ObjKind::LEX_ID.as_u8(),
+            o_key: u64::from(u32::MAX - 1),
+            p_id: u32::MAX,
+            dt_id: 0,
+            lang_id: 0,
+            i_val: 0,
+            t: 1,
+        };
+
+        for b in [&bogus_sid, &bogus_pid, &bogus_lit] {
+            // With a graph view: resolution fails.
+            let cell = sparql_table_cell(b, &compactor, Some(&gv)).expect("cell renders");
+            assert_eq!(cell, UNRESOLVED_CELL, "with gv, binding {b:?}");
+
+            // Without a graph view: nothing to resolve against.
+            let cell = sparql_table_cell(b, &compactor, None).expect("cell renders");
+            assert_eq!(cell, UNRESOLVED_CELL, "without gv, binding {b:?}");
+        }
+    }
+
+    /// Nested containers (Cypher list cells) recurse through the same arm, so
+    /// the placeholder has to hold there too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unresolvable_binding_inside_list_renders_placeholder() {
+        let (_ledger, db) = indexed_ledger_with_novelty_subject().await;
+        let gv = db.binary_graph().expect("indexed view has a binary graph");
+        let compactor = compactor_for(&db);
+
+        let cell = sparql_table_cell(
+            &Binding::List(vec![Binding::encoded_sid(u64::MAX - 1)]),
+            &compactor,
+            Some(&gv),
+        )
+        .expect("cell renders");
+
+        assert_eq!(cell, UNRESOLVED_CELL);
+        assert!(!cell.contains("EncodedSid"), "Debug repr leaked: {cell:?}");
+    }
 }
