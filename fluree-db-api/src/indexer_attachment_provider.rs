@@ -243,6 +243,7 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
 /// subject (namespace_code = 0) does not return rows reliably across
 /// all backends. Malformed bundles are skipped (consistent with
 /// `AttachmentNovelty::observe_flakes`).
+#[cfg(not(target_arch = "wasm32"))]
 async fn scan_base_index_for_attachment_events(
     manager: &LedgerManager,
     ledger_id: &str,

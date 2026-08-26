@@ -19,3 +19,10 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# run-node.mjs uses wasm-pack for the node smoke run; keep that build
+# deterministic by skipping wasm-pack's bundled wasm-opt pass (it can reject
+# bulk-memory output depending on the installed wasm-opt). Size measurement
+# runs wasm-opt separately with explicit feature flags — see README.md.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
