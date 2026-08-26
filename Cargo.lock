@@ -2740,6 +2740,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "fluree-db-api",
+ "fluree-db-binary-index",
  "fluree-db-core",
  "fluree-db-nameservice",
  "fluree-db-nameservice-sync",

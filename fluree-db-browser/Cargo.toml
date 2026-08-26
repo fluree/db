@@ -68,6 +68,10 @@ wasm-bindgen-test = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+# For the end-to-end proof that the engine's landed retry primitives
+# (RetryBudget / fetch_wants) drive this storage through the real
+# StorageContentStore bridge.
+fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 
 [lints]
 workspace = true
