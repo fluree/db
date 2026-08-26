@@ -223,7 +223,7 @@ pub trait StorageRead: Debug + Send + Sync {
     /// "no bytes" from "no object" by the `NotFound` error, not by this.
     ///
     /// Known gap: `S3Storage` returns 416 rather than an empty vec for a start
-    /// past the end. That predates this doc and is tracked separately; the
+    /// past the end. That predates this doc and is tracked in #1712; the
     /// clamping half of the contract holds on every backend.
     ///
     /// The default implementation fetches the full object and slices.

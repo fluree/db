@@ -428,6 +428,9 @@ so if the first 100,000 entries it encounters are content, every subsequent
 start re-walks those same entries and the orphans beyond them are never
 reached. That case logs at `warn`; if you see it, raise
 `FLUREE_STORAGE_TMP_SWEEP_BUDGET` past the number of files under the directory.
+That variable only ever *sizes* the walk — an unparseable value, or `0`, keeps
+the 100,000 default rather than meaning "don't walk". Turning the sweep off is
+the other variable's job.
 
 Set `FLUREE_STORAGE_TMP_SWEEP=0` to skip the sweep entirely — worth doing if
 you want a crash's leftovers preserved for a post-mortem.

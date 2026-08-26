@@ -112,9 +112,23 @@ fn is_tmp_artifact(name: &str) -> bool {
     name.ends_with(TMP_SUFFIX)
 }
 
-/// A run of ASCII digits — a pid or a sequence number.
-fn is_ascii_digits(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+/// A decimal number written the way this backend writes one: digits, and no
+/// leading zeros.
+///
+/// The zero-padding rule is free — `std::process::id()` and a `fetch_add`
+/// counter never produce a padded number, so nothing we emit is excluded — and
+/// it narrows what the legacy branch below will admit. `backup.2026.08.tmp` and
+/// `wal.000001.000002.tmp` are the shape of a foreign file that would otherwise
+/// read as `<name>.<pid>.<seq>.tmp`.
+fn is_plain_decimal(s: &str) -> bool {
+    match s.as_bytes() {
+        [] => false,
+        // A sequence number legitimately starts at zero; `00` does not.
+        [b'0'] => true,
+        [first, rest @ ..] => {
+            first.is_ascii_digit() && *first != b'0' && rest.iter().all(u8::is_ascii_digit)
+        }
+    }
 }
 
 /// The 16 lowercase hex digits [`tmp_sibling`] formats a process token as.
@@ -137,9 +151,21 @@ fn is_process_token(s: &str) -> bool {
 ///
 /// Both formats this backend has ever written parse: the current one, and the
 /// pre-`b0a9c416a` `<name>.<pid>.<seq>.tmp`, whose pid lands in the token
-/// position and is accepted as digits. Every segment is shape-checked, so a
-/// foreign name that merely happens to have enough dots in it (`a.b.c.tmp`)
-/// does not slip through on arity alone.
+/// position and is accepted as a decimal. **That branch is load-bearing, not
+/// legacy politeness** — staging writes arrived in `85183c9ca`, which is
+/// contained in v4.1.5 and v4.1.6, so every store written by a currently
+/// released build produces orphans in that format. Dropping it would strand
+/// them on disk forever.
+///
+/// Every segment is shape-checked, so a foreign name that merely happens to
+/// have enough dots in it (`a.b.c.tmp`) does not slip through on arity alone.
+///
+/// Residual: the legacy branch still admits a foreign name shaped
+/// `<non-empty>.<decimal>.<decimal>.tmp` — `dump.1.2.tmp` parses. No in-tree
+/// `.tmp` producer emits that shape, so this is an operator's own file rather
+/// than a collision with anything we ship, and narrowing it further means
+/// gating legacy reclaim behind an opt-in, which is an upgrade-behavior
+/// decision rather than a parser one.
 ///
 /// Returns `None` for anything else. That is the safe direction in the only
 /// sense that matters: failing to reclaim an orphan wastes disk, and reclaiming
@@ -150,10 +176,10 @@ fn staging_token(name: &str) -> Option<&str> {
     let (prefix, token) = head.rsplit_once('.')?;
     // There has to be a destination name in front of the pid, or this is some
     // other file that merely ends in `.tmp`.
-    if prefix.is_empty() || !is_ascii_digits(seq) {
+    if prefix.is_empty() || !is_plain_decimal(seq) {
         return None;
     }
-    if is_process_token(token) || is_ascii_digits(token) {
+    if is_process_token(token) || is_plain_decimal(token) {
         Some(token)
     } else {
         None
@@ -532,6 +558,12 @@ impl FileStorage {
     /// An unrecognized value keeps the default rather than guessing, matching
     /// how `Durability::parse` treats a typo — a mistyped budget should not
     /// quietly turn the sweep into a no-op.
+    ///
+    /// Note that includes `0`, which therefore means [`SWEEP_ENTRY_BUDGET`] and
+    /// *not* "don't walk", even though it reads like the latter. Turning the
+    /// sweep off is [`Self::SWEEP_ENV_VAR`]'s job: a budget of zero would be a
+    /// second, sideways spelling of off, and one switch per decision is the
+    /// whole reason these are two variables.
     fn parse_budget(value: Option<&str>) -> usize {
         value
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1749,6 +1781,47 @@ mod tests {
         assert_eq!(staging_token(".4242.7.tmp"), None, "no destination name");
         assert_eq!(staging_token("plain.tmp"), None);
         assert_eq!(staging_token("leaf.json"), None);
+
+        // Zero-padded numbers are not something this backend emits, and
+        // rejecting them is what keeps date- and offset-stamped foreign files
+        // out of the legacy branch.
+        assert_eq!(staging_token("backup.2026.08.tmp"), None);
+        assert_eq!(staging_token("wal.000001.000002.tmp"), None);
+        // ...while a sequence number legitimately starting at zero still parses.
+        assert_eq!(staging_token("leaf.json.999.0.tmp"), Some("999"));
+        assert_eq!(staging_token("leaf.json.999.00.tmp"), None);
+    }
+
+    /// The staging name is built from a caller-supplied destination, so the
+    /// shape check must not reject the odd but legal names a real ledger
+    /// produces. Driven through `tmp_sibling` itself so it cannot drift.
+    #[test]
+    fn the_shape_check_accepts_every_destination_name_we_can_stage() {
+        for destination in [
+            "leaf",
+            "a.json.gz",
+            "many.dots.in.here.json",
+            ".hidden",
+            "UPPER.JSON",
+            "with space.json",
+            "ünïcødé.json",
+            "trailing.",
+            "4242",
+            "0123456789abcdef",
+            "-",
+            "_",
+        ] {
+            let name = tmp_sibling(Path::new("/data").join(destination).as_path())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            assert_eq!(
+                staging_token(&name),
+                Some(own_token().as_str()),
+                "{destination:?} staged as {name:?} and was not recognised as ours"
+            );
+        }
     }
 
     /// THE OTHER ONE THAT MATTERS. `.tmp` is a suffix, not a namespace: the
@@ -1850,13 +1923,26 @@ mod tests {
 
     /// Without a runtime there is nothing to hand the walk to, and a plain
     /// synchronous caller can afford to block — so it runs inline and is
-    /// finished by the time `new` returns.
+    /// *finished* by the time construction returns. Asserting the orphan is
+    /// already gone is the part that carries the coverage; `is_none()` alone
+    /// would also be satisfied by a sweep that never ran.
     #[test]
     fn the_walk_runs_inline_without_a_runtime() {
         let dir = tempfile::tempdir().unwrap();
+        let orphan = plant_staging_file(
+            dir.path(),
+            "leaf.json",
+            "fedcba9876543210",
+            STALE_STAGING_AGE * 2,
+        );
+
         assert!(
             FileStorage::sweep_on_construction(dir.path()).is_none(),
             "no runtime, so there is no task to return"
+        );
+        assert!(
+            !orphan.exists(),
+            "the inline sweep had not finished when construction returned"
         );
     }
 
