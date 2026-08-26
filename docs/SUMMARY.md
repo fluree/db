@@ -246,6 +246,7 @@
   - [Crate map](reference/crate-map.md)
 
 - [Contributing](contributing/README.md)
+  - [Linking issues from PRs](contributing/issue-linking.md)
   - [Dev setup](contributing/dev-setup.md)
   - [Tests](contributing/tests.md)
   - [Adding a benchmark](contributing/benches.md)
