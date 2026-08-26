@@ -420,6 +420,25 @@ impl LedgerHandle {
         cache_dir: &std::path::Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> Result<()> {
+        use tracing::Instrument as _;
+        let span = tracing::debug_span!(
+            "apply_index_v2",
+            ledger_id = %self.id(),
+            index_t = tracing::field::Empty,
+        );
+        self.apply_index_v2_inner(index_id, cs, cache_dir, leaflet_cache)
+            .instrument(span)
+            .await
+    }
+
+    async fn apply_index_v2_inner(
+        &self,
+        index_id: &ContentId,
+        cs: Arc<dyn ContentStore>,
+        cache_dir: &std::path::Path,
+        leaflet_cache: Option<Arc<LeafletCache>>,
+    ) -> Result<()> {
+        use tracing::Instrument as _;
         let bytes = cs
             .get(index_id)
             .await
@@ -453,13 +472,19 @@ impl LedgerHandle {
             had_annotation_arena: root.had_annotation_arena,
             has_list_meta: root.has_list_meta,
         };
+        tracing::Span::current().record("index_t", meta.t);
         let db = LedgerSnapshot::new_meta(meta)
             .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;
 
         // Brief lock: apply snapshot (trims novelty, rebuilds dict_novelty),
         // then wire up range_provider with the correct dict_novelty.
         // Lock ordering: state → binary_store (same as snapshot()).
-        {
+        //
+        // The span brackets the exclusive-lock section so a commit-latency
+        // spike can be attributed to an index install; the two novelty walks
+        // inside (apply_loaded_db, reseed_runtime_small_dicts) scale with
+        // accumulated novelty, so this is not a constant-time swap.
+        let install = async {
             let mut state = self.inner.state.write().await;
 
             // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
@@ -496,7 +521,11 @@ impl LedgerHandle {
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
             *self.inner.binary_store.write().await = Some(arc_store);
-        }
+            Ok::<(), ApiError>(())
+        };
+        install
+            .instrument(tracing::debug_span!("apply_index_install_lock"))
+            .await?;
 
         Ok(())
     }
