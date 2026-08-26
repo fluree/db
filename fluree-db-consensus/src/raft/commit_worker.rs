@@ -634,6 +634,9 @@ impl Worker {
             TransactionBody::JsonLdInsert(json) => staged.insert(json),
             TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
             TransactionBody::JsonLdUpdate(json) => staged.update(json),
+            TransactionBody::JsonLdGraphSync { graph_iri, body } => {
+                staged.sync_graph(graph_iri.as_str(), body)
+            }
             TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
             TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
                 staged.upsert_turtle(text.as_str())
@@ -672,10 +675,33 @@ impl Worker {
             builder = builder.policy(policy);
         }
 
-        let (write_guard, staged_commit) = builder
+        let Some((write_guard, staged_commit)) = builder
             .build_commit()
             .await
-            .map_err(|e| stage_failure(&format!("build_commit failed: {e}")))?;
+            .map_err(|e| stage_failure(&format!("build_commit failed: {e}")))?
+        else {
+            // No-change transaction (e.g. a graph sync whose payload already
+            // matches the graph): mirror the revert NoOp short-circuit —
+            // republish the current head with `install: None` so the queue
+            // entry completes without advancing and the local state is
+            // untouched. A no-op requires an already-registered graph, hence
+            // an existing head.
+            let snap = ledger_handle.snapshot().await;
+            let head_id = snap.head_commit_id.clone().ok_or_else(|| {
+                stage(PoisonReason::WorkerPanic {
+                    message: "no-op transaction on a ledger without a head commit".into(),
+                })
+            })?;
+            return Ok(StagedOutcome {
+                receipt: AppliedReceipt::Transact(TransactApplied {
+                    commit_id: head_id,
+                    commit_t: snap.t,
+                    flake_count: 0,
+                    tally: None,
+                }),
+                install: None,
+            });
+        };
 
         let commit_cid = staged_commit.commit.id.clone().ok_or_else(|| {
             stage(PoisonReason::WorkerPanic {

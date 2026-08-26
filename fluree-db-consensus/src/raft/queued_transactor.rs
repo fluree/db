@@ -489,6 +489,12 @@ impl Committer for QueuedTransactor {
                     commit_id: record.head,
                     t: record.t,
                     flake_count: record.flake_count as usize,
+                    // The raft idempotency record carries only the total —
+                    // the assert/retract split is not persisted in raft
+                    // state (wire-format stability), so a replayed receipt
+                    // reports 0/0.
+                    assert_count: 0,
+                    retract_count: 0,
                 },
                 tally: record.tally.map(Into::into),
                 cypher_return: None,
@@ -853,6 +859,11 @@ fn transaction_receipt_from(
             commit_id,
             t: commit_t,
             flake_count,
+            // `AppliedReceipt` does not carry the assert/retract split
+            // (raft wire-format stability), so raft-applied receipts
+            // report 0/0.
+            assert_count: 0,
+            retract_count: 0,
         },
         tally,
         cypher_return: None,

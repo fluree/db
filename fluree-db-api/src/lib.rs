@@ -121,6 +121,8 @@ pub use admin::{
     IndexStatusResult,
     ReindexOptions,
     ReindexResult,
+    SyncGraphOpts,
+    SyncGraphReport,
     TriggerIndexOptions,
     TriggerIndexResult,
 };

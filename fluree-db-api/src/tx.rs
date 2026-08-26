@@ -240,6 +240,7 @@ impl SequentialStager {
             ns_registry,
             txn_meta: self.txn_meta,
             graph_delta,
+            sync_graph: None,
         })
     }
 }
@@ -1895,6 +1896,11 @@ pub struct StageResult {
     pub txn_meta: Vec<TxnMetaEntry>,
     /// Named graph IRI to g_id mappings introduced by this transaction
     pub graph_delta: rustc_hash::FxHashMap<u16, String>,
+    /// Graph-sync target, when this was a sync transaction (see
+    /// [`fluree_db_transact::Txn::sync_graph`]). A sync that stages zero
+    /// flakes is a legitimate no-change outcome, so the commit paths skip
+    /// the commit for it exactly like a no-op update/upsert.
+    pub sync_graph: Option<String>,
 }
 
 /// Convert named graph blocks to TripleTemplates with proper graph_id assignments.
@@ -2167,10 +2173,93 @@ impl crate::Fluree {
             txn.graph_delta.extend(named_graph_delta);
         }
 
+        self.stage_built_txn_tracked(
+            ledger,
+            txn,
+            ns_registry,
+            txn_json,
+            index_config,
+            external_tracker,
+            policy,
+        )
+        .await
+    }
+
+    /// Stage a graph-sync transaction (see
+    /// [`fluree_db_transact::Txn::sync_graph`]): the JSON-LD payload is the
+    /// target graph's desired full contents, parsed with the staging
+    /// registry (same namespace hand-off as any JSON-LD transaction) and
+    /// re-homed onto `graph_iri`; staging's sync wave turns it into a
+    /// delta-only flake set.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_sync_transaction_tracked(
+        &self,
+        ledger: LedgerState,
+        graph_iri: &str,
+        txn_json: &JsonValue,
+        txn_opts: TxnOpts,
+        index_config: Option<&IndexConfig>,
+        external_tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+    ) -> Result<StageResult> {
+        let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        // Deterministic, graph-scoped blank-node identity: the payload is
+        // the graph's authoritative document, so the same source label must
+        // mint the same skolem IRI on every sync — otherwise every
+        // bnode-rooted structure (OWL restrictions, RDF lists) would churn
+        // as retract+assert on each sync even when unchanged. Exporters
+        // that regenerate labels per save (e.g. Protégé's genid) still
+        // churn; structural (RDFC-style) canonicalization is the designed
+        // follow-up for those. A caller-supplied id wins.
+        let mut txn_opts = txn_opts;
+        if txn_opts.skolem_txn_id.is_none() {
+            let scope = fluree_db_core::skolem::doc_scope(fluree_db_core::skolem::doc_id(
+                "fluree:graph-sync",
+                graph_iri,
+                0,
+            ));
+            txn_opts.skolem_txn_id = Some(format!("sync{scope}"));
+        }
+        let txn = {
+            let parse_span = tracing::debug_span!("txn_parse", txn_type = "sync");
+            let _guard = parse_span.enter();
+            fluree_db_transact::parse_sync_transaction(
+                txn_json,
+                graph_iri,
+                txn_opts,
+                &mut ns_registry,
+            )?
+        };
+        self.stage_built_txn_tracked(
+            ledger,
+            txn,
+            ns_registry,
+            txn_json,
+            index_config,
+            external_tracker,
+            policy,
+        )
+        .await
+    }
+
+    /// Shared staging tail for a fully-built JSON-LD [`Txn`]: uniqueness /
+    /// SHACL / reasoning validation and [`StageResult`] assembly.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_built_txn_tracked(
+        &self,
+        ledger: LedgerState,
+        txn: Txn,
+        ns_registry: NamespaceRegistry,
+        txn_json: &JsonValue,
+        index_config: Option<&IndexConfig>,
+        external_tracker: Option<&Tracker>,
+        policy: Option<&crate::PolicyContext>,
+    ) -> Result<StageResult> {
         // Extract txn_meta, graph_delta, and any inline uniqueness
         // properties before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
         let graph_delta = txn.graph_delta.clone();
+        let sync_graph = txn.sync_graph.clone();
         let inline_unique_properties = txn.opts.unique_properties.clone();
 
         // Use external tracker if provided, otherwise fall back to limits-only tracker
@@ -2232,6 +2321,7 @@ impl crate::Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph,
         })
     }
 
@@ -2249,6 +2339,7 @@ impl crate::Fluree {
         tracker: Option<&Tracker>,
     ) -> Result<StageResult> {
         let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let sync_graph = txn.sync_graph.clone();
         let (view, ns_registry, txn_meta, graph_delta) = self
             .stage_view_once(ledger, txn, ns_registry, index_config, policy, tracker)
             .await?;
@@ -2257,6 +2348,7 @@ impl crate::Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph,
         })
     }
 
@@ -2423,6 +2515,7 @@ impl crate::Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph: None,
         })
     }
 
@@ -2487,6 +2580,7 @@ impl crate::Fluree {
                 ns_registry,
                 txn_meta: Vec::new(),
                 graph_delta: FxHashMap::default(),
+                sync_graph: None,
             });
         }
 
@@ -2588,6 +2682,7 @@ impl crate::Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph: None,
         })
     }
 
@@ -2623,6 +2718,7 @@ impl crate::Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph: _,
         } = self
             .stage_transaction_tracked_with_policy(ledger, input, Some(index_config), &tracker)
             .await?;
@@ -2787,6 +2883,7 @@ impl crate::Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph,
         } = self
             .stage_transaction(ledger, txn_type, txn_json, txn_opts, Some(index_config))
             .await?;
@@ -2801,25 +2898,31 @@ impl crate::Fluree {
         //
         // This allows patterns like "delete if exists, then insert" to execute safely when
         // there are no matches, and supports conditional updates.
-        let (receipt, ledger) =
-            if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
-                let (base, flakes) = view.into_parts();
-                debug_assert!(
-                    flakes.is_empty(),
-                    "no-op transaction path requires zero staged flakes"
-                );
-                (
-                    CommitReceipt {
-                        commit_id: ContentId::new(ContentKind::Commit, &[]),
-                        t: base.t(),
-                        flake_count: 0,
-                    },
-                    base,
-                )
-            } else {
-                self.commit_staged(view, ns_registry, index_config, commit_opts)
-                    .await?
-            };
+        let (receipt, ledger) = if !view.has_staged()
+            && (matches!(txn_type, TxnType::Update | TxnType::Upsert)
+                    // A sync that stages zero flakes is a no-change outcome
+                    // (payload identical to the graph), not an empty insert.
+                    || sync_graph.is_some())
+        {
+            let (base, flakes) = view.into_parts();
+            debug_assert!(
+                flakes.is_empty(),
+                "no-op transaction path requires zero staged flakes"
+            );
+            (
+                CommitReceipt {
+                    commit_id: ContentId::new(ContentKind::Commit, &[]),
+                    t: base.t(),
+                    flake_count: 0,
+                    assert_count: 0,
+                    retract_count: 0,
+                },
+                base,
+            )
+        } else {
+            self.commit_staged(view, ns_registry, index_config, commit_opts)
+                .await?
+        };
 
         Ok(self
             .finalize_owned_commit(receipt, ledger, index_config)
@@ -2856,6 +2959,7 @@ impl crate::Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph,
         } = self
             .stage_transaction_with_trig_meta(
                 ledger,
@@ -2874,25 +2978,31 @@ impl crate::Fluree {
 
         // No-op updates: if WHERE matches nothing (or templates produce no flakes),
         // return success without committing.
-        let (receipt, ledger) =
-            if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
-                let (base, flakes) = view.into_parts();
-                debug_assert!(
-                    flakes.is_empty(),
-                    "no-op transaction path requires zero staged flakes"
-                );
-                (
-                    CommitReceipt {
-                        commit_id: ContentId::new(ContentKind::Commit, &[]),
-                        t: base.t(),
-                        flake_count: 0,
-                    },
-                    base,
-                )
-            } else {
-                self.commit_staged(view, ns_registry, index_config, commit_opts)
-                    .await?
-            };
+        let (receipt, ledger) = if !view.has_staged()
+            && (matches!(txn_type, TxnType::Update | TxnType::Upsert)
+                    // A sync that stages zero flakes is a no-change outcome
+                    // (payload identical to the graph), not an empty insert.
+                    || sync_graph.is_some())
+        {
+            let (base, flakes) = view.into_parts();
+            debug_assert!(
+                flakes.is_empty(),
+                "no-op transaction path requires zero staged flakes"
+            );
+            (
+                CommitReceipt {
+                    commit_id: ContentId::new(ContentKind::Commit, &[]),
+                    t: base.t(),
+                    flake_count: 0,
+                    assert_count: 0,
+                    retract_count: 0,
+                },
+                base,
+            )
+        } else {
+            self.commit_staged(view, ns_registry, index_config, commit_opts)
+                .await?
+        };
 
         Ok(self
             .finalize_owned_commit(receipt, ledger, index_config)
@@ -2932,6 +3042,7 @@ impl crate::Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph,
         } = self
             .stage_transaction_with_named_graphs(
                 ledger,
@@ -2951,25 +3062,31 @@ impl crate::Fluree {
 
         // No-op updates: if WHERE matches nothing (or templates produce no flakes),
         // return success without committing.
-        let (receipt, ledger) =
-            if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
-                let (base, flakes) = view.into_parts();
-                debug_assert!(
-                    flakes.is_empty(),
-                    "no-op transaction path requires zero staged flakes"
-                );
-                (
-                    CommitReceipt {
-                        commit_id: ContentId::new(ContentKind::Commit, &[]),
-                        t: base.t(),
-                        flake_count: 0,
-                    },
-                    base,
-                )
-            } else {
-                self.commit_staged(view, ns_registry, index_config, commit_opts)
-                    .await?
-            };
+        let (receipt, ledger) = if !view.has_staged()
+            && (matches!(txn_type, TxnType::Update | TxnType::Upsert)
+                    // A sync that stages zero flakes is a no-change outcome
+                    // (payload identical to the graph), not an empty insert.
+                    || sync_graph.is_some())
+        {
+            let (base, flakes) = view.into_parts();
+            debug_assert!(
+                flakes.is_empty(),
+                "no-op transaction path requires zero staged flakes"
+            );
+            (
+                CommitReceipt {
+                    commit_id: ContentId::new(ContentKind::Commit, &[]),
+                    t: base.t(),
+                    flake_count: 0,
+                    assert_count: 0,
+                    retract_count: 0,
+                },
+                base,
+            )
+        } else {
+            self.commit_staged(view, ns_registry, index_config, commit_opts)
+                .await?
+        };
 
         Ok(self
             .finalize_owned_commit(receipt, ledger, index_config)
@@ -3074,6 +3191,7 @@ impl crate::Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph: _,
         } = stage_result;
 
         // Add transaction metadata and graph delta (graph_delta typically empty for Turtle)
@@ -3189,6 +3307,7 @@ impl crate::Fluree {
             ns_registry,
             txn_meta: Vec::new(),
             graph_delta: rustc_hash::FxHashMap::default(),
+            sync_graph: None,
         })
     }
 

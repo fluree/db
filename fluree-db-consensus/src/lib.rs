@@ -194,6 +194,14 @@ pub enum TransactionBody {
         /// object map, matching `fluree_db_cypher::ParamMap`.
         params: Option<serde_json::Map<String, JsonValue>>,
     },
+    /// JSON-LD document staged as a graph sync: `graph_iri`'s contents
+    /// become exactly the document, committing only the delta (whole-graph
+    /// retraction wave + accumulator cancellation).
+    ///
+    /// Appended last: the queue envelope and its [`BodyKind`] discriminator
+    /// are postcard-encoded in persisted Raft state, where variant ordinals
+    /// are positional — never insert a variant mid-enum.
+    JsonLdGraphSync { graph_iri: String, body: JsonValue },
 }
 
 impl TransactionBody {
@@ -205,6 +213,7 @@ impl TransactionBody {
             Self::JsonLdInsert(_) | Self::TurtleInsert(_) => "insert",
             Self::JsonLdUpsert(_) | Self::TurtleUpsert(_) | Self::TrigUpsert(_) => "upsert",
             Self::JsonLdUpdate(_) => "update",
+            Self::JsonLdGraphSync { .. } => "graph-sync",
             Self::Sparql(_) => "sparql-update",
             Self::Cypher { .. } => "cypher",
         }
@@ -236,6 +245,12 @@ impl TransactionBody {
             Self::JsonLdUpdate(json) => {
                 hasher.update(b"jsonld-update");
                 hasher.update(json.to_string().as_bytes());
+            }
+            Self::JsonLdGraphSync { graph_iri, body } => {
+                hasher.update(b"jsonld-graph-sync");
+                hasher.update(graph_iri.as_bytes());
+                hasher.update([0u8]);
+                hasher.update(body.to_string().as_bytes());
             }
             Self::TurtleInsert(text) => {
                 hasher.update(b"turtle-insert");
@@ -304,6 +319,12 @@ pub enum BodyKind {
     /// conflict strategy. Worker re-runs `prepare_rebase` and
     /// advances the branch's head.
     Rebase,
+    /// Graph sync (delta-only whole-graph replacement). Appended last:
+    /// `BodyKind` is postcard-encoded in persisted Raft state snapshots
+    /// (`QueueEntry.body_kind`), where variant ordinals are positional —
+    /// inserting mid-enum would make existing snapshots and mixed-version
+    /// nodes decode every later variant as the wrong operation.
+    JsonLdGraphSync,
 }
 
 impl From<&TransactionBody> for BodyKind {
@@ -312,6 +333,7 @@ impl From<&TransactionBody> for BodyKind {
             TransactionBody::JsonLdInsert(_) => BodyKind::JsonLdInsert,
             TransactionBody::JsonLdUpsert(_) => BodyKind::JsonLdUpsert,
             TransactionBody::JsonLdUpdate(_) => BodyKind::JsonLdUpdate,
+            TransactionBody::JsonLdGraphSync { .. } => BodyKind::JsonLdGraphSync,
             TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
             TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
             TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
@@ -907,5 +929,36 @@ mod tests {
             IdempotencyKey::new(over),
             Err(InvalidIdempotencyKey::TooLong { len })
         );
+    }
+}
+
+#[cfg(all(test, feature = "raft"))]
+mod body_kind_wire_tests {
+    use super::BodyKind;
+
+    /// `BodyKind` is postcard-encoded in persisted Raft state snapshots
+    /// (`QueueEntry.body_kind`), where variant ordinals are positional.
+    /// This pins every ordinal so a new variant can only ever be appended.
+    #[test]
+    fn body_kind_ordinals_are_append_only() {
+        let expected = [
+            (BodyKind::JsonLdInsert, 0u8),
+            (BodyKind::JsonLdUpsert, 1),
+            (BodyKind::JsonLdUpdate, 2),
+            (BodyKind::TurtleInsert, 3),
+            (BodyKind::TurtleUpsert, 4),
+            (BodyKind::TrigUpsert, 5),
+            (BodyKind::Sparql, 6),
+            (BodyKind::Cypher, 7),
+            (BodyKind::Pushed, 8),
+            (BodyKind::Revert, 9),
+            (BodyKind::Merge, 10),
+            (BodyKind::Rebase, 11),
+            (BodyKind::JsonLdGraphSync, 12),
+        ];
+        for (kind, ordinal) in expected {
+            let bytes = postcard::to_allocvec(&kind).expect("encode");
+            assert_eq!(bytes, vec![ordinal], "{kind:?} ordinal moved");
+        }
     }
 }

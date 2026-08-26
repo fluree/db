@@ -12,6 +12,7 @@ pub mod docs;
 pub mod drop;
 pub mod export;
 pub mod graph;
+pub mod graph_sync;
 pub mod history;
 pub mod iceberg;
 pub mod index;

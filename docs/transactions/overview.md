@@ -221,13 +221,14 @@ See [SPARQL UPDATE](../query/sparql.md#sparql-update) for complete documentation
 
 ## Transaction Endpoints
 
-Fluree exposes three transaction endpoints (all under `/v1/fluree/`):
+Fluree exposes four transaction endpoints (all under `/v1/fluree/`):
 
 - `POST /insert` — add triples (JSON-LD or Turtle)
 - `POST /update` — WHERE/DELETE/INSERT (JSON-LD) and SPARQL UPDATE
 - `POST /upsert` — replace values for the predicates you supply (JSON-LD, Turtle, TriG)
+- `POST /sync` — make one named graph's contents exactly the payload, committing only the delta (JSON-LD)
 
-See [Insert](insert.md), [Update](update-where-delete-insert.md), and [Upsert](upsert.md) for details.
+See [Insert](insert.md), [Update](update-where-delete-insert.md), [Upsert](upsert.md), and [Sync](sync.md) for details.
 
 ## Transaction Semantics
 
