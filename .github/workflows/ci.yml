@@ -355,3 +355,54 @@ jobs:
       # exits 0 only on the future's own Ok (see wasm-probe/README.md).
       - name: Runtime smoke (wasm32 under Node)
         run: node wasm-probe/run-node.mjs
+
+  # Executes the browser build (the wasm32 job only proves it compiles).
+  # 1. The playground binding runs create → insert → query → format inside a
+  #    dedicated worker in headless Chrome (wasm-bindgen-test, assertions on
+  #    returned rows — a positive ran-marker, never "didn't crash").
+  # 2. The SHIPPED npm package (main-thread proxy → module worker → wasm) is
+  #    driven end to end over the DevTools protocol with no COOP/COEP headers,
+  #    which is the package's hosting contract.
+  # ubuntu-latest ships a matching Chrome + chromedriver pair. Same RUSTFLAGS
+  # restatement as the wasm32 job (an env RUSTFLAGS masks .cargo/config.toml).
+  wasm-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install wasm-pack, wasm-bindgen CLI (Cargo.lock version), binaryen
+        run: |
+          curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+          VER=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | tail -1 | cut -d'"' -f2)
+          if [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" != "$VER" ]; then
+            cargo install wasm-bindgen-cli --version "$VER" --locked --force
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq binaryen
+
+      - name: Browser tests (wasm-bindgen-test in a dedicated worker, headless Chrome)
+        run: wasm-pack test --headless --chrome fluree-db-wasm
+
+      - name: Build npm package (wasm-release profile + wasm-opt + tsc)
+        working-directory: fluree-db-wasm/js
+        run: |
+          npm ci
+          node scripts/build.mjs
+
+      - name: Smoke the shipped package (headless Chrome over CDP, no isolation headers)
+        working-directory: fluree-db-wasm/js
+        run: node scripts/smoke-browser.mjs
+
+      - name: Size report
+        run: cat fluree-db-wasm/js/pkg/size-report.json
