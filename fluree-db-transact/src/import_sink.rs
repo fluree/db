@@ -251,8 +251,18 @@ mod inner {
         }
 
         /// Fold this chunk's list-position observation into the shared sticky
-        /// bit. Called from both finish paths — every `SpoolContext` ends at
-        /// one of them, so no chunk's observation is lost.
+        /// bit. Called from both finish paths.
+        ///
+        /// A context can also be dropped without finishing: every call site
+        /// has a `?` on the parse and on `into_parts()` between construction
+        /// and finish, and either one drops the sink with the context still
+        /// inside it. What makes a `Some(false)` root safe is therefore NOT
+        /// "every context finishes" but "a context that doesn't finish means
+        /// no root": both of those errors propagate a `TransactError` that
+        /// aborts the whole import, so there is no root assembled to record a
+        /// wrong flag into. A future change that tolerates per-chunk failures
+        /// would break that and has to publish the bit some other way — a
+        /// wrongly-`false` root silently skips list-meta hydration.
         ///
         /// Relaxed is enough: the store happens-before the join that collects
         /// the chunk results, and the root-assembly read happens after every
