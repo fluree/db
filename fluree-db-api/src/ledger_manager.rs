@@ -494,6 +494,9 @@ impl LedgerHandle {
             // the M2a scan path even on snapshots with on-disk arenas.
             snap.content_store = Some(Arc::clone(&cs));
 
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
+
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
             *self.inner.binary_store.write().await = Some(arc_store);
@@ -760,6 +763,38 @@ fn default_cache_dir() -> PathBuf {
 
 use fluree_db_query::BinaryRangeProvider;
 
+/// Residency mode (F8): prewarm the reverse-dict leaves that overlay
+/// translation of this snapshot's novelty will touch, in one concurrent
+/// fetch round at load time. Novelty replay stays the load model; its
+/// query-time miss sources (sync `find_subject_id_by_parts` /
+/// `find_string_id` per novelty entry) are prefetched here so a cold
+/// residency peer does not spend a retry round per reverse-tree leaf.
+/// Best-effort: failures fall back to the query-entry retry loop.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+async fn prefetch_novelty_translation(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    dict_novelty: &fluree_db_core::dict_novelty::DictNovelty,
+) {
+    if dict_novelty.subjects.is_empty() && dict_novelty.strings.is_empty() {
+        return;
+    }
+    let outcome = store
+        .prefetch_novelty_reverse_wants(
+            dict_novelty.subjects.iter_entries(),
+            dict_novelty.strings.iter_values(),
+            fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+        )
+        .await;
+    if outcome.wanted > 0 {
+        tracing::debug!(
+            wanted = outcome.wanted,
+            newly_resident = outcome.newly_resident,
+            failures = outcome.failures.len(),
+            "novelty reverse-leaf prefetch at load"
+        );
+    }
+}
+
 /// Load BinaryIndexStore from a v2 index root, attach range_provider
 /// to the LedgerState's LedgerSnapshot, and return the Arc'd store.
 ///
@@ -864,6 +899,10 @@ pub(crate) async fn load_and_attach_binary_store(
     // would always be false on snapshots loaded outside the
     // LedgerManager handle path.
     snap.content_store = Some(Arc::clone(&cs));
+
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
+
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
     // graph-scoped BinaryRangeProviders (needed for named-graph upsert deletions).

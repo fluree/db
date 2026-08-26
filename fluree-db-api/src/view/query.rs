@@ -20,6 +20,26 @@ use fluree_db_query::ir::{GraphName, Pattern};
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
 use serde_json::Value as JsonValue;
 
+/// The content store backing `db`'s binary index, when it participates in
+/// the sync residency tier (exposes a miss register): the handle the
+/// query-entry retry loop drains misses from, fetches through, and holds
+/// the in-flight guard on. `None` on non-residency stores keeps the loop
+/// arm dormant even when compiled in.
+///
+/// Resolved from the snapshot's range provider rather than the connection's
+/// backend so the loop uses exactly the store the sync reads went through.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+fn residency_content_store(
+    db: &GraphDb,
+) -> Option<std::sync::Arc<dyn fluree_db_core::ContentStore>> {
+    let provider = db.snapshot.range_provider.as_ref()?;
+    let brp = provider
+        .as_any()
+        .downcast_ref::<fluree_db_query::BinaryRangeProvider>()?;
+    let cs = brp.store().content_store()?.clone();
+    cs.miss_register().is_some().then_some(cs)
+}
+
 /// If the view was created from a graph source, wrap all top-level patterns
 /// in `GRAPH <gs_id> { ... }` so the R2RML provider handles them.
 ///
@@ -355,17 +375,96 @@ impl Fluree {
         maybe_wrap_for_graph_source(db, &mut parsed);
         guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input))?;
 
-        // 2. Build executable with optional reasoning override
-        let plan_start = fluree_db_core::clock::Instant::now();
-        let executable = self.build_executable_for_view(db, &parsed).await?;
-        let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+        // 2 + 4. Plan and execute.
+        //
+        // Residency mode (wasm32, or native under the `residency` feature
+        // with a miss-register-bearing store): plan+execute run inside the
+        // production drain/fetch/re-run loop — the whole-query backstop for
+        // one-shot paths whose misses the scan operator's in-frame retry
+        // cannot absorb. Each round gets a FRESH fuel tracker (the Tracker
+        // is Arc-shared, so reusing one would bill earlier rounds' work
+        // against the final round's budget); the reported tally is the
+        // final round's. The store's in-flight guard is held across every
+        // round so pinned bytes cannot evict between them, which is what
+        // makes retry progress monotone. The streaming entry
+        // (`run_stream_query`) is NOT wrapped — rows are emitted before
+        // execution completes, so it cannot be re-run transparently and is
+        // excluded on residency-mode peers.
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        let (batches, plan_ms, exec_ms) = {
+            let _ = &tracker;
+            let residency_cs = residency_content_store(db);
+            let _guard = residency_cs.as_ref().and_then(|cs| cs.query_guard());
+            let mut budget = fluree_db_binary_index::read::need_fetch::RetryBudget::default();
+            loop {
+                let round_tracker = match &input {
+                    QueryInput::JsonLd(json) => tracker_for_limits(json),
+                    QueryInput::Sparql(_) => Tracker::disabled(),
+                };
+                charge_query_floor(&round_tracker).map_err(fluree_db_query::QueryError::from)?;
+                let plan_start = fluree_db_core::clock::Instant::now();
+                let round: Result<_> = async {
+                    let executable = self.build_executable_for_view(db, &parsed).await?;
+                    let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+                    let exec_start = fluree_db_core::clock::Instant::now();
+                    let batches = self
+                        .execute_view_internal(db, &vars, &executable, &round_tracker, &options)
+                        .await?;
+                    Ok((
+                        batches,
+                        plan_ms,
+                        exec_start.elapsed().as_secs_f64() * 1000.0,
+                    ))
+                }
+                .await;
+                match round {
+                    Ok(v) => break v,
+                    Err(e) => {
+                        if let Some(cs) = residency_cs.as_deref() {
+                            let retried = budget
+                                .after_error(
+                                    cs,
+                                    fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+                                )
+                                .await
+                                .map_err(|re| {
+                                    crate::ApiError::from(fluree_db_query::QueryError::from_io(
+                                        "residency retry",
+                                        re,
+                                    ))
+                                })?;
+                            if retried {
+                                tracing::debug!(
+                                    rounds = budget.rounds(),
+                                    fetched_total = budget.fetched_total(),
+                                    "query-entry residency retry round"
+                                );
+                                continue;
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        };
+        #[cfg(not(any(target_arch = "wasm32", feature = "residency")))]
+        let (batches, plan_ms, exec_ms) = {
+            // 2. Build executable with optional reasoning override
+            let plan_start = fluree_db_core::clock::Instant::now();
+            let executable = self.build_executable_for_view(db, &parsed).await?;
+            let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
-        // 4. Execute
-        let exec_start = fluree_db_core::clock::Instant::now();
-        let batches = self
-            .execute_view_internal(db, &vars, &executable, &tracker, &options)
-            .await?;
-        let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
+            // 4. Execute
+            let exec_start = fluree_db_core::clock::Instant::now();
+            let batches = self
+                .execute_view_internal(db, &vars, &executable, &tracker, &options)
+                .await?;
+            (
+                batches,
+                plan_ms,
+                exec_start.elapsed().as_secs_f64() * 1000.0,
+            )
+        };
 
         tracing::info!(
             parse_ms = format!("{:.2}", parse_ms),
