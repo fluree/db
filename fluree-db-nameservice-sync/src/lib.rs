@@ -36,6 +36,7 @@ pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod driver;
 pub mod error;
+pub mod head_stream;
 pub mod integrity;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod origin;
@@ -43,12 +44,10 @@ pub mod origin;
 pub mod pack_client;
 pub mod proxy_nameservice;
 pub mod proxy_storage;
-#[cfg(not(target_arch = "wasm32"))]
 mod server_sse;
 pub mod transport;
 #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
 pub mod vended_s3;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod watch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod watch_poll;
@@ -67,6 +66,12 @@ pub use driver::{FetchResult, PullResult, PushResult, SyncDriver};
 pub use error::{Result, SyncError};
 // Re-export LedgerConfig types from fluree-db-nameservice (canonical home)
 pub use fluree_db_nameservice::{AuthRequirement, LedgerConfig, Origin, ReplicationDefaults};
+pub use head_stream::{
+    run_head_stream, BoxChunkStream, HeadSink, HeadStreamConfig, Sleeper, SseChunkSource,
+    SseConnectError,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use head_stream::{ReqwestSseSource, TokenProvider, TokioSleeper};
 pub use integrity::verify_object_integrity;
 #[cfg(not(target_arch = "wasm32"))]
 pub use origin::{HttpOriginFetcher, MultiOriginFetcher};
@@ -82,7 +87,6 @@ pub use transport::ReqwestTransport;
 pub use transport::{
     HttpTransport, TransportError, TransportMethod, TransportRequest, TransportResponse,
 };
-#[cfg(not(target_arch = "wasm32"))]
 pub use watch::{RemoteEvent, RemoteWatch};
 #[cfg(not(target_arch = "wasm32"))]
 pub use watch_poll::PollRemoteWatch;

@@ -26,6 +26,9 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 urlencoding = { workspace = true }
+# Backoff jitter in the shared head-stream pump (wasm gets the JS
+# getrandom backend through fluree-db-core's target deps).
+rand = { workspace = true }
 
 # Vended S3 credentials consumer (feature "aws")
 fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true, default-features = false, features = ["s3"] }
@@ -35,9 +38,13 @@ aws-credential-types = { workspace = true, optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { workspace = true, features = ["stream"] }
 tokio = { workspace = true, features = ["time", "sync"] }
-rand = { workspace = true }
 parking_lot = "0.12"
 async-stream = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Runtime-less sync primitives for the shared head-stream pump's stop
+# signal; no runtime, no timers.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [features]
 default = ["native"]
