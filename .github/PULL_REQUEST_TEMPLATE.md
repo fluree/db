@@ -4,4 +4,5 @@
        Partially addresses #N — issue stays open; say below what remains
                                 (write it this way — "partially fixes #N" would close it)
      Closing keywords only fire when this PR's base is the default branch.
+     Creating with `gh pr create --body`/`--body-file`? This template is bypassed — add the line yourself.
 -->
