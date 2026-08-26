@@ -151,12 +151,11 @@ pub trait HttpTransport: Debug + Send + Sync {
     async fn execute(&self, req: TransportRequest) -> Result<TransportResponse, TransportError>;
 }
 
-#[async_trait]
-impl HttpTransport for std::sync::Arc<dyn HttpTransport> {
-    async fn execute(&self, req: TransportRequest) -> Result<TransportResponse, TransportError> {
-        self.as_ref().execute(req).await
-    }
-}
+// No blanket `impl HttpTransport for Arc<dyn HttpTransport>`: the proxy
+// clients hold `Arc<dyn HttpTransport>` and auto-deref to the vtable
+// directly, and nothing takes a generic `T: HttpTransport` bound. A blanket
+// impl would also shadow that deref and box every dispatch twice on the CAS
+// read path.
 
 /// Native transport over a pooled [`reqwest::Client`].
 #[derive(Clone)]
