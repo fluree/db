@@ -1,9 +1,32 @@
+# Cargo configuration for the Fluree DB-R workspace.
+#
+# The settings below apply to every `cargo` invocation run from this
+# directory tree (including CI).
+
+[env]
+# Default thread stack size for std::thread and test runners.
+#
+# In dev/test builds, async state machines are unoptimized and can grow very
+# large — particularly where SHACL validation, policy enforcement, and the
+# axum HTTP handler chain compose through several nested async fns. The
+# 2 MB Rust/Tokio default overflows on first poll in the policy_integration
+# and proxy_integration suites when the transact HTTP pipeline is exercised.
+#
+# Release builds collapse these futures aggressively and do not need the
+# larger stack; this variable only affects threads that check it at startup
+# (std::thread, cargo test harness, compiler threads). Production runtime
+# stack sizing is controlled separately via tokio's runtime builder.
+RUST_MIN_STACK = "8388608"  # 8 MB
+
 # wasm32 C toolchain (zstd-sys): route through in-repo shims that pick a
 # wasm32-capable clang per platform (Homebrew LLVM on macOS — Apple clang has
 # no WebAssembly backend — plain clang on Linux/CI). Scoped to the wasm target.
-[env]
 CC_wasm32-unknown-unknown = { value = "scripts/wasm-clang.sh", relative = true }
 AR_wasm32-unknown-unknown = { value = "scripts/wasm-ar.sh", relative = true }
 
+# getrandom 0.3 (pulled via ulid -> rand 0.9) selects its wasm backend with a
+# --cfg, not only a crate feature; scoped to the wasm target so native builds
+# are untouched. NOTE for CI: an environment-level RUSTFLAGS overrides this
+# table — the ci.yml wasm32 job restates the cfg explicitly for that reason.
 [target.wasm32-unknown-unknown]
 rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
