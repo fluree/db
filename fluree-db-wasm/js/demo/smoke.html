@@ -1,0 +1,63 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>fluree-db-wasm smoke</title>
+<pre id="out">running…</pre>
+<script type="module">
+  // Drives the shipped package end to end and publishes a machine-readable
+  // verdict on window.__smoke (awaited by scripts/smoke-browser.mjs).
+  import { playground } from "../dist/index.js";
+
+  const out = document.getElementById("out");
+  const data = {
+    "@context": { ex: "http://example.org/ns/" },
+    "@graph": [
+      { "@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 34,
+        "ex:knows": { "@id": "ex:bob" } },
+      { "@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob", "ex:age": 29 },
+    ],
+  };
+  const sparql = `PREFIX ex: <http://example.org/ns/>
+    SELECT ?name WHERE { ?p a ex:Person ; ex:name ?name } ORDER BY ?name`;
+
+  window.__smoke = (async () => {
+    const timings = {};
+    try {
+      let t0 = performance.now();
+      const pg = await playground();
+      timings.init = Math.round(performance.now() - t0);
+
+      const ledger = await pg.createLedger("smoke");
+      t0 = performance.now();
+      const receipt = await ledger.insert(data);
+      timings.insert = Math.round(performance.now() - t0);
+
+      t0 = performance.now();
+      const res = await ledger.query(sparql);
+      timings.query = Math.round(performance.now() - t0);
+      const names = res.results.bindings.map((b) => b.name.value);
+
+      const ask = await ledger.query(
+        "PREFIX ex: <http://example.org/ns/> ASK { ex:alice ex:knows ex:bob }");
+      const info = await ledger.info();
+      pg.close();
+
+      const report = {
+        status: "pass",
+        version: pg.version,
+        transport: "transfer",
+        rows: names.length,
+        names,
+        ask: ask.boolean,
+        t: info.t,
+        receiptT: receipt.t,
+        timings,
+      };
+      out.textContent = JSON.stringify(report, null, 2);
+      return report;
+    } catch (err) {
+      const report = { status: "fail", error: String(err?.stack ?? err), timings };
+      out.textContent = JSON.stringify(report, null, 2);
+      return report;
+    }
+  })();
+</script>
