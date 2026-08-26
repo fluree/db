@@ -112,18 +112,52 @@ fn is_tmp_artifact(name: &str) -> bool {
     name.ends_with(TMP_SUFFIX)
 }
 
-/// The process token embedded in a staging name, for names shaped the way
-/// [`tmp_sibling`] writes them (`<name>.<pid>.<token>.<seq>.tmp`).
+/// A run of ASCII digits — a pid or a sequence number.
+fn is_ascii_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The 16 lowercase hex digits [`tmp_sibling`] formats a process token as.
+fn is_process_token(s: &str) -> bool {
+    s.len() == 16
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// The process token embedded in a staging name, for names shaped exactly the
+/// way [`tmp_sibling`] writes them (`<name>.<pid>.<token>.<seq>.tmp`).
 ///
-/// Returns `None` for anything else ending in `.tmp` — a file an operator
-/// dropped there, or one written by an older version of this code. The sweep
-/// treats an unparseable name as *not* ours, which is the safe direction: it
-/// still has to clear the age threshold before anything happens to it.
+/// **This is the sweep's admission test, not a convenience.** `.tmp` is a
+/// suffix, not a namespace: the indexer's vocab merge, the disk cache, the
+/// nameservice's tracking file and the Raft log all stage under it, and the
+/// nameservice shares the swept tree by construction (`FileNameService::new`
+/// builds a `FileStorage` on the path `FlureeBuilder::build` also hands to
+/// storage). Recognizing our own naming — rather than trusting the extension —
+/// is the only thing keeping this sweep off their files.
+///
+/// Both formats this backend has ever written parse: the current one, and the
+/// pre-`b0a9c416a` `<name>.<pid>.<seq>.tmp`, whose pid lands in the token
+/// position and is accepted as digits. Every segment is shape-checked, so a
+/// foreign name that merely happens to have enough dots in it (`a.b.c.tmp`)
+/// does not slip through on arity alone.
+///
+/// Returns `None` for anything else. That is the safe direction in the only
+/// sense that matters: failing to reclaim an orphan wastes disk, and reclaiming
+/// someone else's file loses data.
 fn staging_token(name: &str) -> Option<&str> {
     let rest = name.strip_suffix(TMP_SUFFIX)?;
-    let (head, _seq) = rest.rsplit_once('.')?;
-    let (_prefix, token) = head.rsplit_once('.')?;
-    Some(token)
+    let (head, seq) = rest.rsplit_once('.')?;
+    let (prefix, token) = head.rsplit_once('.')?;
+    // There has to be a destination name in front of the pid, or this is some
+    // other file that merely ends in `.tmp`.
+    if prefix.is_empty() || !is_ascii_digits(seq) {
+        return None;
+    }
+    if is_process_token(token) || is_ascii_digits(token) {
+        Some(token)
+    } else {
+        None
+    }
 }
 
 /// How long a staging file must have gone untouched before a sweep may
@@ -140,10 +174,17 @@ const STALE_STAGING_AGE: std::time::Duration = std::time::Duration::from_secs(24
 
 /// Directory entries one sweep will look at before giving up.
 ///
-/// The walk runs on the construction path, so it must not turn opening a large
-/// volume into a startup stall. Exhausting the budget leaves the rest of the
-/// tree for the next start rather than delaying this one — orphans are inert,
-/// so deferring them costs nothing but the disk they sit on.
+/// A walk bounded in *entries* is not bounded in wall-clock — on the shared
+/// mount this design is written for, each `readdir` is a network round trip —
+/// so the cap stays even though the walk no longer runs on the caller's thread.
+///
+/// **Exhausting it is not a deferral.** The walk restarts from the base path
+/// every time with no cursor, and it never removes content files, so a tree
+/// whose first `SWEEP_ENTRY_BUDGET` entries in traversal order are content will
+/// re-walk those same entries on every start and never reach an orphan beyond
+/// them. That is silent under-delivery, which is why truncation logs at `warn`
+/// and why [`FileStorage::SWEEP_ENV_VAR`] accepts a larger budget: an operator
+/// who sees the warning needs something to do about it.
 const SWEEP_ENTRY_BUDGET: usize = 100_000;
 
 /// What one sweep did.
@@ -171,9 +212,13 @@ struct StagingSweep {
 /// # What this will not delete
 ///
 /// Storage is shared by more than one process in a multi-instance deployment,
-/// so a sweep that guessed wrong would pull a live writer's file out from under
-/// it. Two rules stop that:
+/// and the tree is shared by other *subsystems* even in one process, so a sweep
+/// that guessed wrong would pull a live writer's file out from under it. Three
+/// rules stop that:
 ///
+/// 0. **Never a file this backend's staging writer did not name.** `.tmp` is a
+///    suffix, not a namespace — see [`staging_token`], which is the admission
+///    test. Everything below applies only to names that pass it.
 /// 1. **Never this process's own.** The staging name carries a 64-bit token
 ///    drawn once per process, so a name bearing our token is ours — in flight
 ///    or already leaked, and a directory entry cannot tell those apart. Both
@@ -231,8 +276,20 @@ fn sweep_orphaned_staging_files(
             if !is_tmp_artifact(&name) {
                 continue;
             }
+            // RULE 0, and the one that decides whether the other two are even
+            // asked. `.tmp` is a suffix several subsystems use, some of them
+            // writing into this very tree, so a file only becomes the sweep's
+            // business once its name parses as one *this* writer produced.
+            // Without this, rule 1 protects nothing outside our own naming and
+            // the age heuristic alone stands between every other subsystem's
+            // staging file and an unlink — including the indexer's vocab-merge
+            // temporaries, which are exactly the long-running shape
+            // `STALE_STAGING_AGE` argues an age threshold must not judge.
+            let Some(token) = staging_token(&name) else {
+                continue;
+            };
             // Rule 1: ours, whatever its age.
-            if staging_token(&name) == Some(own_token.as_str()) {
+            if token == own_token.as_str() {
                 sweep.kept += 1;
                 continue;
             }
@@ -269,14 +326,20 @@ fn sweep_orphaned_staging_files(
 /// for the API's own handle, frequently on the same directory. Only the first
 /// walk can find anything; the rest would re-walk the tree to look at exactly
 /// the files the first one declined to touch.
+///
+/// Canonicalized first, so the guarantee is about the *directory* and not about
+/// how a caller spelled it — `/x`, `/x/.` and `/x/` are one base path, not
+/// three. Falls back to the literal path when canonicalization fails (the
+/// directory may not exist yet), which is the pre-existing behaviour.
 fn claim_sweep(base: &Path) -> bool {
     static SWEPT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
         std::sync::OnceLock::new();
+    let key = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
     SWEPT
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(base.to_path_buf())
+        .insert(key)
 }
 
 /// Write `bytes` to a staging sibling of `path`, returning the staging path.
@@ -414,11 +477,13 @@ impl FileStorage {
     ///
     /// Constructing the storage also reclaims staging files orphaned by an
     /// earlier crash — see [`sweep_orphaned_staging_files`] for what it will
-    /// and will not delete, and [`Self::SWEEP_ENV_VAR`] to turn it off. The
-    /// walk is bounded and runs at most once per base path per process.
+    /// and will not delete, and [`Self::SWEEP_ENV_VAR`] to tune or disable it.
+    /// The walk is bounded, runs at most once per base path per process, and is
+    /// handed to the blocking pool when there is a runtime to hand it to, so
+    /// constructing a storage never waits on it.
     pub fn new(base_path: impl Into<std::path::PathBuf>) -> Self {
         let base_path = base_path.into();
-        Self::sweep_on_construction(&base_path);
+        let _ = Self::sweep_on_construction(&base_path);
         Self {
             base_path,
             durability: Durability::from_env(),
@@ -426,24 +491,55 @@ impl FileStorage {
         }
     }
 
-    /// Set to a falsey value (`0`, `false`, `off`, `no`) to skip the
-    /// startup sweep of orphaned staging files.
+    /// Set to a falsey value (`0`, `false`, `off`, `no`) to skip the startup
+    /// sweep of orphaned staging files.
     ///
-    /// The escape hatch exists because the sweep walks the storage tree, and
-    /// an operator who knows their volume is enormous — or who wants a crash's
-    /// leftovers preserved for a post-mortem — should be able to say so
-    /// without patching the binary.
+    /// The escape hatch exists because the sweep walks the storage tree, and an
+    /// operator who wants a crash's leftovers preserved for a post-mortem
+    /// should be able to say so without patching the binary.
     pub const SWEEP_ENV_VAR: &'static str = "FLUREE_STORAGE_TMP_SWEEP";
 
-    /// Whether [`Self::SWEEP_ENV_VAR`] asks for the sweep to be skipped.
-    fn sweep_disabled_by_env() -> bool {
-        std::env::var(Self::SWEEP_ENV_VAR)
+    /// Overrides [`SWEEP_ENTRY_BUDGET`], the number of directory entries one
+    /// sweep will look at.
+    ///
+    /// Deliberately a *separate* variable rather than an overload of
+    /// [`Self::SWEEP_ENV_VAR`]: `FLUREE_STORAGE_FSYNC=1` means "on", so an
+    /// operator would reasonably write `FLUREE_STORAGE_TMP_SWEEP=1` meaning the
+    /// same — and if that spelling were read as a budget it would silently mean
+    /// "look at one entry", which is off wearing a disguise. One variable, one
+    /// job.
+    ///
+    /// This exists so the truncation warning has a remedy attached. A warning
+    /// an operator cannot act on is just noise.
+    pub const SWEEP_BUDGET_ENV_VAR: &'static str = "FLUREE_STORAGE_TMP_SWEEP_BUDGET";
+
+    /// The entry budget for a sweep, or `None` to skip it entirely.
+    fn sweep_budget_from_env() -> Option<usize> {
+        if std::env::var(Self::SWEEP_ENV_VAR)
             .ok()
             .is_some_and(|v| Self::env_says_off(&v))
+        {
+            return None;
+        }
+        Some(Self::parse_budget(
+            std::env::var(Self::SWEEP_BUDGET_ENV_VAR).ok().as_deref(),
+        ))
     }
 
-    /// Pure half of [`Self::sweep_disabled_by_env`], so the accepted spellings
-    /// are testable without touching process environment. Same spellings
+    /// Pure half of the budget lookup, so the accepted spellings are testable
+    /// without touching process environment.
+    ///
+    /// An unrecognized value keeps the default rather than guessing, matching
+    /// how `Durability::parse` treats a typo — a mistyped budget should not
+    /// quietly turn the sweep into a no-op.
+    fn parse_budget(value: Option<&str>) -> usize {
+        value
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(SWEEP_ENTRY_BUDGET)
+    }
+
+    /// Whether a value spells one of the falsey settings. Same spellings
     /// [`Durability::ENV_VAR`] accepts — one convention for the whole storage
     /// backend, not one per switch.
     fn env_says_off(value: &str) -> bool {
@@ -455,21 +551,59 @@ impl FileStorage {
 
     /// Reclaim orphaned staging files under `base_path`, at most once per path
     /// per process.
-    fn sweep_on_construction(base_path: &Path) {
-        if Self::sweep_disabled_by_env() || !claim_sweep(base_path) {
-            return;
+    ///
+    /// Returns the spawned task when the walk was handed to the blocking pool,
+    /// so a test can await it. Production ignores it — the sweep is best-effort
+    /// and nothing waits on the result.
+    fn sweep_on_construction(base_path: &Path) -> Option<tokio::task::JoinHandle<()>> {
+        let budget = Self::sweep_budget_from_env()?;
+        if !claim_sweep(base_path) {
+            return None;
         }
-        let sweep = sweep_orphaned_staging_files(base_path, STALE_STAGING_AGE, SWEEP_ENTRY_BUDGET);
-        // Silence is the normal case, and a startup log line per storage would
-        // be noise. Say something only when there was debris to report or a
-        // walk that did not finish.
-        if sweep.reclaimed > 0 || sweep.truncated {
+        let base = base_path.to_path_buf();
+        // A RECURSIVE `read_dir` IS BLOCKING I/O, AND `new` IS REACHABLE FROM
+        // ASYNC CONNECTION SETUP (`create_async_connection`, and
+        // `build_from_config`'s async path), so running it here would park a
+        // runtime worker for the whole walk — measured at ~1s warm on local
+        // APFS for the default budget, and a readdir on the shared mount this
+        // design targets is a network round trip rather than a page-cache hit.
+        // #1620 asked for the walk to be bounded *or* backgrounded; it is worth
+        // being both.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Some(handle.spawn_blocking(move || Self::run_sweep(&base, budget))),
+            // No runtime: a plain synchronous caller (`create_sync_connection`),
+            // which can afford to block on its own thread.
+            Err(_) => {
+                Self::run_sweep(&base, budget);
+                None
+            }
+        }
+    }
+
+    /// The walk itself, plus what it reports.
+    fn run_sweep(base_path: &Path, budget: usize) {
+        let sweep = sweep_orphaned_staging_files(base_path, STALE_STAGING_AGE, budget);
+        // Silence is the normal case, and a startup line per storage would be
+        // noise. Reclaiming is routine good news at `info`.
+        if sweep.reclaimed > 0 {
             tracing::info!(
                 base_path = %base_path.display(),
                 reclaimed = sweep.reclaimed,
                 kept = sweep.kept,
-                truncated = sweep.truncated,
                 "reclaimed staging files orphaned by an interrupted write"
+            );
+        }
+        // Truncation is a different event and a worse one: the walk has no
+        // cursor, so this base path stays under-swept on every future start
+        // until the budget is raised. That is not a deferral, so it does not
+        // get to look like one.
+        if sweep.truncated {
+            tracing::warn!(
+                base_path = %base_path.display(),
+                budget,
+                env_var = Self::SWEEP_BUDGET_ENV_VAR,
+                "staging-file sweep hit its entry budget and stopped; entries past it are not \
+                 reached on this or any later start. Raise the budget to cover the tree."
             );
         }
     }
@@ -1599,14 +1733,158 @@ mod tests {
             .to_string();
         assert_eq!(staging_token(&name), Some(own_token().as_str()), "{name}");
 
-        // Anything not shaped like a staging name is not ours, which is the
-        // safe answer: it still has to clear the age threshold.
-        assert_eq!(staging_token("plain.tmp"), None);
-        assert_eq!(staging_token("leaf.json"), None);
+        // The pre-`b0a9c416a` format put the pid where the token now sits. It
+        // still parses, so an orphan written by that build is still reclaimable
+        // — and it is plainly not ours.
+        assert_eq!(staging_token("leaf.json.999.0.tmp"), Some("999"));
         assert_ne!(
             staging_token("leaf.json.999.0.tmp"),
             Some(own_token().as_str())
         );
+
+        // Enough dots is not the same as the right shape: a foreign name with
+        // the same arity must not slip through on arity alone.
+        assert_eq!(staging_token("subjects.offsets.0.tmp"), None);
+        assert_eq!(staging_token("a.b.c.tmp"), None);
+        assert_eq!(staging_token(".4242.7.tmp"), None, "no destination name");
+        assert_eq!(staging_token("plain.tmp"), None);
+        assert_eq!(staging_token("leaf.json"), None);
+    }
+
+    /// THE OTHER ONE THAT MATTERS. `.tmp` is a suffix, not a namespace: the
+    /// indexer's vocab merge, the disk cache, the nameservice tracking file and
+    /// the Raft log all stage under it, and the nameservice shares this very
+    /// tree — `FileNameService::new` builds a `FileStorage` on the path
+    /// `FlureeBuilder::build` also hands to storage. If the sweep predicated on
+    /// the extension, the age threshold would be the only thing between all of
+    /// them and an unlink. The vocab-merge entries are the sharp case: index
+    /// build temporaries are exactly the long-running shape `STALE_STAGING_AGE`
+    /// argues an age threshold must not judge.
+    #[test]
+    fn the_sweep_ignores_tmp_files_other_subsystems_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = [
+            "notes.tmp",
+            "report.tmp",
+            "subjects.offsets.tmp", // vocab_merge.rs
+            "strings.lens.tmp",     // vocab_merge.rs
+            ".cas_4242_7.tmp",      // disk_cache.rs
+            "myledger.json.tmp",    // tracking_file.rs
+            "snap-0.tmp",           // fluree-raft-core storage/fs.rs
+            // Same arity as one of ours, but the segments are the wrong shape.
+            "subjects.offsets.0.tmp",
+        ];
+        for name in &foreign {
+            let path = dir.path().join(name);
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"someone else's in-flight work").unwrap();
+            f.set_modified(SystemTime::now() - STALE_STAGING_AGE * 10)
+                .unwrap();
+        }
+
+        // Threshold at zero, so age offers no protection at all — the shape
+        // check is the only thing on trial.
+        let sweep = sweep_orphaned_staging_files(dir.path(), Duration::ZERO, SWEEP_ENTRY_BUDGET);
+
+        assert_eq!(
+            sweep.reclaimed, 0,
+            "the sweep unlinked another subsystem's staging file"
+        );
+        for name in &foreign {
+            assert!(dir.path().join(name).exists(), "{name} was reclaimed");
+        }
+    }
+
+    /// The shape check must not cost us the orphans the sweep exists for: a
+    /// foreign-token file in our own naming is still reclaimed, sitting in the
+    /// same directory as the files that must survive.
+    #[test]
+    fn the_shape_check_still_reclaims_our_own_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("subjects.offsets.tmp"), b"theirs").unwrap();
+        let ours = plant_staging_file(
+            dir.path(),
+            "leaf.json",
+            "fedcba9876543210",
+            STALE_STAGING_AGE * 2,
+        );
+        // And the legacy `<name>.<pid>.<seq>.tmp` shape, which predates the
+        // token and must still be reclaimable.
+        let legacy = dir.path().join(format!("old.json.999.0{TMP_SUFFIX}"));
+        let mut f = std::fs::File::create(&legacy).unwrap();
+        f.write_all(b"legacy orphan").unwrap();
+        f.set_modified(SystemTime::now() - STALE_STAGING_AGE * 2)
+            .unwrap();
+
+        let sweep = sweep_orphaned_staging_files(dir.path(), STALE_STAGING_AGE, SWEEP_ENTRY_BUDGET);
+
+        assert!(!ours.exists(), "a real orphan survived the shape check");
+        assert!(!legacy.exists(), "a legacy-format orphan survived");
+        assert_eq!(sweep.reclaimed, 2);
+        assert!(
+            dir.path().join("subjects.offsets.tmp").exists(),
+            "the foreign file next to them was taken"
+        );
+    }
+
+    /// `FileStorage::new` is called from inside `create_async_connection`, so a
+    /// synchronous recursive `read_dir` there parks a runtime worker for the
+    /// whole walk. Awaiting the handle rather than polling for the file keeps
+    /// this deterministic.
+    #[tokio::test]
+    async fn the_walk_is_handed_to_the_blocking_pool_when_a_runtime_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = plant_staging_file(
+            dir.path(),
+            "leaf.json",
+            "fedcba9876543210",
+            STALE_STAGING_AGE * 2,
+        );
+
+        let handle = FileStorage::sweep_on_construction(dir.path())
+            .expect("a sweep inside a runtime must be spawned, not run inline");
+        handle.await.expect("sweep task panicked");
+
+        assert!(!orphan.exists(), "the spawned sweep did not run");
+    }
+
+    /// Without a runtime there is nothing to hand the walk to, and a plain
+    /// synchronous caller can afford to block — so it runs inline and is
+    /// finished by the time `new` returns.
+    #[test]
+    fn the_walk_runs_inline_without_a_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            FileStorage::sweep_on_construction(dir.path()).is_none(),
+            "no runtime, so there is no task to return"
+        );
+    }
+
+    /// Same spellings the durability switch accepts — one convention for the
+    /// storage backend, not one per environment variable.
+    #[test]
+    fn sweep_env_var_accepts_the_durability_spellings() {
+        for v in ["0", "false", "off", "no", "OFF", " false "] {
+            assert!(FileStorage::env_says_off(v), "{v:?}");
+        }
+        for v in ["1", "true", "on", "", "nonsense"] {
+            assert!(!FileStorage::env_says_off(v), "{v:?}");
+        }
+    }
+
+    /// An operator who sees the truncation warning needs something to do about
+    /// it. Note `"1"` means a budget of one only because it arrives through the
+    /// budget variable — through the on/off switch it would mean "on", which is
+    /// exactly why these are two variables and not one.
+    #[test]
+    fn sweep_budget_env_var_parses_a_size() {
+        assert_eq!(FileStorage::parse_budget(Some("5000000")), 5_000_000);
+        assert_eq!(FileStorage::parse_budget(Some(" 250 ")), 250);
+        // Unset, mistyped, or a zero that would quietly make the sweep a no-op
+        // all keep the default rather than guessing.
+        for v in [None, Some(""), Some("nonsense"), Some("0"), Some("-5")] {
+            assert_eq!(FileStorage::parse_budget(v), SWEEP_ENTRY_BUDGET, "{v:?}");
+        }
     }
 
     /// The threshold is the only thing standing between a foreign in-flight
@@ -1616,8 +1894,8 @@ mod tests {
     fn only_files_past_the_threshold_are_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
         let threshold = Duration::from_secs(3600);
-        let young = plant_staging_file(dir.path(), "young.json", "aaaa", threshold / 2);
-        let old = plant_staging_file(dir.path(), "old.json", "bbbb", threshold * 2);
+        let young = plant_staging_file(dir.path(), "young.json", "aaaaaaaaaaaaaaaa", threshold / 2);
+        let old = plant_staging_file(dir.path(), "old.json", "bbbbbbbbbbbbbbbb", threshold * 2);
 
         let sweep = sweep_orphaned_staging_files(dir.path(), threshold, SWEEP_ENTRY_BUDGET);
 
@@ -1631,7 +1909,9 @@ mod tests {
     #[test]
     fn a_future_mtime_is_treated_as_live() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(format!("skewed.json.7.cccc.0{TMP_SUFFIX}"));
+        let path = dir
+            .path()
+            .join(format!("skewed.json.7.cccccccccccccccc.0{TMP_SUFFIX}"));
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(b"partial").unwrap();
         file.set_modified(SystemTime::now() + Duration::from_secs(3600))
@@ -1682,7 +1962,7 @@ mod tests {
             plant_staging_file(
                 dir.path(),
                 &format!("o{i}.json"),
-                "dddd",
+                "dddddddddddddddd",
                 STALE_STAGING_AGE * 2,
             );
         }
@@ -1702,18 +1982,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(claim_sweep(dir.path()), "first claim must win");
         assert!(!claim_sweep(dir.path()), "second claim must be refused");
-    }
-
-    /// Same spellings the durability switch accepts — one convention for the
-    /// storage backend, not one per environment variable.
-    #[test]
-    fn sweep_env_var_accepts_the_durability_spellings() {
-        for v in ["0", "false", "off", "no", "OFF", " false "] {
-            assert!(FileStorage::env_says_off(v), "{v:?}");
-        }
-        for v in ["1", "true", "on", "", "nonsense"] {
-            assert!(!FileStorage::env_says_off(v), "{v:?}");
-        }
     }
 
     /// Write a zero-length file directly, bypassing the storage API — which is

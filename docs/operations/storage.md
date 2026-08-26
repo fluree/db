@@ -394,9 +394,14 @@ them, so they can't be read back as content — but they are a full copy of the
 object being written, and a crash loop produces one per attempt.
 
 Opening a file-backed storage reclaims them. The sweep is deliberately timid,
-because in a multi-instance deployment the directory it is walking may have
-another process writing into it right now:
+because the directory it walks is shared — by other instances in a
+multi-instance deployment, and by other subsystems even in a single process:
 
+- Only files named the way this backend's own staging writer names them are
+  considered at all. `.tmp` is a suffix, not a namespace — the indexer, the
+  disk cache, the nameservice and the Raft log all stage under it, and the
+  nameservice writes into this same tree. Anything whose name doesn't parse as
+  ours is ignored outright, whatever its age.
 - A staging file carrying **this process's token** is never removed, at any
   age. In flight and already-leaked look identical from a directory entry.
 - A staging file **modified within the last 24 hours** is never removed. A
@@ -411,10 +416,21 @@ and a foreign staging write that somehow stayed open for over a day would be
 unlinked. Even then nothing is corrupted — on POSIX the writer keeps its open
 descriptor, so only its final rename fails and the write reports an error.
 
-The walk is bounded (100,000 directory entries) and runs at most once per
-directory per process; whatever it doesn't reach is picked up on a later start.
-Set `FLUREE_STORAGE_TMP_SWEEP=0` to skip it entirely — worth doing if you want
-a crash's leftovers preserved for a post-mortem.
+The walk runs at most once per directory per process, and is handed to a
+background thread when one is available, so opening a storage never waits on
+it.
+
+It is also bounded, at 100,000 directory entries by default — a walk bounded in
+entries is not bounded in wall-clock on a network mount, where every directory
+read is a round trip. **Exhausting that budget is not a deferral.** The walk
+restarts from the top each time with no cursor and never removes content files,
+so if the first 100,000 entries it encounters are content, every subsequent
+start re-walks those same entries and the orphans beyond them are never
+reached. That case logs at `warn`; if you see it, raise
+`FLUREE_STORAGE_TMP_SWEEP_BUDGET` past the number of files under the directory.
+
+Set `FLUREE_STORAGE_TMP_SWEEP=0` to skip the sweep entirely — worth doing if
+you want a crash's leftovers preserved for a post-mortem.
 
 ## AWS Storage Details
 

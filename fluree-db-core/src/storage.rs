@@ -213,6 +213,19 @@ pub trait StorageRead: Debug + Send + Sync {
     /// the range, which may be shorter than requested if the object is
     /// smaller than `range.end`.
     ///
+    /// **Clamping is the contract, not an implementation detail.** An
+    /// implementation must size its result from the object, never from the
+    /// width of the range: `mid..u64::MAX` is the established spelling of
+    /// "read to the end" against this trait, so a `range.end` past the object
+    /// is normal input rather than an error. A `range.start` at or past the
+    /// end of the object returns `Ok(vec![])`, the same answer an empty range
+    /// gives — absence of bytes is not an error here, and callers distinguish
+    /// "no bytes" from "no object" by the `NotFound` error, not by this.
+    ///
+    /// Known gap: `S3Storage` returns 416 rather than an empty vec for a start
+    /// past the end. That predates this doc and is tracked separately; the
+    /// clamping half of the contract holds on every backend.
+    ///
     /// The default implementation fetches the full object and slices.
     /// StorageBackends that support native range reads (S3, HTTP) should override
     /// for efficiency.
