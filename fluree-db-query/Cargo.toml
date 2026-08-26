@@ -76,6 +76,10 @@ vector = ["dep:usearch"]
 # queries remain cancellable only at generic per-batch operator boundaries.
 # Never enable in production builds.
 cancel-checks-off = []
+# Store-driven sync residency mode (see fluree-db-binary-index's feature of
+# the same name): compiles the operator-frame drain/fetch/retry arms so
+# native tests can drive the wasm read-path recovery machinery end to end.
+residency = ["fluree-db-binary-index/residency"]
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -1021,7 +1021,7 @@ fn driver_subject_boundaries(
     for leaf in leaves {
         let handle = store
             .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         for entry in &handle.dir().entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
@@ -2834,7 +2834,7 @@ fn execute_chain(
                                 leaf_entry.sidecar_cid.as_ref(),
                                 false,
                             )
-                            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                            .map_err(|e| QueryError::from_io("leaf open", e))?,
                     );
                 }
 
@@ -3467,7 +3467,7 @@ fn predicate_objects_all_iri(store: &BinaryIndexStore, g_id: GraphId, p_id: u32)
     for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         for entry in &handle.dir().entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
@@ -3685,7 +3685,7 @@ impl<'a> PsotSoIter<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 

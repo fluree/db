@@ -2656,7 +2656,7 @@ pub fn build_where_operators_seeded_with_needed(
             // Spatial search is unsupported on wasm32 (s2 stack is native-only).
             #[cfg(target_arch = "wasm32")]
             Pattern::S2Search(_) => {
-                return Err(crate::error::QueryError::Internal(
+                return Err(crate::error::QueryError::UnsupportedFeature(
                     "spatial (S2) search is unsupported on wasm32".into(),
                 ));
             }
