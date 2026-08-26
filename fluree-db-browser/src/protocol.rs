@@ -9,10 +9,12 @@
 use crate::gauge::WriteBehindPermit;
 use bytes::Bytes;
 use fluree_db_core::ContentId;
-use fluree_db_nameservice_sync::{TransportError, TransportRequest, TransportResponse};
+use fluree_db_nameservice_sync::{
+    SseConnectError, TransportError, TransportRequest, TransportResponse,
+};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// One unit of work for the driver.
 #[derive(Debug)]
@@ -42,6 +44,20 @@ pub enum IoJob {
         key: ContentId,
         bytes: Arc<[u8]>,
         permit: Option<WriteBehindPermit>,
+    },
+    /// Open a fetch-streamed SSE connection. Streaming deliberately does
+    /// NOT go through the `HttpTransport` seam (whose contract is
+    /// full-body buffering): the JS `ReadableStream` stays inside the
+    /// driver, which forwards raw body chunks over `chunks`. `ready`
+    /// resolves once response headers arrive (`Err` classifies the
+    /// failure); the chunk sender dropping means clean stream end, a
+    /// `chunks` `Err` item means a mid-stream failure, and the receiver
+    /// dropping tells the driver to cancel the stream and abort the fetch.
+    SseOpen {
+        url: String,
+        headers: Vec<(&'static str, String)>,
+        ready: oneshot::Sender<Result<(), SseConnectError>>,
+        chunks: mpsc::UnboundedSender<Result<Bytes, String>>,
     },
     /// Reply after `duration`. The engine side has no timer of its own —
     /// JS owns the clock — so bounded waits (deferred-insert deadlines)

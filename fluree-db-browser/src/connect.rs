@@ -10,15 +10,27 @@
 use crate::bridge::{IoHandle, WasmFetchTransport};
 use crate::cas::BrowserCasStorage;
 use crate::config::BrowserIoConfig;
+use crate::heads::{
+    events_url, ChannelSseSource, DriverSleeper, HeadChange, HeadRegistry, HeadTracker,
+    PeerHeadSink,
+};
 use fluree_db_api::{Fluree, FlureeBuilder, NameServiceMode};
-use fluree_db_nameservice_sync::{ProxyNameService, ProxyReadMode, ProxyStorage};
+use fluree_db_nameservice_sync::{
+    run_head_stream, HeadStreamConfig, ProxyNameService, ProxyReadMode, ProxyStorage,
+};
+use futures::future::BoxFuture;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 /// A connected browser peer: the engine plus handles to its I/O layer.
 pub struct BrowserPeer {
     fluree: Fluree,
     cas: BrowserCasStorage,
     io: IoHandle,
+    api_base: String,
+    token: String,
+    config: BrowserIoConfig,
+    heads: Arc<HeadRegistry>,
 }
 
 impl std::fmt::Debug for BrowserPeer {
@@ -58,6 +70,55 @@ impl BrowserPeer {
     pub fn into_fluree(self) -> Fluree {
         self.fluree
     }
+
+    /// Register a callback for ledger head changes seen by head tracking.
+    ///
+    /// Callbacks run on the pump's task: keep them cheap and non-blocking
+    /// (a JS-facing shell bridges to its own dispatch rather than calling
+    /// into JS from here — the callback must be `Send + Sync`).
+    pub fn on_head_change(&self, callback: impl Fn(&HeadChange) + Send + Sync + 'static) {
+        self.heads.add(Box::new(callback));
+    }
+
+    /// Build the head-tracking pump for `ledgers` (empty = everything the
+    /// token may see). Returns the tracker and the pump future — the
+    /// caller spawns it ([`start_head_tracking`](Self::start_head_tracking)
+    /// does so on the browser event loop; native tests use `tokio::spawn`).
+    ///
+    /// Head changes refresh the cached ledger between queries (the same
+    /// `LedgerManager::notify` path the native peer uses — an in-flight
+    /// query keeps its frozen view; the next `db()` sees the new head) and
+    /// fan out to [`on_head_change`](Self::on_head_change) callbacks.
+    pub fn head_stream(&self, ledgers: &[String]) -> (HeadTracker, BoxFuture<'static, ()>) {
+        let source = ChannelSseSource::new(
+            self.io.clone(),
+            events_url(&self.api_base, ledgers),
+            Some(self.token.clone()),
+        );
+        let sink = PeerHeadSink {
+            fluree: self.fluree.clone(),
+            registry: Arc::clone(&self.heads),
+        };
+        let sleeper = DriverSleeper::new(self.io.clone());
+        let stream_config = HeadStreamConfig {
+            reconnect_initial: self.config.reconnect_initial,
+            reconnect_max: self.config.reconnect_max,
+            reconnect_multiplier: 2.0,
+        };
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let future = Box::pin(async move {
+            run_head_stream(&source, &sink, &sleeper, stream_config, stop_rx).await;
+        });
+        (HeadTracker::new(stop_tx), future)
+    }
+
+    /// Start head tracking on the browser event loop.
+    #[cfg(target_arch = "wasm32")]
+    pub fn start_head_tracking(&self, ledgers: &[String]) -> HeadTracker {
+        let (tracker, future) = self.head_stream(ledgers);
+        wasm_bindgen_futures::spawn_local(future);
+        tracker
+    }
 }
 
 /// Assemble a peer over an existing driver handle.
@@ -87,7 +148,11 @@ pub fn build_peer(
         ProxyReadMode::Raw,
         block_transport,
     );
-    let nameservice = ProxyNameService::from_api_base_with_transport(api_base, token, ns_transport);
+    let nameservice = ProxyNameService::from_api_base_with_transport(
+        api_base.clone(),
+        token.clone(),
+        ns_transport,
+    );
     let cas = BrowserCasStorage::new(proxy, io.clone(), config);
 
     let fluree = FlureeBuilder::memory().build_with(
@@ -95,7 +160,15 @@ pub fn build_peer(
         NameServiceMode::ReadOnly(Arc::new(nameservice)),
     );
 
-    BrowserPeer { fluree, cas, io }
+    BrowserPeer {
+        fluree,
+        cas,
+        io,
+        api_base: api_base.trim_end_matches('/').to_string(),
+        token,
+        config: config.clone(),
+        heads: Arc::new(HeadRegistry::default()),
+    }
 }
 
 /// Start the browser driver and assemble a peer over it.
@@ -158,6 +231,74 @@ mod tests {
             assert_eq!(headers, &vec![("authorization", "Bearer tok".to_string())]);
         }
 
+        peer.shutdown();
+        driver.await.unwrap();
+    }
+
+    /// End-to-end head tracking against the mock driver: the pump opens the
+    /// events URL with the right subscription and headers, a ledger event
+    /// reaches the registered callback (and the notify path — the ledger is
+    /// not cached, so notify is a NotLoaded no-op), and the tracker stops
+    /// the pump.
+    #[tokio::test]
+    async fn head_tracking_dispatches_callbacks_and_stops() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let frame = "event: ns-record\ndata: {\"action\":\"ns-record\",\"kind\":\"ledger\",\"resource_id\":\"books:main\",\"record\":{\"ledger_id\":\"books:main\",\"branch\":\"main\",\"commit_head_id\":null,\"commit_t\":5,\"index_head_id\":null,\"index_t\":2,\"retracted\":false},\"emitted_at\":\"now\"}\n\n";
+        state
+            .lock()
+            .unwrap()
+            .sse_script
+            .push_back(vec![frame.as_bytes().to_vec()]);
+        let (io, rx) = IoHandle::channel();
+        let driver = spawn_mock_driver(rx, Arc::clone(&state));
+        let config = BrowserIoConfig {
+            reconnect_initial: Duration::from_millis(5),
+            reconnect_max: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let peer = build_peer(io, API_BASE, "tok", &config);
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        {
+            let received = Arc::clone(&received);
+            let arrived = Arc::clone(&arrived);
+            peer.on_head_change(move |change| {
+                received.lock().unwrap().push(change.clone());
+                arrived.notify_one();
+            });
+        }
+
+        let (tracker, future) = peer.head_stream(&["books:main".to_string()]);
+        let pump = tokio::spawn(future);
+
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("head change must arrive");
+        {
+            let received = received.lock().unwrap();
+            assert_eq!(
+                received[0],
+                crate::heads::HeadChange {
+                    ledger_id: "books:main".to_string(),
+                    commit_t: 5,
+                    index_t: 2,
+                }
+            );
+        }
+        {
+            let s = state.lock().unwrap();
+            let (url, headers) = &s.sse_log[0];
+            assert_eq!(url, &format!("{API_BASE}/events?ledger=books%3Amain"));
+            assert!(headers.contains(&("accept", "text/event-stream".to_string())));
+            assert!(headers.contains(&("authorization", "Bearer tok".to_string())));
+        }
+
+        tracker.stop();
+        tokio::time::timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump must stop")
+            .unwrap();
         peer.shutdown();
         driver.await.unwrap();
     }

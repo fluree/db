@@ -22,6 +22,7 @@ futures = { workspace = true }
 http = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+urlencoding = { workspace = true }
 # Channels and the fetch-width semaphore only; no runtime. tokio's sync
 # primitives are executor-agnostic and build for wasm32.
 tokio = { version = "1", default-features = false, features = ["sync"] }
@@ -56,6 +57,8 @@ web-sys = { version = "0.3", features = [
     "IdbTransaction",
     "IdbTransactionMode",
     "IdbVersionChangeEvent",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
     "Request",
     "RequestCredentials",
     "RequestInit",

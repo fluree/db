@@ -29,6 +29,11 @@ pub struct BrowserIoConfig {
     /// finishing, bytes removed) before failing with the typed error. The
     /// safety net against waiting on one's own query guard.
     pub budget_wait: Duration,
+    /// First SSE head-tracking reconnect delay (grows ×2 with ±25% jitter,
+    /// resetting on a clean stream end — the native peer's policy).
+    pub reconnect_initial: Duration,
+    /// Reconnect delay ceiling.
+    pub reconnect_max: Duration,
     /// IndexedDB persistence settings.
     pub cache: CacheConfig,
 }
@@ -42,6 +47,8 @@ impl Default for BrowserIoConfig {
             residency_budget_bytes: 256 * 1024 * 1024,
             write_behind_budget_bytes: 64 * 1024 * 1024,
             budget_wait: Duration::from_secs(10),
+            reconnect_initial: Duration::from_secs(1),
+            reconnect_max: Duration::from_secs(30),
             cache: CacheConfig::default(),
         }
     }

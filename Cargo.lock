@@ -2597,6 +2597,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "urlencoding",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
