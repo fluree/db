@@ -1432,3 +1432,376 @@ async fn datalog_rule_all_unbound_leading_pattern_still_derives_correctly() {
         "reordered rule with all-unbound leading pattern must still derive, got {results:?}"
     );
 }
+
+// =============================================================================
+// IRI comparison in rule FILTERs (issue #1556)
+//
+// A filter operand that names an IRI must compare against a bound IRI as an
+// IRI. Before the fix all three sites disagreed — the operand parsed as the
+// *string* `"ex:ssn"`, a bound Sid resolved to its bare local name `"ssn"`,
+// and `compare_values` string-compared the two — so `=` was always false and
+// `!=` was always true. The `!=` direction is the dangerous one: an exclusion
+// filter silently excluded nothing and the rule derived the very fact it was
+// written to withhold.
+// =============================================================================
+
+/// The headline of #1556: a copy-properties rule that excludes a sensitive
+/// predicate with `(!= ?prop ex:ssn)` must actually exclude it.
+///
+/// Before the fix this FAILED OPEN — `ex:ssn` was copied onto `ex:alice`
+/// anyway, with no error and no warning.
+#[tokio::test]
+async fn datalog_filter_iri_exclusion_actually_excludes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-exclusion");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:copyPropsRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "ex:sameAs": {"@id": "?other"}},
+                            {"@id": "?other", "?prop": "?val"},
+                            ["filter", "(!= ?prop ex:ssn)"]
+                        ],
+                        "insert": {"@id": "?s", "?prop": "?val"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "ex:name": "Bob", "ex:ssn": "123-45-6789"}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?prop", "?val"],
+        "where": {"@id": "ex:alice", "?prop": "?val"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!(["ex:name", "Bob"])),
+        "the non-excluded property must still be copied, got {results:?}"
+    );
+    let rendered = serde_json::to_string(&results).unwrap();
+    assert!(
+        !rendered.contains("ssn") && !rendered.contains("123-45-6789"),
+        "(!= ?prop ex:ssn) must EXCLUDE ex:ssn — an exclusion filter that fails \
+         open copies the sensitive value, got {results:?}"
+    );
+}
+
+/// The other direction of #1556: `(= ?p ex:knows)` was always false, so the
+/// rule derived nothing at all.
+#[tokio::test]
+async fn datalog_filter_iri_equality_matches() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-equality");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:connectedRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "?p": {"@id": "?o"}},
+                            ["filter", "(= ?p ex:knows)"]
+                        ],
+                        "insert": {"@id": "?s", "ex:connected": {"@id": "?o"}}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?who",
+        "where": {"@id": "ex:alice", "ex:connected": "?who"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!("ex:bob")),
+        "(= ?p ex:knows) must match a ?p bound to ex:knows, got {results:?}"
+    );
+}
+
+/// IRI comparison must be namespace-aware: `(= ?p ex:knows)` must not match
+/// `foaf:knows`. The only operand that matched before the fix was the bare
+/// local name `knows`, which matched every `knows` in every namespace.
+#[tokio::test]
+async fn datalog_filter_iri_equality_is_namespace_aware() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-namespace");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:connectedRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "?p": {"@id": "?o"}},
+                            ["filter", "(= ?p ex:knows)"]
+                        ],
+                        "insert": {"@id": "?s", "ex:connected": {"@id": "?o"}}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "foaf": "http://xmlns.com/foaf/0.1/"
+        },
+        "@graph": [
+            {"@id": "ex:alice",
+             "ex:knows": {"@id": "ex:bob"},
+             "foaf:knows": {"@id": "ex:carol"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?who",
+        "where": {"@id": "ex:alice", "ex:connected": "?who"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!("ex:bob")),
+        "ex:knows must match, got {results:?}"
+    );
+    assert!(
+        !results.contains(&json!("ex:carol")),
+        "foaf:knows must NOT match the ex:knows filter operand — IRI comparison \
+         must be namespace-aware, not local-name-blind, got {results:?}"
+    );
+}
+
+/// #1556 is not specific to predicate position: `flake_value_to_binding` maps
+/// a `Ref` object to a `Sid` binding too, so an object-position IRI filter was
+/// broken identically — and in the `!=` direction, identically fail-open.
+#[tokio::test]
+async fn datalog_filter_iri_object_position_exclusion() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-object");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:knowsOtherRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "ex:knows": {"@id": "?o"}},
+                            ["filter", "(!= ?o ex:bob)"]
+                        ],
+                        "insert": {"@id": "?s", "ex:knowsOther": {"@id": "?o"}}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:knows": [{"@id": "ex:bob"}, {"@id": "ex:carol"}]}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?who",
+        "where": {"@id": "ex:alice", "ex:knowsOther": "?who"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!("ex:carol")),
+        "the non-excluded object must still derive, got {results:?}"
+    );
+    assert!(
+        !results.contains(&json!("ex:bob")),
+        "(!= ?o ex:bob) must exclude ex:bob in object position, got {results:?}"
+    );
+}
+
+/// Fail CLOSED, not open. A filter operand that is shaped like a compact IRI
+/// but whose prefix the rule's `@context` never defines cannot be compared as
+/// an IRI. Demoting it to a string — what the engine used to do — is exactly
+/// the fail-open exclusion of #1556, so the rule is rejected at parse time
+/// instead: it derives nothing rather than deriving the excluded fact, and the
+/// author gets a named error.
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_filter_unresolvable_iri_operand_fails_closed() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-unresolvable");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                // Sound rule: must keep deriving even though its sibling is rejected.
+                "@id": "ex:grandparentRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+                        "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+                    }
+                }
+            },
+            {
+                // `foo:` is never defined in this rule's @context, so the
+                // operand cannot be resolved to an IRI.
+                "@id": "ex:copyPropsRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "ex:sameAs": {"@id": "?other"}},
+                            {"@id": "?other", "?prop": "?val"},
+                            ["filter", "(!= ?prop foo:ssn)"]
+                        ],
+                        "insert": {"@id": "?s", "?prop": "?val"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}, "ex:parent": {"@id": "ex:dan"}},
+            {"@id": "ex:dan", "ex:parent": {"@id": "ex:erin"}},
+            {"@id": "ex:bob", "ex:name": "Bob", "ex:ssn": "123-45-6789"}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?prop", "?val"],
+        "where": {"@id": "ex:alice", "?prop": "?val"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    let rendered = serde_json::to_string(&results).unwrap();
+    assert!(
+        !rendered.contains("123-45-6789"),
+        "an unresolvable IRI filter operand must fail CLOSED — the rule must not \
+         run and copy the value its filter was meant to exclude, got {results:?}"
+    );
+    assert!(
+        results.contains(&json!(["ex:grandparent", "ex:erin"])),
+        "the sound sibling rule must keep deriving, got {results:?}"
+    );
+
+    let diagnostics: Vec<String> = store
+        .all_events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .flat_map(|e| {
+            let mut parts: Vec<String> = e.fields.values().cloned().collect();
+            parts.push(e.message().to_string());
+            parts
+        })
+        .collect();
+    assert!(
+        diagnostics.iter().any(|d| d.contains("foo:ssn")),
+        "the rejected rule must produce a diagnostic naming the operand, got {diagnostics:?}"
+    );
+}

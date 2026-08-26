@@ -270,7 +270,9 @@ fn parse_where_clause(
                     }
                     JsonValue::Array(filter_arr) if is_filter_expression(filter_arr) => {
                         // Filter expression like ["filter", "(>= ?age 62)"]
-                        if let Some(filter) = parse_filter_expression(filter_arr)? {
+                        if let Some(filter) =
+                            parse_filter_expression(filter_arr, context, snapshot)?
+                        {
                             filters.push(filter);
                         }
                     }
@@ -296,7 +298,16 @@ fn is_filter_expression(arr: &[JsonValue]) -> bool {
 }
 
 /// Parse a filter expression like ["filter", "(>= ?age 62)"]
-fn parse_filter_expression(arr: &[JsonValue]) -> Result<Option<RuleFilter>> {
+///
+/// `context` and `snapshot` are threaded in so an IRI operand can be expanded
+/// and resolved the same way a node-pattern term is (#1556) — without them a
+/// colon-bearing operand was silently demoted to a string and could never
+/// equal the IRI it named.
+fn parse_filter_expression(
+    arr: &[JsonValue],
+    context: &JsonValue,
+    snapshot: &LedgerSnapshot,
+) -> Result<Option<RuleFilter>> {
     if arr.len() != 2 {
         return Ok(None);
     }
@@ -339,38 +350,129 @@ fn parse_filter_expression(arr: &[JsonValue]) -> Result<Option<RuleFilter>> {
     };
 
     // Parse left and right terms
-    let left = parse_filter_term(parts[1])?;
+    let left = parse_filter_term(parts[1], context, snapshot)?;
     let right = if parts.len() > 2 {
-        parse_filter_term(parts[2])?
+        parse_filter_term(parts[2], context, snapshot)?
     } else {
         return Err(QueryError::InvalidQuery(format!(
             "Comparison filter needs two arguments: {expr}"
         )));
     };
 
+    // An IRI has no ordering, so `<`/`<=`/`>`/`>=` against an IRI operand can
+    // never be answered. Reject it here rather than letting it evaluate to
+    // "no" per row — a silently-unsatisfiable ordering filter is the same
+    // class of invisible failure as the fail-open equality of #1556.
+    if !matches!(op, CompareOp::Equal | CompareOp::NotEqual)
+        && (matches!(left, RuleTerm::Sid(_)) || matches!(right, RuleTerm::Sid(_)))
+    {
+        return Err(QueryError::InvalidQuery(format!(
+            "Filter operator `{op_str}` cannot order IRIs: {expr}. \
+             Only `=` and `!=` are defined for IRI operands."
+        )));
+    }
+
     Ok(Some(RuleFilter::Compare { op, left, right }))
 }
 
-/// Parse a single term in a filter expression (variable or literal)
-fn parse_filter_term(s: &str) -> Result<RuleTerm> {
-    if s.starts_with('?') {
-        // Variable
-        Ok(RuleTerm::var(s))
-    } else if let Ok(n) = s.parse::<i64>() {
-        // Integer literal
-        Ok(RuleTerm::Value(RuleValue::Long(n)))
-    } else if let Ok(f) = s.parse::<f64>() {
-        // Float literal
-        Ok(RuleTerm::Value(RuleValue::Double(f)))
-    } else if s == "true" {
-        Ok(RuleTerm::Value(RuleValue::Boolean(true)))
-    } else if s == "false" {
-        Ok(RuleTerm::Value(RuleValue::Boolean(false)))
-    } else {
-        // String literal (strip quotes if present)
-        let s = s.trim_matches('"').trim_matches('\'');
-        Ok(RuleTerm::Value(RuleValue::String(s.to_string())))
+/// The prefix of a token shaped like a compact IRI (`prefix:local`).
+///
+/// Deliberately narrow: the prefix must be a plausible NCName (leading letter
+/// or `_`), which keeps colon-bearing *literals* — `12:30:00`,
+/// `2026-08-25T09:30:00Z` — out of IRI classification, since no NCName starts
+/// with a digit. Returns `None` for anything that is not CURIE-shaped.
+fn curie_prefix(s: &str) -> Option<&str> {
+    let colon = s.find(':')?;
+    let prefix = &s[..colon];
+    let mut chars = prefix.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
     }
+    if chars.any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')) {
+        return None;
+    }
+    Some(prefix)
+}
+
+/// Whether a filter token is wrapped in matching quotes — the explicit
+/// "compare this as a string" escape hatch for a literal that would otherwise
+/// read as a compact IRI.
+fn quoted_literal(s: &str) -> Option<&str> {
+    for q in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+            return Some(&s[1..s.len() - 1]);
+        }
+    }
+    None
+}
+
+/// Parse a single term in a filter expression (variable, literal, or IRI)
+///
+/// Classification order is load-bearing (#1556):
+///
+/// 1. A quoted token is always a string literal — the escape hatch for a
+///    literal that happens to look like a compact IRI.
+/// 2. `?x` is a variable.
+/// 3. Numbers and booleans are literals.
+/// 4. An absolute `http(s)` IRI, or a [`curie_prefix`]-shaped token, is an
+///    IRI: it is expanded through the rule's `@context` and resolved to a Sid,
+///    exactly as [`parse_term`] resolves a node-pattern term.
+/// 5. Anything else is a plain string literal.
+///
+/// Step 4 **fails closed**. When an IRI-shaped operand cannot be resolved to a
+/// namespace registered on this ledger, the rule is rejected instead of
+/// falling back to a string comparison. That fallback is precisely the #1556
+/// defect: `(!= ?prop ex:ssn)` compared the string `"ex:ssn"` against the bare
+/// local name `"ssn"`, was therefore always true, and copied the property the
+/// author wrote the rule to withhold. A rule that refuses to run is recoverable;
+/// a rule that silently derives an excluded fact is not.
+fn parse_filter_term(s: &str, context: &JsonValue, snapshot: &LedgerSnapshot) -> Result<RuleTerm> {
+    if let Some(inner) = quoted_literal(s) {
+        return Ok(RuleTerm::Value(RuleValue::String(inner.to_string())));
+    }
+    if s.starts_with('?') {
+        return Ok(RuleTerm::var(s));
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Ok(RuleTerm::Value(RuleValue::Long(n)));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Ok(RuleTerm::Value(RuleValue::Double(f)));
+    }
+    if s == "true" {
+        return Ok(RuleTerm::Value(RuleValue::Boolean(true)));
+    }
+    if s == "false" {
+        return Ok(RuleTerm::Value(RuleValue::Boolean(false)));
+    }
+
+    let absolute = s.starts_with("http://") || s.starts_with("https://");
+    if absolute || curie_prefix(s).is_some() {
+        let expanded = expand_iri(s, context)?;
+        // `encode_iri_strict` (unlike `encode_iri`) refuses to mint a Sid in
+        // the EMPTY namespace for an unrecognized IRI, which is what makes the
+        // failure loud instead of producing a Sid that can never match. Same
+        // rule the SPARQL rule lowerer applies to an unresolved IRI.
+        return match snapshot.encode_iri_strict(&expanded) {
+            Some(sid) => Ok(RuleTerm::Sid(sid)),
+            None => Err(QueryError::InvalidQuery(format!(
+                "Filter operand `{s}` names an IRI that is not registered on this \
+                 ledger{}. Define the prefix in the rule's @context, use an absolute \
+                 IRI, or quote the operand (\"{s}\") to compare it as a string. \
+                 Refusing to compare it as a string: a filter whose IRI operand can \
+                 never match makes `!=` always true, so an exclusion rule derives the \
+                 fact it was written to exclude.",
+                if expanded == s {
+                    String::new()
+                } else {
+                    format!(" (expanded to `{expanded}`)")
+                }
+            ))),
+        };
+    }
+
+    Ok(RuleTerm::Value(RuleValue::String(s.to_string())))
 }
 
 /// Parse a node-map pattern into triple patterns
@@ -704,20 +806,62 @@ pub async fn execute_rule_matching(
         binding_rows = new_bindings;
     }
 
-    // Apply filters to eliminate non-matching bindings
+    // Apply filters to eliminate non-matching bindings.
+    //
+    // A row survives only on an outright `True`. `Error` — an unresolvable
+    // operand or a pair of values with no defined comparison — drops the row,
+    // never keeps it, so no filter can fail open (#1556).
     if !rule.filters.is_empty() {
+        let mut errored_rows = 0usize;
         binding_rows.retain(|bindings| {
-            rule.filters
+            let mut row_errored = false;
+            let keep = rule
+                .filters
                 .iter()
-                .all(|filter| evaluate_filter(filter, bindings))
+                .all(|filter| match evaluate_filter(filter, bindings) {
+                    FilterOutcome::True => true,
+                    FilterOutcome::False => false,
+                    FilterOutcome::Error => {
+                        row_errored = true;
+                        false
+                    }
+                });
+            errored_rows += row_errored as usize;
+            keep
         });
+        if errored_rows > 0 {
+            // Excluding the row is the safe answer, but silently excluding it
+            // is how a mis-typed filter looks exactly like a rule that
+            // legitimately matched nothing.
+            tracing::warn!(
+                rule = rule.name.as_deref().unwrap_or("<unnamed>"),
+                rule_id = %rule.id,
+                errored_rows,
+                "datalog rule filter could not compare its operands on some binding \
+                 rows; those rows were excluded — check the filter's operand types"
+            );
+        }
     }
 
     Ok(binding_rows)
 }
 
+/// Outcome of evaluating a rule filter against one binding row.
+///
+/// Three-valued on purpose, following SPARQL's treatment of a type error.
+/// Collapsing `Error` into `False` would be wrong under `Not`: `!(error)`
+/// would become `true` and re-admit a row the filter could not actually judge.
+/// Only [`FilterOutcome::True`] keeps a row, so an incomparable filter can
+/// exclude but never include.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterOutcome {
+    True,
+    False,
+    Error,
+}
+
 /// Evaluate a filter expression against a set of bindings
-fn evaluate_filter(filter: &RuleFilter, bindings: &Bindings) -> bool {
+fn evaluate_filter(filter: &RuleFilter, bindings: &Bindings) -> FilterOutcome {
     match filter {
         RuleFilter::Compare { op, left, right } => {
             let left_val = resolve_filter_term(left, bindings);
@@ -725,16 +869,57 @@ fn evaluate_filter(filter: &RuleFilter, bindings: &Bindings) -> bool {
 
             match (left_val, right_val) {
                 (Some(l), Some(r)) => compare_values(&l, &r, *op),
-                _ => false, // If either side can't be resolved, filter fails
+                // An unbound operand cannot be judged either way.
+                _ => FilterOutcome::Error,
             }
         }
-        RuleFilter::And(filters) => filters.iter().all(|f| evaluate_filter(f, bindings)),
-        RuleFilter::Or(filters) => filters.iter().any(|f| evaluate_filter(f, bindings)),
-        RuleFilter::Not(inner) => !evaluate_filter(inner, bindings),
+        // `false && error` is `false`; `true && error` is `error`.
+        RuleFilter::And(filters) => {
+            let mut saw_error = false;
+            for f in filters {
+                match evaluate_filter(f, bindings) {
+                    FilterOutcome::False => return FilterOutcome::False,
+                    FilterOutcome::Error => saw_error = true,
+                    FilterOutcome::True => {}
+                }
+            }
+            if saw_error {
+                FilterOutcome::Error
+            } else {
+                FilterOutcome::True
+            }
+        }
+        // `true || error` is `true`; `false || error` is `error`.
+        RuleFilter::Or(filters) => {
+            let mut saw_error = false;
+            for f in filters {
+                match evaluate_filter(f, bindings) {
+                    FilterOutcome::True => return FilterOutcome::True,
+                    FilterOutcome::Error => saw_error = true,
+                    FilterOutcome::False => {}
+                }
+            }
+            if saw_error {
+                FilterOutcome::Error
+            } else {
+                FilterOutcome::False
+            }
+        }
+        RuleFilter::Not(inner) => match evaluate_filter(inner, bindings) {
+            FilterOutcome::True => FilterOutcome::False,
+            FilterOutcome::False => FilterOutcome::True,
+            // Never `True`: negating something uncomparable must not admit the row.
+            FilterOutcome::Error => FilterOutcome::Error,
+        },
     }
 }
 
 /// Resolve a filter term to a comparable value
+///
+/// An IRI stays an IRI. Rendering a bound Sid as its bare local name — what
+/// this did before #1556 — threw away the namespace, so `ex:knows` and
+/// `foaf:knows` both resolved to `"knows"` and neither could ever equal the
+/// operand `"ex:knows"` that the author actually wrote.
 fn resolve_filter_term(term: &RuleTerm, bindings: &Bindings) -> Option<FlakeValue> {
     match term {
         RuleTerm::Var(name) => bindings.get(name.as_ref()).map(|bv| match bv {
@@ -744,23 +929,35 @@ fn resolve_filter_term(term: &RuleTerm, bindings: &Bindings) -> Option<FlakeValu
             BindingValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
             BindingValue::String(s) => FlakeValue::String(s.clone()),
             BindingValue::Boolean(b) => FlakeValue::Boolean(*b),
-            BindingValue::Sid(sid) => FlakeValue::String(sid.name.to_string()),
+            BindingValue::Sid(sid) => FlakeValue::Ref(sid.clone()),
         }),
         RuleTerm::Value(val) => Some(match val {
             RuleValue::Long(n) => FlakeValue::Long(*n),
             RuleValue::Double(d) => FlakeValue::Double(*d),
             RuleValue::String(s) => FlakeValue::String(s.clone()),
             RuleValue::Boolean(b) => FlakeValue::Boolean(*b),
-            RuleValue::Ref(sid) => FlakeValue::String(sid.name.to_string()),
+            RuleValue::Ref(sid) => FlakeValue::Ref(sid.clone()),
         }),
-        RuleTerm::Sid(sid) => Some(FlakeValue::String(sid.name.to_string())),
+        RuleTerm::Sid(sid) => Some(FlakeValue::Ref(sid.clone())),
     }
 }
 
-/// Compare two filter values using the given operator. Only the
-/// Long/Double/String/Boolean variants of FlakeValue are inspected; other
-/// variants fall through to "incompatible".
-fn compare_values(left: &FlakeValue, right: &FlakeValue, op: CompareOp) -> bool {
+/// Compare two filter values using the given operator.
+///
+/// Numeric, IRI (`Ref`), string and boolean pairs are comparable; every other
+/// pairing is [`FilterOutcome::Error`], which excludes the row. Note what is
+/// deliberately absent: a `Ref`-versus-`String` pairing does NOT stringify the
+/// IRI to make the comparison "work". That coercion is what made `!=` against
+/// an IRI always true (#1556).
+fn compare_values(left: &FlakeValue, right: &FlakeValue, op: CompareOp) -> FilterOutcome {
+    let outcome = |b: bool| {
+        if b {
+            FilterOutcome::True
+        } else {
+            FilterOutcome::False
+        }
+    };
+
     // Try numeric comparison first: exact across all numeric representations
     // (Long/Double/BigInt/Decimal), with BigDecimal promotion where an f64
     // cast would lose precision.
@@ -771,39 +968,50 @@ fn compare_values(left: &FlakeValue, right: &FlakeValue, op: CompareOp) -> bool 
     };
 
     if let Some(cmp) = numeric_result {
-        return match op {
+        return outcome(match op {
             CompareOp::Equal => cmp == std::cmp::Ordering::Equal,
             CompareOp::NotEqual => cmp != std::cmp::Ordering::Equal,
             CompareOp::LessThan => cmp == std::cmp::Ordering::Less,
             CompareOp::LessThanOrEqual => cmp != std::cmp::Ordering::Greater,
             CompareOp::GreaterThan => cmp == std::cmp::Ordering::Greater,
             CompareOp::GreaterThanOrEqual => cmp != std::cmp::Ordering::Less,
-        };
+        });
     }
 
     // Fall back to string comparison
     let (left_str, right_str) = match (left, right) {
         (FlakeValue::String(l), FlakeValue::String(r)) => (l.as_str(), r.as_str()),
+        // IRI identity: Sid equality, namespace included. Ordering is
+        // undefined for IRIs — the parser rejects an ordering operator against
+        // a constant IRI, and a variable that turns out to be IRI-bound at run
+        // time lands here.
+        (FlakeValue::Ref(l), FlakeValue::Ref(r)) => {
+            return match op {
+                CompareOp::Equal => outcome(l == r),
+                CompareOp::NotEqual => outcome(l != r),
+                _ => FilterOutcome::Error,
+            };
+        }
         (FlakeValue::Boolean(l), FlakeValue::Boolean(r)) => {
             // Boolean comparison
             return match op {
-                CompareOp::Equal => l == r,
-                CompareOp::NotEqual => l != r,
-                _ => false, // Other comparisons don't make sense for booleans
+                CompareOp::Equal => outcome(l == r),
+                CompareOp::NotEqual => outcome(l != r),
+                _ => FilterOutcome::Error, // Other comparisons don't make sense for booleans
             };
         }
-        _ => return false, // Incompatible types
+        _ => return FilterOutcome::Error, // Incompatible types
     };
 
     let cmp = left_str.cmp(right_str);
-    match op {
+    outcome(match op {
         CompareOp::Equal => cmp == std::cmp::Ordering::Equal,
         CompareOp::NotEqual => cmp != std::cmp::Ordering::Equal,
         CompareOp::LessThan => cmp == std::cmp::Ordering::Less,
         CompareOp::LessThanOrEqual => cmp != std::cmp::Ordering::Greater,
         CompareOp::GreaterThan => cmp == std::cmp::Ordering::Greater,
         CompareOp::GreaterThanOrEqual => cmp != std::cmp::Ordering::Less,
-    }
+    })
 }
 
 /// Match a single triple pattern against the database
@@ -1545,5 +1753,172 @@ mod tests {
             &flake_value_to_binding(&dec("19.99")),
             &BindingValue::Double(19.99)
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // IRI comparison in filters (#1556)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn curie_prefix_rejects_colon_bearing_literals() {
+        // Real CURIEs.
+        assert_eq!(curie_prefix("ex:ssn"), Some("ex"));
+        assert_eq!(curie_prefix("foaf:knows"), Some("foaf"));
+        assert_eq!(curie_prefix("_x:y"), Some("_x"));
+        assert_eq!(curie_prefix("dc-terms:title"), Some("dc-terms"));
+
+        // Literals that merely contain a colon must NOT be read as IRIs — no
+        // NCName may start with a digit, which is what keeps times and
+        // timestamps out of IRI classification.
+        assert_eq!(curie_prefix("12:30:00"), None);
+        assert_eq!(curie_prefix("2026-08-25T09:30:00Z"), None);
+        assert_eq!(curie_prefix("no-colon-here"), None);
+        assert_eq!(curie_prefix("has space:x"), None);
+    }
+
+    #[test]
+    fn quoted_operand_is_the_string_escape_hatch() {
+        assert_eq!(quoted_literal("\"ex:ssn\""), Some("ex:ssn"));
+        assert_eq!(quoted_literal("'ex:ssn'"), Some("ex:ssn"));
+        assert_eq!(quoted_literal("ex:ssn"), None);
+        assert_eq!(quoted_literal("\"\""), Some(""));
+    }
+
+    fn sid(ns: u16, name: &str) -> Sid {
+        Sid::new(ns, name)
+    }
+
+    #[test]
+    fn iri_equality_compares_sids_not_local_names() {
+        // The #1556 defect in miniature: `ex:knows` and `foaf:knows` share a
+        // local name. Comparing local names conflated them; comparing Sids
+        // does not.
+        let ex_knows = FlakeValue::Ref(sid(100, "knows"));
+        let foaf_knows = FlakeValue::Ref(sid(200, "knows"));
+
+        assert_eq!(
+            compare_values(&ex_knows, &ex_knows.clone(), CompareOp::Equal),
+            FilterOutcome::True
+        );
+        assert_eq!(
+            compare_values(&ex_knows, &foaf_knows, CompareOp::Equal),
+            FilterOutcome::False,
+            "same local name in different namespaces must not compare equal"
+        );
+        assert_eq!(
+            compare_values(&ex_knows, &foaf_knows, CompareOp::NotEqual),
+            FilterOutcome::True
+        );
+    }
+
+    #[test]
+    fn iri_ordering_is_an_error_not_a_silent_false() {
+        let a = FlakeValue::Ref(sid(100, "a"));
+        let b = FlakeValue::Ref(sid(100, "b"));
+        for op in [
+            CompareOp::LessThan,
+            CompareOp::LessThanOrEqual,
+            CompareOp::GreaterThan,
+            CompareOp::GreaterThanOrEqual,
+        ] {
+            assert_eq!(compare_values(&a, &b, op), FilterOutcome::Error);
+        }
+    }
+
+    #[test]
+    fn incomparable_operands_never_fail_open() {
+        // The whole point of #1556: an inequality the engine cannot actually
+        // evaluate must not answer "true" and let the row through. An IRI
+        // against a string is exactly the pairing the old code stringified.
+        let iri = FlakeValue::Ref(sid(100, "ssn"));
+        let text = FlakeValue::String("ex:ssn".to_string());
+
+        for op in [
+            CompareOp::Equal,
+            CompareOp::NotEqual,
+            CompareOp::LessThan,
+            CompareOp::GreaterThan,
+        ] {
+            assert_ne!(
+                compare_values(&iri, &text, op),
+                FilterOutcome::True,
+                "IRI vs string must never evaluate true for {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn negating_an_uncomparable_filter_does_not_admit_the_row() {
+        // `Not` is reachable from SPARQL rules (`FILTER(!(...))`). If Error
+        // collapsed to False, `!Error` would become True and re-admit a row
+        // the engine could not judge — a fail-open path straight back in.
+        let bindings = Bindings::new();
+        let uncomparable = RuleFilter::Compare {
+            op: CompareOp::Equal,
+            left: RuleTerm::var("?never_bound"),
+            right: RuleTerm::Value(RuleValue::Long(1)),
+        };
+
+        assert_eq!(
+            evaluate_filter(&uncomparable, &bindings),
+            FilterOutcome::Error
+        );
+        assert_eq!(
+            evaluate_filter(&RuleFilter::Not(Box::new(uncomparable)), &bindings),
+            FilterOutcome::Error,
+            "negating an error must stay an error, never become True"
+        );
+    }
+
+    #[test]
+    fn and_or_follow_sparql_error_propagation() {
+        let bindings = Bindings::new();
+        let error = || RuleFilter::Compare {
+            op: CompareOp::Equal,
+            left: RuleTerm::var("?never_bound"),
+            right: RuleTerm::Value(RuleValue::Long(1)),
+        };
+        let truth = || RuleFilter::Compare {
+            op: CompareOp::Equal,
+            left: RuleTerm::Value(RuleValue::Long(1)),
+            right: RuleTerm::Value(RuleValue::Long(1)),
+        };
+        let falsehood = || RuleFilter::Compare {
+            op: CompareOp::Equal,
+            left: RuleTerm::Value(RuleValue::Long(1)),
+            right: RuleTerm::Value(RuleValue::Long(2)),
+        };
+
+        // false && error => false; true && error => error
+        assert_eq!(
+            evaluate_filter(&RuleFilter::And(vec![falsehood(), error()]), &bindings),
+            FilterOutcome::False
+        );
+        assert_eq!(
+            evaluate_filter(&RuleFilter::And(vec![truth(), error()]), &bindings),
+            FilterOutcome::Error
+        );
+        // true || error => true; false || error => error
+        assert_eq!(
+            evaluate_filter(&RuleFilter::Or(vec![truth(), error()]), &bindings),
+            FilterOutcome::True
+        );
+        assert_eq!(
+            evaluate_filter(&RuleFilter::Or(vec![falsehood(), error()]), &bindings),
+            FilterOutcome::Error
+        );
+    }
+
+    #[test]
+    fn sid_bound_variable_resolves_as_an_iri() {
+        let mut bindings = Bindings::new();
+        bindings.insert(Arc::from("?p"), BindingValue::Sid(sid(100, "knows")));
+
+        let resolved = resolve_filter_term(&RuleTerm::var("?p"), &bindings);
+        assert_eq!(
+            resolved,
+            Some(FlakeValue::Ref(sid(100, "knows"))),
+            "a Sid binding must stay a Ref, not collapse to its local name"
+        );
     }
 }
