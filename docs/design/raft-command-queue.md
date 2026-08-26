@@ -36,7 +36,7 @@ The Raft consensus crate (`fluree-db-consensus/src/raft/`) is structured as a se
 | `WaiterMap`                | `waiter.rs`                                              | Per-process registry of *local interest*. Armed by `request_cid` before proposing, bound to a `queue_id` when this node applies the enqueue. Only local proposals are tracked, so a follower's map stays empty. |
 | `StagedReceiptMap`         | `staged_receipt.rs`                                      | Per-process map carrying typed apply receipts (flake counts, tally, conflict resolution) from worker to transactor on the same node. |
 
-Two of these (`EvictionScheduler`, the background indexer) are gated on leadership: the leader watcher spawns / stops them in response to `current_leader()` changes. `commit_worker::Worker` is deliberately **not**: the worker supervisor runs on every node and owns whichever branches rendezvous-hash to it, so the blob-writing half of a commit is spread across the cluster rather than serialized through the leader. The follower-forward middleware runs everywhere and simply does nothing on the leader.
+Three of these (`EvictionScheduler`, `LivenessMonitor`, the background indexer) are gated on leadership: the leader watcher spawns / stops them in response to `current_leader()` changes. `commit_worker::Worker` is deliberately **not**: the worker supervisor runs on every node and owns whichever branches rendezvous-hash to it, so the blob-writing half of a commit is spread across the cluster rather than serialized through the leader. The follower-forward middleware runs everywhere and simply does nothing on the leader.
 
 ## Submission flow in detail
 

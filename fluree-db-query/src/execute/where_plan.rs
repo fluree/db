@@ -2792,14 +2792,24 @@ pub(crate) fn build_scan_or_join(
             // to amortize it; rows that do not fully ground the pattern keep
             // exact join semantics via a per-row fallback.
             if bounds.is_none() && inline_ops.is_empty() {
-                // The operator's own estimate when it has one (VALUES, subquery
-                // producers); else the planner's running chain estimate, which
-                // is what the hash-join gate below is costed against. Scans and
-                // nested loops report `None`, and reading that as "large" built
-                // a whole-predicate hash set for ~20 driving rows (BSBM Q10).
-                let driving_rows = left
-                    .estimated_rows()
-                    .or_else(|| hash_planner.step_est().map(|e| e.round().max(1.0) as usize));
+                // The planner's running chain estimate — the same number the
+                // hash-join gate below is costed against and EXPLAIN reports as
+                // `driving-est` — with the operator's own estimate as the
+                // fallback for ledgers without statistics.
+                //
+                // Consulting the operator first instead meant the gate rarely
+                // saw the planner at all: `NestedLoopJoinOperator` reports
+                // `left × 10` per hop, so once a VALUES or subquery seeds a
+                // chain, every later probe was weighed against a compounding
+                // heuristic rather than the statistics. Producers are not lost
+                // by preferring `step_est` — `with_left_estimate` folds their
+                // estimate into it. Scans and nested loops over scans report
+                // `None`, and reading that as "large" built a whole-predicate
+                // hash set for ~20 driving rows (BSBM Q10).
+                let driving_rows = hash_planner
+                    .step_est()
+                    .map(|e| e.round().max(1.0) as usize)
+                    .or_else(|| left.estimated_rows());
                 if let Some(key_vars) =
                     membership_join_key_vars(&left_schema, tp, planning, hash_planner, driving_rows)
                 {
@@ -5581,6 +5591,65 @@ mod tests {
         // 55_700 / 10 = 5_570 driving rows: well above the floor.
         let op = bsbm_q10_prefix(10);
         assert_eq!(op.describe().op, "MembershipJoinOperator");
+    }
+
+    /// `VALUES ?a { 30 rows } . ?a :knows ?b . ?b :knows ?a`.
+    ///
+    /// A producer-seeded chain is the case where the operator estimate and the
+    /// planner disagree: `NestedLoopJoinOperator` reports `left × 10`, so the
+    /// second probe's left says 300 while the statistics say the same 30 rows
+    /// VALUES supplied. Reading the operator first admitted the lane on the
+    /// ×10 heuristic and drained the whole 100k `:knows` extension for 30
+    /// driving rows — under the floor, and not what EXPLAIN's `driving-est`
+    /// reported for the same step.
+    #[test]
+    fn membership_lane_prefers_planner_estimate_over_nested_loop_fanout() {
+        use crate::seed::EmptyOperator;
+        use crate::values::ValuesOperator;
+        use crate::Binding;
+
+        let stats = knows_stats(100_000);
+        let (a, b) = (VarId(0), VarId(1));
+        let rows: Vec<Vec<Binding>> = (0..30)
+            .map(|n| vec![Binding::sid(Sid::new(101, format!("p{n}").as_str()))])
+            .collect();
+        let seed: BoxedOperator = Box::new(ValuesOperator::new(
+            Box::new(EmptyOperator::new()),
+            vec![a],
+            rows,
+        ));
+        assert_eq!(seed.estimated_rows(), Some(30), "VALUES reports its rows");
+
+        let first = make_pattern(a, "knows", b);
+        let second = make_pattern(b, "knows", a);
+        let bounds = HashMap::new();
+        let planning = PlanningContext::current();
+        let mut planner = HashJoinPlanner::new(Some(&stats)).with_left_estimate(Some(30));
+        let mut bound: HashSet<VarId> = HashSet::new();
+        bound.extend(seed.schema().iter().copied());
+
+        let mut op = seed;
+        for tp in [&first, &second] {
+            planner.before_step(tp, &bound);
+            op = build_scan_or_join(
+                Some(op),
+                tp,
+                &bounds,
+                Vec::new(),
+                None,
+                EmitMask::ALL,
+                &[],
+                &planning,
+                &planner,
+            );
+            bound.extend(op.schema().iter().copied());
+        }
+
+        assert_eq!(
+            op.describe().op,
+            "NestedLoopJoinOperator",
+            "30 planner-estimated driving rows must not drain the :knows extension"
+        );
     }
 
     /// The build ceiling still applies independently of the driving side.

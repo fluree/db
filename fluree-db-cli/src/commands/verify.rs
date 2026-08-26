@@ -1,7 +1,7 @@
 use crate::context;
-use crate::error::{CliError, CliResult};
+use crate::error::{CliError, CliResult, EXIT_VERIFY_CHAIN, EXIT_VERIFY_PROVENANCE};
 use fluree_db_api::server_defaults::FlureeDir;
-use fluree_db_api::VerifyProblem;
+use fluree_db_api::{VerifyProblem, VerifySeverity};
 
 pub async fn run(
     ledger: Option<&str>,
@@ -21,8 +21,16 @@ pub async fn run(
         }
     })?;
 
+    let severity = report.severity();
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        // `severity` is derived from `problems`, so it is attached here
+        // rather than stored on the report — one source of truth.
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("severity".to_string(), serde_json::to_value(severity)?);
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("Ledger:   {}", report.ledger_id);
         println!(
@@ -63,13 +71,26 @@ pub async fn run(
         }
     }
 
-    if report.is_healthy() {
-        Ok(())
-    } else {
-        Err(CliError::Config(format!(
-            "ledger '{alias}' has {} integrity problem(s)",
-            report.problems.len()
-        )))
+    // Typed exits so a caller can gate on what actually broke: a
+    // provenance gap still clones (this is the case the tolerant read
+    // paths were built for), a broken chain does not. Exit 1 stays
+    // reserved for "verify could not run".
+    match severity {
+        VerifySeverity::Healthy => Ok(()),
+        VerifySeverity::Provenance => {
+            if !json {
+                eprintln!(
+                    "ledger '{alias}': provenance gaps only — state and replication are intact"
+                );
+            }
+            Err(CliError::ExitCode(EXIT_VERIFY_PROVENANCE))
+        }
+        VerifySeverity::Chain => {
+            if !json {
+                eprintln!("ledger '{alias}': commit chain or index root is broken");
+            }
+            Err(CliError::ExitCode(EXIT_VERIFY_CHAIN))
+        }
     }
 }
 
@@ -81,6 +102,9 @@ fn describe(p: &VerifyProblem) -> String {
             referenced_by_t,
         } => format!(
             "missing commit {commit_id} (parent of t={referenced_by_t} {referenced_by}); chain is broken below this point"
+        ),
+        VerifyProblem::MissingHead { commit_id } => format!(
+            "missing head commit {commit_id}; the nameservice points at a commit that is not in storage"
         ),
         VerifyProblem::UnreadableCommit { commit_id, error } => {
             format!("unreadable commit {commit_id}: {error}")

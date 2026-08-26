@@ -189,7 +189,7 @@ impl<'de> Deserialize<'de> for Base64Bytes {
 }
 
 /// Request body for pushing commits to a transactor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PushCommitsRequest {
     /// Commit v2 blobs, in order (oldest -> newest).
     pub commits: Vec<Base64Bytes>,
@@ -198,6 +198,18 @@ pub struct PushCommitsRequest {
     /// Map key is a CID string or legacy address string.
     #[serde(default)]
     pub blobs: HashMap<String, Base64Bytes>,
+    /// CIDs the sender knows it cannot supply — a provenance gap it is
+    /// declaring rather than hiding. Mirrors `missing_blobs` on
+    /// [`ExportCommitsResponse`], so the two halves of the replication
+    /// protocol describe a gap the same way.
+    ///
+    /// Additive on the wire. The receiver currently tolerates *undeclared*
+    /// gaps too (see [`validate_required_blobs`]) so that a sender predating
+    /// this field can still replicate a ledger that has one; declaring is
+    /// what lets a later release tighten that back to a 400 without
+    /// stranding those ledgers.
+    #[serde(default)]
+    pub missing_blobs: Vec<String>,
 }
 
 /// Response body for a successful push.
@@ -347,7 +359,8 @@ impl Fluree {
             .map_err(PushError::into_api_error)?;
 
         // 3) Validate referenced blobs are provided (if any) and pre-validate hashes.
-        validate_required_blobs(&decoded, &request.blobs).map_err(PushError::into_api_error)?;
+        validate_required_blobs(&decoded, &request.blobs, &request.missing_blobs)
+            .map_err(PushError::into_api_error)?;
 
         // 4) Validate each commit against evolving server view.
         //
@@ -891,9 +904,16 @@ fn preflight_strict_next_t_and_prev(
 /// (logged): the source may itself have a dangling reference, and refusing
 /// the push would make that ledger impossible to replicate. Blobs that ARE
 /// provided must hash-verify.
+///
+/// A gap the sender listed in `declared_missing` is expected and logged at
+/// debug. An undeclared gap is accepted too — a sender predating
+/// `PushCommitsRequest::missing_blobs` cannot declare one — but warns,
+/// because it is indistinguishable from a client that simply forgot to
+/// attach `blobs`.
 fn validate_required_blobs(
     decoded: &[PushCommitDecoded],
     provided: &HashMap<String, Base64Bytes>,
+    declared_missing: &[String],
 ) -> std::result::Result<(), PushError> {
     let mut required: HashSet<String> = HashSet::new();
     for c in decoded {
@@ -902,13 +922,21 @@ fn validate_required_blobs(
         }
     }
 
+    let declared: HashSet<&str> = declared_missing.iter().map(String::as_str).collect();
     for addr in &required {
-        if !provided.contains_key(addr) {
+        if provided.contains_key(addr) {
+            continue;
+        }
+        if declared.contains(addr.as_str()) {
+            tracing::debug!(
+                txn_cid = %addr,
+                "pushed commit references a txn blob the sender declared missing; accepting commit without it"
+            );
+        } else {
             tracing::warn!(
                 txn_cid = %addr,
-                "pushed commit references a txn blob the client did not provide; accepting commit without it"
+                "pushed commit references a txn blob the client neither provided nor declared missing; accepting commit without it"
             );
-            continue;
         }
     }
 
@@ -2046,6 +2074,7 @@ impl Fluree {
         let request = PushCommitsRequest {
             commits,
             blobs: blobs.clone(),
+            missing_blobs: Vec::new(),
         };
 
         // 3) Decode and validate chain.
@@ -2057,7 +2086,8 @@ impl Fluree {
             .map_err(PushError::into_api_error)?;
 
         // 5) Validate referenced blobs are provided.
-        validate_required_blobs(&decoded, &request.blobs).map_err(PushError::into_api_error)?;
+        validate_required_blobs(&decoded, &request.blobs, &request.missing_blobs)
+            .map_err(PushError::into_api_error)?;
 
         // 6) Write blobs + commit bytes to local CAS.
         let storage = self.backend().admin_storage_cloned().ok_or_else(|| {

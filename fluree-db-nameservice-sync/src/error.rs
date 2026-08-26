@@ -29,6 +29,14 @@ pub enum SyncError {
     #[error("All origins failed for CID {cid}: {details}")]
     FetchFailed { cid: String, details: String },
 
+    /// Every origin answered 404 for this CID — the object is genuinely
+    /// absent upstream, not unreachable. Distinct from [`Self::FetchFailed`]
+    /// so callers that can tolerate a known-absent object (a dangling
+    /// `commit.txn` provenance ref) do not also swallow auth failures,
+    /// 5xx, or network blips.
+    #[error("Object not found on any origin: {0}")]
+    NotFound(String),
+
     /// Bytes returned but hash doesn't verify — always terminal, never retry
     #[error("Integrity verification failed for CID {0}")]
     IntegrityFailed(String),

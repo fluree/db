@@ -35,6 +35,7 @@ use crate::raft::{
     log_adapter::LogAdapter,
     nameservice::{apply_queue_poison_router, apply_staged_commit_router, RaftNameService},
     network::{self as raft_network, HttpRaftNetworkFactory, NetworkConfig},
+    runtime,
     staged_receipt::StagedReceiptMap,
     state_machine_adapter::{NameServiceObserver, SharedState, StateMachineAdapter},
     storage::{fs::FsRaftStorage, StorageError},
@@ -248,25 +249,12 @@ impl RaftIntegration {
 
         let raft_cfg = Arc::new(config.raft_config.validate()?);
 
-        // Liveness invariant: a candidate must outlast its own vote
-        // RPCs before re-electing, or votes land on stale terms and a
-        // failover livelocks (every survivor climbs to the same term
-        // with no leader). openraft's own `validate()` can't see this —
-        // it doesn't know the transport timeout — so check it here, the
-        // one place that holds both configs. Warn rather than reject so
-        // an operator who has deliberately tuned for a fast link isn't
-        // hard-blocked; `default_raft_config` keeps the shipped default
-        // safe.
-        let rpc_timeout_ms = config.network_config.transport.rpc_timeout.as_millis() as u64;
-        if raft_cfg.election_timeout_min <= rpc_timeout_ms {
-            tracing::warn!(
-                election_timeout_min = raft_cfg.election_timeout_min,
-                rpc_timeout_ms,
-                "election_timeout_min <= rpc_timeout: candidates may re-elect before their vote \
-                 RPCs resolve, risking election livelock on leader failover; set \
-                 election_timeout_min comfortably above rpc_timeout"
-            );
-        }
+        // Liveness invariant: a candidate must outlast its own vote RPCs
+        // before re-electing, or a failover livelocks. Checked here
+        // because this is the one place holding both configs — an
+        // override of *either* that breaks the invariant is caught even
+        // when `runtime::default_raft_config` wasn't used to build it.
+        runtime::check_election_timeout(&raft_cfg, &config.network_config.transport);
 
         let http_client = raft_network::build_client(&config.network_config.http_client)?;
         let network_config = config.network_config.clone();
@@ -389,42 +377,10 @@ impl RaftBootstrapConfig {
         Self {
             node_id,
             storage_path: storage_path.into(),
-            raft_config: default_raft_config(&network_config),
+            raft_config: runtime::default_raft_config(&network_config.transport),
             network_config,
             event_bus_capacity: 1024,
         }
-    }
-}
-
-/// Election timeouts derived from [`NetworkConfig`]'s RPC timeouts,
-/// rather than openraft's stock 150–300 ms.
-///
-/// openraft's defaults assume sub-millisecond, always-reachable peers.
-/// Ours don't hold: `rpc_timeout` is 500 ms and a *dead but not yet
-/// evicted* voter costs `connect_timeout` (250 ms) on every vote round.
-/// With the stock 150–300 ms election window, a candidate re-elects —
-/// bumping its term — before its own vote RPCs from the previous round
-/// resolve, so every vote lands on a now-stale term and no quorum ever
-/// forms. On a leader failover the survivors then livelock: all climb
-/// to the same term with no leader and never converge.
-///
-/// The fix is the invariant `election_timeout_min > rpc_timeout`: a
-/// candidate must give the live quorum (which answers in well under a
-/// millisecond on a LAN) time to vote before it abandons the term.
-/// Deriving the window from `rpc_timeout` keeps that invariant intact
-/// if the network defaults are ever retuned. We use 2× `rpc_timeout`
-/// with a 750 ms floor for `min`, and a 2× spread to `max` so timers
-/// desynchronize. Cost is a slightly slower failover (~1–2 s at the
-/// defaults). [`RaftIntegration::bootstrap`] re-checks the invariant
-/// at runtime so an override of *either* config that breaks it is
-/// caught even when this constructor isn't used.
-fn default_raft_config(network: &NetworkConfig) -> RaftConfig {
-    let rpc_ms = network.transport.rpc_timeout.as_millis() as u64;
-    let election_timeout_min = rpc_ms.saturating_mul(2).max(750);
-    RaftConfig {
-        election_timeout_min,
-        election_timeout_max: election_timeout_min.saturating_mul(2),
-        ..RaftConfig::default()
     }
 }
 

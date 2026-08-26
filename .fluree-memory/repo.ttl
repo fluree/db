@@ -2529,6 +2529,23 @@ mem:fact-01kx0h97eybzh5g0bkaw3dr0f3 a mem:Fact ;
     mem:branch "fix/policy-class-with-identity" ;
     mem:createdAt "2026-07-08T09:34:58.014473+00:00"^^xsd:dateTime .
 
+mem:constraint-01m0xcxydkmh6amzdm8a62q7cc a mem:Constraint ;
+    mem:content "Nothing reclaims raw-txn blobs: gc/sweep.rs excludes ContentKind::Txn by design, and after PR #1677 no inline release touches them, so every distinct failed-staging body leaks permanently. A commit-chain-rooted sweep of the `txn/` prefix is UNSAFE as written: the raft queued transactor puts live QueuedRequest envelopes under ContentKind::Txn in the same per-ledger prefix and releases them itself. A future collector needs a candidate list (orphan CIDs recorded at failure time) plus a grace period, not blind enumerate-minus-live." ;
+    mem:tag "content-store" ;
+    mem:tag "gc" ;
+    mem:tag "raft" ;
+    mem:tag "raw-txn" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/src/verify.rs" ;
+    mem:artifactRef "fluree-db-consensus/src/raft/queued_transactor.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/gc/sweep.rs" ;
+    mem:artifactRef "fluree-db-transact/src/raw_txn_upload.rs" ;
+    mem:branch "fix/raw-txn-release-dangling-ref" ;
+    mem:createdAt "2026-08-25T21:23:58.003623+00:00"^^xsd:dateTime ;
+    mem:rationale "The obvious implementation of the deferred orphan-reclaim follow-up would delete in-flight raft queue entries." .
+
 mem:fact-01kqfy6r0w86fcsd9km0707xzg a mem:Fact ;
     mem:content "v3 commit envelope reader at `legacy_v3.rs:305-309` deliberately stubs `graph_delta = HashMap::new()` since v3 never encoded the field. Envelope-only walkers (`first_t_where_graph_registered`) therefore return `None` on any chain that includes v3 commits, regardless of whether the named graph was actually registered. Callers that rely on the result for short-circuiting must either fall through to a full load on `None`, detect v3 envelopes and signal \"inconclusive\", or accept silent correctness regressions on legacy chains." ;
     mem:tag "commit-envelope" ;
