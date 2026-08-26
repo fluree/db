@@ -135,6 +135,15 @@ fluree-bench-support = { path = "../fluree-bench-support" }
 fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+# Residency-mode read arms for the wasm read-path recovery tests
+# (it_residency_retry): dev-only feature unification — production native
+# builds keep the feature off and compile the pre-residency read path.
+fluree-db-query = { path = "../fluree-db-query", features = ["residency"] }
+fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["residency"] }
+
+[[test]]
+name = "it_residency_retry"
+path = "tests/it_residency_retry.rs"
 
 [[test]]
 name = "grp_graphsource"
