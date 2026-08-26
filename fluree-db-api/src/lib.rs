@@ -36,6 +36,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admin;
 pub mod block_fetch;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
 mod commit_data;
 pub mod commit_transfer;
@@ -243,6 +244,7 @@ pub use fluree_db_iceberg::mor_guard::ALLOW_MOR_DELETES_ENV;
 #[cfg(feature = "iceberg")]
 pub use fluree_db_iceberg::DeleteConvention;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
 };
@@ -4583,6 +4585,11 @@ impl Fluree {
     /// Returns JoinHandle for graceful shutdown. Call `.abort()` on shutdown.
     /// Should be called once after building Fluree.
     /// Returns None if caching is not enabled.
+    ///
+    /// Native-only: spawns onto the ambient tokio runtime, which browser
+    /// builds do not have. A wasm embedder that wants idle eviction drives
+    /// it from its own scheduler instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn spawn_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
         self.ledger_manager
             .as_ref()

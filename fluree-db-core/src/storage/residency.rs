@@ -155,6 +155,17 @@ impl std::error::Error for NeedFetch {}
 /// never needs failure bookkeeping of its own.
 ///
 /// Interior-mutability + `Send + Sync`: safe to share behind the store `Arc`.
+///
+/// ## Scope: one draining query per store at a time
+///
+/// The register is store-global, and `drain` hands EVERYTHING recorded to
+/// the caller. Two queries concurrently missing on the same store would
+/// steal each other's wants (one drains the other's recordings), turning a
+/// recoverable miss into a spurious hard error for the loser. The current
+/// consumers respect this: native tests run one query per store, and the
+/// browser's advance-cycle serializes re-runs under a single cycle guard.
+/// A future multi-query driver must either serialize its drains or scope
+/// wants per query before relying on concurrent recovery.
 #[derive(Debug, Default)]
 pub struct MissRegister {
     inner: Mutex<RegisterInner>,

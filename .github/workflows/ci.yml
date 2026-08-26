@@ -253,7 +253,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+      # -D warnings: `cargo check` exits 0 on warnings, so without this the
+      # branch's zero-warning wasm build could rot silently (registry deps
+      # stay cap-linted, so only workspace code is gated).
+      RUSTFLAGS: -D warnings --cfg getrandom_backend="wasm_js"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0

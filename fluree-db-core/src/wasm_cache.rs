@@ -1,5 +1,10 @@
 //! Minimal `moka::sync::Cache` stand-in for wasm32.
 //!
+//! Boundary: this stand-in implements only the TTL-free subset the engine's
+//! wasm-reachable caches use. A future wasm consumer needing TTL/TTI (e.g.
+//! the iceberg layer's expiring caches, which do not compile for wasm today)
+//! must extend it or keep that consumer native-only.
+//!
 //! moka 0.12 constructs its eviction clock from `std::time::Instant::now()`
 //! the moment a cache or builder is created (`Clock::default()` in
 //! `moka::sync::CacheBuilder`), which aborts on wasm32-unknown-unknown. None

@@ -81,8 +81,11 @@ web-time = "1"
 # Backing store for `wasm_cache` (the moka stand-in).
 lru = { workspace = true }
 # Central JS-randomness unification for the whole wasm graph (feature
-# unification applies per-target): rand/rand_core need getrandom/js,
-# moka's uuid needs uuid/js. Declared once here since core is in every graph.
+# unification applies per-target): rand/rand_core need getrandom/js; the
+# uuid consumers on wasm are the query layer's UUID()/STRUUID() functions
+# and fluree-db-policy (moka, whose uuid dep motivated the first cut of
+# this comment, is native-only). Declared once here since core is in
+# every wasm graph.
 getrandom = { version = "0.2", features = ["js"] }
 getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 uuid = { version = "1", default-features = false, features = ["js"] }
