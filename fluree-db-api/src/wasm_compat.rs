@@ -1,4 +1,7 @@
-//! Target-compat shims for the wasm32 build (spike).
+//! Target-compat shims for the wasm32 build.
+//!
+//! On native this module is the canonical import path for the re-exported
+//! indexer types — not a spike artifact; removing it breaks native imports.
 //!
 //! On native these re-export the real indexer types; on wasm32 they provide
 //! compile-compatible stand-ins. wasm builds run with
