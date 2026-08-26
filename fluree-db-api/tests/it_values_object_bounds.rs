@@ -389,3 +389,63 @@ async fn property_join_probe_lanes_stay_in_a_sane_fuel_envelope() {
         "hub star fuel ({fuel}) blew past the per-row schedule"
     );
 }
+
+/// A nested-loop join reads leaflets itself, through `scan_matches` and the
+/// object-driven flush, so its probe rows cross none of the scan-operator
+/// charging surfaces. Before those lanes were charged, a star whose subject
+/// was seeded by `VALUES` expanded its whole probe side for free: 400
+/// subjects returned 400 rows and reported 1.001 fuel — the query floor and
+/// nothing else, invisible to `max_fuel`.
+///
+/// Pins the charge by proportionality rather than a magic total: the same
+/// query shape over 4 seeded subjects and over 400 must differ by roughly
+/// the row count, which only a per-row charge on that lane can supply.
+#[tokio::test]
+async fn nested_loop_join_probe_rows_are_visible_to_fuel() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree).await;
+
+    let fuel_of = |n: usize| {
+        let fluree = &fluree;
+        async move {
+            let subjects = (0..n)
+                .map(|i| format!("<http://example.org/edge/{i}>"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let result = fluree
+                .query_from()
+                .sparql(&format!(
+                    "PREFIX ns: <http://example.org/ns#>\n\
+                     SELECT ?b FROM <{LEDGER_ID}> WHERE {{\n\
+                       VALUES ?ev {{ {subjects} }}\n\
+                       ?ev ns:entity1 ?a ; ns:entity2 ?b ; ns:snap ?snap }}"
+                ))
+                .track_all()
+                .execute_tracked()
+                .await
+                .expect("query should succeed");
+            assert_eq!(result.status, 200);
+            let rows = result.result["results"]["bindings"]
+                .as_array()
+                .expect("bindings")
+                .len();
+            assert_eq!(rows, n, "every seeded subject must expand");
+            result.fuel.expect("fuel")
+        }
+    };
+
+    let few = fuel_of(4).await;
+    let many = fuel_of(400).await;
+
+    // 400 subjects x 3 predicates = 1200 probe rows at PER_ROW_MICRO_FUEL,
+    // so the gap is ~1.2 fuel. Assert well inside that so the pin survives
+    // unrelated schedule tuning, but far enough above the 4-subject case
+    // that only a per-row charge on this lane can produce it.
+    assert!(
+        many > few + 0.5,
+        "expanding 400 seeded subjects charged {many} fuel vs {few} for 4; \
+         the nested-loop-join probe lanes are uncharged again and the whole \
+         probe side is invisible to max_fuel"
+    );
+}

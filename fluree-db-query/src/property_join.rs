@@ -735,20 +735,6 @@ impl PropertyJoinOperator {
 ///
 /// The fused star lanes drain scans, probes, and SPOT walks whose per-row
 /// work never crosses the fuel-charging surfaces (leaflet touches are far
-/// coarser than rows, and late materialization skips dict touches), so a
-/// CPU-bound star could do seconds of work while reporting floor-level fuel —
-/// invisible to `max_fuel` limits. Charge [`PER_ROW_MICRO_FUEL`] per row
-/// handled, but only at the existing batch/chunk boundaries (next to the
-/// cancellation polls): per-iteration accounting inside the merge loops is
-/// forbidden by the hot-loop purity rule (see CLAUDE.md — a never-taken
-/// branch there measured +5-15% end-to-end).
-///
-/// [`PER_ROW_MICRO_FUEL`]: fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL
-fn charge_scan_rows(ctx: &ExecutionContext<'_>, rows: usize) -> crate::error::Result<()> {
-    ctx.tracker
-        .consume_fuel(rows as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL)?;
-    Ok(())
-}
 
 #[async_trait]
 impl Operator for PropertyJoinOperator {
@@ -946,7 +932,6 @@ impl Operator for PropertyJoinOperator {
                                     probe_ops.as_mut(),
                                 )?;
                                 scan_rows_total += probe_matches.len() as u64;
-                                charge_scan_rows(ctx, probe_matches.len())?;
                                 for probe_match in probe_matches {
                                     self.ingest_probe_match(
                                         ctx,
@@ -1139,7 +1124,6 @@ impl Operator for PropertyJoinOperator {
                                 probe_ops.as_mut(),
                             )?;
                             scan_rows_total += spot_matches.len() as u64;
-                            charge_scan_rows(ctx, spot_matches.len())?;
                             for spot_match in spot_matches {
                                 self.ingest_spot_star_match(
                                     ctx,

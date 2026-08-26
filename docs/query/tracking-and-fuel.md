@@ -81,7 +81,8 @@ Cost ladder (per event):
 | Flake returned from a `db.range` call (e.g. SHACL graph reads, graph crawl) | 0.001 |
 | Row emitted by a binary index scan (per row, charged per batch at the scan boundary) | 0.001 |
 | Row joined through a `VALUES` clause (per input row, charged per batch) | 0.001 |
-| Row returned by a property-join batched subject probe / SPOT star walk | 0.001 |
+| Row returned by a batched subject probe / SPOT star walk (charged in the primitive, so property-join and nested-loop-join callers pay alike) | 0.001 |
+| Row matched by a nested-loop join's own leaflet scan (subject-driven and object-driven lanes) | 0.001 |
 | Overlay/novelty row materialized | 0.001 |
 | History row scanned (base + in-range sidecar rows) | 0.001 |
 | R2RML row emitted (Iceberg/Parquet) | 0.001 |
@@ -108,14 +109,6 @@ What this changes:
 - **Per-flake (`0.001`), subject-resolve, object-decode, and dict-touch (`0.010`) fuel** all scale with the number of selected predicates rather than the subject's total predicate count.
 
 What this does **not** change:
-> **Known gap — the subject-seeded lane is not charged.** A star whose
-> SUBJECT is bound by a `VALUES` clause is seeded rather than joined, and the
-> rows it expands cross none of the charging surfaces above. Measured: a
-> 400-subject `VALUES ?ev { ... } ?ev :p1 ?a ; :p2 ?b ; :snap ?s` returns 400
-> rows and reports 1.001 fuel — floor level, and invisible to `max_fuel`.
-> Charge it at the lane's own batch boundary, the way the scan, VALUES-join,
-> and property-join lanes are.
-
 - **Index leaflet touches (`0.010` each)** still scale with the cursor's scanned subject range. For K ≥ 2 the cursor opens `SPOT(s,*,*)` and pays one `INDEX_TOUCH` per leaflet batch returned, the same as a full crawl over the subject — the filter narrows which rows get *materialized*, not how many leaflets get *read*. For K = 1 the cursor opens `SPOT(s,p,*)` directly via `RangeMatch::subject_predicate`, which narrows the leaflet key-range to the `(s, p)` prefix — same `INDEX_TOUCH` count for small subjects (one batch either way), strictly fewer touches for subjects whose flakes span multiple batches.
 
 Wildcard projections (`select: {"?x": ["*"]}`) take the unchanged decode-everything path — every flake on the subject is materialized and charged. Refinements on a wildcard level (e.g. `{"ex:friend": ["*"]}` inside a `["*", ...]` selection) keep the parent level wildcard; only the explicit-list form opts into the filter.
