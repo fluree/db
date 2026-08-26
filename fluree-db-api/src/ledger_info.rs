@@ -34,8 +34,8 @@ use fluree_db_core::{
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType, NsRecord};
 use fluree_db_novelty::{
-    assemble_fast_stats_with, assemble_full_stats_with, NoveltyMerge, StatsAssemblyError,
-    StatsLookup,
+    assemble_fast_stats_with, assemble_full_stats_with, stats_merge_site, NoveltyMerge,
+    StatsAssemblyError, StatsLookup,
 };
 use fluree_db_r2rml::{CompiledR2rmlMapping, ObjectMap, TermType};
 use fluree_graph_json_ld::ParsedContext;
@@ -552,7 +552,9 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
             ledger.novelty.as_ref(),
             ledger.t(),
             &stats_lookup,
-            NoveltyMerge::Reconciled,
+            NoveltyMerge::Reconciled {
+                site: stats_merge_site::LEDGER_INFO_FULL,
+            },
         )
         .await
         .map_err(|e| LedgerInfoError::ClassLookup(e.to_string()))?,
@@ -562,7 +564,9 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
             ledger.novelty.as_ref(),
             ledger.t(),
             Some(&stats_lookup as &dyn StatsLookup),
-            NoveltyMerge::Reconciled,
+            NoveltyMerge::Reconciled {
+                site: stats_merge_site::LEDGER_INFO_FAST,
+            },
         ),
     };
 

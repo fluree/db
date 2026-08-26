@@ -401,11 +401,19 @@ async fn build_policy_context_from_opts_inner(
     // restrictions apply even when novelty adds properties without restating
     // the subject's `@type` in the same transaction.
     //
-    // Deliberately the ESTIMATE merge (#1391): policy enforcement reads which
-    // properties a class *has*, never how many facts carry them, so a
-    // duplicate re-assert inflating a count changes no enforcement decision —
-    // and this builder runs uncached on every governed query, where per-fact
-    // base probes would be a real cost.
+    // Deliberately the ESTIMATE merge (#1391). Policy enforcement reads which
+    // properties a class *has*, never how many facts carry them
+    // (`fluree-db-policy/src/index.rs`), and this builder runs uncached on
+    // every governed query, where per-fact base probes would be a real cost.
+    //
+    // "Never reads a count" is not quite "count drift cannot matter", though:
+    // the assembler prunes zero-count entries before policy sees them, so a
+    // spurious `-1` can delete a property from a class's list. In the
+    // `f:onClass` Allow direction that fails closed, which is the safe way to
+    // be wrong; in `compute_class_check_needed`'s subset test it could drop a
+    // runtime class check, which is not. Left on the estimate lane anyway —
+    // an uncached per-query builder cannot afford base probes — but the
+    // exposure is a count-drift one, not a no-op.
     let stats: Option<IndexStats> = if let Some(novelty) = novelty_for_stats {
         let indexed = snapshot.stats.clone().unwrap_or_default();
         let lookup = PolicyStatsLookup { overlay };

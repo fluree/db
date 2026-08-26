@@ -62,16 +62,52 @@ pub fn resolve_runtime_predicate_id(
 /// stamp regression tests assert against.
 pub const STATS_MERGE_TARGET: &str = "fluree::stats";
 
+/// Canonical `site` labels for [`NoveltyMerge::Reconciled`], one per calling
+/// surface.
+///
+/// Constants rather than string literals at the call sites so a routing
+/// assertion and the code it asserts about cannot drift apart, and so adding a
+/// reconciling surface is a visible edit here.
+pub mod stats_merge_site {
+    /// `fluree info` / the ledger-info route, class-attributing arm — the
+    /// default, since `LedgerInfoOptions::realtime_property_details` is `true`.
+    pub const LEDGER_INFO_FULL: &str = "ledger-info-full";
+    /// `fluree info` with `realtime_property_details` explicitly disabled.
+    pub const LEDGER_INFO_FAST: &str = "ledger-info-fast";
+    /// The Cypher `apoc.meta.data` per-`(class, property)` rollup.
+    pub const APOC_META_DATA: &str = "apoc-meta-data";
+    /// The Cypher catalog shims — `db.labels` / `db.relationshipTypes` /
+    /// `db.propertyKeys` / `db.schema.visualization`.
+    pub const MERGED_STATS: &str = "merged-stats";
+}
+
 /// Above this many novelty flakes an assembly that asked for
 /// [`NoveltyMerge::Reconciled`] declines and falls back to
 /// [`NoveltyMerge::Estimate`].
 ///
 /// Reconciliation costs one base-index point lookup per distinct
 /// `(graph, subject, predicate)` touched by novelty, so it is bounded work
-/// proportional to the novelty window — fine for a per-request introspection
-/// answer, not for an unbounded pre-index backlog. Declining keeps the
-/// surface responsive; the counts then carry the same over-count this cap
-/// exists to bound, which the stamp records.
+/// proportional to the window. Measured worst case — every flake a duplicate
+/// on its own `(s, p)`, so the probe cache misses on every one, release build,
+/// local file-backed ledger (`issue_1391_reconciliation_cost` in
+/// `fluree-db-api/tests/it_fast_stats_1391_regression.rs`, run with
+/// `--ignored`):
+///
+/// ```text
+/// novelty= 10,008 flakes   estimate 1.5ms   reconciled  41.7ms   (28.0x)
+/// novelty= 48,008 flakes   estimate 7.6ms   reconciled 210.0ms   (27.7x)
+/// ```
+///
+/// So ~4.3us per novelty flake, and ~210ms at the ceiling this cap permits.
+/// That is a per-request metadata cost, not a query one, and it needs a
+/// deliberately raised reindex threshold to reach — the default is low enough
+/// that `server_defaults.rs` describes it as reindexing roughly every commit,
+/// which keeps the window tiny and all of this in the noise. Real windows also
+/// share `(s, p)` across values and carry new subjects, whose dictionary
+/// lookup misses cheaply, so they land well under the worst case.
+///
+/// Above the cap, declining keeps the surface responsive and the counts carry
+/// the same drift this fix removes — the stamp records which happened.
 const MAX_RECONCILED_NOVELTY_FLAKES: usize = 50_000;
 
 /// How novelty is folded onto the indexed base counts.
@@ -95,7 +131,14 @@ pub enum NoveltyMerge {
     /// `apoc.meta.data` / `db.*` catalog shims). Falls back to
     /// [`NoveltyMerge::Estimate`] when the snapshot carries no base index to
     /// probe or novelty exceeds [`MAX_RECONCILED_NOVELTY_FLAKES`].
-    Reconciled,
+    ///
+    /// `site` names the calling surface and is stamped on
+    /// [`STATS_MERGE_TARGET`]. It is required, not optional, because a stamp
+    /// shared across entry points is useless as a routing assertion: with
+    /// several surfaces reconciling inside one capture window, a must-fire
+    /// check on a shared label is satisfied by *any* of them rather than by the
+    /// one whose numbers are under test.
+    Reconciled { site: &'static str },
 }
 
 /// Merge novelty into `indexed` with planner-grade [`NoveltyMerge::Estimate`]
@@ -461,8 +504,19 @@ type BaseFact = (FlakeValue, Sid, Option<FlakeMeta>);
 /// against an *empty* overlay at the indexed `t` — the question is strictly
 /// about the base, not about the merged view.
 struct BaseIndexProbe<'a> {
+    /// Calling surface, for the routing stamp.
+    site: &'static str,
     provider: &'a dyn RangeProvider,
     /// The `t` the `indexed` stats describe — the base state to probe.
+    ///
+    /// This must be the same `t` novelty was flushed to, or a partial flush
+    /// could leave a retraction in the window whose matching assert has already
+    /// moved into a base this probe reads as of an earlier `t`, charging `0`
+    /// where the truth is `-1`. It is, by construction: both production callers
+    /// of `Novelty::clear_up_to` (`fluree-db-ledger/src/lib.rs`) pass
+    /// `new_snapshot.t` — the cutoff and the snapshot installed alongside it are
+    /// the same value — and both refuse a snapshot whose `t` is below the
+    /// current index `t`, so it cannot lag.
     indexed_t: i64,
     /// Read base-only: an overlay with nothing in it.
     empty_overlay: Novelty,
@@ -487,24 +541,25 @@ impl<'a> BaseIndexProbe<'a> {
         novelty: &Novelty,
         merge: NoveltyMerge,
     ) -> Option<BaseIndexProbe<'a>> {
-        if merge != NoveltyMerge::Reconciled {
+        let NoveltyMerge::Reconciled { site } = merge else {
             return None;
-        }
+        };
         // Nothing indexed yet ⇒ no base fact can be duplicated; every novelty
         // assertion is genuinely new and the blind delta is already exact.
         if indexed.graphs.is_none() && indexed.properties.is_none() && indexed.classes.is_none() {
-            stamp_merge("declined:no_base_index", 0, 0);
+            stamp_merge(site, "declined:no_base_index", 0, 0);
             return None;
         }
         let Some(provider) = snapshot.range_provider.as_ref() else {
-            stamp_merge("declined:no_range_provider", 0, 0);
+            stamp_merge(site, "declined:no_range_provider", 0, 0);
             return None;
         };
         if novelty.len() > MAX_RECONCILED_NOVELTY_FLAKES {
-            stamp_merge("declined:novelty_too_large", 0, 0);
+            stamp_merge(site, "declined:novelty_too_large", 0, 0);
             return None;
         }
         Some(BaseIndexProbe {
+            site,
             provider: provider.as_ref(),
             indexed_t: snapshot.t,
             empty_overlay: Novelty::new(0),
@@ -521,6 +576,11 @@ impl<'a> BaseIndexProbe<'a> {
     /// `NoveltyFactState`'s key ordering — `FlakeValue`'s `Eq` is looser across
     /// numeric representations, and equating `Long(3)` with `Double(3.0)` here
     /// would suppress a legitimate assertion.
+    ///
+    /// The cached facts are sorted on `(o, dt)`, so this binary-searches to the
+    /// matching block and walks only that. A `(s, p)` with large base fan-out —
+    /// an RDF list, a heavily multi-valued predicate — would otherwise cost
+    /// `O(identities x fan-out)` on the surface whose whole point is bounded work.
     fn base_contains(&mut self, g_id: GraphId, flake: &Flake) -> bool {
         let key = (g_id, flake.s.clone(), flake.p.clone());
         if !self.cache.contains_key(&key) {
@@ -528,18 +588,33 @@ impl<'a> BaseIndexProbe<'a> {
             let facts = self.scan_base(g_id, &flake.s, &flake.p);
             self.cache.insert(key.clone(), facts);
         }
-        let hit = self.cache[&key].iter().any(|(o, dt, m)| {
-            o.cmp(&flake.o) == Ordering::Equal && *dt == flake.dt && *m == flake.m
+        let facts = &self.cache[&key];
+        let start = facts.partition_point(|(o, dt, _)| {
+            o.cmp(&flake.o).then_with(|| dt.cmp(&flake.dt)) == Ordering::Less
         });
+        let hit = facts[start..]
+            .iter()
+            .take_while(|(o, dt, _)| {
+                o.cmp(&flake.o) == Ordering::Equal && dt.cmp(&flake.dt) == Ordering::Equal
+            })
+            .any(|(_, _, m)| *m == flake.m);
         if hit && flake.op {
             self.duplicates += 1;
         }
         hit
     }
 
-    /// One bounded base scan for `(s, p)`. A provider error (or an absent
-    /// index order) yields an empty set, which degrades to today's blind
-    /// delta for that pair — never to a suppressed assertion.
+    /// One bounded base scan for `(s, p)`, sorted on `(o, dt)` for
+    /// [`Self::base_contains`]'s binary search.
+    ///
+    /// The sort is defensive rather than necessary — SPOT is
+    /// `(s, p, o, dt, t, op, m)`, so with `s` and `p` bound a provider returns
+    /// this already ordered — but it costs `O(n log n)` once per `(s, p)` and
+    /// removes a silent dependency on provider ordering.
+    ///
+    /// A provider error (or an absent index order) yields an empty set, which
+    /// degrades to today's blind delta for that pair — never to a suppressed
+    /// assertion.
     fn scan_base(&self, g_id: GraphId, s: &Sid, p: &Sid) -> Vec<BaseFact> {
         let match_val = RangeMatch::subject_predicate(s.clone(), p.clone());
         let opts = RangeOptions::new().with_to_t(self.indexed_t);
@@ -553,11 +628,15 @@ impl<'a> BaseIndexProbe<'a> {
             tracker: None,
         };
         match self.provider.range(&query) {
-            Ok(flakes) => flakes
-                .into_iter()
-                .filter(|f| f.op)
-                .map(|f| (f.o, f.dt, f.m))
-                .collect(),
+            Ok(flakes) => {
+                let mut facts: Vec<BaseFact> = flakes
+                    .into_iter()
+                    .filter(|f| f.op)
+                    .map(|f| (f.o, f.dt, f.m))
+                    .collect();
+                facts.sort_by(|(o1, dt1, _), (o2, dt2, _)| o1.cmp(o2).then_with(|| dt1.cmp(dt2)));
+                facts
+            }
             Err(e) => {
                 tracing::debug!(
                     target: STATS_MERGE_TARGET,
@@ -570,11 +649,12 @@ impl<'a> BaseIndexProbe<'a> {
     }
 }
 
-/// Stamp one reconciliation decision on [`STATS_MERGE_TARGET`].
-fn stamp_merge(outcome: &'static str, scans: usize, duplicates: usize) {
+/// Stamp one reconciliation decision on [`STATS_MERGE_TARGET`], labelled with
+/// the calling surface so a routing assertion can name the lane it means.
+fn stamp_merge(site: &'static str, outcome: &'static str, scans: usize, duplicates: usize) {
     tracing::debug!(
         target: STATS_MERGE_TARGET,
-        site = "fast-stats-novelty-merge",
+        site,
         outcome,
         scans,
         duplicates,
@@ -584,20 +664,22 @@ fn stamp_merge(outcome: &'static str, scans: usize, duplicates: usize) {
 
 /// Turns the novelty POST stream into per-flake current-state deltas.
 ///
-/// The blind version charges `+1` per assertion and `-1` per retraction. That
-/// is right for every flake *except the first one of each fact identity*: only
-/// there does the base index's own state matter. Because novelty applies RDF
-/// set semantics within its window, an identity's kept flakes strictly
-/// alternate assert/retract, so once the first flake is charged against base
-/// presence every later flake is a faithful state transition and needs no
-/// probe.
-///
-/// POST order is `(p, o, dt, s, t, op, m)`, so all flakes sharing
-/// `(p, o, dt, s)` are contiguous and `t`-ascending; only `m` varies within a
-/// run, and it is tracked with a tiny per-run vec (fan-out is the number of
-/// distinct language tags / list positions on one value).
 /// Drive this over a novelty walk in `IndexType::Post` order to get each
 /// flake's *current-state* delta instead of a blind `±1`.
+///
+/// It folds **presence**, not ops. Per fact identity it carries the op that has
+/// won lifecycle resolution so far and charges each flake the change in
+/// presence it causes; the first flake of an identity costs one base-index
+/// probe and charges `op − base_present`. Those deltas telescope, so the sum
+/// over an identity is `final_present − base_present` regardless of how many
+/// flakes the window holds or what order they arrive in.
+///
+/// It deliberately does **not** assume kept flakes alternate assert/retract.
+/// Novelty's set semantics are one-sided — `Novelty::apply_commit` suppresses
+/// redundant *asserts* only — and a same-`t` assert/retract pair reaches this
+/// fold retract-first because POST sorts `op` ascending, so runs like
+/// `(retract, assert, assert)` and `(retract, retract)` are both reachable.
+/// See `delta_in_graph`.
 ///
 /// Any consumer that folds novelty into indexed counts by hand — the stats
 /// assemblers here, `apoc.meta.data`'s per-`(class, property)` rollup — should
@@ -618,8 +700,11 @@ pub struct NoveltyDeltaResolver<'a> {
     probe: Option<BaseIndexProbe<'a>>,
     /// Identity components of the run in progress, `(g_id, p, o, dt, s)`.
     run: Option<(GraphId, Sid, FlakeValue, Sid, Sid)>,
-    /// Metas already seen in this run — i.e. identities already opened.
-    seen_metas: Vec<Option<FlakeMeta>>,
+    /// Per-identity lifecycle state for the run in progress: `(m, t, op)`,
+    /// where `(t, op)` is the op that has WON resolution so far. Only `m`
+    /// varies within a run, so this vec is as long as the value's distinct
+    /// language tags / list positions.
+    seen: Vec<(Option<FlakeMeta>, i64, bool)>,
 }
 
 impl<'a> NoveltyDeltaResolver<'a> {
@@ -637,7 +722,7 @@ impl<'a> NoveltyDeltaResolver<'a> {
             snapshot,
             probe: BaseIndexProbe::open(indexed, snapshot, novelty, merge),
             run: None,
-            seen_metas: Vec::new(),
+            seen: Vec::new(),
         }
     }
 
@@ -655,30 +740,55 @@ impl<'a> NoveltyDeltaResolver<'a> {
 
     /// Delta `flake` contributes, for callers that already resolved its graph.
     ///
-    /// The blind version charges `+1` per assertion and `-1` per retraction.
-    /// That is right for every flake *except the first one of each fact
-    /// identity*: only there does the base index's own state matter. Because
-    /// novelty applies RDF set semantics within its window, an identity's kept
-    /// flakes strictly alternate assert/retract, so once the first flake is
-    /// charged against base presence every later flake is a faithful state
-    /// transition and needs no probe.
+    /// This is a running fold over *presence*, not over ops. The first flake of
+    /// an identity costs one base probe and charges `op − base_present`; each
+    /// later flake charges `new_present − old_present`, where the new presence
+    /// is whatever lifecycle resolution says it is. The deltas telescope, so
+    /// their sum over an identity is exactly `final_present − base_present`
+    /// however many flakes the window holds.
+    ///
+    /// Resolution is the same rule [`crate::Novelty`]'s `fact_state::record`
+    /// applies — the highest `t` wins, and at equal `t` a retract beats an
+    /// assert — so the fold cannot disagree with what a read would see. It
+    /// deliberately does **not** assume kept flakes alternate assert/retract.
+    /// They do not: `Novelty::apply_commit`'s dedup gate short-circuits on
+    /// `flake.op &&`, so it suppresses redundant *asserts* only and never
+    /// examines a retraction. And because POST sorts `op` ascending at equal
+    /// `t`, a same-`t` pair reaches this fold retract-first — the assert
+    /// arrives last despite having lost. `bulk_apply_commits` replays raw
+    /// persisted flakes on cold load, which is why the crate keeps
+    /// `same_t_assert_retract_keeps_later_reassert` around to pin that state as
+    /// legal.
     ///
     /// POST order puts `m` last, so flakes sharing `(p, o, dt, s)` are
     /// contiguous while distinct `m`s (language tags, list positions) interleave
-    /// by `t` within that run — hence the small per-run set of opened metas.
-    /// The run key carries `g_id` too: the same triple can live in two named
-    /// graphs, and each has its own base-index state to resolve against.
+    /// by `t` within that run — hence per-identity state keyed on `m`. The run
+    /// key carries `g_id` too: the same triple can live in two named graphs, and
+    /// each has its own base-index state to resolve against.
     pub fn delta_in_graph(&mut self, g_id: GraphId, flake: &Flake) -> i64 {
-        let op_delta = if flake.op { 1 } else { -1 };
         let Some(probe) = self.probe.as_mut() else {
-            return op_delta;
+            return if flake.op { 1 } else { -1 };
         };
-        // Contiguity is the whole basis of the "first flake of an identity"
-        // rule: if a run could reopen after closing, an identity's first flake
-        // would be charged against base presence more than once and a
-        // novelty-local assert/retract pair could net non-zero. Fail loudly in
-        // debug rather than silently mis-count if the stream ever stops being
-        // non-decreasing within a graph (a segmented-novelty merge regression).
+        // Commit-metadata flakes: subject is the commit's own CID digest hex
+        // (`commit_flakes.rs`), so it is content-addressed and unique per
+        // commit — no base fact can share the identity, and the blind delta is
+        // already exact. Probing them anyway would be 7-10 guaranteed cache
+        // misses per commit in the window, and `include_in_runtime_stats`
+        // discards every one of them from the per-class and per-property counts
+        // this reconciliation exists to fix. Skipping is legal under the
+        // ordering contract above: the subject namespace is an identity
+        // component, so the skipped set is disjoint by identity from the
+        // resolved set and no run is left half-consumed.
+        if flake.s.namespace_code == FLUREE_COMMIT {
+            return if flake.op { 1 } else { -1 };
+        }
+        // Contiguity is what lets per-identity state live in a per-run vec
+        // instead of a map over the whole window: if a run could reopen after
+        // closing, an identity's first flake would be charged against base
+        // presence twice. Fail loudly in debug rather than silently mis-count
+        // if the stream ever stops being non-decreasing within a graph (a
+        // segmented-novelty merge regression). Note this checks *contiguity*
+        // only — the fold makes no assumption about op order within a run.
         #[cfg(debug_assertions)]
         if let Some((prev_g, p, o, dt, s)) = self.run.as_ref() {
             let ord = p
@@ -708,30 +818,50 @@ impl<'a> NoveltyDeltaResolver<'a> {
                 flake.dt.clone(),
                 flake.s.clone(),
             ));
-            self.seen_metas.clear();
+            self.seen.clear();
         }
-        if self.seen_metas.contains(&flake.m) {
-            // Not the first flake of this identity: novelty already told us
-            // what the pre-state was, so the transition is exact as written.
-            return op_delta;
+        if let Some((_, cur_t, cur_op)) = self.seen.iter_mut().find(|(m, _, _)| *m == flake.m) {
+            // Lifecycle resolution, verbatim from `NoveltyFactState::record`.
+            // A flake that does not win changes no presence and charges zero —
+            // that covers the same-`t` assert arriving behind its winning
+            // retract, and a redundant retract repeated at a later `t`.
+            let wins = flake.t > *cur_t || (flake.t == *cur_t && *cur_op && !flake.op);
+            if !wins {
+                return 0;
+            }
+            let delta = i64::from(flake.op) - i64::from(*cur_op);
+            *cur_t = flake.t;
+            *cur_op = flake.op;
+            return delta;
         }
-        self.seen_metas.push(flake.m.clone());
+        self.seen.push((flake.m.clone(), flake.t, flake.op));
         let base = i64::from(probe.base_contains(g_id, flake));
         i64::from(flake.op) - base
     }
 
     /// Restart run tracking for a second walk of the same POST stream, keeping
     /// the base-probe cache warm so the second pass reads no extra leaflets.
+    ///
+    /// `duplicates` resets with it: `base_contains` counts a duplicate on every
+    /// call, so without this the two-pass `assemble_full_stats_with` would stamp
+    /// 2x. That matters because the regression test's anti-vacuity guard is a
+    /// *floor* on `duplicates` — inflating it makes the guard easier to satisfy,
+    /// which is the wrong direction for a check whose job is to prove the pass
+    /// did real work. `scans` deliberately keeps accumulating: it measures index
+    /// reads, and the second pass genuinely issues none.
     pub fn restart_walk(&mut self) {
         self.run = None;
-        self.seen_metas.clear();
+        self.seen.clear();
+        if let Some(probe) = self.probe.as_mut() {
+            probe.duplicates = 0;
+        }
     }
 
     /// Stamp what this resolver did. Call once per assembly; a resolver that
     /// declined already stamped its reason at construction.
     pub fn finish(&self) {
         if let Some(probe) = self.probe.as_ref() {
-            stamp_merge("reconciled", probe.scans, probe.duplicates);
+            stamp_merge(probe.site, "reconciled", probe.scans, probe.duplicates);
         }
     }
 }
@@ -1129,6 +1259,9 @@ mod tests {
         Flake, GraphStatsEntry, PropertyStatEntry, RuntimePredicateId, ValueTypeTag,
     };
 
+    /// Site label for resolver unit tests.
+    const TEST_RECONCILE: NoveltyMerge = NoveltyMerge::Reconciled { site: "unit-test" };
+
     fn sid(ns: u16, name: &str) -> Sid {
         Sid::new(ns, name)
     }
@@ -1484,8 +1617,7 @@ mod tests {
         for (t, batch) in by_t {
             novelty.apply_commit(batch, t, &HashMap::new()).unwrap();
         }
-        let mut resolver =
-            NoveltyDeltaResolver::new(&indexed, &snapshot, &novelty, NoveltyMerge::Reconciled);
+        let mut resolver = NoveltyDeltaResolver::new(&indexed, &snapshot, &novelty, TEST_RECONCILE);
         assert!(
             resolver.is_reconciling(),
             "fixture must take the reconciling path, or the assertions are vacuous"
@@ -1628,6 +1760,129 @@ mod tests {
         assert_eq!(scans, 1, "one base scan per (graph, subject, predicate)");
     }
 
+    // -- Non-alternating runs (adversarial review of #1699) ----------------
+    //
+    // Novelty's set semantics are ONE-SIDED: `Novelty::apply_commit`'s gate is
+    // `if flake.op && self.fact_state.is_asserted(..)`, which short-circuits so
+    // a retraction is never examined and never dropped. Kept flakes therefore
+    // do NOT strictly alternate, and the resolver may not assume they do.
+
+    #[test]
+    fn reconcile_ignores_a_repeated_retraction_of_an_absent_fact() {
+        let s = sid(10, "alice");
+        let p = sid(10, "name");
+        // The same no-op DELETE run twice. Both retractions are kept (novelty
+        // dedups asserts only), so the run is (retract, retract) — the second
+        // is not a state transition and must charge zero.
+        let (deltas, _) = deltas_over(
+            Vec::new(),
+            vec![
+                string_flake(&s, &p, "gone", 2, false, None),
+                string_flake(&s, &p, "gone", 3, false, None),
+            ],
+        );
+        assert_eq!(deltas, vec![0, 0], "neither retraction removes anything");
+    }
+
+    #[test]
+    fn reconcile_folds_a_same_t_pair_then_reassert() {
+        let s = sid(10, "alice");
+        let p = sid(10, "name");
+        // `bulk_apply_commits` (cold load) replays raw persisted flakes, so an
+        // assert+retract of one identity at the SAME `t` can both land — see
+        // `same_t_assert_retract_keeps_later_reassert` in lib.rs, which builds
+        // exactly this on purpose. `fact_state` resolves it retract-wins, so a
+        // later re-assert is kept; but `cmp_post` sorts `op` ASCENDING at equal
+        // `t`, so the losing assert arrives AFTER the winning retract and the
+        // walk sees (retract@1, assert@1, assert@2) — two consecutive asserts.
+        let (deltas, _) = deltas_over(
+            Vec::new(),
+            vec![
+                string_flake(&s, &p, "a", 1, true, None),
+                string_flake(&s, &p, "a", 1, false, None),
+                string_flake(&s, &p, "a", 2, true, None),
+            ],
+        );
+        assert_eq!(
+            deltas.iter().sum::<i64>(),
+            1,
+            "the fact ends up asserted exactly once: {deltas:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_folds_two_consecutive_same_t_pairs() {
+        let s = sid(10, "alice");
+        let p = sid(10, "name");
+        // Two same-`t` assert/retract pairs back to back. The first pair leaves
+        // the fact ABSENT (retract wins), so the second pair's assert passes
+        // `apply_commit`'s dedup gate and both of its ops land. The walk sees
+        // (retract@1, assert@1, retract@2, assert@2) — the second retract
+        // repeats the first's op, so a fold that only compared against the
+        // previous op would swallow it and then credit the trailing assert.
+        // Resolving presence the way `fact_state::record` does gets it right.
+        let (deltas, _) = deltas_over(
+            Vec::new(),
+            vec![
+                string_flake(&s, &p, "a", 1, true, None),
+                string_flake(&s, &p, "a", 1, false, None),
+                string_flake(&s, &p, "a", 2, true, None),
+                string_flake(&s, &p, "a", 2, false, None),
+            ],
+        );
+        assert_eq!(
+            deltas.iter().sum::<i64>(),
+            0,
+            "retract wins at t=2, so the fact is absent and was never in base: {deltas:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_treats_list_positions_as_distinct_identities() {
+        let s = sid(10, "alice");
+        let p = sid(10, "items");
+        // Same (s, p, o, dt) at two `@list` positions. POST sorts `m` last, so
+        // these interleave inside one run exactly like language tags do, and
+        // `NoveltyFactState`'s FactKey includes `m` — so position 1 must not be
+        // charged as a duplicate of the already-indexed position 0.
+        let at = |i: i32, t: i64| {
+            let mut f = string_flake(&s, &p, "a", t, true, None);
+            f.m = Some(fluree_db_core::FlakeMeta {
+                i: Some(i),
+                ..Default::default()
+            });
+            f
+        };
+        let (deltas, _) = deltas_over(vec![at(0, 1)], vec![at(0, 2), at(1, 2)]);
+        assert_eq!(
+            deltas.iter().sum::<i64>(),
+            1,
+            "position 0 duplicates the base fact; position 1 is new: {deltas:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_folds_a_same_t_pair_then_reassert_over_a_base_fact() {
+        let s = sid(10, "alice");
+        let p = sid(10, "name");
+        // Same sequence, but base already holds the fact: it is present before
+        // and after, so the window nets zero.
+        let base = vec![string_flake(&s, &p, "a", 0, true, None)];
+        let (deltas, _) = deltas_over(
+            base,
+            vec![
+                string_flake(&s, &p, "a", 1, true, None),
+                string_flake(&s, &p, "a", 1, false, None),
+                string_flake(&s, &p, "a", 2, true, None),
+            ],
+        );
+        assert_eq!(
+            deltas.iter().sum::<i64>(),
+            0,
+            "present in base, present at the end: {deltas:?}"
+        );
+    }
+
     #[test]
     fn reconcile_resolves_the_same_triple_per_graph() {
         // `iter_flakes` walks graph 0's POST stream, then graph 1's — so the
@@ -1646,8 +1901,7 @@ mod tests {
                 &HashMap::new(),
             )
             .unwrap();
-        let mut resolver =
-            NoveltyDeltaResolver::new(&indexed, &snapshot, &novelty, NoveltyMerge::Reconciled);
+        let mut resolver = NoveltyDeltaResolver::new(&indexed, &snapshot, &novelty, TEST_RECONCILE);
         let flake = novelty
             .iter_flakes(IndexType::Post)
             .next()
@@ -1736,14 +1990,8 @@ mod tests {
         assert_eq!(estimate.flakes, 2);
         assert_eq!(provider.scans.load(std::sync::atomic::Ordering::Relaxed), 0);
 
-        let reconciled = assemble_fast_stats_with(
-            &indexed,
-            &snapshot,
-            &novelty,
-            2,
-            None,
-            NoveltyMerge::Reconciled,
-        );
+        let reconciled =
+            assemble_fast_stats_with(&indexed, &snapshot, &novelty, 2, None, TEST_RECONCILE);
         assert_eq!(name_count(&reconciled), 1, "one fact, asserted twice");
         assert_eq!(reconciled.flakes, 1);
         assert_eq!(

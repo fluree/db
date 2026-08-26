@@ -57,23 +57,41 @@ pub(crate) fn cached_stats_view_for_db(
             };
             // Deliberately the ESTIMATE merge (`NoveltyMerge::Estimate`), not
             // the base-reconciled one the user-facing count surfaces use
-            // (#1391). Two reasons this lane keeps the blind +1/-1 delta log:
+            // (#1391): reconciliation costs one base probe per
+            // `(graph, subject, predicate)` in the window, and this view is
+            // rebuilt on every overlay epoch bump — i.e. every commit — so
+            // accumulating a novelty window would become quadratic in its own
+            // size.
             //
-            // 1. Nothing here answers a user's COUNT. Every count-serving fast
-            //    path gates on `fast_path_store`, which declines outright when
-            //    the overlay can still contribute flakes — so with non-empty
-            //    novelty the exact answer always comes from the generic
-            //    pipeline, which reads through the overlay and sees set
-            //    semantics. These numbers only order joins.
-            // 2. This view is rebuilt on every overlay epoch bump (i.e. every
-            //    commit) and reconciliation costs one base probe per
-            //    `(graph, subject, predicate)` in the window — which would make
-            //    accumulating a novelty window quadratic in its own size.
+            // No COUNT *answer* rides on these numbers, but not for the
+            // tempting reason. Several COUNT lanes deliberately do NOT gate on
+            // `fast_path_store` and do run with novelty present — see
+            // `count_plan_exec.rs` and `count_rows.rs`, both gating on
+            // `allow_cursor_fast_path`, the latter noting that the stricter
+            // gate "forced the whole encoded-filters COUNT family onto the
+            // generic fallback whenever any novelty was present (~50% of real
+            // queries)". What makes them safe is that they read through a
+            // `BinaryCursor` that folds the overlay in and applies set
+            // semantics; none of them reads this merged `StatsView`.
             //
-            // A duplicate re-assert therefore still inflates planner
-            // cardinality estimates by one until the next reindex. That is the
-            // same class of imprecision `ndv_*` and `last_modified_t` already
-            // carry here.
+            // So a duplicate re-assert inflates planner cardinality estimates
+            // by one until the next reindex — the same class of imprecision
+            // `ndv_*` and `last_modified_t` already carry here. One consumer of
+            // this view is not purely an estimate, though, and is worth knowing
+            // about: `StatsView::property_ref_only` is derived from the merged
+            // per-datatype breakdown and feeds `filter_fold`'s node-only
+            // soundness guard, which decides whether `FILTER(?x = ?y)` may be
+            // folded into a term-equality join. `merge_property_datatypes`
+            // drops any datatype whose merged count reaches zero, so a spurious
+            // `-1` — a novelty retraction of a literal that was never there —
+            // could in principle drop a predicate's last literal tag and
+            // license that fold where SPARQL *value* equality was required.
+            // Latent and pre-existing (the blind delta log long predates
+            // #1391), not demonstrated end to end, and deliberately NOT
+            // addressed here: the repair belongs in the estimate lane itself,
+            // and changing what `PropertyStatEntry.datatypes` emits reaches
+            // every consumer that sums it. Tracked separately rather than
+            // folded into a stats-count fix.
             assemble_fast_stats(
                 &indexed,
                 db.snapshot,

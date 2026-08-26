@@ -12,13 +12,17 @@
 //! like any other Cypher read.
 //!
 //! Answers come from the HEAD-index stats merged with novelty
-//! ([`assemble_fast_stats_with`]), so labels and types written since the
-//! last index build are visible. That merge runs in
-//! [`NoveltyMerge::Reconciled`] mode: these numbers are read by people and by
-//! schema-introspecting tooling, so a novelty assertion that restates an
-//! already-indexed fact must not be counted twice (#1391). Like Neo4j's own catalog procedures, the
-//! answers are lenient about tombstones: a label or key whose every fact
-//! was later retracted may keep appearing until a reindex.
+//! ([`assemble_fast_stats_with`]), so labels and types written since the last
+//! index build are visible. That merge runs in [`NoveltyMerge::Reconciled`]
+//! mode: these numbers are read by people and by schema-introspecting tooling,
+//! so a novelty assertion that restates an already-indexed fact must not be
+//! counted twice, and a retraction of a fact that was never there must not
+//! subtract one (#1391).
+//!
+//! Like Neo4j's own catalog procedures, the answers are still lenient about
+//! tombstones in one direction: a label or key whose every fact was retracted
+//! *before* the last index build stays in the persisted stats until a reindex.
+//! Retractions inside the novelty window are now reflected.
 //!
 //! Supported: `db.labels`, `db.relationshipTypes`, `db.propertyKeys`,
 //! `db.schema.visualization` (best effort), `dbms.components`,
@@ -34,7 +38,9 @@ use fluree_db_cypher::ast::{
     Expr, Literal, ProcedureCall, ProjectionItem, Query, ReadClause, ReturnClause, Variable,
     WithClause,
 };
-use fluree_db_novelty::{assemble_fast_stats_with, Novelty, NoveltyDeltaResolver, NoveltyMerge};
+use fluree_db_novelty::{
+    assemble_fast_stats_with, stats_merge_site, Novelty, NoveltyDeltaResolver, NoveltyMerge,
+};
 use fluree_db_query::policy::QueryPolicyEnforcer;
 
 use crate::error::ApiError;
@@ -276,8 +282,14 @@ fn meta_data_rows(
                 }
             }
         }
-        let mut deltas =
-            NoveltyDeltaResolver::new(&indexed, snapshot, novelty, NoveltyMerge::Reconciled);
+        let mut deltas = NoveltyDeltaResolver::new(
+            &indexed,
+            snapshot,
+            novelty,
+            NoveltyMerge::Reconciled {
+                site: stats_merge_site::APOC_META_DATA,
+            },
+        );
         for flake in novelty.iter_flakes(IndexType::Post) {
             if !meta_include(flake) || is_rdf_type(&flake.p) {
                 continue;
@@ -614,7 +626,9 @@ fn merged_stats(snapshot: &LedgerSnapshot, overlay: Option<&dyn OverlayProvider>
             novelty,
             i64::MAX,
             None,
-            NoveltyMerge::Reconciled,
+            NoveltyMerge::Reconciled {
+                site: stats_merge_site::MERGED_STATS,
+            },
         ),
         None => indexed,
     }

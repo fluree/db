@@ -11,21 +11,33 @@
 //! `apoc.meta.data` schema rows LangChain-style tooling reads, and the
 //! class/property counts `fluree info` prints.
 //!
-//! What this file pins, on an indexed ledger whose novelty holds a mix of
-//! duplicate re-asserts and genuinely new facts:
+//! The mirror case has the same root and cost the same accuracy: novelty
+//! accepts *every* retraction — `apply_commit`'s dedup gate short-circuits on
+//! `flake.op &&` — so a DELETE matching nothing subtracted one from a count
+//! that never included it.
+//!
+//! What this file pins, on an indexed ledger whose novelty holds duplicate
+//! re-asserts, genuinely new facts, a real retraction, and a no-op one:
 //!
 //! * every `apoc.meta.data` count equals what a scan of the same
 //!   `(class, property)` returns — the stats-served answer and the
 //!   pipeline-served answer agree;
-//! * `fluree info`'s class and property counts equal the same scan;
+//! * `fluree info`'s class and property counts equal the same scan, on BOTH
+//!   arms (`realtime_property_details` true and false — separate call sites);
+//! * `db.propertyKeys()` drops a predicate whose every fact was retracted,
+//!   which is `merged_stats`' one count-sensitive output;
 //! * the answers are identical with fast paths on and with the
 //!   `FLUREE_DISABLE_QUERY_FAST_PATHS` kill switch engaged, which pins the
 //!   issue's read-path claim (query answers were never affected — set
 //!   semantics make the duplicate idempotent at read time) and would catch a
 //!   future COUNT lane that started trusting the drifted stats;
-//! * the merge actually reconciled — the `fast-stats novelty merge outcome`
-//!   stamp reports `reconciled` with a non-zero duplicate count, so none of
-//!   the above can pass by quietly declining to the estimate lane.
+//! * each of the four reconciling surfaces stamped `reconciled` ON ITS OWN
+//!   SITE with at least the duplicate count the fixture plants. A stamp label
+//!   shared across entry points would let one reconciling assembly satisfy the
+//!   guard for all four, so the check names the lane it means.
+//!
+//! Reverting all four `NoveltyMerge::Reconciled` call sites turns this into 18
+//! failures; reverting any single one fails that site's assertions alone.
 //!
 //! Own test binary: toggles the process-global kill switch AND asserts
 //! routing via span capture, so it must not share a process with other tests.
@@ -85,6 +97,27 @@ fn novelty_doc() -> Value {
     })
 }
 
+/// The third commit, covering the *under*-count half of #1391. Novelty accepts
+/// every retraction — `apply_commit`'s dedup gate short-circuits on
+/// `flake.op &&` and never examines one — so a ground DELETE that matches
+/// nothing still lands as a retraction flake and, under a blind delta log,
+/// subtracts one from a count that never included it.
+///
+/// * `ex:w2 ex:name "never-existed"` matches nothing: must charge zero;
+/// * `ex:w1 ex:size 1` is a real base fact: must charge `-1`, taking
+///   `ex:size`'s ledger-wide count to zero so the property drops out of
+///   `apoc.meta.data` and `db.propertyKeys()` entirely.
+fn deletion_doc() -> Value {
+    json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where": {},
+        "delete": [
+            {"@id": "ex:w2", "ex:name": "never-existed"},
+            {"@id": "ex:w1", "ex:size": 1}
+        ]
+    })
+}
+
 /// `(label, property)` pairs the schema shims report, each paired with the
 /// SPARQL that counts the same facts by scanning. The hand-pinned number is
 /// the current-state truth; both the stats answer and the scan must equal it.
@@ -100,7 +133,9 @@ const CASES: &[(&str, &str, &str, u64)] = &[
         "ex:Widget",
         "ex:size",
         "SELECT (COUNT(?o) AS ?c) WHERE { ?s a ex:Widget . ?s ex:size ?o }",
-        1,
+        // Asserted in the base index, restated as a duplicate in novelty, then
+        // genuinely retracted: the duplicate must not keep it alive.
+        0,
     ),
     (
         "ex:Gadget",
@@ -129,7 +164,22 @@ const LEDGER_CASES: &[(&str, &str, u64)] = &[
         "SELECT (COUNT(?o) AS ?c) WHERE { ?s ex:partOf ?o }",
         2,
     ),
+    (
+        "ex:size",
+        "SELECT (COUNT(?o) AS ?c) WHERE { ?s ex:size ?o }",
+        0,
+    ),
 ];
+
+/// `db.propertyKeys()` lists a predicate only while its merged count is above
+/// zero, so it is `merged_stats`' one count-sensitive output — and the only
+/// assertion that pins that call site. `ex:size` is exactly the discriminator:
+/// under a blind merge its duplicate re-assert cancels the real retraction and
+/// it stays listed; reconciled, it is gone.
+/// `ex:partOf` is ref-valued, so `schema_names` files it under
+/// `db.relationshipTypes()` rather than here.
+const PROPERTY_KEYS_PRESENT: &[&str] = &["ex:name"];
+const PROPERTY_KEYS_ABSENT: &[&str] = &["ex:size"];
 
 /// Class instance counts `fluree info` renders.
 const CLASS_CASES: &[(&str, &str, u64)] = &[
@@ -200,6 +250,28 @@ async fn setup() -> (tempfile::TempDir, Fluree) {
         !ledger.novelty.is_empty(),
         "the second commit must stay in novelty for this pin to mean anything"
     );
+    let _ = fluree
+        .update_with_opts(
+            ledger,
+            &deletion_doc(),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &index_config,
+        )
+        .await
+        .expect("deletion update");
+
+    let ledger = fluree.ledger(ALIAS).await.expect("reload after deletion");
+    let retractions = ledger
+        .novelty
+        .iter_flakes(fluree_db_core::IndexType::Post)
+        .filter(|f| !f.op)
+        .count();
+    assert_eq!(
+        retractions, 2,
+        "the fixture needs both retractions in novelty — the no-op one is the \
+         whole point of the under-count half"
+    );
     (dir, fluree)
 }
 
@@ -254,10 +326,37 @@ fn apoc_count(rows: &[(String, String, u64)], class: &str, property: &str) -> Op
         .map(|(_, _, c)| *c)
 }
 
+/// `db.propertyKeys()` as full IRIs — `merged_stats`' count-sensitive output.
+async fn property_keys(fluree: &Fluree) -> Vec<String> {
+    let snapshot = fluree.graph(ALIAS).load().await.expect("load");
+    let db = snapshot.db();
+    let rows = fluree
+        .query_cypher(
+            db,
+            "CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey",
+        )
+        .await
+        .expect("db.propertyKeys")
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    rows.as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r[0].as_str().expect("propertyKey").to_string())
+        .collect()
+}
+
 /// `fluree info`'s class + property counts, keyed by the IRI it renders.
-async fn info_counts(fluree: &Fluree) -> (Value, Value) {
+///
+/// `realtime_property_details` selects the arm: `true` (the default, so what
+/// plain `fluree info` runs) takes `assemble_full_stats_with`, `false` takes
+/// the lighter `assemble_fast_stats_with`. Both reconcile, and both are
+/// asserted, because they are separate call sites.
+async fn info_counts_arm(fluree: &Fluree, realtime: bool) -> (Value, Value) {
     let info = fluree
         .ledger_info(ALIAS)
+        .with_realtime_property_details(realtime)
         .execute()
         .await
         .expect("ledger_info");
@@ -298,6 +397,14 @@ fn info_count(block: &Value, iri_or_curie: &str) -> Option<u64> {
     }
 }
 
+/// One `fast-stats novelty merge outcome` event.
+#[derive(Debug)]
+struct Stamp {
+    site: String,
+    outcome: String,
+    duplicates: u64,
+}
+
 /// RAII restore of the process-global kill switch, including on panic.
 struct FastPathGuard;
 impl Drop for FastPathGuard {
@@ -329,18 +436,20 @@ async fn issue_1391_duplicate_novelty_asserts_do_not_inflate_stats_counts() {
     set_fast_paths_disabled(false);
 
     let apoc_fast = apoc_counts(&fluree).await;
-    let (classes, properties) = info_counts(&fluree).await;
-    let merges: Vec<_> = store
+    let (classes, properties) = info_counts_arm(&fluree, true).await;
+    let (classes_fast_arm, properties_fast_arm) = info_counts_arm(&fluree, false).await;
+    let keys = property_keys(&fluree).await;
+    let merges: Vec<Stamp> = store
         .find_events("fast-stats novelty merge outcome")
         .into_iter()
-        .map(|e| {
-            (
-                e.fields.get("outcome").cloned().unwrap_or_default(),
-                e.fields
-                    .get("duplicates")
-                    .and_then(|d| d.parse::<u64>().ok())
-                    .unwrap_or(0),
-            )
+        .map(|e| Stamp {
+            site: e.fields.get("site").cloned().unwrap_or_default(),
+            outcome: e.fields.get("outcome").cloned().unwrap_or_default(),
+            duplicates: e
+                .fields
+                .get("duplicates")
+                .and_then(|d| d.parse::<u64>().ok())
+                .unwrap_or(0),
         })
         .collect();
 
@@ -356,29 +465,44 @@ async fn issue_1391_duplicate_novelty_asserts_do_not_inflate_stats_counts() {
     }
     drop(tracing_guard);
 
-    // The merge must have actually reconciled against the base index, and
-    // must have found duplicates — otherwise every count below could be
-    // right for the wrong reason (an assembly that quietly took the estimate
-    // lane on a fixture with no duplicates in it).
-    if !merges.iter().any(|(outcome, _)| outcome == "reconciled") {
-        failures.push(format!(
-            "no `reconciled` fast-stats merge was stamped — the user-facing \
-             count surfaces declined to the estimate lane [stamps: {merges:?}]"
-        ));
-    }
-    let duplicates: u64 = merges
-        .iter()
-        .filter(|(outcome, _)| outcome == "reconciled")
-        .map(|(_, d)| *d)
-        .max()
-        .unwrap_or(0);
-    if duplicates < 4 {
-        failures.push(format!(
-            "the reconciling merge found only {duplicates} duplicate novelty \
-             facts; the fixture restates seven already-indexed ones (w1's \
-             type/name/size, w2's type/name, g1's type/partOf), so this pin \
-             is not exercising the bug [stamps: {merges:?}]"
-        ));
+    // Each asserted surface must have reconciled ON ITS OWN SITE, and must
+    // have found the duplicates the fixture plants. A shared stamp label would
+    // let any one reconciling assembly satisfy the guard for all four, so the
+    // check names the lane it means. The `duplicates` floors are what stop a
+    // count from being right for the wrong reason — an assembly that quietly
+    // took the estimate lane, or one walking a window with nothing duplicated
+    // in it.
+    //
+    // The fixture restates seven already-indexed facts (w1's type/name/size,
+    // w2's type/name, g1's type/partOf). `apoc.meta.data`'s rollup skips
+    // `rdf:type` — it tracks class membership separately — so it sees four of
+    // them; the whole-window walks see all seven.
+    for (site, floor) in [
+        ("ledger-info-full", 7),
+        ("ledger-info-fast", 7),
+        ("apoc-meta-data", 4),
+        ("merged-stats", 7),
+    ] {
+        let reconciled: Vec<&Stamp> = merges
+            .iter()
+            .filter(|m| m.site == site && m.outcome == "reconciled")
+            .collect();
+        if reconciled.is_empty() {
+            failures.push(format!(
+                "`{site}` never stamped a `reconciled` merge — that surface \
+                 declined to the estimate lane, or the test never reached it \
+                 [stamps: {merges:?}]"
+            ));
+            continue;
+        }
+        let best = reconciled.iter().map(|m| m.duplicates).max().unwrap_or(0);
+        if best < floor {
+            failures.push(format!(
+                "`{site}` reconciled but found only {best} duplicate novelty \
+                 facts (expected at least {floor}) — this pin is not \
+                 exercising the bug on that surface [stamps: {merges:?}]"
+            ));
+        }
     }
 
     // -- Phase 2: the generic pipeline (kill-switch reference) -------------
@@ -423,16 +547,15 @@ async fn issue_1391_duplicate_novelty_asserts_do_not_inflate_stats_counts() {
     }
 
     for (class, property, _, expected) in CASES {
-        match apoc_count(&apoc_fast, class, property) {
-            Some(actual) if actual == *expected => {}
-            Some(actual) => failures.push(format!(
+        // `apoc.meta.data` emits a row only while the count is above zero, so a
+        // missing row reads as zero — which is the correct answer for a
+        // property whose every fact has been retracted.
+        let actual = apoc_count(&apoc_fast, class, property).unwrap_or(0);
+        if actual != *expected {
+            failures.push(format!(
                 "apoc.meta.data reports {class} {property} = {actual}; a scan of \
-                 the same facts returns {expected} (duplicate novelty asserts \
-                 counted on top of the base index)"
-            )),
-            None => failures.push(format!(
-                "apoc.meta.data has no row for {class} {property} [rows: {apoc_fast:?}]"
-            )),
+                 the same facts returns {expected} [rows: {apoc_fast:?}]"
+            ));
         }
     }
 
@@ -449,16 +572,53 @@ async fn issue_1391_duplicate_novelty_asserts_do_not_inflate_stats_counts() {
         }
     }
     for (property, _, expected) in LEDGER_CASES {
-        match info_count(&properties, property) {
-            Some(actual) if actual == *expected => {}
-            Some(actual) => failures.push(format!(
+        // A property whose every fact is retracted is legitimately dropped from
+        // the rendered stats, so "absent" reads as zero here.
+        let actual = info_count(&properties, property).unwrap_or(0);
+        if actual != *expected {
+            failures.push(format!(
                 "`fluree info` reports {property} count {actual}; a scan returns \
-                 {expected}"
+                 {expected} [properties: {properties}]"
+            ));
+        }
+    }
+
+    // The fast `ledger_info` arm is a separate call site from the default one
+    // and must agree with it fact for fact.
+    for (class, _, expected) in CLASS_CASES {
+        match info_count(&classes_fast_arm, class) {
+            Some(actual) if actual == *expected => {}
+            other => failures.push(format!(
+                "`fluree info` (realtime_property_details=false) reports {class} \
+                 instance count {other:?}; a scan returns {expected}"
             )),
-            None => failures.push(format!(
-                "`fluree info` has no property entry for {property} \
-                 [properties: {properties}]"
-            )),
+        }
+    }
+    for (property, _, expected) in LEDGER_CASES {
+        let actual = info_count(&properties_fast_arm, property).unwrap_or(0);
+        if actual != *expected {
+            failures.push(format!(
+                "`fluree info` (realtime_property_details=false) reports \
+                 {property} count {actual}; a scan returns {expected}"
+            ));
+        }
+    }
+
+    // `db.propertyKeys()` is the one count-sensitive output of `merged_stats`.
+    for key in PROPERTY_KEYS_PRESENT {
+        if !keys.contains(&iri(key)) {
+            failures.push(format!(
+                "db.propertyKeys() omits {key}, which still has facts [keys: {keys:?}]"
+            ));
+        }
+    }
+    for key in PROPERTY_KEYS_ABSENT {
+        if keys.contains(&iri(key)) {
+            failures.push(format!(
+                "db.propertyKeys() still lists {key} — every one of its facts was \
+                 retracted, and only a duplicate re-assert counted on top of the \
+                 base index keeps its merged count above zero [keys: {keys:?}]"
+            ));
         }
     }
 
@@ -468,4 +628,108 @@ async fn issue_1391_duplicate_novelty_asserts_do_not_inflate_stats_counts() {
         failures.len(),
         failures.join("\n\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cost of reconciliation (#1391 asked for a measurement, not an assertion)
+// ---------------------------------------------------------------------------
+
+/// A/B the two merge modes over a synthetic novelty window at the sizes the
+/// `MAX_RECONCILED_NOVELTY_FLAKES` cap permits, so the cap's cost is a number
+/// rather than a claim.
+///
+/// Worst case by construction: every novelty flake restates an already-indexed
+/// fact on a distinct `(graph, subject, predicate)`, so the probe cache misses
+/// on every one and issues its maximum base scans. Real windows share `(s, p)`
+/// across values and carry genuinely new subjects (whose dictionary lookup
+/// misses cheaply), so they land well under this.
+///
+/// Ignored by default — it is a timing measurement, not a pin. Run with:
+///
+/// ```text
+/// cargo test --release -p fluree-db-api --features native \
+///     --test it_fast_stats_1391_regression -- --ignored --nocapture
+/// ```
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "timing measurement; run with --ignored --nocapture"]
+async fn issue_1391_reconciliation_cost() {
+    for subjects in [5_000usize, 24_000] {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let fluree = FlureeBuilder::file(path).build().expect("build Fluree");
+        let alias = "r1391/cost:main";
+        let index_config = IndexConfig {
+            reindex_min_bytes: 5_000_000_000,
+            reindex_max_bytes: 5_000_000_000,
+        };
+        // Two facts per subject => `2 * subjects` novelty flakes, each on its
+        // own (s, p).
+        let doc = |n: usize| {
+            let graph: Vec<Value> = (0..n)
+                .map(|i| {
+                    json!({
+                        "@id": format!("ex:s{i}"),
+                        "@type": "ex:Thing",
+                        "ex:name": format!("n{i}")
+                    })
+                })
+                .collect();
+            json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": graph})
+        };
+
+        let ledger = fluree.create_ledger(alias).await.expect("create_ledger");
+        let _ = fluree
+            .insert_with_opts(
+                ledger,
+                &doc(subjects),
+                TxnOpts::default(),
+                CommitOpts::default(),
+                &index_config,
+            )
+            .await
+            .expect("base insert");
+        fluree
+            .reindex(alias, ReindexOptions::default())
+            .await
+            .expect("reindex");
+        let ledger = fluree.ledger(alias).await.expect("reload");
+        // Restate all of it: every flake is a duplicate of a base fact.
+        let _ = fluree
+            .insert_with_opts(
+                ledger,
+                &doc(subjects),
+                TxnOpts::default(),
+                CommitOpts::default(),
+                &index_config,
+            )
+            .await
+            .expect("duplicate insert");
+
+        let ledger = fluree.ledger(alias).await.expect("reload");
+        let indexed = ledger.snapshot.stats.clone().unwrap_or_default();
+        let flakes = ledger.novelty.len();
+
+        let time_it = |merge| {
+            let start = std::time::Instant::now();
+            let stats = fluree_db_novelty::assemble_fast_stats_with(
+                &indexed,
+                &ledger.snapshot,
+                ledger.novelty.as_ref(),
+                ledger.t(),
+                None,
+                merge,
+            );
+            (start.elapsed(), stats.flakes)
+        };
+
+        let (estimate, est_flakes) = time_it(fluree_db_novelty::NoveltyMerge::Estimate);
+        let (reconciled, rec_flakes) =
+            time_it(fluree_db_novelty::NoveltyMerge::Reconciled { site: "cost-probe" });
+
+        println!(
+            "novelty={flakes:>6} flakes  estimate={estimate:>10.2?} (flakes {est_flakes})  \
+             reconciled={reconciled:>10.2?} (flakes {rec_flakes})  ratio={:.1}x",
+            reconciled.as_secs_f64() / estimate.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+    }
 }
