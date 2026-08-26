@@ -3536,14 +3536,23 @@ fn skolem_namespace_flag_controls_cross_ledger_blank_node_identity() {
 // #1466 — table output must never Debug-print an internal binding
 // ============================================================================
 
-/// End-to-end version of the reported repro: an indexed ledger with a subject
-/// whose triples arrived after the index snapshot, joined in through an indexed
-/// literal, rendered as a table.
+/// The fix, end to end through the real binary: an indexed ledger, a subject
+/// whose triples arrived after the index snapshot, and a `--format table`
+/// render that has to resolve that subject from novelty.
 ///
-/// The bug printed `EncodedSid { s_id: .., t: None, op: None }` in the `kind`
-/// column. The renderer-level guards live in `output.rs`; this pins the whole
-/// pipeline (insert, index, insert, `query --format table`) so a regression
-/// anywhere along it — not just in the resolver — is caught.
+/// The bug printed `EncodedSid { s_id: .., t: None, op: None }` into a cell.
+///
+/// The query shape matters. Joining the novelty subject in through a *literal*
+/// — the reported repro's shape — never reaches the arm this fixes: subjects
+/// arrive at the formatter already materialized as `Binding::Sid`, so that
+/// version of this test passed with the whole `EncodedSid` arm deleted. Joining
+/// through a *reference* edge against a typed object keeps `?s`
+/// late-materialized, which is what puts a novelty-only `EncodedSid` in front
+/// of the renderer. `output.rs`'s
+/// `novelty_only_encoded_sid_from_a_real_query_renders_its_iri` asserts that
+/// property directly on the batch; this pins the same shape through the whole
+/// pipeline (insert, index, insert, query), so a regression anywhere along it —
+/// not just in the resolver — is caught.
 #[test]
 fn table_output_renders_novelty_only_subject_after_index() {
     let tmp = TempDir::new().unwrap();
@@ -3558,9 +3567,9 @@ fn table_output_renders_novelty_only_subject_after_index() {
         .args([
             "insert",
             "-e",
-            "<urn:x1> <urn:indexed-prop> \"val1\" . \
+            "<urn:x1> a <urn:Target> ; <urn:indexed-prop> \"val1\" . \
              <urn:s1> <urn:ref> \"val1\" ; <urn:content> \"c1\" ; \
-             a <urn:Probe> .",
+             <urn:knows> <urn:x1> ; a <urn:Probe> .",
         ])
         .assert()
         .success();
@@ -3573,7 +3582,7 @@ fn table_output_renders_novelty_only_subject_after_index() {
             "-e",
             "<urn:x2> <urn:indexed-prop> \"val2\" . \
              <urn:m9> <urn:ref> \"val2\" ; <urn:content> \"probe content\" ; \
-             a <urn:Probe> .",
+             <urn:knows> <urn:x1> ; a <urn:Probe> .",
         ])
         .assert()
         .success();
@@ -3584,18 +3593,18 @@ fn table_output_renders_novelty_only_subject_after_index() {
             "--format",
             "table",
             "--sparql",
-            "SELECT ?m ?kind ?content WHERE { \
-               ?x <urn:indexed-prop> ?v . \
-               ?m <urn:ref> ?v ; <urn:content> ?content ; a ?kind . }",
+            "SELECT ?s ?o WHERE { \
+               ?s <urn:knows> ?o . \
+               ?o a <urn:Target> . }",
         ])
         .assert()
         .success()
         .stdout(predicate::str::contains("urn:m9"))
-        .stdout(predicate::str::contains("probe content"))
+        .stdout(predicate::str::contains("urn:s1"))
         // The reported symptom, and the placeholder that replaced it: neither
         // belongs in a correct render.
         .stdout(predicate::str::contains("EncodedSid").not())
         .stdout(predicate::str::contains("EncodedPid").not())
         .stdout(predicate::str::contains("EncodedLit").not())
-        .stdout(predicate::str::contains("<unresolved>").not());
+        .stdout(predicate::str::contains("(unresolved ").not());
 }
