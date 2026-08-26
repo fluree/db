@@ -68,7 +68,6 @@ pub mod import_source;
 mod indexer_attachment_provider;
 #[cfg(not(target_arch = "wasm32"))]
 mod indexer_fulltext_provider;
-pub mod wasm_compat;
 mod inline_ontology;
 #[cfg(feature = "shacl")]
 mod inline_shapes;
@@ -106,6 +105,7 @@ pub mod vector_worker;
 pub mod vended_credentials;
 pub mod verify;
 pub mod view;
+pub mod wasm_compat;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod wire;
 
@@ -1408,7 +1408,9 @@ pub fn spawn_local_cache_event_listener(
     event_bus: Arc<fluree_db_nameservice::LedgerEventBus>,
     ledger_manager: Arc<LedgerManager>,
 ) {
-    tokio::spawn(async move {
+    // spawn_detached: tokio::spawn on native (as before); the browser event
+    // loop on wasm32, where builds run without an ambient tokio runtime.
+    crate::wasm_compat::spawn_detached(async move {
         let mut subscription = event_bus.subscribe(fluree_db_nameservice::SubscriptionScope::all());
         drop(event_bus);
 

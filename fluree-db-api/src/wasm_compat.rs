@@ -11,6 +11,31 @@ pub use fluree_db_indexer::{
     IndexerHandle, DEFAULT_MAX_OLD_INDEXES,
 };
 
+/// Spawn a fire-and-forget background task.
+///
+/// Native: `tokio::spawn` on the ambient runtime, exactly as call sites did
+/// before this seam existed (the discarded `JoinHandle` included).
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+pub fn spawn_detached<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(fut);
+}
+
+/// wasm32: there is no tokio runtime to attach to (`tokio::spawn` panics
+/// "must be called from within a runtime"); the browser event loop is the
+/// executor, reached through `wasm_bindgen_futures::spawn_local`.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+pub fn spawn_detached<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    wasm_bindgen_futures::spawn_local(fut);
+}
+
 #[cfg(target_arch = "wasm32")]
 mod stubs {
     /// Mirrors `fluree_db_indexer::gc::DEFAULT_MAX_OLD_INDEXES`.

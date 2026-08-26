@@ -14,13 +14,14 @@ use super::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
 use crate::format::column_block::ColumnId;
 use crate::format::run_record::RunSortOrder;
 use crate::format::run_record_v2::RunRecordV2;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::GraphId;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -96,34 +97,40 @@ pub fn batched_lookup_predicate_refs(
     let subjects_with_hits = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Heartbeat thread: emits progress even if we stall inside cursor.next_batch().
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-    let hb_scanned_batches = Arc::clone(&scanned_batches);
-    let hb_scanned_rows = Arc::clone(&scanned_rows);
-    let hb_chunk_idx = Arc::clone(&current_chunk_idx);
-    let hb_hits = Arc::clone(&subjects_with_hits);
-    let hb_started = started_all;
-    let hb = std::thread::spawn(move || loop {
-        match stop_rx.recv_timeout(HEARTBEAT_INTERVAL) {
-            Ok(()) => return,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let b = hb_scanned_batches.load(std::sync::atomic::Ordering::Relaxed);
-                let r = hb_scanned_rows.load(std::sync::atomic::Ordering::Relaxed);
-                let c = hb_chunk_idx.load(std::sync::atomic::Ordering::Relaxed);
-                let h = hb_hits.load(std::sync::atomic::Ordering::Relaxed);
-                tracing::debug!(
-                    g_id,
-                    p_id,
-                    chunk_idx = c,
-                    scanned_batches = b,
-                    scanned_rows = r,
-                    subjects_with_hits = h,
-                    elapsed_ms = hb_started.elapsed().as_millis() as u64,
-                    "batched_lookup_predicate_refs: heartbeat"
-                );
+    // Telemetry only — wasm32 cannot spawn threads (`std::thread::spawn`
+    // panics there), so the heartbeat is native-only.
+    #[cfg(not(target_arch = "wasm32"))]
+    let (stop_tx, hb) = {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let hb_scanned_batches = Arc::clone(&scanned_batches);
+        let hb_scanned_rows = Arc::clone(&scanned_rows);
+        let hb_chunk_idx = Arc::clone(&current_chunk_idx);
+        let hb_hits = Arc::clone(&subjects_with_hits);
+        let hb_started = started_all;
+        let hb = std::thread::spawn(move || loop {
+            match stop_rx.recv_timeout(HEARTBEAT_INTERVAL) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let b = hb_scanned_batches.load(std::sync::atomic::Ordering::Relaxed);
+                    let r = hb_scanned_rows.load(std::sync::atomic::Ordering::Relaxed);
+                    let c = hb_chunk_idx.load(std::sync::atomic::Ordering::Relaxed);
+                    let h = hb_hits.load(std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(
+                        g_id,
+                        p_id,
+                        chunk_idx = c,
+                        scanned_batches = b,
+                        scanned_rows = r,
+                        subjects_with_hits = h,
+                        elapsed_ms = hb_started.elapsed().as_millis() as u64,
+                        "batched_lookup_predicate_refs: heartbeat"
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-        }
-    });
+        });
+        (stop_tx, hb)
+    };
 
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         current_chunk_idx.store(chunk_idx as u64, std::sync::atomic::Ordering::Relaxed);
@@ -200,8 +207,11 @@ pub fn batched_lookup_predicate_refs(
     }
 
     // Stop heartbeat.
-    let _ = stop_tx.send(());
-    let _ = hb.join();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = stop_tx.send(());
+        let _ = hb.join();
+    }
 
     tracing::debug!(
         g_id,
