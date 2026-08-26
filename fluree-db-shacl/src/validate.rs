@@ -756,6 +756,21 @@ fn validate_shape<'a>(
             results.extend(constraint_results);
         }
 
+        // SPARQL-based constraints (sh:sparql) on the node shape: each runs
+        // its SELECT with $this pre-bound; every solution is a violation.
+        for constraint in &shape.sparql_constraints {
+            let sparql_results = crate::sparql::validate_sparql_constraint(
+                db,
+                focus_node,
+                constraint,
+                None,
+                shape.severity,
+                &shape.id,
+            )
+            .await?;
+            results.extend(sparql_results);
+        }
+
         active.lock().remove(&guard_key);
         Ok(results)
     })
@@ -1733,6 +1748,25 @@ async fn validate_property_shape<'a>(
             graph_id: None,
         });
         return Ok(results);
+    }
+
+    // SPARQL-based constraints (sh:sparql) on this property shape: each runs
+    // its SELECT with $this pre-bound; solutions are violations. Runs before
+    // value-node collection since the query is independent of the path's
+    // value nodes (the shape's predicate path only backs sh:resultPath when
+    // the solution doesn't bind ?path).
+    for constraint in &prop_shape.sparql_constraints {
+        results.extend(
+            crate::sparql::validate_sparql_constraint(
+                db,
+                focus_node,
+                constraint,
+                prop_shape.path.as_predicate(),
+                prop_shape.severity,
+                &prop_shape.id,
+            )
+            .await?,
+        );
     }
 
     // Get all value nodes reached by this property shape's path on the focus node.
@@ -3115,6 +3149,7 @@ mod tests {
             name: None,
             message: None,
             deactivated: false,
+            sparql_constraints: vec![],
         };
 
         let key = ShaclCacheKey::new("test", 1);
@@ -3177,6 +3212,7 @@ mod tests {
             name: None,
             message: None,
             deactivated: false,
+            sparql_constraints: vec![],
         };
 
         let key = ShaclCacheKey::new("test", 1);

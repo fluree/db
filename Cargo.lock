@@ -3178,6 +3178,7 @@ dependencies = [
  "async-trait",
  "fluree-db-core",
  "fluree-db-query",
+ "fluree-db-sparql",
  "fluree-vocab",
  "parking_lot",
  "regex",
