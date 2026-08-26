@@ -449,3 +449,58 @@ async fn nested_loop_join_probe_rows_are_visible_to_fuel() {
          probe side is invisible to max_fuel"
     );
 }
+
+/// The `IN`-over-resources bug was never SPARQL-specific: JSON-LD `filter`
+/// expressions lower to the same IR and run through the same `eval_in`, so
+/// the encoded-vs-IRI mismatch dropped every row there too. Twin of
+/// `filter_in_matches_encoded_iri_bindings`, per the SPARQL/JSON-LD parity
+/// rule for shared-IR fixes.
+#[tokio::test]
+async fn jsonld_filter_in_matches_encoded_iri_bindings() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree).await;
+    let (b, c) = (entity_b(), entity_c());
+
+    let db = fluree.db(LEDGER_ID).await.expect("db");
+    let rows_for = |expr: String| {
+        let fluree = &fluree;
+        let db = &db;
+        async move {
+            let q = json!({
+                "@context": { "ns": "http://example.org/ns#" },
+                "select": ["?ev"],
+                "where": [
+                    { "@id": "?ev", "ns:entity2": "?b" },
+                    ["filter", expr]
+                ]
+            });
+            fluree
+                .query(db, &q)
+                .await
+                .expect("query")
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("format")
+                .as_array()
+                .expect("rows array")
+                .len()
+        }
+    };
+
+    assert_eq!(
+        rows_for(format!("(in ?b [(iri \"{b}\")])")).await,
+        1,
+        "single-element IN over an encoded ref binding"
+    );
+    assert_eq!(
+        rows_for(format!("(in ?b [(iri \"{b}\") (iri \"{c}\")])")).await,
+        2,
+        "two-element IN over encoded ref bindings"
+    );
+    assert_eq!(
+        rows_for("(in ?b [(iri \"http://example.org/item/none\")])".to_string()).await,
+        0,
+        "absent IRI matches nothing"
+    );
+}
