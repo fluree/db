@@ -2739,7 +2739,7 @@ mem:fact-01kynrrhdfqt0n6rx1wpcv5843 a mem:Fact ;
     mem:rationale "Answers \"would batching help existing-subject upserts?\" with measurements — avoids speculative batching work; documents the store-cached p_sid_table invariant (store immutable behind Arc → OnceLock safe)." .
 
 mem:fact-01m0srrpntk3mxseprnpcvey08 a mem:Fact ;
-    mem:content "REVERTED, do not re-land as written: lowering star-block VALUES to FILTER(?v IN ...) at block assembly (convert_star_values_to_membership_filters) did not work. inline_singleton_values_objects rewrites a singleton VALUES into the triple object but RETAINS the VALUES pattern, so its var is no longer produced by any star triple, membership_filter_from_values declines it, and the all-or-nothing gate declines the whole block — which is exactly the two-VALUES repro shape. Measured: 0 firings across the 6 tests that shipped with it, 1 across the whole 349-test SPARQL group. Where it does fire it is SLOWER: Function::In yields no range constraint from extract_range_constraints, so the block carries no object_bounds, has_selective_anchor is false, and it leaves the fused PropertyJoinOperator for the NLJ chain. Push the constraint down as a SEED that keeps the star anchored, not a filter that unanchors it." ;
+    mem:content "REVERTED, do not re-land as written: lowering star-block VALUES to FILTER(?v IN ...) at block assembly failed two ways. inline_singleton_values_objects rewrites a singleton VALUES into the triple object but RETAINS the VALUES pattern, so membership_filter_from_values declines its var and the all-or-nothing gate declines the whole block — exactly the two-VALUES repro shape; 1 firing across the 349-test SPARQL group. Where it does fire it is SLOWER: Function::In yields no object_bounds, has_selective_anchor goes false, and the block leaves the fused PropertyJoinOperator for the NLJ chain. Push the constraint down as a SEED that keeps the star anchored, not a filter that unanchors it." ;
     mem:tag "performance" ;
     mem:tag "planner" ;
     mem:tag "reverted" ;
@@ -2751,7 +2751,7 @@ mem:fact-01m0srrpntk3mxseprnpcvey08 a mem:Fact ;
     mem:artifactRef "fluree-db-query/src/planner.rs" ;
     mem:branch "fix/values-object-scan-constraint" ;
     mem:createdAt "2026-08-24T11:33:51.418875+00:00"^^xsd:dateTime ;
-    mem:updatedAt "2026-08-25T23:36:20.896572+00:00"^^xsd:dateTime ;
+    mem:updatedAt "2026-08-26T13:52:55.183934+00:00"^^xsd:dateTime ;
     mem:rationale "The approach looks obviously right and was already tried and reverted; the singleton-fold interaction and the missing object_bounds are the two things that kill it." .
 
 mem:fact-01m0srrz87xpy9dy11z0b084hv a mem:Fact ;
