@@ -13,7 +13,6 @@
 use crate::wasm_compat::memmap2;
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -25,7 +24,6 @@ use fluree_db_core::{ContentId, ContentStore};
 
 /// Global atomic counter for unique temp file names (avoids collisions
 /// across concurrent pack fetches within the same process).
-#[cfg(not(target_arch = "wasm32"))]
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ============================================================================
@@ -397,13 +395,6 @@ fn validate_meta(
 /// with the async `ContentStore::get`. This pattern works on both single-thread
 /// and multi-thread Tokio runtimes (unlike `block_in_place` which requires
 /// multi-thread).
-/// wasm32 lazy pack load: no filesystem and no sync→async bridge — serve the
-/// content store's residency tier (`resolve_cached_bytes`) with shared,
-/// zero-copy backing, surfacing a typed
-/// [`crate::read::need_fetch::NeedFetch`] miss for an async caller to fetch
-/// and retry. The surrounding `OnceCell` makes a successful load one-time,
-/// exactly as on native.
-#[cfg(target_arch = "wasm32")]
 fn fetch_and_load(
     expected_first_id: u64,
     expected_last_id: u64,
@@ -411,26 +402,23 @@ fn fetch_and_load(
     cache_path: &Path,
     ctx: &LoadContext,
 ) -> io::Result<LazyLoaded> {
-    let _ = cache_path;
-    let bytes = crate::read::need_fetch::resident_or_need_fetch(
-        ctx.cs.as_ref(),
-        pack_cid,
-        crate::read::need_fetch::FetchKind::ForwardPack,
-    )?;
-    let backing = LoadedBacking::InMemory(bytes);
-    let meta = parse_pack_meta(backing.bytes())?;
-    validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
-    Ok(LazyLoaded { meta, backing })
-}
+    // Residency-mode stores: serve the residency tier with shared zero-copy
+    // backing; a miss surfaces as `NeedFetch` (recorded in the miss
+    // register). The surrounding `OnceCell` makes a successful load
+    // one-time, exactly as on native. Checked before any filesystem probe.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    if ctx.cs.miss_register().is_some() {
+        let bytes = crate::read::need_fetch::resident_or_need_fetch(
+            ctx.cs.as_ref(),
+            pack_cid,
+            crate::read::need_fetch::FetchKind::ForwardPack,
+        )?;
+        let backing = LoadedBacking::InMemory(bytes);
+        let meta = parse_pack_meta(backing.bytes())?;
+        validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
+        return Ok(LazyLoaded { meta, backing });
+    }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn fetch_and_load(
-    expected_first_id: u64,
-    expected_last_id: u64,
-    pack_cid: &ContentId,
-    cache_path: &Path,
-    ctx: &LoadContext,
-) -> io::Result<LazyLoaded> {
     // Fast paths: check if something appeared since construction.
     if let Some(path) = ctx.cs.resolve_local_path(pack_cid) {
         let backing = load_pack_backing(&path)?;
@@ -638,7 +626,6 @@ fn touch_pages(bytes: &[u8]) -> u64 {
 ///
 /// Ensures the parent directory exists so lazy fetches succeed even if the
 /// cache directory was removed between construction and first lookup.
-#[cfg(not(target_arch = "wasm32"))]
 fn atomic_write_to_cache(cache_path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)?;

@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
-#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use fluree_db_core::ids::DatatypeDictId;
@@ -40,7 +39,6 @@ use crate::format::run_record::RunSortOrder;
 use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid};
 use super::leaflet_cache::LeafletCache;
 
-#[cfg(not(target_arch = "wasm32"))]
 const HOT_REMOTE_LEAF_PROMOTION_TOUCHES: usize = 2;
 #[cfg(not(target_arch = "wasm32"))]
 const CAS_HELPER_RUNTIME_THREADS: usize = 2;
@@ -80,7 +78,6 @@ pub(crate) struct DictionarySet {
 /// the storage backend's own request timeout (e.g. S3's 35s send_timeout).
 /// Applied by the leaf, dict, and pack read bridges so a stalled fetch becomes
 /// a bounded error instead of an unbounded block.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn cas_sync_timeout() -> Option<Duration> {
     std::env::var("FLUREE_CAS_SYNC_TIMEOUT_MS")
         .ok()
@@ -240,9 +237,10 @@ pub enum SharedLeafBytes {
     Mmap(Arc<memmap2::Mmap>),
     Owned(Vec<u8>),
     /// Zero-copy view of the content store's resident tier
-    /// (`resolve_cached_bytes`). wasm32-only so native match sites and
-    /// layout stay exactly as they were.
-    #[cfg(target_arch = "wasm32")]
+    /// (`resolve_cached_bytes`). Compiled only for residency-capable builds
+    /// (wasm32, or native with the `residency` feature) so default native
+    /// match sites and layout stay exactly as they were.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     Shared(Arc<[u8]>),
 }
 
@@ -252,7 +250,7 @@ impl std::ops::Deref for SharedLeafBytes {
         match self {
             SharedLeafBytes::Mmap(mmap) => mmap,
             SharedLeafBytes::Owned(bytes) => bytes,
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
             SharedLeafBytes::Shared(bytes) => bytes,
         }
     }
@@ -277,7 +275,6 @@ pub struct BinaryIndexStore {
     cache_dir: PathBuf,
     /// Shared disk artifact cache — kept alive here so the global `CACHE_REGISTRY`
     /// weak ref survives across calls, avoiding repeated dir scans on every write.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     disk_cache: Arc<super::artifact_cache::DiskArtifactCache>,
     leaflet_cache: Option<Arc<LeafletCache>>,
     /// Remote leaf metadata cache keyed by leaf CID.
@@ -289,7 +286,6 @@ pub struct BinaryIndexStore {
     ///
     /// Once a remote leaf is touched repeatedly, we promote it to the local
     /// disk cache so subsequent opens use `FullBlobLeafHandle`.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     remote_leaf_open_counts: RwLock<HashMap<ContentId, usize>>,
     max_t: i64,
     base_t: i64,
@@ -640,7 +636,6 @@ impl BinaryIndexStore {
         );
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn note_remote_leaf_open(&self, leaf_cid: &ContentId) -> usize {
         let mut counts = self.remote_leaf_open_counts.write();
         let count = counts.entry(leaf_cid.clone()).or_insert(0);
@@ -655,18 +650,39 @@ impl BinaryIndexStore {
     /// through this instead of [`Self::get_leaf_bytes_sync`], which copies
     /// the full file into a fresh `Vec` on every call.
     pub fn get_leaf_bytes_shared(&self, leaf_cid: &ContentId) -> io::Result<SharedLeafBytes> {
-        #[cfg(target_arch = "wasm32")]
-        return self
-            .resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf)
-            .map(SharedLeafBytes::Shared);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self
+                .resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf)
+                .map(SharedLeafBytes::Shared);
+        }
         self.get_leaf_bytes_shared_native(leaf_cid)
     }
 
-    /// wasm32 residency tier: serve `cid` from the content store's
+    /// True when the content store carries a sync residency tier (it exposes
+    /// a miss register): sync reads are then served exclusively from
+    /// `resolve_cached_bytes` + `NeedFetch` misses, never the filesystem or
+    /// bridge tiers. Always true for browser stores; native stores opt in
+    /// (tests) by exposing a register.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    pub(crate) fn residency_mode(&self) -> bool {
+        self.cas
+            .as_ref()
+            .is_some_and(|cs| cs.miss_register().is_some())
+    }
+
+    /// The CAS content store backing this index, when one is configured.
+    /// Residency retry frames use it to drain the miss register and fetch
+    /// wants; see [`super::need_fetch::RetryBudget`].
+    pub fn content_store(&self) -> Option<&Arc<dyn ContentStore>> {
+        self.cas.as_ref()
+    }
+
+    /// Residency tier: serve `cid` from the content store's
     /// `resolve_cached_bytes` or surface a typed [`super::need_fetch::NeedFetch`]
-    /// miss for an async caller to fetch and retry. No I/O, no blocking.
-    #[cfg(target_arch = "wasm32")]
+    /// miss (recorded in the store's miss register) for an async caller to
+    /// fetch and retry. No I/O, no blocking.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     fn resident_leaf_bytes(
         &self,
         cid: &ContentId,
@@ -679,7 +695,6 @@ impl BinaryIndexStore {
         super::need_fetch::resident_or_need_fetch(cs.as_ref(), cid, kind)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn get_leaf_bytes_shared_native(&self, leaf_cid: &ContentId) -> io::Result<SharedLeafBytes> {
         if let Some(cs) = self.cas.as_ref() {
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
@@ -714,15 +729,15 @@ impl BinaryIndexStore {
     }
 
     pub fn get_leaf_bytes_sync(&self, leaf_cid: &ContentId) -> io::Result<Vec<u8>> {
-        #[cfg(target_arch = "wasm32")]
-        return self
-            .resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf)
-            .map(|bytes| bytes.to_vec());
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self
+                .resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf)
+                .map(|bytes| bytes.to_vec());
+        }
         self.get_leaf_bytes_sync_native(leaf_cid)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn get_leaf_bytes_sync_native(&self, leaf_cid: &ContentId) -> io::Result<Vec<u8>> {
         let cs = self
             .cas
@@ -795,17 +810,19 @@ impl BinaryIndexStore {
         sidecar_cid: Option<&ContentId>,
         need_replay: bool,
     ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
-        #[cfg(target_arch = "wasm32")]
-        return self.open_resident_leaf_handle(leaf_cid, sidecar_cid, need_replay);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self.open_resident_leaf_handle(leaf_cid, sidecar_cid, need_replay);
+        }
         self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay)
     }
 
-    /// wasm32 leaf open: whole leaf (and sidecar when replaying) must be
-    /// resident; a miss surfaces as `NeedFetch`. The local-path/mmap and
-    /// range-read tiers don't exist here — there is no filesystem, and the
-    /// residency tier already holds full blobs.
-    #[cfg(target_arch = "wasm32")]
+    /// Residency-mode leaf open: whole leaf (and sidecar when replaying)
+    /// must be resident; a miss surfaces as `NeedFetch` and is recorded in
+    /// the miss register. The local-path/mmap and range-read tiers are
+    /// bypassed — on wasm there is no filesystem, and the residency tier
+    /// holds full blobs.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     fn open_resident_leaf_handle(
         &self,
         leaf_cid: &ContentId,
@@ -826,7 +843,6 @@ impl BinaryIndexStore {
         )?))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn open_leaf_handle_native(
         &self,
         leaf_cid: &ContentId,
@@ -944,7 +960,6 @@ impl BinaryIndexStore {
     /// directory served from the shared `LeafletCache`. The raw bytes stay in OS
     /// page cache (only touched pages fault in) — no whole-blob copy, and the
     /// directory is parsed once per leaf CID. See [`super::leaf_access::MmapLeafHandle`].
-    #[cfg(not(target_arch = "wasm32"))]
     fn open_mmapped_leaf(
         &self,
         path: &Path,
@@ -1030,15 +1045,14 @@ impl BinaryIndexStore {
             Some(cid) => cid,
             None => return Ok(None),
         };
-        #[cfg(target_arch = "wasm32")]
-        return self
-            .resident_leaf_bytes(sc_cid, super::need_fetch::FetchKind::HistorySidecar)
-            .map(|bytes| Some(bytes.to_vec()));
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let bytes = self.get_leaf_bytes_sync(sc_cid)?;
-            Ok(Some(bytes))
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self
+                .resident_leaf_bytes(sc_cid, super::need_fetch::FetchKind::HistorySidecar)
+                .map(|bytes| Some(bytes.to_vec()));
         }
+        let bytes = self.get_leaf_bytes_sync(sc_cid)?;
+        Ok(Some(bytes))
     }
 
     // ── Value decoding ─────────────────────────────────────────────
@@ -3018,7 +3032,6 @@ async fn load_per_graph_arenas(
 /// `BinaryIndexStore::get_leaf_bytes_sync()`.
 struct ContentStoreRangeFetcher {
     cs: Arc<dyn ContentStore>,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     cache_dir: PathBuf,
 }
 
@@ -3030,18 +3043,20 @@ impl ContentStoreRangeFetcher {
 
 impl super::leaf_access::RangeReadFetcher for ContentStoreRangeFetcher {
     fn fetch_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> io::Result<Vec<u8>> {
-        #[cfg(target_arch = "wasm32")]
-        return self.fetch_range_resident(id, range);
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.cs.miss_register().is_some() {
+            return self.fetch_range_resident(id, range);
+        }
         self.fetch_range_native(id, range)
     }
 }
 
 impl ContentStoreRangeFetcher {
-    /// wasm32: whole blobs live in the residency tier; serve the range as a
-    /// subslice copy with the same EOF-truncation semantics as the native
-    /// positional read. A miss surfaces as `NeedFetch` for the whole blob.
-    #[cfg(target_arch = "wasm32")]
+    /// Residency mode: whole blobs live in the residency tier; serve the
+    /// range as a subslice copy with the same EOF-truncation semantics as
+    /// the native positional read. A miss surfaces as `NeedFetch` for the
+    /// whole blob (recorded in the miss register).
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     fn fetch_range_resident(
         &self,
         id: &ContentId,
@@ -3058,7 +3073,6 @@ impl ContentStoreRangeFetcher {
         Ok(bytes[start..end].to_vec())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn fetch_range_native(
         &self,
         id: &ContentId,
@@ -3503,6 +3517,120 @@ pub(crate) mod tests {
                 "retry after failure at CAS call {fail_on} must not lose rows"
             );
         }
+    }
+
+    /// Residency mode, F1 multi-want: a scan's first leaf-open miss must
+    /// register the cursor's WHOLE remaining routed leaf set, so one retry
+    /// round fetches N leaves instead of learning one per round.
+    #[cfg(feature = "residency")]
+    #[test]
+    fn residency_miss_registers_remaining_routed_leaves() {
+        use crate::read::binary_cursor::BinaryCursor;
+        use crate::read::column_types::{BinaryFilter, ColumnProjection};
+        use crate::read::need_fetch::{tests::MissInjectingStore, FetchKind, NeedFetch};
+
+        let store = Arc::new(MissInjectingStore::new());
+
+        // Two single-leaflet leaves over disjoint POST key ranges.
+        let mut leaves = Vec::new();
+        for half in 0..2u64 {
+            let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+            writer.set_skip_history(true);
+            for i in 0..5u64 {
+                let s_id = half * 100 + i + 1;
+                writer
+                    .push_record(make_rec(s_id, 1, OType::XSD_INTEGER.as_u16(), s_id * 10, 1))
+                    .unwrap();
+            }
+            leaves.push(writer.finish().unwrap().remove(0));
+        }
+        let mut entries = Vec::new();
+        for info in &leaves {
+            let cid = run_sync_on_runtime({
+                let store = Arc::clone(&store);
+                let bytes = info.leaf_bytes.clone();
+                async move {
+                    store
+                        .inner
+                        .put(ContentKind::IndexLeaf, &bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("seed leaf");
+            entries.push(crate::format::branch::LeafEntry {
+                first_key: info.first_key,
+                last_key: info.last_key,
+                row_count: info.total_rows,
+                leaf_cid: cid,
+                sidecar_cid: None,
+            });
+        }
+        let leaf_cids: Vec<ContentId> = entries.iter().map(|e| e.leaf_cid.clone()).collect();
+
+        let cache_dir = temp_cache_dir();
+        let cs: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
+        let binary_store = Arc::new(empty_store(cs, cache_dir.clone()));
+        assert!(
+            binary_store.residency_mode(),
+            "a register-bearing store must put the read path in residency mode"
+        );
+        let branch = Arc::new(crate::format::branch::BranchManifest { leaves: entries });
+
+        let mut cursor = BinaryCursor::scan_all(
+            Arc::clone(&binary_store),
+            RunSortOrder::Post,
+            branch,
+            BinaryFilter::default(),
+            ColumnProjection::all(),
+        );
+
+        // First call: leaf 0 is not resident — typed miss, and the register
+        // must carry BOTH routed leaves, not just the one that failed.
+        let err = cursor.next_batch().expect_err("cold scan must miss");
+        let nf = NeedFetch::from_io_error(&err).expect("typed NeedFetch");
+        assert_eq!(nf.cid, leaf_cids[0]);
+        assert_eq!(nf.kind, FetchKind::IndexLeaf);
+        let register = binary_store
+            .content_store()
+            .and_then(|cs| cs.miss_register())
+            .expect("residency store exposes a register");
+        let wants = register.drain();
+        let want_cids: Vec<&ContentId> = wants.iter().map(|w| &w.cid).collect();
+        assert!(
+            want_cids.contains(&&leaf_cids[0]) && want_cids.contains(&&leaf_cids[1]),
+            "one miss must register the scan's whole routed want set, got {want_cids:?}"
+        );
+
+        // Fetch the whole want set (fetch-pins contract), then the SAME
+        // cursor completes without further misses.
+        run_sync_on_runtime({
+            let store = Arc::clone(&store);
+            async move {
+                let cs: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
+                let outcome = crate::read::need_fetch::fetch_wants(cs.as_ref(), wants, 4).await;
+                if outcome.newly_resident == outcome.wanted {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "failures: {:?}",
+                        outcome.failures
+                    )))
+                }
+            }
+        })
+        .expect("fetch whole want set");
+
+        let mut rows = 0u64;
+        loop {
+            match cursor.next_batch() {
+                Ok(Some(batch)) => rows += batch.row_count as u64,
+                Ok(None) => break,
+                Err(e) => panic!("no misses after the want set was pinned: {e}"),
+            }
+        }
+        assert_eq!(rows, 10, "both leaves' rows after one fetch round");
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]

@@ -156,7 +156,7 @@ impl LeafHandle for FullBlobLeafHandle {
 /// residency tier (`resolve_cached_bytes`) as `Arc<[u8]>`; this handle is
 /// [`FullBlobLeafHandle`] with shared instead of owned backing, so opening a
 /// resident leaf clones two `Arc`s and decodes the directory — no byte copy.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
 pub struct SharedBlobLeafHandle {
     bytes: Arc<[u8]>,
     dir: DecodedLeafDirV3,
@@ -164,7 +164,7 @@ pub struct SharedBlobLeafHandle {
     leaf_id: u128,
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
 impl SharedBlobLeafHandle {
     /// Create from resident leaf bytes and optional resident sidecar bytes.
     ///
@@ -181,7 +181,7 @@ impl SharedBlobLeafHandle {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
 impl LeafHandle for SharedBlobLeafHandle {
     fn dir(&self) -> &DecodedLeafDirV3 {
         &self.dir
