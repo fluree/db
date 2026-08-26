@@ -416,11 +416,10 @@ impl StorageRead for FileStorage {
         if range.end <= range.start {
             return Ok(Vec::new());
         }
-        let len = (range.end - range.start) as usize;
+        let requested = range.end - range.start;
         let offset = range.start;
         let address = address.to_owned();
         tokio::task::spawn_blocking(move || {
-            let mut buf = vec![0u8; len];
             let file = std::fs::File::open(&path).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     crate::error::Error::not_found(format!("{}: {}", address, path.display()))
@@ -428,6 +427,17 @@ impl StorageRead for FileStorage {
                     crate::error::Error::io(format!("Failed to open {}: {}", path.display(), e))
                 }
             })?;
+            // One stat off the open handle, serving both the zero-length guard
+            // and the clamp below: no extra syscall, and no window between the
+            // check and the read. `fstat` on a descriptor this thread owns does
+            // not fail in practice; if it ever did there would be nothing to
+            // size the read against, and saying so beats guessing a length.
+            let file_len = file
+                .metadata()
+                .map_err(|e| {
+                    crate::error::Error::io(format!("Failed to stat {}: {}", path.display(), e))
+                })?
+                .len();
             // The fourth read path, held to the same rule as the other three:
             // an empty file at a content address is debris, not content. A
             // ranged read would otherwise stop at EOF and hand back an empty
@@ -435,9 +445,8 @@ impl StorageRead for FileStorage {
             // replace with "absent". This arm is not hypothetical: once
             // `resolve_local_path` refuses the debris, the leaflet reader
             // falls through to `ContentStore::get_range`, which lands here for
-            // the very same file. Read off the open handle, so there is no
-            // extra stat and no window between the check and the read.
-            if file.metadata().map(|m| m.len() == 0).unwrap_or(false) {
+            // the very same file.
+            if file_len == 0 {
                 tracing::warn!(
                     address,
                     path = %path.display(),
@@ -450,6 +459,19 @@ impl StorageRead for FileStorage {
                     path.display()
                 )));
             }
+            // SIZE THE BUFFER FROM THE OBJECT, NOT FROM THE RANGE. The trait
+            // documents a ranged read as returning bytes that "may be shorter
+            // than requested if the object is smaller than `range.end`", and
+            // `mid..u64::MAX` is the established spelling of "read to the end"
+            // against it. Trusting the range's width made that spelling a
+            // `usize::MAX` allocation — a capacity-overflow panic that
+            // `spawn_blocking` caught and relabelled `Io("spawn_blocking
+            // failed: ...")`, so the one backend that could not serve the call
+            // was also the one that could not say why. The loops below already
+            // stop at EOF, so a range that fits reads exactly as before; this
+            // only stops the allocation from believing the caller.
+            let len = requested.min(file_len.saturating_sub(offset)) as usize;
+            let mut buf = vec![0u8; len];
             #[cfg(unix)]
             {
                 use std::os::unix::fs::FileExt;
@@ -1341,6 +1363,79 @@ mod tests {
             storage.read_byte_range(address, 0..4).await.unwrap(),
             b"real"
         );
+    }
+
+    /// `StorageRead::read_byte_range` documents a ranged read as returning
+    /// "the bytes within the range, which may be shorter than requested if the
+    /// object is smaller than `range.end`", and `mid..u64::MAX` is the
+    /// established spelling of "read to the end" against that trait. The
+    /// default implementation, `MemoryStorage` and the proxy (which inherits
+    /// the default) all clamp; this backend sized its buffer from the range's
+    /// width instead, so the same call allocated `usize::MAX` and came back as
+    /// `Io("spawn_blocking failed: task panicked ... capacity overflow")`.
+    #[tokio::test]
+    async fn an_open_ended_range_is_clamped_to_the_object() {
+        let (_dir, storage) = storage();
+        storage
+            .write_bytes("z/clamp.dict", b"hello world")
+            .await
+            .unwrap();
+
+        let tail = storage
+            .read_byte_range("z/clamp.dict", 6..u64::MAX)
+            .await
+            .expect("open-ended range must clamp like every other backend");
+        assert_eq!(tail, b"world");
+
+        // From the top, too — the whole object, not a `usize::MAX` buffer.
+        let all = storage
+            .read_byte_range("z/clamp.dict", 0..u64::MAX)
+            .await
+            .expect("open-ended range from zero must clamp");
+        assert_eq!(all, b"hello world");
+
+        // A start past the end is empty, matching the default implementation
+        // rather than erroring.
+        assert!(storage
+            .read_byte_range("z/clamp.dict", 99..u64::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The clamp must agree with the backend every caller compares against.
+    /// Same bytes, same ranges, same answers — that is the whole point of the
+    /// shared trait.
+    #[tokio::test]
+    async fn ranged_reads_match_the_memory_backend() {
+        let (_dir, file) = storage();
+        let memory = crate::storage::memory::MemoryStorage::new();
+        let bytes = b"the quick brown fox".as_slice();
+        file.write_bytes("z/same.dict", bytes).await.unwrap();
+        memory.write_bytes("z/same.dict", bytes).await.unwrap();
+
+        for range in [
+            0..u64::MAX,
+            4..u64::MAX,
+            0..4,
+            4..9,
+            0..1000,
+            18..1000,
+            19..u64::MAX,
+            50..60,
+            5..5,
+        ] {
+            assert_eq!(
+                file.read_byte_range("z/same.dict", range.clone())
+                    .await
+                    .unwrap_or_else(|e| panic!("file backend refused {range:?}: {e:?}")),
+                memory
+                    .read_byte_range("z/same.dict", range.clone())
+                    .await
+                    .unwrap(),
+                "backends disagree on {range:?}"
+            );
+        }
     }
 
     /// The guard must not fire on legitimate content. A one-byte blob is the
