@@ -43,8 +43,26 @@
 //! So the clone-and-resolve cost this path took on is bounded by the matched
 //! fact set, not by novelty — which is why the `limit` early exit was not
 //! worth restoring at the price of depending on the walk order with no sort
-//! to fall back on. Revisit if a caller ever sets a limit on a pattern with
-//! no bound component; today none does.
+//! to fall back on.
+//!
+//! ## The shape neither scenario models
+//!
+//! Both scenarios bind a subject, which is what keeps their matched set
+//! small. One caller does not: `probe_timestamp_axis`
+//! (`fluree-db-api/src/time_resolve.rs:154`, the `@iso:`/timestamp
+//! time-travel probe) issues `RangeMatch::predicate(..)` — predicate only, no
+//! subject, no object — with `flake_limit(1)` against the txn-meta graph, and
+//! adds `object_bounds` when resolving `after: Some`. Its matched set is one
+//! flake per commit, so it scales with commits-in-novelty rather than with a
+//! bound subject's fact count, and it is doubly exposed: those object bounds
+//! now prune AFTER resolution instead of inside the walk.
+//!
+//! It stays off this bench deliberately — it only takes the overlay-only path
+//! when the txn-meta graph has no POST branch, it reads a system graph, and at
+//! ~80 ns per matched row the absolute cost is small. But it is the site to
+//! measure first if this path ever needs the bound back, and it is the
+//! counter-example to "every limit-setting caller binds a subject", which is
+//! what an earlier version of this reasoning claimed.
 //!
 //! ## Matrix
 //!

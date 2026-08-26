@@ -13,9 +13,9 @@ use fluree_db_binary_index::{
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{
-    flake_matches_range_eq, range_provider::RangeQuery, Flake, FlakeValue, GraphId, IndexType,
-    OType, OverlayProvider, RangeMatch, RangeOptions, RangeProvider, RangeTest, RuntimeSmallDicts,
-    Sid,
+    flake_matches_range_eq, range_provider::RangeQuery, Flake, FlakeMeta, FlakeValue, GraphId,
+    IndexType, OType, OverlayProvider, RangeMatch, RangeOptions, RangeProvider, RangeTest,
+    RuntimeSmallDicts, Sid,
 };
 
 use crate::binary_scan::{encode_bound_object_prefilter, index_type_to_sort_order};
@@ -876,12 +876,21 @@ fn resolve_latest_ops_keep_asserts(mut flakes: Vec<Flake>, index: IndexType) -> 
         // "have I seen this `m`" probe would make that quadratic — the shape
         // this whole area of the code exists to have stopped doing.
         //
-        // The sort keys on `m` ALONE and is stable, so the comparator's
-        // `t, op` order survives inside each group and the winner scan below
-        // sees candidates in ascending `t`.
+        // The sort keys on `m` ALONE via `meta_group_cmp`, NOT `FlakeMeta`'s
+        // own `Ord` — that one ignores `lang` whenever both sides carry a
+        // list index, so it calls `{en, i: 0}` and `{fr, i: 0}` equal while
+        // `==` calls them distinct. Grouping on `==` after sorting by it
+        // would sort by one relation and cut by a stricter one: the same
+        // mismatch as #1703, one level down. `meta_group_cmp` agrees with
+        // `==` by construction (pinned by
+        // `group_order_agrees_with_metadata_equality`).
+        //
+        // The sort is stable, so the comparator's `t, op` order survives
+        // inside each group and the winner scan below sees candidates in
+        // ascending `t`.
         idxs.clear();
         idxs.extend(start..end);
-        idxs.sort_by(|&a, &b| flakes[a].m.cmp(&flakes[b].m));
+        idxs.sort_by(|&a, &b| meta_group_cmp(&flakes[a].m, &flakes[b].m));
 
         let mut g = 0usize;
         while g < idxs.len() {
@@ -914,6 +923,33 @@ fn resolve_latest_ops_keep_asserts(mut flakes: Vec<Flake>, index: IndexType) -> 
     // inversions are inside those runs.
     out.sort_by(cmp);
     out
+}
+
+/// Strict total order on flake metadata, for grouping inside a fact run.
+///
+/// [`FlakeMeta`](fluree_db_core::FlakeMeta)'s own `Ord` compares ONLY `i`
+/// when both sides carry a list index — `lang` is never consulted — while its
+/// `PartialEq` is derived over both fields. So `{lang: en, i: 0}` and
+/// `{lang: fr, i: 0}` compare `Equal` without being equal: `Ord` is not
+/// consistent with `Eq` for that type. Sorting by it and then cutting groups
+/// on `==` sorts by one relation and groups by a stricter one, which lets a
+/// sibling's assert separate a fact from its own retraction — the #1703
+/// failure, one level down.
+///
+/// This order is consistent with `==` by construction: it compares `i` and
+/// then `lang`, so `Equal` here means equal in fact.
+///
+/// Deliberately local. Repairing `FlakeMeta::Ord` itself moves index ordering
+/// semantics repo-wide (every comparator's `cmp_meta` tiebreak reads it), so
+/// that belongs in #1711 rather than in a fix for the range path.
+#[inline]
+fn meta_group_cmp(a: &Option<FlakeMeta>, b: &Option<FlakeMeta>) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(x), Some(y)) => x.i.cmp(&y.i).then_with(|| x.lang.cmp(&y.lang)),
+    }
 }
 
 /// Run key for [`resolve_latest_ops_keep_asserts`]: the four fields every
@@ -1830,6 +1866,87 @@ mod tests {
             "resolved range results must be index-ordered, got {:?}",
             rendered(&out)
         );
+    }
+
+    /// One list POSITION carrying two language tags — the combination the
+    /// other cases only cover separately, and the one place `FlakeMeta`'s
+    /// `Ord`/`Eq` disagreement bites (#1711).
+    ///
+    /// `FlakeMeta::cmp` consults only `i` when both sides carry a list index,
+    /// so `{lang: en, i: 0}` and `{lang: fr, i: 0}` compare `Equal` while
+    /// being unequal. Grouping that sorts on `cmp` and cuts on `==` therefore
+    /// sorts by one relation and groups by a stricter one — the #1703 mistake
+    /// one level down — and the `@en` sibling's assert separates the `@fr`
+    /// fact from its own retraction.
+    ///
+    /// The retraction must land in a LATER transaction than the sibling's
+    /// assert; a same-transaction rewrite happens to resolve either way.
+    #[test]
+    fn one_list_position_under_two_language_tags_resolves_independently() {
+        let at_lang = |lang: &str, i: i32| FlakeMeta::from_parts(Some(lang), Some(i));
+        let out = resolve_latest_ops_keep_asserts(
+            vec![
+                f("x", 2, true, at_lang("en", 0)),
+                f("x", 3, true, at_lang("fr", 0)),
+                f("x", 4, false, at_lang("en", 0)),
+            ],
+            IndexType::Spot,
+        );
+        assert_eq!(
+            rendered(&out),
+            vec![("x".to_string(), at_lang("fr", 0))],
+            "the retracted @en fact must go; its @fr sibling at the same \
+             position must stay"
+        );
+    }
+
+    /// Mirror of the above with the tags swapped, so a grouping that happens
+    /// to work for one tag order can't pass.
+    #[test]
+    fn one_list_position_two_tags_mirror_order() {
+        let at_lang = |lang: &str, i: i32| FlakeMeta::from_parts(Some(lang), Some(i));
+        let out = resolve_latest_ops_keep_asserts(
+            vec![
+                f("x", 2, true, at_lang("fr", 0)),
+                f("x", 3, true, at_lang("en", 0)),
+                f("x", 4, false, at_lang("fr", 0)),
+            ],
+            IndexType::Spot,
+        );
+        assert_eq!(rendered(&out), vec![("x".to_string(), at_lang("en", 0))]);
+    }
+
+    /// The invariant the grouping rests on: the order it sorts by must agree
+    /// with the equality it cuts groups on. `FlakeMeta`'s own `Ord` does NOT
+    /// (that is #1711), which is why grouping uses a local strict order.
+    #[test]
+    fn group_order_agrees_with_metadata_equality() {
+        let m = |lang: Option<&str>, i: Option<i32>| FlakeMeta::from_parts(lang, i);
+        let metas = [
+            m(None, None),
+            m(Some("en"), None),
+            m(Some("fr"), None),
+            m(None, Some(0)),
+            m(Some("en"), Some(0)),
+            m(Some("fr"), Some(0)),
+            m(Some("en"), Some(1)),
+            m(None, Some(1)),
+        ];
+        for a in &metas {
+            for b in &metas {
+                assert_eq!(
+                    meta_group_cmp(a, b) == std::cmp::Ordering::Equal,
+                    a == b,
+                    "group order disagrees with equality for {a:?} vs {b:?}"
+                );
+            }
+        }
+        // And the pair that motivates it: equal under `FlakeMeta::cmp`,
+        // unequal in fact.
+        let en0 = m(Some("en"), Some(0)).unwrap();
+        let fr0 = m(Some("fr"), Some(0)).unwrap();
+        assert_eq!(en0.cmp(&fr0), std::cmp::Ordering::Equal, "see #1711");
+        assert_ne!(en0, fr0);
     }
 
     /// A list holding ONE value at many positions puts every entry in a

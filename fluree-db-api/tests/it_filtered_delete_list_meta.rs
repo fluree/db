@@ -815,6 +815,23 @@ async fn novelty_only_predicate_resolves_metadata_siblings() {
                 vec!["hello@fr"],
                 "the @en fact goes; the @fr fact sharing its lexical form stays"
             );
+
+            // The COMBINATION of the two legs above — one list position
+            // carrying two language tags — is pinned at the unit level
+            // instead (`binary_range::tests::
+            // one_list_position_under_two_language_tags_resolves_independently`),
+            // because it cannot currently be built through this path at all.
+            //
+            // `FlakeMeta`'s `Ord` ignores `lang` whenever both sides carry a
+            // list index, so `{en, i: 0}` and `{fr, i: 0}` compare equal
+            // without being equal (#1711). Asserting the second tag at the
+            // same position commits (receipt says one flake at its own `t`)
+            // but never appears in the live view: novelty keys the fact by
+            // that same ordering and folds it onto the first tag. So the
+            // write side collapses the shape before the read side can be
+            // asked about it. Worth knowing when #1711 is fixed — repairing
+            // the type will make this shape constructible, and this is the
+            // test that should then grow an end-to-end leg.
         })
         .await;
 }
