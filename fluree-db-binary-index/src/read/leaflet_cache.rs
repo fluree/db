@@ -25,12 +25,18 @@
 //! - `DictLeaf`: keyed by `xxh3_128(cas_address)`. Content-addressed and
 //!   immutable — no epoch/time dimension needed.
 
-#[cfg(target_arch = "wasm32")]
-use crate::wasm_compat::memmap2;
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::read::types::OverlayOp;
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_compat::memmap2;
 use fluree_db_core::subject_id::SubjectIdColumn;
 use fluree_db_core::{Flake, ListIndex, Sid, StatsView};
+// moka's eviction clock reads std::time::Instant at cache construction, which
+// aborts on wasm32-unknown-unknown; shadow-import core's clock-free LRU
+// stand-in there (same API subset, exact-LRU instead of TinyLFU).
+#[cfg(target_arch = "wasm32")]
+use fluree_db_core::wasm_cache::Cache;
+#[cfg(not(target_arch = "wasm32"))]
 use moka::sync::Cache;
 use std::io;
 use std::sync::Arc;

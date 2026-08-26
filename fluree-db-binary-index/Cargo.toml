@@ -22,7 +22,7 @@ rustc-hash = "2"
 ciborium = "0.2"
 
 # Cache
-moka.workspace = true
+# moka is native-only: its eviction clock aborts on wasm32 (see fluree-db-core::wasm_cache)
 
 # Concurrency
 once_cell.workspace = true
@@ -57,6 +57,7 @@ workspace = true
 
 # Native: full tokio + mmap + real spatial provider; core's filesystem backends.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+moka = { workspace = true }
 fluree-db-core = { path = "../fluree-db-core", features = ["native"] }
 fluree-db-spatial = { path = "../fluree-db-spatial" }
 tokio = { workspace = true }
