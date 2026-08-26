@@ -1061,6 +1061,141 @@ ex:bob   ex:worksFor ex:acme .
     );
 }
 
+/// A bulk import with no RDF collections anywhere must record
+/// `IndexRoot.has_list_meta = Some(false)` — an exact observation, not
+/// `None`. That is what lets filtered-DELETE staging skip list-meta
+/// hydration on bulk-imported ledgers, which are the large ones.
+#[tokio::test]
+async fn import_without_lists_records_has_list_meta_false() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = r"
+@prefix ex: <http://example.org/> .
+ex:alice ex:worksFor ex:acme ; ex:name 'Alice' .
+ex:bob   ex:worksFor ex:acme ; ex:name 'Bob' .
+";
+    let ttl_path = write_ttl(data_dir.path(), "plain.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let ledger_id = "test/import-no-lists:main";
+    let result = fluree
+        .create(ledger_id)
+        .import(&ttl_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("plain import should succeed");
+    assert!(result.root_id.is_some(), "index should have been built");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("load imported ledger");
+    assert_eq!(
+        ledger.snapshot.has_list_meta,
+        Some(false),
+        "bulk import observed no list positions and must say so exactly"
+    );
+}
+
+/// The load-bearing half: one RDF collection anywhere in the import must
+/// record `Some(true)`. A wrongly-`false` root would let staging skip
+/// position hydration, and the list retraction below would silently do
+/// nothing — so the flag is asserted AND exercised.
+#[tokio::test]
+async fn import_with_list_records_has_list_meta_true_and_still_retracts() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // `ex:bob` carries no collection; `ex:alice`'s is the only one in the
+    // dataset, so the bit has to survive being OR'd across chunks.
+    let ttl = r"
+@prefix ex: <http://example.org/> .
+ex:bob   ex:name 'Bob' .
+ex:alice ex:items ( 'a' 'b' 'c' ) .
+";
+    let ttl_path = write_ttl(data_dir.path(), "listed.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let ledger_id = "test/import-with-lists:main";
+    let result = fluree
+        .create(ledger_id)
+        .import(&ttl_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("list-bearing import should succeed");
+    assert!(result.root_id.is_some(), "index should have been built");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("load imported ledger");
+    assert_eq!(
+        ledger.snapshot.has_list_meta,
+        Some(true),
+        "one collection in the import must flip the flag on"
+    );
+
+    // And it is not merely reported: a filtered DELETE of one entry has to
+    // land, which needs hydration to have run.
+    let ctx = json!({"ex": "http://example.org/"});
+    let items = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .and_then(|a| a.first())
+            .and_then(|node| node.get("ex:items"))
+            .map(|v| match v {
+                serde_json::Value::Array(a) => {
+                    a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+                }
+                other => other.as_str().map(str::to_string).into_iter().collect(),
+            })
+            .unwrap_or_default()
+    };
+    let read = json!({
+        "@context": ctx,
+        "select": {"?s": ["ex:items"]},
+        "where": {"@id": "?s"},
+        "values": ["?s", [{"@id": "ex:alice"}]]
+    });
+
+    let before = support::query_jsonld_formatted(&fluree, &ledger, &read)
+        .await
+        .expect("list query");
+    assert_eq!(items(&before), vec!["a", "b", "c"]);
+
+    let del = json!({
+        "@context": ctx,
+        "where": [{"@id": "?s", "ex:items": "b"}],
+        "delete": [{"@id": "?s", "ex:items": "b"}]
+    });
+    let r = fluree
+        .update_with_opts(
+            ledger,
+            &del,
+            fluree_db_api::TxnOpts::default(),
+            fluree_db_api::CommitOpts::default(),
+            // Unreachable thresholds: the delete must not trigger a rebuild
+            // that would re-derive the flag and mask a wrong root.
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1 << 40,
+                reindex_max_bytes: 1 << 41,
+            },
+        )
+        .await
+        .expect("filtered delete");
+    assert_eq!(r.receipt.flake_count, 1);
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let after = support::query_jsonld_formatted(&fluree, &ledger, &read)
+        .await
+        .expect("list query");
+    assert_eq!(items(&after), vec!["a", "c"], "the entry must actually go");
+}
+
 /// Firewall regression: a JSON-LD bulk import that hand-writes a
 /// fully-expanded `https://ns.flur.ee/db#reifies*` IRI must be rejected,
 /// exactly as the transact path rejects it. The expanded form carries none
