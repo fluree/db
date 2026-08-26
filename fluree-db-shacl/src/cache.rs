@@ -206,6 +206,7 @@ mod tests {
             name: None,
             message: None,
             deactivated: false,
+            sparql_constraints: vec![],
         }
     }
 
