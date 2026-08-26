@@ -380,65 +380,82 @@ impl BinaryCursor {
                         continue;
                     }
 
-                    // Load columns via LeafHandle (cached when LeafletCache is available).
-                    let mut batch = if entry.row_count > 0 {
-                        let leaflet_idx = self.current_leaflet_idx - 1;
-                        let decode_set = self.leaflet_decode_set(has_ov);
-                        if let Some(cache) = self.store.leaflet_cache() {
-                            load_columns_cached_via_handle(
-                                leaf.handle.as_ref(),
-                                cache,
-                                super::column_loader::LeafletDecodeSpec {
-                                    leaf_id: leaf.handle.leaf_id(),
-                                    leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
-                                        std::io::Error::other(format!(
-                                            "leaflet index {leaflet_idx} exceeds u32::MAX"
-                                        ))
-                                    })?,
-                                    order: self.order,
-                                    decode_set,
-                                },
-                            )?
+                    // The leaflet's fallible reads (column load + history
+                    // sidecar), isolated so a failure rewinds: the leaflet
+                    // index steps back and the leaf is restored, leaving the
+                    // cursor re-enterable — the next `next_batch` call retries
+                    // this same leaflet (transient I/O, wasm NeedFetch miss)
+                    // instead of dropping it and the rest of the leaf.
+                    let load_result = (|| -> io::Result<ColumnBatch> {
+                        // Load columns via LeafHandle (cached when LeafletCache is available).
+                        let mut batch = if entry.row_count > 0 {
+                            let leaflet_idx = self.current_leaflet_idx - 1;
+                            let decode_set = self.leaflet_decode_set(has_ov);
+                            if let Some(cache) = self.store.leaflet_cache() {
+                                load_columns_cached_via_handle(
+                                    leaf.handle.as_ref(),
+                                    cache,
+                                    super::column_loader::LeafletDecodeSpec {
+                                        leaf_id: leaf.handle.leaf_id(),
+                                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                                            std::io::Error::other(format!(
+                                                "leaflet index {leaflet_idx} exceeds u32::MAX"
+                                            ))
+                                        })?,
+                                        order: self.order,
+                                        decode_set,
+                                    },
+                                )?
+                            } else {
+                                let proj = ColumnProjection {
+                                    output: decode_set,
+                                    internal: ColumnSet::EMPTY,
+                                };
+                                leaf.handle.load_columns(leaflet_idx, &proj, self.order)?
+                            }
                         } else {
-                            let proj = ColumnProjection {
-                                output: decode_set,
-                                internal: ColumnSet::EMPTY,
-                            };
-                            leaf.handle.load_columns(leaflet_idx, &proj, self.order)?
-                        }
-                    } else {
-                        ColumnBatch::empty()
-                    };
+                            ColumnBatch::empty()
+                        };
 
-                    // Time-travel replay: if to_t < index_t, reconstruct leaflet state
-                    // at to_t using the history sidecar.
-                    if self.need_replay() {
-                        // Quick-skip: if this leaflet's history doesn't extend past to_t,
-                        // and no base rows have t > to_t, replay is unnecessary.
-                        let to_t_u32 = u32::try_from(self.to_t).unwrap_or(u32::MAX);
-                        let needs_leaflet_replay = entry.history_max_t > to_t_u32
-                            || batch_has_rows_above_t(&batch, to_t_u32);
+                        // Time-travel replay: if to_t < index_t, reconstruct leaflet state
+                        // at to_t using the history sidecar.
+                        if self.need_replay() {
+                            // Quick-skip: if this leaflet's history doesn't extend past to_t,
+                            // and no base rows have t > to_t, replay is unnecessary.
+                            let to_t_u32 = u32::try_from(self.to_t).unwrap_or(u32::MAX);
+                            let needs_leaflet_replay = entry.history_max_t > to_t_u32
+                                || batch_has_rows_above_t(&batch, to_t_u32);
 
-                        if needs_leaflet_replay && entry.history_len > 0 {
-                            let history = leaf
-                                .handle
-                                .load_sidecar_segment(self.current_leaflet_idx - 1)?;
-                            if !history.is_empty() {
+                            if needs_leaflet_replay && entry.history_len > 0 {
+                                let history = leaf
+                                    .handle
+                                    .load_sidecar_segment(self.current_leaflet_idx - 1)?;
+                                if !history.is_empty() {
+                                    if let Some(replayed) =
+                                        replay_leaflet(&batch, &history, self.to_t, self.order)
+                                    {
+                                        batch = replayed;
+                                    }
+                                }
+                            } else if needs_leaflet_replay {
+                                // No sidecar but base rows have t > to_t: filter them out.
                                 if let Some(replayed) =
-                                    replay_leaflet(&batch, &history, self.to_t, self.order)
+                                    replay_leaflet(&batch, &[], self.to_t, self.order)
                                 {
                                     batch = replayed;
                                 }
                             }
-                        } else if needs_leaflet_replay {
-                            // No sidecar but base rows have t > to_t: filter them out.
-                            if let Some(replayed) =
-                                replay_leaflet(&batch, &[], self.to_t, self.order)
-                            {
-                                batch = replayed;
-                            }
                         }
-                    }
+                        Ok(batch)
+                    })();
+                    let batch = match load_result {
+                        Ok(batch) => batch,
+                        Err(err) => {
+                            self.current_leaflet_idx -= 1;
+                            self.current_leaf = Some(leaf);
+                            return Err(err);
+                        }
+                    };
 
                     // Apply row-level filter.
                     let batch = if self.filter.is_empty() || batch.is_empty() {
@@ -500,17 +517,21 @@ impl BinaryCursor {
             let leaf_idx = self.current_leaf_idx;
             let leaf_cid = self.branch.leaves[leaf_idx].leaf_cid.clone();
             let sidecar_cid = self.branch.leaves[leaf_idx].sidecar_cid.clone();
+
+            // Open leaf via LeafHandle (auto-selects local vs range-read path).
+            // Fallible — must run BEFORE any cursor-state advance (leaf index,
+            // overlay slicing) so a failed open (transient I/O, wasm NeedFetch
+            // miss) leaves the cursor re-enterable: the next `next_batch` call
+            // retries this same leaf instead of silently skipping it.
+            let handle =
+                self.store
+                    .open_leaf_handle(&leaf_cid, sidecar_cid.as_ref(), self.need_replay())?;
             self.current_leaf_idx += 1;
 
             // Slice overlay ops for this leaf (binary search on branch keys).
             if self.has_any_overlay() {
                 self.slice_overlay_for_leaf(leaf_idx);
             }
-
-            // Open leaf via LeafHandle (auto-selects local vs range-read path).
-            let handle =
-                self.store
-                    .open_leaf_handle(&leaf_cid, sidecar_cid.as_ref(), self.need_replay())?;
 
             // Range seek: skip directory entries wholly before `range_min`
             // instead of walking them one by one. Safe only when no replay
