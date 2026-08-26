@@ -3330,6 +3330,181 @@ pub(crate) mod tests {
         writer.finish().unwrap().remove(0).leaf_bytes
     }
 
+    /// Same leaf as [`build_test_leaf_bytes`], keeping the routing keys so a
+    /// `BranchManifest` can be built around it.
+    fn build_test_leaf_info() -> crate::format::leaf::LeafInfo {
+        let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+        writer.set_skip_history(true);
+        for i in 0..5u64 {
+            writer
+                .push_record(make_rec(i + 1, 1, OType::XSD_INTEGER.as_u16(), i * 10, 1))
+                .unwrap();
+        }
+        writer.finish().unwrap().remove(0)
+    }
+
+    /// Content store that fails exactly one CAS read — the `fail_on`-th
+    /// `get`/`get_range` call (1-based; 0 = never) — then recovers. Models a
+    /// transient remote failure (or a wasm residency miss) at an arbitrary
+    /// point in the read sequence.
+    #[derive(Debug, Clone)]
+    struct FailNthContentStore {
+        inner: MemoryContentStore,
+        calls: Arc<AtomicUsize>,
+        fail_on: usize,
+    }
+
+    impl FailNthContentStore {
+        fn new(fail_on: usize) -> Self {
+            Self {
+                inner: MemoryContentStore::new(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail_on,
+            }
+        }
+
+        fn cas_calls(&self) -> usize {
+            self.calls.load(AtomicOrdering::Relaxed)
+        }
+
+        fn check_injected_failure(&self) -> fluree_db_core::Result<()> {
+            let call_number = self.calls.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if call_number == self.fail_on {
+                return Err(fluree_db_core::Error::Storage(format!(
+                    "injected transient failure at CAS call {call_number}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ContentStore for FailNthContentStore {
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.check_injected_failure()?;
+            self.inner.get(id).await
+        }
+
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+
+        async fn get_range(
+            &self,
+            id: &ContentId,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_core::Result<Vec<u8>> {
+            self.check_injected_failure()?;
+            self.inner.get_range(id, range).await
+        }
+    }
+
+    /// Drive a full scan over the single test leaf through a store whose
+    /// `fail_on`-th CAS read fails once, retrying `next_batch` on error.
+    /// Returns (rows_seen, errors_seen, cas_calls).
+    fn scan_with_injected_failure(fail_on: usize) -> (u64, usize, usize) {
+        use crate::read::binary_cursor::BinaryCursor;
+        use crate::read::column_types::{BinaryFilter, ColumnProjection};
+
+        let store = FailNthContentStore::new(fail_on);
+        let info = build_test_leaf_info();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let bytes = info.leaf_bytes.clone();
+            async move {
+                store
+                    .inner
+                    .put(ContentKind::IndexLeaf, &bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("seed leaf");
+
+        let cache_dir = temp_cache_dir();
+        let binary_store = Arc::new(empty_store(Arc::new(store.clone()), cache_dir.clone()));
+        let branch = Arc::new(crate::format::branch::BranchManifest {
+            leaves: vec![crate::format::branch::LeafEntry {
+                first_key: info.first_key,
+                last_key: info.last_key,
+                row_count: info.total_rows,
+                leaf_cid,
+                sidecar_cid: None,
+            }],
+        });
+
+        let mut cursor = BinaryCursor::scan_all(
+            binary_store,
+            RunSortOrder::Post,
+            branch,
+            BinaryFilter::default(),
+            ColumnProjection::all(),
+        );
+
+        let mut rows = 0u64;
+        let mut errors = 0usize;
+        loop {
+            match cursor.next_batch() {
+                Ok(Some(batch)) => rows += batch.row_count as u64,
+                Ok(None) => break,
+                Err(_) => {
+                    errors += 1;
+                    assert!(
+                        errors <= 8,
+                        "cursor did not recover after repeated retries (fail_on={fail_on})"
+                    );
+                }
+            }
+        }
+        let cas_calls = store.cas_calls();
+        let _ = std::fs::remove_dir_all(cache_dir);
+        (rows, errors, cas_calls)
+    }
+
+    /// A transient failure at ANY point in the leaf-read CAS sequence must
+    /// surface exactly one error and, on retry of `next_batch`, still deliver
+    /// every row — no silently skipped leaf (advance-before-open) or leaflet
+    /// (mid-leaf `?` with the leaf taken). This is the native pin for the
+    /// wasm NeedFetch fetch-and-retry contract at cursor granularity.
+    #[test]
+    fn cursor_retries_failed_cas_reads_without_losing_rows() {
+        // Baseline: no injected failure. Positively establish that the scan
+        // reads through CAS at all — otherwise the sweep below is vacuous.
+        let (rows, errors, total_calls) = scan_with_injected_failure(0);
+        assert_eq!(rows, 5, "baseline scan must see every row");
+        assert_eq!(errors, 0, "baseline scan must not error");
+        assert!(
+            total_calls >= 2,
+            "expected the remote scan to issue CAS reads (got {total_calls})"
+        );
+
+        // Sweep: fail each CAS call position once (header, directory, column
+        // loads, promotion refetch, ...) and require full recovery.
+        for fail_on in 1..=total_calls {
+            let (rows, errors, _) = scan_with_injected_failure(fail_on);
+            assert_eq!(
+                errors, 1,
+                "injected failure at CAS call {fail_on} must surface exactly once"
+            );
+            assert_eq!(
+                rows, 5,
+                "retry after failure at CAS call {fail_on} must not lose rows"
+            );
+        }
+    }
+
     #[test]
     fn open_leaf_handle_caches_remote_metadata() {
         let store = CountingContentStore::new();
