@@ -137,19 +137,26 @@ mod tests {
             .await
             .expect_err("unknown ledger cannot open");
         let text = err.to_string();
-        assert!(!text.contains("driver"), "must not be a transport failure: {text}");
+        assert!(
+            !text.contains("driver"),
+            "must not be a transport failure: {text}"
+        );
 
-        let s = state.lock().unwrap();
-        let ns_calls: Vec<_> = s
-            .url_log
-            .iter()
-            .filter(|(url, _)| url.contains("/storage/ns/"))
-            .collect();
-        assert!(!ns_calls.is_empty(), "head resolution must hit the nameservice");
-        let (url, headers) = ns_calls[0];
-        assert_eq!(url, &format!("{API_BASE}/storage/ns/mydb%3Amain"));
-        assert_eq!(headers, &vec![("authorization", "Bearer tok".to_string())]);
-        drop(s);
+        {
+            let s = state.lock().unwrap();
+            let ns_calls: Vec<_> = s
+                .url_log
+                .iter()
+                .filter(|(url, _)| url.contains("/storage/ns/"))
+                .collect();
+            assert!(
+                !ns_calls.is_empty(),
+                "head resolution must hit the nameservice"
+            );
+            let (url, headers) = ns_calls[0];
+            assert_eq!(url, &format!("{API_BASE}/storage/ns/mydb%3Amain"));
+            assert_eq!(headers, &vec![("authorization", "Bearer tok".to_string())]);
+        }
 
         peer.shutdown();
         driver.await.unwrap();

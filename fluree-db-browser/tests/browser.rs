@@ -145,6 +145,7 @@ async fn driver_serves_cache_jobs_end_to_end() {
     io.send(IoJob::CachePut {
         key: key.clone(),
         bytes: Arc::from(payload.clone()),
+        permit: None,
     })
     .unwrap();
     // Write-behind: give the put task a moment.

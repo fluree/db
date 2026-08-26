@@ -56,6 +56,7 @@ pub mod config;
 pub mod connect;
 #[cfg(target_arch = "wasm32")]
 pub mod driver;
+pub mod gauge;
 pub mod protocol;
 pub mod residency;
 
@@ -67,8 +68,9 @@ pub use connect::connect;
 pub use connect::{build_peer, BrowserPeer};
 #[cfg(target_arch = "wasm32")]
 pub use driver::start_driver;
+pub use gauge::{WriteBehindGauge, WriteBehindPermit};
 pub use protocol::IoJob;
-pub use residency::{PinSet, ResidencyError, ResidencyStats, ResidencyTier};
+pub use residency::{PinSet, QueryGuard, ResidencyError, ResidencyStats, ResidencyTier};
 
 // The transport contract this crate implements, re-exported so the shell
 // does not need a direct dependency on the sync crate.

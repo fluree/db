@@ -185,10 +185,7 @@ mod tests {
 
     #[test]
     fn rebuild_from_records_preserves_ordering_inputs() {
-        let idx = CacheIndex::load(vec![
-            ("x".to_string(), 5, 5.0),
-            ("y".to_string(), 7, 1.0),
-        ]);
+        let idx = CacheIndex::load(vec![("x".to_string(), 5, 5.0), ("y".to_string(), 7, 1.0)]);
         assert_eq!(idx.total_bytes(), 12);
         // y is older, so it goes first when over budget.
         let victims = idx.plan_for_insert(20, 20, 10);

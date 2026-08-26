@@ -30,8 +30,9 @@
 use crate::bridge::IoHandle;
 use crate::coalesce::{InFlight, Ticket};
 use crate::config::BrowserIoConfig;
+use crate::gauge::{WriteBehindGauge, WriteBehindPermit};
 use crate::protocol::IoJob;
-use crate::residency::{PinSet, ResidencyError, ResidencyTier};
+use crate::residency::{PinSet, QueryGuard, ResidencyError, ResidencyTier};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_core::error::{Error as CoreError, Result};
@@ -43,6 +44,7 @@ use fluree_db_core::{
 use fluree_db_nameservice_sync::{cid_and_ledger_from_address, ProxyStorage};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{oneshot, Semaphore};
 
 type SharedError = Arc<CoreError>;
@@ -82,6 +84,10 @@ pub struct CasStats {
     pub bytes_fetched: u64,
     /// Reads that joined an in-flight fetch instead of starting one.
     pub coalesced_waits: u64,
+    /// Bytes currently queued for the IndexedDB write-behind.
+    pub write_behind_outstanding: u64,
+    /// High-water mark of the write-behind queue.
+    pub write_behind_peak: u64,
 }
 
 struct Inner {
@@ -91,6 +97,8 @@ struct Inner {
     inflight: InFlight<ContentId, Arc<[u8]>, SharedError>,
     fetch_slots: Semaphore,
     cache_enabled: bool,
+    write_behind: Arc<WriteBehindGauge>,
+    budget_wait: Duration,
     counters: Counters,
 }
 
@@ -125,6 +133,8 @@ impl BrowserCasStorage {
                 inflight: InFlight::default(),
                 fetch_slots: Semaphore::new(config.max_concurrent_fetches.max(1)),
                 cache_enabled: config.cache.enabled,
+                write_behind: WriteBehindGauge::new(config.write_behind_budget_bytes),
+                budget_wait: config.budget_wait,
                 counters: Counters::default(),
             }),
         }
@@ -159,7 +169,76 @@ impl BrowserCasStorage {
             fetches: c.fetches.load(Ordering::Relaxed),
             bytes_fetched: c.bytes_fetched.load(Ordering::Relaxed),
             coalesced_waits: c.coalesced_waits.load(Ordering::Relaxed),
+            write_behind_outstanding: self.inner.write_behind.outstanding(),
+            write_behind_peak: self.inner.write_behind.peak(),
         }
+    }
+
+    /// Mark a query as in flight for the guard's lifetime; eviction from
+    /// the residency tier is frozen while any guard is alive. The retry
+    /// loop holds one across a query's rounds so every observed byte stays
+    /// resident (the engine's fetch-pins contract).
+    pub fn query_guard(&self) -> QueryGuard {
+        self.inner.residency.begin_query()
+    }
+
+    /// The canonical storage address for a CID under `ledger`, using this
+    /// storage's method. `None` for CIDs whose kind has no distinct address
+    /// (the annotation arenas).
+    pub fn address_for(&self, ledger: &str, cid: &ContentId) -> Option<String> {
+        let kind = cid.content_kind()?;
+        Some(fluree_db_core::content_address(
+            self.storage_method(),
+            kind,
+            ledger,
+            &cid.digest_hex(),
+        ))
+    }
+
+    /// Batch-first want fetching: make every CID resident, at most
+    /// `max_concurrent_fetches` in flight, coalescing with any concurrent
+    /// reads. This is the fetch half of the miss-register drain loop —
+    /// hand it the CIDs from the drained wants. Returns per-CID failures;
+    /// empty means everything is resident.
+    pub async fn fetch_cids<I>(&self, ledger: &str, cids: I) -> Vec<(ContentId, CoreError)>
+    where
+        I: IntoIterator<Item = ContentId>,
+    {
+        let futures = cids.into_iter().map(|cid| async move {
+            let result = match self.address_for(ledger, &cid) {
+                Some(address) => self.load(&address).await.map(|_| ()),
+                None => Err(CoreError::storage(format!(
+                    "CID {cid} has no addressable storage kind"
+                ))),
+            };
+            (cid, result)
+        });
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .filter_map(|(cid, result)| result.err().map(|e| (cid, e)))
+            .collect()
+    }
+
+    /// [`fetch_cids`](Self::fetch_cids), pinning each successfully fetched
+    /// CID into `pins` so it survives until the pin set drops.
+    pub async fn fetch_cids_pinned<I>(
+        &self,
+        ledger: &str,
+        cids: I,
+        pins: &PinSet,
+    ) -> Vec<(ContentId, CoreError)>
+    where
+        I: IntoIterator<Item = ContentId>,
+    {
+        let cids: Vec<ContentId> = cids.into_iter().collect();
+        let failures = self.fetch_cids(ledger, cids.clone()).await;
+        for cid in &cids {
+            if failures.iter().all(|(failed, _)| failed != cid) {
+                pins.pin(cid);
+            }
+        }
+        failures
     }
 
     /// The CID a canonical storage address refers to, if it parses.
@@ -241,7 +320,7 @@ impl BrowserCasStorage {
                     .fetch_add(1, Ordering::Relaxed);
                 let resident: Arc<[u8]> = Arc::from(&bytes[..]);
                 drop(bytes);
-                return self.make_resident(cid, resident, false);
+                return self.make_resident(cid, resident, None).await;
             }
         }
 
@@ -261,32 +340,86 @@ impl BrowserCasStorage {
             .bytes_fetched
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
 
+        // Write-behind admission: reserving the queue slot here — after the
+        // fetch, before completion — is the backpressure point. When
+        // IndexedDB lags, loads (and everything queued behind the fetch
+        // slots) stall instead of stacking un-persisted clones.
+        let permit = if self.inner.cache_enabled {
+            Some(self.inner.write_behind.acquire(bytes.len() as u64).await)
+        } else {
+            None
+        };
+
         let resident: Arc<[u8]> = Arc::from(&bytes[..]);
         drop(bytes);
-        self.make_resident(cid, resident, true)
+        self.make_resident(cid, resident, permit).await
     }
 
     /// Insert verified bytes into the residency tier and, for network
-    /// fetches, enqueue the write-behind persist. The persist is enqueued
-    /// first so a residency-budget failure never loses the bytes for the
-    /// next session.
-    fn make_resident(
+    /// fetches (signalled by a write-behind permit), enqueue the persist.
+    /// The persist is enqueued first so a residency-budget failure never
+    /// loses the bytes for the next session. A mid-flight budget overflow
+    /// waits one bounded release interval for room before failing typed.
+    async fn make_resident(
         &self,
         cid: &ContentId,
         bytes: Arc<[u8]>,
-        persist: bool,
+        permit: Option<WriteBehindPermit>,
     ) -> Result<Arc<[u8]>> {
-        if persist && self.inner.cache_enabled {
-            // Driver gone → nothing to persist to; not a read failure.
+        if let Some(permit) = permit {
+            // Driver gone → nothing to persist to (the dropped permit
+            // credits the gauge); not a read failure.
             let _ = self.inner.io.send(IoJob::CachePut {
                 key: cid.clone(),
                 bytes: Arc::clone(&bytes),
+                permit: Some(permit),
             });
         }
-        self.inner
-            .residency
-            .insert(cid.clone(), bytes)
-            .map_err(residency_error)
+        match self.inner.residency.insert(cid.clone(), Arc::clone(&bytes)) {
+            Err(ResidencyError::EvictionDeferred { .. }) => {
+                self.wait_for_release_bounded().await;
+                self.inner
+                    .residency
+                    .insert(cid.clone(), bytes)
+                    .map_err(residency_error)
+            }
+            other => other.map_err(residency_error),
+        }
+    }
+
+    /// Wait for a residency release event, bounded by `budget_wait`. The
+    /// bound is the safety net against waiting while holding the only
+    /// query guard. Natively the bound is a tokio timer; on wasm the
+    /// engine side has no timer, so the deadline is a `Sleep` job served
+    /// by the driver (whose JS timeout stays behind the channel, keeping
+    /// this future `Send`).
+    async fn wait_for_release_bounded(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ =
+                tokio::time::timeout(self.inner.budget_wait, self.inner.residency.released()).await;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (reply, deadline) = oneshot::channel();
+            if self
+                .inner
+                .io
+                .send(IoJob::Sleep {
+                    duration: self.inner.budget_wait,
+                    reply,
+                })
+                .is_err()
+            {
+                // No driver, no timer: waiting would be unbounded.
+                return;
+            }
+            futures::future::select(
+                Box::pin(self.inner.residency.released()),
+                Box::pin(deadline),
+            )
+            .await;
+        }
     }
 
     async fn cache_get(&self, cid: &ContentId) -> Option<Bytes> {
@@ -424,6 +557,9 @@ pub(crate) mod tests {
         pub in_flight: usize,
         pub max_in_flight: usize,
         pub hold: Option<Duration>,
+        /// Hold each CachePut's write-behind permit this long before
+        /// releasing it (simulates a slow IndexedDB).
+        pub put_hold: Option<Duration>,
     }
 
     fn cid_from_url(url: &str) -> String {
@@ -477,10 +613,25 @@ pub(crate) mod tests {
                             .map(|v| Bytes::from(v.clone()));
                         let _ = reply.send(hit);
                     }
-                    IoJob::CachePut { key, bytes } => {
-                        let mut s = state.lock().unwrap();
-                        s.puts.push(key.to_string());
-                        s.cache.insert(key.to_string(), bytes.to_vec());
+                    IoJob::Sleep { duration, reply } => {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(duration).await;
+                            let _ = reply.send(());
+                        });
+                    }
+                    IoJob::CachePut { key, bytes, permit } => {
+                        let put_hold = {
+                            let mut s = state.lock().unwrap();
+                            s.puts.push(key.to_string());
+                            s.cache.insert(key.to_string(), bytes.to_vec());
+                            s.put_hold
+                        };
+                        tokio::spawn(async move {
+                            if let Some(hold) = put_hold {
+                                tokio::time::sleep(hold).await;
+                            }
+                            drop(permit);
+                        });
                     }
                     IoJob::Shutdown => break,
                 }
@@ -491,8 +642,12 @@ pub(crate) mod tests {
     pub(crate) fn object(tag: u8, len: usize) -> (ContentId, String, Vec<u8>) {
         let bytes = vec![tag; len];
         let id = ContentId::new(ContentKind::IndexLeaf, &bytes);
-        let address =
-            fluree_db_core::content_address("proxy", ContentKind::IndexLeaf, LEDGER, &id.digest_hex());
+        let address = fluree_db_core::content_address(
+            "proxy",
+            ContentKind::IndexLeaf,
+            LEDGER,
+            &id.digest_hex(),
+        );
         (id, address, bytes)
     }
 
@@ -532,7 +687,10 @@ pub(crate) mod tests {
             .insert(id.to_string(), (200, bytes.clone()));
         let (storage, io, driver) = storage_with(&state, &config());
 
-        let got = storage.read_bytes(&address).await.expect("first read fetches");
+        let got = storage
+            .read_bytes(&address)
+            .await
+            .expect("first read fetches");
         assert_eq!(got, bytes);
         assert_eq!(state.lock().unwrap().fetch_log, vec![id.to_string()]);
         // Bearer header and canonical URL formed by the shared proxy client.
@@ -732,12 +890,143 @@ pub(crate) mod tests {
         assert!(!storage.supports_ranged_reads());
         let slice = storage.read_byte_range(&address, 4..12).await.unwrap();
         assert_eq!(slice, bytes[4..12].to_vec());
-        assert!(storage.read_byte_range(&address, 40..50).await.unwrap().is_empty());
-        assert!(storage.read_byte_range(&address, 5..5).await.unwrap().is_empty());
-        let tail = storage.read_byte_range(&address, 30..u64::MAX).await.unwrap();
+        assert!(storage
+            .read_byte_range(&address, 40..50)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .read_byte_range(&address, 5..5)
+            .await
+            .unwrap()
+            .is_empty());
+        let tail = storage
+            .read_byte_range(&address, 30..u64::MAX)
+            .await
+            .unwrap();
         assert_eq!(tail, bytes[30..].to_vec());
         assert_eq!(state.lock().unwrap().fetch_log.len(), 1, "one fetch total");
         assert!(storage.exists(&address).await.unwrap());
+        io.shutdown();
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_behind_backpressure_bounds_queued_bytes() {
+        let objects: Vec<_> = (30u8..34).map(|t| object(t, 16)).collect();
+        let state = Arc::new(Mutex::new(MockState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            for (id, _, bytes) in &objects {
+                s.objects.insert(id.to_string(), (200, bytes.clone()));
+            }
+            s.put_hold = Some(Duration::from_millis(20));
+        }
+        let cfg = BrowserIoConfig {
+            // One 16-byte block at a time may sit un-persisted.
+            write_behind_budget_bytes: 16,
+            ..config()
+        };
+        let (storage, io, driver) = storage_with(&state, &cfg);
+
+        let failures = storage
+            .prefetch(objects.iter().map(|(_, a, _)| a.clone()))
+            .await;
+        assert!(failures.is_empty(), "{failures:?}");
+        let stats = storage.stats();
+        assert!(
+            stats.write_behind_peak <= 16,
+            "write-behind queue must stay within budget, peak {}",
+            stats.write_behind_peak
+        );
+        for (id, _, _) in &objects {
+            assert!(storage.resolve_cached_bytes(id).is_some());
+        }
+        // Let the held permits drain, then confirm every block persisted.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(state.lock().unwrap().puts.len(), 4);
+        assert_eq!(storage.stats().write_behind_outstanding, 0);
+        io.shutdown();
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_insert_waits_for_a_query_release_then_fails_typed() {
+        let a = object(40, 16);
+        let b = object(41, 16);
+        let c = object(42, 16);
+        let d = object(43, 16);
+        let state = Arc::new(Mutex::new(MockState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            for (id, _, bytes) in [&a, &b, &c, &d] {
+                s.objects.insert(id.to_string(), (200, bytes.clone()));
+            }
+        }
+        let cfg = BrowserIoConfig {
+            residency_budget_bytes: 32,
+            budget_wait: Duration::from_millis(60),
+            ..config()
+        };
+        let (storage, io, driver) = storage_with(&state, &cfg);
+
+        storage.ensure_resident(&a.1).await.unwrap();
+        storage.ensure_resident(&b.1).await.unwrap();
+
+        // A query is in flight; a third block needs eviction, which is
+        // frozen — but the guard drops shortly, so the deferred insert's
+        // bounded wait succeeds on the release.
+        let guard = storage.query_guard();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            drop(guard);
+        });
+        let resident = storage
+            .ensure_resident(&c.1)
+            .await
+            .expect("waits then evicts");
+        assert_eq!(&resident[..], &c.2[..]);
+        release.await.unwrap();
+
+        // With a guard held for longer than budget_wait, the deferred
+        // insert fails typed instead of evicting or hanging.
+        let _held = storage.query_guard();
+        let err = storage.ensure_resident(&d.1).await.expect_err("deferred");
+        assert!(err.to_string().contains("eviction deferred"), "got: {err}");
+        io.shutdown();
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_cids_makes_wants_resident_and_pins_them() {
+        let objects: Vec<_> = (50u8..53).map(|t| object(t, 8)).collect();
+        let missing = object(60, 8); // never served by the mock → 404
+        let state = Arc::new(Mutex::new(MockState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            for (id, _, bytes) in &objects {
+                s.objects.insert(id.to_string(), (200, bytes.clone()));
+            }
+        }
+        let (storage, io, driver) = storage_with(&state, &config());
+
+        let pins = storage.pin_set();
+        let wants: Vec<ContentId> = objects
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .chain([missing.0.clone()])
+            .collect();
+        let failures = storage.fetch_cids_pinned(LEDGER, wants, &pins).await;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, missing.0);
+        assert!(matches!(failures[0].1, CoreError::NotFound(_)));
+        assert_eq!(pins.len(), 3, "every fetched want is pinned");
+        for (id, _, bytes) in &objects {
+            assert!(pins.contains(id));
+            assert_eq!(&storage.resolve_cached_bytes(id).unwrap()[..], &bytes[..]);
+        }
+        // The formed addresses went through the shared proxy client.
+        assert_eq!(state.lock().unwrap().fetch_log.len(), 4);
         io.shutdown();
         driver.await.unwrap();
     }
@@ -765,14 +1054,23 @@ pub(crate) mod tests {
         assert!(pins.pin(&a.0));
         storage.ensure_resident(&b.1).await.unwrap();
         storage.ensure_resident(&c.1).await.unwrap();
-        assert!(storage.resolve_cached_bytes(&a.0).is_some(), "pinned survives");
-        assert!(storage.resolve_cached_bytes(&b.0).is_none(), "LRU unpinned evicted");
+        assert!(
+            storage.resolve_cached_bytes(&a.0).is_some(),
+            "pinned survives"
+        );
+        assert!(
+            storage.resolve_cached_bytes(&b.0).is_none(),
+            "LRU unpinned evicted"
+        );
         assert!(storage.resolve_cached_bytes(&c.0).is_some());
 
         // Pin c too: the working set (80) fills the budget, so a further
         // insert is a typed working-set failure — not silent thrashing.
         assert!(pins.pin(&c.0));
-        let err = storage.ensure_resident(&b.1).await.expect_err("over budget");
+        let err = storage
+            .ensure_resident(&b.1)
+            .await
+            .expect_err("over budget");
         assert!(err.to_string().contains("working set exceeds"), "got {err}");
 
         drop(pins);

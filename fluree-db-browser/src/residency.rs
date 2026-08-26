@@ -7,15 +7,24 @@
 //! hit, no I/O. Bytes enter it only after CID verification, so a hit is
 //! trusted.
 //!
-//! Eviction is LRU over a byte budget. Entries pinned through a [`PinSet`]
-//! are never evicted, which is what makes the fetch-and-re-run loop
-//! monotone: everything a query has already pulled in stays resident until
-//! the query's pin set drops. When the pinned working set alone would
-//! exceed the budget, inserts fail with a typed error instead of thrashing.
+//! Eviction is LRU over a byte budget, and it runs **only while no query is
+//! in flight** (an in-flight counter maintained through [`QueryGuard`]s): a
+//! hit cannot be attributed to a query through the sync hook, so the only
+//! way to keep every concurrent query's progress monotone — the engine's
+//! fetch-pins contract: bytes made resident for a retry round must still be
+//! resident on the re-run — is to freeze eviction while anything is
+//! running. An insert that would need eviction mid-flight gets a typed
+//! [`ResidencyError::EvictionDeferred`] (the async caller waits for a
+//! release and retries). Entries pinned through a [`PinSet`] are never
+//! evicted regardless, and when the pinned working set alone would exceed
+//! the budget, inserts fail with
+//! [`ResidencyError::WorkingSetExceedsBudget`] instead of thrashing.
 
 use fluree_db_core::ContentId;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use tokio::sync::Notify;
 
 /// Why bytes could not be made resident.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -33,6 +42,13 @@ pub enum ResidencyError {
     /// A single object is larger than the whole budget.
     #[error("object of {size} bytes exceeds the residency budget of {budget} bytes")]
     ObjectExceedsBudget { size: usize, budget: usize },
+    /// Making room would require evicting while queries are in flight,
+    /// which the monotone-progress contract forbids. The caller should
+    /// wait for a release (a query finishing, an entry removed) and retry.
+    #[error(
+        "residency eviction deferred: {in_flight} queries in flight, {needed} more bytes needed"
+    )]
+    EvictionDeferred { needed: usize, in_flight: usize },
 }
 
 /// Point-in-time counters for observability and tests.
@@ -65,6 +81,10 @@ struct Inner {
 pub struct ResidencyTier {
     budget: usize,
     inner: Mutex<Inner>,
+    in_flight: AtomicUsize,
+    /// Notified when room may have appeared: the last in-flight query
+    /// finished, or resident bytes were removed.
+    released: Notify,
 }
 
 impl std::fmt::Debug for ResidencyTier {
@@ -93,7 +113,33 @@ impl ResidencyTier {
                 clock: 0,
                 evictions: 0,
             }),
+            in_flight: AtomicUsize::new(0),
+            released: Notify::new(),
         }
+    }
+
+    /// Mark a query as in flight for the guard's lifetime. While any guard
+    /// is alive, eviction is frozen — every resident byte a running query
+    /// might have observed stays resident (monotone progress without
+    /// per-query pin attribution).
+    pub fn begin_query(self: &Arc<Self>) -> QueryGuard {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        QueryGuard {
+            tier: Arc::clone(self),
+        }
+    }
+
+    /// Number of queries currently in flight.
+    pub fn queries_in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Resolves on the next release event: the last in-flight query
+    /// finishing, or resident bytes being removed. Used by async callers to
+    /// retry a deferred insert; pair with a deadline (a release may never
+    /// come if the waiter itself holds the only guard).
+    pub async fn released(&self) {
+        self.released.notified().await;
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -149,6 +195,13 @@ impl ResidencyTier {
             });
         }
         if inner.total + size > self.budget {
+            let in_flight = self.in_flight.load(Ordering::Acquire);
+            if in_flight > 0 {
+                return Err(ResidencyError::EvictionDeferred {
+                    needed: size,
+                    in_flight,
+                });
+            }
             let need = inner.total + size - self.budget;
             Self::evict_unpinned(&mut inner, need);
         }
@@ -225,35 +278,44 @@ impl ResidencyTier {
     /// Drop an unpinned entry. Returns `false` if the entry is absent or
     /// pinned.
     pub fn remove(&self, id: &ContentId) -> bool {
-        let mut inner = self.lock();
-        match inner.entries.get(id) {
-            Some(e) if e.pins == 0 => {
-                let size = e.bytes.len();
-                inner.entries.remove(id);
-                inner.total -= size;
-                true
+        let removed = {
+            let mut inner = self.lock();
+            match inner.entries.get(id) {
+                Some(e) if e.pins == 0 => {
+                    let size = e.bytes.len();
+                    inner.entries.remove(id);
+                    inner.total -= size;
+                    true
+                }
+                _ => false,
             }
-            _ => false,
+        };
+        if removed {
+            self.released.notify_waiters();
         }
+        removed
     }
 
     /// Drop every unpinned entry.
     pub fn clear_unpinned(&self) {
-        let mut inner = self.lock();
-        let keep: Vec<ContentId> = inner
-            .entries
-            .iter()
-            .filter(|(_, e)| e.pins > 0)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut kept = HashMap::with_capacity(keep.len());
-        for id in keep {
-            if let Some(e) = inner.entries.remove(&id) {
-                kept.insert(id, e);
+        {
+            let mut inner = self.lock();
+            let keep: Vec<ContentId> = inner
+                .entries
+                .iter()
+                .filter(|(_, e)| e.pins > 0)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let mut kept = HashMap::with_capacity(keep.len());
+            for id in keep {
+                if let Some(e) = inner.entries.remove(&id) {
+                    kept.insert(id, e);
+                }
             }
+            inner.entries = kept;
+            inner.total = inner.pinned_total;
         }
-        inner.entries = kept;
-        inner.total = inner.pinned_total;
+        self.released.notify_waiters();
     }
 
     /// Current counters.
@@ -274,6 +336,34 @@ impl ResidencyTier {
         PinSet {
             tier: Arc::clone(self),
             pinned: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+/// Marks one query as in flight; dropping it releases the mark and, when it
+/// was the last one, wakes waiters whose inserts were deferred.
+///
+/// Discipline: hold the guard across a query's sync compute AND its retry
+/// rounds (the fetch-pins contract needs the fetched bytes to survive to
+/// the re-run), and never wait on
+/// [`ResidencyTier::released`] while holding the only guard — the deadline
+/// in the caller is the safety net for that mistake.
+pub struct QueryGuard {
+    tier: Arc<ResidencyTier>,
+}
+
+impl std::fmt::Debug for QueryGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryGuard")
+            .field("in_flight", &self.tier.queries_in_flight())
+            .finish()
+    }
+}
+
+impl Drop for QueryGuard {
+    fn drop(&mut self) {
+        if self.tier.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tier.released.notify_waiters();
         }
     }
 }
@@ -368,7 +458,10 @@ mod tests {
         assert!(tier.resolve(&id).is_none());
         let stored = tier.insert(id.clone(), bytes.clone()).unwrap();
         let hit = tier.resolve(&id).unwrap();
-        assert!(Arc::ptr_eq(&stored, &hit), "hit must be the same allocation");
+        assert!(
+            Arc::ptr_eq(&stored, &hit),
+            "hit must be the same allocation"
+        );
         assert!(Arc::ptr_eq(&bytes, &hit));
         assert_eq!(tier.stats().bytes, 10);
     }
@@ -504,5 +597,53 @@ mod tests {
         assert!(!tier.contains(&b));
         assert_eq!(tier.stats().bytes, 8);
         assert!(!tier.remove(&a), "pinned entries cannot be removed");
+    }
+
+    #[tokio::test]
+    async fn eviction_is_deferred_while_queries_are_in_flight() {
+        let tier = Arc::new(ResidencyTier::new(20));
+        let (a, ab) = blob(1, 10);
+        let (b, bb) = blob(2, 10);
+        let (c, cb) = blob(3, 10);
+        tier.insert(a.clone(), ab).unwrap();
+        tier.insert(b.clone(), bb).unwrap();
+
+        let guard = tier.begin_query();
+        let err = tier.insert(c.clone(), Arc::clone(&cb)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ResidencyError::EvictionDeferred {
+                    needed: 10,
+                    in_flight: 1
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            tier.contains(&a) && tier.contains(&b),
+            "nothing may be evicted mid-flight"
+        );
+
+        drop(guard);
+        tier.insert(c.clone(), cb).unwrap();
+        assert!(tier.contains(&c), "eviction resumes once idle");
+        assert_eq!(tier.stats().bytes, 20);
+    }
+
+    #[tokio::test]
+    async fn guard_drop_wakes_released_waiters() {
+        let tier = Arc::new(ResidencyTier::new(16));
+        let guard = tier.begin_query();
+        assert_eq!(tier.queries_in_flight(), 1);
+        let waiter = {
+            let tier = Arc::clone(&tier);
+            tokio::spawn(async move { tier.released().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "no release yet");
+        drop(guard);
+        waiter.await.unwrap();
+        assert_eq!(tier.queries_in_flight(), 0);
     }
 }

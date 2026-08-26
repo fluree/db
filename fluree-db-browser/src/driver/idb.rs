@@ -156,8 +156,8 @@ async fn transaction_done(tx: &IdbTransaction) -> Result<(), JsValue> {
 async fn open_db(name: &str) -> Result<IdbDatabase, JsValue> {
     let factory = idb_factory()?;
     let open_req: IdbOpenDbRequest = factory.open_with_u32(name, DB_VERSION)?;
-    let on_upgrade = Closure::<dyn FnMut(IdbVersionChangeEvent)>::new(
-        move |event: IdbVersionChangeEvent| {
+    let on_upgrade =
+        Closure::<dyn FnMut(IdbVersionChangeEvent)>::new(move |event: IdbVersionChangeEvent| {
             let Some(target) = event.target() else {
                 return;
             };
@@ -177,8 +177,7 @@ async fn open_db(name: &str) -> Result<IdbDatabase, JsValue> {
             if !names.contains(META) {
                 let _ = db.create_object_store(META);
             }
-        },
-    );
+        });
     open_req.set_onupgradeneeded(Some(on_upgrade.as_ref().unchecked_ref()));
     let base: &IdbRequest = &open_req;
     let result = request(base.clone()).await;
@@ -381,7 +380,11 @@ impl IdbCache {
                 self.dirty.borrow_mut().insert(k, now);
                 return;
             }
-            index.plan_for_insert(size, self.config.budget_bytes, self.config.low_water_bytes())
+            index.plan_for_insert(
+                size,
+                self.config.budget_bytes,
+                self.config.low_water_bytes(),
+            )
         };
         match self.write(&k, &bytes, size, now, &victims).await {
             Ok(()) => {
