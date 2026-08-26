@@ -284,9 +284,8 @@ async fn ledger_with_recovery(
         match fluree.ledger(LEDGER).await {
             Ok(ledger) => return ledger,
             Err(e) => {
-                if !recover_once(&cs, storage, &mut recovery, &e).await {
-                    panic!("non-residency ledger-load error: {e:?}");
-                }
+                let recovered = recover_once(&cs, storage, &mut recovery, &e).await;
+                assert!(recovered, "non-residency ledger-load error: {e:?}");
             }
         }
     }
