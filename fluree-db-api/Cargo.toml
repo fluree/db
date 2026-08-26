@@ -76,7 +76,7 @@ bytes = "1.4"
 chrono.workspace = true
 futures.workspace = true
 indexmap.workspace = true
-moka.workspace = true
+# moka is native-only: its eviction clock aborts on wasm32 (see fluree-db-core::wasm_cache)
 rustc-hash = "2"
 thiserror.workspace = true
 serde.workspace = true
@@ -458,6 +458,7 @@ path = "tests/it_literal_identity.rs"
 required-features = ["native"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+moka = { workspace = true }
 fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
 fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-db-spatial = { path = "../fluree-db-spatial" }
@@ -468,3 +469,5 @@ dirs = "5"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 fluree-db-transact = { path = "../fluree-db-transact" }
 tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "io-util"] }
+# Executor for `wasm_compat::spawn_detached` (browser event loop).
+wasm-bindgen-futures = "0.4"

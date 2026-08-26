@@ -35,7 +35,7 @@ once_cell = "1"
 lru = "0.12"
 parking_lot = "0.12"
 # TinyLFU cache for fulltext novelty deltas
-moka = { workspace = true }
+# moka is native-only: its eviction clock aborts on wasm32 (see fluree-db-core::wasm_cache)
 # BM25 index serialization
 postcard = { version = "1", features = ["alloc"] }
 # Compression for chunked BM25 snapshots (v4)
@@ -94,6 +94,7 @@ workspace = true
 # Real spatial provider (s2 geometry stack) is native-only; wasm32 uses the
 # stub trait re-exported through fluree-db-binary-index::wasm_compat.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+moka = { workspace = true }
 fluree-db-spatial = { path = "../fluree-db-spatial" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
