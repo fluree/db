@@ -3230,6 +3230,17 @@ impl Fluree {
         self.indexing_mode = mode;
     }
 
+    /// The background indexer handle, when indexing runs in this process.
+    ///
+    /// `None` under [`IndexingMode::Disabled`]. Lets embedders observe or
+    /// drain indexing (`status`, `wait_for_idle`) on an instance built via
+    /// [`FlureeBuilder`], whose worker is otherwise reachable only through
+    /// the `indexing_mode` field.
+    ///
+    /// [`IndexingMode::Disabled`]: tx::IndexingMode::Disabled
+    pub fn indexer_handle(&self) -> Option<&IndexerHandle> {
+        self.indexing_mode.handle()
+    }
 
     /// Return a clone of this `Fluree` carrying `resolver`, used to hydrate
     /// `ConfigValue::SecretRef` auth references in Iceberg graph sources.
