@@ -852,11 +852,8 @@ fn resolve_latest_ops_keep_asserts(mut flakes: Vec<Flake>, index: IndexType) -> 
     }
 
     let mut out: Vec<Flake> = Vec::with_capacity(flakes.len());
-    // Winners for the run being scanned: one index per distinct `m`. A linear
-    // scan beats a map — the cardinality is how many distinct metadata values
-    // a single `(s, p, o, dt)` carries, which is 1 for every plain fact and
-    // stays small even for a list that repeats a value.
-    let mut winners: Vec<usize> = Vec::new();
+    // Scratch index buffer for the multi-flake run path, reused across runs.
+    let mut idxs: Vec<usize> = Vec::new();
     let mut start = 0usize;
     while start < flakes.len() {
         let mut end = start + 1;
@@ -864,37 +861,57 @@ fn resolve_latest_ops_keep_asserts(mut flakes: Vec<Flake>, index: IndexType) -> 
             end += 1;
         }
 
-        winners.clear();
-        for j in start..end {
-            match winners.iter().position(|&w| flakes[w].m == flakes[j].m) {
-                Some(slot) => {
-                    let cur = &flakes[winners[slot]];
-                    let cand = &flakes[j];
-                    // Newest op wins; at equal `t` a retraction beats an
-                    // assert, matching `resolve_current_flakes`.
-                    if cand.t > cur.t || (cand.t == cur.t && !cand.op && cur.op) {
-                        winners[slot] = j;
-                    }
-                }
-                None => winners.push(j),
+        // Overwhelmingly the common run: one flake, so no grouping at all.
+        if end - start == 1 {
+            if flakes[start].op {
+                out.push(flakes[start].clone());
             }
+            start = end;
+            continue;
         }
-        out.extend(
-            winners
-                .iter()
-                .filter(|&&w| flakes[w].op)
-                .map(|&w| flakes[w].clone()),
-        );
+
+        // Group the run by `m`. Sorting rather than scanning a winners list
+        // keeps this O(k log k): a list that repeats one value across k
+        // positions puts all k in ONE run with k distinct `m`, and a linear
+        // "have I seen this `m`" probe would make that quadratic — the shape
+        // this whole area of the code exists to have stopped doing.
+        //
+        // The sort keys on `m` ALONE and is stable, so the comparator's
+        // `t, op` order survives inside each group and the winner scan below
+        // sees candidates in ascending `t`.
+        idxs.clear();
+        idxs.extend(start..end);
+        idxs.sort_by(|&a, &b| flakes[a].m.cmp(&flakes[b].m));
+
+        let mut g = 0usize;
+        while g < idxs.len() {
+            let mut best = idxs[g];
+            let mut h = g + 1;
+            while h < idxs.len() && flakes[idxs[h]].m == flakes[best].m {
+                let cand = &flakes[idxs[h]];
+                let cur = &flakes[best];
+                // Newest op wins; at equal `t` a retraction beats an assert,
+                // matching `resolve_current_flakes`.
+                if cand.t > cur.t || (cand.t == cur.t && !cand.op && cur.op) {
+                    best = idxs[h];
+                }
+                h += 1;
+            }
+            if flakes[best].op {
+                out.push(flakes[best].clone());
+            }
+            g = h;
+        }
 
         start = end;
     }
 
-    // Winners are collected in first-appearance (`t`) order within a run, so a
-    // run resolving to more than one surviving fact can emit them out of the
-    // comparator's order. Callers take this as a range result and expect index
-    // order, which the single-winner-per-group predecessor gave them for free.
-    // Nearly free to restore: `out` is a subsequence of an already-sorted vec
-    // with at most a few local inversions.
+    // Survivors of a multi-flake run are emitted in `m` order, which is not
+    // the comparator's order for the run (it orders `t` first). Callers take
+    // this as a range result and expect index order, which the
+    // single-winner-per-group predecessor gave them for free. Cheap to
+    // restore: `out` is a subsequence of an already-sorted vec whose only
+    // inversions are inside those runs.
     out.sort_by(cmp);
     out
 }
@@ -1812,6 +1829,49 @@ mod tests {
                 .all(|w| cmp(&w[0], &w[1]) != std::cmp::Ordering::Greater),
             "resolved range results must be index-ordered, got {:?}",
             rendered(&out)
+        );
+    }
+
+    /// A list holding ONE value at many positions puts every entry in a
+    /// single `(s, p, o, dt)` run with a distinct `m` each — the worst case
+    /// for the per-`m` grouping, and the shape a "have I seen this `m`"
+    /// linear probe would turn quadratic. Sized so a quadratic grouper would
+    /// be conspicuous rather than merely slower.
+    #[test]
+    fn many_positions_of_one_value_resolve_without_a_quadratic() {
+        const K: i32 = 4_000;
+        let mut flakes: Vec<Flake> = (0..K).map(|i| f("x", 2, true, at(i))).collect();
+        // Retract every third position.
+        flakes.extend(
+            (0..K)
+                .filter(|i| i % 3 == 0)
+                .map(|i| f("x", 3, false, at(i))),
+        );
+
+        let started = std::time::Instant::now();
+        let out = resolve_latest_ops_keep_asserts(flakes, IndexType::Spot);
+        let elapsed = started.elapsed();
+
+        let expected = (0..K).filter(|i| i % 3 != 0).count();
+        assert_eq!(
+            out.len(),
+            expected,
+            "exactly the unretracted positions live"
+        );
+        let survivors: Vec<i32> = out.iter().filter_map(|f| f.m.as_ref()?.i).collect();
+        assert!(
+            survivors.iter().all(|i| i % 3 != 0),
+            "no retracted position may survive"
+        );
+        assert!(
+            survivors.windows(2).all(|w| w[0] < w[1]),
+            "survivors stay in index order"
+        );
+        // Generous by ~2 orders of magnitude against the real runtime, so it
+        // fails on a reintroduced quadratic without flaking on a slow box.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "resolution took {elapsed:?} for {K} positions — grouping went superlinear"
         );
     }
 
