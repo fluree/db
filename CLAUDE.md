@@ -52,9 +52,11 @@ PR labels drive release-note categories via `.github/release.yml` — an unlabel
   indistinguishable from pending. Confirm the expected workflows actually created runs.
 - **Prove a new regression test is non-vacuous.** Revert the fix, watch the test fail, restore it.
   Several tests here have passed against the bug they were meant to pin.
-- **`FLUREE_DISABLE_QUERY_FAST_PATHS` is the usual differential oracle, but it is not infallible** —
-  see issue #1700, where the generic pipeline is the *wrong* lane for `COUNT(*)` over a
-  multi-object join. Confirm which lane is correct before "fixing" toward the oracle.
+- **Two lanes agreeing is not evidence of correctness.** `FLUREE_DISABLE_QUERY_FAST_PATHS` is the
+  usual differential oracle, but a defect in the *plan both lanes share* is invisible to it — see
+  #1700, where an unprojected object variable silently collapsed row multiplicity and both lanes
+  returned the same wrong answer on most shapes. Where the two do disagree, confirm which lane is
+  right before "fixing" toward the oracle.
 - **Fast-path suites use routing stamps** (`MustFire` / `MustNotFire`) so a test cannot pass by
   silently taking the generic lane. If you add a fast path, stamp it.
 - SPARQL and JSON-LD share an IR: a fix on one surface generally needs a twin test on the other.
