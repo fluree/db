@@ -30,6 +30,7 @@
 
 use crate::transport::{HttpTransport, TransportError, TransportRequest};
 use async_trait::async_trait;
+use bytes::Bytes;
 use fluree_db_core::error::{Error as CoreError, Result};
 use fluree_db_core::format_ledger_id;
 use fluree_db_core::storage::{ReadHint, GRAPH_SOURCES_PATH_SEGMENT};
@@ -41,11 +42,11 @@ use fluree_db_core::{
     CODEC_FLUREE_INDEX_ROOT, CODEC_FLUREE_LEDGER_CONFIG, CODEC_FLUREE_SPATIAL_INDEX,
     CODEC_FLUREE_STATS_SKETCH, CODEC_FLUREE_TXN,
 };
-use bytes::Bytes;
 use http::StatusCode;
 use serde::Serialize;
 use std::fmt::Debug;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 /// How [`ProxyStorage`] fetches ledger content from the origin server.
@@ -231,6 +232,7 @@ impl ProxyStorage {
     /// * `mode` - Read mode: [`ProxyReadMode::Raw`] for CID-verified canonical
     ///   bytes (full-access tokens), [`ProxyReadMode::Filtered`] for
     ///   policy-filtered FLKB leaf payloads
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(base_url: String, token: String, mode: ProxyReadMode) -> Self {
         // Server root → default versioned API base.
         let api_base = format!("{}/v1/fluree", base_url.trim_end_matches('/'));
@@ -242,6 +244,7 @@ impl ProxyStorage {
     /// or advertised via discovery's `api_base_url`. Use this instead of
     /// [`new`](Self::new) when the API may be mounted under a non-default
     /// prefix.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_api_base(api_base: String, token: String, mode: ProxyReadMode) -> Self {
         let transport = Arc::new(crate::transport::ReqwestTransport::with_timeout(
             Duration::from_secs(60), // 1 minute for block reads
@@ -358,7 +361,7 @@ impl ProxyStorage {
         match status {
             StatusCode::OK => {
                 let bytes = response.body;
-                if !crate::origin::verify_object_integrity(&cid, &bytes) {
+                if !crate::integrity::verify_object_integrity(&cid, &bytes) {
                     return Err(CoreError::storage(format!(
                         "Integrity verification failed for {address} (cid {cid})"
                     )));
@@ -544,7 +547,7 @@ impl StorageRead for ProxyStorage {
             // full object and slice locally.
             StatusCode::OK => {
                 let bytes = response.body;
-                if !crate::origin::verify_object_integrity(&cid, &bytes) {
+                if !crate::integrity::verify_object_integrity(&cid, &bytes) {
                     return Err(CoreError::storage(format!(
                         "Integrity verification failed for {address} (cid {cid})"
                     )));

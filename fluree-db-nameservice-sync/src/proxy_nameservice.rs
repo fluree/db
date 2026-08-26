@@ -11,6 +11,7 @@ use http::StatusCode;
 use serde::Deserialize;
 use std::fmt::Debug;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 /// NameService implementation that proxies lookups through the transaction server
@@ -110,6 +111,7 @@ impl ProxyNameService {
     ///
     /// * `base_url` - Base URL of the transaction server (e.g., `https://tx.fluree.internal:8090`)
     /// * `token` - Bearer token for authentication (with `fluree.storage.*` claims)
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(base_url: String, token: String) -> Self {
         // Server root → default versioned API base.
         let api_base = format!("{}/v1/fluree", base_url.trim_end_matches('/'));
@@ -121,6 +123,7 @@ impl ProxyNameService {
     /// add` or advertised via discovery's `api_base_url`. Use this instead
     /// of [`new`](Self::new) when the API may be mounted under a
     /// non-default prefix.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_api_base(api_base: String, token: String) -> Self {
         let transport = Arc::new(crate::transport::ReqwestTransport::with_timeout(
             Duration::from_secs(30), // 30 seconds for NS lookups

@@ -273,7 +273,7 @@ jobs:
           tool: wasm-pack
 
       - name: Check engine stack (wasm32)
-        run: cargo check --target wasm32-unknown-unknown -p fluree-db-api --no-default-features
+        run: cargo check --target wasm32-unknown-unknown -p fluree-db-api -p fluree-db-nameservice-sync --no-default-features
 
       - name: Check parse layer, no default features (wasm32)
         run: cargo check --target wasm32-unknown-unknown --no-default-features -p fluree-vocab -p fluree-graph-ir -p fluree-graph-turtle -p fluree-graph-json-ld -p fluree-db-sparql
