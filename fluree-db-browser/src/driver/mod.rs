@@ -58,12 +58,22 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                     let _ = reply.send(None);
                 }
             },
-            IoJob::CachePut { key, bytes } => {
+            IoJob::CachePut { key, bytes, permit } => {
                 if let Some(cache) = cache.clone() {
                     spawn_local(async move {
                         cache.put(key, bytes).await;
+                        // Credit the write-behind gauge only once the write
+                        // finished (or failed) — this is the backpressure.
+                        drop(permit);
                     });
                 }
+            }
+            IoJob::Sleep { duration, reply } => {
+                let millis = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);
+                spawn_local(async move {
+                    gloo_timers::future::TimeoutFuture::new(millis).await;
+                    let _ = reply.send(());
+                });
             }
             IoJob::Shutdown => break,
         }

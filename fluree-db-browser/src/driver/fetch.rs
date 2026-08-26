@@ -79,7 +79,7 @@ pub async fn execute(
         // Request bodies are the small JSON block requests; copying them
         // into JS memory is the only way to hand them to fetch.
         let array = Uint8Array::from(&body[..]);
-        init.set_body(Some(&array));
+        init.set_body(&array);
     }
     init.set_credentials(RequestCredentials::Omit);
     init.set_mode(RequestMode::Cors);
@@ -114,9 +114,9 @@ pub async fn execute(
             )));
         }
     };
-    let response: Response = response
-        .dyn_into()
-        .map_err(|_| TransportError::Request("fetch resolved to a non-Response value".to_string()))?;
+    let response: Response = response.dyn_into().map_err(|_| {
+        TransportError::Request("fetch resolved to a non-Response value".to_string())
+    })?;
 
     let status = StatusCode::from_u16(response.status())
         .map_err(|e| TransportError::Request(format!("invalid HTTP status: {e}")))?;

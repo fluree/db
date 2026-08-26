@@ -6,6 +6,7 @@
 //! unbounded channel and awaits a oneshot reply. Both halves are plain Rust
 //! data, so the protocol is exercised natively by a mock consumer in tests.
 
+use crate::gauge::WriteBehindPermit;
 use bytes::Bytes;
 use fluree_db_core::ContentId;
 use fluree_db_nameservice_sync::{TransportError, TransportRequest, TransportResponse};
@@ -34,7 +35,21 @@ pub enum IoJob {
     /// Persist a block. Write-behind: the sender has already served the
     /// bytes and never waits for the write. The `Arc` is the residency
     /// tier's own allocation, so enqueueing costs a refcount, not a copy.
-    CachePut { key: ContentId, bytes: Arc<[u8]> },
+    /// The permit sizes the block against the write-behind gauge and
+    /// releases when the driver finishes (or drops) the write — the driver
+    /// just moves it into the write task.
+    CachePut {
+        key: ContentId,
+        bytes: Arc<[u8]>,
+        permit: Option<WriteBehindPermit>,
+    },
+    /// Reply after `duration`. The engine side has no timer of its own —
+    /// JS owns the clock — so bounded waits (deferred-insert deadlines)
+    /// borrow the driver's.
+    Sleep {
+        duration: Duration,
+        reply: oneshot::Sender<()>,
+    },
     /// Stop the driver after draining what it already spawned.
     Shutdown,
 }
