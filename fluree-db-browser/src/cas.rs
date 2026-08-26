@@ -36,6 +36,7 @@ use crate::residency::{PinSet, QueryGuard, ResidencyError, ResidencyTier};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_core::error::{Error as CoreError, Result};
+use fluree_db_core::storage::residency::{MissRegister, Want};
 use fluree_db_core::storage::ReadHint;
 use fluree_db_core::{
     ContentAddressedWrite, ContentId, ContentKind, ContentWriteResult, StorageMethod, StorageRead,
@@ -99,6 +100,7 @@ struct Inner {
     cache_enabled: bool,
     write_behind: Arc<WriteBehindGauge>,
     budget_wait: Duration,
+    register: MissRegister,
     counters: Counters,
 }
 
@@ -135,6 +137,7 @@ impl BrowserCasStorage {
                 cache_enabled: config.cache.enabled,
                 write_behind: WriteBehindGauge::new(config.write_behind_budget_bytes),
                 budget_wait: config.budget_wait,
+                register: MissRegister::new(),
                 counters: Counters::default(),
             }),
         }
@@ -218,6 +221,22 @@ impl BrowserCasStorage {
             .into_iter()
             .filter_map(|(cid, result)| result.err().map(|e| (cid, e)))
             .collect()
+    }
+
+    /// Fetch a drained want set (the miss register's currency) and pin the
+    /// successes — the browser-side twin of the engine's `fetch_wants`
+    /// retry primitive, for callers that hold the ledger context.
+    pub async fn fetch_wants<I>(
+        &self,
+        ledger: &str,
+        wants: I,
+        pins: &PinSet,
+    ) -> Vec<(ContentId, CoreError)>
+    where
+        I: IntoIterator<Item = Want>,
+    {
+        self.fetch_cids_pinned(ledger, wants.into_iter().map(|w| w.cid), pins)
+            .await
     }
 
     /// [`fetch_cids`](Self::fetch_cids), pinning each successfully fetched
@@ -483,6 +502,15 @@ impl StorageRead for BrowserCasStorage {
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
         self.inner.residency.resolve(id)
+    }
+
+    /// Participation signal for the sync residency tier: the binary-index
+    /// read path serves exclusively from `resolve_cached_bytes` and records
+    /// every miss here for a retry frame to drain. The fetch-pins contract
+    /// holds because `read_bytes` inserts into the residency tier and
+    /// eviction is frozen while the retry frame's query guard is alive.
+    fn miss_register(&self) -> Option<&MissRegister> {
+        Some(&self.inner.register)
     }
 }
 
@@ -1027,6 +1055,62 @@ pub(crate) mod tests {
         }
         // The formed addresses went through the shared proxy client.
         assert_eq!(state.lock().unwrap().fetch_log.len(), 4);
+        io.shutdown();
+        driver.await.unwrap();
+    }
+
+    /// The load-bearing integration: the engine's LANDED retry primitives
+    /// drive this storage through the exact bridge the engine assembles
+    /// (`content_store_for` → `StorageContentStore`). A sync miss records
+    /// into this storage's register through the bridge; `RetryBudget::
+    /// after_error` drains it, fetches through `ContentStore::get` (our
+    /// `read_bytes`), verifies residency (fetch-pins contract), and the
+    /// re-run hits. Positive markers throughout — no vacuous passes.
+    #[tokio::test]
+    async fn landed_retry_primitives_drive_this_storage_through_the_engine_bridge() {
+        use fluree_db_binary_index::read::need_fetch::RetryBudget;
+        use fluree_db_core::storage::residency::{resident_or_need_fetch, FetchKind, NeedFetch};
+
+        let (id, _address, bytes) = object(70, 24);
+        let state = Arc::new(Mutex::new(MockState::default()));
+        state
+            .lock()
+            .unwrap()
+            .objects
+            .insert(id.to_string(), (200, bytes.clone()));
+        let (storage, io, driver) = storage_with(&state, &config());
+        let bridge = fluree_db_core::storage::content_store_for(storage.clone(), LEDGER);
+
+        // Retry frames hold a query guard; eviction stays frozen throughout.
+        let _guard = storage.query_guard();
+
+        // Sync read misses: typed error AND a recorded want, through the bridge.
+        let err = resident_or_need_fetch(&bridge, &id, FetchKind::IndexLeaf)
+            .expect_err("cold tier must miss");
+        let nf = NeedFetch::from_io_error(&err).expect("typed NeedFetch payload");
+        assert_eq!(nf.cid, id);
+        assert_eq!(storage.miss_register().unwrap().len(), 1, "want recorded");
+
+        // The landed drain/fetch/verify round reports progress.
+        let mut budget = RetryBudget::default();
+        let rerun = budget
+            .after_error(&bridge, 4)
+            .await
+            .expect("round must make progress");
+        assert!(rerun, "wants were fetched — re-run the unit");
+        assert_eq!(budget.fetched_total(), 1);
+        assert!(storage.miss_register().unwrap().is_empty(), "drained");
+
+        // Re-run hits the resident tier — zero-copy, no new fetch.
+        let hit = resident_or_need_fetch(&bridge, &id, FetchKind::IndexLeaf)
+            .expect("fetch-pins contract: fetched bytes are resident");
+        assert_eq!(&hit[..], &bytes[..]);
+        assert_eq!(state.lock().unwrap().fetch_log.len(), 1, "one fetch total");
+
+        // A real (non-miss) error leaves the loop alone: empty register → false.
+        let no_rerun = budget.after_error(&bridge, 4).await.expect("no wants");
+        assert!(!no_rerun, "empty register means the error was real");
+
         io.shutdown();
         driver.await.unwrap();
     }
