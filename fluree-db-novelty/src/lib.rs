@@ -977,7 +977,7 @@ impl Novelty {
         );
         let _guard = span.enter();
 
-        let started = std::time::Instant::now();
+        let started = fluree_db_core::clock::Instant::now();
 
         // ---- Phase 1: partition incoming flakes by graph ----
         let mut per_graph: HashMap<GraphId, Vec<Flake>> = HashMap::new();

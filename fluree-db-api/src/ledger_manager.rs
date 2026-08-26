@@ -19,10 +19,11 @@
 //! - Transactions serialize via `lock_for_write()` (hold lock for stage+commit)
 //! - Manager lock is released during I/O (no blocking other ledgers)
 
+use fluree_db_core::clock::Instant;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use std::path::PathBuf;
 
@@ -793,10 +794,26 @@ impl Default for LedgerManagerConfig {
         Self {
             idle_ttl: Duration::from_secs(30 * 60),
             sweep_interval: Duration::from_secs(60),
-            cache_dir: std::env::temp_dir().join("fluree_binary_cache"),
+            cache_dir: default_cache_dir(),
             leaflet_cache: None,
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_cache_dir() -> PathBuf {
+    std::env::temp_dir().join("fluree_binary_cache")
+}
+
+/// wasm32 has no filesystem and `std::env::temp_dir()` PANICS there ("no
+/// filesystem on this platform") — and this default runs inside
+/// `FlureeBuilder::memory()`, before any build method. The synthetic path is
+/// never touched at runtime: the disk cache opens with a zero write budget
+/// (`fs::create_dir_all` fails → writes disabled) and reads map
+/// `Unsupported` to a cache miss.
+#[cfg(target_arch = "wasm32")]
+fn default_cache_dir() -> PathBuf {
+    PathBuf::from("/fluree-cache")
 }
 
 // ============================================================================

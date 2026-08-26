@@ -8,12 +8,12 @@
 //! the global LRU cache (respecting the customer's memory budget). Without
 //! a cache, leaves are read directly from disk on each lookup.
 
+use fluree_db_core::clock::Instant;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use super::branch::DictBranch;
 use super::reverse_leaf::ReverseLeaf;
