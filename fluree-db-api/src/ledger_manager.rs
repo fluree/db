@@ -1021,13 +1021,7 @@ impl LedgerManager {
         &self,
         ledger_id: &str,
     ) -> Option<RunningAttachmentEvents> {
-        let canonical_alias =
-            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
-        let entries = self.entries.read().await;
-        let entry = entries.get(&canonical_alias)?;
-        let LoadState::Ready(handle) = entry else {
-            return None;
-        };
+        let handle = self.ready_handle(ledger_id).await?;
         let view = handle.snapshot().await;
         // Coverage heuristic: when the snapshot's `t` is zero, no
         // index has ever run on this ledger, so the running
@@ -1088,14 +1082,29 @@ impl LedgerManager {
     /// the provider needs the snapshot + range_provider to scan the
     /// base index for `f:reifies*` flakes itself.
     pub async fn get_loaded_view(&self, ledger_id: &str) -> Option<LedgerView> {
+        let handle = self.ready_handle(ledger_id).await?;
+        Some(handle.snapshot().await)
+    }
+
+    /// Clone out a `Ready` handle, releasing the `entries` guard before
+    /// returning.
+    ///
+    /// Every caller that goes on to touch the handle's `state` lock must
+    /// come through here. Holding `entries` across a `state` acquisition
+    /// is the one ordering this file forbids: a transaction holds
+    /// `state` for its whole commit, so a reader parked behind it while
+    /// still holding `entries` blocks the next `entries.write()` — a
+    /// cold load of any ledger — and, because the lock is write-fair,
+    /// every `entries.read()` after that. The manager wedges for the
+    /// duration of an unrelated write.
+    async fn ready_handle(&self, ledger_id: &str) -> Option<LedgerHandle> {
         let canonical_alias =
             normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
         let entries = self.entries.read().await;
-        let entry = entries.get(&canonical_alias)?;
-        let LoadState::Ready(handle) = entry else {
-            return None;
-        };
-        Some(handle.snapshot().await)
+        match entries.get(&canonical_alias) {
+            Some(LoadState::Ready(handle)) => Some(handle.clone()),
+            _ => None,
+        }
     }
 
     /// Return the already-cached handle for `ledger_id`, or `None` when it is
@@ -2665,6 +2674,87 @@ mod tests {
             let entries = mgr.entries.read().await;
             assert_eq!(entries.len(), 0);
         }
+    }
+
+    // ========================================================================
+    // Lock order: never hold `entries` across a handle `state` lock
+    // ========================================================================
+
+    fn ready_handle(alias: &str) -> LedgerHandle {
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+        let state = LedgerState::new(LedgerSnapshot::genesis(alias), Novelty::new(1));
+        LedgerHandle::new(alias.to_string(), state, None)
+    }
+
+    /// The shape of the wedge a writer can cause: a transaction holds
+    /// ledger A's `state` write lock for its whole commit, and a
+    /// background reader snapshots A while still holding the global
+    /// `entries` guard. That reader now parks on A's state lock *with
+    /// `entries` held*, and because tokio's `RwLock` is write-fair, the
+    /// next `entries.write()` — a cold load of any other ledger — queues,
+    /// and every `entries.read()` after it queues too. `ledger_cached`
+    /// on a ledger that has nothing to do with A blocks until A's
+    /// transaction finishes.
+    ///
+    /// Drives the two offenders and asserts the manager stays usable.
+    #[tokio::test]
+    async fn snapshot_readers_release_entries_before_taking_state() {
+        let mgr = Arc::new(make_test_manager());
+        let handle = ready_handle("busy:main");
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert("busy:main".to_string(), LoadState::Ready(handle.clone()));
+        }
+
+        // A transaction in flight on `busy:main`.
+        let in_flight = handle.lock_for_write().await;
+
+        // Two background readers that snapshot the busy ledger. Each
+        // must park on `state`, not on `entries`.
+        let reader_a = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.try_running_attachment_events("busy:main").await })
+        };
+        let reader_b = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_loaded_view("busy:main").await })
+        };
+        tokio::task::yield_now().await;
+
+        // While those readers are parked, the manager must still admit
+        // a writer to `entries` (what a cold load of an unrelated ledger
+        // needs) and readers behind it.
+        let unrelated = tokio::time::timeout(Duration::from_millis(500), async {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "other:main".to_string(),
+                LoadState::Ready(ready_handle("other:main")),
+            );
+            drop(entries);
+            mgr.current_t("other:main").await
+        })
+        .await;
+        assert!(
+            unrelated
+                .expect("entries must not be wedged by a reader parked on a state lock")
+                .is_some(),
+            "the unrelated ledger must be reachable",
+        );
+
+        // Release the transaction; the parked readers complete normally.
+        drop(in_flight);
+        let a = tokio::time::timeout(Duration::from_secs(2), reader_a)
+            .await
+            .expect("reader A completes once the writer is done")
+            .expect("reader A does not panic");
+        assert!(a.is_some());
+        let b = tokio::time::timeout(Duration::from_secs(2), reader_b)
+            .await
+            .expect("reader B completes once the writer is done")
+            .expect("reader B does not panic");
+        assert!(b.is_some());
     }
 
     // ========================================================================

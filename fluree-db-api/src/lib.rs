@@ -1104,6 +1104,7 @@ async fn build_s3_storage_from_config(
             .endpoint
             .as_ref()
             .map(std::string::ToString::to_string),
+        force_path_style: s3_config.force_path_style,
         // Consolidate per-op timeouts to a single SDK operation timeout.
         // Use the maximum to avoid unexpectedly shortening slower operations.
         timeout_ms: {
@@ -1567,6 +1568,7 @@ impl FlureeBuilder {
             bucket: Arc::from(bucket),
             prefix: None,
             endpoint: Some(Arc::from(endpoint)),
+            force_path_style: None,
             read_timeout_ms: None,
             write_timeout_ms: None,
             list_timeout_ms: None,
@@ -1621,6 +1623,19 @@ impl FlureeBuilder {
     pub fn s3_prefix(mut self, prefix: impl Into<String>) -> Self {
         if let StorageType::S3(s3) = &mut self.config.index_storage.storage_type {
             s3.prefix = Some(Arc::from(prefix.into()));
+        }
+        self
+    }
+
+    /// Address the bucket in the URL path rather than as a virtual host.
+    ///
+    /// Needed for S3-compatible stores without bucket-subdomain DNS —
+    /// a plain MinIO at `http://minio:9000`, typically. An endpoint
+    /// override alone still produces `http://bucket.minio:9000/...`.
+    #[cfg(feature = "aws")]
+    pub fn s3_force_path_style(mut self, path_style: bool) -> Self {
+        if let StorageType::S3(s3) = &mut self.config.index_storage.storage_type {
+            s3.force_path_style = Some(path_style);
         }
         self
     }
@@ -2371,6 +2386,7 @@ impl FlureeBuilder {
                     .endpoint
                     .as_ref()
                     .map(std::string::ToString::to_string),
+                force_path_style: s3_cfg.force_path_style,
                 timeout_ms,
                 max_retries: s3_cfg.max_retries.map(|n| n as u32),
                 retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
@@ -2461,6 +2477,7 @@ impl FlureeBuilder {
                     .as_ref()
                     .map(std::string::ToString::to_string)
                     .filter(|e| !e.is_empty()),
+                force_path_style: s3_cfg.force_path_style,
                 timeout_ms,
                 max_retries: s3_cfg.max_retries.map(|n| n as u32),
                 retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
@@ -2558,6 +2575,7 @@ impl FlureeBuilder {
                     .endpoint
                     .as_ref()
                     .map(std::string::ToString::to_string),
+                force_path_style: s3_cfg.force_path_style,
                 timeout_ms,
                 max_retries: s3_cfg.max_retries.map(|n| n as u32),
                 retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
@@ -3254,7 +3272,12 @@ impl Fluree {
     ///
     /// Set from `FlureeBuilder::with_indexing_thresholds()` for builder paths,
     /// or derived from `ConnectionConfig::defaults.indexing` for JSON-LD paths.
-    pub(crate) fn default_index_config(&self) -> IndexConfig {
+    ///
+    /// Public so a process that runs the Raft commit workers alongside
+    /// this engine can hand them the same thresholds. A worker staging
+    /// against different thresholds than the engine's novelty
+    /// backpressure silently diverges the two.
+    pub fn default_index_config(&self) -> IndexConfig {
         self.index_config.clone()
     }
 

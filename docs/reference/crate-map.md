@@ -660,6 +660,20 @@ ledger-cache watermark). The generic bookkeeping is
 historical path. `publish` runs in two phases: every commit-head
 watermark reaches the ledger cache before any event reaches the bus.
 
+**Embedding**: `raft::integration` (`RaftIntegration::bootstrap`) is the
+one-call consensus assembly — storage, adapters, `Raft`, the replicated
+nameservice, routers, channels — and `raft::embedded`
+(`EmbeddedRaftNode::attach`) wires a `Fluree` engine to it and starts the
+per-node tasks. Neither knows about `fluree-db-server`; the server binary
+is one consumer, and `tests/it_embedded_node.rs` proves a process with no
+server dependency gets the same node. The one thing an embedder must get
+right: route writes through `EmbeddedRaftNode::committer`, never the
+engine handle — `fluree-db-api` sits below this crate and cannot name
+`Committer`, so `Fluree::transact` on a Raft-mode engine still writes
+locally. The background indexer is the host's to supply (via
+`extra_leader_tasks`), because this crate does not depend on
+`fluree-db-indexer`.
+
 **Feature flags**: `raft` (non-default) gates `openraft` so monolithic
 users don't compile or link it. `testing` (implies `raft`) pulls in
 `fluree-raft-core`'s conformance fixture and runs the nameservice's

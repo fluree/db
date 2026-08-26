@@ -73,15 +73,37 @@ fn fsync_parent_dir(path: &Path, policy: &WritePolicy) -> std::io::Result<()> {
 /// and rename the result into place.
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Staging path alongside `path`, unique per process and per call.
+/// Distinguishes this process from every other one that may be writing the
+/// same directory — including ones on other hosts.
+///
+/// The pid is unique per host only. Two nodes of a Raft cluster sharing a
+/// content store over NFS can have the same pid, and each starts `TMP_SEQ`
+/// at zero, so `(pid, seq)` alone can collide across hosts: both stage to
+/// the same sibling name, and the loser's rename fails even though the bytes
+/// (content-addressed, hence identical) are in place. A 64-bit random token
+/// drawn once per process makes that collision negligible without needing a
+/// node id plumbed down from whoever knows one.
+fn process_token() -> u64 {
+    static TOKEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TOKEN.get_or_init(rand::random::<u64>)
+}
+
+/// Staging path alongside `path`, unique per process — across hosts — and
+/// per call.
 ///
 /// Appends rather than replacing the extension so `foo.json` stages as
-/// `foo.json.<pid>.<seq>.tmp`, keeping the final name recoverable by eye and
-/// leaving multi-part extensions intact.
+/// `foo.json.<pid>.<token>.<seq>.tmp`, keeping the final name recoverable by
+/// eye and leaving multi-part extensions intact. The pid stays in the name
+/// because it is what an operator greps for; the token is what makes it
+/// unique.
 fn tmp_sibling(path: &Path) -> PathBuf {
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.{seq}{TMP_SUFFIX}", std::process::id()));
+    name.push(format!(
+        ".{}.{:016x}.{seq}{TMP_SUFFIX}",
+        std::process::id(),
+        process_token()
+    ));
     path.with_file_name(name)
 }
 
@@ -1061,6 +1083,60 @@ mod tests {
 
     /// Staging names append to the full file name so a multi-part extension
     /// survives; `with_extension` would have turned `a.json.gz` into `a.json`.
+    /// Two *processes* staging the same address must pick different
+    /// siblings, or — on a shared mount, where two hosts can share a
+    /// pid — one of them loses its rename. Proven by re-executing this
+    /// test binary as a child and comparing what it picks.
+    #[test]
+    fn tmp_sibling_is_unique_across_processes() {
+        const PROBE: &str = "FLUREE_TMP_SIBLING_PROBE";
+        let mine = tmp_sibling(Path::new("/data/x"))
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        if std::env::var_os(PROBE).is_some() {
+            println!("{mine}");
+            return;
+        }
+
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::file::tests::tmp_sibling_is_unique_across_processes",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .output()
+            .expect("re-exec the test binary");
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let theirs = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.starts_with("x."))
+            .expect("child printed its sibling name")
+            .to_string();
+
+        // Neither the pid nor the sequence may be what keeps them apart:
+        // two hosts can share a pid, and both start the counter at zero.
+        // Only the per-process token is cross-host unique, so it is the
+        // component that must differ.
+        let token = |n: &str| -> String {
+            // `x.<pid>.<token>.<seq>.tmp`
+            let parts: Vec<&str> = n.split('.').collect();
+            assert_eq!(parts.len(), 5, "unexpected staging name shape: {n}");
+            parts[2].to_string()
+        };
+        assert_ne!(
+            token(&mine),
+            token(&theirs),
+            "two processes must draw different tokens: {mine} vs {theirs}",
+        );
+    }
+
     #[test]
     fn tmp_sibling_appends_to_the_full_file_name() {
         let tmp = tmp_sibling(Path::new("/data/a.json.gz"));

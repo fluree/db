@@ -23,18 +23,20 @@ The Raft consensus crate (`fluree-db-consensus/src/raft/`) is structured as a se
 | `NameServiceApp`           | `app.rs`                                                 | The pure reduction: routes a `Command` through `state_machine::apply`, mirrors membership, owns the snapshot codec. |
 | `NameServiceObserver`      | `app.rs`                                                 | The effects: event bus, waiter resolution, staged receipts, releases, ledger-cache watermark. Captured under the state lock, published after it drops. |
 | `StateMachineAdapter`      | `state_machine_adapter.rs`                               | The two above composed with `fluree_raft_core::state_machine::StateMachineAdapter`, which owns last-applied, membership, and snapshot persistence. |
+| `RaftIntegration`          | `integration.rs`                                         | One-call consensus assembly: storage, adapters, `Raft`, `RaftNameService`, routers, channels. Host-agnostic — moved here from the server binary, which it never depended on. |
+| `EmbeddedRaftNode`         | `embedded.rs`                                            | Wires a `Fluree` engine to a `RaftIntegration`: the committer, worker supervisor, leader watcher, release task, and their shutdown order. What an embedding process calls instead of re-deriving `FlureeServerBuilder::build`. |
 | `LogStore`, `SnapshotStore`| `fluree-raft-core` `log_adapter.rs`, `storage/{fs,memory}.rs` | openraft's `RaftLogStorage`/`RaftLogReader`/`RaftSnapshotBuilder`. Local-disk persistence. The backends are openraft-free — they store opaque `Vec<u8>` payloads. |
 | `HttpRaftNetworkFactory`   | `fluree-raft-core` `network.rs`                          | Inter-node RPC (`/raft/vote`, `/raft/append-entries`, `/raft/install-snapshot`) over HTTP. Generic over the type config; `network.rs` here keeps only the nameservice-specific `NetworkConfig` fields. |
 | `RaftAdmin` / `/cluster/*` | `fluree-raft-core` `admin.rs`                            | Operator-facing membership endpoints (`initialize`, `add-learner`, `change-membership`, `status`).         |
 | Follower-forward middleware| `fluree-raft-core` `forward.rs`                          | Axum middleware that proxies leader-only client requests to the current leader. Generic over a `LeaderView` source. |
 | `QueuedTransactor`         | `queued_transactor.rs`                                   | Client-side proposer. Builds envelopes, writes to CAS, proposes `EnqueueCommand`, awaits the typed receipt. |
-| `commit_worker::Worker`             | `commit_worker.rs`                                       | Leader-only. Drains per-branch queues, stages work, proposes `ApplyHead`.                                  |
+| `commit_worker::Worker`             | `commit_worker.rs`                                       | Node-scoped, one per branch this node owns under rendezvous. Drains the queue, stages work, writes the blob to CAS, publishes `ApplyHead` — locally if leader, via `apply_staged_commit` if not. |
 | `EvictionScheduler`        | `eviction_scheduler.rs`                                  | Leader-only. Periodically proposes `EvictIdempotency` to age out the cache.                                |
 | `RaftNameService`          | `nameservice.rs`                                         | The replicated `NameService` impl. Reads observe `NameServiceState`; writes propose log entries.            |
 | `WaiterMap`                | `waiter.rs`                                              | Per-process registry of *local interest*. Armed by `request_cid` before proposing, bound to a `queue_id` when this node applies the enqueue. Only local proposals are tracked, so a follower's map stays empty. |
 | `StagedReceiptMap`         | `staged_receipt.rs`                                      | Per-process map carrying typed apply receipts (flake counts, tally, conflict resolution) from worker to transactor on the same node. |
 
-Three of these (`commit_worker::Worker`, `EvictionScheduler`, follower-forward middleware) are gated on leadership: the integration's leader watcher spawns / stops them in response to `current_leader()` changes.
+Three of these (`EvictionScheduler`, `LivenessMonitor`, the background indexer) are gated on leadership: the leader watcher spawns / stops them in response to `current_leader()` changes. `commit_worker::Worker` is deliberately **not**: the worker supervisor runs on every node and owns whichever branches rendezvous-hash to it, so the blob-writing half of a commit is spread across the cluster rather than serialized through the leader. The follower-forward middleware runs everywhere and simply does nothing on the leader.
 
 ## Submission flow in detail
 
@@ -61,12 +63,14 @@ Client → POST /api/transact
         - each node binds any locally-armed interest for request_cid to
           queue_id; a follower has none, so this is a no-op there
         ↓
-[commit_worker::Worker on leader]
+[commit_worker::Worker on the node that OWNS branch — rendezvous, often a follower]
    6. polls state.queues[branch].front()
    7. fetches envelope from CAS, stages via `Fluree` API
-   8. writes commit blob to CAS → head_cid
+   8. writes commit blob to CAS → head_cid   (the bytes never enter the log)
    9. stashes AppliedReceipt in StagedReceiptMap[queue_id]
-  10. propose Command::ApplyHead { branch, queue_id, head_cid, ... }
+  10. publish ApplyHead { branch, queue_id, head_cid, ... }:
+        leader   → propose locally
+        follower → POST /raft/apply_staged_commit to the leader (CID only)
         ↓
 [Raft consensus]
   11. leader appends, replicates to quorum
