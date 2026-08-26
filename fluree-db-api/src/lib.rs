@@ -1929,6 +1929,27 @@ impl FlureeBuilder {
         self
     }
 
+    /// Enable background indexing with an explicit [`IndexerConfig`].
+    ///
+    /// Controls index-build parameters that are otherwise defaults-only
+    /// through the builder: `incremental_max_commits`, `run_budget_bytes`,
+    /// leaf sizing, and `data_dir`. Novelty thresholds already set via
+    /// [`with_indexing_thresholds`] are preserved; otherwise the
+    /// production defaults apply.
+    ///
+    /// [`with_indexing_thresholds`]: FlureeBuilder::with_indexing_thresholds
+    pub fn with_indexer_config(mut self, indexer_config: IndexerConfig) -> Self {
+        let index_config = self
+            .indexing_config
+            .map(|c| c.index_config)
+            .unwrap_or_else(server_defaults::default_index_config);
+        self.indexing_config = Some(IndexingBuilderConfig {
+            indexer_config,
+            index_config,
+        });
+        self
+    }
+
     /// Set novelty backpressure thresholds without enabling background indexing.
     ///
     /// Use this for short-lived processes (CLI, one-shot scripts) that need
@@ -3208,6 +3229,7 @@ impl Fluree {
     pub fn set_indexing_mode(&mut self, mode: tx::IndexingMode) {
         self.indexing_mode = mode;
     }
+
 
     /// Return a clone of this `Fluree` carrying `resolver`, used to hydrate
     /// `ConfigValue::SecretRef` auth references in Iceberg graph sources.
