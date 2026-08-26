@@ -2610,6 +2610,7 @@ dependencies = [
  "fluree-db-query",
  "fluree-db-r2rml",
  "fluree-db-server",
+ "fluree-graph-turtle",
  "fluree-vocab",
  "futures",
  "hex",
