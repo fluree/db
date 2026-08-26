@@ -41,6 +41,24 @@ use moka::sync::Cache;
 use std::io;
 use std::sync::Arc;
 
+/// Convert a shared loader error back into `io::Error`, preserving a typed
+/// `NeedFetch` payload when one is present.
+///
+/// Loader closures run inside the cache's `try_get_with`, which shares the
+/// error as `Arc<io::Error>`; a plain `to_string()` re-wrap severs the typed
+/// residency miss. Residency invariant: read paths should resolve residency
+/// BEFORE entering a loader closure where possible (the dict-leaf path
+/// does); this rewrap is the backstop for paths that cannot — e.g.
+/// `open_leaf_dir`'s header fetch runs inside the dir-load closure. The
+/// store-level miss register is unaffected either way: the miss was
+/// recorded inside the closure before the error propagated.
+fn arc_io_error(arc_err: std::sync::Arc<io::Error>) -> io::Error {
+    if let Some(nf) = fluree_db_core::storage::residency::NeedFetch::from_io_error(&arc_err) {
+        return nf.clone().into_io_error();
+    }
+    io::Error::new(arc_err.kind(), arc_err.to_string())
+}
+
 // ============================================================================
 // Sparse column types (for lang_id and list-index)
 // ============================================================================
@@ -576,7 +594,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::DictLeaf(bytes)) => Ok(bytes),
             Ok(_) => unreachable!("DictLeaf key always maps to DictLeaf entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -628,7 +646,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::LeafMmap(mmap)) => Ok(mmap),
             Ok(_) => unreachable!("LeafMmap key always maps to LeafMmap entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -657,7 +675,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::LeafDir(dir)) => Ok(dir),
             Ok(_) => unreachable!("LeafDir key always maps to LeafDir entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -775,7 +793,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::VectorShard(shard)) => Ok(shard),
             Ok(_) => unreachable!("VectorShard key always maps to VectorShard entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -885,7 +903,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::V3Batch(batch)) => Ok(batch),
             Ok(_) => unreachable!("V3Batch key always maps to V3Batch entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 

@@ -6,6 +6,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Store-driven sync residency mode on native (wasm32 has it unconditionally):
+# lets native tests and tools drive the resolve_cached_bytes + NeedFetch +
+# miss-register read arms with a residency-tier content store. Off by default
+# so production native builds compile the exact pre-residency read path.
+residency = []
+
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
 fluree-vocab = { path = "../fluree-vocab" }

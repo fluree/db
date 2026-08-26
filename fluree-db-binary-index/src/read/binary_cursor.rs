@@ -301,6 +301,34 @@ impl BinaryCursor {
         self.leaf_overlay_end = self.overlay_pos + (end_offset - start_offset);
     }
 
+    /// After a leaf-open failure in residency mode, record every remaining
+    /// routed leaf (and sidecar, when replaying) that is not yet resident
+    /// into the store's miss register — the scan's whole want set, so the
+    /// retry frame fetches it in one concurrent round (see
+    /// [`crate::read::need_fetch::RetryBudget`]).
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn register_remaining_wants(&self, from_leaf_idx: usize) {
+        use crate::read::need_fetch::FetchKind;
+        let Some(cs) = self.store.content_store() else {
+            return;
+        };
+        let Some(register) = cs.miss_register() else {
+            return;
+        };
+        for entry in &self.branch.leaves[from_leaf_idx..self.leaf_range.end] {
+            if cs.resolve_cached_bytes(&entry.leaf_cid).is_none() {
+                register.record(&entry.leaf_cid, FetchKind::IndexLeaf);
+            }
+            if self.need_replay() {
+                if let Some(sc_cid) = &entry.sidecar_cid {
+                    if cs.resolve_cached_bytes(sc_cid).is_none() {
+                        register.record(sc_cid, FetchKind::HistorySidecar);
+                    }
+                }
+            }
+        }
+    }
+
     /// Advance to the next non-empty leaflet and return its `ColumnBatch`.
     ///
     /// Returns `None` when all leaflets in all leaves are exhausted
@@ -523,9 +551,22 @@ impl BinaryCursor {
             // overlay slicing) so a failed open (transient I/O, wasm NeedFetch
             // miss) leaves the cursor re-enterable: the next `next_batch` call
             // retries this same leaf instead of silently skipping it.
-            let handle =
-                self.store
-                    .open_leaf_handle(&leaf_cid, sidecar_cid.as_ref(), self.need_replay())?;
+            let handle = match self.store.open_leaf_handle(
+                &leaf_cid,
+                sidecar_cid.as_ref(),
+                self.need_replay(),
+            ) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    // A residency miss on this leaf means the rest of the
+                    // scan's routed leaves are likely missing too: record
+                    // the whole remaining want set so one retry round
+                    // fetches N objects instead of one per round.
+                    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                    self.register_remaining_wants(leaf_idx);
+                    return Err(err);
+                }
+            };
             self.current_leaf_idx += 1;
 
             // Slice overlay ops for this leaf (binary search on branch keys).

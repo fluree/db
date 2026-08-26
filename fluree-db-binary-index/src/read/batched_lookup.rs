@@ -132,6 +132,36 @@ pub fn batched_lookup_predicate_refs(
         (stop_tx, hb)
     };
 
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    register_routed_wants(
+        store,
+        &branch,
+        RunSortOrder::Psot,
+        chunks.iter().map(|chunk| {
+            let (min_s, max_s) = (chunk[0], *chunk.last().unwrap());
+            (
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(min_s),
+                    o_key: 0,
+                    p_id,
+                    t: 0,
+                    o_i: 0,
+                    o_type: 0,
+                    g_id,
+                },
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(max_s),
+                    o_key: u64::MAX,
+                    p_id,
+                    t: 0,
+                    o_i: u32::MAX,
+                    o_type: u16::MAX,
+                    g_id,
+                },
+            )
+        }),
+    );
+
     for (chunk_idx, chunk) in chunks.iter().enumerate() {
         current_chunk_idx.store(chunk_idx as u64, std::sync::atomic::Ordering::Relaxed);
         let min_s = chunk[0];
@@ -276,6 +306,36 @@ pub fn batched_lookup_subject_properties(
         output: needed,
         internal: ColumnSet::EMPTY,
     };
+
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    register_routed_wants(
+        store,
+        &branch,
+        RunSortOrder::Spot,
+        chunks.iter().map(|chunk| {
+            let (min_s, max_s) = (chunk[0], *chunk.last().unwrap());
+            (
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(min_s),
+                    o_key: 0,
+                    p_id: 0,
+                    t: 0,
+                    o_i: 0,
+                    o_type: 0,
+                    g_id,
+                },
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(max_s),
+                    o_key: u64::MAX,
+                    p_id: u32::MAX,
+                    t: 0,
+                    o_i: u32::MAX,
+                    o_type: u16::MAX,
+                    g_id,
+                },
+            )
+        }),
+    );
 
     for chunk in &chunks {
         let min_s = chunk[0];
@@ -458,6 +518,36 @@ pub fn batched_lookup_inbound_refs(
         internal: ColumnSet::EMPTY,
     };
 
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    register_routed_wants(
+        store,
+        &branch,
+        RunSortOrder::Opst,
+        chunks.iter().map(|chunk| {
+            let (min_o, max_o) = (chunk[0], *chunk.last().unwrap());
+            (
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(0),
+                    o_key: min_o,
+                    p_id: 0,
+                    t: 0,
+                    o_i: 0,
+                    o_type: iri_ref,
+                    g_id,
+                },
+                RunRecordV2 {
+                    s_id: SubjectId::from_u64(u64::MAX),
+                    o_key: max_o,
+                    p_id: u32::MAX,
+                    t: 0,
+                    o_i: u32::MAX,
+                    o_type: iri_ref,
+                    g_id,
+                },
+            )
+        }),
+    );
+
     for chunk in &chunks {
         let min_o = chunk[0];
         let max_o = *chunk.last().unwrap();
@@ -512,6 +602,37 @@ pub fn batched_lookup_inbound_refs(
         v.dedup();
     }
     Ok(out)
+}
+
+/// Residency mode: record every non-resident leaf the routed key ranges will
+/// touch into the store's miss register — the probe's whole want set — before
+/// any leaf is opened, so the first miss's retry round fetches all of it
+/// concurrently instead of learning one chunk at a time (see
+/// [`crate::read::need_fetch::RetryBudget`]). No-op outside residency mode.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+fn register_routed_wants(
+    store: &BinaryIndexStore,
+    branch: &crate::format::branch::BranchManifest,
+    order: RunSortOrder,
+    ranges: impl Iterator<Item = (RunRecordV2, RunRecordV2)>,
+) {
+    use crate::format::run_record_v2::cmp_v2_for_order;
+    use crate::read::need_fetch::FetchKind;
+    let Some(cs) = store.content_store() else {
+        return;
+    };
+    let Some(register) = cs.miss_register() else {
+        return;
+    };
+    let cmp = cmp_v2_for_order(order);
+    for (min_key, max_key) in ranges {
+        let range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
+        for entry in &branch.leaves[range] {
+            if cs.resolve_cached_bytes(&entry.leaf_cid).is_none() {
+                register.record(&entry.leaf_cid, FetchKind::IndexLeaf);
+            }
+        }
+    }
 }
 
 /// Break sorted subjects into chunks where each chunk spans at most

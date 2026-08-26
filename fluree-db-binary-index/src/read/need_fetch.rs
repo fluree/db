@@ -1,179 +1,255 @@
-//! Typed cache-miss signaling for targets without a sync→async CAS bridge.
+//! Residency-mode miss reporting and the async fetch/retry primitives.
 //!
 //! On native targets, the sync read path bridges a cache miss to an async CAS
 //! fetch via [`run_sync_on_runtime`](super::binary_index_store::run_sync_on_runtime).
-//! On `wasm32-unknown-unknown` no such bridge can exist (single thread, no
-//! `block_on`), so the sync accessors instead consult the content store's
-//! resident-bytes tier ([`ContentStore::resolve_cached_bytes`]) and, on a miss,
-//! surface a [`NeedFetch`] error naming the wanted [`ContentId`]. An async
-//! caller above the operator boundary catches it, fetches the object into the
-//! resident tier, and re-runs — the same "typed error through sync frames,
-//! catch at the async boundary" channel the fuel tracker already uses (see
-//! `BinaryCursor::next_batch`'s fuel charge and its downcast contract).
+//! In **residency mode** — a content store that exposes a
+//! [`MissRegister`] (always the case on `wasm32`, where no sync→async bridge
+//! can exist) — the sync accessors instead serve bytes exclusively from the
+//! store's resident tier and, on a miss, *report* the want and error out.
 //!
-//! Channel choice: `NeedFetch` rides inside [`io::Error`] as a custom payload
-//! (`io::Error::other`) rather than as a new variant on the store's error
-//! types. Every sync accessor already returns `io::Result`, so no signature
-//! changes, and native builds construct `NeedFetch` on **no** path — the type
-//! is only reachable from `cfg(target_arch = "wasm32")` read paths and from
-//! tests. Catchers use [`NeedFetch::from_io_error`] at an `io::Error`
-//! boundary, or [`NeedFetch::find_in_chain`] to search a wrapped error's
-//! `source()` chain from higher layers.
+//! Two reporting channels, with different guarantees (see
+//! [`fluree_db_core::storage::residency`] for the full contract):
+//!
+//! - **The store-level [`MissRegister`] is the load-bearing channel.** Every
+//!   miss records `(ContentId, FetchKind)` into it before erroring, and
+//!   routed callers (the scan cursor, the batched probes) record their
+//!   unit's *whole* remaining want set, so one retry round learns N objects.
+//!   A retry frame reacts to any `Err` from execution by calling
+//!   [`RetryBudget::after_error`]: drains the register, fetches the wants
+//!   concurrently, verifies they became resident, and reports whether the
+//!   failing unit should re-run. This channel survives every error
+//!   conversion in the engine — including the many query-crate sites that
+//!   flatten errors into strings.
+//! - **The typed [`NeedFetch`] payload inside `io::Error` is best-effort.**
+//!   It survives only io-preserving wrappers (`QueryError::from_io`
+//!   downcasts it, mirroring the fuel-limit precedent) and makes every miss
+//!   error name its CID for logs. It is NOT reliably catchable above the
+//!   operator boundary — most wrappers stringify — which is exactly why the
+//!   register, not the error chain, is the contract.
+//!
+//! Native builds without the `residency` feature compile none of the
+//! residency read arms; the types and primitives here are target-agnostic
+//! and always available (the browser crate and native tests drive them).
 
 use std::io;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use fluree_db_core::{ContentId, ContentStore};
+use fluree_db_core::ContentStore;
 
-/// Which read-path family wanted the bytes. Diagnostic only — retry logic
-/// needs just the [`ContentId`] (fetch the object, re-run); the kind labels
-/// telemetry and error messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FetchKind {
-    /// Whole index-leaf blob (scan opens, point-lookup probes, promotions).
-    IndexLeaf,
-    /// Per-leaf history sidecar (time-travel replay).
-    HistorySidecar,
-    /// Dictionary-tree leaf (reverse lookups: IRI → id, string → id).
-    DictLeaf,
-    /// Forward pack (id → IRI, id → string materialization).
-    ForwardPack,
-    /// Vector arena shard (vector search).
-    VectorShard,
+pub use fluree_db_core::storage::residency::{
+    resident_or_need_fetch, FetchKind, MissRegister, NeedFetch, Want,
+};
+
+/// Default concurrent fetch width for retry rounds. Matches the browser's
+/// practical per-host connection budget; callers with better knowledge
+/// (HTTP/2, local stores) pass their own.
+pub const DEFAULT_FETCH_WIDTH: usize = 8;
+
+/// Sanity cap on retry rounds per failing unit. Termination comes from the
+/// progress requirement (each round must pin at least one new object), not
+/// from this number — the cap only bounds a store that violates the
+/// fetch-pins contract in a way that still reports progress.
+pub const DEFAULT_ROUND_CAP: usize = 256;
+
+/// Outcome of fetching one drained want set.
+#[derive(Debug)]
+pub struct FetchOutcome {
+    /// Wants attempted.
+    pub wanted: usize,
+    /// Wants that are resident after the round (fetch succeeded and the
+    /// store upheld the fetch-pins contract).
+    pub newly_resident: usize,
+    /// Per-want failures: fetch errors, or a fetched object the store did
+    /// not pin.
+    pub failures: Vec<(Want, String)>,
 }
 
-impl std::fmt::Display for FetchKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            FetchKind::IndexLeaf => "index-leaf",
-            FetchKind::HistorySidecar => "history-sidecar",
-            FetchKind::DictLeaf => "dict-leaf",
-            FetchKind::ForwardPack => "forward-pack",
-            FetchKind::VectorShard => "vector-shard",
-        };
-        f.write_str(s)
-    }
-}
-
-/// A sync read needed CAS-backed bytes that are not resident.
+/// Fetch `wants` into the store's resident tier, `width` at a time.
 ///
-/// Carries everything the async boundary needs to make progress: fetch
-/// `cid` into the store's resident tier, then re-run the failed unit of
-/// work (the cursor leaf/leaflet, or the whole query on a v1 peer).
-#[derive(Debug, Clone)]
-pub struct NeedFetch {
-    /// The content object to fetch.
-    pub cid: ContentId,
-    /// Which read-path family wanted it.
-    pub kind: FetchKind,
-}
+/// Uses [`ContentStore::get`] as the fetch-and-pin primitive (the residency
+/// contract: bytes returned by `get` become resident) and verifies each want
+/// via [`ContentStore::resolve_cached_bytes`] afterwards. Failures are
+/// collected, not short-circuited — a partially fetched round can still be
+/// progress.
+pub async fn fetch_wants(cs: &dyn ContentStore, wants: Vec<Want>, width: usize) -> FetchOutcome {
+    use futures::stream::StreamExt;
 
-impl NeedFetch {
-    pub fn new(cid: ContentId, kind: FetchKind) -> Self {
-        Self { cid, kind }
-    }
+    let wanted = wants.len();
+    let newly_resident = AtomicUsize::new(0);
+    let failures: parking_lot::Mutex<Vec<(Want, String)>> = parking_lot::Mutex::new(Vec::new());
 
-    /// Wrap into the `io::Error` channel the sync accessors return.
-    pub fn into_io_error(self) -> io::Error {
-        io::Error::other(self)
-    }
-
-    /// Recover a `NeedFetch` from an `io::Error`, if it carries one.
-    pub fn from_io_error(err: &io::Error) -> Option<&NeedFetch> {
-        err.get_ref()?.downcast_ref::<NeedFetch>()
-    }
-
-    /// Recover a `NeedFetch` from anywhere in an error's `source()` chain.
-    ///
-    /// Higher layers wrap the accessor `io::Error` (e.g. query errors); as
-    /// long as each wrapper preserves `source()`, the retry loop can find
-    /// the miss without knowing the intermediate error types.
-    pub fn find_in_chain<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a NeedFetch> {
-        let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
-        while let Some(e) = cur {
-            if let Some(nf) = e.downcast_ref::<NeedFetch>() {
-                return Some(nf);
+    futures::stream::iter(wants)
+        .for_each_concurrent(width.max(1), |want| {
+            let newly_resident = &newly_resident;
+            let failures = &failures;
+            async move {
+                match cs.get(&want.cid).await {
+                    Ok(_bytes) => {
+                        if cs.resolve_cached_bytes(&want.cid).is_some() {
+                            newly_resident.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            failures.lock().push((
+                                want,
+                                "store did not pin fetched bytes (fetch-pins contract violated)"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        failures.lock().push((want, msg));
+                    }
+                }
             }
-            cur = if let Some(io_err) = e.downcast_ref::<io::Error>() {
-                // `io::Error::source()` skips its custom payload (it returns
-                // the payload's source), so descend into the payload itself.
-                io_err
-                    .get_ref()
-                    .map(|inner| inner as &(dyn std::error::Error + 'static))
-                    .or_else(|| e.source())
-            } else {
-                e.source()
-            };
-        }
-        None
+        })
+        .await;
+
+    FetchOutcome {
+        wanted,
+        newly_resident: newly_resident.load(Ordering::Relaxed),
+        failures: failures.into_inner(),
     }
 }
 
-impl std::fmt::Display for NeedFetch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "content not resident: {} {} (fetch and retry)",
-            self.kind, self.cid
-        )
-    }
-}
-
-impl std::error::Error for NeedFetch {}
-
-/// Serve `cid` from the store's resident-bytes tier, or report the miss.
+/// Progress-terminated retry policy for one failing unit of work.
 ///
-/// This is the whole wasm read tier: an O(1) lookup returning a shared,
-/// zero-copy `Arc<[u8]>` on hit, and a [`NeedFetch`] on miss. It performs
-/// no I/O and never blocks, so it is safe from any sync frame on any
-/// target. Native production code does not call it (the bridge fetches
-/// instead); native tests drive it directly to pin the miss/retry contract.
-pub fn resident_or_need_fetch(
-    cs: &dyn ContentStore,
-    cid: &ContentId,
-    kind: FetchKind,
-) -> io::Result<Arc<[u8]>> {
-    match cs.resolve_cached_bytes(cid) {
-        Some(bytes) => Ok(bytes),
-        None => Err(NeedFetch::new(cid.clone(), kind).into_io_error()),
+/// The drain/fetch/re-run loop every retry frame runs — an operator's async
+/// frame (scan cursor), an outer query loop (fast paths, whole-query
+/// backstop), or the browser driver:
+///
+/// ```ignore
+/// let mut budget = RetryBudget::default();
+/// loop {
+///     match failing_unit() {
+///         Ok(v) => break v,
+///         Err(e) => {
+///             if budget.after_error(cs, DEFAULT_FETCH_WIDTH).await? {
+///                 continue; // wants fetched and pinned — re-run the unit
+///             }
+///             return Err(e); // not a residency miss — a real error
+///         }
+///     }
+/// }
+/// ```
+///
+/// Termination: `after_error` returns `Ok(true)` only when the round pinned
+/// at least one new object. The resident set grows monotonically and the
+/// unit's want set is finite, so the loop terminates; [`DEFAULT_ROUND_CAP`]
+/// is a sanity net, not the mechanism.
+#[derive(Debug)]
+pub struct RetryBudget {
+    rounds: usize,
+    cap: usize,
+    fetched_total: usize,
+}
+
+impl Default for RetryBudget {
+    fn default() -> Self {
+        Self::with_cap(DEFAULT_ROUND_CAP)
+    }
+}
+
+impl RetryBudget {
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            rounds: 0,
+            cap,
+            fetched_total: 0,
+        }
+    }
+
+    /// Rounds run so far.
+    pub fn rounds(&self) -> usize {
+        self.rounds
+    }
+
+    /// Total objects pinned across rounds.
+    pub fn fetched_total(&self) -> usize {
+        self.fetched_total
+    }
+
+    /// React to an execution error: drain the store's miss register and, if
+    /// it held wants, fetch them and report whether to re-run.
+    ///
+    /// - `Ok(true)` — wants were fetched with progress; re-run the unit.
+    /// - `Ok(false)` — the register was empty (or the store has none): the
+    ///   error was not a residency miss; surface it.
+    /// - `Err(_)` — wants existed but no progress is possible (every fetch
+    ///   failed, the store broke the fetch-pins contract, or the sanity cap
+    ///   tripped); surface this error instead.
+    pub async fn after_error(&mut self, cs: &dyn ContentStore, width: usize) -> io::Result<bool> {
+        let Some(register) = cs.miss_register() else {
+            return Ok(false);
+        };
+        let wants = register.drain();
+        if wants.is_empty() {
+            return Ok(false);
+        }
+
+        self.rounds += 1;
+        if self.rounds > self.cap {
+            return Err(io::Error::other(format!(
+                "residency retry round cap exceeded: rounds={}, fetched_total={}, pending_wants={} (first: {})",
+                self.rounds,
+                self.fetched_total,
+                wants.len(),
+                wants[0].cid,
+            )));
+        }
+
+        let outcome = fetch_wants(cs, wants, width).await;
+        self.fetched_total += outcome.newly_resident;
+        if outcome.newly_resident == 0 {
+            let detail = outcome
+                .failures
+                .first()
+                .map(|(w, e)| format!("{} {}: {}", w.kind, w.cid, e))
+                .unwrap_or_else(|| "no wants fetched".to_string());
+            return Err(io::Error::other(format!(
+                "residency retry stalled: 0 of {} wants became resident (round {}; first failure: {})",
+                outcome.wanted, self.rounds, detail,
+            )));
+        }
+        tracing::debug!(
+            round = self.rounds,
+            wanted = outcome.wanted,
+            newly_resident = outcome.newly_resident,
+            failures = outcome.failures.len(),
+            "residency retry round fetched wants"
+        );
+        Ok(true)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::read::binary_index_store::run_sync_on_runtime;
     use async_trait::async_trait;
     use fluree_db_core::content_kind::ContentKind;
-    use fluree_db_core::MemoryContentStore;
+    use fluree_db_core::{ContentId, MemoryContentStore};
     use parking_lot::RwLock;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// Content store whose async side has the bytes but whose resident tier
-    /// starts empty: the wasm-shaped scenario where the object exists in CAS
-    /// but has not been fetched into sync-readable memory yet.
+    /// starts empty: the wasm-shaped scenario where objects exist in CAS but
+    /// have not been fetched into sync-readable memory. `get` pins
+    /// (fetch-pins contract); misses are recorded in the register.
     #[derive(Debug)]
-    struct MissInjectingStore {
-        inner: MemoryContentStore,
+    pub(crate) struct MissInjectingStore {
+        pub(crate) inner: MemoryContentStore,
         resident: RwLock<HashMap<ContentId, Arc<[u8]>>>,
+        register: MissRegister,
     }
 
     impl MissInjectingStore {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 inner: MemoryContentStore::new(),
                 resident: RwLock::new(HashMap::new()),
+                register: MissRegister::new(),
             }
-        }
-
-        /// The async fetch step a retry loop performs: pull from CAS, pin
-        /// into the resident tier.
-        async fn fetch_into_resident(&self, cid: &ContentId) -> fluree_db_core::Result<()> {
-            let bytes = self.inner.get(cid).await?;
-            self.resident
-                .write()
-                .insert(cid.clone(), Arc::from(bytes.into_boxed_slice()));
-            Ok(())
         }
     }
 
@@ -184,7 +260,12 @@ mod tests {
         }
 
         async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
-            self.inner.get(id).await
+            let bytes = self.inner.get(id).await?;
+            // Fetch-pins contract: fetched bytes become resident.
+            self.resident
+                .write()
+                .insert(id.clone(), Arc::from(bytes.clone().into_boxed_slice()));
+            Ok(bytes)
         }
 
         async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
@@ -202,12 +283,18 @@ mod tests {
         fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
             self.resident.read().get(id).cloned()
         }
+
+        fn miss_register(&self) -> Option<&MissRegister> {
+            Some(&self.register)
+        }
     }
 
-    /// The full miss/fetch/retry round trip, with a positive assertion that
-    /// the miss actually fired (an absent error is a failure, not a pass).
+    /// The load-bearing round trip: miss → register carries the want → any
+    /// error triggers `after_error` → fetch+pin → re-run hits. Positive
+    /// assertions that the miss fired and was recorded — absence of error is
+    /// not a pass.
     #[test]
-    fn miss_fetch_retry_round_trip() {
+    fn register_drain_fetch_retry_round_trip() {
         let store = Arc::new(MissInjectingStore::new());
         let payload = b"leaf bytes".to_vec();
         let cid = run_sync_on_runtime({
@@ -222,61 +309,120 @@ mod tests {
         })
         .expect("seed CAS");
 
-        // Miss MUST fire and MUST be recoverable as a typed NeedFetch.
+        // Miss MUST fire, MUST be recorded, and MUST name its CID.
         let err = resident_or_need_fetch(store.as_ref(), &cid, FetchKind::IndexLeaf)
             .expect_err("resident tier is empty; the miss must surface");
-        let nf = NeedFetch::from_io_error(&err).expect("io::Error must carry a typed NeedFetch");
-        assert_eq!(nf.cid, cid, "the miss must name the wanted CID");
+        assert_eq!(store.register.len(), 1, "the miss must be registered");
+        let nf = NeedFetch::from_io_error(&err).expect("io::Error carries a typed NeedFetch");
+        assert_eq!(nf.cid, cid);
         assert_eq!(nf.kind, FetchKind::IndexLeaf);
-        assert!(
-            err.to_string().contains(&cid.to_string()),
-            "message names the CID for logs: {err}"
-        );
+        assert!(err.to_string().contains(&cid.to_string()));
 
-        // The retry step: async fetch into the resident tier, then re-run.
-        run_sync_on_runtime({
+        // The retry frame: ANY error + non-empty register → fetch and re-run.
+        let should_retry = run_sync_on_runtime({
             let store = Arc::clone(&store);
-            let cid = cid.clone();
             async move {
-                store
-                    .fetch_into_resident(&cid)
-                    .await
-                    .map_err(|e| io::Error::other(e.to_string()))
+                let mut budget = RetryBudget::default();
+                let r = budget.after_error(store.as_ref(), 4).await?;
+                Ok((r, budget.rounds()))
             }
         })
-        .expect("fetch into resident tier");
+        .expect("retry round succeeds");
+        assert_eq!(should_retry, (true, 1), "wants fetched → re-run signal");
 
+        // Re-run: hit, zero copy.
         let bytes = resident_or_need_fetch(store.as_ref(), &cid, FetchKind::IndexLeaf)
             .expect("resident after fetch");
         assert_eq!(&bytes[..], &payload[..]);
-
-        // Zero-copy contract: a second hit returns the same allocation.
         let again = resident_or_need_fetch(store.as_ref(), &cid, FetchKind::IndexLeaf).unwrap();
-        assert!(
-            Arc::ptr_eq(&bytes, &again),
-            "hits must clone the Arc, not copy the bytes"
-        );
+        assert!(Arc::ptr_eq(&bytes, &again), "hits clone the Arc");
+
+        // Register drained: a real error now reports no-retry.
+        let no_retry = run_sync_on_runtime({
+            let store = Arc::clone(&store);
+            async move { RetryBudget::default().after_error(store.as_ref(), 4).await }
+        })
+        .unwrap();
+        assert!(!no_retry, "empty register → the error was real");
     }
 
-    /// Wrapper error preserving `source()`, as higher layers do.
-    #[derive(Debug)]
-    struct Wrapped(io::Error);
+    /// Multi-want: several recorded misses drain and fetch as one round.
+    #[test]
+    fn one_round_fetches_the_whole_want_set() {
+        let store = Arc::new(MissInjectingStore::new());
+        let cids: Vec<ContentId> = (0..5u8)
+            .map(|i| {
+                run_sync_on_runtime({
+                    let inner = store.inner.clone();
+                    async move {
+                        inner
+                            .put(ContentKind::IndexLeaf, &[i; 16])
+                            .await
+                            .map_err(|e| io::Error::other(e.to_string()))
+                    }
+                })
+                .unwrap()
+            })
+            .collect();
 
-    impl std::fmt::Display for Wrapped {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "query failed: {}", self.0)
+        for cid in &cids {
+            let _ = resident_or_need_fetch(store.as_ref(), cid, FetchKind::IndexLeaf);
+            // Duplicate recordings dedupe.
+            let _ = resident_or_need_fetch(store.as_ref(), cid, FetchKind::IndexLeaf);
+        }
+        assert_eq!(store.register.len(), cids.len(), "want set deduplicated");
+
+        let retried = run_sync_on_runtime({
+            let store = Arc::clone(&store);
+            async move {
+                let mut budget = RetryBudget::default();
+                let r = budget.after_error(store.as_ref(), 3).await?;
+                Ok((r, budget.fetched_total()))
+            }
+        })
+        .unwrap();
+        assert_eq!(retried, (true, cids.len()), "one round pinned every want");
+        for cid in &cids {
+            assert!(store.resolve_cached_bytes(cid).is_some());
         }
     }
 
-    impl std::error::Error for Wrapped {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            Some(&self.0)
+    /// A store that violates the fetch-pins contract stalls the loop with an
+    /// error instead of spinning.
+    #[derive(Debug)]
+    struct NonPinningStore {
+        inner: MemoryContentStore,
+        register: MissRegister,
+    }
+
+    #[async_trait]
+    impl ContentStore for NonPinningStore {
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.inner.get(id).await
+        }
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+        fn miss_register(&self) -> Option<&MissRegister> {
+            Some(&self.register)
         }
     }
 
     #[test]
-    fn find_in_chain_walks_wrapped_sources() {
-        let store = MissInjectingStore::new();
+    fn no_progress_is_an_error_not_a_loop() {
+        let store = Arc::new(NonPinningStore {
+            inner: MemoryContentStore::new(),
+            register: MissRegister::new(),
+        });
         let cid = run_sync_on_runtime({
             let inner = store.inner.clone();
             async move {
@@ -287,36 +433,21 @@ mod tests {
             }
         })
         .unwrap();
+        store.register.record(&cid, FetchKind::IndexLeaf);
 
-        let io_err = resident_or_need_fetch(&store, &cid, FetchKind::DictLeaf).unwrap_err();
-        let outer = Wrapped(io_err);
-        let nf = NeedFetch::find_in_chain(&outer).expect("found through the source chain");
-        assert_eq!(nf.cid, cid);
-        assert_eq!(nf.kind, FetchKind::DictLeaf);
-
-        let unrelated = Wrapped(io::Error::other("plain failure"));
-        assert!(
-            NeedFetch::find_in_chain(&unrelated).is_none(),
-            "unrelated errors must not read as misses"
-        );
-    }
-
-    /// A default-implementation store (no resident tier) always misses —
-    /// pins that the trait default is None, not a panic or a fetch.
-    #[test]
-    fn default_resolve_cached_bytes_is_a_miss() {
-        let store = MemoryContentStore::new();
-        let cid = run_sync_on_runtime({
-            let store = store.clone();
+        let err = run_sync_on_runtime({
+            let store = Arc::clone(&store);
             async move {
-                store
-                    .put(ContentKind::IndexLeaf, b"y")
+                RetryBudget::default()
+                    .after_error(store.as_ref(), 2)
                     .await
-                    .map_err(|e| io::Error::other(e.to_string()))
+                    .map(|_| ())
             }
         })
-        .unwrap();
-        let err = resident_or_need_fetch(&store, &cid, FetchKind::ForwardPack).unwrap_err();
-        assert!(NeedFetch::from_io_error(&err).is_some());
+        .expect_err("no progress must surface as an error");
+        assert!(
+            err.to_string().contains("stalled"),
+            "error names the stall: {err}"
+        );
     }
 }
