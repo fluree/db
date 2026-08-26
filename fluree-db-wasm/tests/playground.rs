@@ -88,7 +88,17 @@ async fn create_insert_sparql_select_roundtrip() {
     assert_eq!(bindings[0]["name"]["value"], "Alice");
     assert_eq!(bindings[0]["age"]["value"], "34");
     assert_eq!(bindings[1]["name"]["value"], "Bob");
-    assert_eq!(rows["head"]["vars"], serde_json::json!(["name", "age"]));
+    // head.vars order is the engine's var-registry order, not SELECT-clause
+    // order (same on the HTTP surface; the W3C JSON results format does not
+    // mandate one) — assert the set, not the sequence.
+    let mut vars: Vec<&str> = rows["head"]["vars"]
+        .as_array()
+        .expect("head.vars array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    vars.sort_unstable();
+    assert_eq!(vars, ["age", "name"]);
     assert!(pg.release(s), "handle was live until released");
 }
 

@@ -98,6 +98,12 @@ interface Pending {
   reject: (e: Error) => void;
 }
 
+/** `Omit` applied per union member — plain `Omit<Request, "id">` would
+ * collapse the union to its common keys and reject every op-specific field. */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+type RequestBody = DistributiveOmit<Request, "id">;
+
 /** Request/response multiplexer over a worker, with crash-recycling. */
 class Channel {
   private worker: Worker;
@@ -149,7 +155,7 @@ class Channel {
     if (this.initMsg) void this.call(this.initMsg).catch(() => {});
   }
 
-  call(req: Omit<Request, "id">): Promise<Response> {
+  call(req: RequestBody): Promise<Response> {
     if (this.closed) {
       return Promise.reject(
         new FlureeError({ code: "closed", status: 499, message: "playground is closed" }),
