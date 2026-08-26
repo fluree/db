@@ -47,6 +47,12 @@ impl From<RuleError> for QueryError {
 /// Local name for the f:rule predicate
 const RULE_LOCAL_NAME: &str = "rule";
 
+/// Prefix the parser puts on variables it invents for anonymous and nested
+/// nodes (`?__implicit_0`, `?__nested_1`, `?__anon_2`). A rule author never
+/// writes one, so diagnostics must not quote them back
+/// (see [`unsafe_insert_variables_message`]).
+const IMPLICIT_VAR_PREFIX: &str = "?__";
+
 /// Extract datalog rules from a database
 ///
 /// Queries for all `f:rule` triples and parses the rule definitions.
@@ -230,6 +236,13 @@ fn parse_rule_definition(
         .ok_or_else(|| QueryError::InvalidQuery("Rule missing 'insert' clause".to_string()))?;
     let insert_patterns = parse_insert_patterns(insert_json, &context, snapshot)?;
 
+    // Reject an insert pattern that references a variable nothing can bind
+    // (#1560). Left alone it is invisible: every binding row is dropped inside
+    // `instantiate_pattern`, so the rule "runs" and derives nothing.
+    if let Some(message) = unsafe_insert_variables_message(&where_patterns, &insert_patterns) {
+        return Err(QueryError::InvalidQuery(message));
+    }
+
     let mut rule = DatalogRule::new(rule_id.clone(), where_patterns, insert_patterns);
 
     // Add filters if any were parsed
@@ -290,6 +303,79 @@ fn parse_where_clause(
     }
 
     Ok((patterns, filters))
+}
+
+/// Variables an `insert` pattern references that no `where` pattern can bind.
+///
+/// This is datalog's range-restriction (safety) condition: every variable in
+/// the head must appear in the body. A rule that breaks it can never derive
+/// anything — `instantiate_pattern` returns `None` for each row — which is the
+/// silent dead end reported in #1560.
+fn unbound_insert_variables(
+    where_patterns: &[RuleTriplePattern],
+    insert_patterns: &[RuleTriplePattern],
+) -> Vec<Arc<str>> {
+    let mut bound: HashSet<Arc<str>> = HashSet::new();
+    for pattern in where_patterns {
+        bind_pattern_vars(pattern, &mut bound);
+    }
+
+    let mut unbound: Vec<Arc<str>> = Vec::new();
+    for pattern in insert_patterns {
+        for term in [&pattern.subject, &pattern.predicate, &pattern.object] {
+            if let RuleTerm::Var(v) = term {
+                if !bound.contains(v) && !unbound.contains(v) {
+                    unbound.push(v.clone());
+                }
+            }
+        }
+    }
+    unbound
+}
+
+/// Actionable message for a rule that violates range restriction, or `None`
+/// when the rule is safe.
+///
+/// Names the offending variables, because "this rule derives nothing" without
+/// them sends an author reading engine source (#1560). Auto-generated
+/// variables get their own wording: the author never wrote `?__implicit_0`, so
+/// naming it would be useless — what they need to know is that a node in the
+/// insert clause has no `@id`.
+fn unsafe_insert_variables_message(
+    where_patterns: &[RuleTriplePattern],
+    insert_patterns: &[RuleTriplePattern],
+) -> Option<String> {
+    let unbound = unbound_insert_variables(where_patterns, insert_patterns);
+    if unbound.is_empty() {
+        return None;
+    }
+
+    let (generated, authored): (Vec<&Arc<str>>, Vec<&Arc<str>>) = unbound
+        .iter()
+        .partition(|v| v.starts_with(IMPLICIT_VAR_PREFIX));
+
+    let mut parts: Vec<String> = Vec::new();
+    if !authored.is_empty() {
+        let names: Vec<&str> = authored.iter().map(|v| &***v).collect();
+        parts.push(format!(
+            "insert pattern references {} that the where clause never binds \
+             (check for a typo against the where clause's variable names)",
+            names.join(", ")
+        ));
+    }
+    if !generated.is_empty() {
+        parts.push(
+            "insert pattern contains a node with no `@id` (or a nested anonymous \
+             node), which has no subject to derive facts about"
+                .to_string(),
+        );
+    }
+
+    Some(format!(
+        "Rule cannot derive anything: {}. Every variable used in `insert` must \
+         also appear in `where`.",
+        parts.join("; ")
+    ))
 }
 
 /// Check if an array is a filter expression (starts with "filter")
@@ -488,7 +574,7 @@ fn parse_node_pattern(
     } else {
         // Generate unique implicit variable for anonymous node
         // Use patterns.len() to ensure uniqueness across multiple node patterns
-        let var_name = format!("?__implicit_{}", patterns.len());
+        let var_name = format!("{IMPLICIT_VAR_PREFIX}implicit_{}", patterns.len());
         RuleTerm::var(&var_name)
     };
 
@@ -529,7 +615,7 @@ fn parse_node_pattern(
                     parse_term(nested_id, context, snapshot)?
                 } else {
                     // Generate intermediate variable
-                    let var_name = format!("?__nested_{}", patterns.len());
+                    let var_name = format!("{IMPLICIT_VAR_PREFIX}nested_{}", patterns.len());
                     RuleTerm::var(&var_name)
                 };
 
@@ -594,7 +680,7 @@ fn parse_object_value(
         }
         JsonValue::Object(nested) => {
             // Nested anonymous node - generate variable and recurse
-            let var_name = format!("?__anon_{}", patterns.len());
+            let var_name = format!("{IMPLICIT_VAR_PREFIX}anon_{}", patterns.len());
             let nested_subject = RuleTerm::var(&var_name);
 
             // Create a map with @id for recursive parsing
@@ -1500,6 +1586,10 @@ pub async fn execute_datalog_rules_with_query_rules(
 
     let start = Instant::now();
     let mut capped: Option<&str> = None;
+    // Rules already flagged for "matched, but instantiated nothing" (#1560).
+    // The fixpoint re-runs every rule each round, so without this the same
+    // rule would warn once per iteration.
+    let mut warned_barren: HashSet<Sid> = HashSet::new();
 
     loop {
         // Budget check BEFORE another round — a round can scan the whole ledger
@@ -1536,12 +1626,32 @@ pub async fn execute_datalog_rules_with_query_rules(
             let binding_rows = execute_rule_matching(rule, iter_db).await?;
 
             if binding_rows.is_empty() {
+                // The where clause matched nothing. That is ordinary and says
+                // nothing about the rule's soundness — stay quiet (#1560).
                 continue;
             }
+            let matched_rows = binding_rows.len();
 
             // Generate flakes from bindings
             let flakes =
                 fluree_db_reasoner::execute_rule_with_bindings(rule, binding_rows, derived_t);
+
+            // "The where clause matched but the insert could not instantiate"
+            // is almost always an authoring bug, and it is invisible otherwise:
+            // the rule appears to run and the fixpoint completes normally
+            // (#1560). Catches what the parse-time safety check cannot see —
+            // SPARQL-lowered rules, and a subject/predicate variable that binds
+            // to a literal only at run time.
+            if flakes.is_empty() && warned_barren.insert(rule.id.clone()) {
+                tracing::warn!(
+                    rule = rule.name.as_deref().unwrap_or("<unnamed>"),
+                    rule_id = %rule.id,
+                    matched_rows,
+                    "datalog rule matched binding rows but derived no facts: every row \
+                     failed to instantiate its insert pattern — an insert variable is \
+                     unbound, or is bound to a literal in subject/predicate position"
+                );
+            }
 
             // Add new flakes (deduplicating by s, p, o, dt, m)
             for flake in flakes {
@@ -1919,6 +2029,80 @@ mod tests {
             resolved,
             Some(FlakeValue::Ref(sid(100, "knows"))),
             "a Sid binding must stay a Ref, not collapse to its local name"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Unbound insert variables (#1560)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn unbound_insert_variable_is_named() {
+        // The issue's own repro: where binds ?relation, insert says ?rel.
+        let where_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "relType")),
+            RuleTerm::var("?relation"),
+        )];
+        let insert_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::var("?rel"),
+            RuleTerm::var("?s"),
+        )];
+
+        let unbound = unbound_insert_variables(&where_patterns, &insert_patterns);
+        assert_eq!(unbound.len(), 1);
+        assert_eq!(unbound[0].as_ref(), "?rel");
+
+        let message = unsafe_insert_variables_message(&where_patterns, &insert_patterns)
+            .expect("unsafe rule must produce a message");
+        assert!(
+            message.contains("?rel"),
+            "the diagnostic must name the offending variable, got: {message}"
+        );
+    }
+
+    #[test]
+    fn safe_rule_produces_no_message() {
+        let where_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "parent")),
+            RuleTerm::var("?p"),
+        )];
+        let insert_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "ancestor")),
+            RuleTerm::var("?p"),
+        )];
+
+        assert!(unbound_insert_variables(&where_patterns, &insert_patterns).is_empty());
+        assert!(unsafe_insert_variables_message(&where_patterns, &insert_patterns).is_none());
+    }
+
+    #[test]
+    fn generated_variables_get_their_own_wording() {
+        // An author never wrote `?__implicit_0`, so quoting it back is useless
+        // — the message has to say what they actually did wrong.
+        let where_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "parent")),
+            RuleTerm::var("?p"),
+        )];
+        let insert_patterns = vec![triple(
+            RuleTerm::var("?__implicit_0"),
+            RuleTerm::sid(sid(100, "ancestor")),
+            RuleTerm::var("?p"),
+        )];
+
+        let message = unsafe_insert_variables_message(&where_patterns, &insert_patterns)
+            .expect("anonymous insert node must produce a message");
+        assert!(
+            message.contains("@id"),
+            "the diagnostic must point at the missing @id, got: {message}"
+        );
+        assert!(
+            !message.contains("?__implicit_0"),
+            "the diagnostic must not quote an engine-generated name, got: {message}"
         );
     }
 }

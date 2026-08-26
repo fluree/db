@@ -1805,3 +1805,160 @@ async fn datalog_filter_unresolvable_iri_operand_fails_closed() {
         "the rejected rule must produce a diagnostic naming the operand, got {diagnostics:?}"
     );
 }
+
+// =============================================================================
+// Unbound insert-pattern variables (issue #1560)
+// =============================================================================
+
+/// #1560: a rule whose `insert` references a variable the `where` clause never
+/// binds derives nothing for every binding row — `instantiate_pattern` returns
+/// `None` and the row is dropped. That is correct semantics but it used to be
+/// completely silent. It must now produce a diagnostic naming the variable,
+/// without disturbing any other rule's derivations.
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_unbound_insert_variable_reports_named_diagnostic() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/unbound-insert-var");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:grandparentRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+                        "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+                    }
+                }
+            },
+            {
+                // The where clause binds ?relation; the insert says ?rel.
+                "@id": "ex:typoRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?s", "ex:relType": {"@id": "?relation"}},
+                        "insert": {"@id": "?s", "?rel": {"@id": "?s"}}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:relType": {"@id": "ex:friendOf"}, "ex:parent": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!("ex:charlie")),
+        "the sound rule must keep deriving alongside the broken one, got {results:?}"
+    );
+
+    let diagnostics: Vec<String> = store
+        .all_events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .flat_map(|e| {
+            let mut parts: Vec<String> = e.fields.values().cloned().collect();
+            parts.push(e.message().to_string());
+            parts
+        })
+        .collect();
+    assert!(
+        diagnostics.iter().any(|d| d.contains("?rel")),
+        "a rule whose insert references an unbindable variable must produce a \
+         diagnostic naming ?rel, got {diagnostics:?}"
+    );
+}
+
+/// The other half of #1560's acceptance criteria: no diagnostic noise for a
+/// rule that legitimately derives nothing because its where clause matched
+/// nothing. Silence is correct there; only "matched but could not instantiate"
+/// is an authoring bug.
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_rule_matching_nothing_is_not_flagged() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/no-match-no-warning");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:grandparentRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+                        "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    // Only a one-hop chain: the two-hop where clause matches nothing.
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [{"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}}]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog"
+    });
+    let _ = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+
+    let noisy: Vec<String> = store
+        .all_events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .map(|e| e.message().to_string())
+        .filter(|m| m.contains("derived no facts"))
+        .collect();
+    assert!(
+        noisy.is_empty(),
+        "a rule whose where clause matched nothing must not be flagged, got {noisy:?}"
+    );
+}
