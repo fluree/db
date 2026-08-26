@@ -234,6 +234,12 @@ pub trait StorageRead: Debug + Send + Sync {
         None
     }
 
+    /// Begin an in-flight window on the store's residency tier. Mirror of
+    /// [`ContentStore::query_guard`].
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        None
+    }
+
     /// Read a byte range from the object at the given address.
     ///
     /// The range is `[start, end)` in bytes. Returns the bytes within
@@ -432,6 +438,10 @@ impl StorageRead for Arc<dyn Storage> {
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.as_ref().miss_register()
     }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.as_ref().query_guard()
+    }
 }
 
 #[async_trait]
@@ -542,6 +552,15 @@ pub trait ContentStore: Debug + Send + Sync {
         None
     }
 
+    /// Begin an in-flight window on the store's residency tier, if it has
+    /// one. See [`residency::InFlightGuard`]: while the returned guard is
+    /// alive the tier must not evict resident bytes, so a retry loop's
+    /// rounds observe a monotone resident set. Stores without a residency
+    /// tier return `None` (the default).
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        None
+    }
+
     /// Signal that this content is no longer needed and may be reclaimed.
     ///
     /// Implementations should make a best effort to free the underlying
@@ -604,6 +623,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.as_ref().miss_register()
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.as_ref().query_guard()
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
@@ -817,6 +840,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.storage.miss_register()
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.storage.query_guard()
     }
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
@@ -1146,6 +1173,21 @@ impl ContentStore for BranchedContentStore {
         self.branch_store
             .miss_register()
             .or_else(|| self.parents.iter().find_map(|p| p.miss_register()))
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        // Guard the whole ancestry chain: reads fall back through parents.
+        let mut guards: Vec<residency::InFlightGuard> = self
+            .branch_store
+            .query_guard()
+            .into_iter()
+            .chain(self.parents.iter().filter_map(ContentStore::query_guard))
+            .collect();
+        match guards.len() {
+            0 => None,
+            1 => Some(guards.remove(0)),
+            _ => Some(residency::InFlightGuard::join(guards)),
+        }
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {

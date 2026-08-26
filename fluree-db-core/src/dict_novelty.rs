@@ -237,6 +237,15 @@ impl SubjectDictNovelty {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+
+    /// Iterate every novel `(ns_code, suffix)` entry.
+    ///
+    /// Query-time overlay translation reverse-looks-up exactly these entries
+    /// against the persisted subject dictionary; residency-mode loads
+    /// prefetch the reverse-tree leaves they will touch.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (u16, &str)> {
+        self.inner.iter_entries()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +291,12 @@ impl StringDictNovelty {
     /// Get the watermark (max persisted string_id).
     pub fn watermark(&self) -> u32 {
         self.watermark
+    }
+
+    /// Iterate every novel string value. Mirror of
+    /// [`SubjectDictNovelty::iter_entries`] for the string dictionary.
+    pub fn iter_values(&self) -> impl Iterator<Item = &str> {
+        self.inner.iter().map(|(_, s)| s)
     }
 
     /// Number of entries in the novelty layer.
