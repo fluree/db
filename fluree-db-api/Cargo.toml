@@ -438,6 +438,9 @@ harness = false
 [[test]]
 name = "it_absent_subject_scan_narrowing"
 
+[[test]]
+name = "it_values_object_bounds"
+
 [lints]
 workspace = true
 

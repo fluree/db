@@ -79,6 +79,10 @@ Cost ladder (per event):
 | Forward-dict touch (per dict-backed value resolved during result materialization) | 0.010 |
 | History-scan leaflet base (per leaflet; per-row costs below add on top) | 0.010 |
 | Flake returned from a `db.range` call (e.g. SHACL graph reads, graph crawl) | 0.001 |
+| Row emitted by a binary index scan (per row, charged per batch at the scan boundary) | 0.001 |
+| Row joined through a `VALUES` clause (per input row, charged per batch) | 0.001 |
+| Row returned by a batched subject probe / SPOT star walk (charged in the primitive, so property-join and nested-loop-join callers pay alike) | 0.001 |
+| Row matched by a nested-loop join's own leaflet scan (subject-driven and object-driven lanes) | 0.001 |
 | Overlay/novelty row materialized | 0.001 |
 | History row scanned (base + in-range sidecar rows) | 0.001 |
 | R2RML row emitted (Iceberg/Parquet) | 0.001 |
@@ -95,7 +99,7 @@ Cost ladder (per event):
 
 Cheap operations (comparisons, arithmetic, type checks, simple string ops, datetime extraction, etc.) cost zero — instrumentation overhead would dwarf the actual cost.
 
-The **query floor** guarantees every fuel-tracked query reports at least `1.000` fuel: a query touching no persisted data still costs the floor, and a query that errors during parsing/planning still reports it. I/O "touches" cost `0.010` each, so a scan-dominated query reports roughly `1.000 + 0.010 × (leaflet/dict touches)`. The fuel schedule above is defined in one place — `fluree-db-core/src/tracking.rs` (`tracking::schedule`).
+The **query floor** guarantees every fuel-tracked query reports at least `1.000` fuel: a query touching no persisted data still costs the floor, and a query that errors during parsing/planning still reports it. I/O "touches" cost `0.010` each and emitted rows `0.001` each, so a scan-dominated query reports roughly `1.000 + 0.001 × rows emitted + 0.010 × (leaflet/dict touches)`. Rows the encoded prefilters drop *inside* the cursor are never emitted and are not charged — their per-row cost is nanoseconds, and the leaflet touch already prices the I/O. Row charges are applied once per batch at existing cancellation boundaries, never per iteration inside fused merge loops (hot-loop purity). The fuel schedule above is defined in one place — `fluree-db-core/src/tracking.rs` (`tracking::schedule`).
 
 #### Graph-crawl projection: materialization fuel scales with selected predicates
 

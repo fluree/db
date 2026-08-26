@@ -2491,6 +2491,19 @@ impl Operator for BinaryScanOperator {
             }
         }
 
+        // Price cursor-emitted rows at the batch boundary: leaflet touches are
+        // far coarser than rows (thousands of rows per 10 uf touch), so a lane
+        // that drains and materializes a whole predicate extent through this
+        // operator — NLJ chains, property-join inner scans, filter scans —
+        // otherwise reported floor-level fuel and stayed invisible to
+        // `max_fuel` limits. One charge per batch (hot-loop purity); rows the
+        // encoded prefilters drop inside the cursor are never emitted and are
+        // not charged — their per-row cost is nanoseconds and the leaflet
+        // touch already prices the I/O.
+        ctx.tracker.consume_fuel(
+            produced as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+        )?;
+
         if produced < batch_size && self.range_iter.is_some() {
             // Overlay/novelty rows are in-memory; charge per row at 1 micro-fuel.
             let n = self.flakes_to_bindings(&mut columns, ctx, batch_size - produced)?;
