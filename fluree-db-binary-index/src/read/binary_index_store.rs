@@ -561,6 +561,84 @@ impl BinaryIndexStore {
         );
     }
 
+    /// Residency mode: prewarm the reverse-dict leaves that overlay
+    /// translation of the given novelty entries will touch, in one
+    /// concurrent fetch round at load time.
+    ///
+    /// Query-time overlay translation resolves every novelty subject and
+    /// string against the persisted reverse trees through SYNC lookups
+    /// (`find_subject_id_by_parts` / `find_string_id`); without this
+    /// prewarm, each distinct cold reverse-tree leaf costs a retry round on
+    /// a residency-mode peer. Routing mirrors the lookups exactly
+    /// (`touched_leaf_addresses` over the same key encodings), and fetching
+    /// goes through the store's fetch-pins contract
+    /// ([`super::need_fetch::fetch_wants`]) — no filesystem involvement, so
+    /// it is wasm-safe. Best-effort: failures are logged by the caller via
+    /// the returned outcome; lookups fall back to the retry loop.
+    ///
+    /// No-op (returning an empty outcome) outside residency mode.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    pub async fn prefetch_novelty_reverse_wants<'a>(
+        &self,
+        subjects: impl Iterator<Item = (u16, &'a str)>,
+        strings: impl Iterator<Item = &'a str>,
+        width: usize,
+    ) -> super::need_fetch::FetchOutcome {
+        use super::need_fetch::{fetch_wants, FetchKind, FetchOutcome, Want};
+
+        let empty = FetchOutcome {
+            wanted: 0,
+            newly_resident: 0,
+            failures: Vec::new(),
+        };
+        if !self.residency_mode() {
+            return empty;
+        }
+        let Some(cs) = self.cas.as_ref() else {
+            return empty;
+        };
+
+        let mut seen: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
+        let mut wants: Vec<Want> = Vec::new();
+        if let Some(tree) = self.dicts.subject_reverse_tree.as_ref() {
+            let keys: Vec<Vec<u8>> = subjects
+                .map(|(ns_code, suffix)| {
+                    crate::dict::reverse_leaf::subject_reverse_key(ns_code, suffix.as_bytes())
+                })
+                .collect();
+            for address in tree.touched_leaf_addresses(keys.iter().map(Vec::as_slice)) {
+                if let Some(cid) = tree.remote_leaf_cid(address) {
+                    if cs.resolve_cached_bytes(cid).is_none() && seen.insert(cid.clone()) {
+                        wants.push(Want {
+                            cid: cid.clone(),
+                            kind: FetchKind::DictLeaf,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(tree) = self.dicts.string_reverse_tree.as_ref() {
+            // String reverse keys are the raw UTF-8 value bytes (see
+            // `find_string_id`).
+            let keys: Vec<&[u8]> = strings.map(str::as_bytes).collect();
+            for address in tree.touched_leaf_addresses(keys.iter().copied()) {
+                if let Some(cid) = tree.remote_leaf_cid(address) {
+                    if cs.resolve_cached_bytes(cid).is_none() && seen.insert(cid.clone()) {
+                        wants.push(Want {
+                            cid: cid.clone(),
+                            kind: FetchKind::DictLeaf,
+                        });
+                    }
+                }
+            }
+        }
+
+        if wants.is_empty() {
+            return empty;
+        }
+        fetch_wants(cs.as_ref(), wants, width).await
+    }
+
     /// Best-effort concurrent prewarm of the subject reverse-tree leaves a batch
     /// of `(ns_code, suffix)` reverse lookups will touch. Encodes keys exactly as
     /// [`Self::find_subject_id_by_parts`] does (`subject_reverse_key` over the same
@@ -3630,6 +3708,125 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(rows, 10, "both leaves' rows after one fetch round");
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// F8: the novelty reverse-leaf prefetcher must pin exactly the routed
+    /// reverse-tree leaves, turning subsequent translation lookups
+    /// (`find_subject_id_by_parts` — what overlay translation runs per
+    /// novelty entry) into pure hits. Cold lookups before the prefetch miss
+    /// with a typed NeedFetch; after one prefetch round every routed lookup
+    /// hits without recording a want.
+    #[cfg(feature = "residency")]
+    #[test]
+    fn residency_prefetch_covers_novelty_reverse_lookups() {
+        use crate::dict::reader::{DictTreeReader, LeafSource};
+        use crate::dict::reverse_leaf::{subject_reverse_key, ReverseEntry};
+        use crate::read::need_fetch::{tests::MissInjectingStore, NeedFetch};
+
+        let store = Arc::new(MissInjectingStore::new());
+        let cs: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
+
+        // Multi-leaf CAS-backed reverse tree over 200 subjects: a tiny
+        // target leaf size forces several leaves, so the prefetch provably
+        // fetches a SET, not one object.
+        let entries: Vec<ReverseEntry> = (0..200u64)
+            .map(|i| ReverseEntry {
+                key: subject_reverse_key(2, format!("subject-{i:04}").as_bytes()),
+                id: i + 1,
+            })
+            .collect();
+        let result = builder::build_reverse_tree(entries, 512).unwrap();
+        assert!(
+            result.branch.leaves.len() >= 2,
+            "fixture must produce a multi-leaf tree, got {}",
+            result.branch.leaves.len()
+        );
+        let mut remote_cids = HashMap::new();
+        for (artifact, branch_leaf) in result.leaves.iter().zip(result.branch.leaves.iter()) {
+            let cid = run_sync_on_runtime({
+                let store = Arc::clone(&store);
+                let bytes = artifact.bytes.clone();
+                async move {
+                    store
+                        .inner
+                        .put(ContentKind::IndexLeaf, &bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("seed reverse leaf");
+            remote_cids.insert(branch_leaf.address.clone(), cid);
+        }
+        let tree = DictTreeReader::new(
+            result.branch,
+            LeafSource::CasOnDemand {
+                cs: Arc::clone(&cs),
+                local_files: HashMap::new(),
+                remote_cids,
+            },
+        );
+
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::clone(&cs), cache_dir.clone());
+        binary_store.dicts.subject_reverse_tree = Some(tree);
+        let binary_store = Arc::new(binary_store);
+
+        // Cold: the translation lookup misses, typed and registered.
+        let err = binary_store
+            .find_subject_id_by_parts(2, "subject-0005")
+            .expect_err("cold reverse lookup must miss");
+        assert!(
+            NeedFetch::from_io_error(&err).is_some(),
+            "typed miss: {err}"
+        );
+        let register = cs.miss_register().expect("residency store");
+        assert!(!register.is_empty(), "cold miss must be registered");
+        register.drain();
+
+        // The load-time prefetch (as `prefetch_novelty_translation` runs it)
+        // pins the whole routed leaf set in one round.
+        let parts: Vec<(u16, String)> = (0..200u64)
+            .map(|i| (2u16, format!("subject-{i:04}")))
+            .collect();
+        let outcome = run_sync_on_runtime({
+            let binary_store = Arc::clone(&binary_store);
+            let parts = parts.clone();
+            async move {
+                Ok(binary_store
+                    .prefetch_novelty_reverse_wants(
+                        parts.iter().map(|(ns, s)| (*ns, s.as_str())),
+                        std::iter::empty(),
+                        4,
+                    )
+                    .await)
+            }
+        })
+        .unwrap();
+        assert!(
+            outcome.wanted >= 2,
+            "prefetch must want the multi-leaf routed set, wanted {}",
+            outcome.wanted
+        );
+        assert_eq!(
+            outcome.newly_resident, outcome.wanted,
+            "every routed leaf pinned: {:?}",
+            outcome.failures
+        );
+
+        // Every routed lookup is now a pure hit: found, and no want recorded.
+        for i in [0u64, 42, 199] {
+            let suffix = format!("subject-{i:04}");
+            let found = binary_store
+                .find_subject_id_by_parts(2, &suffix)
+                .expect("prefetched lookup must not miss");
+            assert_eq!(found, Some(i + 1), "reverse lookup value for {suffix}");
+        }
+        assert!(
+            register.is_empty(),
+            "pure hits must not record wants: {} pending",
+            register.len()
+        );
         let _ = std::fs::remove_dir_all(cache_dir);
     }
 
