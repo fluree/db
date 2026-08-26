@@ -12,7 +12,7 @@
 // with the expected bound rows — a positive ran-marker. Timeouts, thrown
 // errors, and a missing marker all exit 1.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,8 +34,10 @@ function findChrome() {
   for (const c of candidates) {
     if (c.includes("/")) {
       if (existsSync(c)) return c;
-    } else {
-      return c; // resolved via PATH by spawn; failure surfaces as ENOENT below
+    } else if (spawnSync("which", [c], { stdio: "ignore" }).status === 0) {
+      // `which`, not a --version launch: on macOS, launching the Chrome
+      // binary can hand off to a running instance and never exit.
+      return c;
     }
   }
   return null;
@@ -73,7 +75,11 @@ const chrome = spawn(
 function cleanup() {
   try { chrome.kill("SIGKILL"); } catch { /* already gone */ }
   server.close();
-  rmSync(profileDir, { recursive: true, force: true });
+  try {
+    // The killed Chrome may still be flushing profile files; retry, and never
+    // let cleanup decide the exit code.
+    rmSync(profileDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch { /* leftover temp dir is harmless */ }
 }
 
 const wsUrl = await new Promise((resolve, reject) => {
