@@ -57,6 +57,7 @@ pub mod connect;
 #[cfg(target_arch = "wasm32")]
 pub mod driver;
 pub mod gauge;
+pub mod heads;
 pub mod protocol;
 pub mod residency;
 
@@ -69,11 +70,14 @@ pub use connect::{build_peer, BrowserPeer};
 #[cfg(target_arch = "wasm32")]
 pub use driver::start_driver;
 pub use gauge::{WriteBehindGauge, WriteBehindPermit};
+pub use heads::{ChannelSseSource, DriverSleeper, HeadChange, HeadTracker};
 pub use protocol::IoJob;
 pub use residency::{PinSet, QueryGuard, ResidencyError, ResidencyStats, ResidencyTier};
 
-// The transport contract this crate implements, re-exported so the shell
-// does not need a direct dependency on the sync crate.
+// The transport and head-stream contracts this crate implements,
+// re-exported so the shell does not need a direct dependency on the sync
+// crate.
 pub use fluree_db_nameservice_sync::{
-    HttpTransport, TransportError, TransportMethod, TransportRequest, TransportResponse,
+    HeadSink, HttpTransport, RemoteEvent, SseConnectError, TransportError, TransportMethod,
+    TransportRequest, TransportResponse,
 };

@@ -151,10 +151,7 @@ where
         futures::pin_mut!(stop_fut);
         match futures::future::select(fut, stop_fut).await {
             Either::Left((value, _)) => return Some(value),
-            Either::Right((true, rest)) => {
-                let _ = rest;
-                return None;
-            }
+            Either::Right((true, _)) => return None,
             Either::Right((false, rest)) => {
                 // Spurious change back to false; keep waiting.
                 fut = rest;

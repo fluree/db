@@ -588,6 +588,11 @@ pub(crate) mod tests {
         /// Hold each CachePut's write-behind permit this long before
         /// releasing it (simulates a slow IndexedDB).
         pub put_hold: Option<Duration>,
+        /// Scripted SSE connections: each entry is the frame chunks of one
+        /// connect; an exhausted script answers `Fatal` (ends the pump).
+        pub sse_script: std::collections::VecDeque<Vec<Vec<u8>>>,
+        /// Every SSE connect observed: `(url, headers)`.
+        pub sse_log: Vec<(String, Vec<(&'static str, String)>)>,
     }
 
     fn cid_from_url(url: &str) -> String {
@@ -646,6 +651,38 @@ pub(crate) mod tests {
                             tokio::time::sleep(duration).await;
                             let _ = reply.send(());
                         });
+                    }
+                    IoJob::SseOpen {
+                        url,
+                        headers,
+                        ready,
+                        chunks,
+                    } => {
+                        let script = {
+                            let mut s = state.lock().unwrap();
+                            s.sse_log.push((url, headers));
+                            s.sse_script.pop_front()
+                        };
+                        match script {
+                            Some(frames) => {
+                                let _ = ready.send(Ok(()));
+                                tokio::spawn(async move {
+                                    for frame in frames {
+                                        if chunks.send(Ok(Bytes::from(frame))).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    // Dropping the sender = clean stream end.
+                                });
+                            }
+                            None => {
+                                let _ = ready.send(Err(
+                                    fluree_db_nameservice_sync::SseConnectError::Fatal(
+                                        "sse script exhausted".to_string(),
+                                    ),
+                                ));
+                            }
+                        }
                     }
                     IoJob::CachePut { key, bytes, permit } => {
                         let put_hold = {

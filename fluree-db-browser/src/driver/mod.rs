@@ -9,6 +9,7 @@
 
 pub mod fetch;
 pub mod idb;
+pub mod sse;
 
 use crate::bridge::{IoHandle, IoReceiver};
 use crate::config::BrowserIoConfig;
@@ -67,6 +68,14 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                         drop(permit);
                     });
                 }
+            }
+            IoJob::SseOpen {
+                url,
+                headers,
+                ready,
+                chunks,
+            } => {
+                spawn_local(sse::run(url, headers, ready, chunks));
             }
             IoJob::Sleep { duration, reply } => {
                 let millis = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);

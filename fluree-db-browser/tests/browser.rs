@@ -9,8 +9,8 @@
 
 use fluree_db_browser::driver::IdbCache;
 use fluree_db_browser::{
-    start_driver, BrowserIoConfig, CacheConfig, HttpTransport, IoJob, TransportError,
-    TransportRequest, WasmFetchTransport,
+    start_driver, BrowserIoConfig, CacheConfig, ChannelSseSource, DriverSleeper, HeadSink,
+    HttpTransport, IoJob, RemoteEvent, TransportError, TransportRequest, WasmFetchTransport,
 };
 use fluree_db_core::{ContentId, ContentKind};
 use gloo_timers::future::TimeoutFuture;
@@ -163,4 +163,66 @@ async fn driver_serves_cache_jobs_end_to_end() {
     io.shutdown();
     TimeoutFuture::new(100).await;
     IdbCache::delete_database(name).await.expect("cleanup");
+}
+
+/// The driver's SSE job streams a real fetch body through the shared pump:
+/// a `data:text/event-stream` URL delivers its frames via the response's
+/// `ReadableStream`, the pump parses and dispatches them, and the sink's
+/// stop signal ends the pump after the first ledger event (the data URL
+/// would otherwise reconnect forever).
+#[wasm_bindgen_test]
+async fn sse_driver_streams_frames_from_a_data_url() {
+    use async_trait::async_trait;
+    use fluree_db_nameservice_sync::{run_head_stream, HeadStreamConfig};
+    use std::sync::Mutex;
+    use tokio::sync::watch;
+
+    struct StopOnLedgerSink {
+        events: Mutex<Vec<String>>,
+        stop: watch::Sender<bool>,
+    }
+
+    #[async_trait]
+    impl HeadSink for StopOnLedgerSink {
+        async fn on_event(&self, event: RemoteEvent) {
+            let tag = match &event {
+                RemoteEvent::Connected => "connected".to_string(),
+                RemoteEvent::LedgerUpdated(r) => format!("ledger:{}@{}", r.ledger_id, r.commit_t),
+                other => format!("{other:?}"),
+            };
+            self.events.lock().unwrap().push(tag);
+            if matches!(event, RemoteEvent::LedgerUpdated(_)) {
+                let _ = self.stop.send(true);
+            }
+        }
+    }
+
+    let io = start_driver(no_cache_config());
+    let frame = "event: ns-record\ndata: {\"action\":\"ns-record\",\"kind\":\"ledger\",\"resource_id\":\"books:main\",\"record\":{\"ledger_id\":\"books:main\",\"branch\":\"main\",\"commit_head_id\":null,\"commit_t\":9,\"index_head_id\":null,\"index_t\":3,\"retracted\":false},\"emitted_at\":\"now\"}\n\n";
+    let url = format!("data:text/event-stream,{}", urlencoding::encode(frame));
+    let source = ChannelSseSource::new(io.clone(), url, None);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let sink = StopOnLedgerSink {
+        events: Mutex::new(Vec::new()),
+        stop: stop_tx,
+    };
+    let sleeper = DriverSleeper::new(io.clone());
+    let config = HeadStreamConfig {
+        reconnect_initial: Duration::from_millis(5),
+        reconnect_max: Duration::from_millis(20),
+        reconnect_multiplier: 2.0,
+    };
+
+    run_head_stream(&source, &sink, &sleeper, config, stop_rx).await;
+
+    let events = sink.events.lock().unwrap().clone();
+    assert!(
+        events.contains(&"connected".to_string()),
+        "must connect: {events:?}"
+    );
+    assert!(
+        events.contains(&"ledger:books:main@9".to_string()),
+        "ledger event must flow through the real stream: {events:?}"
+    );
+    io.shutdown();
 }
