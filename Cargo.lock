@@ -2604,6 +2604,7 @@ dependencies = [
  "gloo-timers",
  "http 1.4.0",
  "js-sys",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2612,6 +2613,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "xxhash-rust",
 ]
 
 [[package]]

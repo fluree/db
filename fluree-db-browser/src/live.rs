@@ -101,6 +101,15 @@ struct Subscription {
     last_hash: Option<u64>,
 }
 
+/// Per-cycle snapshot of one subscription's descriptors, taken so the
+/// registry lock is never held across an await.
+struct SelectedSub {
+    sub_id: SubId,
+    query: LiveQuery,
+    filter: Arc<dyn FootprintFilter>,
+    last_hash: Option<u64>,
+}
+
 /// Coalescing state machine for one ledger's cycles: a head change during
 /// a running cycle folds into exactly ONE follow-up at the latest head
 /// (novelty has already absorbed every intermediate commit).
@@ -343,19 +352,15 @@ impl LiveQuerySet {
         commit_flakes: Option<&[Flake]>,
     ) -> CycleOutcome {
         // Snapshot descriptors without holding the lock across awaits.
-        let selected: Vec<(SubId, LiveQuery, Arc<dyn FootprintFilter>, Option<u64>)> = {
+        let selected: Vec<SelectedSub> = {
             let subs = self.subs_lock();
             subs.iter()
-                .filter(|(id, sub)| {
-                    sub.ledger == ledger && only.is_none_or(|ids| ids.contains(id))
-                })
-                .map(|(id, sub)| {
-                    (
-                        *id,
-                        sub.query.clone(),
-                        Arc::clone(&sub.filter),
-                        sub.last_hash,
-                    )
+                .filter(|(id, sub)| sub.ledger == ledger && only.is_none_or(|ids| ids.contains(id)))
+                .map(|(id, sub)| SelectedSub {
+                    sub_id: *id,
+                    query: sub.query.clone(),
+                    filter: Arc::clone(&sub.filter),
+                    last_hash: sub.last_hash,
                 })
                 .collect()
         };
@@ -385,7 +390,7 @@ impl LiveQuerySet {
                 let message = e.to_string();
                 outcome.errored = selected
                     .into_iter()
-                    .map(|(id, ..)| (id, message.clone()))
+                    .map(|sub| (sub.sub_id, message.clone()))
                     .collect();
                 return outcome;
             }
@@ -402,21 +407,24 @@ impl LiveQuerySet {
             .map(BrowserCasStorage::query_guard);
 
         let mut hash_updates: Vec<(SubId, u64)> = Vec::new();
-        for (sub_id, query, filter, last_hash) in selected {
+        for SelectedSub {
+            sub_id,
+            query,
+            filter,
+            last_hash,
+        } in selected
+        {
             // v2 seam: skip provably-unaffected subscriptions — but never
             // one that has yet to produce its first result.
-            if last_hash.is_some()
-                && commit_flakes.is_some_and(|flakes| !filter.affected(flakes))
-            {
+            if last_hash.is_some() && commit_flakes.is_some_and(|flakes| !filter.affected(flakes)) {
                 outcome.unchanged.push(sub_id);
                 continue;
             }
 
             // (3) re-run through the production entry (retry loop included
             // on wasm32) against the shared frozen view.
-            let builder =
-                GraphSnapshotQueryBuilder::new_from_parts(&self.inner.fluree, &view)
-                    .execution_options(self.inner.execution.clone());
+            let builder = GraphSnapshotQueryBuilder::new_from_parts(&self.inner.fluree, &view)
+                .execution_options(self.inner.execution.clone());
             let builder = match &query {
                 LiveQuery::Sparql(text) => builder.sparql(text),
                 LiveQuery::JsonLd(json) => builder.jsonld(json),
@@ -551,7 +559,10 @@ mod tests {
             .expect("names payload");
         let parsed: JsonValue = serde_json::from_slice(&names_payload.payload).unwrap();
         let rendered = parsed.to_string();
-        assert!(rendered.contains("Alice") && rendered.contains("Bob"), "{rendered}");
+        assert!(
+            rendered.contains("Alice") && rendered.contains("Bob"),
+            "{rendered}"
+        );
 
         // Advance the head with a commit that changes names+count but not bob.
         add_person(&fluree, "carol", "Carol").await;
@@ -734,7 +745,11 @@ mod tests {
         // First cycle WITH flakes: the filtered subscription has no result
         // yet, so the filter must not skip it.
         let first = live.run_cycle_with_flakes(LEDGER, Some(&[])).await;
-        assert_eq!(first.changed.len(), 2, "unprimed subs always run: {first:?}");
+        assert_eq!(
+            first.changed.len(),
+            2,
+            "unprimed subs always run: {first:?}"
+        );
 
         // Later cycles with flakes: the filter short-circuits the
         // filtered subscription straight to unchanged (no re-run), while
