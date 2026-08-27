@@ -58,6 +58,7 @@ pub mod connect;
 pub mod driver;
 pub mod gauge;
 pub mod heads;
+pub mod live;
 pub mod protocol;
 pub mod residency;
 
@@ -71,6 +72,9 @@ pub use connect::{build_peer, BrowserPeer};
 pub use driver::start_driver;
 pub use gauge::{WriteBehindGauge, WriteBehindPermit};
 pub use heads::{ChannelSseSource, DriverSleeper, HeadChange, HeadTracker};
+pub use live::{
+    AlwaysAffected, ChangedSub, CycleOutcome, FootprintFilter, LiveQuery, LiveQuerySet, SubId,
+};
 pub use protocol::IoJob;
 pub use residency::{PinSet, QueryGuard, ResidencyError, ResidencyStats, ResidencyTier};
 
