@@ -286,9 +286,8 @@ async fn query_with_recovery(
         match fluree.query(db, query).await {
             Ok(result) => return (result, recovery),
             Err(e) => {
-                if !recover_once(&cs, storage, &mut recovery, &e).await {
-                    panic!("non-residency query error: {e:?}");
-                }
+                let recovered = recover_once(&cs, storage, &mut recovery, &e).await;
+                assert!(recovered, "non-residency query error: {e:?}");
             }
         }
     }
@@ -307,9 +306,8 @@ async fn ledger_with_recovery(
         match fluree.ledger(LEDGER).await {
             Ok(ledger) => return ledger,
             Err(e) => {
-                if !recover_once(&cs, storage, &mut recovery, &e).await {
-                    panic!("non-residency ledger-load error: {e:?}");
-                }
+                let recovered = recover_once(&cs, storage, &mut recovery, &e).await;
+                assert!(recovered, "non-residency ledger-load error: {e:?}");
             }
         }
     }
@@ -414,9 +412,8 @@ async fn fast_path_count_recovers_through_outer_loop() {
         match fluree_b.query(&db_b, query).await {
             Ok(result) => break result,
             Err(e) => {
-                if !recover_once(&cs, &storage, &mut recovery, &e).await {
-                    panic!("non-residency query error: {e:?}");
-                }
+                let recovered = recover_once(&cs, &storage, &mut recovery, &e).await;
+                assert!(recovered, "non-residency query error: {e:?}");
             }
         }
     };
@@ -471,9 +468,8 @@ async fn count_distinct_dir_walk_recovers() {
         match fluree_b.query(&db_b, query).await {
             Ok(result) => break result,
             Err(e) => {
-                if !recover_once(&cs, &storage, &mut recovery, &e).await {
-                    panic!("non-residency query error: {e:?}");
-                }
+                let recovered = recover_once(&cs, &storage, &mut recovery, &e).await;
+                assert!(recovered, "non-residency query error: {e:?}");
             }
         }
     };
@@ -541,9 +537,8 @@ async fn policy_filtered_query_recovers_via_register() {
         match fluree_b.query_connection(&query).await {
             Ok(result) => break result,
             Err(e) => {
-                if !recover_once(&cs, &storage, &mut recovery, &e).await {
-                    panic!("non-residency policy-query error: {e:?}");
-                }
+                let recovered = recover_once(&cs, &storage, &mut recovery, &e).await;
+                assert!(recovered, "non-residency policy-query error: {e:?}");
             }
         }
     };
