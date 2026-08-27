@@ -339,6 +339,15 @@ async fn indexed_optional_extends_union_unbound_rows() {
             trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
             wait_for_index_application(&fluree, ledger_id, ledger.t()).await;
             let view = fluree.db(ledger_id).await.expect("indexed view");
+            // Lane guard. Post-fix this shape declines the batched probe, so
+            // without this a lost indexer race would silently downgrade the
+            // whole test to a second novelty-lane assertion — which passes on
+            // the unfixed engine too.
+            assert!(
+                view.binary_store().is_some(),
+                "the indexed lane needs a binary store on the view; without one this test is a \
+                 duplicate of the novelty-lane one"
+            );
 
             let with_optional = fluree
                 .query(
