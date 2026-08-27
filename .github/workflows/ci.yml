@@ -423,6 +423,16 @@ jobs:
       - name: Browser I/O tests (headless Chrome)
         run: wasm-pack test --headless --chrome fluree-db-browser
 
+      # Lints the wasm-only targets, which nothing else sees: the workspace
+      # clippy job builds for the host, so wasm-gated code and
+      # `#[wasm_bindgen_test]` targets are never compiled there, and the
+      # wasm32 job runs `cargo check`, which does not lint. Scoped to these
+      # two crates deliberately — they hold all the wasm-only code, and a
+      # workspace-wide wasm clippy would not be cheap. This job has already
+      # compiled the wasm32 graph twice by now, so it reuses that.
+      - name: Clippy (wasm32-only targets)
+        run: cargo clippy -p fluree-db-browser -p fluree-db-wasm --target wasm32-unknown-unknown --all-targets -- -D warnings
+
       - name: Build npm package (wasm-release profile + wasm-opt + tsc)
         working-directory: fluree-db-wasm/js
         run: |
