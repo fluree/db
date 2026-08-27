@@ -30,6 +30,15 @@
       const peer = await connect(api, { getToken: () => token });
       const connectMs = performance.now() - t0;
 
+      // `wait` splits the run in two so a profiler can be armed around the
+      // cold open ALONE: the ~1.3 s of worker boot and wasm compilation that
+      // `connect()` covers would otherwise dominate a whole-run profile and
+      // be misread as engine work.
+      if (params.has("wait")) {
+        window.__connected = true;
+        for (let i = 0; i < 3000 && !window.__go; i++) await new Promise((r) => setTimeout(r, 10));
+      }
+
       const tOpen = performance.now();
       const ledger = await peer.ledger(ledgerId);
       const openMs = performance.now() - tOpen;
@@ -38,9 +47,26 @@
       const res = await ledger.query(SPARQL);
       const queryMs = performance.now() - tQuery;
 
+      // The SAME query again at the SAME head, with everything now resident.
+      // The cold/warm ratio separates intrinsic query cost from the cost of
+      // the miss → drain → fetch → re-run machinery, without needing wasm
+      // symbol names.
+      const tWarm = performance.now();
+      const warmRes = await ledger.query(SPARQL);
+      const warmQueryMs = performance.now() - tWarm;
+      const warmRows = warmRes?.results?.bindings?.length ?? -1;
+
+      // And a fresh open of the same (already-loaded) ledger.
+      const tReopen = performance.now();
+      await peer.ledger(ledgerId);
+      const reopenMs = performance.now() - tReopen;
+
       // A timing with no rows behind it is not a measurement of anything.
       const names = res?.results?.bindings?.map((b) => b.name.value) ?? [];
-      peer.close();
+      // `keepalive` leaves the worker running so a CPU profile attached to it
+      // can still be stopped and read — `close()` terminates the worker, and
+      // a profiler session on a dead target never answers.
+      if (!params.has("keepalive")) peer.close();
 
       const report = {
         status: names.length > 0 ? "pass" : "fail",
@@ -49,6 +75,9 @@
         openMs: Math.round(openMs),
         queryMs: Math.round(queryMs),
         coldOpenMs: Math.round(openMs + queryMs),
+        warmQueryMs: Math.round(warmQueryMs),
+        warmRows,
+        reopenMs: Math.round(reopenMs),
       };
       out.textContent = JSON.stringify(report, null, 2);
       return report;
