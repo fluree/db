@@ -618,8 +618,12 @@ fn build_class_data(indexed: &IndexStats) -> HashMap<Sid, ClassDataMut> {
 
 /// Merge index per-datatype counts with novelty deltas, dropping any datatype
 /// whose current-state count is zero. Keeps the aggregate `datatypes` breakdown
-/// current-state-exact so a predicate that gains/loses literal values via
-/// novelty is reflected (used by the equijoin-filter fold's node-only guard).
+/// tracking novelty rather than the index alone, for the estimators that sum it.
+///
+/// These are estimates, and the drop is not reliable: a retraction of a fact the
+/// base index never held still charges its `-1`, so a tag can vanish while the
+/// data it described is still there. Read [`union_observed_datatypes`] instead
+/// of this if you need the *set* of datatypes a property carries.
 fn merge_property_datatypes(
     index: &[(u8, u64)],
     deltas: Option<&HashMap<u8, i64>>,
