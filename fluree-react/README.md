@@ -21,10 +21,12 @@ code. If the commit did not change what this query returns, the component
 does not re-render at all — and when it does, the rows that did not change
 keep their object identity, so `React.memo` down the tree keeps working.
 
-> **Status:** pre-release (`0.0.0-dev`). Both modes are implemented and
-> tested against scripted doubles. See
-> [Verification status](#verification-status) — it is deliberately blunt
-> about what has and has not been run for real.
+> **Status:** pre-release (`0.0.0-dev`), and it does **not** work against a
+> released Fluree server yet — remote mode needs an SSE fix that is still an
+> open PR. Read [What you need on the server](#what-you-need-on-the-server)
+> before your first run, and
+> [What's proven / what isn't](#whats-proven--what-isnt) before believing
+> anything else in this file.
 
 ## Two modes, one API
 
@@ -104,6 +106,34 @@ quietly returning something of the wrong shape or the wrong age.
 
 Everything else — result shapes, identity stability, error semantics,
 dedup, GC — is identical by construction.
+
+## What you need on the server
+
+Neither mode works against a stock, released `fluree-server` today. If you
+install this package, point it at one, and see a subscription that connects
+and then never updates, this section — not your code — is the reason.
+
+### Remote mode
+
+| Requirement | Why |
+| --- | --- |
+| **A server built with the `?ledger=` SSE fix** (PR **#1730**, `fix/events-per-ledger-subscription`). Not in any release. | Without it `GET /v1/fluree/events?ledger=…` fails deserialization outright — axum's `Query` extractor cannot build a `Vec` from repeated query keys — so **even a single ledger** 400s and the stream never opens. The symptom is a query stuck in `loading` with `useConnectionState()` flapping `reconnecting`. |
+| Nothing else. | Query + events is the whole surface. No flags, no tokens unless your server enforces them. |
+
+### Peer mode
+
+Everything above, plus:
+
+| Requirement | Why |
+| --- | --- |
+| `--storage-proxy-enabled` | The in-browser engine reads ledger heads and index blocks through `/v1/fluree/storage/*`. Off by default; without it every request 401s with *"Token lacks storage proxy permissions"*. |
+| `--storage-proxy-trusted-issuer <did:key>` | The proxy trusts only issuers named here (it falls back to `--events-auth-trusted-issuer`). |
+| A bearer token carrying **`fluree.storage.all`** or **`fluree.storage.ledgers`** | The storage proxy requires `fluree.storage.*` claims specifically. **`fluree.events.*` is not sufficient**, and the shipped `fluree-events-token` CLI mints only the events half — so it cannot produce a working peer token. `fluree-db-wasm/js/scripts/fluree-server.mjs` exports `createIdentity()` and `mintStorageProxyToken()` that do. |
+| `@fluree/db-wasm`'s generated glue | `cd fluree-db-wasm/js && npm install && node scripts/build.mjs` writes `js/pkg/`. |
+| A bundler allowed to read it | In a monorepo, Vite's dev server refuses paths outside the project root: set `server.fs.allow`. The symptom is `engine_crashed` with an **empty page console**, because the failure is inside the worker. |
+
+If your server enforces events auth (`--events-auth-mode` is not `none`,
+the default), a peer token needs **both** claim families.
 
 ## API
 
@@ -246,12 +276,40 @@ request, no SSE connect. The client takes over after hydration. A server
 render does create a cache entry, which collects itself after `gcTime` — so
 prefer a per-request client, or a short `gcTime`, in a server process.
 
-## Verification status
+## What's proven / what isn't
 
-Written out plainly, because "the tests pass" and "this works against
-Fluree" are different claims and only the first is true today.
+Written out plainly, because "the tests pass" and "this works against Fluree"
+are different claims.
 
-**Executed** — 178 tests (`npx vitest run`), all running real package code:
+**In one paragraph:** both modes have run in a real browser against a real
+`fluree-server` and done the thing this package exists to do — a commit in
+one tab re-rendering exactly the affected row in another, with no polling
+code in the app. Remote mode is reliable there; peer mode is reliable only
+with a warm block cache, and stalls from cold for reasons that live in the
+engine, below this package. Everything in the automated suite is mocked:
+178 tests, no network, no wasm. Two known blockers are listed at the end.
+
+### Proven in a real browser, against a real server
+
+| | remote | peer |
+| --- | --- | --- |
+| Two tabs, live cross-tab update | yes | yes |
+| Only the changed row re-rendered (`1×`→`2×`, siblings still `1×`) | yes | yes |
+| A second query on the same ledger re-ran and did **not** re-render | yes | yes |
+| Watermark advanced | `t` 5→8 | `t` 1→2 |
+| Reliable from a cold start | yes | **no** — stalls |
+
+Remote mode reached first rendered data in **141 ms** on loopback. Peer mode
+is slower to first paint by design (see
+[Peer mode is not a speed-up on first paint](#peer-mode-is-not-a-speed-up-on-first-paint));
+no honest peer cold-open number was obtainable here, because the only clean
+cold runs available were the ones that stall.
+
+Also executed for real: the demo builds through a real bundler in CI (`vite
+build`), which is the only thing exercising this as a *package* rather than
+as source files a test imported.
+
+### Proven by executed tests — 178 (`npx vitest run`), all real package code
 
 | Suite | Tests | What it actually proves |
 | --- | --- | --- |
@@ -267,20 +325,11 @@ Fluree" are different claims and only the first is true today.
 | `integration` | 7 | The public barrel and `createClient` composed as an app uses them: an SSE head event drives a re-query that re-renders a component. |
 | `ssr` | 4 | `renderToString` yields the loading snapshot and performs no I/O. |
 
-**Also executed:** the demo app builds through a real bundler in CI (`vite
-build`), which is the only thing that exercises this package as a *package*
-rather than as source files a test imported.
+### What the live runs found that 178 green tests could not
 
-**Run for real, once, by hand (remote mode).** The demo was driven in two
-Chrome tabs against a release `fluree-server` on file storage: a vote in one
-tab appeared in the other, and in the untouched tab **only the changed row
-re-rendered** (its counter `1×`→`2×`, every sibling still `1×`, the
-second query's panel untouched); adding a note then re-rendered that second
-panel and no existing row. That run is what found the four defects listed
-below — none of which the 177 tests could see, because all four live in the
-gap between a mock and a browser talking to a server.
-
-**What that one live run found**, after every mocked test was green:
+Every one of these was invisible to the mocked suite, and the first three
+share a failure mode: **silence**. That is the argument for making the live
+run a standing gate rather than a one-off.
 
 1. `fetch` held as an instance property and called as `this.fetchImpl(...)`
    passes the transport as the receiver, and **every browser** rejects that
@@ -295,49 +344,57 @@ gap between a mock and a browser talking to a server.
    the bare name produced a stream that connects, stays open, and delivers
    nothing. The canonical alias is now *resolved* from `/info/{ledger}`
    rather than guessed from a default branch name.
-4. (Server-side, fixed here) the events endpoint's documented `?ledger=`
-   filter never worked at all — axum's `Query` extractor cannot build a
-   `Vec` from repeated query keys, so even a single `?ledger=x` failed
-   deserialization and `?all=true` was the only usable form.
+4. (Server-side; now PR **#1730**) the events endpoint's documented
+   `?ledger=` filter never worked at all — axum's `Query` extractor cannot
+   build a `Vec` from repeated query keys, so even a single `?ledger=x`
+   failed deserialization and `?all=true` was the only usable form.
+5. The demo — the artifact whose *entire purpose* is showing that unchanged
+   rows do not re-render — mapped results into fresh row objects each render,
+   discarding the identity the package had just preserved. Everything worked;
+   every row simply re-rendered on every commit. Only the render counters
+   showed it. This is the easiest way for a user to lose the whole benefit.
 
-Each of the first three is the same failure mode: **silence**. That is why
-they survived a full mocked suite, and it is the argument for the live run
-being a standing gate rather than a one-off.
+### Mocked
 
-**Still mocked.** Every HTTP response, every SSE frame, and the whole wasm
-engine, in the automated suite. The live run above was manual and is not
-reproducible in CI today.
+Every HTTP response, every SSE frame, and the whole wasm engine, in the
+automated suite. The live runs were manual and are **not reproducible in CI
+today** — that gap is why defects 1-4 survived a green suite.
 
-**Not verified:**
+### Unverified
 
-- **Peer mode is proven end to end, but not yet reliably.** Driven in two
-  Chrome tabs against a release `fluree-server` with the storage proxy on, it
-  worked exactly as designed: two independent wasm engines, a vote in one tab
-  appearing in the other, **only the changed row re-rendering** (`1×`→`2×`
-  while its siblings stayed `1×`), the second query's panel untouched, and
-  the watermark advancing `t = 1` → `t = 2`. Peer mode also knows its
-  watermark immediately, where remote mode reports `undefined` until the
-  first head event.
-
-  On later runs, after clearing the browser's IndexedDB block cache, peer
-  queries **stall indefinitely**: `init` succeeds, the token handshake
-  completes, the connection reports `live` — and then no query ever answers,
-  with no error, no panic, and **no `/v1/fluree/storage/*` request ever
-  issued**, so the engine stalls before its first block fetch. It reproduces
-  through the raw worker protocol with head tracking switched off, i.e.
-  entirely below this package, and remote mode against the same server is
-  unaffected. Engine-side; reported, not fixed here.
-- **No browser run.** jsdom only. The demo has been driven against a real
-  server (see below), but not as an automated test.
-- **No packaging smoke.** `npm run build` emits `dist/`, and the demo bundles
+- **No automated browser run.** jsdom only.
+- **No packaging smoke.** `npm run build` emits `dist/` and the demo bundles
   the package through Vite, but nothing installs the published tarball and
   checks its export map.
-- **Nothing measured.** No benchmark of cycle cost, structural-sharing cost,
-  or behaviour at high subscription counts.
-- **The remote fan-out is bounded, not fixed.** Remote mode still issues one
-  HTTP request per live subscription per commit; `maxConcurrency` limits how
-  many run at once, it does not reduce how many run. There is no multi-query
-  endpoint on the server to fix this properly today.
+- **Nothing measured** beyond the two first-paint numbers above: no benchmark
+  of cycle cost, structural-sharing cost, or behaviour at high subscription
+  counts.
+- **`useSuspenseQuery`, optimistic writes, and the differential results tier**
+  are not built; the API was shaped not to preclude them.
+
+### Known blockers
+
+1. **Remote mode needs PR #1730.** Not in any release. Until it lands, the
+   SSE subscription 400s and no query ever updates. See
+   [What you need on the server](#what-you-need-on-the-server).
+2. **Peer mode stalls from a cold block cache.** `init` succeeds, the token
+   handshake completes, the connection reports `live` — then no query ever
+   answers: no error, no panic, and **no `/v1/fluree/storage/*` request ever
+   issued**, so the engine stalls before its first block fetch. Reproduces
+   through the raw worker protocol with head tracking off, i.e. entirely
+   below this package; remote mode against the same server is unaffected.
+   Engine-side, owned elsewhere. With a warm cache, peer mode works.
+
+Neither blocker is in this package's code.
+
+### Not a blocker, but know it
+
+**The remote fan-out is bounded, not reduced.** Remote mode issues one HTTP
+request per live subscription per commit; `maxConcurrency` (default 6) limits
+how many run at once, not how many run. There is no multi-query endpoint on
+the server to fix this properly today, so a page with many subscriptions on a
+busy ledger is the case to watch. Peer mode does not have this shape at all —
+its re-runs are local.
 
 ## The demo
 
@@ -346,7 +403,12 @@ other update — with no polling code in the app. Its per-component
 `rendered N×` counters make the invisible property visible: voting on one
 note re-renders exactly that row, and a second panel subscribed to a
 different query on the same ledger re-runs on every commit but does not
-re-render, because its answer did not move. See [demo/README.md](demo/README.md).
+re-render, because its answer did not move.
+
+- [demo/WALKTHROUGH.md](demo/WALKTHROUGH.md) — the presentation script: setup
+  commands, what to click in what order, what to point at on screen, and the
+  questions you will get.
+- [demo/README.md](demo/README.md) — how it is built and why.
 
 ## Development
 
