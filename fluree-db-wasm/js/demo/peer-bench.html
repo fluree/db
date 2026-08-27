@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>fluree-db-wasm peer cold-open bench</title>
+<pre id="out">running…</pre>
+<script type="module">
+  // Times ONE cold open of a remote ledger: connect → open (head resolve) →
+  // query (CAS fetches + local execution). Driven by scripts/bench-preflight.mjs,
+  // which launches a fresh Chrome per measurement so the profile — and so the
+  // IndexedDB block cache AND the browser's own HTTP cache — is genuinely cold.
+  //
+  // The headline number is `coldOpenMs` (open + query), because that phase is
+  // pure API traffic in every arm. `connectMs` is reported but excluded: it is
+  // dominated by fetching and compiling the ~9 MB wasm, which in the
+  // same-origin arm comes through the delayed tap and in the cross-origin arm
+  // does not.
+  import { connect } from "../dist/index.js";
+
+  const out = document.getElementById("out");
+  const params = new URLSearchParams(location.search);
+  const api = params.get("api");
+  const token = params.get("token");
+  const ledgerId = params.get("ledger");
+
+  const SPARQL = `PREFIX ex: <http://example.org/ns/>
+    SELECT ?name WHERE { ?p a ex:Person ; ex:name ?name } ORDER BY ?name`;
+
+  window.__bench = (async () => {
+    try {
+      const t0 = performance.now();
+      const peer = await connect(api, { getToken: () => token });
+      const connectMs = performance.now() - t0;
+
+      const tOpen = performance.now();
+      const ledger = await peer.ledger(ledgerId);
+      const openMs = performance.now() - tOpen;
+
+      const tQuery = performance.now();
+      const res = await ledger.query(SPARQL);
+      const queryMs = performance.now() - tQuery;
+
+      // A timing with no rows behind it is not a measurement of anything.
+      const names = res?.results?.bindings?.map((b) => b.name.value) ?? [];
+      peer.close();
+
+      const report = {
+        status: names.length > 0 ? "pass" : "fail",
+        names,
+        connectMs: Math.round(connectMs),
+        openMs: Math.round(openMs),
+        queryMs: Math.round(queryMs),
+        coldOpenMs: Math.round(openMs + queryMs),
+      };
+      out.textContent = JSON.stringify(report, null, 2);
+      return report;
+    } catch (err) {
+      const report = { status: "fail", error: String(err?.stack ?? err) };
+      out.textContent = JSON.stringify(report, null, 2);
+      return report;
+    }
+  })();
+</script>
