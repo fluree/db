@@ -295,6 +295,22 @@ impl PatternOptionalBuilder {
         }
     }
 
+    /// True when the pattern's object variable is also a REQUIRED variable, so
+    /// the per-row object substitution is load-bearing.
+    ///
+    /// The batched probe keys on `(subject, predicate)` and reads the object
+    /// slot off the plan-time template, never off the row — sound while the
+    /// object variable is optional-only, wrong the moment the required side
+    /// carries values for it. Left in, it answered one bare existence row per
+    /// matching triple: a required row binding the variable was duplicated
+    /// instead of filtered, and a required row leaving it unbound was passed
+    /// through instead of extended. The per-row `build` path substitutes the
+    /// row's own object (and leaves an unbound one free), so it is exactly
+    /// right here; this shape declines the probe and takes it.
+    fn object_var_shared_with_required(&self) -> bool {
+        matches!(&self.pattern.o, Term::Var(v) if !self.optional_only_vars.contains(v))
+    }
+
     fn resolve_subject_id(
         &self,
         required_batch: &Batch,
@@ -436,6 +452,52 @@ impl PatternOptionalBuilder {
     }
 }
 
+/// Append one correlation binding to a cache key, or return `false` when it
+/// has no stable encoding (the caller then declines to cache).
+///
+/// Every variable-length component is length-prefixed so two different
+/// correlation tuples can never concatenate to the same bytes.
+fn push_cache_key_component(key: &mut Vec<u8>, binding: &Binding) -> bool {
+    fn push_bytes(key: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
+        key.push(tag);
+        key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        key.extend_from_slice(bytes);
+    }
+
+    match binding {
+        Binding::EncodedSid { s_id, .. } => {
+            key.push(b'S');
+            key.extend_from_slice(&s_id.to_le_bytes());
+            true
+        }
+        Binding::Sid { sid, .. } => {
+            // Fallback stable key: namespace code + suffix bytes.
+            key.push(b's');
+            key.extend_from_slice(&sid.namespace_code.to_le_bytes());
+            push_bytes(key, b'n', sid.name_str().as_bytes());
+            true
+        }
+        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
+            push_bytes(key, b'i', iri.as_bytes());
+            true
+        }
+        // Not a defect: `substitute_pattern` leaves the slot a variable, so
+        // "unbound here" is a correlation state in its own right and must
+        // get its own key rather than collide with any bound value.
+        Binding::Unbound => {
+            key.push(b'u');
+            true
+        }
+        Binding::Poisoned => false,
+        Binding::EncodedPid { .. } | Binding::EncodedLit { .. } | Binding::Lit { .. } => false,
+        Binding::Grouped(_)
+        | Binding::Path { .. }
+        | Binding::Rel(_)
+        | Binding::List(_)
+        | Binding::Map(_) => false,
+    }
+}
+
 #[async_trait]
 impl OptionalBuilder for PatternOptionalBuilder {
     /// The batched lane probes each required row independently (a pure
@@ -449,7 +511,10 @@ impl OptionalBuilder for PatternOptionalBuilder {
     /// True only when `build_batch`'s own admission gates hold, so the
     /// operator never buffers the driving side just to fall back per-row.
     fn supports_seed_coalescing(&self, ctx: &ExecutionContext<'_>) -> bool {
-        if ctx.is_multi_ledger() || self.pattern.dtc.is_some() || self.subject_left_col().is_none()
+        if ctx.is_multi_ledger()
+            || self.pattern.dtc.is_some()
+            || self.subject_left_col().is_none()
+            || self.object_var_shared_with_required()
         {
             return false;
         }
@@ -497,7 +562,10 @@ impl OptionalBuilder for PatternOptionalBuilder {
         start_row: usize,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<Vec<OptionalBatchRow>>> {
-        if start_row >= required_batch.len() || ctx.is_multi_ledger() {
+        if start_row >= required_batch.len()
+            || ctx.is_multi_ledger()
+            || self.object_var_shared_with_required()
+        {
             return Ok(None);
         }
         let Some(store) = ctx.binary_store.as_ref() else {
@@ -608,57 +676,36 @@ impl OptionalBuilder for PatternOptionalBuilder {
         row: usize,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<Box<[u8]>>> {
-        // Key on the substituted correlation bindings only.
-        // For the common case `OPTIONAL { ?s <p> ?o }` with `?s` coming from the left,
-        // this makes repeated `?s` values (fan-out on the left) reuse right-side results.
+        // Key on the FULL substituted correlation tuple — every position
+        // `substitute_pattern` reads, not just the subject. `OPTIONAL { ?s <p> ?o }`
+        // where `?o` also arrives from the left substitutes the object too, so a
+        // subject-only key served one row's answer to a row whose `?o` differed.
+        // For the common shape (a left-bound `?s`, a free `?o`) the tuple is still
+        // just the subject and left-side fan-out reuses right-side results as before.
+        let _ = ctx;
         if self.has_poisoned_binding(required_batch, row) {
             return Ok(None);
         }
 
-        // Today we support cache keys for subjects that are either already encoded
-        // or can be resolved to an IRI string without ambiguity.
-        // (Multi-ledger mode can still work without caching.)
-        for instr in &self.bind_instructions {
-            if instr.position != PatternPosition::Subject {
-                continue;
-            }
-            let binding = required_batch.get_by_col(row, instr.left_col);
-            return match binding {
-                Binding::EncodedSid { s_id, .. } => {
-                    let mut v = Vec::with_capacity(1 + 8);
-                    v.push(b'S');
-                    v.extend_from_slice(&s_id.to_le_bytes());
-                    Ok(Some(v.into_boxed_slice()))
-                }
-                Binding::Sid { sid, .. } => {
-                    // Fallback stable key: namespace code + suffix bytes.
-                    let mut v = Vec::with_capacity(1 + 2 + sid.name_str().len());
-                    v.push(b's');
-                    v.extend_from_slice(&sid.namespace_code.to_le_bytes());
-                    v.extend_from_slice(sid.name_str().as_bytes());
-                    Ok(Some(v.into_boxed_slice()))
-                }
-                Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                    let mut v = Vec::with_capacity(1 + iri.len());
-                    v.push(b'i');
-                    v.extend_from_slice(iri.as_bytes());
-                    Ok(Some(v.into_boxed_slice()))
-                }
-                Binding::Unbound | Binding::Poisoned => Ok(None),
-                Binding::EncodedPid { .. } | Binding::EncodedLit { .. } | Binding::Lit { .. } => {
-                    Ok(None)
-                }
-                Binding::Grouped(_)
-                | Binding::Path { .. }
-                | Binding::Rel(_)
-                | Binding::List(_)
-                | Binding::Map(_) => Ok(None),
-            };
+        if self.bind_instructions.is_empty() {
+            // No correlation => don't cache.
+            return Ok(None);
         }
 
-        // No subject correlation => don't cache.
-        let _ = ctx;
-        Ok(None)
+        let mut key = Vec::with_capacity(16 * self.bind_instructions.len());
+        for instr in &self.bind_instructions {
+            key.push(match instr.position {
+                PatternPosition::Subject => b'0',
+                PatternPosition::Predicate => b'1',
+                PatternPosition::Object => b'2',
+            });
+            let binding = required_batch.get_by_col(row, instr.left_col);
+            if !push_cache_key_component(&mut key, binding) {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(key.into_boxed_slice()))
     }
 
     fn schema(&self) -> &[VarId] {
@@ -1364,11 +1411,28 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         let mut seed_rows: Vec<Vec<Binding>> = Vec::new();
         let mut seen_seed: HashSet<Vec<GroupKeyOwned>> = HashSet::new();
         for row in start_row..n {
-            let unmatchable = corr_cols.iter().any(|&c| {
+            // An UNBOUND correlation variable is compatible with every inner
+            // solution (§18.2.4), which a partition by correlation key cannot
+            // express — the key would have to match every bucket at once, and
+            // the optional-side batches carry only optional-only vars, so
+            // there is nothing for the merge to read the value back off. Hand
+            // the whole batch to the per-row path, which seeds the inner from
+            // the row and leaves the unbound variable free. Poison, by
+            // contrast, can never match anything.
+            let mut unbound_corr = false;
+            let mut poisoned_corr = false;
+            for &c in &corr_cols {
                 let b = required_batch.get_by_col(row, c);
-                b.is_poisoned() || matches!(b, Binding::Unbound)
-            });
-            if unmatchable {
+                if matches!(b, Binding::Unbound) {
+                    unbound_corr = true;
+                    break;
+                }
+                poisoned_corr |= b.is_poisoned();
+            }
+            if unbound_corr {
+                return Ok(None);
+            }
+            if poisoned_corr {
                 row_keys.push(None);
                 continue;
             }
@@ -2066,6 +2130,16 @@ pub struct OptionalOperator {
     pending_output: VecDeque<PendingOptionalMatch>,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
+    /// Required columns holding a variable the optional side can also bind,
+    /// as `(required column, variable)`.
+    ///
+    /// These are exactly the builder's unify columns. A required row that left
+    /// one of them UNBOUND is still compatible with an optional solution that
+    /// binds it, and SPARQL merge (§18.2.4) says the merged solution carries
+    /// the optional side's value — so `combine_rows` patches these columns.
+    /// Empty for the overwhelmingly common OPTIONAL that shares only
+    /// already-bound correlation vars, which keeps the merge off the hot path.
+    shared_merge_cols: Vec<(usize, VarId)>,
     /// Memoized optional-side results keyed by correlation bindings.
     ///
     /// This prevents repeated OPTIONAL evaluation when the left side has fan-out
@@ -2148,11 +2222,22 @@ impl OptionalOperator {
         combined.extend(optional_builder.optional_only_vars());
         let combined_schema: Arc<[VarId]> = Arc::from(combined.into_boxed_slice());
 
+        let shared_merge_cols: Vec<(usize, VarId)> = optional_builder
+            .unify_instructions()
+            .iter()
+            .filter_map(|instr| {
+                required_schema
+                    .get(instr.left_col)
+                    .map(|var| (instr.left_col, *var))
+            })
+            .collect();
+
         Self {
             required,
             optional_builder,
             required_schema,
             combined_schema,
+            shared_merge_cols,
             state: OperatorState::Created,
             current_required_batch: None,
             current_required_row: 0,
@@ -2245,6 +2330,13 @@ impl OptionalOperator {
     }
 
     /// Combine required row with optional row into output row
+    ///
+    /// This is SPARQL merge (§18.2.4): the required row wins on every variable
+    /// it binds, and a variable it left UNBOUND takes the optional side's value
+    /// when the optional side binds it. That second half only ever fires for a
+    /// shared variable an upstream UNION / OPTIONAL / VALUES could leave
+    /// unbound on some rows — a shared variable bound on every row costs one
+    /// `is_unbound` test per merge column.
     fn combine_rows(
         &self,
         required_batch: &Batch,
@@ -2261,6 +2353,23 @@ impl OptionalOperator {
 
         // Copy optional-only columns from optional batch
         let optional_schema = optional_batch.schema();
+
+        // Fill shared columns the required row left unbound from the optional
+        // side. `unify_check` has already accepted this pairing, and it accepts
+        // an unbound left value against any right value.
+        for &(col, var) in &self.shared_merge_cols {
+            if !matches!(result[col], Binding::Unbound) {
+                continue;
+            }
+            let Some(opt_col) = optional_schema.iter().position(|v| *v == var) else {
+                continue;
+            };
+            let candidate = optional_batch.get_by_col(optional_row, opt_col);
+            if !matches!(candidate, Binding::Unbound | Binding::Poisoned) {
+                result[col] = candidate.clone();
+            }
+        }
+
         for var in self.optional_builder.optional_only_vars() {
             if let Some(opt_col) = optional_schema.iter().position(|v| v == var) {
                 result.push(optional_batch.get_by_col(optional_row, opt_col).clone());

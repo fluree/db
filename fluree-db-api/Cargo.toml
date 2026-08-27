@@ -312,6 +312,11 @@ path = "tests/it_cypher_import.rs"
 name = "it_query_explain"
 path = "tests/it_query_explain.rs"
 
+# Own binary: needs the background indexer to reach the indexed OPTIONAL lane.
+[[test]]
+name = "it_optional_after_union"
+path = "tests/it_optional_after_union.rs"
+
 [[test]]
 name = "it_query_sparql_indexed"
 path = "tests/it_query_sparql_indexed.rs"
