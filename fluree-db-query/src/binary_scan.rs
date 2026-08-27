@@ -2541,15 +2541,14 @@ impl Operator for BinaryScanOperator {
             // Keep them as materialized flakes and stream them after the cursor completes.
             // (Already sorted + retraction-resolved in the cached entry.)
             if !translated.untranslated.is_empty() {
-                // Apply equality match (subject/predicate/object) against pattern constants.
-                let s_sid = match &self.pattern.s {
-                    Ref::Sid(s) => Some(s.clone()),
-                    _ => None,
-                };
-                let p_sid = match &self.pattern.p {
-                    Ref::Sid(p) => Some(p.clone()),
-                    _ => None,
-                };
+                // Apply equality match (subject/predicate/object) against pattern
+                // constants. Use the SNAPSHOT-NORMALIZED `s_sid`/`p_sid` rather
+                // than re-deriving raw ones from `self.pattern`: novelty flakes
+                // carry compressed Sids, so an uncompressed pattern term
+                // (`Sid(EMPTY, "http://…")`) or a `Ref::Iri` would otherwise
+                // compare unequal against every flake and silently drop the
+                // whole untranslated lane. `extract_bound_terms_snapshot`
+                // already did that normalization for exactly this reason.
                 // Raw (untranslatable) novelty flakes carry their tag in
                 // `FlakeMeta`; a tagged bound object must match it.
                 let bound_lang = self.pattern.dtc.as_ref().and_then(|d| d.lang_tag());
