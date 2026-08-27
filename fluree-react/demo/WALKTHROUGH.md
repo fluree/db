@@ -108,14 +108,13 @@ round trip.
 
 It works, and it is a genuinely different thing to show. But:
 
-- it is reliable only with a **warm** block cache. From cold it currently
-  stalls (engine-side bug, being fixed). **Load the page once before you
-  present**, confirm data appears, and do not clear site data;
 - it is **slower to first paint** than remote mode — a ~9 MB wasm download
-  plus several sequential discovery rounds, against remote's one HTTP query.
-  The Board's `first data N ms` badge shows this in both modes, so don't
-  claim otherwise; the win is update latency, not startup;
-- setup is heavier (below).
+  and compile, against remote's one HTTP query. The Board's
+  `first data N ms` badge shows this in both modes, so don't claim
+  otherwise; the win is update latency, not startup. A cold open is ~3.4 s
+  today, and that cost is a known open engine issue — say so if asked rather
+  than explaining it away;
+- setup is heavier (below), so do it before the room is watching.
 
 ```sh
 # generated wasm glue
@@ -154,8 +153,9 @@ current cost and the reason a multi-query endpoint is on the list. Peer mode
 re-runs locally and doesn't have this shape.
 
 **"Does it work today?"** Remote mode, against a server built from #1730 —
-yes. Against a released server — no, and that PR is why. Peer mode — warm
-only, for now.
+yes. Against a released server — no, and that PR is why. Peer mode — yes,
+including with the block cache unavailable entirely; its open question is
+cold-open *cost* (~3.4 s), not correctness.
 
 **"How does it know nothing changed?"** In peer mode the worker hashes the
 formatted result and ships **zero bytes** when it matches. In remote mode the

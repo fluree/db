@@ -38,19 +38,16 @@ CORS never enters the story; point it elsewhere with `FLUREE_URL`.
 
 ## Peer mode
 
-> **Works, but not yet reliably (2026-08-27).** Two tabs against a real
-> server did the whole thing: two wasm engines, a vote in one tab landing in
-> the other, only the changed row re-rendering, `t` advancing. On later runs
-> — after clearing the IndexedDB block cache — queries stall indefinitely
-> with no error and no block fetch ever issued. That reproduces through the
-> raw worker protocol, below this package, and remote mode is unaffected.
-> Engine-side.
+> **Works (2026-08-27).** Two tabs against a real server did the whole
+> thing: two wasm engines, a vote in one tab landing in the other, only the
+> changed row re-rendering, `t` advancing — including with the block cache
+> entirely unavailable.
 >
-> Note also that peer mode is **slower to first paint** than remote mode
-> (a ~9 MB wasm fetch plus several sequential discovery rounds against
-> remote mode's single query). It wins on what happens after: updates
-> re-query locally with no round trip. The `first data N ms` badge on the
-> Board shows this honestly in both modes.
+> Peer mode is **slower to first paint** than remote mode: a ~9 MB wasm
+> fetch and compile, against remote's single HTTP query. It wins on what
+> happens after — updates re-query locally with no round trip. The
+> `first data N ms` badge on the Board shows this honestly in both modes,
+> so don't claim otherwise while demoing.
 
 ```
 http://localhost:5173/?mode=peer&token=<bearer>
@@ -80,6 +77,37 @@ Two behaviours differ by mode, and both fail loudly rather than silently:
 peer mode cannot serve a time-anchored (`opts.at`) query — the in-browser
 engine has no historical view — and cannot serve a format other than the
 query language's own.
+
+### If peer mode connects and then answers nothing
+
+Historic, fixed in `746c39578`, and documented because a regression would be
+invisible to every cold-profile test we have.
+
+The symptom was: `init` fine, token handshake fine, connection `live`, and
+then no query ever answering — no error, no timeout, and no
+`/v1/fluree/storage/*` request ever issued. The cause was a **wedged**
+`fluree-cas-v1` database, where `indexedDB.open()` returns *no event at all*
+— not `success`, not `error`, not even `blocked` — while a brand-new
+database in the same tab opens instantly. The driver used to await that open
+before servicing any job.
+
+That state is durable per browser profile, which is why a fresh profile never
+reproduces it: an *absent* database opens fine, a *wedged* one never returns.
+
+To create the wedge deliberately (the only reliable path): open a peer tab,
+then from a **second** tab call
+`indexedDB.deleteDatabase("fluree-cas-v1")` while the first tab's engine
+still holds it open. Clearing site data for the origin releases it. If you
+ever see this symptom again, probe first — one line tells you whether the
+cache is the culprit:
+
+```js
+await new Promise((res) => {
+  const q = indexedDB.open("fluree-cas-v1");
+  q.onsuccess = () => res("ok"); q.onerror = () => res("error");
+  q.onblocked = () => res("blocked"); setTimeout(() => res("HUNG"), 5000);
+});
+```
 
 ## The trap this demo fell into first
 

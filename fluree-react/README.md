@@ -79,17 +79,24 @@ result shapes are identical in both.
 
 Worth stating plainly, because the opposite is the natural assumption. Peer
 mode pays a cold-start cost remote mode does not have: fetching and compiling
-a ~9 MB wasm engine, then discovering and fetching index blocks. A measured
-cold open on a 200-row ledger is ~3.4 s, and the dominant term is not I/O —
-about 2.7 s of it is idle across eight sequential discovery rounds (~25 ms of
-object fetches, ~15 ms of preflights). For comparison, remote mode reached
-first rendered data in **141 ms** in the demo on loopback.
+a ~9 MB wasm engine before it can answer anything. A measured cold open is
+**~3.4 s**, against remote mode's **141 ms** to first rendered data on
+loopback.
+
+Two things are known about that 3.4 s, and both are worth knowing before you
+plan around it. It is **fixed overhead, near-invariant to data size** — 2
+rows cost ~3.3 s and 200 rows ~3.5 s — and the worker is **on-CPU for ~90%**
+of it, with only tens of milliseconds of network. So it is not the cache
+(peer mode serves in 252 ms with IndexedDB entirely unavailable — see
+[What's proven / what isn't](#whats-proven--what-isnt)), and it is not
+round-trip latency. It is an open engine-side issue, localized but **not**
+root-caused; do not read a fix date into it.
 
 What peer mode buys is everything after that first paint: subsequent queries
 and every update re-run locally against a frozen snapshot, with no round trip
-and no server work. Reducing the round count is the known path to fixing cold
-open; until then, choose peer mode for update latency and offline-ish
-resilience, not for time-to-first-paint.
+and no server work — a warm re-query is 49–182 ms. Choose peer mode for
+update latency and offline-capable local re-query, not for
+time-to-first-paint.
 
 ### What differs between the modes
 
@@ -284,10 +291,11 @@ are different claims.
 **In one paragraph:** both modes have run in a real browser against a real
 `fluree-server` and done the thing this package exists to do — a commit in
 one tab re-rendering exactly the affected row in another, with no polling
-code in the app. Remote mode is reliable there; peer mode is reliable only
-with a warm block cache, and stalls from cold for reasons that live in the
-engine, below this package. Everything in the automated suite is mocked:
-178 tests, no network, no wasm. Two known blockers are listed at the end.
+code in the app. Both are reliable there, including peer mode with **no
+usable block cache at all**. Peer mode is still slower to first paint than
+remote mode, and a separate engine-side cold-open cost is still open.
+Everything in the automated suite is mocked: 178 tests, no network, no wasm.
+One known blocker remains, listed at the end.
 
 ### Proven in a real browser, against a real server
 
@@ -297,13 +305,24 @@ engine, below this package. Everything in the automated suite is mocked:
 | Only the changed row re-rendered (`1×`→`2×`, siblings still `1×`) | yes | yes |
 | A second query on the same ledger re-ran and did **not** re-render | yes | yes |
 | Watermark advanced | `t` 5→8 | `t` 1→2 |
-| Reliable from a cold start | yes | **no** — stalls |
+| Reliable with no usable block cache | n/a | yes — 252 ms |
 
-Remote mode reached first rendered data in **141 ms** on loopback. Peer mode
-is slower to first paint by design (see
-[Peer mode is not a speed-up on first paint](#peer-mode-is-not-a-speed-up-on-first-paint));
-no honest peer cold-open number was obtainable here, because the only clean
-cold runs available were the ones that stall.
+**First-paint numbers**, navigation start to first rendered row, on loopback:
+
+| | first data |
+| --- | --- |
+| remote mode | **141 ms** |
+| peer mode, one engine, **no usable cache** | **252 ms** |
+| peer mode, two engines in two tabs, no usable cache | **252 ms** and **262 ms** |
+
+The peer numbers were measured with the block cache **provably out of the
+picture** — `indexedDB.open()` on it was re-probed *during* the passing run
+and still never returned — so they isolate what the peer costs when
+IndexedDB contributes nothing, which makes them a clean lower bound rather
+than a best case. Their most useful implication is a negative one: the
+separate ~3.3 s cold-open cost is **not** the cache waiting on anything.
+That cost is fixed overhead, ~90% on-CPU, and an open engine-side issue —
+see [Peer mode is not a speed-up on first paint](#peer-mode-is-not-a-speed-up-on-first-paint).
 
 Also executed for real: the demo builds through a real bundler in CI (`vite
 build`), which is the only thing exercising this as a *package* rather than
@@ -377,15 +396,40 @@ today** — that gap is why defects 1-4 survived a green suite.
 1. **Remote mode needs PR #1730.** Not in any release. Until it lands, the
    SSE subscription 400s and no query ever updates. See
    [What you need on the server](#what-you-need-on-the-server).
-2. **Peer mode stalls from a cold block cache.** `init` succeeds, the token
-   handshake completes, the connection reports `live` — then no query ever
-   answers: no error, no panic, and **no `/v1/fluree/storage/*` request ever
-   issued**, so the engine stalls before its first block fetch. Reproduces
-   through the raw worker protocol with head tracking off, i.e. entirely
-   below this package; remote mode against the same server is unaffected.
-   Engine-side, owned elsewhere. With a warm cache, peer mode works.
 
-Neither blocker is in this package's code.
+Not in this package's code.
+
+### Resolved: the peer-mode silent stall
+
+Kept here because the diagnosis is worth more than the bug, and because a
+regression would be invisible to every cold-profile test we have.
+
+**Symptom.** `init` succeeded, the token handshake completed, the connection
+reported `live` — and then no query ever answered. No error, no panic, no
+timeout, and **no `/v1/fluree/storage/*` request ever issued**. It reproduced
+through the raw worker protocol with head tracking off, i.e. entirely below
+this package.
+
+**Actual trigger — not "cold".** The database `fluree-cas-v1` was *wedged*:
+`indexedDB.open()` on it never returned and fired **no event at all** — not
+`success`, not `error`, not even `blocked` — while opening a brand-new
+database in the same tab succeeded instantly. That state is durable per
+browser profile, which is exactly why a fresh profile never reproduced it: an
+*absent* database opens fine, a *wedged* one never returns. The driver
+awaited the cache open before entering its job loop, so a hang there
+deadlocked everything downstream — no job dispatched, no request issued, and
+therefore no per-request timeout able to fire.
+
+**Fixed** in `746c39578`: the cache now opens concurrently and attaches when
+it lands, so an unavailable or wedged IndexedDB degrades to cache-less
+operation instead of a hang. Verified as a before/after on the *same* wedged
+profile, with `indexedDB.open("fluree-cas-v1")` re-probed during the passing
+run and confirmed still hanging: peer mode served in **252 ms**.
+
+**To reproduce the wedge deliberately** (the only reliable path — a cold
+profile cannot produce it): open a peer tab, then from a second tab call
+`indexedDB.deleteDatabase("fluree-cas-v1")` while the first tab's engine
+still holds the database open. Clearing site data for the origin releases it.
 
 ### Not a blocker, but know it
 
