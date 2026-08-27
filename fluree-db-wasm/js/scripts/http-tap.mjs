@@ -59,11 +59,16 @@ export function startTap(upstreamUrl) {
         url: `http://127.0.0.1:${port}`,
         apiBase: `http://127.0.0.1:${port}/v1/fluree`,
         requests,
-        /** Requests whose path starts with `prefix`, optionally filtered by status. */
-        matching: (prefix, status) =>
-          requests.filter(
-            (r) => r.path.startsWith(prefix) && (status === undefined || r.status === status),
-          ),
+        /**
+         * Requests whose path starts with `prefix`, filtered by method.
+         *
+         * The method is required, not optional: a cross-origin `GET` is
+         * preceded by an `OPTIONS` preflight on the same path, so a
+         * path-only filter double-counts every request and would report
+         * twice the CAS fetches that actually happened.
+         */
+        matching: (method, prefix) =>
+          requests.filter((r) => r.method === method && r.path.startsWith(prefix)),
         close: () => server.close(),
       });
     });

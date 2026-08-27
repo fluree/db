@@ -128,6 +128,18 @@ try {
   check("nameservice record status", nsRes.status, 200);
   check("advertised serving tiers", nsRecord.serving, ["query", "blocks"]);
 
+  // The token has to be load-bearing, or a regression that stopped enforcing
+  // it would still show green here. Tokenless is 401; a token scoped to some
+  // other ledger is 404, not 403 — the proxy's no-existence-leak posture.
+  const nsUrl = `${server.apiBase}/storage/ns/${encodeURIComponent(LEDGER)}`;
+  check("tokenless nameservice read", (await fetch(nsUrl)).status, 401);
+  const otherScope = mintStorageProxyToken(identity, { ledgers: ["someone-else:main"] });
+  check(
+    "out-of-scope token sees no such ledger",
+    (await fetch(nsUrl, { headers: { authorization: `Bearer ${otherScope}` } })).status,
+    404,
+  );
+
   // ── 3. The tap + the page's origin ──────────────────────────────────────
   tap = await startTap(server.url);
   cleanups.push(tap.close);
@@ -201,13 +213,22 @@ try {
   console.log(`  ok  engine absorbed the advance (ledger re-opens at t=${r.reopenedT})`);
 
   // Traffic evidence: the peer really pulled CAS objects and held SSE open.
-  const objects = tap.matching("/v1/fluree/storage/objects/");
+  // GETs only — each cross-origin GET is preceded by an OPTIONS preflight on
+  // the same path, and counting those as fetches would double every number.
+  const objects = tap.matching("GET", "/v1/fluree/storage/objects/");
   const okObjects = objects.filter((x) => x.status === 200 || x.status === 206);
-  const nsLookups = tap.matching("/v1/fluree/storage/ns/");
-  const sse = tap.matching("/v1/fluree/events");
-  const queries = tap.matching("/v1/fluree/query");
+  const nsLookups = tap.matching("GET", "/v1/fluree/storage/ns/");
+  const sse = tap.matching("GET", "/v1/fluree/events");
+  const queries = tap.matching("POST", "/v1/fluree/query").concat(tap.matching("GET", "/v1/fluree/query"));
+  const preflights = tap.requests.filter((r) => r.method === "OPTIONS");
   if (okObjects.length === 0) {
     throw new Error("no successful GET /storage/objects/{cid} was recorded — the peer never read CAS bytes");
+  }
+  if (okObjects.length !== objects.length) {
+    throw new Error(
+      `${objects.length - okObjects.length} of ${objects.length} CAS object fetches failed: ` +
+        objects.filter((x) => !(x.status === 200 || x.status === 206)).map((x) => x.status).join(","),
+    );
   }
   if (nsLookups.length === 0) throw new Error("no /storage/ns/ head resolution was recorded");
   if (sse.length === 0) throw new Error("no /events SSE stream was recorded");
@@ -215,8 +236,9 @@ try {
     throw new Error(`the peer query-shipped: ${queries.length} request(s) to /query — local compute not proven`);
   }
   console.log(
-    `  ok  proxy traffic: ${okObjects.length}/${objects.length} CAS object fetches OK, ` +
-      `${nsLookups.length} head resolution(s), ${sse.length} SSE stream(s), 0 /query calls`,
+    `  ok  proxy traffic: ${okObjects.length} CAS object GETs, all 200/206; ` +
+      `${nsLookups.length} head resolution(s); ${sse.length} SSE stream(s); ` +
+      `0 /query calls; ${preflights.length} CORS preflight(s) answered`,
   );
 
   console.log(
