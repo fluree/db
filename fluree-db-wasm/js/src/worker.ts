@@ -108,6 +108,23 @@ function emit(event: EventBody): void {
   self.postMessage({ v: 1, event });
 }
 
+/** Bridge the engine's live-query cycle outcomes (A4): ONE message per
+ * advance-cycle; changed payloads posted as TRANSFERRED buffers aligned
+ * with `event.changed` (zero-copy handoff, per the transport tiering). */
+function wireCycleOutcomes(eng: Playground | Peer): void {
+  eng.onCycleOutcome((metaJson: string, payloads: Uint8Array[]) => {
+    const meta = JSON.parse(metaJson) as Omit<
+      Extract<EventBody, { kind: "cycleOutcome" }>,
+      "kind"
+    >;
+    const buffers = payloads.map((p) => p.buffer);
+    self.postMessage(
+      { v: 1, event: { kind: "cycleOutcome", ...meta }, payloads: buffers },
+      buffers,
+    );
+  });
+}
+
 /** Ask the main thread for a bearer token; resolves on its `tokenResponse`.
  * No timeout: the proxy always answers, even when no `getToken` was
  * configured (with an error, which fails the connect typed). */
@@ -227,6 +244,7 @@ async function handle(req: Request): Promise<void> {
               } else {
                 engine = new Playground(req.maxMemoryBytes);
               }
+              wireCycleOutcomes(engine);
               mode = req.mode;
               initError = null;
               return null;
@@ -295,6 +313,16 @@ async function handle(req: Request): Promise<void> {
             await requirePlayground("sparqlUpdate").sparqlUpdate(req.ledger, req.body),
           ),
         });
+        return;
+      case "subscribe":
+        reply({
+          id,
+          ok: true,
+          result: { subId: requireEngine().subscribe(req.ledger, req.kind, req.text) },
+        });
+        return;
+      case "unsubscribe":
+        reply({ id, ok: true, result: requireEngine().unsubscribe(req.subId) });
         return;
       case "debugCrash":
         // Test hook (see Playground._debugCrash): deliberately trap the

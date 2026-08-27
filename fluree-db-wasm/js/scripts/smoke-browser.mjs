@@ -197,6 +197,10 @@ try {
   // token supplied over the EVENT channel (getToken called exactly once,
   // reason "connect" — init itself carries no credential), and an
   // unreachable remote failed typed and non-fatal.
+  // Phase 1b (A4): the live subscription primed with the initial 2 rows and
+  // delivered exactly one further update (3 rows) after the commit.
+  const phaseLive =
+    Array.isArray(r?.live?.rows) && r.live.rows.join(",") === "2,3";
   const phase3 =
     r?.peer?.version === r?.version &&
     Array.isArray(r?.peer?.tokenReasons) &&
@@ -205,16 +209,19 @@ try {
     r.peer.ledgerCode.length > 0 &&
     r.peer.ledgerCode !== "engine_crashed" &&
     r.peer.ledgerFatal !== true;
-  if (phase1 && phase2 && phase3) {
+  if (phase1 && phaseLive && phase2 && phase3) {
     console.log(`PASS: create → insert → query returned ${r.rows} rows via ${r.transport} transport ` +
       `(engine ${r.version}; init ${r.timings.init} ms, insert ${r.timings.insert} ms, query ${r.timings.query} ms); ` +
       `crash/recycle: typed ${r.crashCode}, stale snapshot → ${r.staleCode}, ` +
       `engine back after ${r.recycleAttempts} attempt(s); ` +
+      `live: primed→updated rows ${r.live.rows.join("→")}; ` +
       `peer boundary: token via event channel (${r.peer.tokenReasons.join(",")}), ` +
       `unreachable remote → typed ${r.peer.ledgerCode}`);
     exit = 0;
   } else if (!phase1) {
     console.error("FAIL: page did not report the expected rows");
+  } else if (!phaseLive) {
+    console.error("FAIL: live subscription did not deliver primed→updated results");
   } else if (!phase2) {
     console.error("FAIL: crash/recycle phase did not report the expected typed outcomes");
   } else {

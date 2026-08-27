@@ -116,6 +116,23 @@ export interface QueryRequest {
   transport: ResultTransport;
 }
 
+/** Register a live subscription (A4). The engine auto-primes it: the first
+ * result arrives as a `cycleOutcome` event at the current head. */
+export interface SubscribeRequest {
+  id: number;
+  op: "subscribe";
+  ledger: string;
+  kind: QueryKind;
+  /** SPARQL text, or the JSON text of a JSON-LD query object. */
+  text: string;
+}
+
+export interface UnsubscribeRequest {
+  id: number;
+  op: "unsubscribe";
+  subId: number;
+}
+
 /** Test-only: deliberately trap the wasm instance to exercise the
  * crash/recycle path (`Playground._debugCrash`). */
 export interface DebugCrashRequest {
@@ -131,6 +148,8 @@ export type Request =
   | ReleaseRequest
   | TransactRequest
   | QueryRequest
+  | SubscribeRequest
+  | UnsubscribeRequest
   | DebugCrashRequest;
 
 // ---------------------------------------------------------------------------
@@ -156,7 +175,25 @@ export interface TokenRequestEvent {
   reason: "connect" | "reconnect";
 }
 
-export type EventBody = HeadChangeEvent | TokenRequestEvent;
+/** One live-query advance-cycle completed (A4; H §2's batch shape). The
+ * changed subscriptions' payloads ride the enclosing `EventMessage`'s
+ * `payloads`, aligned with `changed`'s order, as transferred buffers —
+ * UTF-8 JSON bytes in each subscription's language-matched format.
+ * Unchanged subscriptions ship no payload (the driver's hash gate); per-sub
+ * errors repeat each cycle and never block other subscriptions. `t` is the
+ * cycle's frozen watermark; `-1` = no consistent view (all subs errored).
+ * A newly subscribed query's first outcome (the auto-prime) always reports
+ * it changed. */
+export interface CycleOutcomeEvent {
+  kind: "cycleOutcome";
+  ledger: string;
+  t: number;
+  changed: { subId: number }[];
+  unchanged: number[];
+  errored: { subId: number; error: string }[];
+}
+
+export type EventBody = HeadChangeEvent | TokenRequestEvent | CycleOutcomeEvent;
 
 /** Envelope for events. `v` is the event-protocol version: a consumer must
  * ignore event kinds — and versions — it does not know, so new kinds can
@@ -164,6 +201,9 @@ export type EventBody = HeadChangeEvent | TokenRequestEvent;
 export interface EventMessage {
   v: 1;
   event: EventBody;
+  /** `cycleOutcome` only: transferred payload buffers, aligned with
+   * `event.changed`. */
+  payloads?: ArrayBuffer[];
 }
 
 export interface ErrorShape {
