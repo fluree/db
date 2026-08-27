@@ -140,7 +140,7 @@ impl ForwardPackReader {
     ) -> io::Result<Self> {
         // Pre-create cache directory once.
         if !refs.is_empty() {
-            std::fs::create_dir_all(cache_dir).map_err(|e| {
+            fluree_db_core::disk_cache::ensure_cache_dir(cache_dir).map_err(|e| {
                 io::Error::other(format!("create cache dir {}: {}", cache_dir.display(), e))
             })?;
         }

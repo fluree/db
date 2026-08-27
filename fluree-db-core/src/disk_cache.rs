@@ -157,6 +157,27 @@ fn read_result_as_cache_outcome(res: io::Result<Vec<u8>>) -> io::Result<Option<V
     }
 }
 
+/// Create the disk-cache directory, treating "this platform has no
+/// filesystem" as success.
+///
+/// Loaders call this once before reading through the cache. On
+/// wasm32-unknown-unknown `create_dir_all` returns `Unsupported`, and failing
+/// there would abort the whole load before a single CAS fetch was attempted —
+/// even though every subsequent cache read already degrades to a miss
+/// ([`try_read_cached_bytes`]) and every cache write is already suppressed
+/// (`available_space` reports 0). Real filesystem failures — permissions, a
+/// full disk, a path that is a file — still surface.
+pub fn ensure_cache_dir(dir: &Path) -> io::Result<()> {
+    create_dir_result_as_cache_outcome(fs::create_dir_all(dir))
+}
+
+fn create_dir_result_as_cache_outcome(res: io::Result<()>) -> io::Result<()> {
+    match res {
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(()),
+        other => other,
+    }
+}
+
 fn scan_cache_entries(root: &Path) -> io::Result<Vec<CacheEntry>> {
     let mut stack = vec![root.to_path_buf()];
     let mut entries = Vec::new();
@@ -672,6 +693,27 @@ mod tests {
 
         // Real I/O failures (EIO, permissions) still surface as errors.
         let denied = read_result_as_cache_outcome(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "eacces",
+        )));
+        assert!(denied.is_err());
+    }
+
+    /// The same rule for the loaders' one-time `create_dir_all`: on a
+    /// filesystem-less platform there is simply no cache directory to make,
+    /// and aborting there kills the load before any CAS fetch is attempted.
+    #[test]
+    fn unsupported_create_dir_is_not_an_error() {
+        let unsupported = create_dir_result_as_cache_outcome(Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "operation not supported on this platform",
+        )));
+        assert!(unsupported.is_ok());
+
+        assert!(create_dir_result_as_cache_outcome(Ok(())).is_ok());
+
+        // A real filesystem failure still aborts the load.
+        let denied = create_dir_result_as_cache_outcome(Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "eacces",
         )));

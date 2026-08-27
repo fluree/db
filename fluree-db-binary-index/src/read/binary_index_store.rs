@@ -351,7 +351,7 @@ impl BinaryIndexStore {
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> io::Result<Self> {
         tracing::debug!("BinaryIndexStore::load_from_root_v6 starting");
-        std::fs::create_dir_all(cache_dir)?;
+        fluree_db_core::disk_cache::ensure_cache_dir(cache_dir)?;
 
         // ── Dict loading ──────────────────────────────────────────────────────────────
         let dicts =
