@@ -192,7 +192,9 @@ impl ResidencyTier {
 
     /// The raw release signal, for callers that must register interest
     /// BEFORE re-checking state (`Notified::enable`) so a release landing
-    /// in between cannot be missed.
+    /// in between cannot be missed. Only the native deferred-insert wait
+    /// uses it — the wasm arm waits through a driver Sleep job instead.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn release_notify(&self) -> &Notify {
         &self.released
     }
