@@ -508,6 +508,7 @@ impl Fluree {
                         // (or denied) when the commit was first staged.
                         requested_validation_mode: None,
                         request_identity: None,
+                        origin_validated_replay: true,
                     },
                     // Commit replay resolves config internally.
                     None,

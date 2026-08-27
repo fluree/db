@@ -438,6 +438,15 @@ Like every other constraint, `sh:sparql` runs at transaction staging time
 against the staged view — the query sees the transaction's writes exactly as
 they would commit.
 
+`sh:sparql` constraints also work when the shapes live in another ledger
+(cross-ledger `f:shapesSource`) — the query text and its prefix declarations
+travel with the shapes. One namespace caveat, which applies same-ledger too:
+the query lowers against the data ledger's committed namespace registry, so a
+constraint over a predicate whose namespace has never been committed to the
+data ledger cannot match until some transaction introducing that namespace
+commits. In practice the shapes target classes the data already uses, so this
+only surfaces on a brand-new ledger's very first write.
+
 ## RDFS entailment in enforcement
 
 SHACL enforcement applies RDFS subclass and subproperty inference

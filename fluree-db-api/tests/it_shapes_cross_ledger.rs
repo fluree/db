@@ -390,3 +390,345 @@ async fn cross_ledger_schema_feeds_shacl_subclass_targeting() {
         .await
         .expect("conforming Manager must pass");
 }
+
+/// Shared seed: model ledger M with a `minCount 1` Person shape, data ledger D
+/// whose `#config` points `f:shapesSource` at M. Returns D's post-config
+/// `LedgerState`.
+async fn seed_cross_ledger_person_shape(
+    fluree: &fluree_db_api::Fluree,
+    model_id: &str,
+    data_id: &str,
+    extra_shacl_config: &str,
+) -> fluree_db_api::LedgerState {
+    let model = genesis_ledger(fluree, model_id);
+    let shapes_graph_iri = "http://example.org/governance/shapes";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r"
+            @prefix sh:   <http://www.w3.org/ns/shacl#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{shapes_graph_iri}> {{
+                ex:PersonShape
+                    rdf:type        sh:NodeShape ;
+                    sh:targetClass  ex:Person ;
+                    sh:property     ex:pshape_name .
+                ex:pshape_name
+                    sh:path     ex:name ;
+                    sh:minCount 1 ;
+                    sh:datatype xsd:string .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M shapes");
+
+    let data = genesis_ledger(fluree, data_id);
+    let config_iri = config_graph_iri(data_id);
+    let r = fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:shaclDefaults <urn:cfg:shacl> .
+                <urn:cfg:shacl> f:shaclEnabled true .
+                {extra_shacl_config}
+                <urn:cfg:shacl> f:shapesSource <urn:cfg:shapes-ref> .
+                <urn:cfg:shapes-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:shapes-src> .
+                <urn:cfg:shapes-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{shapes_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger SHACL config");
+    r.ledger
+}
+
+fn assert_shacl_violation(err: fluree_db_api::ApiError, context: &str) {
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "{context}: expected ShaclViolation, got: {err:?}"
+    );
+}
+
+/// The direct-flake Turtle insert path resolves and enforces a cross-ledger
+/// `f:shapesSource` just like the JSON-LD staging path.
+#[tokio::test]
+async fn turtle_insert_rejected_by_cross_ledger_shape() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let data = seed_cross_ledger_person_shape(
+        &fluree,
+        "test/cross-ledger-shapes/ttl-model:main",
+        "test/cross-ledger-shapes/ttl-data:main",
+        "",
+    )
+    .await;
+
+    let err = fluree
+        .insert_turtle(
+            data,
+            r"
+            @prefix ex: <http://example.org/ns/> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            ex:alice rdf:type ex:Person .
+        ",
+        )
+        .await
+        .expect_err("violating Turtle insert under cross-ledger shape must be rejected");
+    assert_shacl_violation(err, "turtle insert");
+
+    // A conforming Turtle insert passes on the same path.
+    let data_id = "test/cross-ledger-shapes/ttl-data:main";
+    fluree
+        .graph(data_id)
+        .transact()
+        .insert_turtle(
+            r#"
+            @prefix ex: <http://example.org/ns/> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            ex:bob rdf:type ex:Person ;
+                   ex:name "Bob" .
+        "#,
+        )
+        .commit()
+        .await
+        .expect("conforming Turtle insert must pass");
+}
+
+/// `Fluree::validate_ledger` resolves a cross-ledger `f:shapesSource` and
+/// reports violations of M's shapes against D's committed state.
+#[tokio::test]
+async fn validate_ledger_reports_cross_ledger_shape_violations() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let data_id = "test/cross-ledger-shapes/validate-data:main";
+    let data = seed_cross_ledger_person_shape(
+        &fluree,
+        "test/cross-ledger-shapes/validate-model:main",
+        data_id,
+        "<urn:cfg:shacl> f:validationMode f:ValidationWarn .",
+    )
+    .await;
+
+    // Warn mode: the violating Person commits (with a logged warning) so
+    // there is non-conforming state for the report to find.
+    fluree
+        .insert(
+            data,
+            &serde_json::json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person"
+            }),
+        )
+        .await
+        .expect("warn mode must admit the violating write");
+
+    let report = fluree
+        .validate_ledger(
+            data_id,
+            &fluree_db_api::validate::ValidateOptions::default(),
+        )
+        .await
+        .expect("validate_ledger must resolve the cross-ledger shapes source");
+    assert!(
+        !report.conforms,
+        "report must flag the missing ex:name (results: {:?})",
+        report.results
+    );
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|r| r.constraint_component.contains("MinCount")),
+        "expected a MinCount violation, got: {:?}",
+        report.results
+    );
+}
+
+/// sh:sparql constraints survive the cross-ledger wire: the SPARQL text,
+/// parsed at compile time on D, enforces against staged writes.
+#[tokio::test]
+async fn sh_sparql_constraint_enforced_across_ledgers() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-shapes/sparql-model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let shapes_graph_iri = "http://example.org/governance/shapes";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix sh:   <http://www.w3.org/ns/shacl#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{shapes_graph_iri}> {{
+                ex:PersonShape
+                    rdf:type        sh:NodeShape ;
+                    sh:targetClass  ex:Person ;
+                    sh:sparql       ex:shortNameConstraint .
+                ex:shortNameConstraint
+                    sh:message "name shorter than 3 characters" ;
+                    sh:select "SELECT $this ?value WHERE {{ $this <http://example.org/ns/name> ?value . FILTER(STRLEN(?value) < 3) }}" .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed M sh:sparql shape");
+
+    let data_id = "test/cross-ledger-shapes/sparql-data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let config_iri = config_graph_iri(data_id);
+    let r = fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:shaclDefaults <urn:cfg:shacl> .
+                <urn:cfg:shacl> f:shaclEnabled true .
+                <urn:cfg:shacl> f:shapesSource <urn:cfg:shapes-ref> .
+                <urn:cfg:shapes-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:shapes-src> .
+                <urn:cfg:shapes-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{shapes_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config");
+    let data = r.ledger;
+
+    // Conforming write first: sh:sparql lowering resolves the query's IRIs
+    // against the data ledger's namespace registry, so `ex:` must be
+    // committed before a constraint over `ex:name` can match (a known
+    // sh:sparql limitation, same-ledger and cross-ledger alike).
+    fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person",
+                "ex:name": "Alice"
+            }),
+        )
+        .await
+        .expect("3+-char name must conform");
+
+    let err = fluree
+        .graph(data_id)
+        .transact()
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@id": "ex:al",
+            "@type": "ex:Person",
+            "ex:name": "Al"
+        }))
+        .commit()
+        .await
+        .map(|_| ())
+        .expect_err("2-char name must violate the sh:sparql constraint");
+    assert!(
+        format!("{err:?}").contains("ShaclViolation"),
+        "sh:sparql over the wire: expected ShaclViolation, got: {err:?}"
+    );
+}
+
+/// Compiled-shape reuse stays sound across model-ledger updates: repeated
+/// transactions reuse the compiled shapes while M's head is unchanged, and a
+/// shape change on M (here: `sh:deactivated true`, which must also survive
+/// the wire) takes effect on the very next transaction.
+#[tokio::test]
+async fn model_head_advance_recompiles_shapes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger-shapes/cache-model:main";
+    let data_id = "test/cross-ledger-shapes/cache-data:main";
+    let data = seed_cross_ledger_person_shape(&fluree, model_id, data_id, "").await;
+
+    // Conforming write first: registers D's `ex:` namespace so later
+    // transactions have an empty namespace delta (the compile-cache
+    // eligibility condition for cross-ledger sources).
+    fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person",
+                "ex:name": "Alice"
+            }),
+        )
+        .await
+        .expect("conforming Person must pass");
+
+    // Two violating writes in a row: the first compiles + caches, the second
+    // runs on the cached compile. Both must reject identically.
+    for attempt in ["compile-and-store", "cache-hit"] {
+        let err = fluree
+            .graph(data_id)
+            .transact()
+            .insert(&json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:bob",
+                "@type": "ex:Person"
+            }))
+            .commit()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{attempt}: violating Person must be rejected"));
+        assert!(
+            err.to_string().contains("SHACL") || format!("{err:?}").contains("ShaclViolation"),
+            "{attempt}: expected ShaclViolation, got: {err:?}"
+        );
+    }
+
+    // Deactivate the shape on M — the head advance must invalidate the
+    // cached compile, and sh:deactivated must survive the wire.
+    fluree
+        .graph(model_id)
+        .transact()
+        .upsert_turtle(
+            r"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix ex: <http://example.org/ns/> .
+            GRAPH <http://example.org/governance/shapes> {
+                ex:PersonShape sh:deactivated true .
+            }
+        ",
+        )
+        .commit()
+        .await
+        .expect("deactivate shape on M");
+
+    fluree
+        .graph(data_id)
+        .transact()
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@id": "ex:bob",
+            "@type": "ex:Person"
+        }))
+        .commit()
+        .await
+        .expect("deactivated shape must no longer reject");
+}

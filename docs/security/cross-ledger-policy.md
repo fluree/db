@@ -445,6 +445,27 @@ Specifics:
   cross-ledger source: both shape sets enforce. See
   [Cookbook: SHACL validation — Inline shapes per
   transaction](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
+- **Enforced surfaces**: JSON-LD transactions (insert / upsert /
+  update, including TriG upserts), direct-flake Turtle inserts,
+  and validation reports (`fluree validate` in ledger mode, the
+  HTTP validate endpoint, `Fluree::validate_ledger`). Commit
+  replay (graph-sync push) intentionally skips SHACL
+  re-validation for cross-ledger sources: the origin already
+  validated against M when the commit was authored, and
+  re-resolving M at replay time could see a different head.
+- **`sh:sparql` constraints travel over the wire** — the query
+  text, `sh:prefixes` declarations, and their `owl:imports`
+  closure are all projected. One caveat: the query lowers
+  against D's committed namespace registry, so a constraint over
+  a predicate whose namespace has never been committed to D
+  cannot match until that namespace lands (this mirrors the
+  same-ledger behavior).
+- **Steady-state cost is one nameservice lookup.** The wire is
+  cached per `(model, graph, resolved_t)` and the *compiled*
+  shapes (including parsed `sh:sparql` queries) are reused
+  across transactions while M's head and D's shape-affecting
+  epochs are unchanged. A commit on M invalidates both on the
+  next transaction — governance updates propagate immediately.
 
 ## Cross-ledger datalog rules
 

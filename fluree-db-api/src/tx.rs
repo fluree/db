@@ -636,6 +636,16 @@ pub(crate) struct StagedShaclContext<'a> {
     /// opts). `None` (no policy context: embedded root, unauthenticated dev
     /// mode) passes `f:OverrideAll` and fails identity-restricted lists.
     pub request_identity: Option<String>,
+
+    /// `true` only on commit replay (graph-sync push), where the flakes being
+    /// staged are already-committed history validated at origin. When the
+    /// configured `f:shapesSource` is cross-ledger and no wire artifact was
+    /// threaded, replay SKIPS SHACL re-validation instead of erroring —
+    /// re-resolving M at the follower's replay time could see a different
+    /// head `t` than the origin did, so the origin's validation is
+    /// authoritative. Authoring paths must leave this `false` so a
+    /// cross-ledger source without a resolved wire stays a loud error.
+    pub origin_validated_replay: bool,
 }
 
 /// Inspect the data ledger's resolved config and, when
@@ -691,6 +701,77 @@ async fn resolve_cross_ledger_shapes_for_tx(
     Ok(Some(resolved))
 }
 
+/// A resolved cross-ledger shapes source with the model ledger opened at the
+/// resolved `t`: the wire artifact plus the live handle `sh:class` value-set
+/// membership probes read from. Produced by
+/// [`open_cross_ledger_shapes_model`]; consumed by the Turtle staging and
+/// validate paths (the JSON-LD staging path carries the same pieces inline).
+#[cfg(feature = "shacl")]
+pub(crate) struct CrossLedgerShapesModel {
+    pub resolved: std::sync::Arc<crate::cross_ledger::ResolvedGraph>,
+    pub model_db: crate::view::GraphDb,
+    pub model_g_id: GraphId,
+}
+
+#[cfg(feature = "shacl")]
+impl CrossLedgerShapesModel {
+    pub(crate) fn wire(&self) -> Option<&crate::cross_ledger::ShapesArtifactWire> {
+        match &self.resolved.artifact {
+            crate::cross_ledger::GovernanceArtifact::Shapes(wire) => Some(wire),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve a cross-ledger `f:shapesSource` (if the config carries one) and
+/// open the model ledger at the resolved `t`. Returns `None` when the config
+/// has no cross-ledger shapes source. The wire itself is served from the
+/// governance cache when M's head hasn't advanced — the only per-call cost in
+/// the steady state is one nameservice head lookup.
+#[cfg(feature = "shacl")]
+pub(crate) async fn open_cross_ledger_shapes_model(
+    config: Option<&LedgerConfig>,
+    resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+) -> std::result::Result<Option<CrossLedgerShapesModel>, fluree_db_transact::TransactError> {
+    let Some(resolved) = resolve_cross_ledger_shapes_for_tx(config, resolve_ctx).await? else {
+        return Ok(None);
+    };
+    let model_db = resolve_ctx
+        .fluree
+        .load_graph_db_at_t(&resolved.model_ledger_id, resolved.resolved_t)
+        .await
+        .map_err(|e| {
+            fluree_db_transact::TransactError::Parse(format!(
+                "failed to open cross-ledger value-set model {} at t={}: {e}",
+                resolved.model_ledger_id, resolved.resolved_t
+            ))
+        })?;
+    // The value-set vocabulary lives in the same M graph the shapes come
+    // from, so a miss here means the graph vanished between materialization
+    // and open. Error loudly rather than dropping membership — a silent
+    // `None` would make every M-only value read as "not a member" and
+    // reject writes with spurious `sh:class` violations.
+    let model_g_id =
+        crate::cross_ledger::resolve_selector_g_id(&model_db.snapshot, &resolved.graph_iri)
+            .map_err(|e| {
+                fluree_db_transact::TransactError::Parse(format!(
+                    "cross-ledger value-set graph resolution failed: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                fluree_db_transact::TransactError::Parse(format!(
+                    "cross-ledger value-set graph {} not present in model ledger {} at t={} \
+                     (shapes resolved but vocabulary graph missing)",
+                    resolved.graph_iri, resolved.model_ledger_id, resolved.resolved_t
+                ))
+            })?;
+    Ok(Some(CrossLedgerShapesModel {
+        resolved,
+        model_db,
+        model_g_id,
+    }))
+}
+
 /// Inspect the data ledger's resolved config and, when
 /// `f:reasoningDefaults`' `f:schemaSource` carries a cross-ledger
 /// `f:ledger` reference, resolve the model ledger's ontology graph and
@@ -723,19 +804,63 @@ async fn resolve_cross_ledger_schema_for_tx(
         })
 }
 
+/// Identity of the shape source a compiled-SHACL cache entry was built from.
+///
+/// `CrossLedger` carries the wire origin — model ledger, graph, and the `t`
+/// the wire was materialized at. M's head advancing produces a new
+/// `resolved_t` (one cheap nameservice lookup per transaction detects this),
+/// which misses here and forces a recompile; an unchanged head reuses the
+/// already-translated, already-parsed shapes (including pre-parsed sh:sparql
+/// ASTs) with zero re-query of M.
+#[cfg(feature = "shacl")]
+#[derive(Clone, PartialEq, Eq)]
+enum CachedShapeSource {
+    Local(Vec<GraphId>),
+    CrossLedger {
+        model_ledger_id: String,
+        graph_iri: String,
+        resolved_t: i64,
+    },
+}
+
 /// Cross-transaction compiled-SHACL cache entry, stored type-erased on
 /// `LedgerState::shacl_compile_cache`. Valid while nothing shape-affecting
 /// changed: same indexed snapshot, same SHACL epoch (no sh:* / shape-typing
 /// flakes committed — see `Novelty::shacl_epoch`), same schema epoch (the
 /// compiled target index bakes in subclass expansion), and the same shape
-/// source graphs. Inline / cross-ledger shapes bypass the cache (per-txn).
+/// source ([`CachedShapeSource`] — local graph IDs, or the cross-ledger wire
+/// origin including M's resolved `t`). Inline `opts.shapes` and cross-ledger
+/// `f:schemaSource` bypass the cache (per-txn), and a cross-ledger entry is
+/// only written/read when the transaction introduced no namespaces (the wire
+/// compiles against the staged registry, so a namespace delta can change
+/// which of M's shapes translate).
 #[cfg(feature = "shacl")]
 struct CachedShaclCompile {
     snapshot_t: i64,
     shacl_epoch: u64,
     schema_epoch: u64,
-    shapes_g_ids: Vec<GraphId>,
+    source: CachedShapeSource,
     cache: std::sync::Arc<fluree_db_shacl::ShaclCache>,
+}
+
+/// Probe `LedgerState::shacl_compile_cache` for a compiled-shape entry that
+/// is still valid for `source` against the current snapshot/epochs.
+#[cfg(feature = "shacl")]
+fn probe_shacl_compile_cache(
+    base: &LedgerState,
+    source: &CachedShapeSource,
+) -> Option<std::sync::Arc<fluree_db_shacl::ShaclCache>> {
+    let slot = base.shacl_compile_cache.read();
+    let entry = slot
+        .as_ref()?
+        .clone()
+        .downcast::<CachedShaclCompile>()
+        .ok()?;
+    (entry.snapshot_t == base.snapshot.t
+        && entry.shacl_epoch == base.novelty.shacl_epoch
+        && entry.schema_epoch == base.novelty.schema_epoch
+        && entry.source == *source)
+        .then(|| std::sync::Arc::clone(&entry.cache))
 }
 
 /// Resolve `f:shapesSource` from a loaded `LedgerConfig` into concrete graph
@@ -918,38 +1043,83 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     // focus node's own data graph is always consulted; these are the extra
     // `f:shapesSource` vocabulary graph(s) unioned in, so a shared value-set
     // (e.g. a list of US states) can live alongside the shapes rather than in
-    // every data graph. Cross-ledger value-sets aren't supported yet, so that
-    // branch falls back to the default graph.
+    // every data graph. Cross-ledger value-sets are served separately via
+    // `ctx.cross_ledger_membership`, so that branch keeps the default graph.
     let membership_g_ids: Vec<fluree_db_core::GraphId>;
-    // Set on the plain same-ledger path — the only shape source eligible for
-    // cross-transaction compile reuse.
-    let mut cacheable_shape_g_ids: Option<Vec<GraphId>> = None;
+    // Set when the configured source is eligible for cross-transaction
+    // compile reuse: the plain same-ledger path, or a cross-ledger wire in a
+    // transaction that introduced no namespaces. Inline `opts.shapes` and
+    // cross-ledger `f:schemaSource` (checked below) disqualify.
+    let mut cache_source: Option<CachedShapeSource> = None;
+    // Compiled-shape cache hit resolved BEFORE the wire translation so a hit
+    // skips translate + sh:sparql parse + compile entirely — the steady-state
+    // cross-ledger cost is then just the head-`t` lookup that produced
+    // `resolved_t`.
+    let mut precompiled: Option<std::sync::Arc<fluree_db_shacl::ShaclCache>> = None;
     let mut shape_dbs: Vec<fluree_db_core::GraphDbRef<'_>> =
         if let (Some(wire), Some(staged_ns)) = (ctx.cross_ledger_shapes, ctx.staged_ns) {
-            let bundle = wire
-                .translate_to_schema_bundle_flakes(staged_ns)
-                .map_err(|e| {
-                    fluree_db_transact::TransactError::Parse(format!(
-                        "cross-ledger shapes wire translation failed: {e}"
-                    ))
-                })?;
-            cl_overlay_holder = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
-                base.novelty.as_ref(),
-                bundle,
-            ));
             membership_g_ids = vec![0];
-            vec![fluree_db_core::GraphDbRef::new(
-                &base.snapshot,
-                0u16,
-                cl_overlay_holder.as_ref().expect("just set above"),
-                base.t(),
-            )]
+            // Reuse is only sound when this transaction introduced no
+            // namespaces: the wire compiles against the staged registry, and
+            // a namespace delta can change which of M's shapes translate.
+            let no_new_namespaces = ctx.uncommitted_namespaces.is_some_and(HashMap::is_empty);
+            if no_new_namespaces
+                && ctx.inline_shape_bundle.is_none()
+                && ctx.cross_ledger_schema.is_none()
+            {
+                let source = CachedShapeSource::CrossLedger {
+                    model_ledger_id: wire.origin.model_ledger_id.clone(),
+                    graph_iri: wire.origin.graph_iri.clone(),
+                    resolved_t: wire.origin.resolved_t,
+                };
+                precompiled = probe_shacl_compile_cache(base, &source);
+                cache_source = Some(source);
+            }
+            if precompiled.is_some() {
+                Vec::new()
+            } else {
+                let bundle = wire
+                    .translate_to_schema_bundle_flakes(staged_ns)
+                    .map_err(|e| {
+                        fluree_db_transact::TransactError::Parse(format!(
+                            "cross-ledger shapes wire translation failed: {e}"
+                        ))
+                    })?;
+                cl_overlay_holder = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+                    base.novelty.as_ref(),
+                    bundle,
+                ));
+                vec![fluree_db_core::GraphDbRef::new(
+                    &base.snapshot,
+                    0u16,
+                    cl_overlay_holder.as_ref().expect("just set above"),
+                    base.t(),
+                )]
+            }
         } else {
             // 4b. Same-ledger path. Resolve `f:shapesSource` into
             //     concrete graph IDs; default to `[0]` when unset.
+            //
+            // Commit replay with a cross-ledger source lands here (no wire is
+            // threaded on that path) — skip re-validation rather than let the
+            // resolver below reject: the origin already validated against M,
+            // and re-resolving M at replay time could see a different head.
+            if ctx.origin_validated_replay
+                && config
+                    .as_deref()
+                    .and_then(|c| c.shacl.as_ref())
+                    .and_then(|s| s.shapes_source.as_ref())
+                    .is_some_and(|s| s.ledger.is_some())
+            {
+                tracing::debug!(
+                    "commit replay: skipping SHACL re-validation for cross-ledger \
+                     f:shapesSource (validated at origin)"
+                );
+                return Ok(());
+            }
             let shapes_g_ids = resolve_shapes_source_g_ids(config.as_deref(), &base.snapshot)?;
             membership_g_ids = shapes_g_ids.clone();
-            cacheable_shape_g_ids = Some(shapes_g_ids.clone());
+            cache_source = Some(CachedShapeSource::Local(shapes_g_ids.clone()));
             shapes_g_ids
                 .iter()
                 .map(|g_id| base.as_graph_db_ref(*g_id))
@@ -964,7 +1134,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     //     staged namespace registry at `stage_with_config_shacl`
     //     entry, so encoding is consistent with the live tx.
     if let Some(bundle) = ctx.inline_shape_bundle.clone() {
-        cacheable_shape_g_ids = None;
+        cache_source = None;
         inline_overlay_holder = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
             base.novelty.as_ref(),
             bundle,
@@ -1014,34 +1184,19 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     // validation pass (the other moves into engine construction).
     let hierarchy_for_validation = hierarchy.clone();
     // Cross-transaction compile reuse: skip the ~40 predicate scans of
-    // ShapeCompiler when nothing shape-affecting changed since the last
-    // compile of the same shape-source graphs.
-    let cacheable_shape_g_ids = if ctx.cross_ledger_schema.is_some() {
+    // ShapeCompiler (and, for cross-ledger sources, the wire translation and
+    // sh:sparql query parsing) when nothing shape-affecting changed since the
+    // last compile of the same shape source.
+    let cache_source = if ctx.cross_ledger_schema.is_some() {
         None
     } else {
-        cacheable_shape_g_ids
+        cache_source
     };
-    let reuse_key = cacheable_shape_g_ids.as_ref().map(|g_ids| {
-        (
-            base.snapshot.t,
-            base.novelty.shacl_epoch,
-            base.novelty.schema_epoch,
-            g_ids.clone(),
-        )
-    });
     let shared_compile: Option<std::sync::Arc<fluree_db_shacl::ShaclCache>> =
-        reuse_key.as_ref().and_then(|key| {
-            let slot = base.shacl_compile_cache.read();
-            let entry = slot
-                .as_ref()?
-                .clone()
-                .downcast::<CachedShaclCompile>()
-                .ok()?;
-            (entry.snapshot_t == key.0
-                && entry.shacl_epoch == key.1
-                && entry.schema_epoch == key.2
-                && entry.shapes_g_ids == key.3)
-                .then(|| std::sync::Arc::clone(&entry.cache))
+        precompiled.or_else(|| {
+            cache_source
+                .as_ref()
+                .and_then(|source| probe_shacl_compile_cache(base, source))
         });
     let engine = match shared_compile {
         Some(cache) => ShaclEngine::from_shared_cache(cache, hierarchy),
@@ -1050,12 +1205,12 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                 ShaclEngine::from_dbs_with_hierarchy(&shape_dbs, base.ledger_id(), hierarchy)
                     .await
                     .map_err(fluree_db_transact::TransactError::from)?;
-            if let Some((snapshot_t, shacl_epoch, schema_epoch, shapes_g_ids)) = reuse_key {
+            if let Some(source) = cache_source {
                 *base.shacl_compile_cache.write() = Some(std::sync::Arc::new(CachedShaclCompile {
-                    snapshot_t,
-                    shacl_epoch,
-                    schema_epoch,
-                    shapes_g_ids,
+                    snapshot_t: base.snapshot.t,
+                    shacl_epoch: base.novelty.shacl_epoch,
+                    schema_epoch: base.novelty.schema_epoch,
+                    source,
                     cache: engine.shared_cache(),
                 }));
             }
@@ -1267,9 +1422,9 @@ async fn stage_with_config_shacl(
     // When f:shapesSource carries f:ledger, resolve the wire artifact from M
     // now so the per-tx ResolveCtx benefits from memo + governance cache. The
     // wire is threaded through staging as an internal governance input and
-    // compiled against the staged namespace registry at validation time.
-    let cross_ledger_shapes =
-        resolve_cross_ledger_shapes_for_tx(config.as_ref(), resolve_ctx).await?;
+    // compiled against the staged namespace registry at validation time. The
+    // model ledger is opened alongside for `sh:class` value-set membership.
+    let cross_ledger_shapes = open_cross_ledger_shapes_model(config.as_ref(), resolve_ctx).await?;
     // Same boundary for the cross-ledger ontology: when
     // f:reasoningDefaults/f:schemaSource points at M, resolve the schema
     // wire (t-cached) so the enforcement hierarchy can merge M's
@@ -1300,75 +1455,36 @@ async fn stage_with_config_shacl(
         .collect();
 
     // Cross-ledger `sh:class` value-sets: when f:shapesSource is cross-ledger,
-    // open the model ledger M live at the resolved t and expose a GraphDbRef
-    // into its value-set graph (the shapes-source graph, where the controlled
-    // vocabulary lives alongside the shapes). `validate_class_constraint`
-    // consults it on demand — memoized — after a local membership miss. The
-    // owned handle and D's namespace map (for term translation) are held across
-    // the validation await below.
-    let cross_ledger_model_db = match cross_ledger_shapes.as_deref() {
-        Some(resolved) => Some(
-            resolve_ctx
-                .fluree
-                .load_graph_db_at_t(&resolved.model_ledger_id, resolved.resolved_t)
-                .await
-                .map_err(|e| {
-                    fluree_db_transact::TransactError::Parse(format!(
-                        "failed to open cross-ledger value-set model {} at t={}: {e}",
-                        resolved.model_ledger_id, resolved.resolved_t
-                    ))
-                })?,
-        ),
-        None => None,
-    };
+    // the opened model handle exposes a GraphDbRef into its value-set graph
+    // (the shapes-source graph, where the controlled vocabulary lives
+    // alongside the shapes). `validate_class_constraint` consults it on
+    // demand — memoized — after a local membership miss. The owned handle and
+    // D's namespace map (for term translation) are held across the validation
+    // await below.
+    //
     // D's namespace codes → IRI prefixes (base + this transaction's staged
     // allocations). Needed to decode a staged value Sid to its IRI before
     // re-encoding against M — the staged base snapshot alone can't decode a
     // namespace introduced this transaction.
     let cross_ledger_data_ns_map: Option<HashMap<u16, String>> =
-        cross_ledger_model_db.as_ref().map(|_| {
+        cross_ledger_shapes.as_ref().map(|_| {
             ns_registry
                 .all_codes()
                 .into_iter()
                 .filter_map(|code| ns_registry.get_prefix(code).map(|p| (code, p.to_string())))
                 .collect()
         });
-    let cross_ledger_membership = match (
-        &cross_ledger_model_db,
-        &cross_ledger_data_ns_map,
-        cross_ledger_shapes.as_deref(),
-    ) {
-        (Some(m_db), Some(ns_map), Some(resolved)) => {
-            // The value-set vocabulary lives in the same M graph the shapes were
-            // compiled from, so a miss here should be unreachable. Error loudly
-            // rather than silently dropping membership — a silent `None` would
-            // make every M-only value fall through to "not a member" and reject
-            // the write with spurious `sh:class` violations.
-            let g_id =
-                crate::cross_ledger::resolve_selector_g_id(&m_db.snapshot, &resolved.graph_iri)
-                    .map_err(|e| {
-                        fluree_db_transact::TransactError::Parse(format!(
-                            "cross-ledger value-set graph resolution failed: {e}"
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        fluree_db_transact::TransactError::Parse(format!(
-                    "cross-ledger value-set graph {} not present in model ledger {} at t={} \
-                     (shapes resolved but vocabulary graph missing)",
-                    resolved.graph_iri, resolved.model_ledger_id, resolved.resolved_t
-                ))
-                    })?;
-            Some(fluree_db_shacl::CrossLedgerMembership {
-                model_db: fluree_db_core::GraphDbRef::new(
-                    &m_db.snapshot,
-                    g_id,
-                    m_db.overlay.as_ref(),
-                    m_db.t,
-                ),
-                data_ns_map: ns_map,
-                same_term_space: false,
-            })
-        }
+    let cross_ledger_membership = match (&cross_ledger_shapes, &cross_ledger_data_ns_map) {
+        (Some(model), Some(ns_map)) => Some(fluree_db_shacl::CrossLedgerMembership {
+            model_db: fluree_db_core::GraphDbRef::new(
+                &model.model_db.snapshot,
+                model.model_g_id,
+                model.model_db.overlay.as_ref(),
+                model.model_db.t,
+            ),
+            data_ns_map: ns_map,
+            same_term_space: false,
+        }),
         _ => None,
     };
 
@@ -1378,13 +1494,8 @@ async fn stage_with_config_shacl(
             graph_delta: Some(&graph_delta),
             graph_sids: Some(&graph_sids),
             tracker,
-            cross_ledger_shapes: cross_ledger_shapes
-                .as_deref()
-                .and_then(|r| match &r.artifact {
-                    crate::cross_ledger::GovernanceArtifact::Shapes(wire) => Some(wire),
-                    _ => None,
-                }),
-            staged_ns: cross_ledger_shapes.as_deref().map(|_| &ns_registry),
+            cross_ledger_shapes: cross_ledger_shapes.as_ref().and_then(|m| m.wire()),
+            staged_ns: cross_ledger_shapes.as_ref().map(|_| &ns_registry),
             uncommitted_namespaces: Some(ns_registry.delta()),
             txn_context,
             inline_shape_bundle,
@@ -1392,6 +1503,7 @@ async fn stage_with_config_shacl(
             cross_ledger_membership,
             requested_validation_mode,
             request_identity,
+            origin_validated_replay: false,
         },
         tx_config,
     )
@@ -3300,6 +3412,32 @@ impl crate::Fluree {
         };
         tracing::info!(flake_count = flakes.len(), "turtle parsed to flakes");
 
+        // Resolve config + any cross-ledger `f:shapesSource` from pre-stage
+        // state, before `ledger` is consumed by staging. The resolved config
+        // is shared with the SHACL pass below so the config graph is scanned
+        // once. Fail loudly on a read error so a broken config can't
+        // silently skip cross-ledger governance.
+        #[cfg(feature = "shacl")]
+        let (tx_config, cross_ledger_shapes) = {
+            let config = crate::config_resolver::resolve_ledger_config(
+                &ledger.snapshot,
+                ledger.novelty.as_ref(),
+                ledger.t(),
+            )
+            .await
+            .map_err(|e| {
+                ApiError::from(fluree_db_transact::TransactError::Parse(format!(
+                    "failed to load ledger config for cross-ledger governance resolution: {e}"
+                )))
+            })?;
+            let ledger_id_owned = ledger.ledger_id().to_string();
+            let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+            let shapes = open_cross_ledger_shapes_model(config.as_ref(), &mut resolve_ctx)
+                .await
+                .map_err(ApiError::from)?;
+            (config.map(std::sync::Arc::new), shapes)
+        };
+
         // Stage the flakes (backpressure + optional policy)
         let mut options = match index_config {
             Some(cfg) => StageOptions::new().with_index_config(cfg),
@@ -3323,42 +3461,64 @@ impl crate::Fluree {
         // validation falls back to default-graph (g_id=0), matching how flakes
         // are produced by `FlakeSink`.
         #[cfg(feature = "shacl")]
-        apply_shacl_policy_to_staged_view(
-            &view,
-            StagedShaclContext {
-                graph_delta: None,
-                graph_sids: None,
-                tracker,
-                // Turtle insert doesn't go through the
-                // cross-ledger dispatch path today; cross-ledger
-                // SHACL on Turtle inserts can be added by calling
-                // resolve_cross_ledger_shapes_for_tx here when
-                // the use case lands.
-                cross_ledger_shapes: None,
-                staged_ns: None,
-                // The prefixes this document declared, which the snapshot has
-                // not seen yet — without them a violation on a predicate the
-                // document introduces has no IRI to report.
-                uncommitted_namespaces: Some(ns_registry.delta()),
-                // Turtle carries its prefixes in the document, not as a
-                // JSON-LD context the API sees, so violations name full IRIs.
-                txn_context: None,
-                cross_ledger_schema: None,
-                // Turtle insert API has no `opts.shapes` surface
-                // today — inline SHACL flows in over the JSON
-                // transaction path. Wireable later if needed.
-                inline_shape_bundle: None,
-                // Turtle insert likewise has no `opts.validationMode`
-                // surface — it always runs the configured posture.
-                requested_validation_mode: None,
-                request_identity: None,
-                cross_ledger_membership: None,
-            },
-            // Turtle insert path resolves config internally.
-            None,
-        )
-        .await
-        .map_err(ApiError::from)?;
+        {
+            // D's namespace codes → IRI prefixes (base + this document's
+            // declared prefixes), for `sh:class` value-set probes against M.
+            let cross_ledger_data_ns_map: Option<HashMap<u16, String>> =
+                cross_ledger_shapes.as_ref().map(|_| {
+                    ns_registry
+                        .all_codes()
+                        .into_iter()
+                        .filter_map(|code| {
+                            ns_registry.get_prefix(code).map(|p| (code, p.to_string()))
+                        })
+                        .collect()
+                });
+            let cross_ledger_membership = match (&cross_ledger_shapes, &cross_ledger_data_ns_map) {
+                (Some(model), Some(ns_map)) => Some(fluree_db_shacl::CrossLedgerMembership {
+                    model_db: fluree_db_core::GraphDbRef::new(
+                        &model.model_db.snapshot,
+                        model.model_g_id,
+                        model.model_db.overlay.as_ref(),
+                        model.model_db.t,
+                    ),
+                    data_ns_map: ns_map,
+                    same_term_space: false,
+                }),
+                _ => None,
+            };
+            apply_shacl_policy_to_staged_view(
+                &view,
+                StagedShaclContext {
+                    graph_delta: None,
+                    graph_sids: None,
+                    tracker,
+                    cross_ledger_shapes: cross_ledger_shapes.as_ref().and_then(|m| m.wire()),
+                    staged_ns: cross_ledger_shapes.as_ref().map(|_| &ns_registry),
+                    // The prefixes this document declared, which the snapshot has
+                    // not seen yet — without them a violation on a predicate the
+                    // document introduces has no IRI to report.
+                    uncommitted_namespaces: Some(ns_registry.delta()),
+                    // Turtle carries its prefixes in the document, not as a
+                    // JSON-LD context the API sees, so violations name full IRIs.
+                    txn_context: None,
+                    cross_ledger_schema: None,
+                    // Turtle insert API has no `opts.shapes` surface
+                    // today — inline SHACL flows in over the JSON
+                    // transaction path. Wireable later if needed.
+                    inline_shape_bundle: None,
+                    // Turtle insert likewise has no `opts.validationMode`
+                    // surface — it always runs the configured posture.
+                    requested_validation_mode: None,
+                    request_identity: None,
+                    cross_ledger_membership,
+                    origin_validated_replay: false,
+                },
+                tx_config,
+            )
+            .await
+            .map_err(ApiError::from)?;
+        }
 
         // Plain Turtle doesn't support named graphs or txn-meta extraction (TriG support handles these)
         Ok(StageResult {

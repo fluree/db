@@ -22,6 +22,7 @@ use fluree_db_core::{
 
 const SHACL: &str = "http://www.w3.org/ns/shacl#";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const OWL: &str = "http://www.w3.org/2002/07/owl#";
 
 #[tracing::instrument(
     name = "cross_ledger.shapes.materialize",
@@ -91,9 +92,26 @@ pub(super) async fn materialize_shapes(
         "and",
         "or",
         "xone",
+        "node",
+        "qualifiedValueShape",
+        "qualifiedMinCount",
+        "qualifiedMaxCount",
+        "qualifiedValueShapesDisjoint",
+        "deactivated",
         "severity",
         "message",
         "name",
+        // SPARQL-based constraints (sh:sparql). `sh:select` carries the
+        // query text as a literal; `sh:prefixes`/`sh:declare`/`sh:prefix`/
+        // `sh:namespace` carry the prefix declarations the query header is
+        // built from, and `owl:imports` (projected below) links prefix
+        // ontologies transitively.
+        "sparql",
+        "select",
+        "prefixes",
+        "declare",
+        "prefix",
+        "namespace",
     ];
 
     let mut shacl_predicate_sids: Vec<Sid> = Vec::new();
@@ -104,6 +122,10 @@ pub(super) async fn materialize_shapes(
     }
     let rdf_first_sid = m_db.snapshot.encode_iri_strict(&format!("{RDF}first"));
     let rdf_rest_sid = m_db.snapshot.encode_iri_strict(&format!("{RDF}rest"));
+    // owl:imports edges are followed when resolving `sh:prefixes` into a
+    // PREFIX header for sh:sparql constraints — project them so the closure
+    // survives the wire.
+    let owl_imports_sid = m_db.snapshot.encode_iri_strict(&format!("{OWL}imports"));
 
     let opts = RangeOptions::default().with_to_t(m_db.t);
     let mut triples: Vec<WireTriple> = Vec::new();
@@ -135,7 +157,7 @@ pub(super) async fn materialize_shapes(
         }
     }
 
-    for opt_sid in [rdf_first_sid, rdf_rest_sid]
+    for opt_sid in [rdf_first_sid, rdf_rest_sid, owl_imports_sid]
         .iter()
         .filter_map(|s| s.as_ref())
     {
