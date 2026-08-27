@@ -46,7 +46,10 @@ function setup(url: string | null = "https://srv/v1/fluree/events?ledger=l") {
 }
 
 beforeEach(() => vi.useFakeTimers());
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 describe("connecting", () => {
   it("connects after the debounce with the resolved URL and headers", async () => {
@@ -193,27 +196,46 @@ describe("reconnect", () => {
   });
 
   it("retries with growing backoff when the connect itself fails", async () => {
+    // Jitter is 50-100% of the cap; pinning it to the floor makes the exact
+    // retry instants assertable, so this proves the doubling rather than
+    // just "it eventually retried".
+    vi.spyOn(Math, "random").mockReturnValue(0);
     const { server, states, connect } = setup();
     server.failEvents = 2;
     await connect();
     expect(states).toEqual(["reconnecting"]);
     expect(server.eventConnects).toHaveLength(1);
 
-    // First retry lands within one base interval (jitter is 50-100%).
-    await vi.advanceTimersByTimeAsync(BACKOFF);
+    // First retry: cap = base, floor = base/2 = 5ms.
+    await vi.advanceTimersByTimeAsync(BACKOFF / 2 - 1);
+    await flush();
+    expect(server.eventConnects).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
     await flush();
     expect(server.eventConnects).toHaveLength(2);
 
-    // Second retry waits up to twice as long: nothing before its floor
-    // (jitter cannot schedule it sooner than half of 2x base)...
+    // Second retry: cap doubled, so its floor is 10ms — twice the first.
     await vi.advanceTimersByTimeAsync(BACKOFF - 1);
     await flush();
     expect(server.eventConnects).toHaveLength(2);
-    // ...and it has certainly fired by its ceiling.
-    await vi.advanceTimersByTimeAsync(BACKOFF * 2);
+    await vi.advanceTimersByTimeAsync(1);
     await flush();
     expect(server.eventConnects).toHaveLength(3);
     expect(states.at(-1)).toBe("live");
+  });
+
+  it("caps the backoff so a long outage does not stall reconnects", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const { server, connect } = setup();
+    server.failEvents = 10;
+    await connect();
+
+    // Uncapped, the 6th wait would be base * 2^5 = 320ms; the cap is 4x base.
+    for (let i = 0; i < 6; i++) {
+      await vi.advanceTimersByTimeAsync(BACKOFF * 2);
+      await flush();
+    }
+    expect(server.eventConnects.length).toBeGreaterThanOrEqual(6);
   });
 
   it("re-resolves auth headers on every reconnect", async () => {

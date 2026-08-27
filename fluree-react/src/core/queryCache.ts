@@ -247,9 +247,11 @@ export class QueryCache {
       dirty.push(handle);
     }
 
-    const head = this.heads.get(cycle.ledger);
-    if (head === undefined || cycle.t > head) {
-      this.heads.set(cycle.ledger, cycle.t);
+    if (cycle.t !== undefined) {
+      const head = this.heads.get(cycle.ledger);
+      if (head === undefined || cycle.t > head) {
+        this.heads.set(cycle.ledger, cycle.t);
+      }
     }
 
     for (const handle of dirty) handle.notify();

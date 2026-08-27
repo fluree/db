@@ -54,7 +54,15 @@ export interface CycleErrored {
  */
 export interface CycleUpdate {
   ledger: string;
-  t: number;
+  /**
+   * The watermark every subscription in this batch was evaluated at. The
+   * peer transport always knows it (the cycle runs against a frozen
+   * snapshot at `t`). Remote mode learns watermarks only from SSE head
+   * events, so a subscription's very first fetch — which happens before any
+   * head event has been seen — reports `undefined` rather than inventing a
+   * watermark it cannot know. `0` would be a lie: it is a real ledger state.
+   */
+  t?: number;
   changed: CycleChange[];
   unchanged: number[];
   errored: CycleErrored[];

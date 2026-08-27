@@ -102,6 +102,18 @@ export class RemoteTransport implements LiveTransport {
   /** Coalescing: target watermark for the next cycle per ledger. */
   private readonly pending = new Map<string, number>();
   private readonly running = new Set<string>();
+  /**
+   * Per-subscription delivery ordering. A subscription's requests can
+   * overlap — a commit can land while its very first query is still in
+   * flight — and HTTP responses can come back out of order. Every request
+   * takes a monotonically increasing ticket, and a response older than what
+   * has already been delivered for that subscription is dropped, so a
+   * subscription's results can only move forward. Without this, a slow
+   * first fetch lands on top of a newer cycle and the component sits on
+   * pre-commit data until the next commit happens to arrive.
+   */
+  private nextTicket = 1;
+  private readonly delivered = new Map<number, number>();
   private closed = false;
 
   constructor(options: RemoteTransportOptions) {
@@ -164,6 +176,7 @@ export class RemoteTransport implements LiveTransport {
     if (!spec) return;
     this.subs.delete(subId);
     this.prev.delete(subId);
+    this.delivered.delete(subId);
     if (spec.at === undefined) {
       const set = this.byLedger.get(spec.ledger);
       set?.delete(subId);
@@ -190,6 +203,19 @@ export class RemoteTransport implements LiveTransport {
     this.byLedger.clear();
     this.prev.clear();
     this.pending.clear();
+    this.heads.clear();
+    this.delivered.clear();
+  }
+
+  /** True if a newer response for this subscription has already landed. */
+  private outranked(subId: number, ticket: number): boolean {
+    const last = this.delivered.get(subId);
+    return last !== undefined && last > ticket;
+  }
+
+  private markDelivered(subId: number, ticket: number): void {
+    const last = this.delivered.get(subId);
+    if (last === undefined || ticket > last) this.delivered.set(subId, ticket);
   }
 
   private eventsUrl(): string | null {
@@ -204,22 +230,31 @@ export class RemoteTransport implements LiveTransport {
   /** Deliver a new subscription's first result as its own single-entry
    * cycle — one delivery path for everything. */
   private async initialFetch(spec: SubscriptionSpec): Promise<void> {
+    // A t-anchored query is pinned to its anchor; otherwise the best we can
+    // honestly say is the newest head SSE has announced for this ledger,
+    // which is `undefined` until the first head event arrives.
+    const t = spec.at ?? this.heads.get(spec.ledger);
+    const ticket = this.nextTicket++;
     try {
       const payload = await this.execute(spec);
       if (!this.subs.has(spec.subId) || this.closed) return;
+      if (this.outranked(spec.subId, ticket)) return;
+      this.markDelivered(spec.subId, ticket);
       this.prev.set(spec.subId, payload);
       this.sink?.onCycle({
         ledger: spec.ledger,
-        t: spec.at ?? this.heads.get(spec.ledger) ?? 0,
+        t,
         changed: [{ subId: spec.subId, payload }],
         unchanged: [],
         errored: [],
       });
     } catch (err) {
       if (!this.subs.has(spec.subId) || this.closed) return;
+      if (this.outranked(spec.subId, ticket)) return;
+      this.markDelivered(spec.subId, ticket);
       this.sink?.onCycle({
         ledger: spec.ledger,
-        t: spec.at ?? this.heads.get(spec.ledger) ?? 0,
+        t,
         changed: [],
         unchanged: [],
         errored: [{ subId: spec.subId, error: toQueryError(err) }],
@@ -252,9 +287,10 @@ export class RemoteTransport implements LiveTransport {
         code: "ledger-retracted",
         message: `ledger ${ledger} was retracted`,
       };
+      const retractedAt = this.heads.get(ledger);
       this.sink?.onCycle({
         ledger,
-        t: this.heads.get(ledger) ?? 0,
+        t: retractedAt,
         changed: [],
         unchanged: [],
         errored: [...set].map((subId) => ({ subId, error })),
@@ -299,6 +335,7 @@ export class RemoteTransport implements LiveTransport {
       .filter((s): s is SubscriptionSpec => s !== undefined);
     if (specs.length === 0) return;
 
+    const tickets = specs.map(() => this.nextTicket++);
     const settled = await Promise.allSettled(
       specs.map((spec) => this.execute(spec)),
     );
@@ -310,7 +347,11 @@ export class RemoteTransport implements LiveTransport {
     for (let i = 0; i < specs.length; i++) {
       const spec = specs[i];
       const outcome = settled[i];
-      if (!spec || !outcome || !this.subs.has(spec.subId)) continue;
+      const ticket = tickets[i];
+      if (!spec || !outcome || ticket === undefined) continue;
+      if (!this.subs.has(spec.subId)) continue;
+      if (this.outranked(spec.subId, ticket)) continue;
+      this.markDelivered(spec.subId, ticket);
       if (outcome.status === "fulfilled") {
         const shared = replaceEqualDeep(this.prev.get(spec.subId), outcome.value);
         if (this.prev.has(spec.subId) && shared === this.prev.get(spec.subId)) {
