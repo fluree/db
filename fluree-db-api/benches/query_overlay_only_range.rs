@@ -54,15 +54,20 @@
 //! subject, no object — with `flake_limit(1)` against the txn-meta graph, and
 //! adds `object_bounds` when resolving `after: Some`. Its matched set is one
 //! flake per commit, so it scales with commits-in-novelty rather than with a
-//! bound subject's fact count, and it is doubly exposed: those object bounds
-//! now prune AFTER resolution instead of inside the walk.
+//! bound subject's fact count. It is the counter-example to "every
+//! limit-setting caller binds a subject", which is what an earlier version of
+//! this reasoning claimed.
 //!
-//! It stays off this bench deliberately — it only takes the overlay-only path
+//! Its `after: Some` leg used to be doubly exposed, because object bounds
+//! pruned after resolution rather than inside the walk. They now prune inside
+//! the walk — sound because a fact and its retraction share `o`, so the bound
+//! is true for both halves or false for both — which puts that leg back to
+//! collecting only the commits past the target instead of all of them.
+//!
+//! It stays off this bench deliberately: it only takes the overlay-only path
 //! when the txn-meta graph has no POST branch, it reads a system graph, and at
-//! ~80 ns per matched row the absolute cost is small. But it is the site to
-//! measure first if this path ever needs the bound back, and it is the
-//! counter-example to "every limit-setting caller binds a subject", which is
-//! what an earlier version of this reasoning claimed.
+//! ~80 ns per matched row the absolute cost is small. It remains the site to
+//! measure first if this path ever needs the `limit` bound back.
 //!
 //! ## Matrix
 //!

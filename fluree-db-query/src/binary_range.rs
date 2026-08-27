@@ -13,9 +13,9 @@ use fluree_db_binary_index::{
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{
-    flake_matches_range_eq, range_provider::RangeQuery, Flake, FlakeMeta, FlakeValue, GraphId,
-    IndexType, OType, OverlayProvider, RangeMatch, RangeOptions, RangeProvider, RangeTest,
-    RuntimeSmallDicts, Sid,
+    flake_matches_range_eq, range_provider::RangeQuery, Flake, FlakeValue, GraphId, IndexType,
+    OType, OverlayProvider, RangeMatch, RangeOptions, RangeProvider, RangeTest, RuntimeSmallDicts,
+    Sid,
 };
 
 use crate::binary_scan::{encode_bound_object_prefilter, index_type_to_sort_order};
@@ -793,7 +793,7 @@ fn binary_range_eq_v3(
     // Correctness fallback: merge untranslated overlay flakes (including retracts),
     // resolve per-fact lifecycles (latest-op-wins), then apply RangeOptions.
     flakes.extend(untranslated);
-    let mut resolved = resolve_latest_ops_keep_asserts(flakes, index);
+    let mut resolved = fluree_db_core::range::resolve_current_flakes(flakes, index);
     resolved.retain(|f| flake_matches_range_eq(f, match_val));
 
     if let Some(bounds) = &opts.object_bounds {
@@ -818,151 +818,6 @@ fn binary_range_eq_v3(
 #[inline]
 fn resolve_sid(s_id: u64, view: &BinaryGraphView) -> std::io::Result<Sid> {
     view.resolve_subject_sid(s_id)
-}
-
-/// Resolve fact lifecycles (latest op wins) and drop retracts.
-///
-/// Used as a correctness fallback when some overlay flakes cannot be translated
-/// into V3 `OverlayOp`s (e.g., missing dict novelty), and by the raw-overlay
-/// paths that serve a pattern the persisted index cannot contribute to. The
-/// input should include both cursor output flakes (asserts) and raw overlay
-/// flakes (asserts/retracts).
-///
-/// ## Why the grouping is two-level
-///
-/// A fact's identity is `(s, p, o, dt, m)`: two `@list` entries holding the
-/// same value at different positions, and one lexical form under two language
-/// tags, are DISTINCT facts (the #1273 class). But every comparator orders
-/// `… t, op, m` — `t` BEFORE `m` (`fluree-db-core/src/comparator.rs`). So
-/// flakes that share `(s, p, o, dt)` and differ only in `m` interleave by `t`,
-/// which puts a sibling's assert between a fact's own assert and its
-/// retraction. Cutting runs on full identity therefore closes a group early
-/// and emits the retracted assert as live — the exact resurrection this
-/// helper exists to prevent, on `["a", "b", "a"]` or `"x"@en` + `"x"@fr`.
-///
-/// So runs are cut on [`same_fact_key`] — the four fields all four comparators
-/// DO order before `t`, making those runs contiguous — and the winner is
-/// picked per distinct `m` inside the run.
-fn resolve_latest_ops_keep_asserts(mut flakes: Vec<Flake>, index: IndexType) -> Vec<Flake> {
-    let cmp = index.comparator();
-    flakes.sort_by(cmp);
-
-    if flakes.len() < 2 {
-        return flakes.into_iter().filter(|f| f.op).collect();
-    }
-
-    let mut out: Vec<Flake> = Vec::with_capacity(flakes.len());
-    // Scratch index buffer for the multi-flake run path, reused across runs.
-    let mut idxs: Vec<usize> = Vec::new();
-    let mut start = 0usize;
-    while start < flakes.len() {
-        let mut end = start + 1;
-        while end < flakes.len() && same_fact_key(&flakes[start], &flakes[end]) {
-            end += 1;
-        }
-
-        // Overwhelmingly the common run: one flake, so no grouping at all.
-        if end - start == 1 {
-            if flakes[start].op {
-                out.push(flakes[start].clone());
-            }
-            start = end;
-            continue;
-        }
-
-        // Group the run by `m`. Sorting rather than scanning a winners list
-        // keeps this O(k log k): a list that repeats one value across k
-        // positions puts all k in ONE run with k distinct `m`, and a linear
-        // "have I seen this `m`" probe would make that quadratic — the shape
-        // this whole area of the code exists to have stopped doing.
-        //
-        // The sort keys on `m` ALONE via `meta_group_cmp`, NOT `FlakeMeta`'s
-        // own `Ord` — that one ignores `lang` whenever both sides carry a
-        // list index, so it calls `{en, i: 0}` and `{fr, i: 0}` equal while
-        // `==` calls them distinct. Grouping on `==` after sorting by it
-        // would sort by one relation and cut by a stricter one: the same
-        // mismatch as #1703, one level down. `meta_group_cmp` agrees with
-        // `==` by construction (pinned by
-        // `group_order_agrees_with_metadata_equality`).
-        //
-        // The sort is stable, so the comparator's `t, op` order survives
-        // inside each group and the winner scan below sees candidates in
-        // ascending `t`.
-        idxs.clear();
-        idxs.extend(start..end);
-        idxs.sort_by(|&a, &b| meta_group_cmp(&flakes[a].m, &flakes[b].m));
-
-        let mut g = 0usize;
-        while g < idxs.len() {
-            let mut best = idxs[g];
-            let mut h = g + 1;
-            while h < idxs.len() && flakes[idxs[h]].m == flakes[best].m {
-                let cand = &flakes[idxs[h]];
-                let cur = &flakes[best];
-                // Newest op wins; at equal `t` a retraction beats an assert,
-                // matching `resolve_current_flakes`.
-                if cand.t > cur.t || (cand.t == cur.t && !cand.op && cur.op) {
-                    best = idxs[h];
-                }
-                h += 1;
-            }
-            if flakes[best].op {
-                out.push(flakes[best].clone());
-            }
-            g = h;
-        }
-
-        start = end;
-    }
-
-    // Survivors of a multi-flake run are emitted in `m` order, which is not
-    // the comparator's order for the run (it orders `t` first). Callers take
-    // this as a range result and expect index order, which the
-    // single-winner-per-group predecessor gave them for free. Cheap to
-    // restore: `out` is a subsequence of an already-sorted vec whose only
-    // inversions are inside those runs.
-    out.sort_by(cmp);
-    out
-}
-
-/// Strict total order on flake metadata, for grouping inside a fact run.
-///
-/// [`FlakeMeta`](fluree_db_core::FlakeMeta)'s own `Ord` compares ONLY `i`
-/// when both sides carry a list index — `lang` is never consulted — while its
-/// `PartialEq` is derived over both fields. So `{lang: en, i: 0}` and
-/// `{lang: fr, i: 0}` compare `Equal` without being equal: `Ord` is not
-/// consistent with `Eq` for that type. Sorting by it and then cutting groups
-/// on `==` sorts by one relation and groups by a stricter one, which lets a
-/// sibling's assert separate a fact from its own retraction — the #1703
-/// failure, one level down.
-///
-/// This order is consistent with `==` by construction: it compares `i` and
-/// then `lang`, so `Equal` here means equal in fact.
-///
-/// Deliberately local. Repairing `FlakeMeta::Ord` itself moves index ordering
-/// semantics repo-wide (every comparator's `cmp_meta` tiebreak reads it), so
-/// that belongs in #1711 rather than in a fix for the range path.
-#[inline]
-fn meta_group_cmp(a: &Option<FlakeMeta>, b: &Option<FlakeMeta>) -> std::cmp::Ordering {
-    match (a, b) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(x), Some(y)) => x.i.cmp(&y.i).then_with(|| x.lang.cmp(&y.lang)),
-    }
-}
-
-/// Run key for [`resolve_latest_ops_keep_asserts`]: the four fields every
-/// comparator orders BEFORE `t`, so flakes sharing it land contiguously after
-/// the sort. Deliberately NOT full fact identity — `m` is resolved per-fact
-/// inside the run, because the comparators interleave differing `m` by `t`.
-///
-/// `g` is absent because every caller walks one `g_id` at a time, so a
-/// mixed-graph vector never reaches here. A caller that ever scopes
-/// differently has to add it.
-#[inline]
-fn same_fact_key(a: &Flake, b: &Flake) -> bool {
-    a.s == b.s && a.p == b.p && a.o == b.o && a.dt == b.dt
 }
 
 /// Batched lookup for ref-valued predicate objects across many subjects (V3).
@@ -1188,8 +1043,15 @@ fn apply_raw_overlay_deltas_to_batched_refs(
             None => {
                 subj_entry.insert(class_sid, (flake.t, flake.op));
             }
-            Some(&(t0, _op0)) => {
-                if flake.t > t0 {
+            Some(&(t0, op0)) => {
+                // Newest op wins; at equal `t` the retraction does. Taking
+                // `>` alone let whichever flake the walk happened to yield
+                // first win the tie — and on this lane, which decides
+                // class-based policy grants, the direction it failed was
+                // open: a same-`t` assert+retract of a class left the class
+                // granted. Same rule as `resolve_current_flakes` and
+                // `resolve_overlay_ops`.
+                if flake.t > t0 || (flake.t == t0 && !flake.op && op0) {
                     subj_entry.insert(class_sid, (flake.t, flake.op));
                 }
             }
@@ -1205,6 +1067,14 @@ fn apply_raw_overlay_deltas_to_batched_refs(
             } else {
                 vec.retain(|c| c != class_sid);
             }
+        }
+        // A subject whose overlay flakes are all retractions would otherwise
+        // be left holding an empty vector, which reads as "present with no
+        // classes". `lookup_subject_classes` documents that subjects with no
+        // `rdf:type` assertions are absent from the map, and its per-subject
+        // fallback enforces that — so don't diverge from it here.
+        if vec.is_empty() {
+            out.remove(subj);
         }
     }
 }
@@ -1534,7 +1404,7 @@ fn binary_range_bounded_v3(
 
     // Correctness fallback: merge raw overlay flakes, resolve lifecycles, then apply options.
     flakes.extend(raw_overlay);
-    let mut resolved = resolve_latest_ops_keep_asserts(flakes, IndexType::Spot);
+    let mut resolved = fluree_db_core::range::resolve_current_flakes(flakes, IndexType::Spot);
 
     // Re-apply subject bounds: start_bound.s <= s < end_bound.s.
     resolved.retain(|f| f.s >= start_bound.s && f.s < end_bound.s);
@@ -1589,7 +1459,7 @@ fn overlay_only_flakes_bounded(
     );
 
     // Resolve lifecycles (latest op wins) and drop retracts.
-    let mut resolved = resolve_latest_ops_keep_asserts(flakes, index);
+    let mut resolved = fluree_db_core::range::resolve_current_flakes(flakes, index);
 
     // Apply options after lifecycle resolution.
     if let Some(ref bounds) = opts.object_bounds {
@@ -1610,22 +1480,37 @@ fn overlay_only_flakes_bounded(
 ///
 /// Reached whenever a bound component of `match_val` has no persisted id
 /// (a novelty-only subject, predicate, or object), or no branch manifest
-/// exists for the requested order (genesis / pre-first-index).
+/// exists for `(g_id, order)`.
+///
+/// That second trigger is broader than "genesis / pre-first-index":
+/// `branch_for_order` is keyed per graph AND order, and the bulk-import path
+/// emits SPOT unconditionally while skipping PSOT/POST/OPST when the order
+/// produced no run files (`index_build.rs`'s empty-run-dir early return),
+/// so a graph with zero rows at the indexed `t` lands here for three of the
+/// four orders. Falling back is still correct: the orders that go missing
+/// are exactly the zero-row ones, so there are no persisted rows to drop.
+/// The converse does NOT hold — SPOT can be `Some` with an empty branch —
+/// so nothing here may treat "this order resolved" as "this graph is
+/// indexed".
 ///
 /// The overlay is a **log**, not a current-state view: an assert at `t=2`
 /// and its retraction at `t=3` both sit in novelty. So retractions are kept
-/// through the walk and the whole matching set is lifecycle-resolved
-/// (newest op per fact identity wins, retracted keys drop out) before
-/// options are applied — the same rule the cursor path gets from
-/// `resolve_overlay_ops` and the bounded twin gets from
-/// `resolve_latest_ops_keep_asserts`. Filtering to `op == true` inside the
-/// walk instead silently resurrects every fact whose assert AND retract
-/// both live in novelty.
+/// through the walk and the whole matching set is lifecycle-resolved by
+/// `resolve_current_flakes` — the shared rule, hashing the full
+/// `(s, p, o, dt, m)` identity, which the bounded twin and the untranslated
+/// fallback also use and which the cursor path mirrors in
+/// `resolve_overlay_ops`. Filtering to `op == true` inside the walk instead
+/// silently resurrects every fact whose assert AND retract both live in
+/// novelty.
 ///
-/// This also rules out an early exit at `limit`: the retraction that
-/// cancels an already-collected assert can arrive after the limit is
-/// reached. `for_each_overlay_flake` walks the graph's whole overlay
-/// regardless, so the exit only ever saved clones of matching flakes.
+/// `object_bounds` stays IN the walk: a retraction that can cancel an assert
+/// carries the same `o` by construction (the fact identity requires it), so
+/// the bound is true for both halves or false for both, and pruning early is
+/// equivalent to pruning survivors while collecting and cloning less. The
+/// `offset`/`limit` pair cannot move in with it — they count survivors, and
+/// the retraction that cancels an already-counted assert can arrive after
+/// the count is reached. `for_each_overlay_flake` walks the graph's whole
+/// overlay regardless, so no early exit would shorten the traversal anyway.
 fn overlay_only_flakes(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
@@ -1677,17 +1562,23 @@ fn overlay_only_flakes(
                 }
             }
 
+            // Object bounds are a pure function of `o`, which a fact and its
+            // retraction share, so this prunes whole facts rather than
+            // splitting one — see the note above.
+            if let Some(ref bounds) = opts.object_bounds {
+                if !bounds.matches(&flake.o) {
+                    return;
+                }
+            }
+
             // Keep both asserts and retracts; resolve lifecycles below.
             flakes.push(flake.clone());
         },
     );
 
-    let mut resolved = resolve_latest_ops_keep_asserts(flakes, index);
+    let mut resolved = fluree_db_core::range::resolve_current_flakes(flakes, index);
 
-    // Options apply to the resolved current state, not to the log.
-    if let Some(ref bounds) = opts.object_bounds {
-        resolved.retain(|f| bounds.matches(&f.o));
-    }
+    // Counting options apply to the resolved current state, not to the log.
     if offset > 0 && !resolved.is_empty() {
         let n = offset.min(resolved.len());
         resolved.drain(0..n);
@@ -1702,294 +1593,9 @@ fn overlay_only_flakes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::FlakeMeta;
 
     fn s(name: &str) -> Sid {
         Sid::new(100, name)
-    }
-
-    fn dt_string() -> Sid {
-        Sid::new(fluree_vocab::namespaces::XSD, "string")
-    }
-
-    /// One flake on `ex:sub ex:pred`, with `m` supplied directly.
-    fn f(o: &str, t: i64, op: bool, m: Option<FlakeMeta>) -> Flake {
-        Flake::new(
-            s("sub"),
-            s("pred"),
-            FlakeValue::String(o.to_string()),
-            dt_string(),
-            t,
-            op,
-            m,
-        )
-    }
-
-    fn at(i: i32) -> Option<FlakeMeta> {
-        FlakeMeta::from_parts(None, Some(i))
-    }
-
-    fn tagged(lang: &str) -> Option<FlakeMeta> {
-        FlakeMeta::from_parts(Some(lang), None)
-    }
-
-    fn rendered(flakes: &[Flake]) -> Vec<(String, Option<FlakeMeta>)> {
-        flakes
-            .iter()
-            .map(|f| {
-                let o = match &f.o {
-                    FlakeValue::String(v) => v.clone(),
-                    other => format!("{other:?}"),
-                };
-                (o, f.m.clone())
-            })
-            .collect()
-    }
-
-    /// The plain case the helper always handled: one fact, asserted then
-    /// retracted, resolves away.
-    #[test]
-    fn single_valued_retraction_resolves() {
-        let out = resolve_latest_ops_keep_asserts(
-            vec![f("a", 2, true, None), f("a", 3, false, None)],
-            IndexType::Spot,
-        );
-        assert!(out.is_empty());
-    }
-
-    /// A `@list` that repeats a value: `["a", "b", "a"]` with position 0
-    /// deleted. The comparators order `t` before `m`, so the sibling `a@2`
-    /// assert sits between `a@0`'s assert and its retraction — cutting runs
-    /// on full identity closed the group early and emitted the retracted
-    /// `a@0` as live. Position 0 is the load-bearing case: deleting position
-    /// 2 passed even with the bug, because it only fails when the retracted
-    /// entry's metadata sorts below a surviving sibling's.
-    #[test]
-    fn repeated_list_value_retracts_the_right_position() {
-        let out = resolve_latest_ops_keep_asserts(
-            vec![
-                f("a", 2, true, at(0)),
-                f("b", 2, true, at(1)),
-                f("a", 2, true, at(2)),
-                f("a", 3, false, at(0)),
-            ],
-            IndexType::Spot,
-        );
-        assert_eq!(
-            rendered(&out),
-            vec![("a".to_string(), at(2)), ("b".to_string(), at(1))],
-            "only the position-0 entry may go"
-        );
-    }
-
-    /// The mirror case that used to pass, kept so a future regrouping can't
-    /// fix one position by breaking the other.
-    #[test]
-    fn repeated_list_value_retracts_the_last_position() {
-        let out = resolve_latest_ops_keep_asserts(
-            vec![
-                f("a", 2, true, at(0)),
-                f("b", 2, true, at(1)),
-                f("a", 2, true, at(2)),
-                f("a", 3, false, at(2)),
-            ],
-            IndexType::Spot,
-        );
-        assert_eq!(
-            rendered(&out),
-            vec![("a".to_string(), at(0)), ("b".to_string(), at(1))]
-        );
-    }
-
-    /// One lexical form under two language tags: distinct facts (#1273), so
-    /// retracting the `@en` must leave the `@fr` and take nothing else.
-    #[test]
-    fn language_tagged_siblings_retract_independently() {
-        let out = resolve_latest_ops_keep_asserts(
-            vec![
-                f("hello", 2, true, tagged("en")),
-                f("hello", 2, true, tagged("fr")),
-                f("hello", 3, false, tagged("en")),
-            ],
-            IndexType::Spot,
-        );
-        assert_eq!(rendered(&out), vec![("hello".to_string(), tagged("fr"))]);
-    }
-
-    /// A position retracted and re-asserted must come back, and the winner is
-    /// the newest op for that `m` alone — not the newest in the whole run.
-    #[test]
-    fn reasserted_position_survives_a_sibling_with_a_later_t() {
-        let out = resolve_latest_ops_keep_asserts(
-            vec![
-                f("a", 2, true, at(0)),
-                f("a", 3, false, at(0)),
-                f("a", 4, true, at(0)),
-                f("a", 5, true, at(1)),
-            ],
-            IndexType::Spot,
-        );
-        assert_eq!(
-            rendered(&out),
-            vec![("a".to_string(), at(0)), ("a".to_string(), at(1))]
-        );
-    }
-
-    /// At equal `t` a retraction beats an assert, per `resolve_current_flakes`.
-    #[test]
-    fn retraction_wins_at_equal_t() {
-        let out = resolve_latest_ops_keep_asserts(
-            vec![f("a", 2, true, at(0)), f("a", 2, false, at(0))],
-            IndexType::Spot,
-        );
-        assert!(out.is_empty());
-    }
-
-    /// Output must stay in comparator order: callers take it as a range
-    /// result. Winners are collected in `t` order inside a run, so a run
-    /// whose survivors' `t` order disagrees with their `m` order would emit
-    /// unsorted without the final sort.
-    #[test]
-    fn output_is_comparator_ordered() {
-        let out = resolve_latest_ops_keep_asserts(
-            vec![
-                // `m` ascending but `t` descending across the two survivors.
-                f("a", 9, true, at(0)),
-                f("a", 3, true, at(1)),
-            ],
-            IndexType::Spot,
-        );
-        let cmp = IndexType::Spot.comparator();
-        assert!(
-            out.windows(2)
-                .all(|w| cmp(&w[0], &w[1]) != std::cmp::Ordering::Greater),
-            "resolved range results must be index-ordered, got {:?}",
-            rendered(&out)
-        );
-    }
-
-    /// One list POSITION carrying two language tags — the combination the
-    /// other cases only cover separately, and the one place `FlakeMeta`'s
-    /// `Ord`/`Eq` disagreement bites (#1711).
-    ///
-    /// `FlakeMeta::cmp` consults only `i` when both sides carry a list index,
-    /// so `{lang: en, i: 0}` and `{lang: fr, i: 0}` compare `Equal` while
-    /// being unequal. Grouping that sorts on `cmp` and cuts on `==` therefore
-    /// sorts by one relation and groups by a stricter one — the #1703 mistake
-    /// one level down — and the `@en` sibling's assert separates the `@fr`
-    /// fact from its own retraction.
-    ///
-    /// The retraction must land in a LATER transaction than the sibling's
-    /// assert; a same-transaction rewrite happens to resolve either way.
-    #[test]
-    fn one_list_position_under_two_language_tags_resolves_independently() {
-        let at_lang = |lang: &str, i: i32| FlakeMeta::from_parts(Some(lang), Some(i));
-        let out = resolve_latest_ops_keep_asserts(
-            vec![
-                f("x", 2, true, at_lang("en", 0)),
-                f("x", 3, true, at_lang("fr", 0)),
-                f("x", 4, false, at_lang("en", 0)),
-            ],
-            IndexType::Spot,
-        );
-        assert_eq!(
-            rendered(&out),
-            vec![("x".to_string(), at_lang("fr", 0))],
-            "the retracted @en fact must go; its @fr sibling at the same \
-             position must stay"
-        );
-    }
-
-    /// Mirror of the above with the tags swapped, so a grouping that happens
-    /// to work for one tag order can't pass.
-    #[test]
-    fn one_list_position_two_tags_mirror_order() {
-        let at_lang = |lang: &str, i: i32| FlakeMeta::from_parts(Some(lang), Some(i));
-        let out = resolve_latest_ops_keep_asserts(
-            vec![
-                f("x", 2, true, at_lang("fr", 0)),
-                f("x", 3, true, at_lang("en", 0)),
-                f("x", 4, false, at_lang("fr", 0)),
-            ],
-            IndexType::Spot,
-        );
-        assert_eq!(rendered(&out), vec![("x".to_string(), at_lang("en", 0))]);
-    }
-
-    /// The invariant the grouping rests on: the order it sorts by must agree
-    /// with the equality it cuts groups on. `FlakeMeta`'s own `Ord` does NOT
-    /// (that is #1711), which is why grouping uses a local strict order.
-    #[test]
-    fn group_order_agrees_with_metadata_equality() {
-        let m = |lang: Option<&str>, i: Option<i32>| FlakeMeta::from_parts(lang, i);
-        let metas = [
-            m(None, None),
-            m(Some("en"), None),
-            m(Some("fr"), None),
-            m(None, Some(0)),
-            m(Some("en"), Some(0)),
-            m(Some("fr"), Some(0)),
-            m(Some("en"), Some(1)),
-            m(None, Some(1)),
-        ];
-        for a in &metas {
-            for b in &metas {
-                assert_eq!(
-                    meta_group_cmp(a, b) == std::cmp::Ordering::Equal,
-                    a == b,
-                    "group order disagrees with equality for {a:?} vs {b:?}"
-                );
-            }
-        }
-        // And the pair that motivates it: equal under `FlakeMeta::cmp`,
-        // unequal in fact.
-        let en0 = m(Some("en"), Some(0)).unwrap();
-        let fr0 = m(Some("fr"), Some(0)).unwrap();
-        assert_eq!(en0.cmp(&fr0), std::cmp::Ordering::Equal, "see #1711");
-        assert_ne!(en0, fr0);
-    }
-
-    /// A list holding ONE value at many positions puts every entry in a
-    /// single `(s, p, o, dt)` run with a distinct `m` each — the worst case
-    /// for the per-`m` grouping, and the shape a "have I seen this `m`"
-    /// linear probe would turn quadratic. Sized so a quadratic grouper would
-    /// be conspicuous rather than merely slower.
-    #[test]
-    fn many_positions_of_one_value_resolve_without_a_quadratic() {
-        const K: i32 = 4_000;
-        let mut flakes: Vec<Flake> = (0..K).map(|i| f("x", 2, true, at(i))).collect();
-        // Retract every third position.
-        flakes.extend(
-            (0..K)
-                .filter(|i| i % 3 == 0)
-                .map(|i| f("x", 3, false, at(i))),
-        );
-
-        let started = std::time::Instant::now();
-        let out = resolve_latest_ops_keep_asserts(flakes, IndexType::Spot);
-        let elapsed = started.elapsed();
-
-        let expected = (0..K).filter(|i| i % 3 != 0).count();
-        assert_eq!(
-            out.len(),
-            expected,
-            "exactly the unretracted positions live"
-        );
-        let survivors: Vec<i32> = out.iter().filter_map(|f| f.m.as_ref()?.i).collect();
-        assert!(
-            survivors.iter().all(|i| i % 3 != 0),
-            "no retracted position may survive"
-        );
-        assert!(
-            survivors.windows(2).all(|w| w[0] < w[1]),
-            "survivors stay in index order"
-        );
-        // Generous by ~2 orders of magnitude against the real runtime, so it
-        // fails on a reintroduced quadratic without flaking on a slow box.
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "resolution took {elapsed:?} for {K} positions — grouping went superlinear"
-        );
     }
 
     /// The latest-op-wins rule `batched_refs_overlay_only` delegates to.
@@ -2052,31 +1658,57 @@ mod tests {
         );
     }
 
-    /// Distinct datatypes on the same lexical value are distinct facts, so a
-    /// retraction of one must not take the other. Pins that `dt` stays in the
-    /// run key rather than being folded in with `m`.
+    /// The equal-`t` tie on the policy lane, and the map-shape contract.
+    ///
+    /// `t > t0` alone let whichever flake the walk yielded first win a tie,
+    /// and the direction it failed was open: a same-`t` assert+retract left
+    /// the class granted. And a subject whose overlay flakes are all
+    /// retractions must be ABSENT from the map, not present with an empty
+    /// vector — `lookup_subject_classes` documents that, and its per-subject
+    /// fallback enforces it.
     #[test]
-    fn datatype_siblings_retract_independently() {
-        let typed = |dt: &str, t: i64, op: bool| {
+    fn batched_ref_deltas_tie_and_map_shape() {
+        let rdf_type = s("type");
+        let type_flake = |subject: &str, class: &str, t: i64, op: bool| {
             Flake::new(
-                s("sub"),
-                s("pred"),
-                FlakeValue::String("1".to_string()),
-                Sid::new(fluree_vocab::namespaces::XSD, dt),
+                s(subject),
+                rdf_type.clone(),
+                FlakeValue::Ref(s(class)),
+                Sid::new(0, ""),
                 t,
                 op,
                 None,
             )
         };
-        let out = resolve_latest_ops_keep_asserts(
-            vec![
-                typed("string", 2, true),
-                typed("token", 2, true),
-                typed("string", 3, false),
-            ],
-            IndexType::Spot,
+
+        // Assert-first and retract-first orderings must agree.
+        for flip in [false, true] {
+            let mut raw = vec![
+                type_flake("carol", "Admin", 2, true),
+                type_flake("carol", "Admin", 2, false),
+            ];
+            if flip {
+                raw.reverse();
+            }
+            let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
+            apply_raw_overlay_deltas_to_batched_refs(&mut out, &raw, &rdf_type, 10);
+            assert!(
+                !out.contains_key(&s("carol")),
+                "same-t assert+retract must revoke, and leave no empty entry (flip={flip})"
+            );
+        }
+
+        // Retraction-only overlay for a subject: absent, not empty.
+        let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
+        apply_raw_overlay_deltas_to_batched_refs(
+            &mut out,
+            &[type_flake("dave", "Admin", 3, false)],
+            &rdf_type,
+            10,
         );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].dt.name_str(), "token");
+        assert!(
+            !out.contains_key(&s("dave")),
+            "a subject with no surviving class must not appear in the map"
+        );
     }
 }

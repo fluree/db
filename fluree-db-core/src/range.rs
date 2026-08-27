@@ -349,20 +349,26 @@ fn collect_overlay_only<O: OverlayProvider + ?Sized>(
 }
 
 /// Resolve a mixed bag of assert/retract flakes to the currently-asserted
-/// set: sort in `index` order (which places the newest `t` last within a
-/// fact key), keep the newest op per fact key, drop retractions. This is the
-/// same lifecycle rule the overlay-only range path applies; callers that
-/// merge base rows with a raw overlay walk themselves use it to get
-/// identical results to [`range_with_overlay`].
+/// set: sort in `index` order, keep the newest op per fact key, drop
+/// retractions. This is the same lifecycle rule the overlay-only range path
+/// applies; callers that merge base rows with a raw overlay walk themselves
+/// use it to get identical results to [`range_with_overlay`].
+///
+/// At equal `t` a retraction beats an assert, so an assert and a retract of
+/// the same fact at one `t` resolve to absent. That matches
+/// `fluree_db_binary_index::read::types::resolve_overlay_ops`, which the
+/// cursor path uses, and the per-commit apply path. The transaction
+/// accumulator dedups within a commit so the tie is not reachable through a
+/// single transaction, but the segment-aware overlay assembly merges runs
+/// across segments — the rule is here so every path lands on the same answer
+/// rather than on whichever flake sorted last.
 pub fn resolve_current_flakes(mut flakes: Vec<Flake>, index: IndexType) -> Vec<Flake> {
     flakes.sort_by(index.comparator());
     remove_stale_flakes(flakes)
 }
 
-/// Remove stale flakes from an owned vector.
-///
-/// Iterates in reverse (newest first for identical facts), keeps only the
-/// first occurrence of each fact key, and drops retractions.
+/// Remove stale flakes from an owned vector: keep the winning op per fact
+/// key, drop retractions, preserve the input's order among survivors.
 ///
 /// The fact key includes the flake metadata `m` (language tag and list
 /// index), not just `(s, p, o, dt)`. Two flakes that share a subject,
@@ -370,8 +376,20 @@ pub fn resolve_current_flakes(mut flakes: Vec<Flake>, index: IndexType) -> Vec<F
 /// (e.g. `"animal"@en` vs `"animal"@fr`) or list position are **distinct
 /// RDF facts** and must both survive — omitting `m` here silently collapses
 /// language variants on insert (issue #1273).
+///
+/// Hashing the full identity is what makes that robust: it needs no
+/// adjacency between a fact's own flakes, so it does not care that the
+/// comparators order `t` before `m` and therefore interleave metadata
+/// siblings (see #1703), nor that `FlakeMeta`'s `Ord` disagrees with its
+/// `Eq` when both sides carry a list index (see #1711). `Hash`/`Eq` are
+/// derived together and agree.
+///
+/// The winner is chosen explicitly rather than by taking the first hit of a
+/// reverse scan, so the equal-`t` tie resolves to the retraction (see
+/// [`resolve_current_flakes`]) instead of to whichever op the comparator
+/// happened to sort last.
 fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     #[derive(Clone, Copy, Hash, PartialEq, Eq)]
     struct FactKeyRef<'a> {
@@ -382,10 +400,9 @@ fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
         m: &'a Option<FlakeMeta>,
     }
 
-    let mut seen: HashSet<FactKeyRef<'_>> = HashSet::new();
-    let mut keep = vec![false; flakes.len()];
+    let mut winner: HashMap<FactKeyRef<'_>, usize> = HashMap::with_capacity(flakes.len());
 
-    for (idx, f) in flakes.iter().enumerate().rev() {
+    for (idx, f) in flakes.iter().enumerate() {
         let key = FactKeyRef {
             s: &f.s,
             p: &f.p,
@@ -393,10 +410,23 @@ fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
             dt: &f.dt,
             m: &f.m,
         };
-        if !seen.insert(key) {
-            continue;
+        match winner.get(&key) {
+            None => {
+                winner.insert(key, idx);
+            }
+            Some(&cur_idx) => {
+                let cur = &flakes[cur_idx];
+                // Newest op wins; at equal `t` the retraction does.
+                if f.t > cur.t || (f.t == cur.t && !f.op && cur.op) {
+                    winner.insert(key, idx);
+                }
+            }
         }
-        if f.op {
+    }
+
+    let mut keep = vec![false; flakes.len()];
+    for idx in winner.into_values() {
+        if flakes[idx].op {
             keep[idx] = true;
         }
     }
@@ -462,6 +492,239 @@ mod tests {
         let out = resolve_current_flakes(flakes, IndexType::Spot);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].m.as_ref().and_then(|m| m.i), Some(0));
+    }
+
+    /// An assert and a retract of the same fact at the SAME `t` resolve to
+    /// absent. The comparator orders `op` ascending, so a reverse scan that
+    /// took its first hit picked the assert and the fact survived — which
+    /// disagreed with `resolve_overlay_ops` on the cursor path, and so with
+    /// this function's own documented promise of "identical results to
+    /// `range_with_overlay`".
+    #[test]
+    fn resolve_current_flakes_retraction_wins_at_equal_t() {
+        let out = resolve_current_flakes(
+            vec![
+                fact("a", "x", 2, true, None),
+                fact("a", "x", 2, false, None),
+            ],
+            IndexType::Spot,
+        );
+        assert!(out.is_empty(), "same-t assert+retract resolves to absent");
+
+        // Order of the input must not change the answer.
+        let out = resolve_current_flakes(
+            vec![
+                fact("a", "x", 2, false, None),
+                fact("a", "x", 2, true, None),
+            ],
+            IndexType::Spot,
+        );
+        assert!(out.is_empty());
+    }
+
+    /// Metadata siblings: the comparators order `t` before `m`, so a
+    /// sibling's assert sits between a fact's own assert and its retraction.
+    /// Hashing the full identity is immune to that — no adjacency is
+    /// assumed (#1703).
+    #[test]
+    fn resolve_current_flakes_metadata_siblings_are_independent() {
+        // `["a", "b", "a"]` with position 0 retracted. Deleting position 0 is
+        // the failing direction for adjacency-based grouping; position 2
+        // passes either way.
+        let out = resolve_current_flakes(
+            vec![
+                fact("s", "a", 2, true, Some(0)),
+                fact("s", "b", 2, true, Some(1)),
+                fact("s", "a", 2, true, Some(2)),
+                fact("s", "a", 3, false, Some(0)),
+            ],
+            IndexType::Spot,
+        );
+        let mut positions: Vec<i32> = out.iter().filter_map(|f| f.m.as_ref()?.i).collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![1, 2], "only position 0 goes");
+    }
+
+    /// One list position under two language tags: `FlakeMeta::cmp` consults
+    /// only `i` when both sides carry a list index, so those two compare
+    /// `Equal` without being equal (#1711). The fact key hashes `Hash`/`Eq`,
+    /// which agree, so they stay distinct facts here.
+    #[test]
+    fn resolve_current_flakes_one_position_two_language_tags() {
+        let tagged = |lang: &str, t: i64, op: bool| Flake {
+            s: Sid::new(1, "s"),
+            p: Sid::new(2, "p"),
+            o: FlakeValue::String("x".to_string()),
+            dt: Sid::new(3, "string"),
+            t,
+            op,
+            m: Some(FlakeMeta {
+                lang: Some(lang.to_string()),
+                i: Some(0),
+            }),
+            g: None,
+        };
+        let out = resolve_current_flakes(
+            vec![
+                tagged("en", 2, true),
+                tagged("fr", 3, true),
+                tagged("en", 4, false),
+            ],
+            IndexType::Spot,
+        );
+        assert_eq!(out.len(), 1, "the retracted @en must go");
+        assert_eq!(
+            out[0].m.as_ref().and_then(|m| m.lang.as_deref()),
+            Some("fr")
+        );
+    }
+
+    /// Mirror of the metadata-sibling case: retracting the LAST position
+    /// passed even under adjacency-based grouping, so it is kept so a future
+    /// regrouping cannot fix one direction by breaking the other.
+    #[test]
+    fn resolve_current_flakes_metadata_siblings_last_position() {
+        let out = resolve_current_flakes(
+            vec![
+                fact("s", "a", 2, true, Some(0)),
+                fact("s", "b", 2, true, Some(1)),
+                fact("s", "a", 2, true, Some(2)),
+                fact("s", "a", 3, false, Some(2)),
+            ],
+            IndexType::Spot,
+        );
+        let mut positions: Vec<i32> = out.iter().filter_map(|f| f.m.as_ref()?.i).collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![0, 1]);
+    }
+
+    /// The winner is the newest op for a fact's OWN key, not the newest op in
+    /// its neighbourhood: a position retracted and then re-asserted comes
+    /// back even when a sibling carries a later `t`.
+    #[test]
+    fn resolve_current_flakes_reasserted_position_survives_later_sibling() {
+        let out = resolve_current_flakes(
+            vec![
+                fact("s", "a", 2, true, Some(0)),
+                fact("s", "a", 3, false, Some(0)),
+                fact("s", "a", 4, true, Some(0)),
+                fact("s", "a", 5, true, Some(1)),
+            ],
+            IndexType::Spot,
+        );
+        let mut positions: Vec<i32> = out.iter().filter_map(|f| f.m.as_ref()?.i).collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![0, 1]);
+    }
+
+    /// Same lexical form under two language tags with no list index — the
+    /// #1273 shape — must retract independently.
+    #[test]
+    fn resolve_current_flakes_language_siblings_without_list_index() {
+        let tagged = |lang: &str, t: i64, op: bool| Flake {
+            s: Sid::new(1, "s"),
+            p: Sid::new(2, "p"),
+            o: FlakeValue::String("hello".to_string()),
+            dt: Sid::new(3, "string"),
+            t,
+            op,
+            m: Some(FlakeMeta {
+                lang: Some(lang.to_string()),
+                i: None,
+            }),
+            g: None,
+        };
+        let out = resolve_current_flakes(
+            vec![
+                tagged("en", 2, true),
+                tagged("fr", 2, true),
+                tagged("en", 3, false),
+            ],
+            IndexType::Spot,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].m.as_ref().and_then(|m| m.lang.as_deref()),
+            Some("fr")
+        );
+    }
+
+    /// Distinct datatypes on one lexical value are distinct facts, so `dt`
+    /// must stay in the key.
+    #[test]
+    fn resolve_current_flakes_datatype_siblings_are_independent() {
+        let typed = |dt: &str, t: i64, op: bool| Flake {
+            s: Sid::new(1, "s"),
+            p: Sid::new(2, "p"),
+            o: FlakeValue::String("1".to_string()),
+            dt: Sid::new(3, dt),
+            t,
+            op,
+            m: None,
+            g: None,
+        };
+        let out = resolve_current_flakes(
+            vec![
+                typed("string", 2, true),
+                typed("token", 2, true),
+                typed("string", 3, false),
+            ],
+            IndexType::Spot,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].dt.name_str(), "token");
+    }
+
+    /// Survivors come back in index order — callers take this as a range
+    /// result. Hashing the identity means the winner is chosen per key, so
+    /// the output must still follow the sorted input's order.
+    #[test]
+    fn resolve_current_flakes_output_is_comparator_ordered() {
+        let out = resolve_current_flakes(
+            vec![
+                // `m` ascending but `t` descending across the two survivors.
+                fact("s", "a", 9, true, Some(0)),
+                fact("s", "a", 3, true, Some(1)),
+            ],
+            IndexType::Spot,
+        );
+        let cmp = IndexType::Spot.comparator();
+        assert!(
+            out.windows(2)
+                .all(|w| cmp(&w[0], &w[1]) != std::cmp::Ordering::Greater),
+            "resolved range results must be index-ordered"
+        );
+    }
+
+    /// A list holding ONE value at many positions puts every entry under the
+    /// same `(s, p, o, dt)` with a distinct `m`. Hashing the identity keeps
+    /// that linear; an adjacency- or scan-based grouper would go quadratic
+    /// here, which is the shape this area of the code exists to have stopped
+    /// doing.
+    #[test]
+    fn resolve_current_flakes_many_positions_of_one_value_stay_linear() {
+        const K: i32 = 4_000;
+        let mut flakes: Vec<Flake> = (0..K).map(|i| fact("s", "x", 2, true, Some(i))).collect();
+        flakes.extend(
+            (0..K)
+                .filter(|i| i % 3 == 0)
+                .map(|i| fact("s", "x", 3, false, Some(i))),
+        );
+
+        let started = std::time::Instant::now();
+        let out = resolve_current_flakes(flakes, IndexType::Spot);
+        let elapsed = started.elapsed();
+
+        let expected = (0..K).filter(|i| i % 3 != 0).count();
+        assert_eq!(out.len(), expected);
+        let positions: Vec<i32> = out.iter().filter_map(|f| f.m.as_ref()?.i).collect();
+        assert!(positions.iter().all(|i| i % 3 != 0));
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
+        // Generous by ~2 orders of magnitude against the real runtime.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "resolution took {elapsed:?} for {K} positions — went superlinear"
+        );
     }
 
     #[test]
