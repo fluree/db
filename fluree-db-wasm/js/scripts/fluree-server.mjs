@@ -9,7 +9,7 @@
 // `--storage-proxy-insecure` dev escape.
 
 import { spawn, spawnSync } from "node:child_process";
-import { createPrivateKey, generateKeyPairSync, sign } from "node:crypto";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -72,7 +72,7 @@ export function mintStorageProxyToken(identity, { ledgers, ttlSecs = 3600, ident
     ...(identityIri ? { "fluree.identity": identityIri } : {}),
   };
   const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
-  const sig = sign(null, Buffer.from(signingInput), createPrivateKey(identity.privateKey));
+  const sig = sign(null, Buffer.from(signingInput), identity.privateKey);
   return `${signingInput}.${b64url(sig)}`;
 }
 
@@ -177,6 +177,20 @@ export async function postJson(url, body, { expect: expectStatus, headers = {} }
     method: "POST",
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (expectStatus !== undefined && res.status !== expectStatus) {
+    throw new Error(`POST ${url} → ${res.status} (expected ${expectStatus}): ${text}`);
+  }
+  return { status: res.status, text, json: text ? safeJson(text) : null };
+}
+
+/** POST a text body (Turtle/TriG) to the server, asserting the status. */
+export async function postText(url, body, { contentType, expect: expectStatus } = {}) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": contentType },
+    body,
   });
   const text = await res.text();
   if (expectStatus !== undefined && res.status !== expectStatus) {

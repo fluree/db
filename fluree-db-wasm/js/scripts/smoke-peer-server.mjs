@@ -33,7 +33,13 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { awaitPageMarker, cdpConnect, evaluate, findChrome, launchChrome, openPage } from "./chrome.mjs";
-import { createIdentity, mintStorageProxyToken, postJson, startFlureeServer } from "./fluree-server.mjs";
+import {
+  createIdentity,
+  mintStorageProxyToken,
+  postJson,
+  postText,
+  startFlureeServer,
+} from "./fluree-server.mjs";
 import { startTap } from "./http-tap.mjs";
 import { packageRoot, startServer } from "./serve.mjs";
 
@@ -90,18 +96,15 @@ try {
   // Pin the serving posture explicitly. `f:serveBlocks` absent already means
   // "allowed", so this asserts the gate is engaged rather than relying on a
   // default the peer would silently depend on.
-  await postJson(
-    `${server.apiBase}/update/${LEDGER}`,
-    {
-      "@context": { f: "https://ns.flur.ee/db#", rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#" },
-      insert: {
-        "@graph": `urn:fluree:${LEDGER.split(":")[0]}#config`,
-        "@id": "urn:cfg:main",
-        "@type": "f:LedgerConfig",
-        "f:servingDefaults": { "@id": "urn:cfg:serving", "f:serveBlocks": true },
-      },
-    },
-    { expect: 200 },
+  await postText(
+    `${server.apiBase}/upsert/${LEDGER}`,
+    `@prefix f: <https://ns.flur.ee/db#> .
+     GRAPH <urn:fluree:${LEDGER}#config> {
+       <urn:cfg:main>    a                 f:LedgerConfig ;
+                         f:servingDefaults <urn:cfg:serving> .
+       <urn:cfg:serving> f:serveBlocks     true .
+     }`,
+    { contentType: "application/trig", expect: 200 },
   );
   await postJson(
     `${server.apiBase}/insert/${LEDGER}`,
