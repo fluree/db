@@ -26,6 +26,7 @@
 
 import type {
   CommitReceipt,
+  CycleOutcomeEvent,
   ErrorShape,
   EventBody,
   EventMessage,
@@ -42,6 +43,7 @@ import type {
 
 export type {
   CommitReceipt,
+  CycleOutcomeEvent,
   ErrorShape,
   EventBody,
   HeadChangeEvent,
@@ -63,6 +65,46 @@ export interface LiveUpdate {
   data?: unknown;
   error?: FlureeError;
 }
+
+/**
+ * One advance-cycle in its BATCH form, as delivered to `onCycle` — before
+ * it is fanned out to per-subscription callbacks.
+ *
+ * `subscribe()`'s per-sub callbacks are the ergonomic surface, but they lose
+ * two things a caching consumer needs. Version coherence: applying every
+ * entry of a cycle before notifying anyone is what makes two sibling
+ * components unable to disagree about `t`, and that is only possible if the
+ * whole batch arrives together. And `unchanged`: "this query re-ran at `t`
+ * and its results did not move" is information (it retires an error, and it
+ * is the signal NOT to touch a cached snapshot), which per-sub callbacks
+ * cannot express because they deliver nothing at all.
+ */
+export interface LiveCycle {
+  ledger: string;
+  /** The cycle's frozen watermark, or `undefined` when the engine had no
+   * consistent view for it (the protocol's `-1`). */
+  t: number | undefined;
+  /** Subscriptions whose results moved, with their decoded payloads. */
+  changed: { subId: number; data: unknown }[];
+  /** Subscriptions that re-ran at `t` and produced identical results. */
+  unchanged: number[];
+  /** Per-subscription failures. These repeat every cycle and never block
+   * the other subscriptions. */
+  errored: { subId: number; error: FlureeError }[];
+}
+
+/**
+ * Engine lifecycle, for consumers that must react to a crash recycle.
+ * Subscriptions and in-memory state do NOT survive one, so a consumer holding
+ * live subscriptions has to re-register them when the engine comes back.
+ *
+ * - `"recycling"`: the worker was poisoned and torn down; a respawn is
+ *   scheduled. Everything in flight has already been rejected.
+ * - `"ready"`: a fresh worker finished re-initializing. Re-subscribe here.
+ * - `"terminal"`: the respawn budget is spent (or the engine never booted).
+ *   Nothing will come back; every later call rejects.
+ */
+export type EngineState = "recycling" | "ready" | "terminal";
 
 /** A registered live subscription; `unsubscribe()` stops updates. */
 export class LiveSubscription {
@@ -187,6 +229,7 @@ class Channel {
   private readonly eventListeners = new Set<
     (event: EventBody, payloads?: ArrayBuffer[]) => void
   >();
+  private readonly stateListeners = new Set<(state: EngineState) => void>();
   /** Bumped on every recycle; `Ledger`/`Snapshot` objects stamp it at
    * creation so pre-crash handles can never alias a fresh engine's state
    * (review H-4). */
@@ -218,6 +261,24 @@ class Channel {
   addEventListener(listener: (event: EventBody, payloads?: ArrayBuffer[]) => void): () => void {
     this.eventListeners.add(listener);
     return () => this.eventListeners.delete(listener);
+  }
+
+  /** Subscribe to engine lifecycle transitions (crash recycle); returns the
+   * unsubscriber. These originate on THIS side, not in the worker, so they
+   * are not `EventBody` kinds. */
+  addStateListener(listener: (state: EngineState) => void): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+
+  private emitState(state: EngineState): void {
+    for (const listener of [...this.stateListeners]) {
+      try {
+        listener(state);
+      } catch {
+        // A listener's throw must not break dispatch to the others.
+      }
+    }
   }
 
   private attach(worker: Worker): void {
@@ -324,8 +385,10 @@ class Channel {
           : `engine worker never became ready: ${error.message}`,
         fatal: true,
       });
+      this.emitState("terminal");
       return;
     }
+    this.emitState("recycling");
     const delay = RESPAWN_BACKOFF_MS * 2 ** this.respawnAttempts;
     this.respawnAttempts++;
     this.respawnTimer = setTimeout(() => {
@@ -343,6 +406,8 @@ class Channel {
           .then((res) => {
             if (res.ok) {
               this.markInitialized();
+              // Subscriptions did NOT survive: consumers re-register here.
+              this.emitState("ready");
               return;
             }
             // A NON-fatal re-init failure lands here and used to stop: not
@@ -424,6 +489,54 @@ function queryKindOf(query: string | object): QueryKind {
   return typeof query === "string" ? "sparql" : "jsonld";
 }
 
+/**
+ * Decode one wire `cycleOutcome` into the batch form. The ONE place payload
+ * buffers are decoded and the `-1` no-consistent-view watermark is
+ * normalized, so the per-sub fan-out below and `Peer.onCycle` can never
+ * disagree about what a cycle meant.
+ */
+function toLiveCycle(event: CycleOutcomeEvent, payloads?: ArrayBuffer[]): LiveCycle {
+  const cycle: LiveCycle = {
+    ledger: event.ledger,
+    t: event.t === -1 ? undefined : event.t,
+    changed: [],
+    unchanged: [...event.unchanged],
+    errored: event.errored.map(({ subId, error }) => ({
+      subId,
+      error: new FlureeError({ code: "internal", status: 500, message: error }),
+    })),
+  };
+  event.changed.forEach((c, i) => {
+    const buf = payloads?.[i];
+    if (buf === undefined) {
+      // The protocol requires a payload per changed entry; a missing one is
+      // a broken cycle, not an empty result.
+      cycle.errored.push({
+        subId: c.subId,
+        error: new FlureeError({
+          code: "internal",
+          status: 500,
+          message: "live cycle reported a change with no payload",
+        }),
+      });
+      return;
+    }
+    try {
+      cycle.changed.push({ subId: c.subId, data: JSON.parse(decoder.decode(buf)) });
+    } catch (err) {
+      cycle.errored.push({
+        subId: c.subId,
+        error: new FlureeError({
+          code: "internal",
+          status: 500,
+          message: `live result decode failed: ${String(err)}`,
+        }),
+      });
+    }
+  });
+  return cycle;
+}
+
 /** Routes batched `cycleOutcome` events to per-subscription callbacks —
  * ONE worker message per advance-cycle in, per-sub `LiveUpdate`s out. */
 class LiveRegistry {
@@ -488,35 +601,15 @@ class LiveRegistry {
       // Events only ever come from the CURRENT worker, so a generation
       // change means everything still in `subs` is from a dead engine.
       this.syncGeneration();
-      event.changed.forEach((c, i) => {
-        const cb = this.subs.get(c.subId);
-        const buf = payloads?.[i];
-        if (!cb || buf === undefined) return;
-        let update: LiveUpdate;
-        try {
-          update = { ledger: event.ledger, t: event.t, data: JSON.parse(decoder.decode(buf)) };
-        } catch (err) {
-          update = {
-            ledger: event.ledger,
-            t: event.t,
-            error: new FlureeError({
-              code: "internal",
-              status: 500,
-              message: `live result decode failed: ${String(err)}`,
-            }),
-          };
-        }
-        cb(update);
-      });
-      for (const { subId, error } of event.errored) {
-        const cb = this.subs.get(subId);
-        if (cb) {
-          cb({
-            ledger: event.ledger,
-            t: event.t,
-            error: new FlureeError({ code: "internal", status: 500, message: error }),
-          });
-        }
+      const cycle = toLiveCycle(event, payloads);
+      // `t: -1` is normalized to `undefined` in the batch form; this per-sub
+      // surface has always reported the raw watermark, so it keeps doing so.
+      const t = cycle.t ?? -1;
+      for (const { subId, data } of cycle.changed) {
+        this.subs.get(subId)?.({ ledger: cycle.ledger, t, data });
+      }
+      for (const { subId, error } of cycle.errored) {
+        this.subs.get(subId)?.({ ledger: cycle.ledger, t, error });
       }
     });
   }
@@ -829,6 +922,31 @@ export class Peer {
         listener({ ledger: event.ledger, t: event.t, indexT: event.indexT });
       }
     });
+  }
+
+  /**
+   * Every advance-cycle in its BATCH form — one call per cycle, covering all
+   * of this peer's subscriptions on that ledger, including the `unchanged`
+   * list that the per-subscription callbacks cannot express.
+   *
+   * Use this instead of `subscribe`'s callback when results feed a cache
+   * that must stay version-coherent: apply the whole batch, then notify.
+   * `subscribe()` is still what REGISTERS a query — pass a no-op callback if
+   * this listener is doing the delivery. Returns the unsubscriber.
+   */
+  onCycle(listener: (cycle: LiveCycle) => void): () => void {
+    return this.channel.addEventListener((event, payloads) => {
+      if (event.kind === "cycleOutcome") listener(toLiveCycle(event, payloads));
+    });
+  }
+
+  /**
+   * Engine lifecycle. A crash recycle discards every subscription, so a
+   * consumer holding live queries must re-register them on `"ready"`.
+   * Returns the unsubscriber.
+   */
+  onEngineState(listener: (state: EngineState) => void): () => void {
+    return this.channel.addStateListener(listener);
   }
 
   /** Terminate the worker (driver, SSE, caches' in-memory tier included).
