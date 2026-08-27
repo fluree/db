@@ -350,13 +350,16 @@ fn apply_overlay_only_options(flakes: &mut Vec<Flake>, opts: &RangeOptions) {
 ///
 /// Returns min/max prefix bound flakes in `index` order when the match's
 /// bound components form a prefix of that order (SPOT: `s` / `s+p`;
-/// PSOT/POST: `p`), letting the overlay binary-search its segments instead
-/// of yielding everything it holds. The min/max sentinels carry
-/// `t = i64::MIN / i64::MAX`, so every real flake compares strictly inside
-/// them — the overlay's left-EXCLUSIVE `(first, rhs]` contract still yields
-/// every matching flake. OPST leads with the object (no object-prefix
-/// constructor exists) and non-equality tests post-filter at call sites, so
-/// both take the unbounded walk.
+/// PSOT: `p`; POST: `p` / `p+o`; OPST: `o`), letting the overlay
+/// binary-search its segments instead of yielding everything it holds. The
+/// min/max sentinels carry `t = i64::MIN / i64::MAX`, so every real flake
+/// compares strictly inside them — the overlay's left-EXCLUSIVE
+/// `(first, rhs]` contract still yields every matching flake. Non-equality
+/// tests post-filter at call sites and take the unbounded walk.
+///
+/// OPST bounds stop at the object: `cmp_object` orders by value THEN
+/// datatype, and the predicate compares after both — so with the datatype
+/// unmatched, an `o+p` bound covers exactly the same span as `o` alone.
 fn overlay_eq_bounds(
     index: IndexType,
     test: RangeTest,
@@ -377,13 +380,29 @@ fn overlay_eq_bounds(
             )),
             _ => None,
         },
-        IndexType::Psot | IndexType::Post => match_val.p.as_ref().map(|p| {
+        IndexType::Psot => match_val.p.as_ref().map(|p| {
             (
                 Flake::min_for_predicate(p.clone()),
                 Flake::max_for_predicate(p.clone()),
             )
         }),
-        IndexType::Opst => None,
+        IndexType::Post => match (&match_val.p, &match_val.o) {
+            (Some(p), Some(o)) => Some((
+                Flake::min_for_predicate_object(p.clone(), o.clone()),
+                Flake::max_for_predicate_object(p.clone(), o.clone()),
+            )),
+            (Some(p), None) => Some((
+                Flake::min_for_predicate(p.clone()),
+                Flake::max_for_predicate(p.clone()),
+            )),
+            _ => None,
+        },
+        IndexType::Opst => match_val.o.as_ref().map(|o| {
+            (
+                Flake::min_for_object(o.clone()),
+                Flake::max_for_object(o.clone()),
+            )
+        }),
     }
 }
 
@@ -795,6 +814,21 @@ mod tests {
                     .is_some()
             );
         }
+
+        // Object-led prefixes: POST narrows to p+o, OPST to the object.
+        let o = FlakeValue::String("v".into());
+        assert!(overlay_eq_bounds(
+            IndexType::Post,
+            RangeTest::Eq,
+            &RangeMatch::predicate_object(p.clone(), o.clone())
+        )
+        .is_some());
+        assert!(overlay_eq_bounds(
+            IndexType::Opst,
+            RangeTest::Eq,
+            &RangeMatch::predicate_object(p.clone(), o)
+        )
+        .is_some());
 
         // Non-prefix / non-Eq shapes stay unbounded.
         assert!(overlay_eq_bounds(
