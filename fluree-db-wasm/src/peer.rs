@@ -30,12 +30,13 @@
 
 use std::cell::RefCell;
 
-use fluree_db_browser::{BrowserIoConfig, BrowserPeer, HeadTracker};
+use fluree_db_browser::{BrowserIoConfig, BrowserPeer, HeadTracker, LiveQuerySet};
 use futures::StreamExt;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
-use crate::engine::{sanitize_bytes, EngineCore};
+use crate::engine::{make_exec_options, sanitize_bytes, EngineCore};
+use crate::live::LiveBridge;
 
 /// A connected read-only peer engine.
 #[wasm_bindgen]
@@ -43,6 +44,8 @@ pub struct Peer {
     core: EngineCore,
     peer: BrowserPeer,
     tracker: RefCell<Option<HeadTracker>>,
+    /// Live subscriptions (A4), advanced from SSE head changes.
+    live: LiveBridge,
 }
 
 /// Connect to a remote Fluree server's storage proxy.
@@ -58,11 +61,38 @@ pub fn connect_peer(api_base: String, token: String, max_memory_bytes: Option<f6
         .map(BrowserIoConfig::from_max_memory)
         .unwrap_or_default();
     let peer = fluree_db_browser::connect(api_base, token, config);
-    let core = EngineCore::new(peer.fluree().clone(), max.map(|m| m / 4));
+    let query_budget = max.map(|m| m / 4);
+    let core = EngineCore::new(peer.fluree().clone(), query_budget);
+
+    // Live-query driver: one cycle-level guard per cycle via the CAS layer,
+    // the same per-query budget as the ad-hoc verbs.
+    let live_set = LiveQuerySet::with_execution_options(
+        peer.fluree().clone(),
+        Some(peer.cas().clone()),
+        make_exec_options(query_budget),
+    );
+    // SSE head change -> one advance per event. The engine callback must be
+    // Send + Sync, so it only forwards the ledger id; the drain task (worker
+    // event loop) awaits advance sequentially - the driver's coalescer folds
+    // bursts into one follow-up cycle at the latest head.
+    let (advance_tx, mut advance_rx) = futures::channel::mpsc::unbounded::<String>();
+    peer.on_head_change(move |change| {
+        let _ = advance_tx.unbounded_send(change.ledger_id.clone());
+    });
+    {
+        let set = live_set.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(ledger) = advance_rx.next().await {
+                set.advance(&ledger).await;
+            }
+        });
+    }
+
     Peer {
         core,
         peer,
         tracker: RefCell::new(None),
+        live: LiveBridge::new(live_set),
     }
 }
 
@@ -134,6 +164,31 @@ impl Peer {
         if let Some(old) = self.tracker.borrow_mut().replace(tracker) {
             old.stop();
         }
+    }
+
+    /// Register a live subscription (auto-primed: its first result arrives
+    /// as a `cycleOutcome` event at the current head). Returns the sub id.
+    #[wasm_bindgen(js_name = subscribe)]
+    pub fn subscribe_live(
+        &self,
+        ledger: String,
+        kind: String,
+        text: String,
+    ) -> Result<f64, JsValue> {
+        self.live.subscribe(&ledger, &kind, &text)
+    }
+
+    /// Remove a live subscription. Idempotent.
+    #[wasm_bindgen(js_name = unsubscribe)]
+    pub fn unsubscribe_live(&self, sub_id: f64) -> bool {
+        self.live.unsubscribe(sub_id)
+    }
+
+    /// Register the cycle-outcome fan-out callback
+    /// `(metaJson: string, payloads: Uint8Array[])`.
+    #[wasm_bindgen(js_name = onCycleOutcome)]
+    pub fn on_cycle_outcome(&self, callback: js_sys::Function) {
+        self.live.on_outcome_js(callback);
     }
 
     /// Stop head tracking and the I/O driver. In-flight jobs complete; new

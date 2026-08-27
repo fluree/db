@@ -51,6 +51,31 @@ export type {
   SnapshotInfo,
 } from "./protocol.js";
 
+/** One update delivered to a live subscription's callback: either fresh
+ * `data` (parsed JSON in the query's language-matched format) or an `error`
+ * for this cycle. Unchanged cycles deliver nothing. Previous data is NOT
+ * retained here — keep-last-good composition belongs to the caller (the
+ * React layer's contract, H §4). */
+export interface LiveUpdate {
+  ledger: string;
+  /** The cycle's frozen watermark (`-1`: no consistent view). */
+  t: number;
+  data?: unknown;
+  error?: FlureeError;
+}
+
+/** A registered live subscription; `unsubscribe()` stops updates. */
+export class LiveSubscription {
+  constructor(
+    readonly subId: number,
+    private readonly stop: () => Promise<void>,
+  ) {}
+
+  unsubscribe(): Promise<void> {
+    return this.stop();
+  }
+}
+
 /** A head-change notification as delivered to `Peer.on("headChange", …)`. */
 export interface HeadChange {
   /** Normalized `name:branch` ledger id. */
@@ -159,7 +184,9 @@ class Channel {
   private initMsg: Omit<InitRequest, "id"> | null = null;
   /** Answers the worker's `tokenRequest` events (peer mode). */
   getToken: ((reason: "connect" | "reconnect") => string | Promise<string>) | null = null;
-  private readonly eventListeners = new Set<(event: EventBody) => void>();
+  private readonly eventListeners = new Set<
+    (event: EventBody, payloads?: ArrayBuffer[]) => void
+  >();
   /** Bumped on every recycle; `Ledger`/`Snapshot` objects stamp it at
    * creation so pre-crash handles can never alias a fresh engine's state
    * (review H-4). */
@@ -186,8 +213,9 @@ class Channel {
     this.respawnAttempts = 0;
   }
 
-  /** Subscribe to worker events; returns the unsubscriber. */
-  addEventListener(listener: (event: EventBody) => void): () => void {
+  /** Subscribe to worker events; returns the unsubscriber. Payloads (the
+   * `cycleOutcome` transfer buffers) ride alongside the event body. */
+  addEventListener(listener: (event: EventBody, payloads?: ArrayBuffer[]) => void): () => void {
     this.eventListeners.add(listener);
     return () => this.eventListeners.delete(listener);
   }
@@ -255,7 +283,7 @@ class Channel {
     }
     for (const listener of this.eventListeners) {
       try {
-        listener(event);
+        listener(event, msg.payloads);
       } catch {
         // A listener's throw must not break dispatch to the others.
       }
@@ -382,6 +410,74 @@ function asJsonText(data: unknown): string {
 
 function queryKindOf(query: string | object): QueryKind {
   return typeof query === "string" ? "sparql" : "jsonld";
+}
+
+/** Routes batched `cycleOutcome` events to per-subscription callbacks —
+ * ONE worker message per advance-cycle in, per-sub `LiveUpdate`s out. */
+class LiveRegistry {
+  private readonly subs = new Map<number, (update: LiveUpdate) => void>();
+  private wired = false;
+
+  constructor(private readonly channel: Channel) {}
+
+  async subscribe(
+    ledger: string,
+    query: string | object,
+    onUpdate: (update: LiveUpdate) => void,
+  ): Promise<LiveSubscription> {
+    this.wire();
+    const res = unwrap<{ subId: number }>(
+      await this.channel.call({
+        op: "subscribe",
+        ledger,
+        kind: queryKindOf(query),
+        text: asJsonText(query),
+      }),
+    );
+    this.subs.set(res.subId, onUpdate);
+    return new LiveSubscription(res.subId, async () => {
+      this.subs.delete(res.subId);
+      await this.channel.call({ op: "unsubscribe", subId: res.subId }).then(unwrap);
+    });
+  }
+
+  private wire(): void {
+    if (this.wired) return;
+    this.wired = true;
+    this.channel.addEventListener((event, payloads) => {
+      if (event.kind !== "cycleOutcome") return;
+      event.changed.forEach((c, i) => {
+        const cb = this.subs.get(c.subId);
+        const buf = payloads?.[i];
+        if (!cb || buf === undefined) return;
+        let update: LiveUpdate;
+        try {
+          update = { ledger: event.ledger, t: event.t, data: JSON.parse(decoder.decode(buf)) };
+        } catch (err) {
+          update = {
+            ledger: event.ledger,
+            t: event.t,
+            error: new FlureeError({
+              code: "internal",
+              status: 500,
+              message: `live result decode failed: ${String(err)}`,
+            }),
+          };
+        }
+        cb(update);
+      });
+      for (const { subId, error } of event.errored) {
+        const cb = this.subs.get(subId);
+        if (cb) {
+          cb({
+            ledger: event.ledger,
+            t: event.t,
+            error: new FlureeError({ code: "internal", status: 500, message: error }),
+          });
+        }
+      }
+    });
+  }
 }
 
 function recycledError(what: string): FlureeError {
@@ -539,6 +635,7 @@ export class Ledger {
 export class Playground {
   /** Engine (crate) version. */
   readonly version: string;
+  private readonly live: LiveRegistry;
 
   constructor(
     private readonly channel: Channel,
@@ -546,6 +643,22 @@ export class Playground {
     private readonly transport: ResultTransport,
   ) {
     this.version = init.version;
+    this.live = new LiveRegistry(channel);
+  }
+
+  /**
+   * Live query (A4): `onUpdate` fires with the first result right away (the
+   * auto-prime) and again after every local commit that changes the result —
+   * unchanged commits are hash-gated engine-side and deliver nothing.
+   * Subscriptions do not survive a crash recycle; re-subscribe after a
+   * `fatal` error.
+   */
+  subscribe(
+    ledger: string,
+    query: string | object,
+    onUpdate: (update: LiveUpdate) => void,
+  ): Promise<LiveSubscription> {
+    return this.live.subscribe(ledger, query, onUpdate);
   }
 
   /** Create a ledger (`"demo"` → `"demo:main"`). Rejects with `conflict` if
@@ -622,6 +735,7 @@ export async function playground(options: PlaygroundOptions = {}): Promise<Playg
 export class Peer {
   /** Engine (crate) version. */
   readonly version: string;
+  private readonly live: LiveRegistry;
 
   constructor(
     private readonly channel: Channel,
@@ -629,6 +743,7 @@ export class Peer {
     private readonly transport: ResultTransport,
   ) {
     this.version = init.version;
+    this.live = new LiveRegistry(channel);
   }
 
   /** Open a remote ledger (resolves its head; rejects `not_found` for
@@ -638,6 +753,22 @@ export class Peer {
   async ledger(id: string): Promise<Ledger> {
     const info = unwrap<LedgerInfo>(await this.channel.call({ op: "ledgerInfo", ledger: id }));
     return new Ledger(this.channel, info, this.transport);
+  }
+
+  /**
+   * Live query (A4): `onUpdate` fires with the first result right away (the
+   * auto-prime) and again after every server commit that changes the result
+   * (SSE head change → one engine advance-cycle; unchanged results are
+   * hash-gated engine-side and deliver nothing). Requires head tracking —
+   * the `subscribe` connect option. Subscriptions do not survive a crash
+   * recycle; re-subscribe after a `fatal` error.
+   */
+  subscribe(
+    ledger: string,
+    query: string | object,
+    onUpdate: (update: LiveUpdate) => void,
+  ): Promise<LiveSubscription> {
+    return this.live.subscribe(ledger, query, onUpdate);
   }
 
   /**

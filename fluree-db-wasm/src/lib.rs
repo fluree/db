@@ -41,6 +41,7 @@
 
 mod engine;
 mod error;
+mod live;
 #[cfg(target_arch = "wasm32")]
 mod peer;
 
@@ -52,8 +53,10 @@ pub use peer::{connect_peer, Peer};
 use fluree_db_api::{FlureeBuilder, TransactResultRef};
 use serde_json::json;
 
-use crate::engine::{ledger_info_json, parse_json, sanitize_bytes, EngineCore};
+use crate::engine::{ledger_info_json, make_exec_options, parse_json, sanitize_bytes, EngineCore};
 use crate::error::{api_error, js_error};
+use crate::live::LiveBridge;
+use fluree_db_browser::LiveQuerySet;
 
 /// Runs once per module instantiation: route Rust panics to `console.error`
 /// with a message instead of an opaque `RuntimeError: unreachable`. A panic
@@ -84,6 +87,9 @@ pub struct Playground {
     /// The full ceiling (the per-query budget equals it in playground mode);
     /// kept separately for the transact pre-gate.
     max_memory_bytes: Option<usize>,
+    /// Live subscriptions (A4). The playground drives `advance` after each
+    /// local commit, so live queries work with no server.
+    live: LiveBridge,
 }
 
 impl Default for Playground {
@@ -105,9 +111,16 @@ impl Playground {
     #[wasm_bindgen(constructor)]
     pub fn new(max_memory_bytes: Option<f64>) -> Playground {
         let max = sanitize_bytes(max_memory_bytes);
+        let fluree = FlureeBuilder::memory().build_memory();
+        let live = LiveBridge::new(LiveQuerySet::with_execution_options(
+            fluree.clone(),
+            None,
+            make_exec_options(max),
+        ));
         Playground {
-            core: EngineCore::new(FlureeBuilder::memory().build_memory(), max),
+            core: EngineCore::new(fluree, max),
             max_memory_bytes: max,
+            live,
         }
     }
 
@@ -163,6 +176,7 @@ impl Playground {
             .commit()
             .await
             .map_err(api_error)?;
+        self.advance_live(&ledger_id);
         Ok(receipt_json(&out))
     }
 
@@ -180,6 +194,7 @@ impl Playground {
             .commit()
             .await
             .map_err(api_error)?;
+        self.advance_live(&ledger_id);
         Ok(receipt_json(&out))
     }
 
@@ -196,6 +211,7 @@ impl Playground {
             .commit()
             .await
             .map_err(api_error)?;
+        self.advance_live(&ledger_id);
         Ok(receipt_json(&out))
     }
 
@@ -216,6 +232,7 @@ impl Playground {
             .commit()
             .await
             .map_err(api_error)?;
+        self.advance_live(&ledger_id);
         Ok(receipt_json(&out))
     }
 
@@ -247,7 +264,47 @@ impl Playground {
     }
 }
 
+/// Live-query verbs (A4) — see `src/live.rs` for the delivery contract.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
 impl Playground {
+    /// Register a live subscription (auto-primed: its first result arrives
+    /// as a `cycleOutcome` event at the current head). Returns the sub id.
+    #[wasm_bindgen(js_name = subscribe)]
+    pub fn subscribe_live(
+        &self,
+        ledger: String,
+        kind: String,
+        text: String,
+    ) -> Result<f64, JsValue> {
+        self.live.subscribe(&ledger, &kind, &text)
+    }
+
+    /// Remove a live subscription. Idempotent.
+    #[wasm_bindgen(js_name = unsubscribe)]
+    pub fn unsubscribe_live(&self, sub_id: f64) -> bool {
+        self.live.unsubscribe(sub_id)
+    }
+
+    /// Register the cycle-outcome fan-out callback
+    /// `(metaJson: string, payloads: Uint8Array[])`.
+    #[wasm_bindgen(js_name = onCycleOutcome)]
+    pub fn on_cycle_outcome(&self, callback: js_sys::Function) {
+        self.live.on_outcome_js(callback);
+    }
+}
+
+impl Playground {
+    /// After a successful local commit: run one live advance-cycle for the
+    /// ledger (detached; the driver coalesces). No-op off-wasm — the native
+    /// build has no event loop to drive detached work.
+    fn advance_live(&self, ledger_id: &str) {
+        #[cfg(target_arch = "wasm32")]
+        self.live.advance_detached(ledger_id);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = ledger_id;
+    }
+
     /// Coarse input-size pre-gate for the transact paths (PR-1715 review):
     /// the memory budget instruments only query execution — staging a
     /// transaction has no engine-side budget yet, and a large JSON body

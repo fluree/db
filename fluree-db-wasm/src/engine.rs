@@ -107,14 +107,20 @@ impl EngineCore {
     }
 
     fn exec_options(&self) -> QueryExecutionOptions {
-        let mut opts = QueryExecutionOptions::default();
-        if let Some(limit) = self.query_budget_bytes {
-            let cancellation = fluree_db_core::QueryCancellation::new();
-            cancellation.set_memory_limit(limit);
-            opts.cancellation = Some(cancellation);
-        }
-        opts
+        make_exec_options(self.query_budget_bytes)
     }
+}
+
+/// Execution options carrying the per-query memory budget (F4): a fresh
+/// cancellation handle with `set_memory_limit`, or defaults when unbudgeted.
+pub(crate) fn make_exec_options(budget_bytes: Option<usize>) -> QueryExecutionOptions {
+    let mut opts = QueryExecutionOptions::default();
+    if let Some(limit) = budget_bytes {
+        let cancellation = fluree_db_core::QueryCancellation::new();
+        cancellation.set_memory_limit(limit);
+        opts.cancellation = Some(cancellation);
+    }
+    opts
 }
 
 pub(crate) fn parse_json(what: &str, text: &str) -> Result<JsonValue, JsValue> {

@@ -47,6 +47,20 @@
       const ask = await ledger.query(askKnows);
       const info = await ledger.info();
 
+      // — Phase 1b: live subscription (A4) on the playground —
+      const liveUpdates = [];
+      const liveSub = await pg.subscribe("smoke", sparql, (u) => liveUpdates.push(u));
+      const until = async (cond, what) => {
+        for (let i = 0; i < 400 && !cond(); i++) await new Promise((r) => setTimeout(r, 25));
+        if (!cond()) throw new Error("timed out waiting for " + what);
+      };
+      await until(() => liveUpdates.length >= 1, "live prime");
+      await ledger.sparqlUpdate(
+        'PREFIX ex: <http://example.org/ns/> INSERT DATA { ex:carol a ex:Person ; ex:name "Carol" }');
+      await until(() => liveUpdates.length >= 2, "live update after commit");
+      await liveSub.unsubscribe();
+      const liveRows = liveUpdates.map((u) => u.data?.results?.bindings?.length ?? -1);
+
       // — Phase 2: crash + recycle semantics —
       const preCrash = await ledger.snapshot();
 
@@ -129,6 +143,7 @@
         staleCode,
         postAlive,
         recycleAttempts,
+        live: { updates: liveUpdates.length, rows: liveRows },
         peer: {
           version: peerVersion,
           tokenReasons,
