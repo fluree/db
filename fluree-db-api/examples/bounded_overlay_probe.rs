@@ -124,7 +124,10 @@ async fn main() {
         .expect("reindex");
 
     println!("subjects={subjects} rounds={rounds} filler/round={filler} queries/round={queries}");
-    println!("{:>12}  {:>10}  {:>10}  {:>10}", "novelty", "mean_us", "p50_us", "p90_us");
+    println!(
+        "{:>12}  {:>10}  {:>10}  {:>10}",
+        "novelty", "mean_us", "p50_us", "p90_us"
+    );
 
     let mut pts: Vec<(f64, f64)> = Vec::with_capacity(rounds);
 
