@@ -4323,7 +4323,14 @@ impl Fluree {
     /// }
     /// ```
     pub async fn ledger_exists(&self, ledger_id: &str) -> Result<bool> {
-        Ok(self.nameservice().lookup(ledger_id).await?.is_some())
+        // Retracted counts as absent: tombstoning backends (the raft
+        // nameservice) keep serving the record so admin tooling can read
+        // the flag, but "exists" is a query-path question.
+        Ok(self
+            .nameservice()
+            .lookup(ledger_id)
+            .await?
+            .is_some_and(|r| !r.retracted))
     }
 
     /// Get a cached ledger handle (loads if not cached).
