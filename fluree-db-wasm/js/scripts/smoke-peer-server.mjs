@@ -81,6 +81,8 @@ function check(label, actual, expected) {
 }
 
 let server;
+let tap;
+const browserLog = [];
 try {
   // ── 1. Identity + server ────────────────────────────────────────────────
   const identity = createIdentity();
@@ -127,7 +129,7 @@ try {
   check("advertised serving tiers", nsRecord.serving, ["query", "blocks"]);
 
   // ── 3. The tap + the page's origin ──────────────────────────────────────
-  const tap = await startTap(server.url);
+  tap = await startTap(server.url);
   cleanups.push(tap.close);
   const { server: pageServer, url: pageOrigin } = await startServer(packageRoot, 0);
   cleanups.push(() => pageServer.close());
@@ -144,7 +146,7 @@ try {
     `?api=${encodeURIComponent(tap.apiBase)}` +
     `&token=${encodeURIComponent(token)}` +
     `&ledger=${encodeURIComponent(LEDGER)}`;
-  const session = await openPage(cdp, pageUrl);
+  const session = await openPage(cdp, pageUrl, (line) => browserLog.push(line));
 
   // Handshake step 1: the page has connected, queried, and primed.
   const ready = await evaluate(
@@ -226,6 +228,14 @@ try {
   exit = 0;
 } catch (err) {
   console.error("FAIL:", err.message ?? err);
+  if (tap) {
+    console.error(`\n--- proxy traffic the browser generated (${tap.requests.length}) ---`);
+    for (const r of tap.requests) console.error(`  ${r.status ?? "…"} ${r.method} ${r.path}`);
+  }
+  if (browserLog.length) {
+    console.error(`\n--- browser console (${browserLog.length}) ---`);
+    for (const l of browserLog) console.error(`  ${l}`);
+  }
   if (server) {
     const log = server.log();
     if (log.trim()) console.error(`\n--- fluree-server log ---\n${log}`);

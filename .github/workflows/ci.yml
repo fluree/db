@@ -368,7 +368,7 @@ jobs:
   # restatement as the wasm32 job (an env RUSTFLAGS masks .cargo/config.toml).
   wasm-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       RUSTFLAGS: --cfg getrandom_backend="wasm_js"
     steps:
@@ -423,6 +423,25 @@ jobs:
       - name: Smoke the packed package (headless Chrome over CDP, no isolation headers)
         working-directory: fluree-db-wasm/js
         run: node scripts/smoke-browser.mjs --packed
+
+      # The Phase-A exit gate: the same package, but against a REAL
+      # fluree-db-server with the storage proxy on. Every other check in this
+      # job stops at a mock; this one proves CID-verified block fetches over
+      # HTTP, cross-origin CORS, and the SSE live loop closing after an
+      # external commit. Builds the server binary itself (debug) — the slow
+      # step, hence its own timeout budget.
+      - name: Build fluree-server (for the real-server peer gate)
+        # The job-level RUSTFLAGS carries the wasm getrandom backend cfg, which
+        # is invalid for a native target — clear it for this one native build.
+        # (`.cargo/config.toml` scopes that cfg to wasm32 already; only the env
+        # restatement leaks across targets.)
+        env:
+          RUSTFLAGS: ""
+        run: cargo build -p fluree-db-server --bin fluree-server
+
+      - name: Peer gate (browser peer ↔ real fluree-db-server)
+        working-directory: fluree-db-wasm/js
+        run: node scripts/smoke-peer-server.mjs
 
       - name: Size report
         run: cat fluree-db-wasm/js/pkg/size-report.json

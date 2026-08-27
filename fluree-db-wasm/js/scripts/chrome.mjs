@@ -94,12 +94,19 @@ export async function cdpConnect(wsUrl) {
   });
   let nextId = 1;
   const waiting = new Map();
+  const eventListeners = new Set();
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.id && waiting.has(msg.id)) {
       const { resolve, reject } = waiting.get(msg.id);
       waiting.delete(msg.id);
       msg.error ? reject(new Error(JSON.stringify(msg.error))) : resolve(msg.result);
+      return;
+    }
+    if (msg.method) {
+      for (const l of eventListeners) {
+        try { l(msg.method, msg.params, msg.sessionId); } catch { /* one listener must not break the rest */ }
+      }
     }
   };
   const send = (method, params = {}, sessionId) => {
@@ -107,13 +114,49 @@ export async function cdpConnect(wsUrl) {
     ws.send(JSON.stringify({ id, method, params, sessionId }));
     return new Promise((resolve, reject) => waiting.set(id, { resolve, reject }));
   };
-  return { send, close: () => ws.close() };
+  return {
+    send,
+    onEvent: (listener) => eventListeners.add(listener),
+    close: () => ws.close(),
+  };
 }
 
-/** Open `url` in a fresh page target. Resolves the CDP session id. */
-export async function openPage(cdp, url) {
+/**
+ * Open `url` in a fresh page target. Resolves the CDP session id.
+ *
+ * `onLog` (optional) receives every console message and uncaught exception
+ * from the page AND from the workers it spawns — which is where the engine
+ * lives, so without the auto-attach the most informative failures are
+ * invisible.
+ */
+export async function openPage(cdp, url, onLog) {
   const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+  if (onLog) {
+    cdp.onEvent((method, params, from) => {
+      if (method === "Runtime.consoleAPICalled") {
+        const text = params.args
+          .map((a) => a.value ?? a.description ?? a.unserializableValue ?? a.type)
+          .join(" ");
+        onLog(`${from === sessionId ? "page" : "worker"} console.${params.type}: ${text}`);
+      } else if (method === "Runtime.exceptionThrown") {
+        const d = params.exceptionDetails;
+        onLog(
+          `${from === sessionId ? "page" : "worker"} exception: ` +
+            (d.exception?.description ?? d.text),
+        );
+      } else if (method === "Target.attachedToTarget") {
+        // A dedicated worker: enable its Runtime so its logs reach onLog too.
+        void cdp.send("Runtime.enable", {}, params.sessionId);
+        void cdp.send("Runtime.runIfWaitingForDebugger", {}, params.sessionId);
+      }
+    });
+    await cdp.send(
+      "Target.setAutoAttach",
+      { autoAttach: true, waitForDebuggerOnStart: true, flatten: true },
+      sessionId,
+    );
+  }
   await cdp.send("Runtime.enable", {}, sessionId);
   await cdp.send("Page.enable", {}, sessionId);
   await cdp.send("Page.navigate", { url }, sessionId);

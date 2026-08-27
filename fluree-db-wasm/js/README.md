@@ -101,7 +101,15 @@ cd fluree-db-wasm/js && npm install
 node scripts/build.mjs            # → pkg/ (wasm + glue) and dist/ (TS output); prints sizes
 node scripts/serve.mjs            # http://127.0.0.1:8787/demo/
 node scripts/smoke-browser.mjs    # headless-Chrome end-to-end check (positive ran-marker)
+node scripts/smoke-peer-server.mjs  # the same, against a REAL fluree-db-server
 ```
+
+`smoke-peer-server.mjs` launches `fluree-server` itself (building it first if
+`target/{debug,release}/fluree-server` is absent, or set `FLUREE_SERVER_BIN`),
+mints a storage-proxy token, creates and populates a ledger over HTTP, then
+drives `connect()` in headless Chrome from a *different origin* through a
+recording reverse proxy — so it asserts the query's rows, the CAS objects the
+browser actually fetched, and the SSE live loop after an external commit.
 
 The Rust-level browser tests run with `wasm-pack test --headless --chrome ..` from the crate directory (needs a `chromedriver` matching your Chrome; set `CHROMEDRIVER=` to point at one).
 
@@ -111,7 +119,11 @@ The `.wasm` builds with the workspace's `wasm-release` cargo profile (fat LTO, o
 
 ### Peer-mode verification status (honest)
 
-Verified in CI's browser smoke without a server: the token event round-trip (init carries no credential; `getToken` answers the worker's request), peer init/close, and typed non-fatal failure against an unreachable remote. Verified natively in `fluree-db-browser`'s mock-driver suites: head resolution through the proxy nameservice, SSE head tracking → callback dispatch, block fetch/verify/cache. **Not yet verified anywhere automated:** the full browser-against-a-real-server flow (real blocks over HTTP, real SSE) — it needs a running `fluree-db-server` with a storage-proxy token, which the smoke harness does not yet launch.
+Verified in CI's browser smoke without a server: the token event round-trip (init carries no credential; `getToken` answers the worker's request), peer init/close, and typed non-fatal failure against an unreachable remote. Verified natively in `fluree-db-browser`'s mock-driver suites: head resolution through the proxy nameservice, SSE head tracking → callback dispatch, block fetch/verify/cache.
+
+Verified in CI against a **real `fluree-db-server`** by `scripts/smoke-peer-server.mjs`: the server runs with the storage proxy on and the smoke's own did:key as its only trusted issuer (the production token path, not `--storage-proxy-insecure`); a ledger is created, given `f:serveBlocks true`, and populated over HTTP; the page is served from a different origin than the API, so the request really is cross-origin; `connect()` then opens the ledger, and the query's rows are asserted alongside the traffic that produced them — successful `GET /storage/objects/{cid}` fetches, head resolutions, an open SSE stream, and **zero** calls to `/query` (local compute, not query-shipping). An external HTTP commit then has to reach the page as an SSE head change, be absorbed by the engine, and show up both in a re-query and in a live subscription's update.
+
+Still not covered: token expiry/refresh against a live server, IndexedDB reuse across a page reload, ranged leaf reads, and anything on the public/anonymous tier (not implemented server-side).
 
 ### Result transport
 
