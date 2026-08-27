@@ -46,7 +46,9 @@ export class QueryHandle {
   readonly store: QueryStore;
   readonly key: string;
   readonly spec: ResolvedSpec;
-  readonly subId: number;
+  /** Transport subscription id. Reassigned if the handle is resurrected
+   * after collection (see `QueryCache.ensureSubscribed`). */
+  subId: number;
   private readonly listeners = new Set<() => void>();
   private observerCount = 0;
   private gcTimer: ReturnType<typeof setTimeout> | undefined;
@@ -93,6 +95,10 @@ export class QueryHandle {
 
   notify(): void {
     for (const listener of [...this.listeners]) listener();
+  }
+
+  hasObservers(): boolean {
+    return this.observerCount > 0;
   }
 
   private scheduleGc(): void {
@@ -147,15 +153,32 @@ export class QueryCache {
   /** First observer attached: open the live subscription (idempotent — a
    * remount within the grace period finds it already open). */
   ensureSubscribed(handle: QueryHandle): void {
-    if (this.closed || this.subscribed.has(handle.subId)) return;
+    if (this.closed) return;
+    if (this.bySubId.get(handle.subId) !== handle) {
+      // Resurrection. A component can hold this handle's memoized store
+      // across a collection — React runs subscribe cleanup on trees that
+      // stay mounted (Activity/Offscreen, and any future re-subscribe) —
+      // and would then own a store the cache had forgotten, so every cycle
+      // for it would be dropped and the component would freeze on stale
+      // data with no error. Re-adopt it under a FRESH id, which also means
+      // a late cycle addressed to the released subscription cannot land.
+      handle.subId = this.nextSubId++;
+      this.bySubId.set(handle.subId, handle);
+      // Only claim the key if nothing else has taken it meanwhile; a rival
+      // handle for the same key stays the one new callers dedup onto.
+      if (!this.byKey.has(handle.key)) this.byKey.set(handle.key, handle);
+    } else if (this.subscribed.has(handle.subId)) {
+      return;
+    }
     this.subscribed.add(handle.subId);
     this.transport.subscribe({ ...handle.spec, subId: handle.subId });
   }
 
   /** GC timer fired: release the subscription and drop the handle. */
   collect(handle: QueryHandle): void {
-    if (this.byKey.get(handle.key) !== handle) return;
-    this.byKey.delete(handle.key);
+    if (this.bySubId.get(handle.subId) !== handle) return; // already collected
+    if (handle.hasObservers()) return; // re-observed; the detach reschedules
+    if (this.byKey.get(handle.key) === handle) this.byKey.delete(handle.key);
     this.bySubId.delete(handle.subId);
     if (this.subscribed.delete(handle.subId) && !this.closed) {
       this.transport.unsubscribe(handle.subId);
