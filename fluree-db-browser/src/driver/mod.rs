@@ -14,6 +14,7 @@ pub mod sse;
 use crate::bridge::{IoHandle, IoReceiver};
 use crate::config::BrowserIoConfig;
 use crate::protocol::IoJob;
+use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen_futures::spawn_local;
 
@@ -28,17 +29,37 @@ pub fn start_driver(config: BrowserIoConfig) -> IoHandle {
 }
 
 async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
-    let cache: Option<Rc<IdbCache>> = if config.cache.enabled {
-        match IdbCache::open(&config.cache).await {
-            Ok(cache) => Some(cache),
-            Err(e) => {
-                tracing::warn!(error = %e, "IndexedDB cache unavailable; running without persistence");
-                None
+    // The cache is an optimization and MUST NOT gate job servicing.
+    //
+    // This await used to sit in front of the loop below, which made every
+    // fetch in the process depend on IndexedDB opening. An open can hang
+    // indefinitely rather than fail — a version upgrade held up by another
+    // connection fires `blocked`, which is neither `success` nor `error` —
+    // and a hang there deadlocked the whole peer: no job ever dispatched,
+    // so no request was issued, no per-request timeout could fire (those
+    // live inside `fetch::execute`), and nothing surfaced an error. The
+    // symptom is a peer that connects, reports healthy, and then answers
+    // nothing forever, with zero HTTP requests to show for it.
+    //
+    // Opening concurrently restores the degraded mode this module already
+    // documents: until the cache lands, lookups miss and writes are
+    // dropped, which costs a cold-start window of persistence and nothing
+    // else — CAS entries are immutable and always re-fetchable.
+    let cache: Rc<RefCell<Option<Rc<IdbCache>>>> = Rc::new(RefCell::new(None));
+    if config.cache.enabled {
+        let slot = Rc::clone(&cache);
+        let cache_config = config.cache.clone();
+        spawn_local(async move {
+            match IdbCache::open(&cache_config).await {
+                Ok(opened) => *slot.borrow_mut() = Some(opened),
+                Err(e) => {
+                    tracing::warn!(error = %e, "IndexedDB cache unavailable; running without persistence");
+                }
             }
-        }
-    } else {
-        None
-    };
+        });
+    }
+    // Snapshot the slot per job; `borrow()` never spans an await.
+    let current = |slot: &Rc<RefCell<Option<Rc<IdbCache>>>>| slot.borrow().clone();
 
     while let Some(job) = rx.recv().await {
         match job {
@@ -51,7 +72,7 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                     let _ = reply.send(fetch::execute(req, timeout).await);
                 });
             }
-            IoJob::CacheGet { key, reply } => match cache.clone() {
+            IoJob::CacheGet { key, reply } => match current(&cache) {
                 Some(cache) => spawn_local(async move {
                     let _ = reply.send(cache.get(&key).await);
                 }),
@@ -60,7 +81,7 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                 }
             },
             IoJob::CachePut { key, bytes, permit } => {
-                if let Some(cache) = cache.clone() {
+                if let Some(cache) = current(&cache) {
                     spawn_local(async move {
                         cache.put(key, bytes).await;
                         // Credit the write-behind gauge only once the write
@@ -88,7 +109,8 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
         }
     }
 
-    if let Some(cache) = cache {
+    let opened = current(&cache);
+    if let Some(cache) = opened {
         cache.flush_access_times().await;
         cache.close();
     }
