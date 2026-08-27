@@ -93,6 +93,16 @@ mod inner {
         pub vector_pool: Arc<SharedVectorArenaPool>,
         /// Shared namespace allocator (for prefix lookup).
         pub ns_alloc: Arc<SharedNamespaceAllocator>,
+        /// Sticky: some record written through this config carried an RDF-list
+        /// position. Set once per chunk at [`SpoolContext::finish`] /
+        /// [`SpoolContext::finish_buffered`] from a plain per-chunk bool, so
+        /// the per-record path stays free of atomic traffic. Read at root
+        /// assembly to fill `IndexRoot.has_list_meta` exactly instead of
+        /// leaving it untracked — that is what lets filtered-DELETE staging
+        /// skip list-meta hydration on bulk-imported ledgers.
+        ///
+        /// Only ever set to `true`; the caller starts it `false` per import.
+        pub saw_list_meta: Arc<std::sync::atomic::AtomicBool>,
     }
 
     /// Result of finishing a [`SpoolContext`] via [`SpoolContext::finish`] —
@@ -160,6 +170,12 @@ mod inner {
         next_lang_id: u16,
         /// Graph ID for all records in this chunk (0 = default).
         g_id: GraphId,
+        /// Per-chunk mirror of `SpoolConfig::saw_list_meta` — a plain bool so
+        /// `write_record` never touches the shared atomic. Folded in at
+        /// finish.
+        saw_list_meta: bool,
+        /// The shared sticky bit this chunk folds into at finish.
+        saw_list_meta_shared: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl SpoolContext {
@@ -189,6 +205,8 @@ mod inner {
                 languages: FxHashMap::default(),
                 next_lang_id: 1, // 0 = no language tag
                 g_id,
+                saw_list_meta: false,
+                saw_list_meta_shared: Arc::clone(&config.saw_list_meta),
             })
         }
 
@@ -203,6 +221,7 @@ mod inner {
         /// dictionaries for the merge phase. This is the backward-compatible path
         /// used by the existing import pipeline.
         pub fn finish(self) -> Result<SpoolResult, std::io::Error> {
+            self.publish_list_meta();
             let mut writer = SpoolWriter::new(&self.spool_path, self.chunk_idx)?;
             for record in &self.records {
                 writer.push(record)?;
@@ -221,12 +240,37 @@ mod inner {
         /// contains all records with chunk-local IDs ready for post-parse
         /// sorting and sorted commit file writing.
         pub fn finish_buffered(self) -> BufferedSpoolResult {
+            self.publish_list_meta();
             BufferedSpoolResult {
                 records: self.records,
                 subjects: self.subjects,
                 strings: self.strings,
                 languages: self.languages,
                 chunk_idx: self.chunk_idx,
+            }
+        }
+
+        /// Fold this chunk's list-position observation into the shared sticky
+        /// bit. Called from both finish paths.
+        ///
+        /// A context can also be dropped without finishing: every call site
+        /// has a `?` on the parse and on `into_parts()` between construction
+        /// and finish, and either one drops the sink with the context still
+        /// inside it. What makes a `Some(false)` root safe is therefore NOT
+        /// "every context finishes" but "a context that doesn't finish means
+        /// no root": both of those errors propagate a `TransactError` that
+        /// aborts the whole import, so there is no root assembled to record a
+        /// wrong flag into. A future change that tolerates per-chunk failures
+        /// would break that and has to publish the bit some other way — a
+        /// wrongly-`false` root silently skips list-meta hydration.
+        ///
+        /// Relaxed is enough: the store happens-before the join that collects
+        /// the chunk results, and the root-assembly read happens after every
+        /// worker has been joined.
+        fn publish_list_meta(&self) {
+            if self.saw_list_meta {
+                self.saw_list_meta_shared
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -467,6 +511,11 @@ mod inner {
                     u32::try_from(idx).unwrap_or(LIST_INDEX_NONE)
                 })
                 .unwrap_or(LIST_INDEX_NONE);
+            // Observe the position on the branch that actually records one:
+            // an out-of-range `list_index` coerces to the sentinel above and
+            // is not a list row in the index, so gate on `i`, not on
+            // `list_index.is_some()`.
+            self.saw_list_meta |= i != LIST_INDEX_NONE;
 
             let record = RunRecord {
                 g_id: self.g_id,
@@ -979,6 +1028,7 @@ mod inner {
                 numbig_pool: Arc::new(SharedNumBigPool::new()),
                 vector_pool: Arc::new(SharedVectorArenaPool::new()),
                 ns_alloc: Arc::new(SharedNamespaceAllocator::from_registry(ns)),
+                saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
@@ -1001,6 +1051,60 @@ mod inner {
             // A user-range code allocated outside the shared allocator.
             let rogue = Sid::new(fluree_vocab::namespaces::USER_START, "name");
             let _ = ctx.assign_predicate_id(&rogue);
+        }
+
+        /// The sticky list-position bit is per-import, not per-chunk: a chunk
+        /// with no list rows must leave it alone, and a single list row in any
+        /// later chunk must flip it. Root assembly reads it to write
+        /// `IndexRoot.has_list_meta` — a wrongly-`false` root would let
+        /// filtered-DELETE staging skip position hydration and silently drop
+        /// list retractions.
+        #[test]
+        fn spool_context_tracks_list_positions_across_chunks() {
+            use std::sync::atomic::Ordering;
+
+            let ns = NamespaceRegistry::new();
+            let config = make_spool_config(&ns);
+            let dir = std::env::temp_dir();
+
+            let s = Sid::new(fluree_vocab::namespaces::RDF, "subject");
+            let p = Sid::new(fluree_vocab::namespaces::RDF, "pred");
+            let dt = Sid::new(fluree_vocab::namespaces::XSD, "string");
+            let o = FlakeValue::String("v".to_string());
+            let rec = |list_index| FlakeRecord {
+                s: &s,
+                p: &p,
+                o: &o,
+                dt: &dt,
+                lang: None,
+                list_index,
+                t: 1,
+            };
+
+            let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-a.spool"), 0, 0, &config)
+                .expect("spool ctx");
+            ctx.write_record(rec(None));
+            let _ = ctx.finish_buffered();
+            assert!(
+                !config.saw_list_meta.load(Ordering::Relaxed),
+                "a chunk without list rows must not set the bit"
+            );
+
+            let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-b.spool"), 1, 0, &config)
+                .expect("spool ctx");
+            ctx.write_record(rec(Some(0)));
+            let _ = ctx.finish_buffered();
+            assert!(
+                config.saw_list_meta.load(Ordering::Relaxed),
+                "one list row in any chunk sets the bit"
+            );
+
+            // Sticky: a later list-free chunk must not clear it.
+            let mut ctx = SpoolContext::new(dir.join("fluree-list-meta-c.spool"), 2, 0, &config)
+                .expect("spool ctx");
+            ctx.write_record(rec(None));
+            let _ = ctx.finish_buffered();
+            assert!(config.saw_list_meta.load(Ordering::Relaxed));
         }
 
         #[test]
