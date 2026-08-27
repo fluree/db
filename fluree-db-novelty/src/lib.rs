@@ -2235,6 +2235,42 @@ mod tests {
             "identity must split on differing metadata values"
         );
 
+        // The three metas above all have `i: None`, so they only exercise the
+        // branch where the ordering consults `lang` unconditionally. Two tags
+        // at the SAME list position are the case that used to collapse:
+        // `FlakeMeta::cmp` compared `lang` only when neither side carried an
+        // index, so `{en, 0}` and `{fr, 0}` were `Equal` without being equal,
+        // and `same_identity` — which tests `cmp_meta(..) == Equal` — folded
+        // two distinct facts into one (#1711). Read the assertions above as
+        // covering this and you would be wrong; this is the case that pins it.
+        let at = |lang: &str, i: i32| FlakeMeta {
+            lang: Some(lang.to_string()),
+            i: Some(i),
+        };
+        let f_en0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("en", 0)));
+        let f_fr0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("fr", 0)));
+        let f_en1 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("en", 1)));
+        assert_eq!(
+            cmp_meta(&f_en0, &f_fr0),
+            Ordering::Less,
+            "one list position under two tags must order, not tie"
+        );
+        assert!(
+            !same_identity(&f_en0, &f_fr0),
+            "two language tags at the same list position are two facts"
+        );
+        assert_ne!(
+            IndexType::Spot.compare(&f_en0, &f_fr0),
+            Ordering::Equal,
+            "SPOT comparator must disagree when only the language tag differs"
+        );
+        // The index still dominates the tag: position orders first.
+        assert_eq!(
+            cmp_meta(&f_fr0, &f_en1),
+            Ordering::Less,
+            "list index remains the primary discriminator"
+        );
+
         // `cmp_object` mixes value and datatype: equal value + differing
         // datatype must order. Use distinct datatype Sids on otherwise
         // identical flakes.
