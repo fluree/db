@@ -19,7 +19,7 @@
 //! graph-source events are logged and ignored (no graph sources in the
 //! v1 browser peer).
 
-use crate::bridge::IoHandle;
+use crate::bridge::{IoHandle, TokenCell};
 use crate::protocol::IoJob;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -105,24 +105,29 @@ impl HeadTracker {
 /// a fetch-streamed SSE request inside the driver and hands the chunks
 /// back over a channel (Send futures on the engine side, JS handles on the
 /// driver side).
+///
+/// The bearer is resolved from the [`TokenCell`] PER CONNECT — the same
+/// semantics as the native `ReqwestSseSource`'s per-connect token
+/// provider — so a reconnect after [`TokenCell::set`] carries the fresh
+/// token.
 #[derive(Debug, Clone)]
 pub struct ChannelSseSource {
     io: IoHandle,
     url: String,
-    bearer: Option<String>,
+    bearer: Option<TokenCell>,
 }
 
 impl ChannelSseSource {
-    /// A source for `url`; `bearer` is sent as the `authorization` header
-    /// when present.
-    pub fn new(io: IoHandle, url: String, bearer: Option<String>) -> Self {
+    /// A source for `url`; when a cell is given, its current token is sent
+    /// as the `authorization` header on each connect attempt.
+    pub fn new(io: IoHandle, url: String, bearer: Option<TokenCell>) -> Self {
         Self { io, url, bearer }
     }
 
     fn headers(&self) -> Vec<(&'static str, String)> {
         let mut headers = vec![("accept", "text/event-stream".to_string())];
-        if let Some(token) = &self.bearer {
-            headers.push(("authorization", format!("Bearer {token}")));
+        if let Some(cell) = &self.bearer {
+            headers.push(("authorization", cell.bearer_header()));
         }
         headers
     }
@@ -257,6 +262,54 @@ pub(crate) fn events_url(api_base: &str, ledgers: &[String]) -> String {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// The bearer is read from the cell on EVERY connect (native
+    /// `ReqwestSseSource` parity): a reconnect after a token refresh
+    /// carries the fresh token.
+    #[tokio::test]
+    async fn sse_source_resolves_the_token_per_connect() {
+        use crate::cas::tests::{spawn_mock_driver, MockState};
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            s.sse_script.push_back(Vec::new());
+            s.sse_script.push_back(Vec::new());
+        }
+        let (io, rx) = IoHandle::channel();
+        let driver = spawn_mock_driver(rx, Arc::clone(&state));
+
+        let cell = TokenCell::new("a");
+        let source = ChannelSseSource::new(
+            io.clone(),
+            "http://origin.example/v1/fluree/events?all=true".to_string(),
+            Some(cell.clone()),
+        );
+
+        let _first = source.connect().await.expect("first connect");
+        cell.set("b");
+        let _second = source.connect().await.expect("second connect");
+
+        {
+            let s = state.lock().unwrap();
+            let bearers: Vec<String> = s
+                .sse_log
+                .iter()
+                .map(|(_, headers)| {
+                    headers
+                        .iter()
+                        .find(|(name, _)| *name == "authorization")
+                        .map(|(_, value)| value.clone())
+                        .expect("connect must send a bearer")
+                })
+                .collect();
+            assert_eq!(bearers, vec!["Bearer a", "Bearer b"]);
+        }
+
+        io.shutdown();
+        driver.await.unwrap();
+    }
 
     #[test]
     fn events_url_encodes_subscriptions() {
