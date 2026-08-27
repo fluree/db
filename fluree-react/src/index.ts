@@ -2,6 +2,7 @@
 export { createClient } from "./createClient.js";
 export type {
   ClientConfig,
+  PeerClientConfig,
   RemoteClientConfig,
   TransportClientConfig,
 } from "./createClient.js";
@@ -38,6 +39,18 @@ export type {
 } from "./core/transport.js";
 export { RemoteTransport } from "./remote/remoteTransport.js";
 export type { RemoteTransportOptions } from "./remote/remoteTransport.js";
+export { PeerTransport } from "./peer/peerTransport.js";
+export type { PeerTransportOptions } from "./peer/peerTransport.js";
+export type {
+  PeerConnect,
+  PeerConnectOptions,
+  PeerCycle,
+  PeerEngine,
+  PeerEngineState,
+  PeerError,
+  PeerLedger,
+  PeerSubscription,
+} from "./peer/peerEngine.js";
 
 // Utilities
 export { replaceEqualDeep } from "./core/structuralShare.js";

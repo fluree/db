@@ -208,3 +208,109 @@ export class MockServer {
     return makeResponse(await this.respond(call, n));
   };
 }
+
+// ---------------------------------------------------------------------------
+// Peer-engine double
+// ---------------------------------------------------------------------------
+
+import type {
+  PeerCycle,
+  PeerEngine,
+  PeerEngineState,
+  PeerLedger,
+  PeerSubscription,
+} from "../src/peer/peerEngine.js";
+
+export interface FakeSubscribeCall {
+  ledger: string;
+  query: string | object;
+  subId: number;
+}
+
+/**
+ * Scriptable stand-in for `@fluree/db-wasm`'s `Peer`. Registration can be
+ * held open (`holdRegistrations`) to drive the async-registration races the
+ * real worker boundary produces.
+ */
+export class FakePeerEngine implements PeerEngine {
+  readonly subscribes: FakeSubscribeCall[] = [];
+  readonly unsubscribes: number[] = [];
+  readonly queries: Array<{ ledger: string; query: string | object }> = [];
+  queryResult: unknown = { ok: true };
+  closed = false;
+  /** When true, `subscribe` promises stay pending until `releaseAll()`. */
+  holdRegistrations = false;
+  /** Set to make the next `subscribe` reject. */
+  failNextSubscribe: unknown;
+
+  private nextSubId = 100;
+  private readonly cycleListeners = new Set<(c: PeerCycle) => void>();
+  private readonly stateListeners = new Set<(s: PeerEngineState) => void>();
+  private readonly held: Array<() => void> = [];
+
+  async ledger(id: string): Promise<PeerLedger> {
+    return {
+      query: async (query: string | object) => {
+        this.queries.push({ ledger: id, query });
+        return this.queryResult;
+      },
+    };
+  }
+
+  subscribe(
+    ledger: string,
+    query: string | object,
+    _onUpdate: () => void,
+  ): Promise<PeerSubscription> {
+    if (this.failNextSubscribe !== undefined) {
+      const err = this.failNextSubscribe;
+      this.failNextSubscribe = undefined;
+      return Promise.reject(err);
+    }
+    const subId = this.nextSubId++;
+    this.subscribes.push({ ledger, query, subId });
+    const sub: PeerSubscription = {
+      subId,
+      unsubscribe: async () => {
+        this.unsubscribes.push(subId);
+      },
+    };
+    if (!this.holdRegistrations) return Promise.resolve(sub);
+    return new Promise((resolve) => this.held.push(() => resolve(sub)));
+  }
+
+  /** Resolve every held registration. */
+  releaseAll(): void {
+    const pending = this.held.splice(0);
+    for (const release of pending) release();
+  }
+
+  onCycle(listener: (cycle: PeerCycle) => void): () => void {
+    this.cycleListeners.add(listener);
+    return () => this.cycleListeners.delete(listener);
+  }
+
+  onEngineState(listener: (state: PeerEngineState) => void): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+
+  close(): void {
+    this.closed = true;
+  }
+
+  emitCycle(cycle: PeerCycle): void {
+    for (const listener of [...this.cycleListeners]) listener(cycle);
+  }
+
+  emitState(state: PeerEngineState): void {
+    for (const listener of [...this.stateListeners]) listener(state);
+  }
+
+  /** Engine subId assigned to the nth subscribe (registration order). */
+  subId(n: number): number {
+    const call = this.subscribes[n];
+    if (!call) throw new Error(`no engine subscription #${n}`);
+    return call.subId;
+  }
+}
