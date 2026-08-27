@@ -12,8 +12,53 @@ use async_trait::async_trait;
 use fluree_db_nameservice_sync::{
     HttpTransport, TransportError, TransportRequest, TransportResponse,
 };
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+
+/// Shared, hot-swappable bearer token.
+///
+/// Long-lived subscribed sessions outlive their tokens: the shell's auth
+/// flow refreshes the bearer mid-session, and every I/O surface holding a
+/// clone of this cell — the fetch transports, the SSE source — picks the
+/// new value up on its next request or connect, with no teardown and no
+/// loss of warm per-store state. [`crate::BrowserPeer::set_token`] is the
+/// public entry.
+///
+/// Per-request cost is one read-lock acquisition plus the header-string
+/// allocation the request needed anyway. `Debug` redacts the token.
+#[derive(Clone)]
+pub struct TokenCell {
+    inner: Arc<RwLock<String>>,
+}
+
+impl TokenCell {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(token.into())),
+        }
+    }
+
+    /// Replace the token. Requests already in flight keep the header they
+    /// were stamped with; everything issued afterwards carries the new one.
+    pub fn set(&self, token: impl Into<String>) {
+        *self.inner.write().unwrap_or_else(PoisonError::into_inner) = token.into();
+    }
+
+    /// The current `authorization` header value (`Bearer {token}`).
+    pub fn bearer_header(&self) -> String {
+        format!(
+            "Bearer {}",
+            self.inner.read().unwrap_or_else(PoisonError::into_inner)
+        )
+    }
+}
+
+impl std::fmt::Debug for TokenCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenCell(<redacted>)")
+    }
+}
 
 /// Receiving end of the job channel, consumed by a driver.
 pub type IoReceiver = mpsc::UnboundedReceiver<IoJob>;
@@ -65,13 +110,30 @@ impl IoHandle {
 pub struct WasmFetchTransport {
     io: IoHandle,
     timeout: Duration,
+    token: Option<TokenCell>,
 }
 
 impl WasmFetchTransport {
     /// A transport whose requests are executed by the driver behind `io`
     /// and abandoned (aborted) after `timeout`.
     pub fn new(io: IoHandle, timeout: Duration) -> Self {
-        Self { io, timeout }
+        Self {
+            io,
+            timeout,
+            token: None,
+        }
+    }
+
+    /// Source the `authorization` header from `cell` on every request,
+    /// REPLACING any authorization header the caller baked into the
+    /// request. This is the hot-refresh seam: the proxy clients construct
+    /// requests with the token they were built with, and a transport
+    /// carrying a cell overrides it with the current one, so
+    /// [`TokenCell::set`] takes effect mid-session without rebuilding the
+    /// peer.
+    pub fn with_token(mut self, cell: TokenCell) -> Self {
+        self.token = Some(cell);
+        self
     }
 
     /// The per-request deadline this transport stamps on its jobs.
@@ -83,6 +145,12 @@ impl WasmFetchTransport {
 #[async_trait]
 impl HttpTransport for WasmFetchTransport {
     async fn execute(&self, req: TransportRequest) -> Result<TransportResponse, TransportError> {
+        let mut req = req;
+        if let Some(cell) = &self.token {
+            req.headers
+                .retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+            req.headers.push(("authorization", cell.bearer_header()));
+        }
         let (reply, rx) = oneshot::channel();
         self.io
             .send(IoJob::Fetch {
@@ -139,6 +207,60 @@ mod tests {
         assert_eq!(resp.headers.get("etag").unwrap(), "\"abc\"");
         assert_eq!(&resp.body[..], b"nope");
         driver.await.unwrap();
+    }
+
+    /// A transport carrying a token cell REPLACES any baked authorization
+    /// header with the cell's current value — the hot-refresh contract —
+    /// and never duplicates it. `Debug` on the cell redacts the token.
+    #[tokio::test]
+    async fn token_cell_stamps_and_replaces_the_authorization_header() {
+        let (io, mut rx) = IoHandle::channel();
+        let cell = TokenCell::new("first");
+        let transport =
+            WasmFetchTransport::new(io, Duration::from_secs(1)).with_token(cell.clone());
+
+        // Echo every authorization header value back as the body.
+        let driver = tokio::spawn(async move {
+            for _ in 0..2 {
+                match rx.recv().await.expect("job") {
+                    IoJob::Fetch { req, reply, .. } => {
+                        let auth: Vec<String> = req
+                            .headers
+                            .iter()
+                            .filter(|(name, _)| *name == "authorization")
+                            .map(|(_, value)| value.clone())
+                            .collect();
+                        let _ = reply.send(Ok(TransportResponse {
+                            status: StatusCode::OK,
+                            headers: HeaderMap::new(),
+                            body: Bytes::from(auth.join("|")),
+                        }));
+                    }
+                    other => panic!("unexpected job {other:?}"),
+                }
+            }
+        });
+
+        // The proxy clients bake the token they were built with; the
+        // transport overrides it with the cell's current value.
+        let stale = TransportRequest::get("http://origin.example/x")
+            .header("authorization", "Bearer stale".to_string());
+        let resp = transport.execute(stale).await.expect("reply");
+        assert_eq!(&resp.body[..], b"Bearer first");
+
+        cell.set("second");
+        let resp = transport
+            .execute(TransportRequest::get("http://origin.example/x"))
+            .await
+            .expect("reply");
+        assert_eq!(&resp.body[..], b"Bearer second");
+        driver.await.unwrap();
+
+        let debugged = format!("{cell:?} / {transport:?}");
+        assert!(
+            !debugged.contains("second") && !debugged.contains("first"),
+            "Debug must redact the token: {debugged}"
+        );
     }
 
     #[tokio::test]

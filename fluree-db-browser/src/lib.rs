@@ -62,7 +62,7 @@ pub mod live;
 pub mod protocol;
 pub mod residency;
 
-pub use bridge::{IoClosed, IoHandle, IoReceiver, WasmFetchTransport};
+pub use bridge::{IoClosed, IoHandle, IoReceiver, TokenCell, WasmFetchTransport};
 pub use cas::{BrowserCasStorage, CasStats};
 pub use config::{BrowserIoConfig, CacheConfig};
 #[cfg(target_arch = "wasm32")]
