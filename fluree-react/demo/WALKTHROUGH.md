@@ -108,12 +108,14 @@ round trip.
 
 It works, and it is a genuinely different thing to show. But:
 
-- it is **slower to first paint** than remote mode — a ~9 MB wasm download
-  and compile, against remote's one HTTP query. The Board's
+- it is **slower to first paint** than remote mode — ~1.3 s to download and
+  compile the ~9 MB wasm engine, then a further ~3.4 s of engine work before
+  the first answer, against remote's one HTTP query. The Board's
   `first data N ms` badge shows this in both modes, so don't claim
-  otherwise; the win is update latency, not startup. A cold open is ~3.4 s
-  today, and that cost is a known open engine issue — say so if asked rather
-  than explaining it away;
+  otherwise; the win is update latency, not startup. If asked why the second
+  number is so large: it is a known open engine issue — measured after
+  compile, ~90% CPU, and near-invariant to how much data the ledger holds —
+  say that rather than explaining it away;
 - setup is heavier (below), so do it before the room is watching.
 
 ```sh

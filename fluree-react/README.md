@@ -78,10 +78,13 @@ result shapes are identical in both.
 ### Peer mode is not a speed-up on first paint
 
 Worth stating plainly, because the opposite is the natural assumption. Peer
-mode pays a cold-start cost remote mode does not have: fetching and compiling
-a ~9 MB wasm engine before it can answer anything. A measured cold open is
-**~3.4 s**, against remote mode's **141 ms** to first rendered data on
-loopback.
+mode pays a cold-start cost remote mode does not have, and it comes in two
+parts. Fetching and compiling the ~9 MB wasm engine costs roughly **1.3 s**
+before the engine can be asked anything. Opening a ledger and answering the
+first query then costs a further **~3.4 s** — measured with the profiler
+armed only *after* the connection resolves, so that figure is engine work,
+**not** download or compile. Remote mode reaches first rendered data in
+**141 ms** on loopback.
 
 Two things are known about that 3.4 s, and both are worth knowing before you
 plan around it. It is **fixed overhead, near-invariant to data size** — 2

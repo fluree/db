@@ -43,8 +43,11 @@ CORS never enters the story; point it elsewhere with `FLUREE_URL`.
 > changed row re-rendering, `t` advancing — including with the block cache
 > entirely unavailable.
 >
-> Peer mode is **slower to first paint** than remote mode: a ~9 MB wasm
-> fetch and compile, against remote's single HTTP query. It wins on what
+> Peer mode is **slower to first paint** than remote mode: ~1.3 s to fetch
+> and compile the ~9 MB wasm engine, and a further ~3.4 s of engine work to
+> open a ledger and answer the first query (that second part is measured
+> after compile — it is a known open engine issue, not download time),
+> against remote's single HTTP query. It wins on what
 > happens after — updates re-query locally with no round trip. The
 > `first data N ms` badge on the Board shows this honestly in both modes,
 > so don't claim otherwise while demoing.
