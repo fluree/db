@@ -1937,7 +1937,20 @@ impl FlureeBuilder {
     /// [`with_indexing_thresholds`] are preserved; otherwise the
     /// production defaults apply.
     ///
+    /// Takes effect on the build paths that start an in-process indexer:
+    /// [`build`], `build_s3*`, and the encrypted variants. It is a silent
+    /// no-op under [`build_memory`] (background indexing is unconditionally
+    /// disabled there) and is not honored by [`build_with`],
+    /// [`Fluree::from_backend`], or [`Fluree::with_indexing_mode`], which
+    /// construct without an in-process worker. Provider hooks set on the
+    /// supplied config (`fulltext_config_provider`,
+    /// `attachment_events_provider`, `warm_cache_source`) are replaced by
+    /// the API layer's own wiring at build time.
+    ///
     /// [`with_indexing_thresholds`]: FlureeBuilder::with_indexing_thresholds
+    /// [`build`]: FlureeBuilder::build
+    /// [`build_memory`]: FlureeBuilder::build_memory
+    /// [`build_with`]: FlureeBuilder::build_with
     pub fn with_indexer_config(mut self, indexer_config: IndexerConfig) -> Self {
         let index_config = self
             .indexing_config
@@ -2083,7 +2096,9 @@ impl FlureeBuilder {
     /// covered by the built-in `build()` / `build_memory()` / `build_s3()`
     /// methods (e.g. proxy storage for peer mode).
     ///
-    /// Honors the builder's cache and indexing settings.
+    /// Honors the builder's cache settings and novelty thresholds, but does
+    /// **not** start background indexing (`indexing_mode` is `Disabled`);
+    /// use `build()` / `build_s3*()` when an in-process indexer is needed.
     pub fn build_with(
         self,
         storage: impl Storage + 'static,
@@ -3235,7 +3250,10 @@ impl Fluree {
     /// `None` under [`IndexingMode::Disabled`]. Lets embedders observe or
     /// drain indexing (`status`, `wait_for_idle`) on an instance built via
     /// [`FlureeBuilder`], whose worker is otherwise reachable only through
-    /// the `indexing_mode` field.
+    /// the `indexing_mode` field. Only the build paths that start an
+    /// in-process indexer return `Some` — `build()`, `build_s3*`, and the
+    /// encrypted variants; `build_memory()`, `build_with()`, and
+    /// `from_backend()` construct with indexing disabled.
     ///
     /// [`IndexingMode::Disabled`]: tx::IndexingMode::Disabled
     pub fn indexer_handle(&self) -> Option<&IndexerHandle> {
@@ -5022,6 +5040,34 @@ mod tests {
         let cfg = fluree.default_index_config();
         assert_eq!(cfg.reindex_min_bytes, 500_000);
         assert_eq!(cfg.reindex_max_bytes, 5_000_000);
+    }
+
+    #[test]
+    fn test_with_indexer_config_composes_with_thresholds_in_either_order() {
+        // Pins the merge semantics both ways: the sibling test above exists
+        // because one half of this merge was once silently dropped (e6d0044);
+        // this guards the other half.
+        let custom = IndexerConfig::default().with_incremental_max_commits(123);
+
+        let b1 = FlureeBuilder::memory()
+            .with_indexing_thresholds(500_000, 5_000_000)
+            .with_indexer_config(custom.clone());
+        let cfg1 = b1.indexing_config.as_ref().expect("set");
+        assert_eq!(cfg1.indexer_config.incremental_max_commits, 123);
+        assert_eq!(cfg1.index_config.reindex_min_bytes, 500_000);
+
+        let b2 = FlureeBuilder::memory()
+            .with_indexer_config(custom)
+            .with_indexing_thresholds(500_000, 5_000_000);
+        let cfg2 = b2.indexing_config.as_ref().expect("set");
+        assert_eq!(cfg2.indexer_config.incremental_max_commits, 123);
+        assert_eq!(cfg2.index_config.reindex_min_bytes, 500_000);
+    }
+
+    #[tokio::test]
+    async fn test_indexer_handle_none_without_background_indexing() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        assert!(fluree.indexer_handle().is_none());
     }
 
     #[test]

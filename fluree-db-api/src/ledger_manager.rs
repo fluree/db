@@ -486,6 +486,10 @@ impl LedgerHandle {
         // accumulated novelty, so this is not a constant-time swap.
         let install = async {
             let mut state = self.inner.state.write().await;
+            // Splits the span into wait-vs-hold: the span opens before the
+            // write().await above, so under contention its duration is
+            // acquisition wait + hold; this event's timestamp marks the seam.
+            tracing::debug!("install lock acquired");
 
             // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
             state
