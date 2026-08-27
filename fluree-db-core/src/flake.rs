@@ -339,6 +339,66 @@ impl Flake {
         }
     }
 
+    /// Create a minimum flake with specific predicate and object (for POST index)
+    ///
+    /// The datatype is left at its minimum: `cmp_object` orders by value then
+    /// datatype, so a value-only bound covers every datatype variant of `o`
+    /// and callers narrow by `dt` afterward if they matched one.
+    pub fn min_for_predicate_object(p: Sid, o: FlakeValue) -> Self {
+        Self {
+            g: None,
+            s: Sid::min(),
+            p,
+            o,
+            dt: Sid::min(),
+            t: i64::MIN,
+            op: false,
+            m: Some(FlakeMeta::min()),
+        }
+    }
+
+    /// Create a maximum flake with specific predicate and object (for POST index)
+    pub fn max_for_predicate_object(p: Sid, o: FlakeValue) -> Self {
+        Self {
+            g: None,
+            s: Sid::max(),
+            p,
+            o,
+            dt: Sid::max(),
+            t: i64::MAX,
+            op: true,
+            m: Some(FlakeMeta::max()),
+        }
+    }
+
+    /// Create a minimum flake with a specific object (for OPST index)
+    pub fn min_for_object(o: FlakeValue) -> Self {
+        Self {
+            g: None,
+            s: Sid::min(),
+            p: Sid::min(),
+            o,
+            dt: Sid::min(),
+            t: i64::MIN,
+            op: false,
+            m: Some(FlakeMeta::min()),
+        }
+    }
+
+    /// Create a maximum flake with a specific object (for OPST index)
+    pub fn max_for_object(o: FlakeValue) -> Self {
+        Self {
+            g: None,
+            s: Sid::max(),
+            p: Sid::max(),
+            o,
+            dt: Sid::max(),
+            t: i64::MAX,
+            op: true,
+            m: Some(FlakeMeta::max()),
+        }
+    }
+
     /// Check if this is a reference flake (object points to another subject)
     ///
     /// Reference flakes have datatype $id (namespace_code JSON_LD, name "id").

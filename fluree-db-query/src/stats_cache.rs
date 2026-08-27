@@ -131,7 +131,61 @@ pub(crate) fn cached_stats_view_for_db(
         return Some(cache.get_or_build_stats_view(cache_key, build_view));
     }
 
+    // No binary store (memory-mode / unindexed ledger): the leaflet-cache
+    // home for stats views doesn't exist, and rebuilding per call walks the
+    // whole novelty in `assemble_fast_stats` — per-query loops (SHACL
+    // sh:sparql validation, transaction WHEREs) paid O(novelty) planning per
+    // execution, which made file-mode sh:sparql validation quadratic in
+    // focus nodes. Fall back to a small process-global cache, keyed by the
+    // same key PLUS the overlay's `content_version()` — the documented
+    // globally-unique content stamp — since `epoch()` alone is only unique
+    // within one overlay instance's lifetime. No version stamp → no caching
+    // (identical to before).
+    if let Some(version) = db.overlay.content_version() {
+        return Some(storeless_stats_cache_get_or_build(
+            cache_key, version, build_view,
+        ));
+    }
+
     Some(build_view())
+}
+
+/// Tiny LRU for stats views of store-less (memory-mode) ledgers. A handful
+/// of slots suffices: one validation or transaction loop reuses a single
+/// entry thousands of times, and distinct concurrently-active memory ledgers
+/// are rare. Capacity-bounded so long-lived processes can't accumulate views.
+fn storeless_stats_cache_get_or_build(
+    cache_key: u128,
+    content_version: u64,
+    build_view: impl FnOnce() -> Arc<StatsView>,
+) -> Arc<StatsView> {
+    use parking_lot::Mutex;
+
+    const CAPACITY: usize = 8;
+    type Slot = (u128, u64, Arc<StatsView>);
+    static CACHE: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
+
+    {
+        let mut cache = CACHE.lock();
+        if let Some(pos) = cache
+            .iter()
+            .position(|(k, v, _)| *k == cache_key && *v == content_version)
+        {
+            let hit = cache.remove(pos);
+            let view = Arc::clone(&hit.2);
+            cache.push(hit); // most-recently-used at the back
+            return view;
+        }
+    }
+
+    // Build outside the lock — assembly walks the overlay and can be slow.
+    let view = build_view();
+    let mut cache = CACHE.lock();
+    if cache.len() >= CAPACITY {
+        cache.remove(0);
+    }
+    cache.push((cache_key, content_version, Arc::clone(&view)));
+    view
 }
 
 #[cfg(test)]
