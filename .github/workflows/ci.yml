@@ -468,3 +468,70 @@ jobs:
 
       - name: Size report
         run: cat fluree-db-wasm/js/pkg/size-report.json
+
+  react-paths:
+    # Same reason bench-paths exists: GitHub's `paths:` filter is
+    # workflow-scoped and the rest of this workflow must run on every PR, so
+    # the filter lives in a job output instead. `@fluree/react` is a plain npm
+    # package and deliberately NOT a Cargo workspace member, so nothing it
+    # contains can affect a Rust job — and equally, no Rust change can affect
+    # it. ci.yml itself is in the list so a change to the job below runs it.
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.filter.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "not a pull_request — running react-sdk"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
+          echo "changed files:"; echo "$changed"
+          if echo "$changed" | grep -qE '^fluree-react/|^\.github/workflows/ci\.yml$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no fluree-react paths changed — skipping react-sdk"
+          fi
+
+  # `@fluree/react`: type-check, unit tests, and the package build. No Rust
+  # toolchain, no cargo cache — this job exists so the TypeScript SDK cannot
+  # rot, and so it never makes a Rust contributor's PR slower.
+  react-sdk:
+    needs: react-paths
+    if: needs.react-paths.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: fluree-react
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: fluree-react/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Test
+        run: npx vitest run
+
+      # Emits dist/ with `types: []`, so a src file that leaned on a vitest
+      # global (or any dev-only type) fails here rather than in a consumer's
+      # build.
+      - name: Build
+        run: npm run build
