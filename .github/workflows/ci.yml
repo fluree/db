@@ -273,7 +273,7 @@ jobs:
           tool: wasm-pack
 
       - name: Check engine stack (wasm32)
-        run: cargo check --target wasm32-unknown-unknown -p fluree-db-api -p fluree-db-nameservice-sync --no-default-features
+        run: cargo check --target wasm32-unknown-unknown -p fluree-db-api -p fluree-db-nameservice-sync -p fluree-db-browser --no-default-features
 
       - name: Check parse layer, no default features (wasm32)
         run: cargo check --target wasm32-unknown-unknown --no-default-features -p fluree-vocab -p fluree-graph-ir -p fluree-graph-turtle -p fluree-graph-json-ld -p fluree-db-sparql
@@ -312,9 +312,14 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install wasm-pack, wasm-bindgen CLI (Cargo.lock version), binaryen
+      # wasm-pack pinned via the same installer action the wasm32 job uses —
+      # not an unpinned `curl | sh`.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.13.1
+
+      - name: Install wasm-bindgen CLI (Cargo.lock version) and binaryen
         run: |
-          curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
           VER=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | tail -1 | cut -d'"' -f2)
           if [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" != "$VER" ]; then
             cargo install wasm-bindgen-cli --version "$VER" --locked --force
@@ -324,15 +329,24 @@ jobs:
       - name: Browser tests (wasm-bindgen-test in a dedicated worker, headless Chrome)
         run: wasm-pack test --headless --chrome fluree-db-wasm
 
+      # The browser I/O crate's real-browser suites (fetch round-trip, error
+      # classification, IndexedDB persistence, SSE streaming) — review H-3:
+      # without this line they never execute in CI.
+      - name: Browser I/O tests (headless Chrome)
+        run: wasm-pack test --headless --chrome fluree-db-browser
+
       - name: Build npm package (wasm-release profile + wasm-opt + tsc)
         working-directory: fluree-db-wasm/js
         run: |
           npm ci
           node scripts/build.mjs
 
-      - name: Smoke the shipped package (headless Chrome over CDP, no isolation headers)
+      # --packed: smoke the `npm pack` tarball, not the repo dir, so a `files`
+      # allowlist regression (e.g. the .wasm dropped from the tarball) fails
+      # here instead of in consumers' installs.
+      - name: Smoke the packed package (headless Chrome over CDP, no isolation headers)
         working-directory: fluree-db-wasm/js
-        run: node scripts/smoke-browser.mjs
+        run: node scripts/smoke-browser.mjs --packed
 
       - name: Size report
         run: cat fluree-db-wasm/js/pkg/size-report.json

@@ -3279,10 +3279,12 @@ fn create_storage_proxy_token_scoped(signing_key: &SigningKey, ledgers: &[&str])
     format!("{header_b64}.{payload_b64}.{sig_b64}")
 }
 
-/// The nameservice record's watermarks are its identity: the endpoint serves
-/// `ETag: "{commit_t}:{index_t}"` with `Cache-Control: no-cache`, answers a
-/// matching `If-None-Match` with 304, and the ETag changes when the head
-/// advances (making SSE-less head polling a cheap 304 loop).
+/// The nameservice record serves a content-digest `ETag` with
+/// `Cache-Control: private, no-cache`, answers a matching `If-None-Match`
+/// with 304, and the ETag changes when the head advances (making SSE-less
+/// head polling a cheap 304 loop). The `*` form of `If-None-Match` is
+/// deliberately not honored (see `if_none_match_matches` in
+/// `routes/storage_proxy.rs`) — pinned below as a 200.
 #[tokio::test]
 async fn test_ns_record_etag_and_conditional_get() {
     let (_tmp, state) = tx_server_state().await;
@@ -3397,6 +3399,29 @@ async fn test_ns_record_etag_and_conditional_get() {
     );
     let new_etag = header_str(&resp, "etag").to_string();
     assert_ne!(new_etag, etag, "ETag must change when the head advances");
+
+    // `If-None-Match: *` is deliberately not honored (the route answers
+    // before consulting storage, so `*`'s "any current representation"
+    // semantics cannot be evaluated) — it must serve the full 200, never 304.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("If-None-Match", "*")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the `*` If-None-Match form is documented as not honored"
+    );
+    assert_eq!(header_str(&resp, "etag"), new_etag);
 }
 
 /// Browser contract for the CORS layer: preflights must explicitly allow
