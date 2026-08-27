@@ -2414,8 +2414,14 @@ impl Operator for BinaryScanOperator {
                     Arc::clone(hit)
                 } else {
                     translate_span.record("cache_hit", false);
-                    translate_span
-                        .record("segments", ctx.overlay().overlay_segments(self.g_id).len());
+                    // `overlay_segments` allocates, so only pay for it when a
+                    // subscriber is actually recording this span — the bounded
+                    // path is a seek, and instrumentation must not be a
+                    // meaningful share of it.
+                    if !translate_span.is_disabled() {
+                        translate_span
+                            .record("segments", ctx.overlay().overlay_segments(self.g_id).len());
+                    }
                     let entry = if let Some(walk) = bounded.as_ref() {
                         // Bounded path. The cross-query `global_translation_cache`
                         // is deliberately skipped: its key has no scope dimension,
@@ -3923,8 +3929,8 @@ mod bounded_overlay_walk_tests {
                 let s = sid(100, &format!("s{}", rng(&mut st) % 7));
                 let p = sid(101, &format!("p{}", rng(&mut st) % 5));
                 let o = FlakeValue::Long((rng(&mut st) % 4) as i64);
-                let op = rng(&mut st) % 3 != 0; // ~1/3 retractions
-                let m = if rng(&mut st) % 4 == 0 {
+                let op = !rng(&mut st).is_multiple_of(3); // ~1/3 retractions
+                let m = if rng(&mut st).is_multiple_of(4) {
                     Some(FlakeMeta::with_index((rng(&mut st) % 3) as i32))
                 } else {
                     None
@@ -3952,7 +3958,7 @@ mod bounded_overlay_walk_tests {
         };
         let mut out = Vec::new();
         n.for_each_overlay_flake(0, index, first, rhs, leftmost, to_t, &mut |f| {
-            out.push(f.clone())
+            out.push(f.clone());
         });
         out
     }
@@ -4053,7 +4059,7 @@ mod bounded_overlay_walk_tests {
                     o_key: rng(&mut st) % 3,
                     o_i: u32::MAX,
                     t: (rng(&mut st) % 9) as i64,
-                    op: rng(&mut st) % 2 == 0,
+                    op: rng(&mut st).is_multiple_of(2),
                 });
             }
 
@@ -4097,7 +4103,7 @@ mod bounded_overlay_walk_tests {
                     o_key: rng(&mut st) % 3,
                     o_i: u32::MAX,
                     t: (rng(&mut st) % 9) as i64,
-                    op: rng(&mut st) % 2 == 0,
+                    op: rng(&mut st).is_multiple_of(2),
                 });
             }
 

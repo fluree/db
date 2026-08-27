@@ -233,7 +233,11 @@ async fn bound_predicate_scan_spans_index_and_novelty() {
         "where":  {"@id": "ex:item2", "ex:tag": "?t"},
         "delete": {"@id": "ex:item2", "ex:tag": "?t"}
     });
-    let ledger = fluree.update(ledger, &update).await.expect("retract").ledger;
+    let ledger = fluree
+        .update(ledger, &update)
+        .await
+        .expect("retract")
+        .ledger;
     let add = json!({
         "@context": ctx(),
         "@id": "ex:item99",
@@ -286,7 +290,11 @@ async fn named_graphs_stay_isolated() {
             ["graph", G2, {"@id": "ex:shared-subject", "ex:colour": "original", "ex:tag": "keep"}]
         ]
     });
-    let ledger = fluree.update(ledger, &seed).await.expect("seed graphs").ledger;
+    let ledger = fluree
+        .update(ledger, &seed)
+        .await
+        .expect("seed graphs")
+        .ledger;
     fluree
         .reindex(LEDGER, ReindexOptions::default())
         .await
@@ -421,14 +429,21 @@ async fn every_subject_reads_back_correctly_after_scattered_retractions() {
             "where":  {"@id": format!("ex:item{i}"), "ex:colour": "?c"},
             "delete": {"@id": format!("ex:item{i}"), "ex:colour": "?c"}
         });
-        ledger = fluree.update(ledger, &update).await.expect("retract").ledger;
+        ledger = fluree
+            .update(ledger, &update)
+            .await
+            .expect("retract")
+            .ledger;
     }
 
     for i in 0..N {
         let p = props(&fluree, LEDGER, &format!("ex:item{i}")).await;
         let has_colour = p.iter().any(|s| s.contains(&format!("colour{i}")));
         if i % 3 == 0 {
-            assert!(!has_colour, "item{i}: retracted colour still visible: {p:?}");
+            assert!(
+                !has_colour,
+                "item{i}: retracted colour still visible: {p:?}"
+            );
         } else {
             assert!(has_colour, "item{i}: untouched colour went missing: {p:?}");
         }
