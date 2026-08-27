@@ -102,7 +102,10 @@ impl Playground {
     ///
     /// `max_memory_bytes` caps each query's retained-memory budget; queries
     /// that cross it fail with a typed `out_of_memory` error instead of
-    /// trapping the whole instance. Omitted/0 → engine default.
+    /// trapping the whole instance. Omitted/0 → engine default. The budget
+    /// instruments QUERY execution only — the transact paths have no
+    /// engine-side budget yet and get a coarse input-size pre-gate instead
+    /// (see [`Self::insert`] and `js/README.md`).
     #[wasm_bindgen(constructor)]
     pub fn new(max_memory_bytes: Option<f64>) -> Playground {
         Playground {
@@ -165,6 +168,7 @@ impl Playground {
     /// Insert JSON-LD (`data` is the JSON text of a node, node array, or
     /// `{"@context", "@graph"}` document). Resolves to a commit receipt.
     pub async fn insert(&self, ledger_id: String, data: String) -> Result<String, JsValue> {
+        self.transact_pregate("insert body", data.len())?;
         let data = parse_json("transaction body", &data)?;
         let out = self
             .fluree
@@ -180,6 +184,7 @@ impl Playground {
     /// Upsert JSON-LD: like `insert`, but existing values of single-cardinality
     /// properties on the same subject are replaced instead of accumulated.
     pub async fn upsert(&self, ledger_id: String, data: String) -> Result<String, JsValue> {
+        self.transact_pregate("upsert body", data.len())?;
         let data = parse_json("transaction body", &data)?;
         let out = self
             .fluree
@@ -194,6 +199,7 @@ impl Playground {
 
     /// JSON-LD update: a `{"where", "delete", "insert"}` document (JSON text).
     pub async fn update(&self, ledger_id: String, data: String) -> Result<String, JsValue> {
+        self.transact_pregate("update document", data.len())?;
         let data = parse_json("update document", &data)?;
         let out = self
             .fluree
@@ -213,6 +219,7 @@ impl Playground {
         ledger_id: String,
         sparql: String,
     ) -> Result<String, JsValue> {
+        self.transact_pregate("SPARQL update", sparql.len())?;
         let out = self
             .fluree
             .graph(&ledger_id)
@@ -254,9 +261,47 @@ impl Playground {
             .map_err(api_error)?;
         to_bytes(&result)
     }
+
+    /// Test hook: deliberately panic — i.e. trap the wasm instance — so the
+    /// JS shell's crash/recycle path can be exercised end to end (a wasm
+    /// panic aborts the instance; there is no gentler way to produce the real
+    /// poisoned state). Hidden: not part of the supported API surface.
+    #[doc(hidden)]
+    #[wasm_bindgen(js_name = debugCrash)]
+    #[allow(clippy::panic, clippy::unused_self)]
+    pub fn debug_crash(&self) {
+        panic!("debugCrash: deliberate trap requested by the test harness");
+    }
 }
 
 impl Playground {
+    /// Coarse input-size pre-gate for the transact paths (PR-1715 review):
+    /// the memory budget instruments only query execution — staging a
+    /// transaction has no engine-side budget yet, and a large JSON body
+    /// expands several-fold into parsed values, staged flakes, and novelty.
+    /// Refuse inputs whose size alone makes an allocator trap plausible:
+    /// ¼ of the budget approximates "input × expansion ≥ budget". Coarse by
+    /// design; the real fix is a transact-side budget in the engine.
+    fn transact_pregate(&self, what: &str, len: usize) -> Result<(), JsValue> {
+        let Some(budget) = self.max_memory_bytes else {
+            return Ok(());
+        };
+        let cap = budget / 4;
+        if len > cap {
+            return Err(js_error(
+                error::code::OUT_OF_MEMORY,
+                507,
+                &format!(
+                    "{what} is {len} bytes; inputs over {cap} bytes (¼ of the \
+                     {budget}-byte memory budget) are refused to avoid trapping \
+                     the engine mid-transact — raise maxMemoryBytes or split the \
+                     transaction"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Clone the pinned view out of the slab; the borrow ends before any await.
     fn view(&self, handle: u32) -> Result<Arc<GraphDb>, JsValue> {
         self.snapshots

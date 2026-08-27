@@ -3,22 +3,30 @@
 // wasm, in a real Chrome, over plain HTTP with no special headers.
 //
 //   node scripts/smoke-browser.mjs            # after `node scripts/build.mjs`
+//   node scripts/smoke-browser.mjs --packed   # smoke the `npm pack` tarball
 //   CHROME=/path/to/chrome node scripts/smoke-browser.mjs
 //
 // Drives headless Chrome over the DevTools protocol (no puppeteer/webdriver
 // dependency — node ≥22 has a global WebSocket). Loads demo/smoke.html, which
 // sets `window.__smoke` to a promise; the test awaits it via
 // Runtime.evaluate and exits 0 ONLY when the page reports `status: "pass"`
-// with the expected bound rows — a positive ran-marker. Timeouts, thrown
-// errors, and a missing marker all exit 1.
+// with the expected bound rows AND the crash/recycle phase's typed outcomes —
+// positive ran-markers. Timeouts, thrown errors, and a missing marker all
+// exit 1.
+//
+// `--packed` smokes what an install actually receives: `npm pack`, extract
+// the tarball, overlay demo/ (not shipped), and serve THAT — so a `files`
+// allowlist regression (e.g. the .wasm dropped from the tarball) fails here
+// instead of in consumers' installs.
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { packageRoot, startServer } from "./serve.mjs";
 
 const TIMEOUT_MS = Number(process.env.SMOKE_TIMEOUT_MS ?? 180_000);
+const packed = process.argv.includes("--packed");
 
 function findChrome() {
   const candidates = [
@@ -50,7 +58,32 @@ for (const f of ["dist/index.js", "dist/worker.js", "pkg/fluree_db_wasm_bg.wasm"
   }
 }
 
-const { server, url } = await startServer(packageRoot, 0);
+let serveRoot = packageRoot;
+let packDir = null;
+if (packed) {
+  packDir = mkdtempSync(join(tmpdir(), "fluree-wasm-pack-"));
+  const packOut = spawnSync("npm", ["pack", "--pack-destination", packDir], {
+    cwd: packageRoot,
+    encoding: "utf8",
+  });
+  if (packOut.status !== 0) {
+    console.error(`npm pack failed: ${packOut.stderr}`);
+    process.exit(2);
+  }
+  const tarball = packOut.stdout.trim().split("\n").pop();
+  const untar = spawnSync("tar", ["-xzf", join(packDir, tarball), "-C", packDir]);
+  if (untar.status !== 0) {
+    console.error("tarball extraction failed");
+    process.exit(2);
+  }
+  serveRoot = join(packDir, "package");
+  // The demo pages are deliberately not shipped; overlay them on the
+  // extracted tarball so the smoke drives exactly the published files.
+  cpSync(join(packageRoot, "demo"), join(serveRoot, "demo"), { recursive: true });
+  console.log(`smoking packed tarball: ${tarball}`);
+}
+
+const { server, url } = await startServer(serveRoot, 0);
 const chromeBin = findChrome();
 if (!chromeBin) {
   console.error("no Chrome/Chromium found; set CHROME=/path/to/binary");
@@ -80,6 +113,11 @@ function cleanup() {
     // let cleanup decide the exit code.
     rmSync(profileDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   } catch { /* leftover temp dir is harmless */ }
+  if (packDir) {
+    try {
+      rmSync(packDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch { /* leftover temp dir is harmless */ }
+  }
 }
 
 const wsUrl = await new Promise((resolve, reject) => {
@@ -145,12 +183,26 @@ try {
   const r = result.value;
   console.log("page report:", JSON.stringify(r, null, 2));
   const names = Array.isArray(r?.names) ? r.names.join(",") : "";
-  if (r?.status === "pass" && r.rows === 2 && names === "Alice,Bob" && r.ask === true) {
+  const phase1 = r?.status === "pass" && r.rows === 2 && names === "Alice,Bob" && r.ask === true;
+  // Phase 2 (H-4/H-5): the deliberate crash was typed and fatal, the fresh
+  // engine came back, the stale pre-crash snapshot handle was refused typed
+  // (never answered from the fresh engine), and its release() left the fresh
+  // engine's snapshot intact.
+  const phase2 =
+    r?.crashCode === "engine_crashed" &&
+    r?.crashFatal === true &&
+    r?.staleCode === "not_found" &&
+    r?.postAlive === true;
+  if (phase1 && phase2) {
     console.log(`PASS: create → insert → query returned ${r.rows} rows via ${r.transport} transport ` +
-      `(engine ${r.version}; init ${r.timings.init} ms, insert ${r.timings.insert} ms, query ${r.timings.query} ms)`);
+      `(engine ${r.version}; init ${r.timings.init} ms, insert ${r.timings.insert} ms, query ${r.timings.query} ms); ` +
+      `crash/recycle: typed ${r.crashCode}, stale snapshot → ${r.staleCode}, ` +
+      `engine back after ${r.recycleAttempts} attempt(s)`);
     exit = 0;
-  } else {
+  } else if (!phase1) {
     console.error("FAIL: page did not report the expected rows");
+  } else {
+    console.error("FAIL: crash/recycle phase did not report the expected typed outcomes");
   }
 } catch (err) {
   console.error("FAIL:", err.message ?? err);

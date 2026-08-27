@@ -7,7 +7,9 @@
  * independent promise, so several queries can be in flight; the engine
  * interleaves them on this worker's event loop (single-threaded — CPU-bound
  * work does not overlap, but a query awaiting nothing still yields between
- * operator batches).
+ * operator batches). Requests that arrive while an init is still compiling
+ * wait for it instead of failing `not_initialized`; if init failed, they get
+ * the init's actual error, not a generic one.
  *
  * Crash model (F4): a Rust panic or allocator failure traps the wasm
  * instance — it is poisoned, not recoverable. This worker survives the trap
@@ -25,11 +27,19 @@ import type { ErrorShape, QueryTarget, Request, Response } from "./protocol.js";
 
 let engine: Playground | null = null;
 let poisoned: ErrorShape | null = null;
+/** In-flight init, so requests racing the wasm compile wait instead of
+ * failing; resolved to `null` on success, the failure shape on error. */
+let initing: Promise<ErrorShape | null> | null = null;
+/** Why init failed, preserved so later requests report the real cause. */
+let initError: ErrorShape | null = null;
 const decoder = new TextDecoder();
 
 function fatalShape(err: unknown): ErrorShape {
   const message = String((err as { message?: unknown })?.message ?? err);
-  const oom = /memory|allocat|oom/i.test(message);
+  // "memory access out of bounds" is the wasm STACK-overflow signature (see
+  // build.rs), not heap exhaustion — classifying it as out_of_memory would
+  // send users tuning maxMemoryBytes for a stack bug.
+  const oom = /memory|allocat|oom/i.test(message) && !/out of bounds/i.test(message);
   return {
     code: oom ? "out_of_memory" : "engine_crashed",
     status: oom ? 507 : 500,
@@ -72,9 +82,12 @@ function reply(res: Response, transfer?: Transferable[]): void {
 
 function requireEngine(): Playground {
   if (!engine) {
-    const e = new Error("engine not initialized") as Error & { code: string; status: number };
-    e.code = "not_initialized";
-    e.status = 500;
+    const cause = initError ?? poisoned;
+    const e = new Error(
+      cause ? `engine failed to initialize: ${cause.message}` : "engine not initialized",
+    ) as Error & { code: string; status: number };
+    e.code = cause ? cause.code : "not_initialized";
+    e.status = cause ? cause.status : 500;
     throw e;
   }
   return engine;
@@ -93,6 +106,11 @@ async function handle(req: Request): Promise<void> {
     reply({ id, ok: false, error: poisoned });
     return;
   }
+  // Any non-init request racing an in-flight init waits for it; the init op
+  // itself replies from its own frame below.
+  if (req.op !== "init" && initing) {
+    await initing;
+  }
   try {
     switch (req.op) {
       case "init": {
@@ -109,8 +127,24 @@ async function handle(req: Request): Promise<void> {
           return;
         }
         if (!engine) {
-          await init(req.wasmUrl === undefined ? undefined : { module_or_path: req.wasmUrl });
-          engine = new Playground(req.maxMemoryBytes);
+          initing ??= (async (): Promise<ErrorShape | null> => {
+            try {
+              await init(req.wasmUrl === undefined ? undefined : { module_or_path: req.wasmUrl });
+              engine = new Playground(req.maxMemoryBytes);
+              initError = null;
+              return null;
+            } catch (err) {
+              initError = toErrorShape(err);
+              return initError;
+            } finally {
+              initing = null;
+            }
+          })();
+          const failure = await initing;
+          if (failure) {
+            reply({ id, ok: false, error: failure });
+            return;
+          }
         }
         reply({
           id,
@@ -147,6 +181,12 @@ async function handle(req: Request): Promise<void> {
           result: JSON.parse(await requireEngine().sparqlUpdate(req.ledger, req.body)),
         });
         return;
+      case "debugCrash":
+        // Test hook (see Playground._debugCrash): deliberately trap the
+        // instance to exercise the crash/recycle path.
+        requireEngine().debugCrash();
+        reply({ id, ok: true });
+        return;
       case "query": {
         const eng = requireEngine();
         const { handle: snap, owned } = await resolveTarget(req.target);
@@ -157,9 +197,17 @@ async function handle(req: Request): Promise<void> {
               ? await eng.querySparql(snap, req.text)
               : await eng.queryJsonld(snap, req.text);
         } finally {
-          // Release only ephemeral (per-call) snapshots — and not on a trap,
-          // where the instance is gone anyway.
-          if (owned && !poisoned) eng.release(snap);
+          // Release only ephemeral (per-call) snapshots. This `finally` runs
+          // BEFORE the outer catch sets `poisoned`, so a trap in the query
+          // must not surface a second trap from release() and mask the
+          // original — swallow release's own failure.
+          if (owned) {
+            try {
+              eng.release(snap);
+            } catch {
+              // A poisoned instance can't release; the recycle discards it.
+            }
+          }
         }
         if (req.transport === "clone") {
           reply({ id, ok: true, text: decoder.decode(bytes) });
@@ -184,4 +232,11 @@ async function handle(req: Request): Promise<void> {
 
 self.onmessage = (ev: MessageEvent<Request>) => {
   void handle(ev.data);
+};
+
+self.onmessageerror = (ev) => {
+  // A request that failed structured deserialization carries no usable id —
+  // nothing to reply to; the proxy fails its pending calls on its own error
+  // handler. Log for diagnosis.
+  console.error("fluree-db-wasm worker: message deserialization failed", ev);
 };
