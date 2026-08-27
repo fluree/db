@@ -18,7 +18,7 @@
 //! - `ns-retracted` - Record retracted/deleted
 
 use axum::{
-    extract::{Query, State},
+    extract::{RawQuery, State},
     response::sse::{Event, KeepAlive, Sse},
 };
 use chrono::Utc;
@@ -38,7 +38,7 @@ use crate::extract::{EventsPrincipal, MaybeBearer};
 use crate::state::AppState;
 
 /// Query parameters for the events endpoint
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct EventsQuery {
     /// Subscribe to all ledgers and graph sources
     #[serde(default)]
@@ -54,6 +54,39 @@ pub struct EventsQuery {
 }
 
 impl EventsQuery {
+    /// Parse this endpoint's query string.
+    ///
+    /// Hand-rolled rather than `Query<EventsQuery>`, because the subscription
+    /// params are REPEATED keys (`?ledger=a&ledger=b`) and
+    /// `serde_urlencoded` — what `axum::extract::Query` deserializes with —
+    /// cannot build a `Vec` from repeated keys. It rejects the whole request
+    /// with `invalid type: string "…", expected a sequence`, so *every*
+    /// `?ledger=` form answered 400, a single alias included; only
+    /// `?all=true` ever worked. The `Deserialize` derive stays for the
+    /// in-process constructions and tests.
+    ///
+    /// Unknown keys are ignored (forward compatibility). `all` is true for
+    /// `true`/`1`; anything else, including its absence, is false.
+    pub fn from_query_str(raw: &str) -> Self {
+        let mut query = EventsQuery::default();
+        for pair in raw.split('&').filter(|p| !p.is_empty()) {
+            let (key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+            // `+` is a space in application/x-www-form-urlencoded; percent
+            // escapes cover everything else (`:` in `books:main` is commonly
+            // sent as %3A).
+            let value = urlencoding::decode(&raw_value.replace('+', " "))
+                .map(std::borrow::Cow::into_owned)
+                .unwrap_or_else(|_| raw_value.to_string());
+            match key {
+                "all" => query.all = matches!(value.as_str(), "true" | "1"),
+                "ledger" if !value.is_empty() => query.ledgers.push(value),
+                "graph-source" if !value.is_empty() => query.graph_sources.push(value),
+                _ => {}
+            }
+        }
+        query
+    }
+
     /// Check if this query matches a given resource ID and kind
     #[cfg(test)]
     pub fn matches(&self, resource_id: &str, kind: &str) -> bool {
@@ -420,9 +453,10 @@ fn filter_to_allowed(params: &EventsQuery, principal: &EventsPrincipal) -> Event
 /// - `None` mode: Token ignored (default)
 pub async fn events(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<EventsQuery>,
+    RawQuery(raw_query): RawQuery,
     MaybeBearer(principal): MaybeBearer,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ServerError> {
+    let params = EventsQuery::from_query_str(raw_query.as_deref().unwrap_or_default());
     // Peer mode: return 404 - events endpoint not available
     // Peers subscribe to the transaction server's events endpoint instead
     if state.config.server_role == ServerRole::Peer {
@@ -579,5 +613,35 @@ mod tests {
 
         assert!(query.matches("any:main", "ledger"));
         assert!(query.matches("any:main", "graph-source"));
+    }
+
+    /// The wire form, which nothing used to cover: every test above builds
+    /// an `EventsQuery` in process, so the fact that no `?ledger=` request
+    /// could ever be deserialized went unnoticed. Repeated keys must
+    /// accumulate, and a percent-encoded `:` must survive.
+    #[test]
+    fn test_events_query_from_query_str() {
+        let one = EventsQuery::from_query_str("ledger=books%3Amain");
+        assert_eq!(one.ledgers, vec!["books:main".to_string()]);
+        assert!(!one.all);
+        assert!(one.matches("books:main", "ledger"));
+
+        let many = EventsQuery::from_query_str(
+            "ledger=books%3Amain&ledger=users%3Amain&graph-source=search%3Amain",
+        );
+        assert_eq!(
+            many.ledgers,
+            vec!["books:main".to_string(), "users:main".to_string()]
+        );
+        assert_eq!(many.graph_sources, vec!["search:main".to_string()]);
+
+        assert!(EventsQuery::from_query_str("all=true").all);
+        assert!(EventsQuery::from_query_str("all=1").all);
+        assert!(!EventsQuery::from_query_str("all=false").all);
+        assert!(!EventsQuery::from_query_str("").all);
+
+        // Unknown keys and empty values are ignored, not fatal.
+        let odd = EventsQuery::from_query_str("ledger=&future=1&ledger=a%3Ab");
+        assert_eq!(odd.ledgers, vec!["a:b".to_string()]);
     }
 }
