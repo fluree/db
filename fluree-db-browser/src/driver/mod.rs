@@ -16,6 +16,7 @@ use crate::config::BrowserIoConfig;
 use crate::protocol::IoJob;
 use std::cell::RefCell;
 use std::rc::Rc;
+use tokio::sync::watch;
 use wasm_bindgen_futures::spawn_local;
 
 pub use idb::IdbCache;
@@ -33,7 +34,7 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
     //
     // This await used to sit in front of the loop below, which made every
     // fetch in the process depend on IndexedDB opening. An open can hang
-    // indefinitely rather than fail — a version upgrade held up by another
+    // indefinitely rather than fail — a version change held up by another
     // connection fires `blocked`, which is neither `success` nor `error` —
     // and a hang there deadlocked the whole peer: no job ever dispatched,
     // so no request was issued, no per-request timeout could fire (those
@@ -41,11 +42,15 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
     // symptom is a peer that connects, reports healthy, and then answers
     // nothing forever, with zero HTTP requests to show for it.
     //
-    // Opening concurrently restores the degraded mode this module already
-    // documents: until the cache lands, lookups miss and writes are
-    // dropped, which costs a cold-start window of persistence and nothing
-    // else — CAS entries are immutable and always re-fetchable.
+    // So the open runs concurrently and the loop starts immediately. Cache
+    // jobs that arrive before it resolves WAIT for it rather than being
+    // dropped: a dropped `CachePut` silently loses persistence for exactly
+    // the blocks a cold start fetches first, and would also strand its
+    // write-behind permit. Fetches never wait on any of this.
     let cache: Rc<RefCell<Option<Rc<IdbCache>>>> = Rc::new(RefCell::new(None));
+    // `false` until the open has succeeded OR failed; cache jobs park on it,
+    // and it is always eventually set so nothing parks forever.
+    let (resolved_tx, resolved_rx) = watch::channel(false);
     if config.cache.enabled {
         let slot = Rc::clone(&cache);
         let cache_config = config.cache.clone();
@@ -56,10 +61,27 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                     tracing::warn!(error = %e, "IndexedDB cache unavailable; running without persistence");
                 }
             }
+            let _ = resolved_tx.send(true);
         });
+    } else {
+        let _ = resolved_tx.send(true);
     }
-    // Snapshot the slot per job; `borrow()` never spans an await.
-    let current = |slot: &Rc<RefCell<Option<Rc<IdbCache>>>>| slot.borrow().clone();
+
+    /// Resolve the cache for one job, waiting for the open if it is still in
+    /// flight. Returns `None` once the open has resolved unsuccessfully.
+    async fn cache_for(
+        slot: &Rc<RefCell<Option<Rc<IdbCache>>>>,
+        resolved: &watch::Receiver<bool>,
+    ) -> Option<Rc<IdbCache>> {
+        // Check-then-drop: a `RefCell` borrow must never span an await.
+        let ready = *resolved.borrow();
+        if !ready {
+            let mut rx = resolved.clone();
+            let _ = rx.wait_for(|r| *r).await;
+        }
+        let hit = slot.borrow().clone();
+        hit
+    }
 
     while let Some(job) = rx.recv().await {
         match job {
@@ -72,23 +94,29 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                     let _ = reply.send(fetch::execute(req, timeout).await);
                 });
             }
-            IoJob::CacheGet { key, reply } => match current(&cache) {
-                Some(cache) => spawn_local(async move {
-                    let _ = reply.send(cache.get(&key).await);
-                }),
-                None => {
-                    let _ = reply.send(None);
-                }
-            },
+            IoJob::CacheGet { key, reply } => {
+                let slot = Rc::clone(&cache);
+                let resolved = resolved_rx.clone();
+                spawn_local(async move {
+                    let hit = match cache_for(&slot, &resolved).await {
+                        Some(cache) => cache.get(&key).await,
+                        None => None,
+                    };
+                    let _ = reply.send(hit);
+                });
+            }
             IoJob::CachePut { key, bytes, permit } => {
-                if let Some(cache) = current(&cache) {
-                    spawn_local(async move {
+                let slot = Rc::clone(&cache);
+                let resolved = resolved_rx.clone();
+                spawn_local(async move {
+                    if let Some(cache) = cache_for(&slot, &resolved).await {
                         cache.put(key, bytes).await;
-                        // Credit the write-behind gauge only once the write
-                        // finished (or failed) — this is the backpressure.
-                        drop(permit);
-                    });
-                }
+                    }
+                    // Credit the write-behind gauge once the write finished,
+                    // failed, or was abandoned for want of a cache — this is
+                    // the backpressure, and it must never be stranded.
+                    drop(permit);
+                });
             }
             IoJob::SseOpen {
                 url,
@@ -109,7 +137,7 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
         }
     }
 
-    let opened = current(&cache);
+    let opened = cache.borrow().clone();
     if let Some(cache) = opened {
         cache.flush_access_times().await;
         cache.close();

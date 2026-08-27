@@ -126,8 +126,10 @@ async fn idb_cache_puts_gets_evicts_and_survives_reopen() {
 async fn driver_serves_cache_jobs_end_to_end() {
     let name = "fluree-cas-test-driver";
     let _ = IdbCache::delete_database(name).await;
-    let mut config = BrowserIoConfig::default();
-    config.cache = cache_config(name, 1024);
+    let config = BrowserIoConfig {
+        cache: cache_config(name, 1024),
+        ..Default::default()
+    };
     let io = start_driver(config);
 
     let payload = b"driver cache payload".to_vec();
@@ -232,4 +234,69 @@ async fn sse_driver_streams_frames_from_a_data_url() {
         "ledger event must flow through the real stream: {events:?}"
     );
     io.shutdown();
+}
+
+/// A job the driver never dispatches must fail TYPED, not hang forever.
+///
+/// This is the regression guard for the worst failure class this crate has:
+/// the per-request timeout lives inside the driver (`fetch::execute`'s
+/// `AbortController`), so it only ever applies to a request that actually
+/// started. Anything that stops the driver servicing jobs used to leave the
+/// caller awaiting a reply that would never come — with the job holding the
+/// reply sender, so even the "driver dropped the request" arm stayed silent.
+/// A peer in that state connects, reports healthy, issues no HTTP request at
+/// all, and answers nothing, forever.
+///
+/// Here the receiver is held but never drained, which is exactly a driver
+/// that is alive and not dispatching. The deadline must fire, and it must
+/// say what timed out.
+#[wasm_bindgen_test]
+async fn undispatched_job_times_out_instead_of_hanging() {
+    // Held, never polled: the sender stays open, so nothing closes the
+    // channel — the job is simply never picked up.
+    let (io, _never_drained) = fluree_db_browser::IoHandle::channel();
+    let transport = WasmFetchTransport::new(io, Duration::from_millis(10));
+
+    let err = transport
+        .execute(TransportRequest::get("http://example.invalid/blocked"))
+        .await
+        .expect_err("an undispatched job must not resolve");
+
+    match err {
+        TransportError::Timeout(message) => {
+            assert!(
+                message.contains("http://example.invalid/blocked"),
+                "the error must name what timed out: {message}"
+            );
+            assert!(
+                message.contains("did not dispatch"),
+                "the error must distinguish 'never started' from a request timeout: {message}"
+            );
+        }
+        other => panic!("expected a typed Timeout, got {other:?}"),
+    }
+}
+
+/// The deadline must NOT pre-empt a driver that is merely slow: a reply that
+/// arrives within it still wins, so this guard cannot mask real behavior.
+#[wasm_bindgen_test]
+async fn a_slow_but_live_driver_still_wins_the_race() {
+    let (io, mut rx) = fluree_db_browser::IoHandle::channel();
+    let transport = WasmFetchTransport::new(io, Duration::from_secs(30));
+
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Some(IoJob::Fetch { reply, .. }) = rx.recv().await {
+            TimeoutFuture::new(50).await;
+            let _ = reply.send(Err(TransportError::Request("driver answered".into())));
+        }
+    });
+
+    let err = transport
+        .execute(TransportRequest::get("http://example.invalid/slow"))
+        .await
+        .expect_err("the driver's own error");
+    assert!(
+        matches!(err, TransportError::Request(ref m) if m == "driver answered"),
+        "the driver's reply must win, not the deadline: {err:?}"
+    );
 }

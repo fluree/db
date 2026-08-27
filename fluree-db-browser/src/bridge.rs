@@ -151,6 +151,7 @@ impl HttpTransport for WasmFetchTransport {
                 .retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
             req.headers.push(("authorization", cell.bearer_header()));
         }
+        let url = req.url.clone();
         let (reply, rx) = oneshot::channel();
         self.io
             .send(IoJob::Fetch {
@@ -159,10 +160,81 @@ impl HttpTransport for WasmFetchTransport {
                 reply,
             })
             .map_err(|e| TransportError::Request(e.to_string()))?;
-        rx.await.map_err(|_| {
-            TransportError::Request("browser I/O driver dropped the request".to_string())
-        })?
+        self.await_reply(rx, &url).await
     }
+}
+
+impl WasmFetchTransport {
+    /// Await the driver's reply under a deadline that does not depend on the
+    /// driver.
+    ///
+    /// `self.timeout` is enforced INSIDE the driver, by `fetch::execute`'s
+    /// `AbortController` — which only runs once the job has been dispatched.
+    /// Anything that stops dispatch therefore has no deadline at all: this
+    /// await blocks forever, the job holds the reply sender so the
+    /// "driver dropped the request" arm never fires either, and the peer
+    /// connects, reports healthy, and answers nothing — with no HTTP request
+    /// and no error to show for it. That shape is expensive to diagnose
+    /// precisely because it is silent, so it gets its own deadline here.
+    ///
+    /// [`dispatch_deadline`] is deliberately slack, so in every normal case
+    /// the driver's own timeout fires first and produces exactly the errors
+    /// it always did; this one fires only when the job never ran.
+    async fn await_reply(
+        &self,
+        rx: oneshot::Receiver<Result<TransportResponse, TransportError>>,
+        url: &str,
+    ) -> Result<TransportResponse, TransportError> {
+        let dropped =
+            || TransportError::Request("browser I/O driver dropped the request".to_string());
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let deadline = dispatch_deadline(self.timeout);
+            // The timer itself is a JS handle and so `!Send`, while this
+            // future must stay `Send` (the storage traits box Send futures on
+            // every target — the reason this bridge exists at all). Run the
+            // timer in its own `spawn_local` task and observe it over a
+            // channel, which is Send: the same trick the driver uses, and it
+            // deliberately does NOT route through the driver, since a
+            // deadline that needs the driver to dispatch it could never
+            // detect the driver failing to dispatch.
+            let (fired, elapsed) = oneshot::channel::<()>();
+            let millis = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX);
+            wasm_bindgen_futures::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(millis).await;
+                let _ = fired.send(());
+            });
+            match futures::future::select(Box::pin(rx), Box::pin(elapsed)).await {
+                futures::future::Either::Left((reply, _)) => reply.map_err(|_| dropped())?,
+                futures::future::Either::Right((_, _)) => Err(TransportError::Timeout(format!(
+                    "browser I/O driver did not dispatch a fetch of {url} within {deadline:?}; \
+                     the driver is not servicing jobs, so the request was never started and its \
+                     own {:?} timeout never applied",
+                    self.timeout
+                ))),
+            }
+        }
+        // Native keeps the original await exactly: there is no driver task to
+        // wedge, and the reqwest transport owns its own timeouts.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = url;
+            rx.await.map_err(|_| dropped())?
+        }
+    }
+}
+
+/// How long to wait for the driver to dispatch a job before declaring it
+/// wedged: twice the request's own timeout, never less than a second.
+///
+/// Slack is the point. The driver's `AbortController` should always be what
+/// times a real request out, so this only fires when dispatch never
+/// happened; the floor keeps very short per-request timeouts (tests) from
+/// making the two indistinguishable.
+#[cfg(target_arch = "wasm32")]
+fn dispatch_deadline(timeout: Duration) -> Duration {
+    timeout.saturating_mul(2).max(Duration::from_secs(1))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
