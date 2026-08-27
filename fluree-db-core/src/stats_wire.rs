@@ -268,6 +268,7 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
         let ndv_subjects = read_u64(data, &mut pos)?;
         let last_modified_t = read_i64(data, &mut pos)?;
         let datatypes = decode_datatypes(data, &mut pos)?;
+        let observed_datatypes = PropertyStatEntry::tags_of(&datatypes);
         agg_props.push(PropertyStatEntry {
             sid,
             count,
@@ -275,6 +276,7 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
             ndv_subjects,
             last_modified_t,
             datatypes,
+            observed_datatypes,
         });
     }
 

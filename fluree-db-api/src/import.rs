@@ -6717,6 +6717,7 @@ where
                         ndv_values: pa.ndv_values,
                         ndv_subjects: pa.ndv_subjects,
                         last_modified_t: pa.last_modified_t,
+                        observed_datatypes: is::PropertyStatEntry::tags_of(&pa.datatypes),
                         datatypes: pa.datatypes,
                     }
                 })

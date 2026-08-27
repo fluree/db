@@ -209,9 +209,17 @@ fn assemble_fast_stats_inner(
 
     let mut property_counts = build_property_counts(indexed);
     // Per-predicate (Sid) datatype deltas from novelty, so the aggregate
-    // `PropertyStatEntry.datatypes` stays current-state-exact (not index-only).
-    // Consumed by the equijoin-filter fold's node-only soundness guard.
+    // `PropertyStatEntry.datatypes` breakdown reflects novelty and not just the
+    // index. These are estimates: novelty is read as a blind ±1 delta log with
+    // no probe of the base index, so a retraction of a fact that was never
+    // asserted charges a `-1` against a tag it does not own.
     let mut property_datatype_deltas: HashMap<(u16, String), HashMap<u8, i64>> = HashMap::new();
+    // The tags novelty ASSERTED, per predicate. Unioned with the base index's
+    // tags this gives `PropertyStatEntry::observed_datatypes`, which is what the
+    // equijoin-filter fold's node-only soundness guard reads. Assertions only
+    // ever add to it, so no retraction — spurious or not — can take a literal
+    // tag away and make a mixed predicate read as all-ref.
+    let mut property_asserted_datatypes: HashMap<(u16, String), HashSet<u8>> = HashMap::new();
     let mut class_data = build_class_data(indexed);
     let mut graphs = indexed.graphs.clone().unwrap_or_default();
     let mut graph_index: HashMap<GraphId, usize> = graphs
@@ -260,11 +268,18 @@ fn assemble_fast_stats_inner(
         }
 
         let sid_key = (flake.p.namespace_code, flake.p.name.to_string());
+        let datatype_tag = runtime_datatype_tag(flake);
         *property_counts.entry(sid_key.clone()).or_insert(0) += delta;
+        if flake.op {
+            property_asserted_datatypes
+                .entry(sid_key.clone())
+                .or_default()
+                .insert(datatype_tag);
+        }
         *property_datatype_deltas
             .entry(sid_key)
             .or_default()
-            .entry(runtime_datatype_tag(flake))
+            .entry(datatype_tag)
             .or_insert(0) += delta;
 
         if let Some(stats_lookup) = lookup {
@@ -296,6 +311,7 @@ fn assemble_fast_stats_inner(
         indexed,
         property_counts,
         property_datatype_deltas,
+        property_asserted_datatypes,
         class_data,
     );
     stats.flakes = (indexed.flakes as i64 + flakes_delta).max(0) as u64;
@@ -623,10 +639,33 @@ fn merge_property_datatypes(
     out
 }
 
+/// Union the base index's observed datatype tags with the tags novelty
+/// ASSERTED, which is the input to `StatsView::property_ref_only`.
+///
+/// Deliberately not derived from [`merge_property_datatypes`]: that merge is
+/// arithmetic over a blind ±1 delta log, so a retraction of a fact the base
+/// index never held drives a tag's count to zero and drops it — and a predicate
+/// carrying both refs and literals then reads as all-ref, licensing the
+/// equijoin-filter fold to rewrite a `FILTER(?x = ?y)` it must not touch
+/// (#1721). A union over assertions cannot lose a tag, so the flag it feeds can
+/// only ever be conservative: after legitimately deleting every literal under a
+/// predicate the fold stays declined until the next index publish reissues the
+/// base tag set without it.
+fn union_observed_datatypes(base: &[u8], asserted: Option<&HashSet<u8>>) -> Vec<u8> {
+    let mut tags: Vec<u8> = base.to_vec();
+    if let Some(asserted) = asserted {
+        tags.extend(asserted.iter().copied());
+    }
+    tags.sort_unstable();
+    tags.dedup();
+    tags
+}
+
 fn finalize_stats(
     indexed: &IndexStats,
     property_counts: PropertyCountMap,
     property_datatype_deltas: HashMap<(u16, String), HashMap<u8, i64>>,
+    property_asserted_datatypes: HashMap<(u16, String), HashSet<u8>>,
     class_data: HashMap<Sid, ClassDataMut>,
 ) -> IndexStats {
     let properties = if property_counts.is_empty() {
@@ -649,6 +688,12 @@ fn finalize_stats(
                     indexed_entry.map(|e| e.datatypes.as_slice()).unwrap_or(&[]),
                     property_datatype_deltas.get(&sid),
                 );
+                let observed_datatypes = union_observed_datatypes(
+                    indexed_entry
+                        .map(|e| e.observed_datatypes.as_slice())
+                        .unwrap_or(&[]),
+                    property_asserted_datatypes.get(&sid),
+                );
                 PropertyStatEntry {
                     sid,
                     count: count.max(0) as u64,
@@ -656,6 +701,7 @@ fn finalize_stats(
                     ndv_subjects: indexed_entry.map(|e| e.ndv_subjects).unwrap_or(0),
                     last_modified_t: indexed_entry.map(|e| e.last_modified_t).unwrap_or(0),
                     datatypes,
+                    observed_datatypes,
                 }
             })
             .collect();
@@ -735,6 +781,169 @@ mod tests {
             true,
             None,
         )
+    }
+
+    fn ref_prop_flake(subject: Sid, property: Sid, target: Sid, t: i64) -> Flake {
+        Flake::new(
+            subject,
+            property,
+            FlakeValue::Ref(target),
+            Sid::new(fluree_vocab::namespaces::JSON_LD, "@id"),
+            t,
+            true,
+            None,
+        )
+    }
+
+    /// A base index for `ex:p`: five ref objects and exactly one integer
+    /// literal, i.e. the mixed ref/literal shape the ref-only guard exists for.
+    fn mixed_property_index(p: &Sid) -> IndexStats {
+        let datatypes = vec![
+            (ValueTypeTag::INTEGER.as_u8(), 1),
+            (ValueTypeTag::JSON_LD_ID.as_u8(), 5),
+        ];
+        IndexStats {
+            flakes: 6,
+            size: 60,
+            properties: Some(vec![PropertyStatEntry {
+                sid: (p.namespace_code, p.name.to_string()),
+                count: 6,
+                ndv_values: 6,
+                ndv_subjects: 6,
+                last_modified_t: 1,
+                observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
+                datatypes,
+            }]),
+            classes: None,
+            graphs: None,
+        }
+    }
+
+    /// #1721: novelty is merged into the aggregate datatype breakdown as a blind
+    /// ±1 delta log, so a retraction of a fact the base index never held charges
+    /// a `-1` against a tag it does not own and can zero it out. The tag set the
+    /// ref-only flag reads must survive that: a predicate that carries literals
+    /// may not start reading as all-ref because of a delete that removed
+    /// nothing.
+    #[test]
+    fn spurious_retraction_keeps_a_literal_datatype_observed() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let p = sid(10, "p");
+        let indexed = mixed_property_index(&p);
+
+        let base_view = fluree_db_core::StatsView::from_db_stats(&indexed);
+        assert_eq!(base_view.is_property_ref_only(&p), Some(false), "baseline");
+
+        // ONE retraction of an integer literal the base index never contained:
+        // different subject, different value.
+        let mut retract = prop_flake(sid(10, "ghost"), p.clone(), 999, 2);
+        retract.op = false;
+        let mut novelty = Novelty::new(1);
+        novelty
+            .apply_commit(vec![retract], 2, &HashMap::new())
+            .expect("apply retraction");
+
+        let merged = assemble_fast_stats(&indexed, &snapshot, &novelty, 2, None);
+        let entry = merged
+            .properties
+            .as_ref()
+            .expect("properties")
+            .iter()
+            .find(|e| e.sid == (10, "p".to_string()))
+            .expect("ex:p entry");
+
+        // The counts still drift — they are estimates and the fix does not try
+        // to reconcile them — but the observed-tag set does not.
+        assert_eq!(
+            entry.datatypes,
+            vec![(ValueTypeTag::JSON_LD_ID.as_u8(), 5)],
+            "the count breakdown is expected to drop the zeroed tag"
+        );
+        assert_eq!(
+            entry.observed_datatypes,
+            vec![
+                ValueTypeTag::INTEGER.as_u8(),
+                ValueTypeTag::JSON_LD_ID.as_u8()
+            ]
+        );
+
+        let view = fluree_db_core::StatsView::from_db_stats(&merged);
+        assert_eq!(
+            view.is_property_ref_only(&p),
+            Some(false),
+            "a spurious retraction made a mixed predicate read as ref-only"
+        );
+    }
+
+    /// The other direction has to keep working: the flag is monotone under
+    /// retraction, not frozen. A novelty assertion that introduces a literal
+    /// under a previously all-ref predicate must take the ref-only licence away.
+    #[test]
+    fn novelty_assertion_can_add_a_literal_datatype() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let p = sid(10, "p");
+        let datatypes = vec![(ValueTypeTag::JSON_LD_ID.as_u8(), 5)];
+        let indexed = IndexStats {
+            flakes: 5,
+            size: 50,
+            properties: Some(vec![PropertyStatEntry {
+                sid: (10, "p".to_string()),
+                count: 5,
+                ndv_values: 5,
+                ndv_subjects: 5,
+                last_modified_t: 1,
+                observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
+                datatypes,
+            }]),
+            classes: None,
+            graphs: None,
+        };
+        assert_eq!(
+            fluree_db_core::StatsView::from_db_stats(&indexed).is_property_ref_only(&p),
+            Some(true),
+            "an all-ref base index must still license the fold"
+        );
+
+        let mut novelty = Novelty::new(1);
+        novelty
+            .apply_commit(
+                vec![prop_flake(sid(10, "s6"), p.clone(), 42, 2)],
+                2,
+                &HashMap::new(),
+            )
+            .expect("apply assertion");
+
+        let merged = assemble_fast_stats(&indexed, &snapshot, &novelty, 2, None);
+        assert_eq!(
+            fluree_db_core::StatsView::from_db_stats(&merged).is_property_ref_only(&p),
+            Some(false),
+            "a novelty literal must revoke the ref-only licence"
+        );
+    }
+
+    /// A predicate that novelty introduces outright, with only ref objects,
+    /// still qualifies — the fix must not cost the optimization on ledgers with
+    /// no published index at all.
+    #[test]
+    fn novelty_only_ref_predicate_is_ref_only() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let p = sid(10, "knows");
+        let indexed = IndexStats::default();
+
+        let mut novelty = Novelty::new(1);
+        novelty
+            .apply_commit(
+                vec![ref_prop_flake(sid(10, "s1"), p.clone(), sid(10, "s2"), 2)],
+                2,
+                &HashMap::new(),
+            )
+            .expect("apply assertion");
+
+        let merged = assemble_fast_stats(&indexed, &snapshot, &novelty, 2, None);
+        assert_eq!(
+            fluree_db_core::StatsView::from_db_stats(&merged).is_property_ref_only(&p),
+            Some(true)
+        );
     }
 
     fn type_flake(subject: Sid, class_sid: Sid, t: i64) -> Flake {
@@ -882,6 +1091,7 @@ mod tests {
                 ndv_subjects: 0,
                 last_modified_t: 1,
                 datatypes: vec![],
+                observed_datatypes: vec![],
             }]),
             classes: None,
             graphs: Some(vec![GraphStatsEntry {

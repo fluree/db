@@ -454,7 +454,7 @@ pub fn decode_stats(data: &[u8]) -> io::Result<IndexStats> {
         let ndv_subjects = read_u64(data, &mut pos)?;
         let last_modified_t = read_i64(data, &mut pos)?;
         let datatypes = decode_datatypes(data, &mut pos)?;
-
+        let observed_datatypes = PropertyStatEntry::tags_of(&datatypes);
         agg_props.push(PropertyStatEntry {
             sid,
             count,
@@ -462,6 +462,7 @@ pub fn decode_stats(data: &[u8]) -> io::Result<IndexStats> {
             ndv_subjects,
             last_modified_t,
             datatypes,
+            observed_datatypes,
         });
     }
 
@@ -699,6 +700,7 @@ pub fn decode_stats_with_len(data: &[u8]) -> io::Result<(IndexStats, usize)> {
         let ndv_subjects = read_u64(data, &mut pos)?;
         let last_modified_t = read_i64(data, &mut pos)?;
         let datatypes = decode_datatypes(data, &mut pos)?;
+        let observed_datatypes = PropertyStatEntry::tags_of(&datatypes);
         agg_props.push(PropertyStatEntry {
             sid,
             count,
@@ -706,6 +708,7 @@ pub fn decode_stats_with_len(data: &[u8]) -> io::Result<(IndexStats, usize)> {
             ndv_subjects,
             last_modified_t,
             datatypes,
+            observed_datatypes,
         });
     }
 
@@ -917,6 +920,7 @@ mod tests {
                     ndv_subjects: 50,
                     last_modified_t: 3,
                     datatypes: vec![(1, 50)],
+                    observed_datatypes: vec![1],
                 },
                 PropertyStatEntry {
                     sid: (10, "age".to_string()),
@@ -925,6 +929,7 @@ mod tests {
                     ndv_subjects: 50,
                     last_modified_t: 3,
                     datatypes: vec![(3, 50)],
+                    observed_datatypes: vec![3],
                 },
             ]),
             classes: None,
@@ -1018,6 +1023,7 @@ mod tests {
                     ndv_subjects: 1,
                     last_modified_t: 1,
                     datatypes: vec![],
+                    observed_datatypes: vec![],
                 },
                 PropertyStatEntry {
                     sid: (10, "aaa".to_string()),
@@ -1026,6 +1032,7 @@ mod tests {
                     ndv_subjects: 2,
                     last_modified_t: 2,
                     datatypes: vec![],
+                    observed_datatypes: vec![],
                 },
             ]),
             classes: None,

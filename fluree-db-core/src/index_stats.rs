@@ -31,6 +31,35 @@ pub struct PropertyStatEntry {
     /// Graph-scoped property stats (authoritative for range narrowing) live under
     /// `IndexStats.graphs[*].properties[*].datatypes`.
     pub datatypes: Vec<(u8, u64)>,
+    /// The datatype tags this property has ever been observed carrying, sorted
+    /// and deduplicated. **Monotone under retraction**: a novelty assertion may
+    /// add a tag, a novelty retraction never removes one.
+    ///
+    /// This exists because `datatypes` is not monotone. On the query path the
+    /// breakdown is the base index merged with novelty as a blind ±1 delta log,
+    /// so a retraction of a fact that was never asserted charges a `-1` against
+    /// a tag it does not own and can drive that tag's count to zero — dropping
+    /// it from `datatypes` while the data it described is still there. Anything
+    /// that reads `datatypes` as a *set* ("does this property carry literals?")
+    /// rather than as counts must read this field instead. The counts stay in
+    /// `datatypes`, unclamped, for the estimators that sum them.
+    ///
+    /// Empty means "unknown", not "no datatypes": consumers must fail closed.
+    pub observed_datatypes: Vec<u8>,
+}
+
+impl PropertyStatEntry {
+    /// The distinct datatype tags of an exact breakdown, sorted — the value for
+    /// [`Self::observed_datatypes`] on every path whose `datatypes` counts are
+    /// exact (the base index and its decoders). Only the novelty merge, which
+    /// arithmetically applies deltas it cannot reconcile against the base, has
+    /// to derive the tag set some other way.
+    pub fn tags_of(datatypes: &[(u8, u64)]) -> Vec<u8> {
+        let mut tags: Vec<u8> = datatypes.iter().map(|&(tag, _)| tag).collect();
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
 }
 
 // === Index Statistics ===

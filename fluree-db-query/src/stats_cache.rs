@@ -167,6 +167,7 @@ mod tests {
                 ndv_subjects: 0,
                 last_modified_t: 1,
                 datatypes: vec![],
+                observed_datatypes: vec![],
             }]),
             classes: None,
             graphs: None,
