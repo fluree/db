@@ -684,6 +684,41 @@ become part of permanent ledger state.
   Identifiers are compacted against the transaction's own `@context`, using its explicit prefixes and `@base` (never `@vocab`), so a violation names the terms you wrote. Where there is no context to compact against — a Turtle insert, or commit replay — the same fields report full IRIs instead.
 - **`f:ValidationWarn`**: violations are logged via `tracing::warn!` and the transaction proceeds. Any **non-violation** error from the SHACL pipeline (compile failure, range-scan failure) still propagates — Warn mode never silently admits a broken validation pipeline.
 
+### Per-transaction mode override
+
+A transaction can request a mode for itself with `opts.validationMode`
+(`"warn"` or `"reject"`):
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "insert": {"@id": "ex:duplicate-candidate", "...": "..."},
+  "opts": {"validationMode": "warn"}
+}
+```
+
+Strengthening (`warn` → `reject`) is always honored. Softening (`reject` →
+`warn`) is granted only when the SHACL group's `f:overrideControl` permits
+it for the request's verified identity — `f:OverrideAll` (the default)
+permits everyone, `f:OverrideNone` pins the configured posture, and an
+identity-restricted list limits softening to named identities. A denied
+request keeps the configured mode; it does not fail the transaction. The
+request never toggles `f:shaclEnabled`.
+
+This is the tool for surgical exceptions — e.g. a remediation agent whose
+merge writes transiently violate uniqueness shapes softens its own writes
+instead of flipping the graph's standing posture for every writer. To limit
+softening to that agent alone:
+
+```trig
+<urn:config:shacl> f:overrideControl [
+  f:controlMode f:IdentityRestricted ;
+  f:allowedIdentities ( <did:key:remediation-agent> )
+] .
+```
+
+See [Override control](../ledger-config/override-control.md#shacl-fshacldefaults).
+
 ## Working with shapes across write surfaces
 
 SHACL validation runs consistently on every write surface:

@@ -488,6 +488,8 @@ fn validate_staged_reasoning_modes(
 fn build_per_graph_shacl_policy(
     config: &LedgerConfig,
     graph_delta: &FxHashMap<u16, String>,
+    requested_mode: Option<fluree_db_core::ledger_config::ValidationMode>,
+    request_identity: Option<&str>,
 ) -> Option<HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy>> {
     let mut map: HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy> = HashMap::new();
 
@@ -496,7 +498,8 @@ fn build_per_graph_shacl_policy(
     // returns the full three-tier merge with `graph_iri = None`.
     let ledger_wide = config_resolver::merge_shacl_opts(
         &config_resolver::resolve_effective_config(config, None),
-        None,
+        requested_mode,
+        request_identity,
     );
 
     // Default graph always gets the ledger-wide policy when SHACL is enabled.
@@ -520,7 +523,9 @@ fn build_per_graph_shacl_policy(
             continue; // already handled above
         }
         let resolved = config_resolver::resolve_effective_config(config, Some(graph_iri));
-        if let Some(per_graph) = config_resolver::merge_shacl_opts(&resolved, None) {
+        if let Some(per_graph) =
+            config_resolver::merge_shacl_opts(&resolved, requested_mode, request_identity)
+        {
             if per_graph.enabled {
                 map.insert(
                     *g_id,
@@ -617,6 +622,20 @@ pub(crate) struct StagedShaclContext<'a> {
     /// Sids into M's term space); `validate_class_constraint` consults it on
     /// demand after a local miss.
     pub cross_ledger_membership: Option<fluree_db_shacl::CrossLedgerMembership<'a>>,
+
+    /// Transaction-requested SHACL validation mode (`opts.validationMode` /
+    /// `TxnOpts::validation_mode`). Honored per graph subject to the SHACL
+    /// group's `f:overrideControl` — see [`config_resolver::merge_shacl_opts`].
+    /// `None` for paths with no request surface (Turtle insert, commit
+    /// replay), which always run the configured posture.
+    pub requested_validation_mode: Option<fluree_db_core::ledger_config::ValidationMode>,
+
+    /// Verified identity for override-control gating, decoded from the
+    /// transaction's policy context (which the server builds from the
+    /// auth-layer bearer / verified credential DID — not from user-settable
+    /// opts). `None` (no policy context: embedded root, unauthenticated dev
+    /// mode) passes `f:OverrideAll` and fails identity-restricted lists.
+    pub request_identity: Option<String>,
 }
 
 /// Inspect the data ledger's resolved config and, when
@@ -818,7 +837,12 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     // 2. Build per-graph policy from the config (if any). Each graph has its
     //    own enabled/mode. Graphs absent from the policy map are disabled.
     let per_graph_policy = match (&config, ctx.graph_delta) {
-        (Some(c), Some(gd)) => build_per_graph_shacl_policy(c, gd),
+        (Some(c), Some(gd)) => build_per_graph_shacl_policy(
+            c,
+            gd,
+            ctx.requested_validation_mode,
+            ctx.request_identity.as_deref(),
+        ),
         (Some(c), None) => {
             // No graph context — apply ledger-wide posture to the default
             // graph only. Shapes for the default graph are where turtle
@@ -826,7 +850,8 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             // specific graph routing.
             let ledger_wide = config_resolver::merge_shacl_opts(
                 &config_resolver::resolve_effective_config(c, None),
-                None,
+                ctx.requested_validation_mode,
+                ctx.request_identity.as_deref(),
             );
             match ledger_wide {
                 Some(cfg) if cfg.enabled => {
@@ -1069,16 +1094,33 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     }
     let compactor = violation_iri_compactor(view, &ctx);
 
-    if !outcome.warn_violations.is_empty() {
+    // Shapes-exist heuristic path (no config graph): there is no
+    // `f:overrideControl` to consult, so the group default (`f:OverrideAll`)
+    // governs and a transaction-requested warn mode softens the heuristic's
+    // reject posture. Config-present paths never reach this branch with an
+    // unhonored request — the gate already ran inside `merge_shacl_opts`.
+    let heuristic_softened = !has_config
+        && ctx.requested_validation_mode
+            == Some(fluree_db_core::ledger_config::ValidationMode::Warn);
+
+    let (warn_violations, reject_violations) = if heuristic_softened {
+        let mut warns = outcome.warn_violations;
+        warns.extend(outcome.reject_violations);
+        (warns, Vec::new())
+    } else {
+        (outcome.warn_violations, outcome.reject_violations)
+    };
+
+    if !warn_violations.is_empty() {
         tracing::warn!(
-            count = outcome.warn_violations.len(),
-            report = %format_violations(&outcome.warn_violations, &compactor),
+            count = warn_violations.len(),
+            report = %format_violations(&warn_violations, &compactor),
             "SHACL violations (warn-mode graph, continuing)"
         );
     }
-    if !outcome.reject_violations.is_empty() {
+    if !reject_violations.is_empty() {
         return Err(fluree_db_transact::TransactError::ShaclViolation(
-            format_violations(&outcome.reject_violations, &compactor),
+            format_violations(&reject_violations, &compactor),
         ));
     }
     Ok(())
@@ -1190,6 +1232,17 @@ async fn stage_with_config_shacl(
     // and accept the cost.
     let inline_shapes_json = txn.opts.shapes.take();
     let inline_shapes_ledger_id = ledger.snapshot.ledger_id.to_string();
+
+    // Requested SHACL mode + the identity that gates it. The identity comes
+    // from the staged policy context — built by the server from the verified
+    // bearer / credential DID — never from user-settable opts directly. A
+    // grounded-random identity (policy context without a real identity)
+    // decodes to a never-match IRI, which correctly fails identity-restricted
+    // override lists.
+    let requested_validation_mode = txn.opts.validation_mode;
+    let request_identity = options
+        .policy_ctx
+        .and_then(|p| ledger.snapshot.decode_sid(&p.identity));
 
     // Detect cross-ledger governance at the API boundary BEFORE staging
     // starts. Resolve D's config once from pre-tx state and share it across
@@ -1337,6 +1390,8 @@ async fn stage_with_config_shacl(
             inline_shape_bundle,
             cross_ledger_schema,
             cross_ledger_membership,
+            requested_validation_mode,
+            request_identity,
         },
         tx_config,
     )
@@ -3293,6 +3348,10 @@ impl crate::Fluree {
                 // today — inline SHACL flows in over the JSON
                 // transaction path. Wireable later if needed.
                 inline_shape_bundle: None,
+                // Turtle insert likewise has no `opts.validationMode`
+                // surface — it always runs the configured posture.
+                requested_validation_mode: None,
+                request_identity: None,
                 cross_ledger_membership: None,
             },
             // Turtle insert path resolves config internally.

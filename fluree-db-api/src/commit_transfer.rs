@@ -503,6 +503,11 @@ impl Fluree {
                         // `opts` payload.
                         inline_shape_bundle: None,
                         cross_ledger_membership: None,
+                        // Replay re-validates under the configured posture:
+                        // any authoring-time softening was already applied
+                        // (or denied) when the commit was first staged.
+                        requested_validation_mode: None,
+                        request_identity: None,
                     },
                     // Commit replay resolves config internally.
                     None,
