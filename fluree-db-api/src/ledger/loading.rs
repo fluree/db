@@ -57,8 +57,15 @@ impl Fluree {
 
     /// Load a ledger by address (e.g., "mydb:main")
     ///
-    /// This loads the ledger state using the connection-wide cache.
+    /// This loads the ledger state DIRECTLY from the nameservice and storage —
+    /// it does not read, populate, or lock the connection-wide ledger cache.
     /// The ledger state combines the indexed database with any uncommitted novelty transactions.
+    ///
+    /// Keep it manager-free: the cached-handle commit path calls this from
+    /// `DetachedCacheSlot::recover` while holding a ledger's state write lock,
+    /// to repair the cache after a failed commit. Routing this through the
+    /// `LedgerManager` would deadlock that path against the lock it already
+    /// holds.
     pub async fn ledger(&self, ledger_id: &str) -> Result<LedgerState> {
         let mut state =
             LedgerState::load(&self.nameservice_mode, ledger_id, self.backend()).await?;
