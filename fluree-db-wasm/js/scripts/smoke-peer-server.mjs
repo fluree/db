@@ -241,6 +241,40 @@ try {
       `0 /query calls; ${preflights.length} CORS preflight(s) answered`,
   );
 
+  // ── 6. The other shell shape: cold, no head tracking, one-shot ─────────
+  // Phase 4 runs with `subscribe`, so head tracking is on and the SSE pump
+  // is driving the I/O driver. A plain one-shot query with tracking OFF is
+  // a DIFFERENT path through the same package, and it is the shape a
+  // read-only app uses. It gets its own Chrome profile so the IndexedDB
+  // block cache and the HTTP cache are cold — a warm cache hides anything
+  // that only goes wrong on the first fetch.
+  const cold = launchChrome(chromeBin);
+  cleanups.push(cold.kill);
+  const coldCdp = await cdpConnect(await cold.wsUrl);
+  cleanups.push(coldCdp.close);
+  const coldSession = await openPage(
+    coldCdp,
+    `${pageOrigin}/demo/peer-bench.html` +
+      `?api=${encodeURIComponent(tap.apiBase)}` +
+      `&token=${encodeURIComponent(token)}` +
+      `&ledger=${encodeURIComponent(LEDGER)}`,
+    (line) => browserLog.push(line),
+  );
+  const oneShot = await awaitPageMarker(coldCdp, coldSession, "__bench", {
+    tries: 900,
+    settleMs: 120_000,
+  });
+  if (oneShot?.status !== "pass") {
+    throw new Error(
+      `cold one-shot query without head tracking failed: ${oneShot?.error ?? JSON.stringify(oneShot)}`,
+    );
+  }
+  check("cold one-shot rows (no head tracking)", oneShot.names, ["Alice", "Bob", "Carol"]);
+  console.log(
+    `  ok  cold one-shot: open ${oneShot.openMs} ms + query ${oneShot.queryMs} ms, ` +
+      `warm re-query ${oneShot.warmQueryMs} ms`,
+  );
+
   console.log(
     `\nPASS: browser peer ↔ real fluree-db-server. ` +
       `Engine ${r.version} opened ${LEDGER} at t=${r.openT} and answered ${r.coldNames.join(",")} ` +

@@ -146,7 +146,11 @@ export async function openPage(cdp, url, onLog) {
             (d.exception?.description ?? d.text),
         );
       } else if (method === "Target.attachedToTarget") {
-        // A dedicated worker: enable its Runtime so its logs reach onLog too.
+        // A dedicated worker: enable its Runtime so its logs reach onLog
+        // too. This is what makes a wasm panic visible — `console_error_
+        // panic_hook` writes the Rust panic text to the WORKER's console,
+        // which is invisible from the page, so without this a trap reads as
+        // a bare `engine_crashed` with no message.
         void cdp.send("Runtime.enable", {}, params.sessionId);
         void cdp.send("Runtime.runIfWaitingForDebugger", {}, params.sessionId);
       }
