@@ -535,3 +535,14 @@ jobs:
       # build.
       - name: Build
         run: npm run build
+
+      # The demo is the program's presentation artifact, so it must not be
+      # allowed to rot. Building it also puts the package through a real
+      # bundler, which the unit tests (which import `src/` directly) never do.
+      # Peer mode is code-split behind a dynamic import and stubbed when the
+      # wasm glue is absent, so this needs no wasm build.
+      - name: Demo (install, type-check, bundle)
+        working-directory: fluree-react/demo
+        run: |
+          npm ci
+          npm run build
