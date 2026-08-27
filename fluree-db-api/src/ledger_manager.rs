@@ -741,20 +741,28 @@ impl Default for LedgerManagerConfig {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn default_cache_dir() -> PathBuf {
-    std::env::temp_dir().join("fluree_binary_cache")
-}
-
+/// A temp-dir-backed cache path under `leaf`.
+///
 /// wasm32 has no filesystem and `std::env::temp_dir()` PANICS there ("no
-/// filesystem on this platform") — and this default runs inside
-/// `FlureeBuilder::memory()`, before any build method. The synthetic path is
-/// never touched at runtime: the disk cache opens with a zero write budget
+/// filesystem on this platform"), so every cache-path site must route
+/// through here rather than calling it directly — this is the one place
+/// that knows the wasm arm exists. The synthetic path is never touched at
+/// runtime: the disk cache opens with a zero write budget
 /// (`fs::create_dir_all` fails → writes disabled) and reads map
 /// `Unsupported` to a cache miss.
-#[cfg(target_arch = "wasm32")]
+pub(crate) fn temp_cache_dir(leaf: &str) -> PathBuf {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::temp_dir().join(leaf)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        PathBuf::from("/").join(leaf)
+    }
+}
+
 fn default_cache_dir() -> PathBuf {
-    PathBuf::from("/fluree-cache")
+    temp_cache_dir("fluree_binary_cache")
 }
 
 // ============================================================================
