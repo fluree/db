@@ -45,6 +45,48 @@ export interface RemoteTransportOptions {
   sseRefreshDebounceMs?: number;
   backoffBaseMs?: number;
   backoffMaxMs?: number;
+  /**
+   * How many of a cycle's queries may be in flight at once.
+   *
+   * Remote mode re-runs EVERY live subscription on a ledger per commit (the
+   * v1 invalidation ladder), which on the peer is local CPU but here is one
+   * HTTP round-trip each. Firing thirty at once on a busy ledger buries the
+   * server and blocks the browser's connection pool for everything else on
+   * the page, so the fan-out is bounded. Default 6 — the classic per-host
+   * connection limit; raise it on HTTP/2, where requests multiplex.
+   */
+  maxConcurrency?: number;
+}
+
+/** Default cycle fan-out width. See `maxConcurrency`. */
+const DEFAULT_MAX_CONCURRENCY = 6;
+
+/**
+ * `Promise.allSettled` with a concurrency ceiling. Results stay aligned with
+ * `items` by index — the caller pairs them back up with their specs.
+ */
+async function settleWithLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const out: PromiseSettledResult<R>[] = new Array(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++;
+      const item = items[i];
+      if (i >= items.length || item === undefined) return;
+      try {
+        out[i] = { status: "fulfilled", value: await fn(item, i) };
+      } catch (reason) {
+        out[i] = { status: "rejected", reason };
+      }
+    }
+  };
+  const width = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: width }, worker));
+  return out;
 }
 
 /** Keep `/`, `:` and `@` literal in the greedy `*ledger` path segment. */
@@ -114,12 +156,22 @@ export class RemoteTransport implements LiveTransport {
    */
   private nextTicket = 1;
   private readonly delivered = new Map<number, number>();
+  /**
+   * The in-flight request per subscription. A superseded or unsubscribed
+   * query is aborted rather than left to run to completion server-side with
+   * its answer thrown away — otherwise a burst of commits leaves the server
+   * computing results nobody will ever read, and holds browser connections
+   * while it does.
+   */
+  private readonly inflight = new Map<number, AbortController>();
+  private readonly maxConcurrency: number;
   private closed = false;
 
   constructor(options: RemoteTransportOptions) {
     this.base = options.url.replace(/\/+$/, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.getToken = options.getToken;
+    this.maxConcurrency = options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
     this.sseOptions = {
       sseRefreshDebounceMs: options.sseRefreshDebounceMs,
       backoffBaseMs: options.backoffBaseMs,
@@ -177,6 +229,8 @@ export class RemoteTransport implements LiveTransport {
     this.subs.delete(subId);
     this.prev.delete(subId);
     this.delivered.delete(subId);
+    this.inflight.get(subId)?.abort();
+    this.inflight.delete(subId);
     if (spec.at === undefined) {
       const set = this.byLedger.get(spec.ledger);
       set?.delete(subId);
@@ -199,12 +253,27 @@ export class RemoteTransport implements LiveTransport {
   close(): void {
     this.closed = true;
     this.sse?.close();
+    for (const ctrl of this.inflight.values()) ctrl.abort();
+    this.inflight.clear();
     this.subs.clear();
     this.byLedger.clear();
     this.prev.clear();
     this.pending.clear();
     this.heads.clear();
     this.delivered.clear();
+  }
+
+  /** Claim the in-flight slot for a subscription, aborting whatever request
+   * was already occupying it. */
+  private beginRequest(subId: number): AbortController {
+    this.inflight.get(subId)?.abort();
+    const ctrl = new AbortController();
+    this.inflight.set(subId, ctrl);
+    return ctrl;
+  }
+
+  private endRequest(subId: number, ctrl: AbortController): void {
+    if (this.inflight.get(subId) === ctrl) this.inflight.delete(subId);
   }
 
   /** True if a newer response for this subscription has already landed. */
@@ -235,8 +304,10 @@ export class RemoteTransport implements LiveTransport {
     // which is `undefined` until the first head event arrives.
     const t = spec.at ?? this.heads.get(spec.ledger);
     const ticket = this.nextTicket++;
+    const ctrl = this.beginRequest(spec.subId);
     try {
-      const payload = await this.execute(spec);
+      const payload = await this.execute(spec, ctrl.signal);
+      this.endRequest(spec.subId, ctrl);
       if (!this.subs.has(spec.subId) || this.closed) return;
       if (this.outranked(spec.subId, ticket)) return;
       this.markDelivered(spec.subId, ticket);
@@ -249,6 +320,9 @@ export class RemoteTransport implements LiveTransport {
         errored: [],
       });
     } catch (err) {
+      this.endRequest(spec.subId, ctrl);
+      // An abort is this transport's own decision, not a failure to report.
+      if (ctrl.signal.aborted) return;
       if (!this.subs.has(spec.subId) || this.closed) return;
       if (this.outranked(spec.subId, ticket)) return;
       this.markDelivered(spec.subId, ticket);
@@ -336,9 +410,14 @@ export class RemoteTransport implements LiveTransport {
     if (specs.length === 0) return;
 
     const tickets = specs.map(() => this.nextTicket++);
-    const settled = await Promise.allSettled(
-      specs.map((spec) => this.execute(spec)),
+    const ctrls = specs.map((spec) => this.beginRequest(spec.subId));
+    const settled = await settleWithLimit(specs, this.maxConcurrency, (spec, i) =>
+      this.execute(spec, ctrls[i]?.signal),
     );
+    specs.forEach((spec, i) => {
+      const ctrl = ctrls[i];
+      if (ctrl) this.endRequest(spec.subId, ctrl);
+    });
     if (this.closed) return;
 
     const changed: CycleChange[] = [];
@@ -349,6 +428,7 @@ export class RemoteTransport implements LiveTransport {
       const outcome = settled[i];
       const ticket = tickets[i];
       if (!spec || !outcome || ticket === undefined) continue;
+      if (ctrls[i]?.signal.aborted) continue; // superseded on purpose
       if (!this.subs.has(spec.subId)) continue;
       if (this.outranked(spec.subId, ticket)) continue;
       this.markDelivered(spec.subId, ticket);
@@ -370,7 +450,7 @@ export class RemoteTransport implements LiveTransport {
     this.sink?.onCycle({ ledger, t, changed, unchanged, errored });
   }
 
-  private async execute(spec: ResolvedSpec): Promise<unknown> {
+  private async execute(spec: ResolvedSpec, signal?: AbortSignal): Promise<unknown> {
     const ledgerPath =
       spec.at !== undefined ? `${spec.ledger}@t:${spec.at}` : spec.ledger;
     const url = `${this.base}/v1/fluree/query/${encodeLedgerPath(ledgerPath)}`;
@@ -387,6 +467,7 @@ export class RemoteTransport implements LiveTransport {
       method: "POST",
       headers,
       body: spec.text,
+      ...(signal ? { signal } : {}),
     });
     if (!res.ok) {
       let message = `HTTP ${res.status}`;

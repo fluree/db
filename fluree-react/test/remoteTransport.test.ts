@@ -15,8 +15,10 @@ import type { RemoteTransportOptions } from "../src/remote/remoteTransport.js";
 import type { SubscriptionSpec } from "../src/core/transport.js";
 import { MockServer, recordingSink } from "./helpers.js";
 
+/** Drain the microtask queue. Generous on purpose: a bounded cycle fan-out
+ * is several sequential rounds deep, each costing a handful of turns. */
 const flush = async () => {
-  for (let i = 0; i < 20; i++) await Promise.resolve();
+  for (let i = 0; i < 400; i++) await Promise.resolve();
 };
 
 const DEBOUNCE = 5;
@@ -636,6 +638,114 @@ describe("unsubscribe and close", () => {
     transport.subscribe(spec());
     await settle();
     expect(server.queries).toHaveLength(0);
+  });
+});
+
+describe("cancellation and fan-out", () => {
+  it("aborts the in-flight request when a subscription goes away", async () => {
+    const { server, sink, transport } = setup();
+    let release: (() => void) | undefined;
+    server.respond = () =>
+      new Promise((resolve) => {
+        release = () => resolve({ body: bindings("late") });
+      });
+    const s = spec();
+    transport.subscribe(s);
+    await flush();
+    expect(server.signals[0]!.aborted).toBe(false);
+
+    transport.unsubscribe(s.subId);
+    // Not merely ignored on arrival: actually cancelled, so the server stops
+    // computing an answer nobody will read.
+    expect(server.signals[0]!.aborted).toBe(true);
+    release?.();
+    await flush();
+    expect(sink.cycles).toHaveLength(0);
+  });
+
+  it("aborts a superseded request rather than racing it", async () => {
+    const { server, sink, transport } = setup();
+    const releases: Array<() => void> = [];
+    server.respond = (_c, n) =>
+      new Promise((resolve) => {
+        releases.push(() => resolve({ body: bindings(`v${n}`) }));
+      });
+    const s = spec();
+    transport.subscribe(s);
+    await settle();
+    // A commit arrives while the first fetch is still open.
+    await head(server, 5);
+
+    expect(server.queries).toHaveLength(2);
+    expect(server.signals[0]!.aborted).toBe(true);
+    expect(server.signals[1]!.aborted).toBe(false);
+
+    // The abort of the first must not surface as a query error.
+    releases[1]?.();
+    await flush();
+    expect(sink.cycles.at(-1)!.errored).toEqual([]);
+    expect(sink.cycles.at(-1)!.changed[0]!.payload).toEqual(bindings("v1"));
+  });
+
+  it("aborts everything still in flight on close", async () => {
+    const { server, transport } = setup();
+    server.respond = () => new Promise(() => {});
+    transport.subscribe(spec());
+    transport.subscribe(spec({ text: "qb" }));
+    await flush();
+    transport.close();
+    expect(server.signals.map((s) => s!.aborted)).toEqual([true, true]);
+  });
+
+  it("bounds how many of a cycle's queries run at once", async () => {
+    const server = new MockServer();
+    const sink = recordingSink();
+    const transport = new RemoteTransport({
+      url: "https://srv",
+      fetchImpl: server.fetchImpl,
+      sseRefreshDebounceMs: DEBOUNCE,
+      maxConcurrency: 2,
+    });
+    transport.start(sink);
+    // Ten components on one ledger. Remote mode re-runs every one of them
+    // per commit; unbounded, that is ten simultaneous HTTP requests.
+    const specs = Array.from({ length: 10 }, (_, i) => spec({ text: `q${i}` }));
+    for (const s of specs) transport.subscribe(s);
+    await settle();
+    server.peakInFlight = 0;
+
+    server.respond = (call) => ({ body: bindings(`${call.body}!`) });
+    await head(server, 5);
+
+    expect(server.peakInFlight).toBeLessThanOrEqual(2);
+    // ...and every subscription still got its answer in ONE cycle.
+    expect(sink.cycles.at(-1)!.changed).toHaveLength(10);
+    expect(sink.cycles.at(-1)!.t).toBe(5);
+  });
+
+  it("still runs a cycle to completion when one query fails mid-fan-out", async () => {
+    const server = new MockServer();
+    const sink = recordingSink();
+    const transport = new RemoteTransport({
+      url: "https://srv",
+      fetchImpl: server.fetchImpl,
+      sseRefreshDebounceMs: DEBOUNCE,
+      maxConcurrency: 2,
+    });
+    transport.start(sink);
+    const specs = Array.from({ length: 5 }, (_, i) => spec({ text: `q${i}` }));
+    for (const s of specs) transport.subscribe(s);
+    await settle();
+
+    server.respond = (call) =>
+      call.body === "q2"
+        ? { status: 500, body: { error: "db/boom", message: "boom" } }
+        : { body: bindings(`${call.body}!`) };
+    await head(server, 5);
+
+    const cycle = sink.cycles.at(-1)!;
+    expect(cycle.errored).toHaveLength(1);
+    expect(cycle.changed).toHaveLength(4);
   });
 });
 

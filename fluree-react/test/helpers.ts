@@ -205,8 +205,37 @@ export class MockServer {
     };
     const n = this.queries.length;
     this.queries.push(call);
-    return makeResponse(await this.respond(call, n));
+    this.signals.push(init?.signal ?? null);
+
+    this.inFlight++;
+    this.peakInFlight = Math.max(this.peakInFlight, this.inFlight);
+    try {
+      const answer = Promise.resolve(this.respond(call, n));
+      const signal = init?.signal;
+      if (!signal) return makeResponse(await answer);
+      // Behave like a real fetch: an abort rejects the request rather than
+      // letting it run to completion.
+      if (signal.aborted) throw abortError();
+      const aborted = new Promise<never>((_, reject) => {
+        signal.addEventListener("abort", () => reject(abortError()), { once: true });
+      });
+      return makeResponse(await Promise.race([answer, aborted]));
+    } finally {
+      this.inFlight--;
+    }
   };
+
+  /** The `AbortSignal` handed to each query call, aligned with `queries`. */
+  readonly signals: Array<AbortSignal | null> = [];
+  /** Concurrency instrumentation for the cycle fan-out. */
+  inFlight = 0;
+  peakInFlight = 0;
+}
+
+function abortError(): Error {
+  const err = new Error("The operation was aborted.");
+  err.name = "AbortError";
+  return err;
 }
 
 // ---------------------------------------------------------------------------
