@@ -50,6 +50,15 @@ pub enum ServerError {
     /// SPARQL UPDATE lowering error
     #[error("SPARQL UPDATE error: {0}")]
     SparqlUpdateLower(#[from] SparqlUpdateLowerError),
+
+    /// Novelty backpressure (503 + `Retry-After`): the ledger's in-memory
+    /// novelty is at `reindex_max_bytes` (or the transaction would cross it)
+    /// and the indexer must drain it before new commits are accepted.
+    /// Carries the pipeline's message for submissions whose typed
+    /// `ApiError::Transact` variant was flattened at the consensus boundary;
+    /// errors that still carry the variant map via the `ApiError` arms.
+    #[error("{0}")]
+    NoveltyBackpressure(String),
 }
 
 impl ServerError {
@@ -146,6 +155,15 @@ impl ServerError {
                 | fluree_db_api::TransactError::PublishLostRace { .. }
                 | fluree_db_api::TransactError::NamespaceConflict(_),
             )) => errors::COMMIT_CONFLICT,
+            // Novelty backpressure: retryable capacity pressure, not an
+            // invalid transaction. Both variants carry the same machine code
+            // (the message distinguishes at-max from would-exceed) so clients
+            // branch on one `@type` for "the indexer needs to drain".
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyAtMax
+                | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
+            ))
+            | ServerError::NoveltyBackpressure(_) => errors::NOVELTY_AT_MAX,
             ServerError::Api(ApiError::Transact(_)) => errors::INVALID_TRANSACTION,
 
             // API-level errors
@@ -227,6 +245,17 @@ impl ServerError {
                 | fluree_db_api::TransactError::PublishLostRace { .. }
                 | fluree_db_api::TransactError::NamespaceConflict(_),
             )) => StatusCode::CONFLICT,
+
+            // 503 - novelty backpressure. The same retryable capacity class
+            // as `NoveltyDeferred` above: only the indexer draining clears
+            // it. A 400 here tells well-behaved clients (retry 5xx, treat
+            // 4xx as permanent) to drop the write. MUST precede the generic
+            // `ApiError::Transact(_)` arm below.
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyAtMax
+                | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
+            ))
+            | ServerError::NoveltyBackpressure(_) => StatusCode::SERVICE_UNAVAILABLE,
 
             // 403 - Forbidden (storage-permission / fail-closed). Raised
             // directly (preview path) or wrapped from the query engine (scan
@@ -386,7 +415,20 @@ impl IntoResponse for ServerError {
             )
         });
 
-        (status, [("content-type", "application/json")], json).into_response()
+        let mut response = (status, [("content-type", "application/json")], json).into_response();
+        // Every 503 this server emits is retryable capacity pressure
+        // (novelty at max, materialization deferred, committer overloaded),
+        // and RFC 9110 says a 503 should tell the client when to come back.
+        // Static 1s: the indexer's drain time is not observable at the
+        // error site, and 1s is the shortest interval that stops a tight
+        // retry loop without penalizing recovery.
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        response
     }
 }
 
@@ -618,6 +660,59 @@ mod tests {
             partial(20, 1, 1).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// Novelty backpressure must answer 503 + `err:db/NoveltyAtMax` in every
+    /// shape it reaches this layer: the raw `ApiError::Transact` variants
+    /// (paths that never cross the consensus boundary) and the
+    /// `ServerError::NoveltyBackpressure` reconstruction (paths where the
+    /// variant was flattened to a `SubmissionError`). Before this mapping the
+    /// condition fell through the `Transact(_)` catch-alls as 400
+    /// InvalidTransaction, and a client that retries 5xx but treats 4xx as
+    /// permanent dropped the write.
+    #[test]
+    fn novelty_backpressure_is_503_with_novelty_code_in_every_shape() {
+        let shapes = [
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyAtMax,
+            )),
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyWouldExceed {
+                    current_bytes: 90,
+                    delta_bytes: 20,
+                    max_bytes: 100,
+                },
+            )),
+            ServerError::NoveltyBackpressure("Novelty at maximum size, reindexing required".into()),
+        ];
+        for se in shapes {
+            assert_eq!(se.status_code(), StatusCode::SERVICE_UNAVAILABLE, "{se}");
+            assert_eq!(se.error_type(), errors::NOVELTY_AT_MAX, "{se}");
+        }
+    }
+
+    /// Every 503 carries `Retry-After` (all of this server's 503s are
+    /// retryable capacity pressure); non-503s must not.
+    #[test]
+    fn service_unavailable_responses_carry_retry_after() {
+        let resp = ServerError::Api(ApiError::Transact(
+            fluree_db_api::TransactError::NoveltyAtMax,
+        ))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+
+        let resp = ServerError::BadRequest("nope".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
     }
 
     #[test]

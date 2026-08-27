@@ -373,7 +373,23 @@ impl SubmissionLookup for LocalCommitter {
 
 /// Map a transaction-pipeline error into a [`SubmissionError`], preserving
 /// the HTTP status so the caller can render an accurate response.
+///
+/// Novelty backpressure keeps its identity through the flattening: both
+/// variants are the same retryable "indexer must drain" condition, and the
+/// server needs to tell them apart from other failures to answer 503 +
+/// `err:db/NoveltyAtMax` + `Retry-After` instead of a terminal error.
 pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
+    if matches!(
+        err,
+        ApiError::Transact(
+            fluree_db_api::TransactError::NoveltyAtMax
+                | fluree_db_api::TransactError::NoveltyWouldExceed { .. }
+        )
+    ) {
+        return SubmissionError::NoveltyBackpressure {
+            message: err.to_string(),
+        };
+    }
     SubmissionError::Execution {
         status: err.status_code(),
         message: err.to_string(),

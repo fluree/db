@@ -248,7 +248,8 @@ fn weigh_policy_map(map: &HashMap<String, PolicyStats>) -> usize {
 
 fn weigh_submission_error(err: &SubmissionError) -> usize {
     match err {
-        SubmissionError::Execution { message, .. } => message.capacity(),
+        SubmissionError::Execution { message, .. }
+        | SubmissionError::NoveltyBackpressure { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
         | SubmissionError::Overloaded => 0,

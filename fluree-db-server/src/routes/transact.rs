@@ -180,6 +180,12 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
     let status = match &err {
         SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => 409,
         SubmissionError::Overloaded => 503,
+        // Keep the typed identity: 503 + `err:db/NoveltyAtMax` + Retry-After
+        // instead of a status-only passthrough (whose `@type` degrades to
+        // the internal-error catch-all).
+        SubmissionError::NoveltyBackpressure { message } => {
+            return ServerError::NoveltyBackpressure(message.clone());
+        }
         SubmissionError::Execution { status, .. } => *status,
     };
     ServerError::Api(ApiError::http(status, err.to_string()))

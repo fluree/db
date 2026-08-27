@@ -774,6 +774,18 @@ pub enum SubmissionError {
     #[error("{message}")]
     Execution { status: u16, message: String },
 
+    /// The submission was refused by novelty backpressure: the ledger's
+    /// in-memory novelty is at `reindex_max_bytes` (or this transaction
+    /// would cross it) and the indexer must drain it before new commits
+    /// are accepted. Retryable. Distinct from [`Self::Execution`] so the
+    /// HTTP layer can surface the dedicated `err:db/NoveltyAtMax` code
+    /// and a `Retry-After` header instead of a generic failure — an
+    /// `Execution` status alone cannot identify the condition because
+    /// other retryable paths (leader transition, stranded waiter) share
+    /// the 5xx range.
+    #[error("{message}")]
+    NoveltyBackpressure { message: String },
+
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
@@ -799,6 +811,10 @@ impl SubmissionError {
             // Admission refusals and racing-submission signals —
             // this submission was never executed.
             Self::KeyCollision | Self::AlreadyInFlight | Self::Overloaded => false,
+            // Refused before commit; a retry with the SAME key must
+            // re-execute once the indexer drains rather than replay a
+            // cached refusal for the cache TTL.
+            Self::NoveltyBackpressure { .. } => false,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }

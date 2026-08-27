@@ -649,6 +649,16 @@ impl ApiError {
                 | fluree_db_transact::TransactError::PublishLostRace { .. }
                 | fluree_db_transact::TransactError::NamespaceConflict(_),
             ) => 409,
+            // 503 + retryable: novelty backpressure, the same class as
+            // `NoveltyDeferred` above. `NoveltyAtMax` (novelty already at
+            // `reindex_max_bytes`) and `NoveltyWouldExceed` (this delta would
+            // cross it) are cleared by the indexer draining, not by changing
+            // the request — a 400 tells retrying clients the write is
+            // permanently invalid and to drop it.
+            ApiError::Transact(
+                fluree_db_transact::TransactError::NoveltyAtMax
+                | fluree_db_transact::TransactError::NoveltyWouldExceed { .. },
+            ) => 503,
             // Other transaction errors are usually validation failures
             ApiError::Transact(_) => 400,
             // Cross-ledger model dependency could not be resolved /
