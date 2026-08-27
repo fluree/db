@@ -55,30 +55,31 @@ pub(crate) fn cached_stats_view_for_db(
                 store: binary_store.map(std::convert::AsRef::as_ref),
                 runtime_small_dicts: db.runtime_small_dicts,
             };
-            // Deliberately the ESTIMATE merge (`NoveltyMerge::Estimate`), not
-            // the base-reconciled one the user-facing count surfaces use
-            // (#1391): reconciliation costs one base probe per
-            // `(graph, subject, predicate)` in the window, and this view is
+            // THE PLANNER LANE IS NOT RECONCILED, ON PURPOSE. This is the
+            // ESTIMATE merge (`NoveltyMerge::Estimate`), not the base-reconciled
+            // one the user-facing count surfaces use (#1391), because
+            // reconciliation costs one base-index probe per
+            // `(graph, subject, predicate)` in the window while this view is
             // rebuilt on every overlay epoch bump — i.e. every commit — so
-            // accumulating a novelty window would become quadratic in its own
-            // size.
+            // accumulating a novelty window would be quadratic in its own size.
             //
-            // No COUNT *answer* rides on these numbers, but not for the
-            // tempting reason. Several COUNT lanes deliberately do NOT gate on
-            // `fast_path_store` and do run with novelty present — see
-            // `count_plan_exec.rs` and `count_rows.rs`, both gating on
-            // `allow_cursor_fast_path`, the latter noting that the stricter
-            // gate "forced the whole encoded-filters COUNT family onto the
-            // generic fallback whenever any novelty was present (~50% of real
-            // queries)". What makes them safe is that they read through a
-            // `BinaryCursor` that folds the overlay in and applies set
-            // semantics; none of them reads this merged `StatsView`.
+            // NO COUNT ANSWER RIDES ON THIS VIEW. Several COUNT lanes do run
+            // with novelty present — `count_plan_exec.rs` and `count_rows.rs`
+            // both gate on `allow_cursor_fast_path` rather than
+            // `fast_path_store`, the latter noting that the stricter gate
+            // "forced the whole encoded-filters COUNT family onto the generic
+            // fallback whenever any novelty was present (~50% of real
+            // queries)". What makes them safe is not that they decline: they
+            // read through a `BinaryCursor` that folds the overlay in and
+            // applies set semantics. None of them reads this merged
+            // `StatsView`.
             //
             // So a duplicate re-assert inflates planner cardinality estimates
             // by one until the next reindex — the same class of imprecision
-            // `ndv_*` and `last_modified_t` already carry here. One consumer of
-            // this view is not purely an estimate, though, and is worth knowing
-            // about: `StatsView::property_ref_only` is derived from the merged
+            // `ndv_*` and `last_modified_t` already carry here.
+            //
+            // One consumer is NOT purely an estimate, and is tracked as #1721:
+            // `StatsView::property_ref_only` is derived from the merged
             // per-datatype breakdown and feeds `filter_fold`'s node-only
             // soundness guard, which decides whether `FILTER(?x = ?y)` may be
             // folded into a term-equality join. `merge_property_datatypes`
@@ -87,11 +88,12 @@ pub(crate) fn cached_stats_view_for_db(
             // could in principle drop a predicate's last literal tag and
             // license that fold where SPARQL *value* equality was required.
             // Latent and pre-existing (the blind delta log long predates
-            // #1391), not demonstrated end to end, and deliberately NOT
-            // addressed here: the repair belongs in the estimate lane itself,
-            // and changing what `PropertyStatEntry.datatypes` emits reaches
-            // every consumer that sums it. Tracked separately rather than
-            // folded into a stats-count fix.
+            // #1391), not demonstrated end to end, and deliberately not
+            // addressed in #1699: the repair belongs in the estimate lane
+            // itself, and changing what `PropertyStatEntry.datatypes` emits
+            // reaches every consumer that sums it. See #1721 for both candidate
+            // fix directions — and note that reconciling THIS lane is not one
+            // of them, for the quadratic reason above.
             assemble_fast_stats(
                 &indexed,
                 db.snapshot,
