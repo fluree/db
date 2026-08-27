@@ -33,6 +33,21 @@ function useRenderCount(): number {
 }
 
 /**
+ * Milliseconds from navigation start to the first render that had data.
+ *
+ * Worth showing, because the honest story is not "peer mode is faster".
+ * Peer mode pays a real cold-start cost — fetching and compiling a ~9 MB
+ * wasm engine, then discovering and fetching index blocks — that remote mode
+ * simply does not have. What it buys is what happens *after*: subsequent
+ * queries and every update run locally, with no round trip.
+ */
+function useFirstDataMs(hasData: boolean): number | undefined {
+  const at = useRef<number | undefined>(undefined);
+  if (hasData && at.current === undefined) at.current = Math.round(performance.now());
+  return at.current;
+}
+
+/**
  * Takes the RAW binding, not a derived object. The binding is what keeps its
  * identity across a commit that did not touch this row, so this is what lets
  * `memo` bail out. Handing it a `{id, text, votes}` built during the parent's
@@ -71,6 +86,7 @@ function Board() {
   const renders = useRenderCount();
   const { data, status, error, t } = useQuery<SparqlResults>(LEDGER, BOARD_QUERY);
   const bindings = bindingsOf(data);
+  const firstDataMs = useFirstDataMs(data !== undefined);
   const onVote = useCallback((note: Note, delta: number) => {
     void vote(note, delta).catch((e: unknown) => console.error(e));
   }, []);
@@ -80,6 +96,9 @@ function Board() {
       <h2>
         Board <span className="badge">rendered {renders}×</span>
         <span className="badge">t = {t ?? "—"}</span>
+        <span className="badge" title="navigation start to first render with data">
+          first data {firstDataMs === undefined ? "—" : `${firstDataMs} ms`}
+        </span>
         {status === "error" && <span className="badge err">{error?.code}</span>}
       </h2>
       {status === "loading" && <p className="muted">loading…</p>}

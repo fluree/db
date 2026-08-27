@@ -300,26 +300,38 @@ export class PeerTransport implements LiveTransport {
     const changed: CycleChange[] = [];
     const unchanged: number[] = [];
     const errored: CycleErrored[] = [];
+    // The engine names ledgers canonically (`demo/board:main`); the app
+    // subscribed with whatever it passed to `useQuery` (usually the bare
+    // name). Report cycles under the APP's spelling, or everything keyed by
+    // ledger downstream — `client.ledgerHead(ledger)` most visibly — is
+    // filed under a name the app never uses and silently reads as unknown.
+    let ledger: string | undefined;
+    const claim = (engineId: number): number | undefined => {
+      const subId = this.byEngineId.get(engineId);
+      if (subId === undefined) return undefined;
+      ledger ??= this.subs.get(subId)?.spec.ledger;
+      return subId;
+    };
 
     for (const entry of cycle.changed) {
-      const subId = this.byEngineId.get(entry.subId);
+      const subId = claim(entry.subId);
       if (subId !== undefined) changed.push({ subId, payload: entry.data });
     }
     for (const engineId of cycle.unchanged) {
-      const subId = this.byEngineId.get(engineId);
+      const subId = claim(engineId);
       if (subId !== undefined) unchanged.push(subId);
     }
     for (const entry of cycle.errored) {
-      const subId = this.byEngineId.get(entry.subId);
+      const subId = claim(entry.subId);
       if (subId !== undefined) {
         errored.push({ subId, error: toQueryError(entry.error) });
       }
     }
-    if (changed.length === 0 && unchanged.length === 0 && errored.length === 0) {
+    if (ledger === undefined) {
       return; // nothing in this cycle belongs to us
     }
 
-    const update: CycleUpdate = { ledger: cycle.ledger, changed, unchanged, errored };
+    const update: CycleUpdate = { ledger, changed, unchanged, errored };
     if (cycle.t !== undefined) update.t = cycle.t;
     this.sink?.onCycle(update);
   }

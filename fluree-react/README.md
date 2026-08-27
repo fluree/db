@@ -73,6 +73,22 @@ Remote mode is the on-ramp: an app written against these hooks today gains
 peer mode by changing that one call, because the transport contract and the
 result shapes are identical in both.
 
+### Peer mode is not a speed-up on first paint
+
+Worth stating plainly, because the opposite is the natural assumption. Peer
+mode pays a cold-start cost remote mode does not have: fetching and compiling
+a ~9 MB wasm engine, then discovering and fetching index blocks. A measured
+cold open on a 200-row ledger is ~3.4 s, and the dominant term is not I/O —
+about 2.7 s of it is idle across eight sequential discovery rounds (~25 ms of
+object fetches, ~15 ms of preflights). For comparison, remote mode reached
+first rendered data in **141 ms** in the demo on loopback.
+
+What peer mode buys is everything after that first paint: subsequent queries
+and every update re-run locally against a frozen snapshot, with no round trip
+and no server work. Reducing the round count is the known path to fixing cold
+open; until then, choose peer mode for update latency and offline-ish
+resilience, not for time-to-first-paint.
+
 ### What differs between the modes
 
 Two things the in-browser engine genuinely cannot do. Both **fail loudly**
@@ -235,7 +251,7 @@ prefer a per-request client, or a short `gcTime`, in a server process.
 Written out plainly, because "the tests pass" and "this works against
 Fluree" are different claims and only the first is true today.
 
-**Executed** — 177 tests (`npx vitest run`), all running real package code:
+**Executed** — 178 tests (`npx vitest run`), all running real package code:
 
 | Suite | Tests | What it actually proves |
 | --- | --- | --- |
@@ -245,7 +261,7 @@ Fluree" are different claims and only the first is true today.
 | `useQuery` (react-dom + jsdom) | 19 | Real components: a memoized row does **not** re-render when a sibling row changes; an unchanged cycle costs zero renders; `getSnapshot` is referentially stable across unrelated parent re-renders (a fresh object per call is the canonical infinite-loop bug with `useSyncExternalStore`); StrictMode double-mount keeps one subscription; siblings advance in lock-step. |
 | `sse` | 19 | The hand-rolled frame parser against a real `ReadableStream`: frames split across chunks, multi-line `data`, keep-alive comments, CRLF, `Last-Event-ID` replay, debounced re-resolve of the watched-ledger URL, jittered exponential backoff (jitter pinned, so the doubling is asserted exactly), and per-reconnect auth re-resolution. |
 | `remoteTransport` | 48 | Request construction; the SSE-triggered cycle; the client-side change gate; coalescing of head events arriving mid-cycle; ledger-path encoding; time anchors; structured errors; per-subscription delivery ordering; cancellation of superseded requests; the bounded fan-out (mutation-checked — removing the bound fails the test). |
-| `peerTransport` | 24 | Engine-id mapping; the batch preserved as one cycle; async-registration races (including an unsubscribe that beats its own registration); the two refusals (`at`, non-native `format`); and crash recycles — re-registration on `"ready"`, stale-id invalidation, and loud failure on `"terminal"`. |
+| `peerTransport` | 25 | Engine-id mapping; the batch preserved as one cycle; async-registration races (including an unsubscribe that beats its own registration); the two refusals (`at`, non-native `format`); and crash recycles — re-registration on `"ready"`, stale-id invalidation, and loud failure on `"terminal"`. |
 | `peerIntegration` (react-dom) | 7 | Peer mode through the real hooks: memoized rows survive `postMessage` cloning, an unchanged cycle costs zero renders, and a crash recycle keeps data on screen and then picks updates back up under the fresh engine's ids. |
 | `protocolCompat` | 2 | The seam. Imports the **real** `@fluree/db-wasm` types and asserts assignability both ways, so `tsc` fails on drift. Mutation-checked against three drifts: a changed cycle shape, a removed method, and a new lifecycle state. |
 | `integration` | 7 | The public barrel and `createClient` composed as an app uses them: an SSE head event drives a re-query that re-renders a component. |
@@ -294,17 +310,23 @@ reproducible in CI today.
 
 **Not verified:**
 
-- **Peer mode has not served live data against a real server** — blocked
-  engine-side, not here. Driven in Chrome against a release `fluree-server`,
-  the worker boots, `init` succeeds, the token handshake completes, SSE head
-  tracking delivers `headChange`, and `subscribe` returns a subscription id;
-  then the wasm traps on the first ledger open with `no filesystem on this
-  platform` — `std::env::temp_dir()` called without a wasm guard from
-  `fluree-db-api/src/view/fluree_ext.rs:228`. It reproduces on a one-shot
-  query with head tracking off, so it is not about live queries or this
-  package. What that run *does* establish is that the transport reports a
-  real engine crash the way the unit tests say it should: `reconnecting`,
-  then a loud error — never a silent freeze.
+- **Peer mode is proven end to end, but not yet reliably.** Driven in two
+  Chrome tabs against a release `fluree-server` with the storage proxy on, it
+  worked exactly as designed: two independent wasm engines, a vote in one tab
+  appearing in the other, **only the changed row re-rendering** (`1×`→`2×`
+  while its siblings stayed `1×`), the second query's panel untouched, and
+  the watermark advancing `t = 1` → `t = 2`. Peer mode also knows its
+  watermark immediately, where remote mode reports `undefined` until the
+  first head event.
+
+  On later runs, after clearing the browser's IndexedDB block cache, peer
+  queries **stall indefinitely**: `init` succeeds, the token handshake
+  completes, the connection reports `live` — and then no query ever answers,
+  with no error, no panic, and **no `/v1/fluree/storage/*` request ever
+  issued**, so the engine stalls before its first block fetch. It reproduces
+  through the raw worker protocol with head tracking switched off, i.e.
+  entirely below this package, and remote mode against the same server is
+  unaffected. Engine-side; reported, not fixed here.
 - **No browser run.** jsdom only. The demo has been driven against a real
   server (see below), but not as an automated test.
 - **No packaging smoke.** `npm run build` emits `dist/`, and the demo bundles

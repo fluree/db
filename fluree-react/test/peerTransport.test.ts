@@ -229,6 +229,27 @@ describe("cycle translation", () => {
     });
   });
 
+  it("reports cycles under the ledger name the app subscribed with", async () => {
+    // The engine names ledgers canonically. Passing that through means the
+    // cache files the watermark under a name the app never uses, so
+    // `client.ledgerHead("demo/board")` reads as unknown forever — caught by
+    // the demo's header showing "ledger head t = —" while the query itself
+    // was happily advancing.
+    const { engine, sink, transport } = setup();
+    await flush();
+    transport.subscribe(spec({ ledger: "demo/board" }));
+    await flush();
+
+    engine.emitCycle(
+      cycle({
+        ledger: "demo/board:main",
+        t: 2,
+        changed: [{ subId: engine.subId(0), data: { rows: [1] } }],
+      }),
+    );
+    expect(sink.cycles[0]!.ledger).toBe("demo/board");
+  });
+
   it("carries an absent watermark through rather than inventing one", async () => {
     const { engine, sink, transport } = setup();
     await flush();

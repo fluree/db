@@ -38,16 +38,19 @@ CORS never enters the story; point it elsewhere with `FLUREE_URL`.
 
 ## Peer mode
 
-> **Blocked on an engine bug as of 2026-08-27.** The worker boots, the token
-> handshake completes, SSE head tracking delivers, and `subscribe` is
-> accepted — then the wasm traps on the first ledger open with
-> `panicked at library/std/src/sys/paths/unsupported.rs:52: no filesystem on
-> this platform`. That is `std::env::temp_dir()` reached from
-> `fluree-db-api/src/view/fluree_ext.rs:228` (and `:363`), which is missing
-> the `#[cfg(target_arch = "wasm32")]` guard its twin in
-> `ledger_manager.rs:744` has. It reproduces on a plain one-shot query with
-> head tracking switched off entirely, so it is not specific to live queries
-> or to this package. Remote mode is unaffected.
+> **Works, but not yet reliably (2026-08-27).** Two tabs against a real
+> server did the whole thing: two wasm engines, a vote in one tab landing in
+> the other, only the changed row re-rendering, `t` advancing. On later runs
+> — after clearing the IndexedDB block cache — queries stall indefinitely
+> with no error and no block fetch ever issued. That reproduces through the
+> raw worker protocol, below this package, and remote mode is unaffected.
+> Engine-side.
+>
+> Note also that peer mode is **slower to first paint** than remote mode
+> (a ~9 MB wasm fetch plus several sequential discovery rounds against
+> remote mode's single query). It wins on what happens after: updates
+> re-query locally with no round trip. The `first data N ms` badge on the
+> Board shows this honestly in both modes.
 
 ```
 http://localhost:5173/?mode=peer&token=<bearer>
