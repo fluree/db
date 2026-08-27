@@ -2453,10 +2453,8 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
     // The read copies `.t` and the head comparison out, so the
     // borrow ends before the `state.queues` push-back below.
     let mut noop_completion = false;
-    if let Some((current_t, head_matches)) = state
-        .refs
-        .get(&ref_key)
-        .map(|r| (r.t, r.head == commit_id))
+    if let Some((current_t, head_matches)) =
+        state.refs.get(&ref_key).map(|r| (r.t, r.head == commit_id))
     {
         if commit_t == current_t && head_matches {
             noop_completion = true;
