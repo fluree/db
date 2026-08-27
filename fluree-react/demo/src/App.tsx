@@ -15,10 +15,12 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useConnectionState, useFlureeClient, useQuery } from "@fluree/react";
 import {
   addNote,
+  bindingsOf,
   BOARD_QUERY,
   LEDGER,
-  toNotes,
+  noteOf,
   vote,
+  type Binding,
   type Note,
   type SparqlResults,
 } from "./api.js";
@@ -30,14 +32,21 @@ function useRenderCount(): number {
   return n.current;
 }
 
+/**
+ * Takes the RAW binding, not a derived object. The binding is what keeps its
+ * identity across a commit that did not touch this row, so this is what lets
+ * `memo` bail out. Handing it a `{id, text, votes}` built during the parent's
+ * render would defeat the memo on every commit — see `noteOf`.
+ */
 const NoteRow = memo(function NoteRow({
-  note,
+  binding,
   onVote,
 }: {
-  note: Note;
+  binding: Binding;
   onVote: (note: Note, delta: number) => void;
 }) {
   const renders = useRenderCount();
+  const note = noteOf(binding);
   return (
     <li className="note">
       <div className="votes">{note.votes}</div>
@@ -61,7 +70,7 @@ const NoteRow = memo(function NoteRow({
 function Board() {
   const renders = useRenderCount();
   const { data, status, error, t } = useQuery<SparqlResults>(LEDGER, BOARD_QUERY);
-  const notes = toNotes(data);
+  const bindings = bindingsOf(data);
   const onVote = useCallback((note: Note, delta: number) => {
     void vote(note, delta).catch((e: unknown) => console.error(e));
   }, []);
@@ -74,12 +83,16 @@ function Board() {
         {status === "error" && <span className="badge err">{error?.code}</span>}
       </h2>
       {status === "loading" && <p className="muted">loading…</p>}
-      {status !== "loading" && notes.length === 0 && (
+      {status !== "loading" && bindings.length === 0 && (
         <p className="muted">No notes yet — add one below.</p>
       )}
       <ul className="notes">
-        {notes.map((note) => (
-          <NoteRow key={note.id} note={note} onVote={onVote} />
+        {bindings.map((binding) => (
+          <NoteRow
+            key={binding.id?.value ?? ""}
+            binding={binding}
+            onVote={onVote}
+          />
         ))}
       </ul>
     </section>

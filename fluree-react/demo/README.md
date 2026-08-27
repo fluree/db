@@ -59,6 +59,30 @@ peer mode cannot serve a time-anchored (`opts.at`) query — the in-browser
 engine has no historical view — and cannot serve a format other than the
 query language's own.
 
+## The trap this demo fell into first
+
+The first version of this app mapped the query result into fresh row objects
+on every render:
+
+```ts
+const notes = data.results.bindings.map((b) => ({ id: …, text: …, votes: … }));
+```
+
+Everything still worked — and **every row re-rendered on every commit**. The
+package had carefully preserved the identity of rows that did not change, and
+that one `.map()` threw all of it away before React ever saw it. Nothing
+warns you; the counters were the only reason it was caught.
+
+So components here take the **raw binding** and convert per row
+(`noteOf`). If you derive objects from query results, memoize the derivation
+per row, or pass the row through and convert at the leaf. This is the single
+easiest way to lose the benefit of the whole package.
+
+(For the same reason there is no `<StrictMode>` here: its dev-only
+double-render doubles every counter, and legible counters are the point.
+That subscriptions survive StrictMode's double-mount is pinned by a unit
+test instead.)
+
 ## What to show
 
 1. Two tabs side by side. Add a note in the left tab; it appears in the right

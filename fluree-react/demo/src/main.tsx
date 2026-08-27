@@ -7,7 +7,6 @@
  *   ?mode=peer               the wasm engine in a worker re-runs them locally
  */
 
-import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { createClient, FlureeProvider, type LiveClient } from "@fluree/react";
 import App from "./App.js";
@@ -56,12 +55,14 @@ async function main(): Promise<void> {
   const client = await buildClient();
   const root = document.getElementById("root");
   if (!root) throw new Error("no #root");
+  // No StrictMode here, deliberately. Its dev-only double-render doubles
+  // every counter on screen, and legible counters ARE this demo. That the
+  // subscription survives StrictMode's double-mount is pinned by a unit test
+  // instead (`useQuery.test.tsx`).
   createRoot(root).render(
-    <StrictMode>
-      <FlureeProvider client={client}>
-        <App mode={mode} />
-      </FlureeProvider>
-    </StrictMode>,
+    <FlureeProvider client={client}>
+      <App mode={mode} />
+    </FlureeProvider>,
   );
 }
 

@@ -75,17 +75,35 @@ WHERE { ?id a ex:Note ; ex:text ?text ; ex:votes ?votes }
 ORDER BY DESC(?votes) ?id
 `.trim();
 
-/** SPARQL JSON results -> the rows the UI renders. */
+/** One row of SPARQL JSON results. */
+export type Binding = Record<string, { value: string }>;
+
 export interface SparqlResults {
   head: { vars: string[] };
-  results: { bindings: Array<Record<string, { value: string }>> };
+  results: { bindings: Binding[] };
 }
 
-export function toNotes(data: SparqlResults | undefined): Note[] {
-  if (!data) return [];
-  return data.results.bindings.map((b) => ({
-    id: b.id?.value ?? "",
-    text: b.text?.value ?? "",
-    votes: Number(b.votes?.value ?? 0),
-  }));
+/**
+ * Read one binding as a note.
+ *
+ * Note what this deliberately is NOT: a `data -> Note[]` mapper. The package
+ * hands back a result tree in which a row that did not change is the SAME
+ * object as last render — that is the point of structural sharing, and it is
+ * what lets `React.memo` skip a row. Mapping the whole tree into fresh
+ * `{id, text, votes}` objects on every render throws all of that away
+ * silently: everything still WORKS, every row just re-renders on every
+ * commit, and nothing tells you.
+ *
+ * So components pass the binding itself down and convert per row, here.
+ */
+export function noteOf(binding: Binding): Note {
+  return {
+    id: binding.id?.value ?? "",
+    text: binding.text?.value ?? "",
+    votes: Number(binding.votes?.value ?? 0),
+  };
+}
+
+export function bindingsOf(data: SparqlResults | undefined): Binding[] {
+  return data?.results.bindings ?? [];
 }

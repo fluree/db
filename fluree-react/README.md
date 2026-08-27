@@ -187,6 +187,13 @@ against the previous one so unchanged branches keep their exact objects. If
 re-render happens at all. This is what makes `React.memo` and `useMemo`
 dependencies work on rows.
 
+> **The easiest way to lose all of this** is to derive new objects from
+> `data` during render — `data.results.bindings.map(b => ({…}))` gives every
+> row a fresh identity and every memoized child re-renders on every commit.
+> Nothing warns you. Pass result rows down as they come and convert at the
+> leaf, or memoize the derivation per row. The demo does the former, after
+> initially getting it wrong.
+
 **Superseded work is cancelled (remote).** A commit that lands while a
 query's request is still open aborts that request rather than letting the
 server finish an answer nobody will read. And because remote mode re-runs
@@ -228,7 +235,7 @@ prefer a per-request client, or a short `gcTime`, in a server process.
 Written out plainly, because "the tests pass" and "this works against
 Fluree" are different claims and only the first is true today.
 
-**Executed** — 171 tests (`npx vitest run`), all running real package code:
+**Executed** — 177 tests (`npx vitest run`), all running real package code:
 
 | Suite | Tests | What it actually proves |
 | --- | --- | --- |
@@ -237,7 +244,7 @@ Fluree" are different claims and only the first is true today.
 | `liveClient` | 13 | Query-kind inference and the language-matched format defaults; cache keying; one-shot queries; connection fan-out; teardown releases timers. |
 | `useQuery` (react-dom + jsdom) | 19 | Real components: a memoized row does **not** re-render when a sibling row changes; an unchanged cycle costs zero renders; `getSnapshot` is referentially stable across unrelated parent re-renders (a fresh object per call is the canonical infinite-loop bug with `useSyncExternalStore`); StrictMode double-mount keeps one subscription; siblings advance in lock-step. |
 | `sse` | 19 | The hand-rolled frame parser against a real `ReadableStream`: frames split across chunks, multi-line `data`, keep-alive comments, CRLF, `Last-Event-ID` replay, debounced re-resolve of the watched-ledger URL, jittered exponential backoff (jitter pinned, so the doubling is asserted exactly), and per-reconnect auth re-resolution. |
-| `remoteTransport` | 42 | Request construction; the SSE-triggered cycle; the client-side change gate; coalescing of head events arriving mid-cycle; ledger-path encoding; time anchors; structured errors; per-subscription delivery ordering; cancellation of superseded requests; the bounded fan-out (mutation-checked — removing the bound fails the test). |
+| `remoteTransport` | 48 | Request construction; the SSE-triggered cycle; the client-side change gate; coalescing of head events arriving mid-cycle; ledger-path encoding; time anchors; structured errors; per-subscription delivery ordering; cancellation of superseded requests; the bounded fan-out (mutation-checked — removing the bound fails the test). |
 | `peerTransport` | 24 | Engine-id mapping; the batch preserved as one cycle; async-registration races (including an unsubscribe that beats its own registration); the two refusals (`at`, non-native `format`); and crash recycles — re-registration on `"ready"`, stale-id invalidation, and loud failure on `"terminal"`. |
 | `peerIntegration` (react-dom) | 7 | Peer mode through the real hooks: memoized rows survive `postMessage` cloning, an unchanged cycle costs zero renders, and a crash recycle keeps data on screen and then picks updates back up under the fresh engine's ids. |
 | `protocolCompat` | 2 | The seam. Imports the **real** `@fluree/db-wasm` types and asserts assignability both ways, so `tsc` fails on drift. Mutation-checked against three drifts: a changed cycle shape, a removed method, and a new lifecycle state. |
@@ -248,14 +255,42 @@ Fluree" are different claims and only the first is true today.
 build`), which is the only thing that exercises this package as a *package*
 rather than as source files a test imported.
 
-**Mocked.** Every HTTP response, every SSE frame, and the whole wasm engine.
-The request shapes this package *sends* —
-`POST /v1/fluree/query/{ledger}`, `GET /v1/fluree/events?ledger=…`, the
-`ns-record` / `ns-retracted` event names and their
-`{kind, resource_id, record.commit_t}` payload, the `{ledger}@t:{n}`
-time-travel path — have been **read against the server's source and found
-correct**, but no test here checks them against a running server: if a route
-or field name changed tomorrow, all 171 tests would still pass.
+**Run for real, once, by hand (remote mode).** The demo was driven in two
+Chrome tabs against a release `fluree-server` on file storage: a vote in one
+tab appeared in the other, and in the untouched tab **only the changed row
+re-rendered** (its counter `1×`→`2×`, every sibling still `1×`, the
+second query's panel untouched); adding a note then re-rendered that second
+panel and no existing row. That run is what found the four defects listed
+below — none of which the 177 tests could see, because all four live in the
+gap between a mock and a browser talking to a server.
+
+**What that one live run found**, after every mocked test was green:
+
+1. `fetch` held as an instance property and called as `this.fetchImpl(...)`
+   passes the transport as the receiver, and **every browser** rejects that
+   as an illegal invocation. Node's fetch does not care, and every transport
+   test injected its own `fetchImpl`, so nothing could see it. Every request
+   in a real browser failed.
+2. The server announces commits for the canonical `name:branch` id
+   (`demo/board:main`), but an app subscribes with the bare name — so every
+   head event was discarded as unwatched. Subscription open, nothing
+   errored, no query ever updating.
+3. The server's events filter compares aliases exactly, so subscribing under
+   the bare name produced a stream that connects, stays open, and delivers
+   nothing. The canonical alias is now *resolved* from `/info/{ledger}`
+   rather than guessed from a default branch name.
+4. (Server-side, fixed here) the events endpoint's documented `?ledger=`
+   filter never worked at all — axum's `Query` extractor cannot build a
+   `Vec` from repeated query keys, so even a single `?ledger=x` failed
+   deserialization and `?all=true` was the only usable form.
+
+Each of the first three is the same failure mode: **silence**. That is why
+they survived a full mocked suite, and it is the argument for the live run
+being a standing gate rather than a one-off.
+
+**Still mocked.** Every HTTP response, every SSE frame, and the whole wasm
+engine, in the automated suite. The live run above was manual and is not
+reproducible in CI today.
 
 **Not verified:**
 

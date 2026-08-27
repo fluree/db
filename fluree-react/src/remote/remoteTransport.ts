@@ -172,7 +172,13 @@ export class RemoteTransport implements LiveTransport {
 
   constructor(options: RemoteTransportOptions) {
     this.base = options.url.replace(/\/+$/, "");
-    this.fetchImpl = options.fetchImpl ?? fetch;
+    // Bound to the global on purpose. `fetch` is a WebIDL operation on
+    // Window: stored as an instance property and called as
+    // `this.fetchImpl(...)`, it receives the transport as its receiver and
+    // every browser throws "Illegal invocation". Node's fetch does not care,
+    // so this is invisible to tests that inject `fetchImpl` — it fails only
+    // in a real browser, on every request.
+    this.fetchImpl = options.fetchImpl ?? fetch.bind(globalThis);
     this.getToken = options.getToken;
     this.maxConcurrency = options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
     this.sseOptions = {

@@ -51,7 +51,10 @@ export class SseSource {
 
   constructor(opts: SseSourceOptions) {
     this.opts = opts;
-    this.fetchImpl = opts.fetchImpl ?? fetch;
+    // Bound to the global: see the note in remoteTransport.ts — an unbound
+    // `fetch` called as `this.fetchImpl(...)` is an "Illegal invocation" in
+    // every browser, and fine everywhere the tests run.
+    this.fetchImpl = opts.fetchImpl ?? fetch.bind(globalThis);
     this.refreshDebounceMs = opts.refreshDebounceMs ?? 20;
     this.backoffBaseMs = opts.backoffBaseMs ?? 1000;
     this.backoffMaxMs = opts.backoffMaxMs ?? 15_000;

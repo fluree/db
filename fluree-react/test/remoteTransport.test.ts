@@ -176,6 +176,47 @@ describe("query request shape", () => {
   });
 });
 
+describe("the global fetch", () => {
+  it("is called with a receiver the browser accepts", async () => {
+    // `fetch` is a WebIDL operation on Window. Held as an instance property
+    // and invoked as `this.fetchImpl(...)`, its receiver is the transport,
+    // and every browser throws "Illegal invocation" — so EVERY request
+    // fails. Node's fetch does not check, and every other test here injects
+    // `fetchImpl`, so nothing else in this suite can see it.
+    const server = new MockServer();
+    server.respond = () => ({ body: bindings("ada") });
+    const original = globalThis.fetch;
+    globalThis.fetch = function (
+      this: unknown,
+      ...args: Parameters<typeof fetch>
+    ) {
+      if (this !== undefined && this !== globalThis) {
+        throw new TypeError("Illegal invocation");
+      }
+      return server.fetchImpl(...args);
+    } as typeof fetch;
+
+    try {
+      const sink = recordingSink();
+      // No fetchImpl: exercise the default path, which is the browser's.
+      const transport = new RemoteTransport({
+        url: "https://srv",
+        sseRefreshDebounceMs: DEBOUNCE,
+      });
+      transport.start(sink);
+      const s = spec();
+      transport.subscribe(s);
+      await settle();
+
+      expect(sink.cycles[0]!.errored).toEqual([]);
+      expect(sink.cycles[0]!.changed[0]!.payload).toEqual(bindings("ada"));
+      transport.close();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
 describe("initial delivery", () => {
   it("delivers the first result as a single-entry cycle", async () => {
     const { server, sink, transport } = setup();
