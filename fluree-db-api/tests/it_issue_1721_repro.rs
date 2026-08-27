@@ -219,6 +219,56 @@ async fn issue_1721_replayed_delete_keeps_filter_equality_results() {
     );
 }
 
+/// The fold has to keep working. The ref-only flag now reads a field that every
+/// producer of `PropertyStatEntry` has to fill, and an unfilled one reads as
+/// "unknown" — fail-closed, so a miss would cost the optimization silently
+/// rather than break a query. This walks the producer chain a real deployment
+/// uses (indexer aggregate -> stats wire encode -> decode -> view) and asserts
+/// an all-ref predicate still licenses the fold, with a literal-valued sibling
+/// for contrast.
+#[tokio::test]
+async fn ref_only_survives_a_published_index_round_trip() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "hazard1721-refonly:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let insert = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            {"@id":"ex:a","ex:knows": {"@id":"ex:b"}, "ex:name": "A"},
+            {"@id":"ex:b","ex:knows": {"@id":"ex:a"}, "ex:name": "B"}
+        ]
+    });
+    let _ = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert")
+        .ledger;
+
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("reload after index");
+
+    let stats = ledger
+        .snapshot
+        .stats
+        .clone()
+        .expect("a published index carries stats");
+    let view = fluree_db_core::StatsView::from_db_stats_with_namespaces(
+        &stats,
+        ledger.snapshot.namespaces(),
+    );
+    let ns = "http://example.org/ns/";
+    assert_eq!(
+        view.is_property_ref_only_by_iri(&format!("{ns}knows")),
+        Some(true),
+        "an all-ref predicate lost its ref-only licence across the index round trip"
+    );
+    assert_eq!(
+        view.is_property_ref_only_by_iri(&format!("{ns}name")),
+        Some(false)
+    );
+}
+
 /// Blast radius: the same hazard against a *published base index* rather than
 /// novelty-synthesized stats. Here the literal datatype tags come from the
 /// index, and the spurious `-1`s have to cancel them out of the merged
