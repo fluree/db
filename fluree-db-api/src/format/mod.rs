@@ -512,6 +512,59 @@ pub async fn format_results_async(
     policy: Option<&fluree_db_policy::PolicyContext>,
     tracker: Option<&Tracker>,
 ) -> Result<JsonValue> {
+    // Residency mode (wasm32 / the `residency` feature): formatting is the
+    // SECOND frame that can take a residency miss. Execution emits
+    // `Binding::Encoded*` for late materialization, and those ids are only
+    // resolved to IRIs and literals here — through forward packs the
+    // execution round often never touched. So a query whose execution
+    // succeeded still needs the drain/fetch/re-run loop around formatting,
+    // or the first peer query dies with "content not resident: forward-pack
+    // … (fetch and retry)". Formatting is a pure function of resident state,
+    // so re-running it is always safe; the in-flight guard pins what earlier
+    // rounds made resident, which is what makes progress monotone.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    if let Some(cs) = crate::residency::content_store(db.snapshot) {
+        let _guard = cs.query_guard();
+        let mut budget = fluree_db_binary_index::read::need_fetch::RetryBudget::default();
+        loop {
+            match format_results_async_inner(result, context, db, config, policy, tracker).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let retried = budget
+                        .after_error(
+                            cs.as_ref(),
+                            fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+                        )
+                        .await
+                        .map_err(|re| {
+                            FormatError::InvalidBinding(format!("residency retry failed: {re}"))
+                        })?;
+                    if retried {
+                        tracing::debug!(
+                            rounds = budget.rounds(),
+                            fetched_total = budget.fetched_total(),
+                            "formatting residency retry round"
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+    format_results_async_inner(result, context, db, config, policy, tracker).await
+}
+
+/// The formatting body. Called directly off residency targets, and once per
+/// retry round on them — see [`format_results_async`].
+async fn format_results_async_inner(
+    result: &QueryResult,
+    context: &ParsedContext,
+    db: GraphDbRef<'_>,
+    config: &FormatterConfig,
+    policy: Option<&fluree_db_policy::PolicyContext>,
+    tracker: Option<&Tracker>,
+) -> Result<JsonValue> {
     // Delimited-text formats produce bytes/String, not JsonValue. Reject early.
     if matches!(config.format, OutputFormat::Tsv | OutputFormat::Csv) {
         return Err(FormatError::InvalidBinding(format!(

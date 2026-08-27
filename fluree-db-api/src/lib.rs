@@ -92,6 +92,8 @@ pub mod policy_view;
 pub mod query;
 mod rebase;
 pub mod remote_service;
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+pub(crate) mod residency;
 mod revert;
 mod revert_preview;
 pub(crate) mod runtime_dicts;
