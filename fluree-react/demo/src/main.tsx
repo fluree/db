@@ -15,6 +15,39 @@ import "./styles.css";
 
 const mode = new URLSearchParams(location.search).get("mode") ?? "remote";
 
+/**
+ * Peer mode's bearer token.
+ *
+ * `?token=…` is accepted for convenience, then immediately moved into
+ * sessionStorage and scrubbed from the address bar — a credential left in a
+ * URL ends up in history, in server logs, and in `Referer` headers, and a
+ * demo is exactly where people copy patterns from. Reload-safe within the
+ * tab; gone when the tab closes.
+ */
+const TOKEN_KEY = "fluree-demo-token";
+
+/** Run at startup, not lazily: the worker only asks for a token once it has
+ * booted, so capturing it inside `getToken` loses it whenever anything fails
+ * earlier. */
+function captureToken(): void {
+  const params = new URLSearchParams(location.search);
+  const fromUrl = params.get("token");
+  if (!fromUrl) return;
+  sessionStorage.setItem(TOKEN_KEY, fromUrl);
+  params.delete("token");
+  const query = params.toString();
+  history.replaceState(null, "", `${location.pathname}${query ? `?${query}` : ""}`);
+}
+
+function peerToken(): string {
+  const stored = sessionStorage.getItem(TOKEN_KEY);
+  if (stored) return stored;
+  throw new Error(
+    "peer mode needs a bearer token with fluree.storage.* scope: load this " +
+      "page once with &token=… and it will be remembered for the tab.",
+  );
+}
+
 async function buildClient(): Promise<LiveClient> {
   if (mode !== "peer") {
     // Same-origin: vite proxies /v1 to the Fluree server (vite.config.ts).
@@ -27,15 +60,7 @@ async function buildClient(): Promise<LiveClient> {
     peer: {
       connect,
       url: `${location.origin}/v1/fluree`,
-      getToken: () => {
-        const token = new URLSearchParams(location.search).get("token");
-        if (!token) {
-          throw new Error(
-            "peer mode needs a bearer token: append &token=… to the URL",
-          );
-        }
-        return token;
-      },
+      getToken: peerToken,
     },
   });
 }
@@ -50,6 +75,7 @@ function fail(err: unknown): void {
 }
 
 async function main(): Promise<void> {
+  captureToken();
   // Idempotent; the first tab to load creates the ledger.
   await ensureLedger();
   const client = await buildClient();

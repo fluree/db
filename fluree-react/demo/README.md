@@ -38,17 +38,36 @@ CORS never enters the story; point it elsewhere with `FLUREE_URL`.
 
 ## Peer mode
 
+> **Blocked on an engine bug as of 2026-08-27.** The worker boots, the token
+> handshake completes, SSE head tracking delivers, and `subscribe` is
+> accepted — then the wasm traps on the first ledger open with
+> `panicked at library/std/src/sys/paths/unsupported.rs:52: no filesystem on
+> this platform`. That is `std::env::temp_dir()` reached from
+> `fluree-db-api/src/view/fluree_ext.rs:228` (and `:363`), which is missing
+> the `#[cfg(target_arch = "wasm32")]` guard its twin in
+> `ledger_manager.rs:744` has. It reproduces on a plain one-shot query with
+> head tracking switched off entirely, so it is not specific to live queries
+> or to this package. Remote mode is unaffected.
+
 ```
 http://localhost:5173/?mode=peer&token=<bearer>
 ```
 
-Peer mode runs the engine in a web worker instead of querying over HTTP. It
-needs two things this repo builds separately:
+The token is moved into `sessionStorage` and stripped from the URL on load,
+so it does not linger in history or logs. Peer mode needs:
 
-1. `@fluree/db-wasm`'s generated glue — `wasm-pack` output in
-   `fluree-db-wasm/pkg/` (see that package's README);
-2. a server serving the blocks tier, and a bearer token with
-   `fluree.storage.*` scope, passed as `&token=`.
+1. `@fluree/db-wasm`'s generated glue — `cd fluree-db-wasm/js && npm install
+   && node scripts/build.mjs`, which writes `fluree-db-wasm/js/pkg/`. Without
+   it, `vite.config.ts` swaps in a stub that explains itself, so the demo
+   still builds and remote mode still runs;
+2. a server with `--storage-proxy-enabled` and a trusted issuer, plus a
+   bearer token carrying **both** `fluree.events.*` and `fluree.storage.*`
+   claims. The shipped `fluree-events-token` CLI only mints the events half —
+   the storage claim has to be added by hand;
+3. `server.fs.allow` covering the repo root (already set here). Both aliases
+   resolve outside `demo/`, and Vite's dev server otherwise 403s the worker
+   module and the `.wasm` — which surfaces only as `engine_crashed`, with
+   nothing in the page console, because the failure is inside the worker.
 
 Everything else is identical: same components, same hooks, same result
 shapes. The only line that differs is the `createClient` call in

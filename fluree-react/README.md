@@ -294,9 +294,17 @@ reproducible in CI today.
 
 **Not verified:**
 
-- **No live-server run in peer mode.** The engine double implements the
-  contract `protocolCompat` pins, but a scripted double cannot prove the real
-  worker delivers cycles the way its types promise.
+- **Peer mode has not served live data against a real server** — blocked
+  engine-side, not here. Driven in Chrome against a release `fluree-server`,
+  the worker boots, `init` succeeds, the token handshake completes, SSE head
+  tracking delivers `headChange`, and `subscribe` returns a subscription id;
+  then the wasm traps on the first ledger open with `no filesystem on this
+  platform` — `std::env::temp_dir()` called without a wasm guard from
+  `fluree-db-api/src/view/fluree_ext.rs:228`. It reproduces on a one-shot
+  query with head tracking off, so it is not about live queries or this
+  package. What that run *does* establish is that the transport reports a
+  real engine crash the way the unit tests say it should: `reconnecting`,
+  then a loud error — never a silent freeze.
 - **No browser run.** jsdom only. The demo has been driven against a real
   server (see below), but not as an automated test.
 - **No packaging smoke.** `npm run build` emits `dist/`, and the demo bundles
