@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_cached_handle_cow_recovery.rs"]
+mod it_cached_handle_cow_recovery;
 #[path = "it_concurrent_update_reconcile.rs"]
 mod it_concurrent_update_reconcile;
 #[path = "it_enforce_unique_upsert_indexed.rs"]
