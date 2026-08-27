@@ -1781,13 +1781,19 @@ impl Fluree {
         // Run the commit on its own task and await the handle: the window where
         // the cache slot is empty MUST NOT be cancellable. See
         // [`Fluree::commit_shielded`].
-        let shielded = tokio::spawn(Self::commit_shielded(
-            self.clone(),
-            write_guard,
-            view,
-            ns_registry,
-            index_config.clone(),
-            commit_opts,
+        // .instrument keeps the caller's span parentage on the spawned tail —
+        // a bare spawn would orphan commit-side log events from the request's
+        // transact span (request-id linkage).
+        let shielded = tokio::spawn(tracing::Instrument::instrument(
+            Self::commit_shielded(
+                self.clone(),
+                write_guard,
+                view,
+                ns_registry,
+                index_config.clone(),
+                commit_opts,
+            ),
+            tracing::Span::current(),
         ));
 
         let (receipt, indexing) = shielded.await.map_err(|e| {
