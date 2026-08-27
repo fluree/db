@@ -300,3 +300,71 @@ async fn a_slow_but_live_driver_still_wins_the_race() {
         "the driver's reply must win, not the deadline: {err:?}"
     );
 }
+
+/// The invariant: **the driver serves fetches even when the cache never
+/// opens.** This is the shape no cold-profile test can produce, and the one
+/// that shipped broken behind a doc comment that already claimed it.
+///
+/// An ABSENT database opens fine — which is why every fresh-profile test
+/// passes and why this bug was invisible for so long. A WEDGED one never
+/// returns *any* event: not `success`, not `error`, not even `blocked`.
+/// Holding a connection open and then starting a `deleteDatabase` that can
+/// never complete wedges the name deterministically, exactly reproducing the
+/// profile this was first observed in.
+#[wasm_bindgen_test]
+async fn driver_serves_fetches_when_the_cache_never_opens() {
+    // No leading delete: this name is wedged on purpose below, and a delete
+    // of a wedged name would itself hang. The test runner starts a fresh
+    // browser, so the database does not exist yet.
+    let name = "fluree-cas-test-wedged";
+
+    // Hold a live connection, then queue a delete behind it. The delete can
+    // never run while this connection is open, and every later open of this
+    // name queues behind the delete — silently, forever.
+    let holder = IdbCache::open(&cache_config(name, 1024))
+        .await
+        .expect("holder opens");
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = IdbCache::delete_database(name).await;
+    });
+    TimeoutFuture::new(100).await;
+
+    let config = BrowserIoConfig {
+        cache: cache_config(name, 1024),
+        // Long enough that the test proves fetches are served WHILE the open
+        // is still outstanding, not merely after it gave up.
+        cache_open_timeout: Duration::from_secs(30),
+        ..Default::default()
+    };
+    let io = start_driver(config);
+
+    // 1. A fetch is served, with the cache open still hanging.
+    let transport = WasmFetchTransport::new(io.clone(), Duration::from_secs(5));
+    let resp = transport
+        .execute(TransportRequest::get(
+            "data:application/octet-stream;base64,aGVsbG8gd2FzbQ==",
+        ))
+        .await
+        .expect("a wedged cache must not stop the driver serving fetches");
+    assert_eq!(&resp.body[..], b"hello wasm");
+
+    // 2. A cache READ answers a miss promptly instead of hanging. This is
+    //    the one that matters most: `fetch_into_residency` awaits this
+    //    before every network fetch, so a read that waits would put the
+    //    wedged cache straight back on the query's critical path.
+    let (tx, rx) = oneshot::channel();
+    io.send(IoJob::CacheGet {
+        key: cid_of(b"anything"),
+        reply: tx,
+    })
+    .unwrap();
+    let miss = rx.await.expect("the cache read must answer, not hang");
+    assert!(miss.is_none(), "an unopened cache reads as a miss");
+
+    // Teardown must not await anything queued behind the wedge — that is
+    // what the wedge means. Closing the holder releases the queued delete,
+    // which then completes on its own and takes the database with it.
+    io.shutdown();
+    holder.close();
+    TimeoutFuture::new(200).await;
+}

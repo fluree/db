@@ -33,32 +33,59 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
     // The cache is an optimization and MUST NOT gate job servicing.
     //
     // This await used to sit in front of the loop below, which made every
-    // fetch in the process depend on IndexedDB opening. An open can hang
-    // indefinitely rather than fail — a version change held up by another
-    // connection fires `blocked`, which is neither `success` nor `error` —
-    // and a hang there deadlocked the whole peer: no job ever dispatched,
-    // so no request was issued, no per-request timeout could fire (those
-    // live inside `fetch::execute`), and nothing surfaced an error. The
-    // symptom is a peer that connects, reports healthy, and then answers
-    // nothing forever, with zero HTTP requests to show for it.
+    // fetch in the process depend on IndexedDB opening. That open can hang
+    // with NO event at all — not `success`, not `error`, not even `blocked`
+    // — when the database has been wedged (observed in the wild: a
+    // `deleteDatabase` that can never complete leaves later opens of that
+    // name queued forever, while other names open instantly). A hang there
+    // deadlocked the whole peer: no job dispatched, so no request issued, no
+    // per-request timeout able to fire (those live inside `fetch::execute`),
+    // and no error anywhere. A peer that connects, reports healthy, and
+    // answers nothing, with zero HTTP requests to show for it.
     //
-    // So the open runs concurrently and the loop starts immediately. Cache
-    // jobs that arrive before it resolves WAIT for it rather than being
-    // dropped: a dropped `CachePut` silently loses persistence for exactly
-    // the blocks a cold start fetches first, and would also strand its
-    // write-behind permit. Fetches never wait on any of this.
+    // Three rules keep that impossible, and `driver_serves_fetches_when_the_
+    // cache_never_opens` pins all three:
+    //
+    //  1. The loop starts immediately; the open runs beside it.
+    //  2. The open is BOUNDED. One that has not landed by now never will,
+    //     and resolving it as unavailable is what releases everything
+    //     parked behind it.
+    //  3. Reads never wait on it. `CacheGet` answers a miss while the open
+    //     is in flight, because a cache read sits on the query's critical
+    //     path (`BrowserCasStorage::fetch_into_residency` awaits it before
+    //     fetching) — waiting there would put a wedged cache right back in
+    //     front of every query. A miss is always safe: it costs a refetch.
+    //
+    // Writes DO wait for (2), because dropping a `CachePut` silently loses
+    // persistence for exactly the blocks a cold start fetches first. They
+    // are off the critical path, and their write-behind permit is released
+    // on every path, so a wedged cache cannot starve fetch admission either.
     let cache: Rc<RefCell<Option<Rc<IdbCache>>>> = Rc::new(RefCell::new(None));
-    // `false` until the open has succeeded OR failed; cache jobs park on it,
-    // and it is always eventually set so nothing parks forever.
+    // `false` until the open has succeeded, failed, or timed out. Always
+    // eventually `true`, so nothing parks on it forever.
     let (resolved_tx, resolved_rx) = watch::channel(false);
     if config.cache.enabled {
         let slot = Rc::clone(&cache);
         let cache_config = config.cache.clone();
+        let open_timeout = config.cache_open_timeout;
         spawn_local(async move {
-            match IdbCache::open(&cache_config).await {
-                Ok(opened) => *slot.borrow_mut() = Some(opened),
-                Err(e) => {
+            let millis = u32::try_from(open_timeout.as_millis()).unwrap_or(u32::MAX);
+            let opening = IdbCache::open(&cache_config);
+            futures::pin_mut!(opening);
+            match futures::future::select(opening, gloo_timers::future::TimeoutFuture::new(millis))
+                .await
+            {
+                futures::future::Either::Left((Ok(opened), _)) => {
+                    *slot.borrow_mut() = Some(opened);
+                }
+                futures::future::Either::Left((Err(e), _)) => {
                     tracing::warn!(error = %e, "IndexedDB cache unavailable; running without persistence");
+                }
+                futures::future::Either::Right(((), _)) => {
+                    tracing::warn!(
+                        timeout = ?open_timeout,
+                        "IndexedDB open did not complete (the database may be wedged);                          running without persistence"
+                    );
                 }
             }
             let _ = resolved_tx.send(true);
@@ -67,9 +94,15 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
         let _ = resolved_tx.send(true);
     }
 
-    /// Resolve the cache for one job, waiting for the open if it is still in
-    /// flight. Returns `None` once the open has resolved unsuccessfully.
-    async fn cache_for(
+    /// The cache if the open has already resolved successfully; `None` while
+    /// it is still in flight or if it failed. NEVER waits — see rule 3.
+    fn cache_now(slot: &Rc<RefCell<Option<Rc<IdbCache>>>>) -> Option<Rc<IdbCache>> {
+        slot.borrow().clone()
+    }
+
+    /// The cache once the open has resolved, waiting if it is still in
+    /// flight. Bounded by rule 2, so this always returns.
+    async fn cache_settled(
         slot: &Rc<RefCell<Option<Rc<IdbCache>>>>,
         resolved: &watch::Receiver<bool>,
     ) -> Option<Rc<IdbCache>> {
@@ -79,8 +112,8 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
             let mut rx = resolved.clone();
             let _ = rx.wait_for(|r| *r).await;
         }
-        let hit = slot.borrow().clone();
-        hit
+        let settled = slot.borrow().clone();
+        settled
     }
 
     while let Some(job) = rx.recv().await {
@@ -94,22 +127,24 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                     let _ = reply.send(fetch::execute(req, timeout).await);
                 });
             }
-            IoJob::CacheGet { key, reply } => {
-                let slot = Rc::clone(&cache);
-                let resolved = resolved_rx.clone();
-                spawn_local(async move {
-                    let hit = match cache_for(&slot, &resolved).await {
-                        Some(cache) => cache.get(&key).await,
-                        None => None,
-                    };
-                    let _ = reply.send(hit);
-                });
-            }
+            // Rule 3: never wait. A miss while the open is in flight costs
+            // one refetch; waiting would hand a wedged cache the power to
+            // hang every query.
+            IoJob::CacheGet { key, reply } => match cache_now(&cache) {
+                Some(cache) => {
+                    spawn_local(async move {
+                        let _ = reply.send(cache.get(&key).await);
+                    });
+                }
+                None => {
+                    let _ = reply.send(None);
+                }
+            },
             IoJob::CachePut { key, bytes, permit } => {
                 let slot = Rc::clone(&cache);
                 let resolved = resolved_rx.clone();
                 spawn_local(async move {
-                    if let Some(cache) = cache_for(&slot, &resolved).await {
+                    if let Some(cache) = cache_settled(&slot, &resolved).await {
                         cache.put(key, bytes).await;
                     }
                     // Credit the write-behind gauge once the write finished,

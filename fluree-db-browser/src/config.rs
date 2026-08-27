@@ -36,6 +36,15 @@ pub struct BrowserIoConfig {
     pub reconnect_max: Duration,
     /// IndexedDB persistence settings.
     pub cache: CacheConfig,
+    /// How long the driver waits for the IndexedDB open before giving up on
+    /// persistence for this session.
+    ///
+    /// An open can hang with no event at all — not `success`, not `error`,
+    /// not even `blocked` — when the database has been wedged. This bound is
+    /// what guarantees the driver's "resolved" signal always arrives, so
+    /// queued writes and their write-behind permits are never stranded. An
+    /// open that has not landed by now is not going to help this session.
+    pub cache_open_timeout: Duration,
 }
 
 impl Default for BrowserIoConfig {
@@ -50,6 +59,7 @@ impl Default for BrowserIoConfig {
             reconnect_initial: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(30),
             cache: CacheConfig::default(),
+            cache_open_timeout: Duration::from_secs(10),
         }
     }
 }
