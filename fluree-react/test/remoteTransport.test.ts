@@ -127,12 +127,16 @@ describe("query request shape", () => {
     await settle();
     await head(server, 2);
 
-    expect(server.queries.map((q) => q.headers.authorization)).toEqual([
-      "Bearer tok-1",
-      "Bearer tok-3",
-    ]);
-    // ...including the SSE connect, which is why rotation works.
-    expect(server.eventConnects[0]!.headers.authorization).toBe("Bearer tok-2");
+    // Every request carries a token, and no two share one — the supplier is
+    // consulted per request, which is what makes rotation work.
+    const tokens = server.queries.map((q) => q.headers.authorization);
+    expect(tokens).toHaveLength(2);
+    expect(new Set(tokens).size).toBe(2);
+    for (const token of tokens) expect(token).toMatch(/^Bearer tok-\d+$/);
+    // ...including the SSE connect.
+    expect(server.eventConnects[0]!.headers.authorization).toMatch(
+      /^Bearer tok-\d+$/,
+    );
   });
 
   it("keeps slashes and colons literal in the ledger path segment", async () => {
@@ -202,18 +206,47 @@ describe("initial delivery", () => {
     expect(sink.cycles.at(-1)!.t).toBe(9);
   });
 
-  it("connects SSE once per newly watched ledger, with sorted params", async () => {
+  it("subscribes under both the raw and the canonical ledger alias", async () => {
     const { server, transport } = setup();
     transport.subscribe(spec());
     transport.subscribe(spec({ text: "other" }));
     await settle();
-    expect(server.eventConnects).toHaveLength(1);
+
+    // One lookup per ledger, not per subscription.
+    expect(server.infoCalls).toEqual(["my/ledger"]);
+    // The server's filter matches the canonical alias exactly, and the app
+    // subscribed with the bare name — so both go on the URL. Sending only
+    // the bare name yields a stream that connects and never delivers.
+    expect(server.eventConnects.at(-1)!.url).toBe(
+      "https://srv/v1/fluree/events?ledger=my%2Fledger&ledger=my%2Fledger%3Amain",
+    );
 
     transport.subscribe(spec({ ledger: "a/nother" }));
     await settle();
-    expect(server.eventConnects).toHaveLength(2);
-    expect(server.eventConnects[1]!.url).toBe(
-      "https://srv/v1/fluree/events?ledger=a%2Fnother&ledger=my%2Fledger",
+    expect(server.eventConnects.at(-1)!.url).toBe(
+      "https://srv/v1/fluree/events?ledger=a%2Fnother&ledger=a%2Fnother%3Amain" +
+        "&ledger=my%2Fledger&ledger=my%2Fledger%3Amain",
+    );
+  });
+
+  it("keeps the raw alias when the canonical lookup fails", async () => {
+    const { server, transport } = setup();
+    server.infoStatus = 404;
+    transport.subscribe(spec());
+    await settle();
+    // Degrades to the old behaviour rather than to no subscription at all.
+    expect(server.eventConnects.at(-1)!.url).toBe(
+      "https://srv/v1/fluree/events?ledger=my%2Fledger",
+    );
+  });
+
+  it("does not duplicate an alias that is already branch-qualified", async () => {
+    const { server, transport } = setup();
+    server.aliasFor = (l) => l; // already canonical
+    transport.subscribe(spec({ ledger: "my/ledger:main" }));
+    await settle();
+    expect(server.eventConnects.at(-1)!.url).toBe(
+      "https://srv/v1/fluree/events?ledger=my%2Fledger%3Amain",
     );
   });
 
@@ -298,6 +331,56 @@ describe("the advance-cycle", () => {
     await head(server, 5);
     await head(server, 4);
     expect(server.queries).toHaveLength(2);
+  });
+
+  it("matches the server's normalized ledger id against the app's bare name", async () => {
+    // Captured verbatim from a running fluree-server: the app subscribed to
+    // "my/ledger", and the announcement names "my/ledger:main". Comparing
+    // these directly drops every head event — the subscription stays open,
+    // nothing errors, and no query EVER updates. This is the exact shape,
+    // straight off the wire.
+    const { server, transport } = setup();
+    server.respond = (_c, n) => ({ body: bindings(`v${n}`) });
+    transport.subscribe(spec());
+    await settle();
+
+    server.stream.push(
+      "event: ns-record\n" +
+        "id: ledger:my/ledger:main:2:2\n" +
+        'data: {"action":"ns-record","kind":"ledger","resource_id":"my/ledger:main",' +
+        '"record":{"ledger_id":"my/ledger:main","branch":"main",' +
+        '"commit_head_id":"bagaybqabciqmfcxh5sdkhjn4goxx","commit_t":2,' +
+        '"index_head_id":"baghybqabciqer","index_t":2}}\n\n',
+    );
+    await flush();
+
+    expect(server.queries).toHaveLength(2);
+  });
+
+  it("matches an explicitly branch-qualified subscription too", async () => {
+    const { server, transport } = setup();
+    transport.subscribe(spec({ ledger: "my/ledger:main" }));
+    await settle();
+    server.stream.frame("ns-record", {
+      kind: "ledger",
+      resource_id: "my/ledger:main",
+      record: { commit_t: 2 },
+    });
+    await flush();
+    expect(server.queries).toHaveLength(2);
+  });
+
+  it("does not confuse a different branch of the same ledger", async () => {
+    const { server, transport } = setup();
+    transport.subscribe(spec({ ledger: "my/ledger:main" }));
+    await settle();
+    server.stream.frame("ns-record", {
+      kind: "ledger",
+      resource_id: "my/ledger:dev",
+      record: { commit_t: 2 },
+    });
+    await flush();
+    expect(server.queries).toHaveLength(1);
   });
 
   it("ignores head events for ledgers nothing is watching", async () => {

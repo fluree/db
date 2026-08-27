@@ -141,6 +141,9 @@ export class RemoteTransport implements LiveTransport {
   private readonly prev = new Map<number, unknown>();
   /** Latest commit watermark seen per subscribed ledger. */
   private readonly heads = new Map<string, number>();
+  /** The server's canonical `name:branch` alias per watched ledger. */
+  private readonly canonicalAlias = new Map<string, string>();
+  private readonly resolvingAlias = new Set<string>();
   /** Coalescing: target watermark for the next cycle per ledger. */
   private readonly pending = new Map<string, number>();
   private readonly running = new Set<string>();
@@ -217,6 +220,7 @@ export class RemoteTransport implements LiveTransport {
         set = new Set();
         this.byLedger.set(spec.ledger, set);
         this.sse?.refresh(); // watched-ledger set grew
+        void this.resolveAlias(spec.ledger); // refreshes again when known
       }
       set.add(spec.subId);
     }
@@ -288,12 +292,59 @@ export class RemoteTransport implements LiveTransport {
   }
 
   private eventsUrl(): string | null {
-    const ledgers = [...this.byLedger.keys()].sort();
-    if (ledgers.length === 0) return null;
-    const params = ledgers
+    // The events filter matches the CANONICAL `name:branch` alias, but an
+    // app subscribes with whatever it passed to `useQuery` — usually the
+    // bare name. Send both: the canonical form once resolved, and the raw
+    // form regardless, so a failed or pending resolution degrades to the
+    // old behaviour instead of to silence.
+    const aliases = new Set<string>();
+    for (const ledger of this.byLedger.keys()) {
+      aliases.add(ledger);
+      const canonical = this.canonicalAlias.get(ledger);
+      if (canonical !== undefined) aliases.add(canonical);
+    }
+    if (aliases.size === 0) return null;
+    const params = [...aliases]
+      .sort()
       .map((l) => `ledger=${encodeURIComponent(l)}`)
       .join("&");
     return `${this.base}/v1/fluree/events?${params}`;
+  }
+
+  /**
+   * Ask the server for a ledger's canonical alias.
+   *
+   * `useQuery("demo/board", …)` queries fine, but the server announces
+   * commits for `demo/board:main`, and its events filter compares aliases
+   * exactly — so subscribing under the bare name yields a stream that
+   * connects, stays open, and never delivers anything. Rather than assuming
+   * a default branch name, ask: `/info/{ledger}` reports the alias. On
+   * failure we keep the raw name and lose nothing we had.
+   */
+  private async resolveAlias(ledger: string): Promise<void> {
+    if (this.canonicalAlias.has(ledger) || this.resolvingAlias.has(ledger)) return;
+    this.resolvingAlias.add(ledger);
+    try {
+      const headers: Record<string, string> = { accept: "application/json" };
+      const token = await this.getToken?.();
+      if (token) headers.authorization = `Bearer ${token}`;
+      const res = await this.fetchImpl(
+        `${this.base}/v1/fluree/info/${encodeLedgerPath(ledger)}`,
+        { headers },
+      );
+      if (res.ok) {
+        const body = (await res.json()) as { ledger?: { alias?: unknown } };
+        const alias = body.ledger?.alias;
+        if (typeof alias === "string" && alias !== "") {
+          this.canonicalAlias.set(ledger, alias);
+        }
+      }
+    } catch {
+      // Keep the raw alias; the stream still opens under it.
+    } finally {
+      this.resolvingAlias.delete(ledger);
+      if (!this.closed) this.sse?.refresh();
+    }
   }
 
   /** Deliver a new subscription's first result as its own single-entry
@@ -336,6 +387,29 @@ export class RemoteTransport implements LiveTransport {
     }
   }
 
+  /**
+   * Resolve an event's `resource_id` to the ledger key this transport is
+   * watching under.
+   *
+   * The server announces the NORMALIZED id — `name:branch`, e.g.
+   * `demo/board:main` — but an application subscribes with whatever string
+   * it passed to `useQuery`, which is usually the bare name whose branch the
+   * server filled in. Comparing them directly silently drops every head
+   * event: the subscription stays open, nothing errors, and no query ever
+   * updates. So try the id as given, then the id with its branch suffix
+   * removed. (Deriving the default branch name instead would be a guess;
+   * this needs none.)
+   */
+  private watchedLedgerFor(resourceId: string): string | undefined {
+    if (this.byLedger.has(resourceId)) return resourceId;
+    const cut = resourceId.lastIndexOf(":");
+    if (cut > 0) {
+      const base = resourceId.slice(0, cut);
+      if (this.byLedger.has(base)) return base;
+    }
+    return undefined;
+  }
+
   private handleSse(event: string, dataText: string): void {
     let data: unknown;
     try {
@@ -350,7 +424,8 @@ export class RemoteTransport implements LiveTransport {
       record?: { commit_t?: unknown };
     };
     if (d.kind !== "ledger" || typeof d.resource_id !== "string") return;
-    const ledger = d.resource_id;
+    const ledger = this.watchedLedgerFor(d.resource_id);
+    if (ledger === undefined) return;
     const set = this.byLedger.get(ledger);
     if (!set || set.size === 0) return;
 

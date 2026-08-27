@@ -197,6 +197,16 @@ export class MockServer {
         body: s.stream,
       } as unknown as Response;
     }
+    if (url.includes("/v1/fluree/info/")) {
+      const ledger = decodeURIComponent(url.split("/v1/fluree/info/")[1] ?? "");
+      this.infoCalls.push(ledger);
+      if (this.infoStatus !== 200) {
+        return makeResponse({ status: this.infoStatus, body: "nope" });
+      }
+      // What a real server returns: the canonical `name:branch` alias.
+      const alias = this.aliasFor ? this.aliasFor(ledger) : `${ledger}:main`;
+      return makeResponse({ body: { ledger: { alias, t: 1 } } });
+    }
     const call: QueryCall = {
       url,
       method: init?.method ?? "GET",
@@ -227,6 +237,12 @@ export class MockServer {
 
   /** The `AbortSignal` handed to each query call, aligned with `queries`. */
   readonly signals: Array<AbortSignal | null> = [];
+  /** Ledgers whose canonical alias was looked up via `/info/`. */
+  readonly infoCalls: string[] = [];
+  /** Override the alias a ledger resolves to; default appends `:main`. */
+  aliasFor: ((ledger: string) => string) | undefined;
+  /** Set non-200 to make alias resolution fail. */
+  infoStatus = 200;
   /** Concurrency instrumentation for the cycle fan-out. */
   inFlight = 0;
   peakInFlight = 0;
