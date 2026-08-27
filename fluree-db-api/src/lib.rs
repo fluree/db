@@ -1071,7 +1071,9 @@ impl StorageMethod for AddressIdentifierResolverStorage {
 /// kept for backward compatibility.
 pub type FlureeClient = Fluree;
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+// Callers live in the native-feature storage builders; the no-native shape
+// (wasm, or a native host building e.g. fluree-db-wasm's dep graph) has none.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 fn decode_encryption_key_base64(key_str: &str) -> Result<[u8; 32]> {
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD
