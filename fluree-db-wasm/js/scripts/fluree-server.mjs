@@ -116,6 +116,13 @@ export async function startFlureeServer({ trustedIssuer, port, env = {}, timeout
       FLUREE_CORS_ENABLED: "true",
       FLUREE_STORAGE_PROXY_ENABLED: "true",
       FLUREE_STORAGE_PROXY_TRUSTED_ISSUERS: trustedIssuer,
+      // Mirrors `.cargo/config.toml`'s [env]. That table only reaches
+      // cargo-launched processes, and we spawn the built binary directly —
+      // so without this a DEBUG server aborts with "has overflowed its
+      // stack" on any transact big enough to matter (unoptimized async
+      // state machines blow the 2 MB thread default; release builds
+      // collapse them and do not need it).
+      RUST_MIN_STACK: process.env.RUST_MIN_STACK ?? "8388608",
       RUST_LOG: process.env.RUST_LOG ?? "warn,fluree_db_server=info",
       ...env,
     },

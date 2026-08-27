@@ -48,7 +48,14 @@ export function startTap(upstreamUrl, { staticRoot, delayMs = 0 } = {}) {
       await serveStatic(staticBase, req, res);
       return;
     }
-    const entry = { method: req.method, path: req.url, status: null };
+    const entry = {
+      method: req.method,
+      path: req.url,
+      status: null,
+      startedAt: performance.now(),
+      endedAt: null,
+      bytes: 0,
+    };
     requests.push(entry);
 
     if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
@@ -64,6 +71,8 @@ export function startTap(upstreamUrl, { staticRoot, delayMs = 0 } = {}) {
       (upRes) => {
         entry.status = upRes.statusCode;
         res.writeHead(upRes.statusCode, upRes.headers);
+        upRes.on("data", (chunk) => { entry.bytes += chunk.length; });
+        upRes.on("end", () => { entry.endedAt = performance.now(); });
         upRes.pipe(res);
       },
     );
