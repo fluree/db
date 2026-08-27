@@ -59,6 +59,15 @@ pub enum ServerError {
     /// errors that still carry the variant map via the `ApiError` arms.
     #[error("{0}")]
     NoveltyBackpressure(String),
+
+    /// The transaction's own delta meets or exceeds `reindex_max_bytes`
+    /// (413 + `err:db/NoveltyDeltaTooLarge`, no `Retry-After`): no amount
+    /// of indexer draining can ever admit it, so telling the client to
+    /// retry (the 503 shape above) would wedge a pipeline on the oversized
+    /// record forever. Same consensus-boundary role as
+    /// `NoveltyBackpressure`.
+    #[error("{0}")]
+    NoveltyDeltaTooLarge(String),
 }
 
 impl ServerError {
@@ -155,6 +164,17 @@ impl ServerError {
                 | fluree_db_api::TransactError::PublishLostRace { .. }
                 | fluree_db_api::TransactError::NamespaceConflict(_),
             )) => errors::COMMIT_CONFLICT,
+            // Oversized single delta: `delta >= max` can never succeed by
+            // drain, so it must not carry the retryable code below. MUST
+            // precede the drainable novelty arm.
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyWouldExceed {
+                    delta_bytes,
+                    max_bytes,
+                    ..
+                },
+            )) if delta_bytes >= max_bytes => errors::NOVELTY_DELTA_TOO_LARGE,
+            ServerError::NoveltyDeltaTooLarge(_) => errors::NOVELTY_DELTA_TOO_LARGE,
             // Novelty backpressure: retryable capacity pressure, not an
             // invalid transaction. Both variants carry the same machine code
             // (the message distinguishes at-max from would-exceed) so clients
@@ -245,6 +265,19 @@ impl ServerError {
                 | fluree_db_api::TransactError::PublishLostRace { .. }
                 | fluree_db_api::TransactError::NamespaceConflict(_),
             )) => StatusCode::CONFLICT,
+
+            // 413 - the transaction's own delta meets or exceeds
+            // `reindex_max_bytes`: no drain can ever admit it, so a 503
+            // would wedge the client retrying a request that can never
+            // work. MUST precede the drainable 503 arm below.
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyWouldExceed {
+                    delta_bytes,
+                    max_bytes,
+                    ..
+                },
+            )) if delta_bytes >= max_bytes => StatusCode::PAYLOAD_TOO_LARGE,
+            ServerError::NoveltyDeltaTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
 
             // 503 - novelty backpressure. The same retryable capacity class
             // as `NoveltyDeferred` above: only the indexer draining clears
@@ -713,6 +746,40 @@ mod tests {
             .headers()
             .get(axum::http::header::RETRY_AFTER)
             .is_none());
+    }
+
+    /// The oversized-delta carve-out: a delta at or above
+    /// `reindex_max_bytes` can never succeed by drain (the commit check is
+    /// `current + delta >= max`, so even empty novelty refuses it), so it
+    /// must NOT get the retryable 503 shape — it answers 413 +
+    /// `err:db/NoveltyDeltaTooLarge` with NO `Retry-After`, in both the
+    /// raw-variant and consensus-flattened shapes. The drainable/oversized
+    /// boundary is exactly `delta >= max`.
+    #[test]
+    fn oversized_novelty_delta_is_413_with_distinct_code_and_no_retry_after() {
+        let shapes = [
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::NoveltyWouldExceed {
+                    current_bytes: 0,
+                    delta_bytes: 100,
+                    max_bytes: 100,
+                },
+            )),
+            ServerError::NoveltyDeltaTooLarge(
+                "Transaction would exceed novelty limit: current=0, delta=100, max=100".into(),
+            ),
+        ];
+        for se in shapes {
+            assert_eq!(se.status_code(), StatusCode::PAYLOAD_TOO_LARGE, "{se}");
+            assert_eq!(se.error_type(), errors::NOVELTY_DELTA_TOO_LARGE, "{se}");
+            let resp = se.into_response();
+            assert!(
+                resp.headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "413 must not invite a retry"
+            );
+        }
     }
 
     #[test]

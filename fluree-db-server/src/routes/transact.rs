@@ -180,11 +180,17 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
     let status = match &err {
         SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => 409,
         SubmissionError::Overloaded => 503,
-        // Keep the typed identity: 503 + `err:db/NoveltyAtMax` + Retry-After
-        // instead of a status-only passthrough (whose `@type` degrades to
-        // the internal-error catch-all).
+        // Keep the typed identity through the flattening: 503 +
+        // `err:db/NoveltyAtMax` + Retry-After for drainable backpressure,
+        // 413 + `err:db/NoveltyDeltaTooLarge` for a delta that can never
+        // fit — a status-only passthrough degrades the `@type` to the
+        // internal-error catch-all (and 413 is ambiguous with the HTTP
+        // body-size limit).
         SubmissionError::NoveltyBackpressure { message } => {
             return ServerError::NoveltyBackpressure(message.clone());
+        }
+        SubmissionError::NoveltyDeltaTooLarge { message } => {
+            return ServerError::NoveltyDeltaTooLarge(message.clone());
         }
         SubmissionError::Execution { status, .. } => *status,
     };

@@ -3868,10 +3868,18 @@ fn assert_novelty_backpressure_response(
     );
 }
 
-/// `NoveltyWouldExceed` (commit-time predictive sizing): with a 1-byte
-/// hard-threshold the very first insert's delta crosses the ceiling.
+/// `NoveltyWouldExceed` with a delta at or above the ceiling itself: with a
+/// 1-byte hard-threshold the very first insert's delta meets `delta >= max`,
+/// which no amount of indexer draining can ever admit — so it must surface
+/// as a permanent 413 + `err:db/NoveltyDeltaTooLarge` with NO `Retry-After`,
+/// not the retryable 503 shape (which would wedge a pipeline retrying an
+/// oversized record forever). The drainable 503 response shape is covered
+/// end-to-end by the `novelty_at_max` test below; the drainable-vs-oversized
+/// `WouldExceed` split itself is pinned at the unit level (server `error.rs`
+/// and consensus `execution_failure` tests) because provoking a drainable
+/// `WouldExceed` over HTTP would need byte-exact control of flake sizes.
 #[tokio::test]
-async fn novelty_would_exceed_surfaces_as_503_with_code_and_retry_after() {
+async fn novelty_delta_too_large_surfaces_as_413_without_retry_after() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let state = backpressure_state(tmp.path(), Some(1)).await;
     let app = build_router(state);
@@ -3900,7 +3908,22 @@ async fn novelty_would_exceed_surfaces_as_503_with_code_and_retry_after() {
     let resp = app.oneshot(insert_request("bp:main", &body)).await.unwrap();
     let headers = resp.headers().clone();
     let (status, json) = json_body(resp).await;
-    assert_novelty_backpressure_response(status, &headers, &json, "would exceed novelty limit");
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{json}");
+    assert_eq!(
+        json.get("@type").and_then(|v| v.as_str()),
+        Some("err:db/NoveltyDeltaTooLarge"),
+        "{json}"
+    );
+    assert_eq!(json.get("status").and_then(JsonValue::as_u64), Some(413));
+    assert!(
+        headers.get("retry-after").is_none(),
+        "413 must not invite a retry, got headers: {headers:?}"
+    );
+    let msg = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        msg.contains("would exceed novelty limit"),
+        "expected the sizing message in {msg:?}"
+    );
 }
 
 /// `NoveltyAtMax` (stage-time check): novelty is already at the ceiling when
@@ -3955,5 +3978,91 @@ async fn novelty_at_max_surfaces_as_503_with_code_and_retry_after() {
     let resp = app.oneshot(insert_request("bp:main", &body)).await.unwrap();
     let headers = resp.headers().clone();
     let (status, json) = json_body(resp).await;
+    assert_novelty_backpressure_response(status, &headers, &json, "Novelty at maximum size");
+}
+
+/// A keyed client that obeys `Retry-After` must get the honest current
+/// answer when it retries — never a 409 (#1719 review CRITICAL-1).
+///
+/// With the novelty refusal misclassified as unsettled, `record_outcome`
+/// skipped it while the claim guard disarmed the `InFlight` cleanup, so the
+/// idempotency slot stayed `InFlight` for the full cache TTL and every
+/// keyed retry bounced with 409 `AlreadyInFlight` — the dropped-write
+/// footgun behind one extra round-trip. Settled `Failed` entries are
+/// re-attemptable (body-hash-matching replace), so the retry re-executes:
+/// here the condition still holds (indexing is disabled, nothing drains),
+/// so the honest answer is 503 again — NOT 409. The condition-clears leg
+/// (same key, refusal then success) is pinned deterministically in
+/// fluree-db-consensus's `keyed_retry_after_novelty_refusal_reexecutes`.
+/// Mutation check: flipping the novelty `is_settled` arm back to `false`
+/// fails this test with a 409 on the retry.
+#[tokio::test]
+async fn novelty_backpressure_keyed_retry_reexecutes_not_409() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Accumulate novelty under a permissive threshold (as in the AtMax test).
+    {
+        let state = backpressure_state(tmp.path(), None).await;
+        let app = build_router(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"ledger": "bp:main"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:item1",
+            "ex:val": 1,
+        });
+        let (status, json) =
+            json_body(app.oneshot(insert_request("bp:main", &body)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "seeding insert failed: {json}");
+    }
+
+    // Reopen at a 1-byte threshold: novelty is at max and stays there.
+    let state = backpressure_state(tmp.path(), Some(1)).await;
+    let app = build_router(state);
+    let body = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:item2",
+        "ex:val": 2,
+    });
+    let keyed_insert = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/insert")
+            .header("content-type", "application/json")
+            .header("fluree-ledger", "bp:main")
+            .header("Idempotency-Key", "ingest-batch-42")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let resp = app.clone().oneshot(keyed_insert()).await.unwrap();
+    let headers = resp.headers().clone();
+    let (status, json) = json_body(resp).await;
+    assert_novelty_backpressure_response(status, &headers, &json, "Novelty at maximum size");
+
+    // Retry with the SAME key and body: must re-execute and report the
+    // still-present condition — not 409 from a pinned InFlight slot.
+    let resp = app.oneshot(keyed_insert()).await.unwrap();
+    let headers = resp.headers().clone();
+    let (status, json) = json_body(resp).await;
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "keyed retry must not bounce off a pinned idempotency slot: {json}"
+    );
     assert_novelty_backpressure_response(status, &headers, &json, "Novelty at maximum size");
 }

@@ -776,15 +776,25 @@ pub enum SubmissionError {
 
     /// The submission was refused by novelty backpressure: the ledger's
     /// in-memory novelty is at `reindex_max_bytes` (or this transaction
-    /// would cross it) and the indexer must drain it before new commits
-    /// are accepted. Retryable. Distinct from [`Self::Execution`] so the
-    /// HTTP layer can surface the dedicated `err:db/NoveltyAtMax` code
-    /// and a `Retry-After` header instead of a generic failure — an
-    /// `Execution` status alone cannot identify the condition because
-    /// other retryable paths (leader transition, stranded waiter) share
-    /// the 5xx range.
+    /// would cross it, while still fitting once novelty drains) and the
+    /// indexer must drain before new commits are accepted. Retryable.
+    /// Distinct from [`Self::Execution`] so the HTTP layer can surface
+    /// the dedicated `err:db/NoveltyAtMax` code and a `Retry-After`
+    /// header instead of a generic failure — an `Execution` status alone
+    /// cannot identify the condition because other retryable paths
+    /// (leader transition, stranded waiter) share the 5xx range.
     #[error("{message}")]
     NoveltyBackpressure { message: String },
+
+    /// The transaction's own delta meets or exceeds `reindex_max_bytes`,
+    /// so no amount of indexer draining can ever admit it — a permanent
+    /// refusal of this payload at this configuration (HTTP 413,
+    /// `err:db/NoveltyDeltaTooLarge`, no `Retry-After`), unlike the
+    /// retryable [`Self::NoveltyBackpressure`]. Typed for the same
+    /// reason: an `Execution` status alone cannot carry the code (413
+    /// is also produced by the HTTP body-size limit).
+    #[error("{message}")]
+    NoveltyDeltaTooLarge { message: String },
 
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
@@ -811,10 +821,19 @@ impl SubmissionError {
             // Admission refusals and racing-submission signals —
             // this submission was never executed.
             Self::KeyCollision | Self::AlreadyInFlight | Self::Overloaded => false,
-            // Refused before commit; a retry with the SAME key must
-            // re-execute once the indexer drains rather than replay a
-            // cached refusal for the cache TTL.
-            Self::NoveltyBackpressure { .. } => false,
+            // SETTLED, even though the client is told to retry. The
+            // unsettled rule exists for maybe-still-commits outcomes
+            // (leader transitions); a novelty refusal is decided before
+            // commit construction on the local path (and Raft never
+            // produces these variants), so recording `Failed` is
+            // truthful — and it is what makes retry-after-drain WORK
+            // for keyed clients: `try_claim_slot` replaces a `Failed`
+            // entry with a matching body hash and re-executes, whereas
+            // an unsettled error is skipped by `record_outcome` while
+            // `guard.commit()` still disarms the `InFlight` cleanup,
+            // pinning the slot so every keyed retry gets
+            // `AlreadyInFlight` (409) for the full cache TTL.
+            Self::NoveltyBackpressure { .. } | Self::NoveltyDeltaTooLarge { .. } => true,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }

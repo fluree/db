@@ -61,6 +61,15 @@ pub const LEDGER_EXISTS: &str = "err:db/LedgerExists";
 /// Novelty at maximum size (backpressure)
 pub const NOVELTY_AT_MAX: &str = "err:db/NoveltyAtMax";
 
+/// A single transaction's delta alone meets or exceeds `reindex_max_bytes`,
+/// so it can never be accepted by waiting for the indexer to drain novelty.
+///
+/// Distinct from [`NOVELTY_AT_MAX`] (retryable backpressure, HTTP 503 +
+/// `Retry-After`): this is a permanent refusal of this transaction at this
+/// configuration, surfaced as HTTP 413 with no `Retry-After` — split the
+/// transaction into smaller pieces or raise `reindex_max_bytes`.
+pub const NOVELTY_DELTA_TOO_LARGE: &str = "err:db/NoveltyDeltaTooLarge";
+
 /// Commit conflict (concurrent modification)
 pub const COMMIT_CONFLICT: &str = "err:db/CommitConflict";
 
