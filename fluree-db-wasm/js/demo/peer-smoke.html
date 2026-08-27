@@ -1,0 +1,115 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>fluree-db-wasm peer smoke (real server)</title>
+<pre id="out">running…</pre>
+<script type="module">
+  // Browser peer against a REAL fluree-db-server, driven by
+  // scripts/smoke-peer-server.mjs. This page is one half of a handshake:
+  //
+  //   1. connect() to the server's storage proxy, open the ledger, query it,
+  //      and prime a live subscription — then publish `window.__peerReady`.
+  //   2. The orchestrator, seeing that, commits a NEW row over the server's
+  //      HTTP API (an external writer — nothing in this page touches it).
+  //   3. This page waits for the SSE head change to arrive, re-queries at the
+  //      new head, and publishes the full verdict on `window.__peerSmoke`.
+  //
+  // Every assertion is a positive marker (named rows at each stage), never
+  // "no exception was thrown".
+  import { connect } from "../dist/index.js";
+
+  const out = document.getElementById("out");
+  const params = new URLSearchParams(location.search);
+  const api = params.get("api");
+  const token = params.get("token");
+  const ledgerId = params.get("ledger");
+
+  const SPARQL = `PREFIX ex: <http://example.org/ns/>
+    SELECT ?name WHERE { ?p a ex:Person ; ex:name ?name } ORDER BY ?name`;
+
+  const namesOf = (res) => res?.results?.bindings?.map((b) => b.name.value) ?? null;
+
+  const until = async (cond, what, tries = 400, ms = 50) => {
+    for (let i = 0; i < tries && !cond(); i++) await new Promise((r) => setTimeout(r, ms));
+    if (!cond()) throw new Error(`timed out waiting for ${what}`);
+  };
+
+  let signalReady;
+  let failReady;
+  window.__peerReady = new Promise((res, rej) => { signalReady = res; failReady = rej; });
+
+  window.__peerSmoke = (async () => {
+    const report = { status: "fail", phases: [] };
+    const mark = (name, detail) => { report.phases.push(name); Object.assign(report, detail); };
+    try {
+      if (!api || !token || !ledgerId) throw new Error("api/token/ledger query params required");
+
+      // — Connect: the token crosses the event channel, never the init message.
+      const tokenReasons = [];
+      const peer = await connect(api, {
+        getToken: (reason) => { tokenReasons.push(reason); return token; },
+        subscribe: [ledgerId],
+      });
+      mark("connected", { version: peer.version, tokenReasons });
+
+      const heads = [];
+      peer.on("headChange", (c) => heads.push(c));
+
+      // — Cold read: head resolves over /storage/ns, blocks arrive
+      //   CID-verified over /storage/objects, the query runs LOCALLY.
+      const ledger = await peer.ledger(ledgerId);
+      const opened = await ledger.info();
+      const cold = await ledger.query(SPARQL);
+      mark("coldQuery", { openT: opened.t, openIndexT: opened.indexT, coldNames: namesOf(cold) });
+
+      // — Warm read: a second query on the same head, served from the
+      //   residency tier / IndexedDB rather than re-fetching.
+      const warmSame = await ledger.query(SPARQL);
+      mark("warmQuery", { warmSameNames: namesOf(warmSame) });
+
+      // — Live subscription primes at the current head.
+      const updates = [];
+      const sub = await peer.subscribe(ledgerId, SPARQL, (u) => updates.push(u));
+      await until(() => updates.length >= 1, "live prime");
+      mark("livePrimed", { primedNames: namesOf(updates[0]?.data) });
+
+      // Hand off: the orchestrator now commits to the server over HTTP.
+      signalReady({ ready: true, t: opened.t, coldNames: report.coldNames });
+
+      // — The live loop, closed against a real server: SSE head change …
+      await until(() => heads.some((h) => h.t > opened.t), "SSE head change past the opened head",
+        600, 100);
+      const advanced = heads.filter((h) => h.t > opened.t);
+      mark("headChanged", { headChanges: heads, newT: advanced[advanced.length - 1].t });
+
+      // … the engine absorbed it (a fresh open reports the new watermark) …
+      const reopened = await ledger.info();
+      mark("reopened", { reopenedT: reopened.t });
+
+      // … and a re-query at the new head returns the NEW row.
+      const fresh = await ledger.query(SPARQL);
+      mark("freshQuery", { freshNames: namesOf(fresh) });
+
+      // … and the live subscription delivered it as its own update.
+      await until(() => updates.length >= 2, "live update after the remote commit", 600, 100);
+      mark("liveUpdated", {
+        liveNames: updates.map((u) => namesOf(u.data)),
+        liveTs: updates.map((u) => u.t),
+      });
+
+      await sub.unsubscribe();
+      peer.close();
+
+      report.status = "pass";
+      out.textContent = JSON.stringify(report, null, 2);
+      return report;
+    } catch (err) {
+      report.error = String(err?.stack ?? err);
+      report.errorCode = err?.code ?? null;
+      // Unblock the orchestrator's handshake so it reports THIS failure
+      // instead of timing out on a promise nobody will ever resolve.
+      failReady?.(err);
+      out.textContent = JSON.stringify(report, null, 2);
+      return report;
+    }
+  })();
+</script>
