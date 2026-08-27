@@ -35,6 +35,13 @@ fn err_code(err: JsValue) -> String {
         .unwrap_or_else(|| "<no code>".to_string())
 }
 
+fn err_status(err: &JsValue) -> f64 {
+    js_sys::Reflect::get(err, &JsValue::from_str("status"))
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(-1.0)
+}
+
 /// Snapshot the ledger head and return the handle.
 async fn snap(pg: &Playground, ledger: &str) -> u32 {
     let info = parse_str(pg.snapshot(ledger.to_string()).await.unwrap());
@@ -153,9 +160,15 @@ async fn errors_carry_codes() {
     pg.create_ledger("errs".into()).await.unwrap();
 
     let dup = pg.create_ledger("errs".into()).await.unwrap_err();
+    assert_eq!(err_status(&dup), 409.0, "conflict carries its HTTP status");
     assert_eq!(err_code(dup), "conflict");
 
     let missing = pg.snapshot("nope".into()).await.unwrap_err();
+    assert_eq!(
+        err_status(&missing),
+        404.0,
+        "not_found carries its HTTP status"
+    );
     assert_eq!(err_code(missing), "not_found");
 
     let s = snap(&pg, "errs").await;
@@ -179,4 +192,135 @@ async fn errors_carry_codes() {
         .await
         .unwrap_err();
     assert_eq!(err_code(gone), "not_found");
+}
+
+/// The F4 memory budget actually fires: a small budget + a query whose
+/// retained working set (full cross join under ORDER BY) exceeds it must be
+/// the typed `out_of_memory` (507), not a trap.
+#[wasm_bindgen_test]
+async fn memory_budget_rejects_oversized_query_typed() {
+    // 64 KiB budget against grouped aggregation, the lane the engine
+    // provably charges (GROUP_EST_BYTES = 128 per group): 64x64 cross-pairs
+    // grouped on both vars = 4,096 groups = 512 KiB charged, 8x the budget,
+    // from only 4,096 joined rows (fast even in a debug wasm build). Plain
+    // cross joins and GROUP_CONCAT payload bytes are NOT charged today — at
+    // any size that finishes inside the harness timeout they complete
+    // without tripping — so this pins the typed-rejection contract, not any
+    // particular operator's accounting completeness.
+    let pg = Playground::new(Some(65536.0));
+    pg.create_ledger("mem".into()).await.unwrap();
+
+    let mut graph = Vec::new();
+    for i in 0..64 {
+        graph.push(serde_json::json!({
+            "@id": format!("ex:n{i}"), "@type": "ex:Thing",
+            "ex:label": format!("thing {i}"),
+        }));
+    }
+    let doc = serde_json::json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": graph});
+    pg.insert("mem".into(), doc.to_string()).await.unwrap();
+
+    let s = snap(&pg, "mem").await;
+    let res = pg
+        .query_sparql(
+            s,
+            "PREFIX ex: <http://example.org/ns/> \
+             SELECT ?a ?b (COUNT(?b) AS ?n) \
+             WHERE { ?a a ex:Thing . ?b a ex:Thing } \
+             GROUP BY ?a ?b"
+                .into(),
+        )
+        .await;
+    // A short panic on the wrong arm: dumping an Ok payload into the panic
+    // message once blew chromedriver's 10 MB response cap.
+    let over = match res {
+        Err(e) => e,
+        Ok(ok) => panic!("expected budget rejection, got Ok ({} bytes)", ok.len()),
+    };
+    assert_eq!(err_status(&over), 507.0, "budget failure carries 507");
+    assert_eq!(err_code(over), "out_of_memory");
+
+    // The engine survived (typed error, not a trap): a small query still runs.
+    let ok = parse(
+        pg.query_sparql(s, "ASK { ?s ?p ?o }".into())
+            .await
+            .expect("engine alive after a budgeted rejection"),
+    );
+    assert_eq!(ok["boolean"], true);
+}
+
+/// The transact pre-gate: with a budget set, an input body over ¼ of it is
+/// refused typed instead of gambling on an allocator trap.
+#[wasm_bindgen_test]
+async fn transact_pregate_rejects_oversized_body() {
+    let pg = Playground::new(Some(65536.0));
+    pg.create_ledger("gate".into()).await.unwrap();
+
+    let big = format!(
+        r#"{{"@context": {{"ex": "http://example.org/ns/"}}, "@id": "ex:big", "ex:blob": "{}"}}"#,
+        "x".repeat(20000)
+    );
+    let refused = pg.insert("gate".into(), big).await.unwrap_err();
+    assert_eq!(err_code(refused), "out_of_memory");
+
+    // Small bodies pass the gate and commit.
+    let receipt = parse_str(
+        pg.insert(
+            "gate".into(),
+            r#"{"@context": {"ex": "http://example.org/ns/"}, "@id": "ex:ok", "ex:n": 1}"#.into(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(receipt["t"], 1);
+}
+
+/// upsert and sparqlUpdate exercised at the binding level.
+#[wasm_bindgen_test]
+async fn upsert_and_sparql_update() {
+    let pg = Playground::new(None);
+    pg.create_ledger("mut".into()).await.unwrap();
+    pg.insert("mut".into(), PEOPLE.into()).await.unwrap();
+
+    let up = r#"{
+      "@context": {"ex": "http://example.org/ns/"},
+      "@id": "ex:bob", "ex:name": "Robert"
+    }"#;
+    let receipt = parse_str(pg.upsert("mut".into(), up.into()).await.unwrap());
+    assert_eq!(receipt["t"], 2);
+
+    let s1 = snap(&pg, "mut").await;
+    let renamed = parse(
+        pg.query_sparql(
+            s1,
+            "PREFIX ex: <http://example.org/ns/> ASK { ex:bob ex:name \"Robert\" }".into(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        renamed["boolean"], true,
+        "upsert replaced the name: {renamed}"
+    );
+
+    let receipt = parse_str(
+        pg.sparql_update(
+            "mut".into(),
+            "PREFIX ex: <http://example.org/ns/> INSERT DATA { ex:carol a ex:Person }".into(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(receipt["t"], 3);
+
+    let s2 = snap(&pg, "mut").await;
+    let carol = parse(
+        pg.query_sparql(
+            s2,
+            "PREFIX ex: <http://example.org/ns/> ASK { ex:carol a ex:Person }".into(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(carol["boolean"], true, "SPARQL update visible: {carol}");
 }

@@ -81,13 +81,21 @@ export interface QueryRequest {
   transport: ResultTransport;
 }
 
+/** Test-only: deliberately trap the wasm instance to exercise the
+ * crash/recycle path (`Playground._debugCrash`). */
+export interface DebugCrashRequest {
+  id: number;
+  op: "debugCrash";
+}
+
 export type Request =
   | InitRequest
   | LedgerRequest
   | SnapshotRequest
   | ReleaseRequest
   | TransactRequest
-  | QueryRequest;
+  | QueryRequest
+  | DebugCrashRequest;
 
 export interface ErrorShape {
   code: string;
