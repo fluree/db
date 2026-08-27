@@ -90,7 +90,7 @@ async function measure({ sameOrigin, delayMs, token, serverUrl }) {
       `&token=${encodeURIComponent(token)}` +
       `&ledger=${encodeURIComponent(LEDGER)}`;
     const session = await openPage(cdp, pageUrl);
-    const r = await awaitPageMarker(cdp, session, "__bench", { tries: 1800 });
+    const r = await awaitPageMarker(cdp, session, "__bench", { tries: 1800, settleMs: 120_000 });
     if (r?.status !== "pass") {
       throw new Error(`bench page failed: ${r?.error ?? JSON.stringify(r)}`);
     }

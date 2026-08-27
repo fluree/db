@@ -183,19 +183,36 @@ export async function evaluate(cdp, sessionId, expression) {
  * Await a promise the page published on `window[name]`, polling until the
  * page installs it. A page that never installs the marker fails loudly
  * rather than resolving `undefined` — the ran-marker rule.
+ *
+ * `settleMs` bounds the wait for the promise to SETTLE, which is a separate
+ * failure from never being installed: `Runtime.evaluate` with
+ * `awaitPromise` has no deadline of its own, so a page whose promise never
+ * resolves would otherwise block the caller forever (it did — a bench run
+ * hung ~15 minutes on exactly this).
  */
-export function awaitPageMarker(cdp, sessionId, name, { pollMs = 100, tries = 600 } = {}) {
+export function awaitPageMarker(
+  cdp,
+  sessionId,
+  name,
+  { pollMs = 100, tries = 600, settleMs = 300_000 } = {},
+) {
+  const key = JSON.stringify(name);
   return evaluate(
     cdp,
     sessionId,
     `(async () => {
-      for (let i = 0; i < ${tries} && !window[${JSON.stringify(name)}]; i++) {
+      for (let i = 0; i < ${tries} && !window[${key}]; i++) {
         await new Promise(r => setTimeout(r, ${pollMs}));
       }
-      if (!window[${JSON.stringify(name)}]) {
+      if (!window[${key}]) {
         return { status: "fail", error: "page never installed window.${name}" };
       }
-      return await window[${JSON.stringify(name)}];
+      return await Promise.race([
+        window[${key}],
+        new Promise(r => setTimeout(
+          () => r({ status: "fail", error: "window.${name} never settled within ${settleMs} ms" }),
+          ${settleMs})),
+      ]);
     })()`,
   );
 }
