@@ -225,7 +225,7 @@ impl Fluree {
                     .get(&index_cid)
                     .await
                     .map_err(|e| ApiError::internal(format!("read index root: {e}")))?;
-                let cache_dir = std::env::temp_dir().join("fluree-cache");
+                let cache_dir = crate::ledger_manager::temp_cache_dir("fluree-cache");
                 let mut store = BinaryIndexStore::load_from_root_bytes(
                     cs,
                     &bytes,
@@ -360,7 +360,7 @@ impl Fluree {
                     let bytes = cs.get(index_cid).await.map_err(|e| {
                         ApiError::internal(format!("failed to read index root {index_cid}: {e}"))
                     })?;
-                    let cache_dir = std::env::temp_dir().join("fluree-cache");
+                    let cache_dir = crate::ledger_manager::temp_cache_dir("fluree-cache");
                     let mut store = BinaryIndexStore::load_from_root_bytes(
                         cs,
                         &bytes,
