@@ -1,15 +1,23 @@
 /**
  * `@fluree/db-wasm` — engine worker.
  *
- * Dedicated worker hosting exactly one wasm instance. It instantiates the
- * module on the first `init` request (streaming compile of the `.wasm`), then
- * services requests from `index.ts`. Each request is handled as an
- * independent promise, so several queries can be in flight; the engine
- * interleaves them on this worker's event loop (single-threaded — CPU-bound
- * work does not overlap, but a query awaiting nothing still yields between
- * operator batches). Requests that arrive while an init is still compiling
- * wait for it instead of failing `not_initialized`; if init failed, they get
- * the init's actual error, not a generic one.
+ * Dedicated worker hosting exactly one wasm instance in one of two modes:
+ * the in-memory read-write **playground**, or the read-only remote **peer**
+ * (`connectPeer` → `fluree-db-browser`'s driver, CID-verified fetches,
+ * IndexedDB cache, SSE head tracking). It instantiates the module on the
+ * first `init` request (streaming compile of the `.wasm`), then services
+ * requests from `index.ts`. Each request is handled as an independent
+ * promise, so several queries can be in flight; the engine interleaves them
+ * on this worker's event loop. Requests that arrive while an init is still
+ * compiling wait for it instead of failing `not_initialized`; if init
+ * failed, they get the init's actual error, not a generic one.
+ *
+ * Credentials (peer mode): `init` deliberately carries NO token — the proxy
+ * replays init verbatim on a crash recycle, and a replayed message must
+ * never be a credential replay. Instead the worker emits a `tokenRequest`
+ * EVENT and waits for the main thread's `tokenResponse` before connecting;
+ * a recycle therefore re-asks, and the main-thread `getToken` callback is
+ * the single source of credentials.
  *
  * Crash model (F4): a Rust panic or allocator failure traps the wasm
  * instance — it is poisoned, not recoverable. This worker survives the trap
@@ -22,10 +30,18 @@
  * buffer is safe to transfer to the main thread.
  */
 
-import init, { Playground, version } from "../pkg/fluree_db_wasm.js";
-import type { ErrorShape, QueryTarget, Request, Response } from "./protocol.js";
+import init, { connectPeer, Peer, Playground, version } from "../pkg/fluree_db_wasm.js";
+import type {
+  EngineMode,
+  ErrorShape,
+  EventBody,
+  QueryTarget,
+  Request,
+  Response,
+} from "./protocol.js";
 
-let engine: Playground | null = null;
+let engine: Playground | Peer | null = null;
+let mode: EngineMode | null = null;
 let poisoned: ErrorShape | null = null;
 /** In-flight init, so requests racing the wasm compile wait instead of
  * failing; resolved to `null` on success, the failure shape on error. */
@@ -33,6 +49,13 @@ let initing: Promise<ErrorShape | null> | null = null;
 /** Why init failed, preserved so later requests report the real cause. */
 let initError: ErrorShape | null = null;
 const decoder = new TextDecoder();
+
+/** Pending token requests, keyed by the event's requestId. */
+const tokenWaiters = new Map<
+  number,
+  (answer: { token?: string; error?: string }) => void
+>();
+let nextTokenRequestId = 1;
 
 function fatalShape(err: unknown): ErrorShape {
   const message = String((err as { message?: unknown })?.message ?? err);
@@ -80,7 +103,34 @@ function reply(res: Response, transfer?: Transferable[]): void {
   }
 }
 
-function requireEngine(): Playground {
+/** Push an unsolicited event to the main thread (see protocol.ts). */
+function emit(event: EventBody): void {
+  self.postMessage({ v: 1, event });
+}
+
+/** Ask the main thread for a bearer token; resolves on its `tokenResponse`.
+ * No timeout: the proxy always answers, even when no `getToken` was
+ * configured (with an error, which fails the connect typed). */
+function requestToken(reason: "connect" | "reconnect"): Promise<string> {
+  const requestId = nextTokenRequestId++;
+  return new Promise((resolve, reject) => {
+    tokenWaiters.set(requestId, ({ token, error }) => {
+      if (typeof token === "string" && token.length > 0) {
+        resolve(token);
+      } else {
+        const e = new Error(
+          error ?? "no bearer token available (is a getToken callback configured?)",
+        ) as Error & { code: string; status: number };
+        e.code = "unauthorized";
+        e.status = 401;
+        reject(e);
+      }
+    });
+    emit({ kind: "tokenRequest", requestId, reason });
+  });
+}
+
+function requireEngine(): Playground | Peer {
   if (!engine) {
     const cause = initError ?? poisoned;
     const e = new Error(
@@ -91,6 +141,21 @@ function requireEngine(): Playground {
     throw e;
   }
   return engine;
+}
+
+/** Playground-only surface (transacts, createLedger, the crash hook). */
+function requirePlayground(opName: string): Playground {
+  const eng = requireEngine();
+  if (!(eng instanceof Playground)) {
+    const e = new Error(
+      `"${opName}" is not available in peer mode — the peer is read-only ` +
+        `(commits are ordered by the origin server's write authority)`,
+    ) as Error & { code: string; status: number };
+    e.code = "unsupported";
+    e.status = 501;
+    throw e;
+  }
+  return eng;
 }
 
 /** Resolve a query target to a snapshot handle plus whether we own it. */
@@ -106,6 +171,16 @@ async function handle(req: Request): Promise<void> {
     reply({ id, ok: false, error: poisoned });
     return;
   }
+  // Token answers are fire-and-forget and must never wait behind init —
+  // init is exactly what they unblock.
+  if (req.op === "tokenResponse") {
+    const waiter = tokenWaiters.get(req.requestId);
+    if (waiter) {
+      tokenWaiters.delete(req.requestId);
+      waiter({ token: req.token, error: req.error });
+    }
+    return;
+  }
   // Any non-init request racing an in-flight init waits for it; the init op
   // itself replies from its own frame below.
   if (req.op !== "init" && initing) {
@@ -114,7 +189,7 @@ async function handle(req: Request): Promise<void> {
   try {
     switch (req.op) {
       case "init": {
-        if (req.mode !== "playground") {
+        if (req.mode !== "playground" && req.mode !== "peer") {
           reply({
             id,
             ok: false,
@@ -130,7 +205,29 @@ async function handle(req: Request): Promise<void> {
           initing ??= (async (): Promise<ErrorShape | null> => {
             try {
               await init(req.wasmUrl === undefined ? undefined : { module_or_path: req.wasmUrl });
-              engine = new Playground(req.maxMemoryBytes);
+              if (req.mode === "peer") {
+                if (!req.url) {
+                  throw Object.assign(new Error("peer mode requires a server url"), {
+                    code: "invalid_input",
+                    status: 400,
+                  });
+                }
+                const token = await requestToken(req.reinit ? "reconnect" : "connect");
+                const peer = connectPeer(req.url, token, req.maxMemoryBytes);
+                peer.onHeadChange((json: string) => {
+                  const change = JSON.parse(json) as {
+                    ledger: string;
+                    t: number;
+                    indexT: number;
+                  };
+                  emit({ kind: "headChange", ...change });
+                });
+                if (req.subscribe) peer.startHeadTracking(req.subscribe);
+                engine = peer;
+              } else {
+                engine = new Playground(req.maxMemoryBytes);
+              }
+              mode = req.mode;
               initError = null;
               return null;
             } catch (err) {
@@ -149,12 +246,16 @@ async function handle(req: Request): Promise<void> {
         reply({
           id,
           ok: true,
-          result: { version: version(), mode: "playground", maxMemoryBytes: req.maxMemoryBytes },
+          result: { version: version(), mode, maxMemoryBytes: req.maxMemoryBytes },
         });
         return;
       }
       case "createLedger":
-        reply({ id, ok: true, result: JSON.parse(await requireEngine().createLedger(req.ledger)) });
+        reply({
+          id,
+          ok: true,
+          result: JSON.parse(await requirePlayground("createLedger").createLedger(req.ledger)),
+        });
         return;
       case "ledgerInfo":
         reply({ id, ok: true, result: JSON.parse(await requireEngine().ledgerInfo(req.ledger)) });
@@ -166,25 +267,39 @@ async function handle(req: Request): Promise<void> {
         reply({ id, ok: true, result: requireEngine().release(req.snapshot) });
         return;
       case "insert":
-        reply({ id, ok: true, result: JSON.parse(await requireEngine().insert(req.ledger, req.body)) });
+        reply({
+          id,
+          ok: true,
+          result: JSON.parse(await requirePlayground("insert").insert(req.ledger, req.body)),
+        });
         return;
       case "upsert":
-        reply({ id, ok: true, result: JSON.parse(await requireEngine().upsert(req.ledger, req.body)) });
+        reply({
+          id,
+          ok: true,
+          result: JSON.parse(await requirePlayground("upsert").upsert(req.ledger, req.body)),
+        });
         return;
       case "update":
-        reply({ id, ok: true, result: JSON.parse(await requireEngine().update(req.ledger, req.body)) });
+        reply({
+          id,
+          ok: true,
+          result: JSON.parse(await requirePlayground("update").update(req.ledger, req.body)),
+        });
         return;
       case "sparqlUpdate":
         reply({
           id,
           ok: true,
-          result: JSON.parse(await requireEngine().sparqlUpdate(req.ledger, req.body)),
+          result: JSON.parse(
+            await requirePlayground("sparqlUpdate").sparqlUpdate(req.ledger, req.body),
+          ),
         });
         return;
       case "debugCrash":
         // Test hook (see Playground._debugCrash): deliberately trap the
         // instance to exercise the crash/recycle path.
-        requireEngine().debugCrash();
+        requirePlayground("debugCrash").debugCrash();
         reply({ id, ok: true });
         return;
       case "query": {

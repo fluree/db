@@ -3372,8 +3372,10 @@ version = "4.1.6"
 dependencies = [
  "console_error_panic_hook",
  "fluree-db-api",
+ "fluree-db-browser",
  "fluree-db-core",
  "fluree-db-query",
+ "futures",
  "js-sys",
  "serde_json",
  "wasm-bindgen",

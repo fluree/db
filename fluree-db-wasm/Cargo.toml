@@ -19,6 +19,9 @@ crate-type = ["cdylib", "rlib"]
 # --no-default-features`). Native-only subsystems (indexer, import, spatial,
 # memmap) are target-gated inside the api crate, not selected here.
 fluree-db-api = { path = "../fluree-db-api", default-features = false }
+# Peer mode: BrowserPeer assembly (driver, CAS storage, head tracking).
+fluree-db-browser = { path = "../fluree-db-browser" }
+futures = { workspace = true }
 # Only for QueryCancellation (the per-query memory-budget handle).
 fluree-db-core = { path = "../fluree-db-core", default-features = false }
 # Only to name QueryError variants (Cancelled, MemoryBudgetExceeded) when

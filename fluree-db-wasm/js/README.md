@@ -2,7 +2,25 @@
 
 > Package name is a placeholder pending the npm org decision.
 
-Fluree in the browser: the graph database engine (`fluree-db-api`) compiled to WebAssembly and hosted in a dedicated Web Worker. This release ships **playground mode** — an in-memory Fluree you can create ledgers in, transact JSON-LD into, and query with SPARQL or JSON-LD, with no server. The **peer mode** (query a Fluree server's ledgers locally from CID-verified, cached index blocks) uses the same API surface via a second constructor and lands in a later release.
+Fluree in the browser: the graph database engine (`fluree-db-api`) compiled to WebAssembly and hosted in a dedicated Web Worker. Two modes share one API surface:
+
+- **Playground** (`playground()`): an in-memory Fluree you can create ledgers in, transact JSON-LD into, and query with SPARQL or JSON-LD — no server.
+- **Peer** (`connect(url, { getToken, ... })`): a read-only local engine over a remote Fluree server — heads resolve through the server's nameservice, index/commit blocks arrive CID-verified and cache in IndexedDB, queries execute locally, and SSE head tracking pushes ledger advances to `peer.on("headChange", …)`. Transacting through a peer rejects with a typed `unsupported`; commits are ordered by the origin server.
+
+```js
+import { connect } from "@fluree/db-wasm";
+
+const peer = await connect("https://data.example.com/v1/fluree", {
+  getToken: () => fetchTokenFromMyBackend(),   // fluree.storage.* scope
+  subscribe: ["books:main"],                   // SSE head tracking ([] = all visible)
+});
+const books = await peer.ledger("books:main");
+const rows = await books.query("SELECT ?s WHERE { ?s ?p ?o } LIMIT 10");
+const off = peer.on("headChange", ({ ledger, t }) => rerender(ledger, t));
+peer.close();
+```
+
+**Peer credentials:** `getToken` is the single source — the token is requested from the main thread over the worker's event channel at connect AND at every post-crash reconnect; it is never embedded in a replayable init message. There is no mid-session re-auth hook yet: when a token expires, requests fail typed and you reconnect (`close()` + `connect()`) with a fresh token.
 
 ## Install & use
 
@@ -42,6 +60,8 @@ fluree.close();                             // terminates the worker; ledgers ar
 | | |
 |---|---|
 | `playground(options?)` → `Promise<Playground>` | Start an engine worker. `options.workerUrl`, `options.wasmUrl` override asset locations; `options.resultTransport` is `"transfer"` (default) or `"clone"`; `options.maxMemoryBytes` caps each query's memory budget (see below). |
+| `connect(url, options?)` → `Promise<Peer>` | Read-only peer over a remote server (`url` = versioned API base). Adds `options.getToken` (credential source — see above) and `options.subscribe` (SSE head tracking). In peer mode `maxMemoryBytes` is the ONE ceiling: it derives the whole browser-io budget split (residency tier, write-behind, fetch width) and the per-query budget (¼ of it). |
+| `Peer.ledger(id)` → `Promise<Ledger>`, `Peer.on("headChange", cb)` → unsubscriber, `Peer.version`, `.close()` | Same `Ledger` surface as the playground minus writes (transacts reject `unsupported`). Head-change callbacks fire after the engine absorbed the advance: the next `snapshot()` sees the new head; frozen snapshots never move. |
 | `Playground.createLedger(id)` / `.ledger(id)` → `Promise<Ledger>` | `"demo"` normalizes to `"demo:main"`. `conflict` / `not_found` errors respectively. |
 | `Playground.version`, `.close()` | Engine version; terminate the worker. |
 | `Ledger.insert(data)` / `.upsert(data)` / `.update(doc)` / `.sparqlUpdate(text)` → `Promise<CommitReceipt>` | JSON-LD in (object or JSON text); `{ t, commit, flakes }` out. |
@@ -86,7 +106,11 @@ The Rust-level browser tests run with `wasm-pack test --headless --chrome ..` fr
 
 ### Build profile and size
 
-The `.wasm` builds with the workspace's `wasm-release` cargo profile (fat LTO, one codegen unit, stripped, `opt-level = "s"`) followed by `wasm-opt -Os`. `scripts/build.mjs` prints raw / gzip / brotli sizes and writes `pkg/size-report.json`; the current numbers are in the crate README. Playground and future peer mode share one binary; a feature-sliced slim build (no R2RML, reasoner, full-text, Cypher) is the lever if size ever matters more than surface.
+The `.wasm` builds with the workspace's `wasm-release` cargo profile (fat LTO, one codegen unit, stripped, `opt-level = "s"`) followed by `wasm-opt -Os`. `scripts/build.mjs` prints raw / gzip / brotli sizes and writes `pkg/size-report.json`; the current numbers are in the crate README. Playground and peer mode share one binary; a feature-sliced slim build (no R2RML, reasoner, full-text, Cypher) is the lever if size ever matters more than surface.
+
+### Peer-mode verification status (honest)
+
+Verified in CI's browser smoke without a server: the token event round-trip (init carries no credential; `getToken` answers the worker's request), peer init/close, and typed non-fatal failure against an unreachable remote. Verified natively in `fluree-db-browser`'s mock-driver suites: head resolution through the proxy nameservice, SSE head tracking → callback dispatch, block fetch/verify/cache. **Not yet verified anywhere automated:** the full browser-against-a-real-server flow (real blocks over HTTP, real SSE) — it needs a running `fluree-db-server` with a storage-proxy token, which the smoke harness does not yet launch.
 
 ### Result transport
 

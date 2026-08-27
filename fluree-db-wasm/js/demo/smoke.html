@@ -7,8 +7,11 @@
   // verdict on window.__smoke (awaited by scripts/smoke-browser.mjs).
   // Phase 1: create → insert → query → ask. Phase 2: deliberate crash, then
   // recycle semantics (H-4/H-5): pre-crash snapshot handles must reject typed
-  // instead of aliasing the fresh engine's snapshots.
-  import { playground } from "../dist/index.js";
+  // instead of aliasing the fresh engine's snapshots. Phase 3: the peer-mode
+  // boundary WITHOUT a server — the token event round-trip (init carries no
+  // credential; the worker asks over the event channel) and a typed,
+  // non-fatal failure when the remote is unreachable.
+  import { connect, playground } from "../dist/index.js";
 
   const out = document.getElementById("out");
   const data = {
@@ -91,6 +94,27 @@
 
       pg.close();
 
+      // — Phase 3: peer-mode boundary, no server —
+      const tokenReasons = [];
+      const peer = await connect("http://127.0.0.1:1/v1/fluree", {
+        getToken: (reason) => {
+          tokenReasons.push(reason);
+          return "smoke-token";
+        },
+      });
+      const peerVersion = peer.version;
+      let peerLedgerCode = null;
+      let peerLedgerFatal = null;
+      try {
+        // Unreachable server: the head resolution must fail TYPED (a
+        // FlureeError with code/fatal), never as a crash or a hang.
+        await peer.ledger("remote:main");
+      } catch (e) {
+        peerLedgerCode = e.code ?? null;
+        peerLedgerFatal = e.fatal ?? null;
+      }
+      peer.close();
+
       const report = {
         status: "pass",
         version: pg.version,
@@ -105,6 +129,12 @@
         staleCode,
         postAlive,
         recycleAttempts,
+        peer: {
+          version: peerVersion,
+          tokenReasons,
+          ledgerCode: peerLedgerCode,
+          ledgerFatal: peerLedgerFatal,
+        },
         timings,
       };
       out.textContent = JSON.stringify(report, null, 2);

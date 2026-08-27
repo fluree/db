@@ -193,16 +193,32 @@ try {
     r?.crashFatal === true &&
     r?.staleCode === "not_found" &&
     r?.postAlive === true;
-  if (phase1 && phase2) {
+  // Phase 3 (A1 peer boundary, serverless): connect() resolved with the
+  // token supplied over the EVENT channel (getToken called exactly once,
+  // reason "connect" — init itself carries no credential), and an
+  // unreachable remote failed typed and non-fatal.
+  const phase3 =
+    r?.peer?.version === r?.version &&
+    Array.isArray(r?.peer?.tokenReasons) &&
+    r.peer.tokenReasons.join(",") === "connect" &&
+    typeof r?.peer?.ledgerCode === "string" &&
+    r.peer.ledgerCode.length > 0 &&
+    r.peer.ledgerCode !== "engine_crashed" &&
+    r.peer.ledgerFatal !== true;
+  if (phase1 && phase2 && phase3) {
     console.log(`PASS: create → insert → query returned ${r.rows} rows via ${r.transport} transport ` +
       `(engine ${r.version}; init ${r.timings.init} ms, insert ${r.timings.insert} ms, query ${r.timings.query} ms); ` +
       `crash/recycle: typed ${r.crashCode}, stale snapshot → ${r.staleCode}, ` +
-      `engine back after ${r.recycleAttempts} attempt(s)`);
+      `engine back after ${r.recycleAttempts} attempt(s); ` +
+      `peer boundary: token via event channel (${r.peer.tokenReasons.join(",")}), ` +
+      `unreachable remote → typed ${r.peer.ledgerCode}`);
     exit = 0;
   } else if (!phase1) {
     console.error("FAIL: page did not report the expected rows");
-  } else {
+  } else if (!phase2) {
     console.error("FAIL: crash/recycle phase did not report the expected typed outcomes");
+  } else {
+    console.error("FAIL: peer-boundary phase did not report the expected typed outcomes");
   }
 } catch (err) {
   console.error("FAIL:", err.message ?? err);
