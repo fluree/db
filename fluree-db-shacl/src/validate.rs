@@ -89,6 +89,11 @@ struct ClassMembershipCtx<'a> {
     /// Current RDFS hierarchy for always-on entailment: property paths and
     /// pair constraints traverse `p` plus its subproperties.
     hierarchy: Option<&'a SchemaHierarchy>,
+    /// Lowering-time IRI resolver override for `sh:sparql` constraint
+    /// queries. Staging passes the staged namespace registry so a constraint
+    /// over a namespace the in-flight transaction introduced matches its
+    /// staged data; `None` falls back to the data snapshot's registry.
+    iri_encoder: Option<&'a (dyn fluree_db_query::parse::IriEncoder + Sync)>,
 }
 
 /// SHACL validation engine
@@ -272,6 +277,7 @@ impl ShaclEngine {
         focus_node: &Sid,
         node_types: &[Sid],
         cross_ledger: Option<CrossLedgerMembership<'_>>,
+        iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
     ) -> Result<ValidationReport> {
         let mut results = Vec::new();
 
@@ -339,6 +345,7 @@ impl ShaclEngine {
             cache: &self.class_cache,
             cross_ledger,
             hierarchy: self.hierarchy.as_ref(),
+            iri_encoder,
         };
         let active = ActiveShapeChecks::default();
         for shape in applicable_shapes {
@@ -368,7 +375,8 @@ impl ShaclEngine {
         node_types: &[Sid],
     ) -> Result<ValidationReport> {
         let db = GraphDbRef::new(snapshot, g_id, &NoOverlay, snapshot.t);
-        self.validate_node(db, focus_node, node_types, None).await
+        self.validate_node(db, focus_node, node_types, None, None)
+            .await
     }
 
     /// Validate all focus nodes targeted by shapes
@@ -384,6 +392,19 @@ impl ShaclEngine {
         db: GraphDbRef<'_>,
         cross_ledger: Option<CrossLedgerMembership<'_>>,
     ) -> Result<ValidationReport> {
+        self.validate_all_with_membership_and_encoder(db, cross_ledger, None)
+            .await
+    }
+
+    /// [`Self::validate_all_with_membership`] with an optional lowering-time
+    /// IRI resolver override for `sh:sparql` constraint queries (see
+    /// [`ClassMembershipCtx::iri_encoder`]).
+    pub async fn validate_all_with_membership_and_encoder(
+        &self,
+        db: GraphDbRef<'_>,
+        cross_ledger: Option<CrossLedgerMembership<'_>>,
+        iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
+    ) -> Result<ValidationReport> {
         let mut all_results = Vec::new();
 
         // Collect all shapes for logical constraint resolution
@@ -394,6 +415,7 @@ impl ShaclEngine {
             cache: &self.class_cache,
             cross_ledger,
             hierarchy: self.hierarchy.as_ref(),
+            iri_encoder,
         };
         // Class-target focus nodes are constant across the shape loop (same
         // `db`, same hierarchy), so memoize them per class: several shapes
@@ -577,7 +599,9 @@ impl ShaclEngine {
                 .collect();
 
             // Validate this node against applicable shapes
-            let report = self.validate_node(db, subject, &node_types, None).await?;
+            let report = self
+                .validate_node(db, subject, &node_types, None, None)
+                .await?;
             all_results.extend(report.results);
         }
 
@@ -766,6 +790,7 @@ fn validate_shape<'a>(
                 None,
                 shape.severity,
                 &shape.id,
+                class_ctx.and_then(|c| c.iri_encoder),
             )
             .await?;
             results.extend(sparql_results);
@@ -1764,6 +1789,7 @@ async fn validate_property_shape<'a>(
                 prop_shape.path.as_predicate(),
                 prop_shape.severity,
                 &prop_shape.id,
+                class_ctx.and_then(|c| c.iri_encoder),
             )
             .await?,
         );

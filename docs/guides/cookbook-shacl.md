@@ -440,12 +440,12 @@ they would commit.
 
 `sh:sparql` constraints also work when the shapes live in another ledger
 (cross-ledger `f:shapesSource`) — the query text and its prefix declarations
-travel with the shapes. One namespace caveat, which applies same-ledger too:
-the query lowers against the data ledger's committed namespace registry, so a
-constraint over a predicate whose namespace has never been committed to the
-data ledger cannot match until some transaction introducing that namespace
-commits. In practice the shapes target classes the data already uses, so this
-only surfaces on a brand-new ledger's very first write.
+travel with the shapes. At write time the query lowers against the *staged*
+namespace registry, so a constraint matches data from the very transaction
+that first introduces its namespace. A constraint over vocabulary the data
+ledger has never seen anywhere is silently inert — it lowers to terms that
+match no data and yields no rows, never an error — so shapes can ship rules
+for classes and predicates the data doesn't use yet.
 
 ## RDFS entailment in enforcement
 

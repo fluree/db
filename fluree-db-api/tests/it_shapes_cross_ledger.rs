@@ -618,10 +618,97 @@ async fn sh_sparql_constraint_enforced_across_ledgers() {
         .expect("seed D config");
     let data = r.ledger;
 
-    // Conforming write first: sh:sparql lowering resolves the query's IRIs
-    // against the data ledger's namespace registry, so `ex:` must be
-    // committed before a constraint over `ex:name` can match (a known
-    // sh:sparql limitation, same-ledger and cross-ledger alike).
+    // The very first write on D mints the `ex:` namespace — sh:sparql
+    // lowering runs against the STAGED registry, so the constraint must
+    // already see the in-flight transaction's data.
+    let err = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:al",
+                "@type": "ex:Person",
+                "ex:name": "Al"
+            }),
+        )
+        .await
+        .expect_err("2-char name must violate the sh:sparql constraint");
+    assert_shacl_violation(err, "sh:sparql over the wire (first-mint namespace)");
+
+    fluree
+        .graph(data_id)
+        .transact()
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@id": "ex:alice",
+            "@type": "ex:Person",
+            "ex:name": "Alice"
+        }))
+        .commit()
+        .await
+        .expect("3+-char name must conform");
+}
+
+/// A constraint over vocabulary the data ledger has never seen is silently
+/// inert — never an error and never a spurious violation. The query's
+/// unknown IRI lowers to a never-matching Sid, so it yields no rows.
+#[tokio::test]
+async fn sh_sparql_over_unknown_vocabulary_is_inert() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-shapes/unknown-vocab-model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let shapes_graph_iri = "http://example.org/governance/shapes";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix sh:   <http://www.w3.org/ns/shacl#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{shapes_graph_iri}> {{
+                ex:PersonShape
+                    rdf:type        sh:NodeShape ;
+                    sh:targetClass  ex:Person ;
+                    sh:sparql       ex:futureConstraint .
+                ex:futureConstraint
+                    sh:message "future-vocab rule" ;
+                    sh:select "SELECT $this ?value WHERE {{ $this <http://not-yet.example/anywhere#p> ?value }}" .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed M shape over unknown vocabulary");
+
+    let data_id = "test/cross-ledger-shapes/unknown-vocab-data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let config_iri = config_graph_iri(data_id);
+    let r = fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:shaclDefaults <urn:cfg:shacl> .
+                <urn:cfg:shacl> f:shaclEnabled true .
+                <urn:cfg:shacl> f:shapesSource <urn:cfg:shapes-ref> .
+                <urn:cfg:shapes-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:shapes-src> .
+                <urn:cfg:shapes-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{shapes_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config");
+    let data = r.ledger;
+
     fluree
         .insert(
             data,
@@ -633,25 +720,7 @@ async fn sh_sparql_constraint_enforced_across_ledgers() {
             }),
         )
         .await
-        .expect("3+-char name must conform");
-
-    let err = fluree
-        .graph(data_id)
-        .transact()
-        .insert(&json!({
-            "@context": {"ex": "http://example.org/ns/"},
-            "@id": "ex:al",
-            "@type": "ex:Person",
-            "ex:name": "Al"
-        }))
-        .commit()
-        .await
-        .map(|_| ())
-        .expect_err("2-char name must violate the sh:sparql constraint");
-    assert!(
-        format!("{err:?}").contains("ShaclViolation"),
-        "sh:sparql over the wire: expected ShaclViolation, got: {err:?}"
-    );
+        .expect("constraint over never-seen vocabulary must be inert, not an error");
 }
 
 /// Compiled-shape reuse stays sound across model-ledger updates: repeated

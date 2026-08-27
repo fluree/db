@@ -23,9 +23,14 @@
 //! # Execution
 //!
 //! Parsing happens at shape-compile time (snapshot-independent); lowering to
-//! query IR happens per validation against the *data* snapshot's namespace
-//! registry, so cross-ledger `f:shapesSource` shapes encode against the graph
-//! being validated. Pre-binding injects a single-row `VALUES` for `$this`
+//! query IR happens per validation against the *data* ledger's namespace
+//! registry — the staged registry when the caller provides one (so a
+//! constraint over a namespace the in-flight transaction introduced matches
+//! its staged data), else the data snapshot's — so cross-ledger
+//! `f:shapesSource` shapes encode against the graph being validated. An IRI
+//! whose namespace the data ledger has never seen lowers to a never-matching
+//! Sid: constraints over absent vocabulary are silently inert, not errors.
+//! Pre-binding injects a single-row `VALUES` for `$this`
 //! (and `$PATH`, on property shapes with a plain predicate path) into every
 //! scope (top level, union branches, optionals, GRAPH bodies, and
 //! sub-selects) — the standard implementation of the spec's solution-mapping
@@ -398,6 +403,13 @@ fn materialize_binding(
 /// Every solution row of the constraint's SELECT (with `$this` pre-bound to
 /// `focus`) becomes one violation. `fallback_path` is the owning property
 /// shape's predicate path, reported when the solution does not bind `?path`.
+///
+/// `iri_encoder`, when provided, overrides the lowering term resolver —
+/// staging passes the staged namespace registry (snapshot + this
+/// transaction's allocations) so a constraint over a namespace the in-flight
+/// transaction introduced matches its staged data. Either way, an IRI whose
+/// namespace the ledger has never seen lowers to a never-matching Sid: a
+/// constraint over vocabulary with no data is silently inert, never an error.
 pub(crate) async fn validate_sparql_constraint(
     db: GraphDbRef<'_>,
     focus: &Sid,
@@ -405,6 +417,7 @@ pub(crate) async fn validate_sparql_constraint(
     fallback_path: Option<&Sid>,
     severity: Severity,
     source_shape: &Sid,
+    iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<Vec<ValidationResult>> {
     if constraint.deactivated {
         return Ok(Vec::new());
@@ -418,15 +431,18 @@ pub(crate) async fn validate_sparql_constraint(
             message: e.clone(),
         })?;
 
-    // Lower against the DATA snapshot's namespace registry — a fresh
-    // registry per call keeps compiled shapes snapshot-independent (the
-    // shapes cache can outlive namespace allocations on the data ledger).
+    // Lower against the staged registry when one is provided, else the data
+    // snapshot — a fresh `VarRegistry` per call keeps compiled shapes
+    // snapshot-independent (the shapes cache can outlive namespace
+    // allocations on the data ledger).
     let mut vars = VarRegistry::new();
-    let mut query = fluree_db_sparql::lower_sparql(ast, db.snapshot, &mut vars).map_err(|e| {
-        ShaclError::SparqlConstraint {
-            constraint: constraint.source.clone(),
-            message: format!("failed to lower sh:select query: {e}"),
-        }
+    let lowered = match iri_encoder {
+        Some(encoder) => fluree_db_sparql::lower_sparql(ast, &encoder, &mut vars),
+        None => fluree_db_sparql::lower_sparql(ast, db.snapshot, &mut vars),
+    };
+    let mut query = lowered.map_err(|e| ShaclError::SparqlConstraint {
+        constraint: constraint.source.clone(),
+        message: format!("failed to lower sh:select query: {e}"),
     })?;
 
     // Lowered variables register under their `?`-prefixed surface name.

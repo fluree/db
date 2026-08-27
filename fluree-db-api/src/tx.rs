@@ -578,8 +578,12 @@ pub(crate) struct StagedShaclContext<'a> {
 
     /// Staged `NamespaceRegistry` — D's snapshot namespaces plus
     /// any IRIs the in-flight transaction has registered. Required
-    /// when `cross_ledger_shapes` is `Some`; consulted as the term
-    /// context for compiling M's wire-form shapes against D.
+    /// when `cross_ledger_shapes` is `Some` (the term context for
+    /// compiling M's wire-form shapes against D); also the
+    /// lowering-time IRI resolver for `sh:sparql` constraint
+    /// queries, so constraints over namespaces this transaction
+    /// introduced match their staged data. `None` (commit replay)
+    /// lowers against the snapshot registry.
     pub staged_ns: Option<&'a fluree_db_transact::namespace::NamespaceRegistry>,
 
     /// Namespace codes this operation introduced, which the snapshot will not
@@ -1228,6 +1232,13 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     //    what mode their violations carry. `None` = shapes-exist heuristic
     //    path → every graph validated in reject mode (the transact helper's
     //    default when policy is absent).
+    // sh:sparql constraint queries lower against the staged registry when
+    // the caller threads one — snapshot namespaces plus this transaction's
+    // allocations — so a constraint over a namespace the in-flight
+    // transaction introduced still matches its staged data.
+    let sparql_iri_encoder = ctx
+        .staged_ns
+        .map(|r| r as &(dyn fluree_db_query::parse::IriEncoder + Sync));
     let outcome = validate_view_with_shacl(
         view,
         shacl_cache,
@@ -1237,6 +1248,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         per_graph_policy.as_ref(),
         &membership_g_ids,
         ctx.cross_ledger_membership,
+        sparql_iri_encoder,
     )
     .await?;
 
@@ -1495,7 +1507,7 @@ async fn stage_with_config_shacl(
             graph_sids: Some(&graph_sids),
             tracker,
             cross_ledger_shapes: cross_ledger_shapes.as_ref().and_then(|m| m.wire()),
-            staged_ns: cross_ledger_shapes.as_ref().map(|_| &ns_registry),
+            staged_ns: Some(&ns_registry),
             uncommitted_namespaces: Some(ns_registry.delta()),
             txn_context,
             inline_shape_bundle,
@@ -3494,7 +3506,7 @@ impl crate::Fluree {
                     graph_sids: None,
                     tracker,
                     cross_ledger_shapes: cross_ledger_shapes.as_ref().and_then(|m| m.wire()),
-                    staged_ns: cross_ledger_shapes.as_ref().map(|_| &ns_registry),
+                    staged_ns: Some(&ns_registry),
                     // The prefixes this document declared, which the snapshot has
                     // not seen yet — without them a violation on a predicate the
                     // document introduces has no IRI to report.

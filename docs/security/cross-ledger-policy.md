@@ -455,11 +455,11 @@ Specifics:
   re-resolving M at replay time could see a different head.
 - **`sh:sparql` constraints travel over the wire** — the query
   text, `sh:prefixes` declarations, and their `owl:imports`
-  closure are all projected. One caveat: the query lowers
-  against D's committed namespace registry, so a constraint over
-  a predicate whose namespace has never been committed to D
-  cannot match until that namespace lands (this mirrors the
-  same-ledger behavior).
+  closure are all projected. At write time the query lowers
+  against D's *staged* namespace registry, so a constraint
+  matches data from the very transaction that first introduces
+  its namespace; a constraint over vocabulary D has never seen
+  anywhere is silently inert (no rows, never an error).
 - **Steady-state cost is one nameservice lookup.** The wire is
   cached per `(model, graph, resolved_t)` and the *compiled*
   shapes (including parsed `sh:sparql` queries) are reused
