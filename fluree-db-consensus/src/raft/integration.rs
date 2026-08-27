@@ -123,6 +123,25 @@ pub struct RaftIntegration {
     /// [`attach_ledger_manager`](Self::attach_ledger_manager) once
     /// `Fluree` exists.
     ledger_manager: Arc<OnceLock<Arc<fluree_db_api::LedgerManager>>>,
+    /// File-registry adoption inputs, when the embedder configured
+    /// them (see [`RaftBootstrapConfig::adopt_file_registry`]):
+    /// where the predecessor registry lives, and the marker file
+    /// under the raft storage root that records a completed replay.
+    adoption: Option<AdoptionPaths>,
+}
+
+/// Where a configured file-registry adoption reads from and how it
+/// remembers completion. Derived in [`RaftIntegration::bootstrap`].
+#[derive(Clone, Debug)]
+struct AdoptionPaths {
+    /// The store root holding the predecessor `ns@v2` registry.
+    registry_root: PathBuf,
+    /// `<raft storage root>/file-registry-adopted` — written after a
+    /// successful replay. Node-local on purpose: only the node that
+    /// initialized the cluster ever adopts, and a crash between the
+    /// (idempotent, conflict-tolerant) replay and this write is
+    /// healed by simply replaying again on the next boot.
+    marker: PathBuf,
 }
 
 /// Shared HTTP transport: a `reqwest::Client` paired with the
@@ -190,6 +209,7 @@ impl RaftIntegration {
             nameservice,
             release_rx: Arc::new(Mutex::new(Some(release_rx))),
             ledger_manager,
+            adoption: None,
         }
     }
 
@@ -224,6 +244,13 @@ impl RaftIntegration {
     /// - `POST /cluster/add-learner` (the existing leader, naming
     ///   this node) — joins an existing cluster.
     pub async fn bootstrap(config: RaftBootstrapConfig) -> Result<Self, RaftBootstrapError> {
+        let adoption = config
+            .adopt_file_registry
+            .as_ref()
+            .map(|root| AdoptionPaths {
+                registry_root: root.clone(),
+                marker: config.storage_path.join("file-registry-adopted"),
+            });
         let storage = Arc::new(FsRaftStorage::open(config.storage_path).await?);
 
         let event_bus = Arc::new(LedgerEventBus::new(config.event_bus_capacity));
@@ -265,7 +292,7 @@ impl RaftIntegration {
 
         let raft = Raft::new(config.node_id, raft_cfg, factory, log, sm).await?;
 
-        Ok(Self::new(
+        let mut integration = Self::new(
             Arc::new(raft),
             config.node_id,
             shared_state,
@@ -280,7 +307,9 @@ impl RaftIntegration {
                 config: network_config,
             },
             release_rx,
-        ))
+        );
+        integration.adoption = adoption;
+        Ok(integration)
     }
 
     /// Inter-node Raft RPC router. Mount under `/raft` on the private
@@ -313,6 +342,173 @@ impl RaftIntegration {
     /// staged receipts.
     pub fn nameservice(&self) -> Arc<RaftNameService> {
         Arc::clone(&self.nameservice)
+    }
+
+    /// Replay a predecessor file-nameservice registry into the
+    /// replicated one — the transition boot for a deployment moving
+    /// from the single-node file posture into raft.
+    ///
+    /// Call on the node that performed `Raft::initialize`, once a
+    /// leader is known (a fresh single voter elects itself within the
+    /// election timeout). Joining nodes must NOT call this — they
+    /// receive the registry by replication like any other log state.
+    ///
+    /// Semantics:
+    /// - No-op unless the bootstrap config carried
+    ///   [`adopt_file_registry`](RaftBootstrapConfig::adopt_file_registry),
+    ///   and at most once per raft storage root: a marker file written
+    ///   after a successful replay makes every later call `Ok(0)`.
+    ///   The registry is deliberately replayed ONLY into the machine
+    ///   this node just initialized — after that, the file registry
+    ///   beside the store goes stale on every raft write and must
+    ///   never be consulted again (embedders should guard their
+    ///   non-raft boot path accordingly).
+    /// - Each non-retracted record replays as ordinary proposals:
+    ///   ledger init, commit head, index head, and the config / status
+    ///   values VERBATIM. Retracted records are skipped — a tombstone
+    ///   carries no live state.
+    /// - Crash-safe by idempotence, not atomicity: a crash between the
+    ///   replay and the marker write re-runs the replay next boot, and
+    ///   every step tolerates its own prior success (`AlreadyExists`
+    ///   on init; a head CAS conflict where the machine already holds
+    ///   a value at least as new; a config/status conflict).
+    ///
+    /// Returns how many ledger records were carried.
+    pub async fn adopt_file_registry(&self) -> Result<usize, FileRegistryAdoptionError> {
+        use fluree_db_nameservice::{
+            CasResult, ConfigLookup, ConfigPublisher, LedgerLifecycle, NameServiceError,
+            NameServiceLookup, RefKind, RefLookup, RefPublisher, RefValue, StatusLookup,
+            StatusPublisher,
+        };
+
+        let Some(adoption) = &self.adoption else {
+            return Ok(0);
+        };
+        if adoption.marker.is_file() {
+            return Ok(0);
+        }
+        let registry = adoption.registry_root.join("ns@v2");
+        let finish = |adopted: usize| -> Result<usize, FileRegistryAdoptionError> {
+            std::fs::write(
+                &adoption.marker,
+                format!("adopted {adopted} ledger records\n"),
+            )
+            .map_err(FileRegistryAdoptionError::Marker)?;
+            Ok(adopted)
+        };
+        if !registry.is_dir() {
+            return finish(0);
+        }
+        let file_ns = fluree_db_nameservice::file::FileNameService::new(&adoption.registry_root);
+        let records = file_ns
+            .all_records()
+            .await
+            .map_err(FileRegistryAdoptionError::Registry)?;
+
+        let publisher = self.nameservice();
+        let mut adopted = 0usize;
+        for record in records {
+            if record.retracted {
+                continue;
+            }
+            let ledger_id = &record.ledger_id;
+            match publisher.init(ledger_id).await {
+                Ok(()) | Err(NameServiceError::LedgerAlreadyExists(_)) => {}
+                Err(e) => return Err(FileRegistryAdoptionError::replay(ledger_id, "init", e)),
+            }
+            if record.commit_head_id.is_some() {
+                let head = RefValue {
+                    id: record.commit_head_id.clone(),
+                    t: record.commit_t,
+                };
+                match publisher.fast_forward_commit(ledger_id, &head, 3).await {
+                    Ok(CasResult::Updated) => {}
+                    // A retried replay finds its own prior write; a
+                    // machine already AHEAD of the file registry means
+                    // raft writes happened, which the marker should
+                    // have prevented — still nothing to carry.
+                    Ok(CasResult::Conflict { actual })
+                        if actual.as_ref().is_some_and(|a| a.t >= record.commit_t) => {}
+                    Ok(CasResult::Conflict { actual }) => {
+                        return Err(FileRegistryAdoptionError::Diverged {
+                            ledger_id: ledger_id.clone(),
+                            kind: "commit head",
+                            detail: format!(
+                                "machine holds {actual:?}, registry carries t={}",
+                                record.commit_t
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(FileRegistryAdoptionError::replay(
+                            ledger_id,
+                            "commit head",
+                            e,
+                        ))
+                    }
+                }
+            }
+            if record.index_head_id.is_some() {
+                let idx = RefValue {
+                    id: record.index_head_id.clone(),
+                    t: record.index_t,
+                };
+                // Read-then-CAS: a freshly initialized ledger may hold
+                // an implicit empty index ref, and a retried replay
+                // holds the previous attempt's value — start from
+                // whatever is actually there.
+                let current = publisher
+                    .get_ref(ledger_id, RefKind::IndexHead)
+                    .await
+                    .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "index head", e))?;
+                if !current.as_ref().is_some_and(|c| c.t >= record.index_t) {
+                    match publisher
+                        .compare_and_set_ref(ledger_id, RefKind::IndexHead, current.as_ref(), &idx)
+                        .await
+                    {
+                        Ok(CasResult::Updated) => {}
+                        Ok(CasResult::Conflict { actual }) => {
+                            return Err(FileRegistryAdoptionError::Diverged {
+                                ledger_id: ledger_id.clone(),
+                                kind: "index head",
+                                detail: format!(
+                                    "machine holds {actual:?}, registry carries t={}",
+                                    record.index_t
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            return Err(FileRegistryAdoptionError::replay(
+                                ledger_id,
+                                "index head",
+                                e,
+                            ))
+                        }
+                    }
+                }
+            }
+            if let Ok(Some(config)) = file_ns.get_config(ledger_id).await {
+                match publisher.push_config(ledger_id, None, &config).await {
+                    // A conflict is a retried replay's own prior write.
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(FileRegistryAdoptionError::replay(ledger_id, "config", e))
+                    }
+                }
+            }
+            if let Ok(Some(status)) = file_ns.get_status(ledger_id).await {
+                match publisher.push_status(ledger_id, None, &status).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(FileRegistryAdoptionError::replay(ledger_id, "status", e))
+                    }
+                }
+            }
+            tracing::info!(ledger = %ledger_id, t = record.commit_t, index_t = record.index_t,
+                "file registry record adopted into the replicated nameservice");
+            adopted += 1;
+        }
+        finish(adopted)
     }
 
     /// Cluster admin router — bootstrap and membership-change
@@ -365,6 +561,15 @@ pub struct RaftBootstrapConfig {
     /// this far behind receive `RecvError::Lagged` and fall back to
     /// a catch-up sweep.
     pub event_bus_capacity: usize,
+    /// Store root that MAY hold a predecessor file-nameservice
+    /// registry (`<root>/ns@v2`), for a deployment moving from the
+    /// single-node file posture into raft. When set, the node that
+    /// initializes the cluster calls
+    /// [`RaftIntegration::adopt_file_registry`] once after election
+    /// and every record replays into the replicated registry —
+    /// existence, both heads, config and status verbatim. `None`
+    /// (the default) means no adoption is ever attempted.
+    pub adopt_file_registry: Option<PathBuf>,
 }
 
 impl RaftBootstrapConfig {
@@ -380,7 +585,16 @@ impl RaftBootstrapConfig {
             raft_config: runtime::default_raft_config(&network_config.transport),
             network_config,
             event_bus_capacity: 1024,
+            adopt_file_registry: None,
         }
+    }
+
+    /// Configure file-registry adoption (see the field docs): `root`
+    /// is the store directory whose `ns@v2` subtree holds the
+    /// predecessor registry.
+    pub fn with_file_registry_adoption(mut self, root: impl Into<PathBuf>) -> Self {
+        self.adopt_file_registry = Some(root.into());
+        self
     }
 }
 
@@ -411,6 +625,48 @@ pub enum RaftBootstrapError {
     /// surfaced during initial state load.
     #[error("raft startup: {0}")]
     RaftStart(#[from] RaftFatal<NodeId>),
+}
+
+/// Failures out of [`RaftIntegration::adopt_file_registry`].
+#[derive(Debug, Error)]
+pub enum FileRegistryAdoptionError {
+    /// Reading the predecessor file registry failed.
+    #[error("reading the file registry: {0}")]
+    Registry(fluree_db_nameservice::NameServiceError),
+    /// One record's replay failed at the named step.
+    #[error("adopting '{ledger_id}' ({step}): {source}")]
+    Replay {
+        ledger_id: String,
+        step: &'static str,
+        source: fluree_db_nameservice::NameServiceError,
+    },
+    /// The replicated registry already holds DIFFERENT state for a
+    /// ledger — the machine was written outside this adoption, which
+    /// the completion marker should have prevented. Refuse rather
+    /// than guess which side is authoritative.
+    #[error("adopting '{ledger_id}' ({kind}): registry diverged — {detail}")]
+    Diverged {
+        ledger_id: String,
+        kind: &'static str,
+        detail: String,
+    },
+    /// Writing the completion marker failed.
+    #[error("writing the adoption marker: {0}")]
+    Marker(std::io::Error),
+}
+
+impl FileRegistryAdoptionError {
+    fn replay(
+        ledger_id: &str,
+        step: &'static str,
+        source: fluree_db_nameservice::NameServiceError,
+    ) -> Self {
+        Self::Replay {
+            ledger_id: ledger_id.to_string(),
+            step,
+            source,
+        }
+    }
 }
 
 // ============================================================================
