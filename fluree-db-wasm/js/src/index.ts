@@ -27,6 +27,9 @@
 import type {
   CommitReceipt,
   ErrorShape,
+  EventBody,
+  EventMessage,
+  HeadChangeEvent,
   InitRequest,
   InitResult,
   LedgerInfo,
@@ -40,11 +43,23 @@ import type {
 export type {
   CommitReceipt,
   ErrorShape,
+  EventBody,
+  HeadChangeEvent,
   LedgerInfo,
   QueryKind,
   ResultTransport,
   SnapshotInfo,
 } from "./protocol.js";
+
+/** A head-change notification as delivered to `Peer.on("headChange", …)`. */
+export interface HeadChange {
+  /** Normalized `name:branch` ledger id. */
+  ledger: string;
+  /** New commit watermark. */
+  t: number;
+  /** New index watermark. */
+  indexT: number;
+}
 
 /** Error raised for engine failures. `code` is stable; `status` mirrors the
  * HTTP status the same failure would carry on the Fluree server. `fatal`
@@ -90,6 +105,23 @@ export interface QueryOptions {
   transport?: ResultTransport;
 }
 
+export interface ConnectOptions
+  extends Pick<PlaygroundOptions, "workerUrl" | "wasmUrl" | "resultTransport" | "maxMemoryBytes"> {
+  /**
+   * Produce a bearer token with `fluree.storage.*` scope. Called on connect
+   * AND again whenever the worker reconnects after a crash recycle — the
+   * init message replayed to a fresh worker never carries credentials, so
+   * this callback is the single source of them. Omitting it makes every
+   * connect fail typed `unauthorized` (public/anonymous serving is a future
+   * server tier).
+   */
+  getToken?: (reason: "connect" | "reconnect") => string | Promise<string>;
+  /** Ledgers to start SSE head tracking for at connect (`[]` = everything
+   * the token may see). Omit for no tracking; `Peer.on("headChange")` then
+   * never fires until a future subscribe surface is used. */
+  subscribe?: string[];
+}
+
 function defaultMaxMemoryBytes(): number {
   const MiB = 1024 * 1024;
   const dev = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
@@ -115,7 +147,9 @@ const MAX_RESPAWN_ATTEMPTS = 3;
 /** Base backoff before a respawn; doubles per consecutive failure. */
 const RESPAWN_BACKOFF_MS = 250;
 
-/** Request/response multiplexer over a worker, with crash-recycling. */
+/** Request/response multiplexer over a worker, with crash-recycling and
+ * event dispatch (unsolicited worker→main messages: head changes, token
+ * requests). */
 class Channel {
   private worker: Worker | null;
   private readonly pending = new Map<number, Pending>();
@@ -123,6 +157,9 @@ class Channel {
   private closed = false;
   /** Replayed into every fresh worker so a recycled engine comes back ready. */
   private initMsg: Omit<InitRequest, "id"> | null = null;
+  /** Answers the worker's `tokenRequest` events (peer mode). */
+  getToken: ((reason: "connect" | "reconnect") => string | Promise<string>) | null = null;
+  private readonly eventListeners = new Set<(event: EventBody) => void>();
   /** Bumped on every recycle; `Ledger`/`Snapshot` objects stamp it at
    * creation so pre-crash handles can never alias a fresh engine's state
    * (review H-4). */
@@ -149,9 +186,21 @@ class Channel {
     this.respawnAttempts = 0;
   }
 
+  /** Subscribe to worker events; returns the unsubscriber. */
+  addEventListener(listener: (event: EventBody) => void): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
   private attach(worker: Worker): void {
-    worker.onmessage = (ev: MessageEvent<Response>) => {
+    worker.onmessage = (ev: MessageEvent<Response | EventMessage>) => {
       const msg = ev.data;
+      // The two message families are disjoint by shape (protocol.ts): an
+      // event carries `event`, a response carries `ok`.
+      if ("event" in msg) {
+        this.handleEvent(msg);
+        return;
+      }
       const p = this.pending.get(msg.id);
       if (p) {
         this.pending.delete(msg.id);
@@ -180,6 +229,44 @@ class Channel {
       for (const p of this.pending.values()) p.reject(err);
       this.pending.clear();
     };
+  }
+
+  /** Route one worker event: token requests are answered here (the version
+   * gate ignores unknown kinds/versions so newer workers stay compatible);
+   * everything else fans out to listeners. */
+  private handleEvent(msg: EventMessage): void {
+    if (msg.v !== 1) return;
+    const event = msg.event;
+    if (event.kind === "tokenRequest") {
+      const answer = (token?: string, error?: string) =>
+        this.post({ op: "tokenResponse", requestId: event.requestId, token, error });
+      const getToken = this.getToken;
+      if (!getToken) {
+        answer(undefined, "no getToken callback configured on connect()");
+        return;
+      }
+      void Promise.resolve()
+        .then(() => getToken(event.reason))
+        .then(
+          (token) => answer(token),
+          (err) => answer(undefined, `getToken failed: ${String(err)}`),
+        );
+      return;
+    }
+    for (const listener of this.eventListeners) {
+      try {
+        listener(event);
+      } catch {
+        // A listener's throw must not break dispatch to the others.
+      }
+    }
+  }
+
+  /** Post a request without registering a pending entry — for
+   * fire-and-forget answers the worker never replies to. */
+  private post(req: RequestBody): void {
+    if (this.closed || this.worker === null) return;
+    this.worker.postMessage({ ...req, id: this.nextId++ });
   }
 
   /** Kill the poisoned worker, fail everything in flight, and — within the
@@ -219,10 +306,12 @@ class Channel {
       this.worker = this.spawn();
       this.attach(this.worker);
       if (this.initMsg) {
-        // Re-init in the background. Success resets the failure budget; a
+        // Re-init in the background, marked as a replay: peer mode turns
+        // that into a `tokenRequest` with reason "reconnect" (init itself
+        // never carries credentials). Success resets the failure budget; a
         // fatal failure re-enters recycle() via the normal reply path, so the
         // cause is never swallowed — it becomes the next terminal message.
-        void this.call(this.initMsg)
+        void this.call({ ...this.initMsg, reinit: true })
           .then((res) => {
             if (res.ok) this.markInitialized();
           })
@@ -522,4 +611,97 @@ export async function playground(options: PlaygroundOptions = {}): Promise<Playg
   );
   channel.markInitialized();
   return new Playground(channel, init, transport);
+}
+
+/**
+ * A read-only peer engine over a remote Fluree server: heads resolve through
+ * the server's nameservice, blocks arrive CID-verified and cached
+ * (IndexedDB), queries run locally. Transacting through a peer rejects with
+ * a typed `unsupported` — commits are ordered by the origin server.
+ */
+export class Peer {
+  /** Engine (crate) version. */
+  readonly version: string;
+
+  constructor(
+    private readonly channel: Channel,
+    init: InitResult,
+    private readonly transport: ResultTransport,
+  ) {
+    this.version = init.version;
+  }
+
+  /** Open a remote ledger (resolves its head; rejects `not_found` for
+   * unknown or unauthorized ledgers — the server answers both identically).
+   * The returned `Ledger`'s transact methods reject `unsupported` in peer
+   * mode; `query`/`snapshot`/`info` work exactly as in the playground. */
+  async ledger(id: string): Promise<Ledger> {
+    const info = unwrap<LedgerInfo>(await this.channel.call({ op: "ledgerInfo", ledger: id }));
+    return new Ledger(this.channel, info, this.transport);
+  }
+
+  /**
+   * Subscribe to ledger head changes (SSE head tracking must be active —
+   * the `subscribe` connect option). The engine has already absorbed the
+   * advance when the callback runs: a new `snapshot()` sees the new head;
+   * existing snapshots stay frozen. Returns the unsubscriber.
+   *
+   * This is the fan-out primitive the live-query tier builds on; it fires
+   * per ledger advance, not per query.
+   */
+  on(kind: "headChange", listener: (change: HeadChange) => void): () => void {
+    void kind;
+    return this.channel.addEventListener((event) => {
+      if (event.kind === "headChange") {
+        listener({ ledger: event.ledger, t: event.t, indexT: event.indexT });
+      }
+    });
+  }
+
+  /** Terminate the worker (driver, SSE, caches' in-memory tier included).
+   * The IndexedDB block cache persists for the next session. */
+  close(): void {
+    this.channel.close();
+  }
+}
+
+/**
+ * Connect to a remote Fluree server as a local read-only peer.
+ *
+ * `url` is the versioned API base (`https://host/v1/fluree`). The worker is
+ * spawned and the `.wasm` compiled lazily, then the token is requested from
+ * `options.getToken` over the event channel (never embedded in the init
+ * message — a crash recycle replays init and re-asks instead of replaying a
+ * credential). Resolves once the engine is ready; no network I/O has
+ * happened yet beyond the wasm fetch — heads resolve on first
+ * `ledger()`/`snapshot()`.
+ */
+export async function connect(url: string, options: ConnectOptions = {}): Promise<Peer> {
+  // Same literal-worker-expression rule as playground() (review H-6).
+  const override = options.workerUrl;
+  const channel = new Channel(
+    override === undefined
+      ? () =>
+          new Worker(new URL("./worker.js", import.meta.url), {
+            type: "module",
+            name: "fluree-db-wasm",
+          })
+      : () => new Worker(override, { type: "module", name: "fluree-db-wasm" }),
+  );
+  channel.getToken = options.getToken ?? null;
+  const transport = options.resultTransport ?? "transfer";
+  const maxMemoryBytes =
+    options.maxMemoryBytes === null ? undefined : (options.maxMemoryBytes ?? defaultMaxMemoryBytes());
+  const init = unwrap<InitResult>(
+    await channel.call({
+      op: "init",
+      mode: "peer",
+      url,
+      subscribe: options.subscribe,
+      wasmUrl: options.wasmUrl === undefined ? undefined : String(options.wasmUrl),
+      maxMemoryBytes,
+    }),
+  );
+  channel.markInitialized();
+  return new Peer(channel, init, transport);
 }

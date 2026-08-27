@@ -14,47 +14,46 @@
 //!   a worker, though — the wasm-bindgen tests run it in one, and a page could
 //!   instantiate it on the main thread at the cost of blocking during queries.
 //! - **Queries run against frozen snapshots** (adversarial review F6): a
-//!   [`Playground::snapshot`] pins a `GraphDb` view under an integer handle
-//!   and every query names a handle, so a head advance — or, in the future
-//!   peer mode, the fetch-and-re-run miss loop — can never see the view move
-//!   mid-query. Only buffered results are exposed; the engine's streaming
-//!   entry (`run_stream_query`) is deliberately not bound, because rows
-//!   emitted before completion cannot participate in that re-run loop.
-//! - **One memory setting** (adversarial review F4): the constructor takes an
-//!   optional byte ceiling that is applied to every query as its memory
-//!   budget (`QueryCancellation::set_memory_limit`), so an oversized query
-//!   fails with a typed `out_of_memory` (HTTP-style 507) instead of growing
-//!   linear memory until the allocator traps and kills the worker. When the
-//!   browser-io crate lands its engine-wide memory governor, this becomes the
-//!   single number handed to it.
+//!   snapshot pins a `GraphDb` view under an integer handle and every query
+//!   names a handle, so a head advance — SSE-driven in peer mode — can never
+//!   move the view mid-query. Only buffered results are exposed; the engine's
+//!   streaming entry (`run_stream_query`) is deliberately not bound, because
+//!   rows emitted before completion cannot participate in the peer's
+//!   fetch-and-re-run loop.
+//! - **One memory setting** (adversarial review F4): the byte ceiling becomes
+//!   each query's memory budget (`QueryCancellation::set_memory_limit`, typed
+//!   `out_of_memory` on breach), and in peer mode additionally derives every
+//!   browser-io knob via `BrowserIoConfig::from_max_memory` — the single
+//!   governor the F4 review asked for.
 //! - **JSON in, JSON out.** Inputs arrive as JSON text (SPARQL is passed as
 //!   the query string itself). Query results leave as UTF-8 JSON *bytes*
 //!   (`Vec<u8>` → `Uint8Array`) so the worker can hand the buffer to the main
 //!   thread as a transferable with zero copies at the boundary; small
 //!   metadata (receipts, ledger/snapshot info) leaves as a JSON string.
-//! - **Playground = memory ledgers.** [`Playground`] wraps
-//!   `FlureeBuilder::memory().build_memory()`: the in-process, novelty-only
-//!   engine with `IndexingMode::Disabled`. Everything lives in linear memory
-//!   for the life of the worker. The peer/cache mode (remote CID-verified
-//!   blocks, IndexedDB/OPFS cache) is a separate constructor on the same JS
-//!   surface, built in `fluree-db-browser`, and is not wired here yet.
+//! - **Two engine modes, one surface.** [`Playground`] wraps
+//!   `FlureeBuilder::memory().build_memory()`: in-process memory ledgers,
+//!   read-write, no server. [`peer::Peer`] (wasm-only module) wraps
+//!   `fluree-db-browser`'s `BrowserPeer`: remote ledgers read locally from
+//!   CID-verified blocks, read-only, with SSE head tracking. Both expose the
+//!   identical snapshot/query methods via [`engine::EngineCore`].
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+mod engine;
 mod error;
+#[cfg(target_arch = "wasm32")]
+mod peer;
 
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use fluree_db_api::{
-    Fluree, FlureeBuilder, GraphDb, GraphSnapshotQueryBuilder, QueryExecutionOptions,
-    TransactResultRef,
-};
-use serde_json::{json, Value as JsonValue};
 use wasm_bindgen::prelude::*;
 
-use crate::error::{api_error, invalid_json, js_error, serialize_failed};
+#[cfg(target_arch = "wasm32")]
+pub use peer::{connect_peer, Peer};
+
+use fluree_db_api::{FlureeBuilder, TransactResultRef};
+use serde_json::json;
+
+use crate::engine::{ledger_info_json, parse_json, sanitize_bytes, EngineCore};
+use crate::error::{api_error, js_error};
 
 /// Runs once per module instantiation: route Rust panics to `console.error`
 /// with a message instead of an opaque `RuntimeError: unreachable`. A panic
@@ -81,13 +80,10 @@ pub fn version() -> String {
 /// borrowed only between awaits, never across one.
 #[wasm_bindgen]
 pub struct Playground {
-    fluree: Fluree,
-    /// Per-query memory budget in bytes; `None` = the engine's process
-    /// default (1 GiB on wasm32). See F4 note in the module docs.
+    core: EngineCore,
+    /// The full ceiling (the per-query budget equals it in playground mode);
+    /// kept separately for the transact pre-gate.
     max_memory_bytes: Option<usize>,
-    /// Frozen `GraphDb` views, keyed by the handle handed to JS.
-    snapshots: RefCell<HashMap<u32, Arc<GraphDb>>>,
-    next_handle: Cell<u32>,
 }
 
 impl Default for Playground {
@@ -108,13 +104,10 @@ impl Playground {
     /// (see [`Self::insert`] and `js/README.md`).
     #[wasm_bindgen(constructor)]
     pub fn new(max_memory_bytes: Option<f64>) -> Playground {
+        let max = sanitize_bytes(max_memory_bytes);
         Playground {
-            fluree: FlureeBuilder::memory().build_memory(),
-            max_memory_bytes: max_memory_bytes
-                .filter(|b| b.is_finite() && *b >= 1.0)
-                .map(|b| b as usize),
-            snapshots: RefCell::new(HashMap::new()),
-            next_handle: Cell::new(1),
+            core: EngineCore::new(FlureeBuilder::memory().build_memory(), max),
+            max_memory_bytes: max,
         }
     }
 
@@ -124,7 +117,8 @@ impl Playground {
     #[wasm_bindgen(js_name = createLedger)]
     pub async fn create_ledger(&self, ledger_id: String) -> Result<String, JsValue> {
         let state = self
-            .fluree
+            .core
+            .fluree()
             .create_ledger(&ledger_id)
             .await
             .map_err(api_error)?;
@@ -139,30 +133,20 @@ impl Playground {
     /// Rejects with `not_found` for unknown ledgers.
     #[wasm_bindgen(js_name = ledgerInfo)]
     pub async fn ledger_info(&self, ledger_id: String) -> Result<String, JsValue> {
-        let state = self.fluree.ledger(&ledger_id).await.map_err(api_error)?;
-        Ok(ledger_info_json(
-            state.ledger_id(),
-            state.t(),
-            state.index_t(),
-        ))
+        self.core.ledger_info(&ledger_id).await
     }
 
     /// Freeze the ledger's current head as a queryable snapshot. Resolves to
     /// `{"handle","id","t"}`; the handle stays valid — and the view immutable,
     /// later commits notwithstanding — until [`Self::release`].
     pub async fn snapshot(&self, ledger_id: String) -> Result<String, JsValue> {
-        let view = self.fluree.db(&ledger_id).await.map_err(api_error)?;
-        let handle = self.next_handle.get();
-        self.next_handle.set(handle.wrapping_add(1));
-        let info = json!({ "handle": handle, "id": view.ledger_id.as_ref(), "t": view.t });
-        self.snapshots.borrow_mut().insert(handle, Arc::new(view));
-        Ok(info.to_string())
+        self.core.snapshot(&ledger_id).await
     }
 
     /// Drop a snapshot. Returns whether the handle existed. Never errors —
     /// releasing twice is a no-op.
     pub fn release(&self, snapshot: u32) -> bool {
-        self.snapshots.borrow_mut().remove(&snapshot).is_some()
+        self.core.release(snapshot)
     }
 
     /// Insert JSON-LD (`data` is the JSON text of a node, node array, or
@@ -171,7 +155,8 @@ impl Playground {
         self.transact_pregate("insert body", data.len())?;
         let data = parse_json("transaction body", &data)?;
         let out = self
-            .fluree
+            .core
+            .fluree()
             .graph(&ledger_id)
             .transact()
             .insert(&data)
@@ -187,7 +172,8 @@ impl Playground {
         self.transact_pregate("upsert body", data.len())?;
         let data = parse_json("transaction body", &data)?;
         let out = self
-            .fluree
+            .core
+            .fluree()
             .graph(&ledger_id)
             .transact()
             .upsert(&data)
@@ -202,7 +188,8 @@ impl Playground {
         self.transact_pregate("update document", data.len())?;
         let data = parse_json("update document", &data)?;
         let out = self
-            .fluree
+            .core
+            .fluree()
             .graph(&ledger_id)
             .transact()
             .update(&data)
@@ -221,7 +208,8 @@ impl Playground {
     ) -> Result<String, JsValue> {
         self.transact_pregate("SPARQL update", sparql.len())?;
         let out = self
-            .fluree
+            .core
+            .fluree()
             .graph(&ledger_id)
             .transact()
             .sparql_update(&sparql)
@@ -236,14 +224,7 @@ impl Playground {
     /// CONSTRUCT/DESCRIBE — the same shapes the HTTP `/query` route returns.
     #[wasm_bindgen(js_name = querySparql)]
     pub async fn query_sparql(&self, snapshot: u32, sparql: String) -> Result<Vec<u8>, JsValue> {
-        let view = self.view(snapshot)?;
-        let result = GraphSnapshotQueryBuilder::new_from_parts(&self.fluree, &view)
-            .sparql(&sparql)
-            .execution_options(self.exec_options())
-            .execute_formatted()
-            .await
-            .map_err(api_error)?;
-        to_bytes(&result)
+        self.core.query_sparql(snapshot, &sparql).await
     }
 
     /// Run a JSON-LD query (`query` is the JSON text of the query object)
@@ -251,15 +232,7 @@ impl Playground {
     /// JSON-LD result format.
     #[wasm_bindgen(js_name = queryJsonld)]
     pub async fn query_jsonld(&self, snapshot: u32, query: String) -> Result<Vec<u8>, JsValue> {
-        let query = parse_json("query", &query)?;
-        let view = self.view(snapshot)?;
-        let result = GraphSnapshotQueryBuilder::new_from_parts(&self.fluree, &view)
-            .jsonld(&query)
-            .execution_options(self.exec_options())
-            .execute_formatted()
-            .await
-            .map_err(api_error)?;
-        to_bytes(&result)
+        self.core.query_jsonld(snapshot, &query).await
     }
 
     /// Test hook: deliberately panic — i.e. trap the wasm instance — so the
@@ -301,43 +274,6 @@ impl Playground {
         }
         Ok(())
     }
-
-    /// Clone the pinned view out of the slab; the borrow ends before any await.
-    fn view(&self, handle: u32) -> Result<Arc<GraphDb>, JsValue> {
-        self.snapshots
-            .borrow()
-            .get(&handle)
-            .cloned()
-            .ok_or_else(|| {
-                js_error(
-                    error::code::NOT_FOUND,
-                    404,
-                    &format!("snapshot handle {handle} was released or never existed"),
-                )
-            })
-    }
-
-    fn exec_options(&self) -> QueryExecutionOptions {
-        let mut opts = QueryExecutionOptions::default();
-        if let Some(limit) = self.max_memory_bytes {
-            let cancellation = fluree_db_core::QueryCancellation::new();
-            cancellation.set_memory_limit(limit);
-            opts.cancellation = Some(cancellation);
-        }
-        opts
-    }
-}
-
-fn parse_json(what: &str, text: &str) -> Result<JsonValue, JsValue> {
-    serde_json::from_str(text).map_err(|e| invalid_json(what, e))
-}
-
-fn to_bytes(value: &JsonValue) -> Result<Vec<u8>, JsValue> {
-    serde_json::to_vec(value).map_err(serialize_failed)
-}
-
-fn ledger_info_json(id: &str, t: i64, index_t: i64) -> String {
-    json!({ "id": id, "t": t, "indexT": index_t }).to_string()
 }
 
 fn receipt_json(out: &TransactResultRef) -> String {

@@ -1,7 +1,17 @@
 /**
  * Message protocol between the main-thread proxy (`index.ts`) and the engine
- * worker (`worker.ts`). Every request carries a client-assigned `id`; the
- * worker answers exactly once with the same `id`.
+ * worker (`worker.ts`).
+ *
+ * Two message families cross the boundary:
+ *
+ * - **Requests/responses**: every request carries a client-assigned `id`;
+ *   the worker answers exactly once with the same `id`.
+ * - **Events** (`EventMessage`, versioned): unsolicited worker→main pushes —
+ *   head-change fan-out, and the worker's token requests (answered by the
+ *   fire-and-forget `tokenResponse` request; the *event* is worker→main, the
+ *   *answer* rides the normal main→worker direction with no reply expected).
+ *   The two families are disjoint by shape: a response has `ok`, an event
+ *   has `event`.
  *
  * Boundary values are plain JSON except query results, which travel as UTF-8
  * JSON bytes in a transferred `ArrayBuffer` by default (see
@@ -12,9 +22,9 @@
  * dependency-free: it is imported by both sides and by the smoke test.
  */
 
-/** Which mode a worker was initialized in. Peer mode is reserved for the
- * remote-cache transport (`fluree-db-browser`) and is not implemented here. */
-export type EngineMode = "playground";
+/** Which mode a worker was initialized in: in-memory read-write playground,
+ * or the read-only remote peer (`fluree-db-browser`'s `BrowserPeer`). */
+export type EngineMode = "playground" | "peer";
 
 /** How query-result bytes cross the worker boundary.
  *
@@ -41,8 +51,33 @@ export interface InitRequest {
   mode: EngineMode;
   /** Override for the `.wasm` location (defaults to next to the worker's glue). */
   wasmUrl?: string;
-  /** Per-query memory budget in bytes (F4). Omit for the engine default. */
+  /** The one memory ceiling (F4): per-query budget in playground mode; in
+   * peer mode it additionally derives the whole browser-io budget split.
+   * Omit for the engine defaults. */
   maxMemoryBytes?: number;
+  /** Peer mode: the server's versioned API base (`https://host/v1/fluree`).
+   * NEVER a token — init is replayed verbatim on worker recycle, so
+   * credentials go through the `tokenRequest` event instead. */
+  url?: string;
+  /** Peer mode: ledgers to subscribe head tracking to at init (empty array =
+   * everything the token may see; omit = no tracking until requested). */
+  subscribe?: string[];
+  /** Set by the proxy when this init is a recycle replay — surfaces as the
+   * token request's `reason: "reconnect"`. */
+  reinit?: boolean;
+}
+
+/** Answer to a `tokenRequest` event. Fire-and-forget: no response comes
+ * back — the worker's pending connect continues (or fails typed) with it. */
+export interface TokenResponseRequest {
+  id: number;
+  op: "tokenResponse";
+  /** Echo of the event's `requestId`. */
+  requestId: number;
+  /** The bearer token; omitted when the main thread could not produce one. */
+  token?: string;
+  /** Why no token, when `token` is absent. */
+  error?: string;
 }
 
 export interface LedgerRequest {
@@ -90,12 +125,46 @@ export interface DebugCrashRequest {
 
 export type Request =
   | InitRequest
+  | TokenResponseRequest
   | LedgerRequest
   | SnapshotRequest
   | ReleaseRequest
   | TransactRequest
   | QueryRequest
   | DebugCrashRequest;
+
+// ---------------------------------------------------------------------------
+// Events: unsolicited worker→main messages.
+// ---------------------------------------------------------------------------
+
+/** A ledger head advanced (peer mode, SSE head tracking). The engine has
+ * already absorbed it: the next snapshot of that ledger sees the new head;
+ * existing snapshots stay frozen. */
+export interface HeadChangeEvent {
+  kind: "headChange";
+  ledger: string;
+  t: number;
+  indexT: number;
+}
+
+/** The worker needs a bearer token (peer connect, including the re-connect
+ * inside a crash recycle — init carries no credentials by design). The main
+ * thread answers with a `tokenResponse` request echoing `requestId`. */
+export interface TokenRequestEvent {
+  kind: "tokenRequest";
+  requestId: number;
+  reason: "connect" | "reconnect";
+}
+
+export type EventBody = HeadChangeEvent | TokenRequestEvent;
+
+/** Envelope for events. `v` is the event-protocol version: a consumer must
+ * ignore event kinds — and versions — it does not know, so new kinds can
+ * ship without breaking older main-thread bundles against newer workers. */
+export interface EventMessage {
+  v: 1;
+  event: EventBody;
+}
 
 export interface ErrorShape {
   code: string;
