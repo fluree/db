@@ -11,6 +11,7 @@ use fluree_db_browser::driver::IdbCache;
 use fluree_db_browser::{
     start_driver, BrowserIoConfig, CacheConfig, ChannelSseSource, DriverSleeper, HeadSink,
     HttpTransport, IoJob, RemoteEvent, TransportError, TransportRequest, WasmFetchTransport,
+    WriteBehindGauge,
 };
 use fluree_db_core::{ContentId, ContentKind};
 use gloo_timers::future::TimeoutFuture;
@@ -43,6 +44,41 @@ fn cache_config(db_name: &str, budget: u64) -> CacheConfig {
 
 fn cid_of(bytes: &[u8]) -> ContentId {
     ContentId::new(ContentKind::IndexLeaf, bytes)
+}
+
+/// Wedge an IndexedDB name deterministically: hold a live connection, then
+/// queue a `deleteDatabase` behind it. The delete cannot run while the
+/// connection is open, and every later open of that name queues behind the
+/// delete — silently, with no `success`, no `error`, not even `blocked`.
+/// Closing the returned holder releases the queue.
+///
+/// An ABSENT database opens fine, which is why no fresh-profile test can
+/// produce this shape.
+async fn wedge(name: &'static str) -> std::rc::Rc<IdbCache> {
+    let holder = IdbCache::open(&cache_config(name, 1024))
+        .await
+        .expect("holder opens");
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = IdbCache::delete_database(name).await;
+    });
+    TimeoutFuture::new(100).await;
+    holder
+}
+
+/// Poll `probe` until it holds, up to `budget_ms`. Returns whether it did —
+/// callers assert on that, so a timeout is a failure with a message, never
+/// a silent pass.
+async fn settles_within<F: FnMut() -> bool>(budget_ms: u32, mut probe: F) -> bool {
+    let step = 25;
+    let mut waited = 0;
+    while waited < budget_ms {
+        if probe() {
+            return true;
+        }
+        TimeoutFuture::new(step).await;
+        waited += step;
+    }
+    probe()
 }
 
 #[wasm_bindgen_test]
@@ -367,4 +403,228 @@ async fn driver_serves_fetches_when_the_cache_never_opens() {
     io.shutdown();
     holder.close();
     TimeoutFuture::new(200).await;
+}
+
+/// **Rule 2 of the driver's contract: the cache open is BOUNDED, and
+/// resolving it is what releases the writes parked behind it.**
+///
+/// `driver_serves_fetches_when_the_cache_never_opens` sets a 30 s
+/// `cache_open_timeout` precisely so the bound never fires — it pins rules
+/// 1 and 3 and cannot pin this one. Nothing else exercised the timeout, or
+/// a `CachePut`'s write-behind permit being credited when the cache never
+/// opens, which is the coupling that makes a wedged cache visible to fetch
+/// admission at all.
+///
+/// Both halves are asserted, because either alone is passable by a broken
+/// driver: the put is still parked (its permit still charged) while the
+/// open is outstanding — a driver that silently dropped every put would
+/// fail here — and its permit is credited once the bound fires.
+#[wasm_bindgen_test]
+async fn a_wedged_cache_open_times_out_and_frees_the_write_behind_it() {
+    let name = "fluree-cas-test-open-timeout";
+    let holder = wedge(name).await;
+
+    let io = start_driver(BrowserIoConfig {
+        cache: cache_config(name, 1024),
+        cache_open_timeout: Duration::from_millis(750),
+        ..Default::default()
+    });
+
+    let gauge = WriteBehindGauge::new(4096);
+    let payload = vec![7u8; 64];
+    let permit = gauge.acquire(payload.len() as u64).await;
+    assert_eq!(gauge.outstanding(), 64, "the permit is charged up front");
+    io.send(IoJob::CachePut {
+        key: cid_of(&payload),
+        bytes: Arc::from(payload.clone()),
+        permit: Some(permit),
+    })
+    .unwrap();
+
+    // Inside the bound: the write really does WAIT for the open. (Writes
+    // wait where reads do not — dropping a put loses persistence for
+    // exactly the blocks a cold start fetches first.)
+    TimeoutFuture::new(200).await;
+    assert_eq!(
+        gauge.outstanding(),
+        64,
+        "a queued put must wait for the open, not be dropped on the floor"
+    );
+
+    // Past the bound: the open resolves as unavailable, and that is what
+    // releases the parked write — bytes abandoned, permit credited.
+    let freed = settles_within(3_000, || gauge.outstanding() == 0).await;
+    assert!(
+        freed,
+        "the bounded open must release the parked write's permit; still {} outstanding",
+        gauge.outstanding()
+    );
+
+    io.shutdown();
+    holder.close();
+    TimeoutFuture::new(200).await;
+}
+
+/// **Rule 4: parked writes are bounded, so a wedged cache cannot starve
+/// fetch admission.**
+///
+/// A parked `CachePut` holds its write-behind permit, and
+/// `WriteBehindGauge::acquire` is awaited INSIDE the fetch-slot scope — so
+/// parked puts spend fetch admission. Let them fill the budget and every
+/// fetch slot blocks until the open resolves. Past the parked bound (a
+/// quarter of the write-behind budget) a put must therefore credit its
+/// permit immediately instead of waiting.
+///
+/// The discriminator is exact rather than directional: with the bound at
+/// 100 bytes, the first 64-byte put parks and the second does not, so the
+/// gauge must read exactly one permit's worth while the open is still
+/// outstanding.
+#[wasm_bindgen_test]
+async fn parked_writes_past_the_bound_credit_their_permits_at_once() {
+    let name = "fluree-cas-test-parked-bound";
+    let holder = wedge(name).await;
+
+    let io = start_driver(BrowserIoConfig {
+        cache: cache_config(name, 1024),
+        cache_open_timeout: Duration::from_millis(1_500),
+        // A quarter of this is the parked bound: 100 bytes.
+        write_behind_budget_bytes: 400,
+        ..Default::default()
+    });
+
+    let gauge = WriteBehindGauge::new(4096);
+    let first = vec![1u8; 64];
+    let second = vec![2u8; 64];
+    let p1 = gauge.acquire(64).await;
+    let p2 = gauge.acquire(64).await;
+    assert_eq!(gauge.outstanding(), 128, "both permits charged");
+
+    for (bytes, permit) in [(first, p1), (second, p2)] {
+        io.send(IoJob::CachePut {
+            key: cid_of(&bytes),
+            bytes: Arc::from(bytes),
+            permit: Some(permit),
+        })
+        .unwrap();
+    }
+
+    // Well inside `cache_open_timeout`, so nothing here is the bound in
+    // rule 2 firing: the second put is past the PARKED bound (64 + 64 >
+    // 100) and gives its permit back at once, while the first is still
+    // parked on the open.
+    let bounded = settles_within(500, || gauge.outstanding() == 64).await;
+    assert!(
+        bounded,
+        "the put past the parked bound must credit its permit immediately, \
+         leaving exactly one parked; outstanding = {}",
+        gauge.outstanding()
+    );
+
+    // And the survivor is released when the open finally resolves.
+    let freed = settles_within(3_000, || gauge.outstanding() == 0).await;
+    assert!(
+        freed,
+        "the parked write is released when the open resolves; still {} outstanding",
+        gauge.outstanding()
+    );
+
+    io.shutdown();
+    holder.close();
+    TimeoutFuture::new(200).await;
+}
+
+/// **A timed-out open must not be DROPPED.**
+///
+/// `request()` in `driver/idb.rs` clears its `onsuccess`/`onerror` only
+/// after its await returns, and `open_db` clears `onupgradeneeded` /
+/// `onblocked` only on the normal path. Dropping the open future therefore
+/// drops those `Closure`s while a live `IDBOpenDBRequest` still references
+/// them, and a LATE event then invokes a dropped closure — wasm-bindgen
+/// throws "closure invoked recursively or after being dropped", uncaught,
+/// which in the shell reaches `worker.onerror` and recycles the engine
+/// (losing residency and every subscription) over an IndexedDB that was
+/// merely slow.
+///
+/// That late event is reachable exactly where the bound is aimed: a
+/// genuinely blocked open resolves once the other connection closes, which
+/// can easily be past the timeout. Here the wedge is released AFTER the
+/// bound fires, so the driver's open completes with nobody waiting.
+///
+/// Ran-marker: IndexedDB serializes requests per database name, so this
+/// test's own open — queued last — can only succeed once the driver's open
+/// has run. Without it the "no uncaught errors" assertion would be vacuous.
+#[wasm_bindgen_test]
+async fn an_open_that_lands_after_the_timeout_does_not_fire_a_dropped_closure() {
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::{JsCast, JsValue};
+
+    let errors = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let listener = {
+        let errors = Arc::clone(&errors);
+        Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let message = js_sys::Reflect::get(&event, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "<no message>".to_string());
+            errors.lock().unwrap().push(message);
+        })
+    };
+    let global: web_sys::EventTarget = js_sys::global().unchecked_into();
+    global
+        .add_event_listener_with_callback("error", listener.as_ref().unchecked_ref())
+        .expect("listen for uncaught errors");
+
+    let name = "fluree-cas-test-late-open";
+    let holder = wedge(name).await;
+
+    let io = start_driver(BrowserIoConfig {
+        cache: cache_config(name, 1024),
+        cache_open_timeout: Duration::from_millis(300),
+        ..Default::default()
+    });
+    // Past the bound: the driver has given up on this open.
+    TimeoutFuture::new(600).await;
+
+    // Release the wedge. The queued delete completes, and the driver's open
+    // — which nobody is waiting for any more — then runs to completion,
+    // firing `upgradeneeded` and `success` on a request whose handlers must
+    // still be alive.
+    holder.close();
+    // Bounded, and in its OWN task for the same reason the driver's open is:
+    // a dropped open would leave dangling handlers of the test's own making.
+    let (probe_tx, probe_rx) = futures::channel::oneshot::channel();
+    wasm_bindgen_futures::spawn_local(async move {
+        // Closing matters: an open connection left behind would block the
+        // next `deleteDatabase` on this name forever.
+        let ok = match IdbCache::open(&cache_config(name, 1024)).await {
+            Ok(cache) => {
+                cache.close();
+                true
+            }
+            Err(_) => false,
+        };
+        let _ = probe_tx.send(ok);
+    });
+    let drained = matches!(
+        futures::future::select(probe_rx, TimeoutFuture::new(5_000)).await,
+        futures::future::Either::Left((Ok(true), _))
+    );
+    assert!(
+        drained,
+        "ran-marker: the wedge must clear, which means the driver's open (queued first) ran"
+    );
+    // Give any late event a turn to dispatch before reading the log.
+    TimeoutFuture::new(200).await;
+
+    let seen = errors.lock().unwrap().clone();
+    assert!(
+        seen.is_empty(),
+        "a late open event must not invoke a dropped closure: {seen:?}"
+    );
+
+    global
+        .remove_event_listener_with_callback("error", listener.as_ref().unchecked_ref())
+        .expect("stop listening");
+    io.shutdown();
+    TimeoutFuture::new(100).await;
 }
