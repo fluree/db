@@ -33,7 +33,11 @@ export default defineConfig({
     // engine's worker module and its .wasm come back 403 and peer mode dies
     // as `engine_crashed` with nothing in the page console, because the
     // failure happens inside the worker.
-    fs: { allow: [here("../..")] },
+    //
+    // Exactly the two trees the aliases need, not the repo root: the wide
+    // form also serves `/@fs/<repo>/.git/config` to anything that can reach
+    // the dev server, and a demo is where people copy patterns from.
+    fs: { allow: [here(".."), here("../../fluree-db-wasm/js")] },
     // The Fluree server runs on 8090 by default; proxying keeps the demo
     // same-origin so CORS configuration is not part of the demo's story.
     proxy: {

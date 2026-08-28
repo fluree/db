@@ -66,12 +66,22 @@ async function buildClient(): Promise<LiveClient> {
 }
 
 function fail(err: unknown): void {
-  const root = document.getElementById("root");
-  if (root) {
-    root.innerHTML = `<main><h1>Could not start</h1><pre>${String(err)}</pre>
-      <p>Is the Fluree server running? See demo/README.md.</p></main>`;
-  }
   console.error(err);
+  const root = document.getElementById("root");
+  if (!root) return;
+  // Built as nodes rather than interpolated into `innerHTML`. `String(err)`
+  // here carries the server's raw response body, which is not ours to trust
+  // and not ours to parse as markup — and a demo is where people copy
+  // patterns from.
+  const main = document.createElement("main");
+  const heading = document.createElement("h1");
+  heading.textContent = "Could not start";
+  const detail = document.createElement("pre");
+  detail.textContent = String(err);
+  const hint = document.createElement("p");
+  hint.textContent = "Is the Fluree server running? See demo/README.md.";
+  main.append(heading, detail, hint);
+  root.replaceChildren(main);
 }
 
 async function main(): Promise<void> {

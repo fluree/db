@@ -67,10 +67,14 @@ so it does not linger in history or logs. Peer mode needs:
    bearer token carrying **both** `fluree.events.*` and `fluree.storage.*`
    claims. The shipped `fluree-events-token` CLI only mints the events half —
    the storage claim has to be added by hand;
-3. `server.fs.allow` covering the repo root (already set here). Both aliases
-   resolve outside `demo/`, and Vite's dev server otherwise 403s the worker
-   module and the `.wasm` — which surfaces only as `engine_crashed`, with
-   nothing in the page console, because the failure is inside the worker.
+3. `server.fs.allow` covering `fluree-react/` and `fluree-db-wasm/js/`
+   (already set here). Both aliases resolve outside `demo/`, and Vite's dev
+   server otherwise 403s the worker module and the `.wasm` — which surfaces
+   only as `engine_crashed`, with nothing in the page console, because the
+   failure is inside the worker. Grant those two trees and not the repo root:
+   the wide form serves every file in your working copy — `Cargo.toml`, any
+   `.env`, and in an ordinary clone `.git/config` — to anything that can
+   reach the dev server.
 
 Everything else is identical: same components, same hooks, same result
 shapes. The only line that differs is the `createClient` call in
