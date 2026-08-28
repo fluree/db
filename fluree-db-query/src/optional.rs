@@ -307,6 +307,17 @@ impl PatternOptionalBuilder {
     /// through instead of extended. The per-row `build` path substitutes the
     /// row's own object (and leaves an unbound one free), so it is exactly
     /// right here; this shape declines the probe and takes it.
+    ///
+    /// The alternative — widen the probe to materialise the object and let
+    /// `unify_check` filter — was declined because `Binding`'s `PartialEq`
+    /// answers `false`, not an error, across representations (`EncodedSid` vs
+    /// `Sid`, `Sid` vs `Iri`, `EncodedLit` vs `Lit`), so a cross-representation
+    /// object correlation would silently DROP rows; #1729 is a live instance on
+    /// the literal/datatype arm. Note this narrows the exposure rather than
+    /// removing it: `substitute_pattern` leaves a late-materialised
+    /// `EncodedSid`/`EncodedPid`/`EncodedLit` object free, and `unify_check`'s
+    /// `left_val == right_val` is then what enforces the correlation on the
+    /// per-row path too.
     fn object_var_shared_with_required(&self) -> bool {
         matches!(&self.pattern.o, Term::Var(v) if !self.optional_only_vars.contains(v))
     }
@@ -455,21 +466,37 @@ impl PatternOptionalBuilder {
 /// Append one correlation binding to a cache key, or return `false` when it
 /// has no stable encoding (the caller then declines to cache).
 ///
+/// The key is the SUBSTITUTED PATTERN, not the row: this mirrors
+/// [`PatternOptionalBuilder::substitute_pattern`] position by position, so a
+/// slot that substitution pushes a value into is keyed by that value, and a
+/// slot it leaves free gets the same `u` token whatever the row held. Two rows whose
+/// substituted patterns are identical then share one scan — which is what the
+/// cache is for, since `unify_check` re-applies the row's own correlation when
+/// the pending match is drained.
+///
 /// Every variable-length component is length-prefixed so two different
 /// correlation tuples can never concatenate to the same bytes.
-fn push_cache_key_component(key: &mut Vec<u8>, binding: &Binding) -> bool {
+fn push_cache_key_component(
+    key: &mut Vec<u8>,
+    position: PatternPosition,
+    binding: &Binding,
+) -> bool {
     fn push_bytes(key: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
         key.push(tag);
         key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         key.extend_from_slice(bytes);
     }
 
+    // `substitute_pattern` leaves the slot a variable, so "free here" is a
+    // correlation state in its own right and gets its own token rather than
+    // colliding with any bound value.
+    fn push_free(key: &mut Vec<u8>) -> bool {
+        key.push(b'u');
+        true
+    }
+
     match binding {
-        Binding::EncodedSid { s_id, .. } => {
-            key.push(b'S');
-            key.extend_from_slice(&s_id.to_le_bytes());
-            true
-        }
+        Binding::Poisoned => false,
         Binding::Sid { sid, .. } => {
             // Fallback stable key: namespace code + suffix bytes.
             key.push(b's');
@@ -481,20 +508,22 @@ fn push_cache_key_component(key: &mut Vec<u8>, binding: &Binding) -> bool {
             push_bytes(key, b'i', iri.as_bytes());
             true
         }
-        // Not a defect: `substitute_pattern` leaves the slot a variable, so
-        // "unbound here" is a correlation state in its own right and must
-        // get its own key rather than collide with any bound value.
-        Binding::Unbound => {
-            key.push(b'u');
+        // Only the SUBJECT slot resolves an encoded id to an IRI and pushes it
+        // down; elsewhere substitution leaves the slot free.
+        Binding::EncodedSid { s_id, .. } if position == PatternPosition::Subject => {
+            key.push(b'S');
+            key.extend_from_slice(&s_id.to_le_bytes());
             true
         }
-        Binding::Poisoned => false,
-        Binding::EncodedPid { .. } | Binding::EncodedLit { .. } | Binding::Lit { .. } => false,
-        Binding::Grouped(_)
-        | Binding::Path { .. }
-        | Binding::Rel(_)
-        | Binding::List(_)
-        | Binding::Map(_) => false,
+        // A literal OBJECT is pushed down by value (plus a string term
+        // constraint), so rows carrying different literals must not share an
+        // entry. Keying it would need a stable byte encoding of every
+        // `FlakeValue`/datatype pair — more than this fix is buying — so the
+        // row goes uncached instead. In every other slot a literal is left
+        // free, like any other unsubstitutable binding.
+        Binding::Lit { .. } if position == PatternPosition::Object => false,
+        // Everything else: substitution's own `_ => leave as variable` arms.
+        _ => push_free(key),
     }
 }
 
@@ -676,11 +705,11 @@ impl OptionalBuilder for PatternOptionalBuilder {
         row: usize,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<Box<[u8]>>> {
-        // Key on the FULL substituted correlation tuple — every position
-        // `substitute_pattern` reads, not just the subject. `OPTIONAL { ?s <p> ?o }`
+        // Key on the FULL substituted pattern — every position
+        // `substitute_pattern` touches, not just the subject. `OPTIONAL { ?s <p> ?o }`
         // where `?o` also arrives from the left substitutes the object too, so a
         // subject-only key served one row's answer to a row whose `?o` differed.
-        // For the common shape (a left-bound `?s`, a free `?o`) the tuple is still
+        // For the common shape (a left-bound `?s`, a free `?o`) the key is still
         // just the subject and left-side fan-out reuses right-side results as before.
         let _ = ctx;
         if self.has_poisoned_binding(required_batch, row) {
@@ -700,7 +729,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
                 PatternPosition::Object => b'2',
             });
             let binding = required_batch.get_by_col(row, instr.left_col);
-            if !push_cache_key_component(&mut key, binding) {
+            if !push_cache_key_component(&mut key, instr.position, binding) {
                 return Ok(None);
             }
         }
@@ -731,6 +760,15 @@ pub struct GroupedPatternOptionalBuilder {
     triples: Vec<TriplePattern>,
     optional_only_vars: Vec<VarId>,
     subject_left_col: usize,
+    /// The shared subject variable, so `OptionalOperator` can merge it back.
+    ///
+    /// The subject only has to be PRESENT in the required schema, not bound on
+    /// every row: an upstream UNION / VALUES / OPTIONAL can leave it unbound,
+    /// and §18.2.4 then says the merged solution takes the optional side's
+    /// subject. Without this instruction the operator's `shared_merge_cols` is
+    /// empty for this builder and those rows keep a null subject while carrying
+    /// the objects it was found by — a fabricated solution, not a missing one.
+    unify_instructions: Vec<UnifyInstruction>,
     /// Planning context captured at planner-time for the per-row chain.
     planning: PlanningContext,
 }
@@ -768,11 +806,23 @@ impl GroupedPatternOptionalBuilder {
             optional_only_vars.push(obj_var);
         }
 
+        // The per-row chain (`build_fallback_chain`) seeds the whole required
+        // row and appends the optional vars, so the subject sits at
+        // `subject_left_col` in its output too. The BATCHED lane's schema is
+        // optional-only (`grouped_schema`) and carries no subject column —
+        // sound only because `build_batch` refuses a batch containing an
+        // unbound subject, which is the only case the merge has work to do.
+        let unify_instructions = vec![UnifyInstruction {
+            left_col: subject_left_col,
+            right_col: subject_left_col,
+        }];
+
         Ok(Self {
             required_schema,
             triples,
             optional_only_vars,
             subject_left_col,
+            unify_instructions,
             planning,
         })
     }
@@ -976,6 +1026,28 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 row_subject_slots.push(None);
                 continue;
             }
+            // An UNBOUND subject is compatible with every triple this group can
+            // find (§18.2.4), and the merged solution takes the subject the
+            // optional side bound. A per-subject probe has no subject to probe
+            // with, and this lane's batches carry only optional-only vars, so
+            // there would be nothing for `combine_rows` to read the subject
+            // back off. Hand the whole batch to the per-row chain, whose output
+            // does carry it. `resolve_subject_id` already declines here; saying
+            // so explicitly keeps the invariant `unify_instructions` relies on
+            // visible at the place that establishes it.
+            if matches!(
+                required_batch.get_by_col(row, self.subject_left_col),
+                Binding::Unbound
+            ) {
+                tracing::debug!(
+                    predicate_count = self.triples.len(),
+                    start_row,
+                    row,
+                    reason = "unbound-subject",
+                    "grouped optional builder fallback"
+                );
+                return Ok(None);
+            }
             let Some(s_id) = self.resolve_subject_id(required_batch, row, ctx)? else {
                 tracing::debug!(
                     predicate_count = self.triples.len(),
@@ -1123,7 +1195,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
     }
 
     fn unify_instructions(&self) -> &[UnifyInstruction] {
-        &[]
+        &self.unify_instructions
     }
 }
 
@@ -1158,6 +1230,17 @@ pub struct PlanTreeOptionalBuilder {
     unify_instructions: Vec<UnifyInstruction>,
     /// Indices of shared variables in the required schema (for poisoned check)
     shared_var_indices: Vec<usize>,
+    /// Variables the inner patterns can BIND, as opposed to merely read.
+    ///
+    /// Only an unbound correlation variable in here needs `build_batch`'s
+    /// per-row fallback: it is the only kind an inner solution can fill in, and
+    /// a partition by correlation key has no bucket for "matches everything".
+    /// A variable the inner only READS — a FILTER operand — can never be
+    /// extended, so the no-match row the batched lane already emits is right.
+    inner_bindable_vars: HashSet<VarId>,
+    /// True when some inner FILTER could still evaluate `true` with an UNBOUND
+    /// operand, which makes [`Self::inner_bindable_vars`] too narrow a gate.
+    filters_tolerate_unbound: bool,
     /// Stats for nested query optimization
     stats: Option<Arc<StatsView>>,
     /// Planning context captured at planner-time for the per-row inner subplan.
@@ -1226,12 +1309,20 @@ impl PlanTreeOptionalBuilder {
 
         let optional_schema: Arc<[VarId]> = Arc::from(optional_vars.into_boxed_slice());
 
+        let inner_bindable_vars: HashSet<VarId> = inner_patterns
+            .iter()
+            .flat_map(Pattern::produced_vars)
+            .collect();
+        let filters_tolerate_unbound = inner_patterns.iter().any(pattern_filters_tolerate_unbound);
+
         Self {
             inner_patterns,
             optional_schema,
             optional_only_vars,
             unify_instructions,
             shared_var_indices,
+            inner_bindable_vars,
+            filters_tolerate_unbound,
             stats,
             planning,
         }
@@ -1411,28 +1502,46 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         let mut seed_rows: Vec<Vec<Binding>> = Vec::new();
         let mut seen_seed: HashSet<Vec<GroupKeyOwned>> = HashSet::new();
         for row in start_row..n {
-            // An UNBOUND correlation variable is compatible with every inner
-            // solution (§18.2.4), which a partition by correlation key cannot
-            // express — the key would have to match every bucket at once, and
-            // the optional-side batches carry only optional-only vars, so
-            // there is nothing for the merge to read the value back off. Hand
-            // the whole batch to the per-row path, which seeds the inner from
-            // the row and leaves the unbound variable free. Poison, by
-            // contrast, can never match anything.
-            let mut unbound_corr = false;
-            let mut poisoned_corr = false;
+            // An UNBOUND correlation variable the inner can BIND is compatible
+            // with every inner solution (§18.2.4), which a partition by
+            // correlation key cannot express — the key would have to match
+            // every bucket at once, and the optional-side batches carry only
+            // optional-only vars, so there is nothing for the merge to read the
+            // value back off. Hand the whole batch to the per-row path, which
+            // seeds the inner from the row and leaves the variable free.
+            //
+            // Scoped to what the inner can bind, not to every correlation
+            // column: `corr_cols` is every required column REFERENCED by the
+            // inner (`Pattern::referenced_vars`), and `Pattern::Filter` is
+            // hash-join safe, so `OPTIONAL { ?s ex:friend ?f . FILTER(?age>20) }`
+            // would otherwise take the whole coalesced driving side off this
+            // lane for one unbound `?age` — while answering identically, since
+            // a filter the inner cannot bind rejects that row either way. Only
+            // a filter that survives an unbound operand (`BOUND`, `||`, …)
+            // reopens the gate.
+            let mut unbound_bindable = false;
+            let mut unmatchable = false;
             for &c in &corr_cols {
                 let b = required_batch.get_by_col(row, c);
                 if matches!(b, Binding::Unbound) {
-                    unbound_corr = true;
-                    break;
+                    if self.filters_tolerate_unbound
+                        || self.inner_bindable_vars.contains(&req_schema[c])
+                    {
+                        unbound_bindable = true;
+                        break;
+                    }
+                    // Read-only and unbound: no inner solution can supply it and
+                    // the filter that reads it errors either way — the no-match
+                    // row is the answer, exactly as before this fix.
+                    unmatchable = true;
+                    continue;
                 }
-                poisoned_corr |= b.is_poisoned();
+                unmatchable |= b.is_poisoned();
             }
-            if unbound_corr {
+            if unbound_bindable {
                 return Ok(None);
             }
-            if poisoned_corr {
+            if unmatchable {
                 row_keys.push(None);
                 continue;
             }
@@ -1588,6 +1697,54 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
 
     fn unify_instructions(&self) -> &[UnifyInstruction] {
         &self.unify_instructions
+    }
+}
+
+/// Whether a FILTER expression could still evaluate to `true` with one of its
+/// operands UNBOUND.
+///
+/// This decides whether a correlation variable the inner patterns can only
+/// READ still needs the per-row OPTIONAL lane. SPARQL turns an unbound operand
+/// into a type error and every strict operator propagates it, `&&` included
+/// (`error && false` is `false`, `error && true` is an error — never `true`).
+/// So a filter built only from strict operators rejects the row whether it is
+/// evaluated correlated or per-row, and the no-match row the batched lane emits
+/// is already the answer §18.2.4 wants.
+///
+/// Four constructs escape that and are named here: `BOUND` and `COALESCE`
+/// inspect boundness instead of reading through it, `IF` evaluates only the
+/// branch it picks, `||` turns `error || true` into `true`, and `XOR` coerces
+/// rather than propagates. `EXISTS` escapes too — it evaluates a pattern with
+/// the variable free rather than reading it as an operand.
+///
+/// Deliberately conservative: anything this cannot prove strict (the Cypher
+/// comprehension/reduce/member family, a runtime-`Resolved` value) counts as
+/// tolerant, which only means those shapes keep the per-row lane they had.
+fn filter_tolerates_unbound(expr: &crate::ir::Expression) -> bool {
+    use crate::ir::expression::Function;
+    use crate::ir::Expression;
+
+    match expr {
+        Expression::Var(_) | Expression::Const(_) => false,
+        Expression::Call { func, args } => {
+            matches!(
+                func,
+                Function::Bound | Function::Coalesce | Function::If | Function::Or | Function::Xor
+            ) || args.iter().any(filter_tolerates_unbound)
+        }
+        _ => true,
+    }
+}
+
+/// [`filter_tolerates_unbound`] lifted to a pattern, recursing through the
+/// wrappers `inner_pattern_is_hash_join_safe` admits.
+fn pattern_filters_tolerate_unbound(p: &Pattern) -> bool {
+    match p {
+        Pattern::Filter(expr) => filter_tolerates_unbound(expr),
+        Pattern::DefaultGraphSource { patterns } => {
+            patterns.iter().any(pattern_filters_tolerate_unbound)
+        }
+        _ => false,
     }
 }
 
@@ -3778,5 +3935,185 @@ mod tests {
         );
         // Left-join preserves every driving row (all OPTIONAL misses).
         assert_eq!(out_rows, 6, "every driving row survives the left join");
+    }
+
+    /// A grouped chain of single-triple OPTIONALs shares its SUBJECT with the
+    /// required side, so `OptionalOperator` needs a merge instruction for it —
+    /// otherwise a row whose subject an upstream UNION/VALUES left unbound
+    /// keeps a null subject while carrying the objects it was found by.
+    #[test]
+    fn grouped_builder_reports_its_subject_as_a_merge_column() {
+        // required [?s, ?name]; OPTIONAL { ?s :email ?email } OPTIONAL { ?s :age ?age }
+        let required_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        let triples = vec![
+            make_optional_pattern(),
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(101, "age")),
+                Term::Var(VarId(3)),
+            ),
+        ];
+        let builder = GroupedPatternOptionalBuilder::new(
+            required_schema,
+            triples,
+            crate::temporal_mode::PlanningContext::current(),
+        )
+        .expect("grouped builder");
+
+        assert_eq!(builder.unify_instructions().len(), 1);
+        assert_eq!(
+            builder.unify_instructions()[0].left_col,
+            0,
+            "?s is required column 0, and the merge reads it back off the per-row chain"
+        );
+    }
+
+    fn friend_triple() -> Pattern {
+        // ?s :friend ?f
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(101, "friend")),
+            Term::Var(VarId(2)),
+        ))
+    }
+
+    fn plan_tree_builder(inner: Vec<Pattern>) -> PlanTreeOptionalBuilder {
+        // required [?s, ?age]
+        let required_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        PlanTreeOptionalBuilder::new(
+            required_schema,
+            inner,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        )
+    }
+
+    /// `?age` is a correlation var (`referenced_vars` sees it) that the inner
+    /// can only READ. An unbound one must not take the whole driving side off
+    /// the batched hash-join lane: no inner solution could have bound it, so
+    /// the no-match row the batched lane emits is already correct.
+    #[test]
+    fn a_filter_only_correlation_var_is_not_bindable_by_the_inner() {
+        let expr = crate::ir::Expression::gt(
+            crate::ir::Expression::Var(VarId(1)),
+            crate::ir::Expression::Const(fluree_db_core::FlakeValue::Long(20)),
+        );
+        let builder = plan_tree_builder(vec![friend_triple(), Pattern::Filter(expr)]);
+
+        assert!(builder.inner_bindable_vars.contains(&VarId(0)), "?s");
+        assert!(builder.inner_bindable_vars.contains(&VarId(2)), "?f");
+        assert!(
+            !builder.inner_bindable_vars.contains(&VarId(1)),
+            "?age is a FILTER operand, not something the inner can bind"
+        );
+        assert!(
+            !builder.filters_tolerate_unbound,
+            "`?age > 20` is strict: an unbound operand is an error, never true"
+        );
+    }
+
+    /// …unless the filter survives an unbound operand, in which case the row
+    /// can still join and the per-row lane is the only correct one.
+    #[test]
+    fn a_filter_that_survives_an_unbound_operand_keeps_the_per_row_lane() {
+        let bound_check = crate::ir::Expression::not(crate::ir::Expression::Call {
+            func: crate::ir::expression::Function::Bound,
+            args: vec![crate::ir::Expression::Var(VarId(1))],
+        });
+        let builder = plan_tree_builder(vec![friend_triple(), Pattern::Filter(bound_check)]);
+        assert!(
+            builder.filters_tolerate_unbound,
+            "`!BOUND(?age)` is TRUE precisely when ?age is unbound"
+        );
+    }
+
+    #[test]
+    fn filter_strictness_classification() {
+        use crate::ir::expression::Function;
+        use crate::ir::Expression;
+
+        let age = || Expression::Var(VarId(1));
+        let twenty = || Expression::Const(fluree_db_core::FlakeValue::Long(20));
+
+        // Strict: the error an unbound operand raises propagates out.
+        assert!(!filter_tolerates_unbound(&Expression::gt(age(), twenty())));
+        assert!(!filter_tolerates_unbound(&Expression::not(Expression::gt(
+            age(),
+            twenty()
+        ))));
+        // `error && true` is an error and `error && false` is false — never true.
+        assert!(!filter_tolerates_unbound(&Expression::and(vec![
+            Expression::gt(age(), twenty()),
+            Expression::gt(age(), twenty()),
+        ])));
+
+        // Non-strict: each of these can answer `true` with ?age unbound.
+        assert!(filter_tolerates_unbound(&Expression::or(vec![
+            Expression::gt(age(), twenty()),
+            Expression::Const(fluree_db_core::FlakeValue::Boolean(true)),
+        ])));
+        assert!(filter_tolerates_unbound(&Expression::Call {
+            func: Function::Bound,
+            args: vec![age()],
+        }));
+        assert!(filter_tolerates_unbound(&Expression::Call {
+            func: Function::Coalesce,
+            args: vec![age(), twenty()],
+        }));
+        // Nested under a strict operator still counts.
+        assert!(filter_tolerates_unbound(&Expression::not(
+            Expression::Call {
+                func: Function::Bound,
+                args: vec![age()],
+            }
+        )));
+    }
+
+    /// The cache key is the SUBSTITUTED PATTERN, so a slot substitution leaves
+    /// free keys as free whatever the row held, and two rows that would drive
+    /// the identical scan share one entry.
+    #[test]
+    fn cache_key_keys_a_free_slot_as_free() {
+        fn key(position: PatternPosition, binding: &Binding) -> Option<Vec<u8>> {
+            let mut k = Vec::new();
+            push_cache_key_component(&mut k, position, binding).then_some(k)
+        }
+
+        let encoded = Binding::EncodedSid {
+            s_id: 42,
+            t: None,
+            op: None,
+        };
+        // Object: substitution leaves a late-materialised IRI free, so this must
+        // key identically to an unbound object — N objects, ONE scan.
+        assert_eq!(
+            key(PatternPosition::Object, &encoded),
+            key(PatternPosition::Object, &Binding::Unbound),
+        );
+        // Subject: substitution resolves it and pushes it down, so it keys by value.
+        assert_ne!(
+            key(PatternPosition::Subject, &encoded),
+            key(PatternPosition::Subject, &Binding::Unbound),
+        );
+        assert_ne!(
+            key(PatternPosition::Subject, &encoded),
+            key(
+                PatternPosition::Subject,
+                &Binding::EncodedSid {
+                    s_id: 43,
+                    t: None,
+                    op: None
+                }
+            ),
+        );
+        // A literal OBJECT is pushed down by value; declining to cache is how
+        // rows carrying different literals are kept apart.
+        assert_eq!(
+            key(
+                PatternPosition::Object,
+                &Binding::lit(fluree_db_core::FlakeValue::Long(7), Sid::new(0, "integer"))
+            ),
+            None
+        );
     }
 }
