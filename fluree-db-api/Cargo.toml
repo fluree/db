@@ -502,6 +502,13 @@ path = "tests/it_literal_identity.rs"
 required-features = ["native"]
 
 # Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch AND asserts membership-join routing via span capture.
+[[test]]
+name = "it_membership_join_list_rows"
+path = "tests/it_membership_join_list_rows.rs"
+required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
 # switch AND asserts stats-merge routing via span capture.
 [[test]]
 name = "it_fast_stats_1391_regression"

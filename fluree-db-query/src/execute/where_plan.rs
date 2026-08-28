@@ -2862,12 +2862,28 @@ pub(crate) fn build_scan_or_join(
                 if let Some(key_vars) =
                     membership_join_key_vars(&left_schema, tp, planning, hash_planner, driving_rows)
                 {
-                    return Box::new(crate::membership_join::MembershipJoinOperator::new(
-                        left,
-                        tp.clone(),
-                        key_vars,
-                        *planning,
-                    ));
+                    // The lane honors the differential kill switch
+                    // (`FLUREE_DISABLE_QUERY_FAST_PATHS`) like the other
+                    // fast paths, so a harness can compare it against the
+                    // generic nested-loop join. Checked here rather than in
+                    // `membership_join_key_vars` so the eligibility predicate
+                    // stays pure and the stamp fires only on shapes the lane
+                    // would actually have taken.
+                    if super::fast_paths_disabled() {
+                        crate::fast_path_outcome::stamp_fast_path(
+                            crate::membership_join::MEMBERSHIP_JOIN_SITE,
+                            crate::fast_path_outcome::FastPathOutcome::Fallback(
+                                crate::fast_path_outcome::FastPathFallback::KillSwitch,
+                            ),
+                        );
+                    } else {
+                        return Box::new(crate::membership_join::MembershipJoinOperator::new(
+                            left,
+                            tp.clone(),
+                            key_vars,
+                            *planning,
+                        ));
+                    }
                 }
             }
 
