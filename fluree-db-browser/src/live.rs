@@ -24,6 +24,20 @@
 //! finishes (its results are a consistent view at its `t`), then exactly
 //! one follow-up cycle runs at the latest head ([`Coalescer`]).
 //!
+//! **One concurrency regime per ledger.** Every cycle that EMITS goes
+//! through the [`Coalescer`] — [`advance`](LiveQuerySet::advance) for head
+//! changes and [`prime`](LiveQuerySet::prime) for a mounting subscription
+//! alike — so two cycles for one ledger are never in flight at once and
+//! emission order is snapshot order. That is what makes "subscribers
+//! cannot disagree about which commit they are showing" hold ACROSS
+//! cycles and not merely within one: a cycle that opened its snapshot at
+//! an older head can never emit after a cycle that opened one at a newer
+//! head, so no subscriber is pinned below its siblings and no `last_hash`
+//! is left describing a superseded result. (The pure
+//! [`run_cycle`](LiveQuerySet::run_cycle) family does not emit and is for
+//! hosts that deliver outcomes themselves — such a host owns the
+//! ordering.)
+//!
 //! Invalidation is v1 of the ladder: re-run everything, diff before
 //! notify. The v2 footprint filter plugs into the [`FootprintFilter`]
 //! seam — [`run_cycle_with_flakes`](LiveQuerySet::run_cycle_with_flakes)
@@ -301,27 +315,64 @@ impl LiveQuerySet {
     /// exactly one follow-up cycle at the latest head. Emits every
     /// outcome through [`on_outcome`](Self::on_outcome) callbacks.
     pub async fn advance(&self, ledger: &str) {
-        if !self.inner.coalescer.begin(ledger) {
-            return;
-        }
-        loop {
-            let outcome = self.run_cycle(ledger).await;
-            self.emit(&outcome);
-            if !self.inner.coalescer.finish(ledger) {
-                return;
-            }
-        }
+        self.run_serialized(ledger, None).await;
     }
 
-    /// Run a NEW subscription solo against the current head (a mounting
-    /// component must not wait for the next commit), emitting and
-    /// returning the single-subscription outcome. The subscription then
-    /// participates in ordinary cycles.
+    /// Run a NEW subscription against the current head — a mounting
+    /// component must not wait for the next commit.
+    ///
+    /// A solo prime is just a cycle with a one-element selection, so it
+    /// takes the SAME coalescer every head change takes; there is no
+    /// second concurrency regime. Two outcomes:
+    ///
+    /// - the ledger is idle → the solo cycle runs now and its outcome is
+    ///   emitted and returned;
+    /// - a cycle is already in flight → this signal FOLDS into that
+    ///   cycle's follow-up (`None`). The subscription is already
+    ///   registered, so the follow-up — a full cycle at a head no older
+    ///   than this one — serves it. Nothing is lost and nothing is
+    ///   delivered out of order.
+    ///
+    /// `None` therefore means "no solo outcome of its own": either the
+    /// fold above, or `sub_id` is not registered (in which case nothing
+    /// will ever deliver for it).
     pub async fn prime(&self, sub_id: SubId) -> Option<CycleOutcome> {
         let ledger = self.subs_lock().get(&sub_id).map(|s| s.ledger.clone())?;
-        let outcome = self.cycle_over(&ledger, Some(&[sub_id]), None).await;
-        self.emit(&outcome);
-        Some(outcome)
+        self.run_serialized(&ledger, Some(vec![sub_id])).await
+    }
+
+    /// The single serialized entry to emitting cycles for one ledger.
+    /// `solo` restricts only the FIRST cycle (a prime's one-element
+    /// selection); every follow-up is a full cycle at the latest head.
+    /// Returns the first cycle's outcome when `solo` asked for one.
+    ///
+    /// The coalescer's `running` flag is cleared by `finish` on every
+    /// return path, so the only way to strand a ledger is to DROP this
+    /// future mid-await. Safe today as a property of the callers, not of
+    /// this driver: both hosts (`fluree-db-wasm`'s `spawn_local` prime and
+    /// advance tasks, and the peer's head-change drain) run it to
+    /// completion, and a panic on wasm32 aborts the instance rather than
+    /// unwinding. A refactor that introduces cancellation here — a
+    /// `select!`, an abort handle — needs an RAII guard on `running`
+    /// first.
+    async fn run_serialized(&self, ledger: &str, solo: Option<Vec<SubId>>) -> Option<CycleOutcome> {
+        if !self.inner.coalescer.begin(ledger) {
+            return None;
+        }
+        let want_outcome = solo.is_some();
+        let mut only = solo;
+        let mut first: Option<CycleOutcome> = None;
+        loop {
+            let outcome = self.cycle_over(ledger, only.as_deref(), None).await;
+            self.emit(&outcome);
+            if want_outcome && first.is_none() {
+                first = Some(outcome);
+            }
+            only = None;
+            if !self.inner.coalescer.finish(ledger) {
+                return first;
+            }
+        }
     }
 
     fn subs_lock(&self) -> std::sync::MutexGuard<'_, HashMap<SubId, Subscription>> {
@@ -726,6 +777,102 @@ mod tests {
         assert!(cycle.unchanged.contains(&early) && cycle.unchanged.contains(&late));
 
         assert!(live.prime(9_999).await.is_none(), "unknown sub");
+    }
+
+    /// The ordering invariant everything above the driver rests on: a
+    /// cycle that opened its snapshot at an OLDER head can never emit
+    /// after one that opened at a newer head.
+    ///
+    /// `prime` used to call `cycle_over` directly while `advance` went
+    /// through the coalescer — two concurrency regimes, only one of them
+    /// serialized. A prime that opened its snapshot at t and was still
+    /// fetching when a commit's `advance` ran and finished would emit the
+    /// OLDER t last: that subscriber renders pre-commit data while its
+    /// siblings sit at t+1, and its `last_hash` is left describing the
+    /// superseded result, so a later commit restoring that result reports
+    /// `unchanged` with no payload and the subscriber never recovers.
+    ///
+    /// The fix is structural — a solo prime is a cycle, so it takes the
+    /// same `begin`/`finish` — and that is what this pins. The in-flight
+    /// cycle is stood in for by taking the coalescer directly, which is
+    /// exactly the state `advance` holds while it awaits its snapshot's
+    /// queries (a real one cannot be suspended mid-await from here:
+    /// nothing in the cycle body yields on a memory ledger).
+    #[tokio::test]
+    async fn a_prime_racing_a_running_cycle_cannot_emit_an_older_watermark() {
+        let fluree = seeded_fluree().await;
+        let live = LiveQuerySet::new(fluree.clone(), None);
+        let early = live.subscribe(LEDGER, names_query());
+
+        let seen: Arc<Mutex<Vec<(i64, Vec<SubId>)>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            live.on_outcome(move |o| {
+                seen.lock()
+                    .unwrap()
+                    .push((o.t, o.changed.iter().map(|c| c.sub_id).collect()));
+            });
+        }
+
+        live.advance(LEDGER).await;
+        let t1 = {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one batch for the first cycle: {seen:?}");
+            assert_eq!(seen[0].1, vec![early]);
+            seen[0].0
+        };
+
+        // A cycle is now in flight for this ledger.
+        assert!(
+            live.inner.coalescer.begin(LEDGER),
+            "the ledger is idle, so this stands in for a cycle in flight"
+        );
+
+        // A component mounts against the pre-commit head and primes.
+        let late = live.subscribe(LEDGER, count_query());
+        assert!(
+            live.prime(late).await.is_none(),
+            "a prime racing a running cycle must FOLD into it, not open a second snapshot"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "a folded prime emits nothing of its own: {:?}",
+            seen.lock().unwrap()
+        );
+
+        // The in-flight cycle's commit lands before it finishes.
+        add_person(&fluree, "carol", "Carol").await;
+
+        // Hand-off: the fold earned exactly ONE follow-up, which is what
+        // `advance`'s loop runs (cycle, emit, finish).
+        assert!(
+            live.inner.coalescer.finish(LEDGER),
+            "the folded prime owes a follow-up cycle"
+        );
+        let follow_up = live.run_cycle(LEDGER).await;
+        assert!(
+            !live.inner.coalescer.finish(LEDGER),
+            "and owes exactly one"
+        );
+
+        // The mounting subscription's FIRST result carries the NEWER
+        // watermark. The un-serialized shape delivered it at `t1`, after
+        // this cycle's `t` had already reached the SDK.
+        assert!(
+            follow_up.t > t1,
+            "the follow-up observes the newer head: {t1} -> {}",
+            follow_up.t
+        );
+        let changed: Vec<SubId> = follow_up.changed.iter().map(|c| c.sub_id).collect();
+        assert!(
+            changed.contains(&late),
+            "the folded prime is served by the follow-up: {follow_up:?}"
+        );
+        assert!(
+            changed.contains(&early),
+            "alongside the commit that landed: {follow_up:?}"
+        );
     }
 
     #[tokio::test]
