@@ -437,6 +437,10 @@ name = "query_hot_property_path"
 harness = false
 
 [[bench]]
+name = "query_hot_optional"
+harness = false
+
+[[bench]]
 name = "query_hot_whole_graph_agg"
 harness = false
 
