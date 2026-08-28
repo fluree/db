@@ -126,6 +126,9 @@ impl LiveBridge {
     }
 }
 
-fn normalize(ledger: &str) -> String {
+/// `LiveQuerySet` matches ledger strings EXACTLY, so every id that reaches
+/// it — from a subscribe call, an SSE head event, or a commit receipt —
+/// goes through here first. Idempotent, so normalizing twice is free.
+pub(crate) fn normalize(ledger: &str) -> String {
     fluree_db_core::ledger_id::normalize_ledger_id(ledger).unwrap_or_else(|_| ledger.to_string())
 }

@@ -354,6 +354,20 @@ impl LiveQuerySet {
         self.subs_lock().is_empty()
     }
 
+    /// Whether any subscription is registered against `ledger` (exact
+    /// match — normalize before asking).
+    ///
+    /// Hosts should gate head-change advances on this. An [`advance`]
+    /// (Self::advance) for a ledger nobody subscribes to is not free: the
+    /// empty-cycle branch still opens the ledger to report the head it
+    /// observed, which on a browser peer is a nameservice resolution, a
+    /// root index-block fetch, CID verification and an IndexedDB write. A
+    /// peer tracking every ledger its token can see (the SSE default)
+    /// would pay that for every commit anywhere on the server.
+    pub fn has_ledger(&self, ledger: &str) -> bool {
+        self.subs_lock().values().any(|sub| sub.ledger == ledger)
+    }
+
     /// Run one advance-cycle for `ledger` at its current head and return
     /// the batch outcome WITHOUT emitting it (pure form — hosts that
     /// deliver outcomes themselves). Equivalent to
@@ -998,6 +1012,30 @@ mod tests {
         let third = live.run_cycle(LEDGER).await;
         let ids: Vec<SubId> = third.changed.iter().map(|c| c.sub_id).collect();
         assert!(ids.contains(&filtered), "v1 re-runs all: {third:?}");
+    }
+
+    /// Hosts gate head-change advances on this, so it has to track
+    /// subscribe/unsubscribe exactly — a stale `true` costs a ledger open
+    /// per commit on a peer, a stale `false` silently stops updating a
+    /// live subscription.
+    #[tokio::test]
+    async fn has_ledger_tracks_subscriptions_exactly() {
+        let fluree = seeded_fluree().await;
+        let live = LiveQuerySet::new(fluree, None);
+        assert!(!live.has_ledger(LEDGER), "nothing subscribed yet");
+
+        let sub = live.subscribe(LEDGER, names_query());
+        assert!(live.has_ledger(LEDGER));
+        // Exact match: the registry never fuzzy-matches ledger strings, so
+        // an un-normalized id is a MISS, not a near-hit.
+        assert!(!live.has_ledger("live/test"), "unnormalized id must miss");
+        assert!(!live.has_ledger("other/ledger:main"));
+
+        assert!(live.unsubscribe(sub));
+        assert!(
+            !live.has_ledger(LEDGER),
+            "the last unsubscribe closes the ledger to advances"
+        );
     }
 
     #[tokio::test]

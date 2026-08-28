@@ -75,6 +75,21 @@ pub fn connect_peer(api_base: String, token: String, max_memory_bytes: Option<f6
     // Send + Sync, so it only forwards the ledger id; the drain task (worker
     // event loop) awaits advance sequentially - the driver's coalescer folds
     // bursts into one follow-up cycle at the latest head.
+    //
+    // Two things the drain does before advancing:
+    //
+    //  - NORMALIZE. `LiveQuerySet` matches ledger strings exactly, and the
+    //    subscribe path already normalizes; an un-normalized id here would
+    //    match nothing and the subscription would silently stop updating.
+    //    `normalize_ledger_id` is idempotent, so this is free insurance.
+    //  - GATE on `has_ledger`. Head tracking defaults to every ledger the
+    //    token can see, while an app typically subscribes to one. An
+    //    advance for an unsubscribed ledger is not a no-op: the empty-cycle
+    //    branch still opens the ledger to report the head it observed —
+    //    on a peer that is a nameservice resolution, a root index-block
+    //    fetch, CID verification and an IndexedDB write, for every commit
+    //    anywhere on the server. The `headChange` event still fires for
+    //    those ledgers; only the pointless cycle is skipped.
     let (advance_tx, mut advance_rx) = futures::channel::mpsc::unbounded::<String>();
     peer.on_head_change(move |change| {
         let _ = advance_tx.unbounded_send(change.ledger_id.clone());
@@ -83,7 +98,10 @@ pub fn connect_peer(api_base: String, token: String, max_memory_bytes: Option<f6
         let set = live_set.clone();
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(ledger) = advance_rx.next().await {
-                set.advance(&ledger).await;
+                let ledger = crate::live::normalize(&ledger);
+                if set.has_ledger(&ledger) {
+                    set.advance(&ledger).await;
+                }
             }
         });
     }
