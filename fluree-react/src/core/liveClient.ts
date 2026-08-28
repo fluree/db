@@ -91,6 +91,19 @@ export class LiveClient {
     return this.cache.ledgerHead(ledger);
   }
 
+  /**
+   * Subscribe to a ledger's head moving. Returns a detach function.
+   *
+   * The head is not any one query's `t` — a query whose results did not move
+   * keeps its own — so rendering it needs its own subscription. This exists
+   * so that rendering it does not need a timer either: an app that polls
+   * `ledgerHead()` on an interval is doing exactly the thing this package
+   * removes from the read path.
+   */
+  onLedgerHead(ledger: string, listener: () => void): () => void {
+    return this.cache.onLedgerHead(ledger, listener);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;

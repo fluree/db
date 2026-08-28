@@ -154,6 +154,30 @@ describe("ledger head", () => {
     });
     expect(client.ledgerHead("l")).toBe(11);
   });
+
+  it("pushes head movement to watchers so nobody has to poll for it", () => {
+    const { client, transport } = setup();
+    client.watch("l", "q").subscribe(() => {});
+    const seen: (number | undefined)[] = [];
+    const detach = client.onLedgerHead("l", () => seen.push(client.ledgerHead("l")));
+
+    const cycle = (t: number) =>
+      transport.emit({
+        ledger: "l",
+        t,
+        changed: [],
+        unchanged: [transport.subId(0)],
+        errored: [],
+      });
+    cycle(11);
+    cycle(11);
+    expect(seen).toEqual([11]);
+
+    detach();
+    cycle(12);
+    expect(seen).toEqual([11]);
+    expect(client.ledgerHead("l")).toBe(12); // still tracked, just not announced
+  });
 });
 
 describe("close", () => {

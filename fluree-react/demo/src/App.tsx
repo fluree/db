@@ -11,7 +11,13 @@
  * package exists for, and it is invisible unless you count.
  */
 
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { useConnectionState, useFlureeClient, useQuery } from "@fluree/react";
 import {
   addNote,
@@ -181,13 +187,17 @@ function Composer() {
 function Header({ mode }: { mode: string }) {
   const connection = useConnectionState();
   const client = useFlureeClient();
-  const [head, setHead] = useState<number | undefined>(undefined);
   // The ledger's newest watermark, which is NOT the same as any one query's
-  // `t` — a query whose results did not move keeps its own.
-  useEffect(() => {
-    const id = setInterval(() => setHead(client.ledgerHead(LEDGER)), 500);
-    return () => clearInterval(id);
-  }, [client]);
+  // `t` — a query whose results did not move keeps its own. Pushed, like
+  // everything else on this page: the client tells us when the head moves.
+  const head = useSyncExternalStore(
+    useCallback(
+      (onChange: () => void) => client.onLedgerHead(LEDGER, onChange),
+      [client],
+    ),
+    () => client.ledgerHead(LEDGER),
+    () => undefined,
+  );
 
   return (
     <header>

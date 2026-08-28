@@ -410,6 +410,60 @@ describe("applying an advance-cycle", () => {
     });
     expect(cache.ledgerHead("other/ledger")).toBeUndefined();
   });
+
+  it("tells head watchers when the head moves, and only then", () => {
+    // Rendering the ledger head is the one thing a query subscription does
+    // not cover, and polling it on a timer is precisely what this package
+    // exists to delete from an app's read path.
+    const { cache, transport } = setup();
+    const h = cache.handleFor(spec("q"));
+    observe(h);
+    const seen: (number | undefined)[] = [];
+    const detach = cache.onLedgerHead("my/ledger", () =>
+      seen.push(cache.ledgerHead("my/ledger")),
+    );
+    const other: number[] = [];
+    cache.onLedgerHead("some/other", () => other.push(1));
+
+    const cycle = (t: number) =>
+      transport.emit({
+        ledger: "my/ledger",
+        t,
+        changed: [],
+        unchanged: [h.subId],
+        errored: [],
+      });
+    cycle(5);
+    cycle(5); // same watermark: nothing moved
+    cycle(3); // older: nothing moved
+    cycle(8);
+    expect(seen).toEqual([5, 8]);
+    expect(other).toEqual([]); // a different ledger's watchers stay quiet
+
+    detach();
+    cycle(9);
+    expect(seen).toEqual([5, 8]);
+  });
+
+  it("has every query already at the new head when it announces one", () => {
+    const { cache, transport } = setup();
+    const h = cache.handleFor(spec("q"));
+    observe(h);
+    const observedT: (number | undefined)[] = [];
+    cache.onLedgerHead("my/ledger", () => observedT.push(h.store.getSnapshot().t));
+
+    transport.emit({
+      ledger: "my/ledger",
+      t: 4,
+      changed: [{ subId: h.subId, payload: { rows: ["a"] } }],
+      unchanged: [],
+      errored: [],
+    });
+
+    // Not `undefined`: a header that renders the head and a row that renders
+    // its query must not disagree inside one React pass.
+    expect(observedT).toEqual([4]);
+  });
 });
 
 describe("delivery order: a handle never moves backwards", () => {

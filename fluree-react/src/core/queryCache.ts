@@ -158,6 +158,7 @@ export class QueryCache {
   private readonly byKey = new Map<string, QueryHandle>();
   private readonly bySubId = new Map<number, QueryHandle>();
   private readonly heads = new Map<string, number>();
+  private readonly headListeners = new Map<string, Set<() => void>>();
   private readonly subscribed = new Set<number>();
   private nextSubId = 1;
   private closed = false;
@@ -241,6 +242,24 @@ export class QueryCache {
   /** Latest observed commit watermark for a ledger (from cycles). */
   ledgerHead(ledger: string): number | undefined {
     return this.heads.get(ledger);
+  }
+
+  /**
+   * Watch a ledger's head. The listener fires when the watermark actually
+   * MOVES — a cycle that re-runs everything and finds nothing new does not
+   * call it — which is what makes the head renderable without a timer.
+   */
+  onLedgerHead(ledger: string, listener: () => void): () => void {
+    let set = this.headListeners.get(ledger);
+    if (!set) {
+      set = new Set();
+      this.headListeners.set(ledger, set);
+    }
+    set.add(listener);
+    return () => {
+      set.delete(listener);
+      if (set.size === 0) this.headListeners.delete(ledger);
+    };
   }
 
   /**
@@ -336,14 +355,23 @@ export class QueryCache {
       dirty.push(handle);
     }
 
+    let headMoved = false;
     if (cycle.t !== undefined && cycle.t >= 0) {
       const head = this.heads.get(cycle.ledger);
       if (head === undefined || cycle.t > head) {
         this.heads.set(cycle.ledger, cycle.t);
+        headMoved = true;
       }
     }
 
     for (const handle of dirty) handle.notify();
+    // Announced in the notify phase like everything else, so a watcher that
+    // reads a query's `t` on the way past sees it already at this head — a
+    // header and a row cannot disagree inside one React pass.
+    if (headMoved) {
+      const listeners = this.headListeners.get(cycle.ledger);
+      if (listeners) for (const listener of [...listeners]) listener();
+    }
   }
 
   close(): void {
@@ -353,5 +381,6 @@ export class QueryCache {
     // last snapshot instead of flipping back to `loading`.
     for (const handle of this.bySubId.values()) handle.dispose();
     this.subscribed.clear();
+    this.headListeners.clear();
   }
 }
