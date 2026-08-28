@@ -315,7 +315,7 @@ one tab re-rendering exactly the affected row in another, with no polling
 code in the app. Both are reliable there, including peer mode with **no
 usable block cache at all**. Peer mode is still slower to first paint than
 remote mode, and a separate engine-side cold-open cost is still open.
-Everything in the automated suite is mocked: 194 tests, no network, no wasm.
+Everything in the automated suite is mocked: 200 tests, no network, no wasm.
 One known blocker remains, listed at the end.
 
 ### Proven in a real browser, against a real server
@@ -349,12 +349,12 @@ Also executed for real: the demo builds through a real bundler in CI (`vite
 build`), which is the only thing exercising this as a *package* rather than
 as source files a test imported.
 
-### Proven by executed tests — 194 (`npx vitest run`), all real package code
+### Proven by executed tests — 200 (`npx vitest run`), all real package code
 
 | Suite | Tests | What it actually proves |
 | --- | --- | --- |
-| `structuralShare` | 11 | Unchanged rows keep **object identity** across an advance; an all-equal result returns the previous object itself. Every assertion is `toBe`, not `toEqual` — a deep-equality test here would pass against an implementation that shares nothing. |
-| `queryCache` | 31 | Dedup by key; the transport subscription opens on the first observer and is released only after `gcTime` with none; the janitor collects never-observed handles; **version coherence** (observers verify the whole cache already carries the new watermark at notify time); a stale cycle cannot move a handle backwards while its siblings hold the newer head; a re-shown component re-binds to the handle that now owns its key rather than resurrecting a second subscription on it; keep-last-good-data and both recovery paths; a persistent identical error re-renders once; an unchanged cycle produces the identical snapshot object and no notification. |
+| `structuralShare` | 15 | Unchanged rows keep **object identity** across an advance; an all-equal result returns the previous object itself; a `__proto__` binding — a legal SPARQL variable name — survives the merge instead of being swallowed by `Object.prototype`'s setter and silently killing sharing for that subtree. Every *sharing* claim is `toBe`, never `toEqual`: a deep-equality test here would pass against an implementation that shares nothing. |
+| `queryCache` | 33 | Dedup by key; the transport subscription opens on the first observer and is released only after `gcTime` with none; the janitor collects never-observed handles; **version coherence** (observers verify the whole cache already carries the new watermark at notify time); a stale cycle cannot move a handle backwards while its siblings hold the newer head; a re-shown component re-binds to the handle that now owns its key rather than resurrecting a second subscription on it; keep-last-good-data and both recovery paths; a persistent identical error re-renders once; a subscription reported `unchanged` before it ever delivered is surfaced as a transport-contract error rather than left spinning; an unchanged cycle produces the identical snapshot object and no notification. |
 | `liveClient` | 14 | Query-kind inference and the language-matched format defaults; cache keying; one-shot queries; connection fan-out; head-movement fan-out; teardown releases timers. |
 | `useQuery` (react-dom + jsdom) | 19 | Real components: a memoized row does **not** re-render when a sibling row changes; an unchanged cycle costs zero renders; `getSnapshot` is referentially stable across unrelated parent re-renders (a fresh object per call is the canonical infinite-loop bug with `useSyncExternalStore`); StrictMode double-mount keeps one subscription; siblings advance in lock-step. |
 | `sse` | 19 | The hand-rolled frame parser against a real `ReadableStream`: frames split across chunks, multi-line `data`, keep-alive comments, CRLF, `Last-Event-ID` replay, debounced re-resolve of the watched-ledger URL, jittered exponential backoff (jitter pinned, so the doubling is asserted exactly), and per-reconnect auth re-resolution. |
@@ -365,7 +365,7 @@ as source files a test imported.
 | `integration` | 7 | The public barrel and `createClient` composed as an app uses them: an SSE head event drives a re-query that re-renders a component. |
 | `ssr` | 4 | `renderToString` yields the loading snapshot and performs no I/O. |
 
-### What the live runs found that 194 green tests could not
+### What the live runs found that 200 green tests could not
 
 Every one of these was invisible to the mocked suite, and the first three
 share a failure mode: **silence**. That is the argument for making the live
