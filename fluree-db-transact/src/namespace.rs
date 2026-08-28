@@ -174,6 +174,15 @@ impl NamespaceRegistry {
         self.codes.get_prefix(code)
     }
 
+    /// Encode an IRI to a Sid, mirroring `LedgerSnapshot::encode_iri`'s
+    /// contract: unknown namespaces fall back to the EMPTY-namespace
+    /// full-IRI Sid, which matches no stored data. Lookup-only — never
+    /// allocates a code.
+    fn encode_iri_with_fallback(&self, iri: &str) -> fluree_db_core::Sid {
+        self.lookup_sid_for_iri(iri)
+            .unwrap_or_else(|| fluree_db_core::Sid::new(fluree_vocab::namespaces::EMPTY, iri))
+    }
+
     /// Check if a prefix is registered
     pub fn has_prefix(&self, prefix: &str) -> bool {
         self.codes.get_code(prefix).is_some()
@@ -610,6 +619,25 @@ pub fn stable_blank_node_sid_from_label(label: &str) -> Option<Sid> {
     label
         .starts_with(fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX)
         .then(|| Sid::new(BLANK_NODE, label))
+}
+
+/// SPARQL-lowering encoder over the staged registry — snapshot namespaces
+/// plus this transaction's allocations. Lets SHACL `sh:sparql` constraint
+/// queries lower against the same term space the staged flakes use, so a
+/// constraint over a namespace the in-flight transaction introduced matches
+/// its staged data. Mirrors `LedgerSnapshot`'s contract exactly: unknown
+/// namespaces encode to the never-matching EMPTY-namespace full-IRI Sid
+/// (constraints over vocabulary the ledger has never seen are silently
+/// inert, not errors), and `encode_iri_strict` rejects them.
+impl fluree_db_query::parse::IriEncoder for NamespaceRegistry {
+    fn encode_iri(&self, iri: &str) -> Option<Sid> {
+        Some(self.encode_iri_with_fallback(iri))
+    }
+
+    fn encode_iri_strict(&self, iri: &str) -> Option<Sid> {
+        self.lookup_sid_for_iri(iri)
+            .filter(|sid| sid.namespace_code != fluree_vocab::namespaces::EMPTY)
+    }
 }
 
 #[cfg(test)]

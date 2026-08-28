@@ -847,8 +847,12 @@ impl BinaryScanOperator {
                     continue;
                 }
                 if let Some(tag) = dtc.lang_tag() {
+                    // Case-insensitive like the overlay filters: a flake
+                    // replayed from a commit written before tag normalization
+                    // carries the tag as authored (`FlakeMeta.lang` is a plain
+                    // deserialized field), while `tag` is always normalized.
                     let flake_lang = flake.m.as_ref().and_then(|m| m.lang.as_ref());
-                    if flake_lang.map(std::string::String::as_str) != Some(tag) {
+                    if !flake_lang.is_some_and(|l| l.eq_ignore_ascii_case(tag)) {
                         continue;
                     }
                 }
@@ -1024,7 +1028,7 @@ impl BinaryScanOperator {
             .map_err(|e| QueryError::Policy(e.to_string()))?;
 
         enforcer
-            .filter_flakes_for_graph(snapshot, overlay, to_t, &ctx.tracker, flakes)
+            .filter_flakes_for_graph(snapshot, db.g_id, overlay, to_t, &ctx.tracker, flakes)
             .await
             .map_err(|e| QueryError::Policy(e.to_string()))
     }
@@ -1545,6 +1549,79 @@ impl BinaryScanOperator {
 }
 
 impl BinaryScanOperator {
+    /// Key bounds that bracket every flake this fallback could match, in
+    /// `index` order, or `None` when nothing constrains the order's leading
+    /// component.
+    ///
+    /// `Segment::range` seeks with `partition_point` on both ends, so supplying
+    /// bounds turns the overlay walk from O(novelty) into
+    /// O(log novelty + matched) and lets `may_overlap` skip whole segments. With
+    /// `first`/`rhs` left `None` the walk covers the entire graph's novelty on
+    /// every probe — and this fallback is reached once per probe of a term
+    /// absent from the persisted dictionaries, which correlated joins issue by
+    /// the thousand.
+    ///
+    /// Bounds are an optimization only: the per-flake equality checks in the
+    /// walk remain the correctness backstop, exactly as in
+    /// `fast_path_common::collect_resolved_overlay_ops`. They must therefore
+    /// never exclude a matching flake — each bound pins only components that
+    /// lead `index`'s sort order and are pinned by an equality match, and lets
+    /// every trailing component span its full range.
+    ///
+    /// `first` is left-*exclusive*, so it sets `t` to `i64::MIN` (with the
+    /// minimal `op`/`m`) to sort strictly below any real flake; `rhs` is
+    /// inclusive and maxes the same trailing components. This mirrors
+    /// `predicate_walk_bounds`.
+    fn overlay_walk_bounds(
+        &self,
+        s_sid: &Option<Sid>,
+        p_sid: &Option<Sid>,
+    ) -> Option<(Flake, Flake)> {
+        use fluree_db_core::flake::FlakeMeta;
+
+        // (value, datatype) pair bracketing the bound object, or the full range.
+        let o_bounds = || match self.bound_o.as_ref() {
+            Some(o) => ((o.clone(), Sid::min()), (o.clone(), Sid::max())),
+            None => (
+                (FlakeValue::min(), Sid::min()),
+                (FlakeValue::max(), Sid::max()),
+            ),
+        };
+        let s_bounds = || match s_sid.as_ref() {
+            Some(s) => (s.clone(), s.clone()),
+            None => (Sid::min(), Sid::max()),
+        };
+        let p_bounds = || match p_sid.as_ref() {
+            Some(p) => (p.clone(), p.clone()),
+            None => (Sid::min(), Sid::max()),
+        };
+
+        // Only worth bounding when the order's leading component is pinned;
+        // otherwise the range spans everything anyway.
+        match self.index {
+            IndexType::Spot if s_sid.is_none() => return None,
+            IndexType::Psot | IndexType::Post if p_sid.is_none() => return None,
+            IndexType::Opst if self.bound_o.is_none() => return None,
+            _ => {}
+        }
+
+        let ((o_min, dt_min), (o_max, dt_max)) = o_bounds();
+        let (s_min, s_max) = s_bounds();
+        let (p_min, p_max) = p_bounds();
+
+        let first = Flake::new(s_min, p_min, o_min, dt_min, i64::MIN, false, None);
+        let rhs = Flake::new(
+            s_max,
+            p_max,
+            o_max,
+            dt_max,
+            i64::MAX,
+            true,
+            Some(FlakeMeta::max()),
+        );
+        Some((first, rhs))
+    }
+
     async fn open_overlay_only_fallback(
         &mut self,
         ctx: &ExecutionContext<'_>,
@@ -1562,39 +1639,77 @@ impl BinaryScanOperator {
         let from_t = ctx.from_t;
         let cmp = self.index.comparator();
 
-        // Collect all overlay flakes for this graph+index (novelty is expected to be small),
-        // then narrow by equality match.
+        // Collect overlay flakes for this graph+index, applying the bound-term
+        // equality match INSIDE the walk.
+        //
+        // Filtering before the copy (rather than `retain`ing afterwards) is
+        // what keeps this path cheap: this fallback is reached once per probe
+        // of a subject/predicate/value that is absent from the persisted
+        // dictionaries, and callers such as upsert's existing-value lookup
+        // issue thousands of such probes per transaction. Cloning and sorting
+        // the whole graph's novelty on each one is O(novelty log novelty) per
+        // call; matching first makes it a comparison-only walk with no
+        // allocation for the (overwhelmingly common) non-matching flakes.
+        //
+        // Equivalent to the previous filter-after-resolve order:
+        // `resolve_overlay_retractions` decides each distinct fact
+        // `(s, p, o, dt, m)` independently, and an (s, p, o) equality filter
+        // either keeps or drops a fact's entries as a whole — so it can never
+        // separate an assertion from the retraction that cancels it.
+        // A tagged bound object matches only flakes carrying the same tag.
+        let bound_lang = self.pattern.dtc.as_ref().and_then(|d| d.lang_tag());
+        let bounds = self.overlay_walk_bounds(s_sid, p_sid);
+        let (first, rhs) = match bounds.as_ref() {
+            Some((f, r)) => (Some(f), Some(r)),
+            None => (None, None),
+        };
+        // `leftmost` must be false whenever `first` is supplied, or the seek's
+        // lower bound is ignored and the walk starts at index 0 again.
+        let leftmost = first.is_none();
+
         let mut flakes: Vec<Flake> = Vec::new();
-        overlay.for_each_overlay_flake(self.g_id, self.index, None, None, true, to_t, &mut |f| {
-            if f.t <= to_t && from_t.is_none_or(|ft| f.t >= ft) {
-                flakes.push(f.clone());
-            }
-        });
-
-        flakes.sort_by(cmp);
-        flakes = resolve_overlay_retractions(flakes);
-
-        // Apply equality match (subject/predicate/object).
-        if s_sid.is_some() || p_sid.is_some() || self.bound_o.is_some() {
-            flakes.retain(|f| {
+        overlay.for_each_overlay_flake(
+            self.g_id,
+            self.index,
+            first,
+            rhs,
+            leftmost,
+            to_t,
+            &mut |f| {
+                if f.t > to_t || from_t.is_some_and(|ft| f.t < ft) {
+                    return;
+                }
                 if let Some(s) = s_sid.as_ref() {
                     if &f.s != s {
-                        return false;
+                        return;
                     }
                 }
                 if let Some(p) = p_sid.as_ref() {
                     if &f.p != p {
-                        return false;
+                        return;
                     }
                 }
                 if let Some(o) = self.bound_o.as_ref() {
                     if &f.o != o {
-                        return false;
+                        return;
+                    }
+                    if let Some(lang) = bound_lang {
+                        if !f
+                            .m
+                            .as_ref()
+                            .and_then(|m| m.lang.as_deref())
+                            .is_some_and(|l| l.eq_ignore_ascii_case(lang))
+                        {
+                            return;
+                        }
                     }
                 }
-                true
-            });
-        }
+                flakes.push(f.clone());
+            },
+        );
+
+        flakes.sort_by(cmp);
+        flakes = resolve_overlay_retractions(flakes);
 
         // Apply object bounds (post-filter) when present.
         if let Some(bounds) = self.object_bounds.as_ref() {
@@ -1957,6 +2072,43 @@ impl Operator for BinaryScanOperator {
         if s_sid.is_some() && filter.s_id.is_none() && self.unresolved_bound_subject_iri.is_none() {
             return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
         }
+
+        // Last chance to narrow before falling back to the widened walk below.
+        //
+        // `build_filter_from_snapshot_sids` resolves `Ref::Sid` through
+        // `ctx.active_snapshot`, but a pattern SID is encoded against
+        // `ctx.original_snapshot` (see `reencode_sid`). In a per-graph context the
+        // two namespace tables differ, so the filter lookup either used the wrong
+        // IRI or never ran — leaving a decoded IRI that was never actually probed
+        // against the store's subject dictionary. Probe it here with the IRI the
+        // pattern really means:
+        //
+        // - `Ok(Some)` — narrow to `s_id` and drop the per-row IRI comparison. The
+        //   subject dictionary is a bijection over the namespaces `find_subject_id`
+        //   consults, so filtering on `s_id` selects exactly the rows the row-by-row
+        //   `resolve_subject_iri(..) == target_iri` check would have kept.
+        // - `Ok(None)` — a conclusive base miss, so novelty is the only place the
+        //   subject can be. Same standard the bound-object `Ref` arm above already
+        //   applies, and the same one `generate_upsert_deletions` relies on.
+        // - `Err(_)` — the dictionary could not answer; absence stays undecidable
+        //   and the widened scan below remains the correct (if slow) answer.
+        //
+        // Skipping this made an absent bound subject cost a full predicate-partition
+        // walk with a dictionary lookup per row — O(partition), not O(1). It is not
+        // an upsert-only path: `join.rs` and `optional.rs` rebind a correlated
+        // subject to `Ref::Iri` per driving row, so every non-batched probe for a
+        // missing subject paid it.
+        if let Some(target_iri) = self.unresolved_bound_subject_iri.clone() {
+            match store_ref.find_subject_id(&target_iri) {
+                Ok(Some(s_id)) => {
+                    filter.s_id = Some(s_id);
+                    self.unresolved_bound_subject_iri = None;
+                }
+                Ok(None) => return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await,
+                Err(_) => {}
+            }
+        }
+
         if self.unresolved_bound_subject_iri.is_some() && filter.p_id.is_some() {
             self.index = IndexType::Psot;
         }
@@ -2242,6 +2394,9 @@ impl Operator for BinaryScanOperator {
                     Ref::Sid(p) => Some(p.clone()),
                     _ => None,
                 };
+                // Raw (untranslatable) novelty flakes carry their tag in
+                // `FlakeMeta`; a tagged bound object must match it.
+                let bound_lang = self.pattern.dtc.as_ref().and_then(|d| d.lang_tag());
 
                 let untranslated: Vec<_> = translated
                     .untranslated
@@ -2250,6 +2405,11 @@ impl Operator for BinaryScanOperator {
                         s_sid.as_ref().is_none_or(|s| &f.s == s)
                             && p_sid.as_ref().is_none_or(|p| &f.p == p)
                             && self.bound_o.as_ref().is_none_or(|o| &f.o == o)
+                            && bound_lang.is_none_or(|lang| {
+                                f.m.as_ref()
+                                    .and_then(|m| m.lang.as_deref())
+                                    .is_some_and(|l| l.eq_ignore_ascii_case(lang))
+                            })
                             && self.object_bounds.as_ref().is_none_or(|b| b.matches(&f.o))
                     })
                     .cloned()
@@ -2330,6 +2490,19 @@ impl Operator for BinaryScanOperator {
                 }
             }
         }
+
+        // Price cursor-emitted rows at the batch boundary: leaflet touches are
+        // far coarser than rows (thousands of rows per 10 uf touch), so a lane
+        // that drains and materializes a whole predicate extent through this
+        // operator — NLJ chains, property-join inner scans, filter scans —
+        // otherwise reported floor-level fuel and stayed invisible to
+        // `max_fuel` limits. One charge per batch (hot-loop purity); rows the
+        // encoded prefilters drop inside the cursor are never emitted and are
+        // not charged — their per-row cost is nanoseconds and the leaflet
+        // touch already prices the I/O.
+        ctx.tracker.consume_fuel(
+            produced as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+        )?;
 
         if produced < batch_size && self.range_iter.is_some() {
             // Overlay/novelty rows are in-memory; charge per row at 1 micro-fuel.
@@ -3197,20 +3370,27 @@ fn infer_exact_datatype_sid_from_stats(
     value: &FlakeValue,
 ) -> Option<Sid> {
     let stats = stats_view?.get_graph_property(g_id, p_id)?;
-    let present: Vec<fluree_db_core::ValueTypeTag> = stats
-        .datatypes
-        .iter()
-        .filter_map(|(tag, count)| (*count > 0).then_some(*tag))
-        .collect();
+    // Read the observed-tag *set*, never the `datatypes` counts: the counts
+    // are novelty-merged as a blind ±1 delta log, so a no-op delete naming a
+    // tag the base carries can zero that tag out while its data is still
+    // there — and a scan narrowed to the surviving tag then returns rows that
+    // don't match the query (#1738). The observed set is monotone under
+    // retraction (asserts add, no retraction removes), and for a read below
+    // the published index `t` the stats builder substitutes the historical
+    // set (or clears it below the accumulation boundary), so "only one
+    // string-compatible tag" is a conclusive statement about the whole
+    // logical DB at the queried `t`. Empty means "unknown": no narrowing.
+    if stats.observed_datatypes.is_empty() {
+        return None;
+    }
+    let present: &[fluree_db_core::ValueTypeTag] = &stats.observed_datatypes;
 
     // Untyped string values can only match string-compatible datatypes, so
     // non-string tags on the predicate (int/date/ref/…) are irrelevant. Narrow
     // when exactly one string-compatible tag is present and it is non-lang
     // (langString needs a language id → multi-slice path). UNKNOWN is unsafe —
     // it may stand in for a string-valued datatype, so its presence declines
-    // narrowing. These stats are novelty-aware (the datatype set reflects base +
-    // novelty), so "only one string-compatible tag" is a conclusive statement
-    // about the whole logical DB, not just the base index.
+    // narrowing.
     if matches!(value, FlakeValue::String(_)) {
         if present.contains(&fluree_db_core::ValueTypeTag::UNKNOWN) {
             return None;
@@ -3231,7 +3411,7 @@ fn infer_exact_datatype_sid_from_stats(
     }
 
     // Non-string values: exact single-datatype inference.
-    let mut tags = present;
+    let mut tags = present.to_vec();
     tags.sort();
     tags.dedup();
     if tags.len() != 1 {
@@ -3479,8 +3659,10 @@ mod tests {
     use super::*;
     use fluree_db_core::{stats_view::GraphPropertyStatData, StatsView, ValueTypeTag};
 
-    #[test]
-    fn infer_exact_datatype_for_integer_family() {
+    fn stats_with(
+        datatypes: Vec<(ValueTypeTag, u64)>,
+        observed_datatypes: Vec<ValueTypeTag>,
+    ) -> StatsView {
         let mut stats = StatsView::default();
         stats.graph_properties.insert(
             0,
@@ -3490,10 +3672,17 @@ mod tests {
                     count: 10,
                     ndv_values: 0,
                     ndv_subjects: 0,
-                    datatypes: vec![(ValueTypeTag::INT, 10)],
+                    datatypes,
+                    observed_datatypes,
                 },
             )]),
         );
+        stats
+    }
+
+    #[test]
+    fn infer_exact_datatype_for_integer_family() {
+        let stats = stats_with(vec![(ValueTypeTag::INT, 10)], vec![ValueTypeTag::INT]);
 
         let inferred = infer_exact_datatype_sid_from_stats(
             Some(&stats),
@@ -3508,18 +3697,9 @@ mod tests {
 
     #[test]
     fn does_not_infer_when_multiple_datatypes_present() {
-        let mut stats = StatsView::default();
-        stats.graph_properties.insert(
-            0,
-            HashMap::from([(
-                RuntimePredicateId::from_u32(7),
-                GraphPropertyStatData {
-                    count: 10,
-                    ndv_values: 0,
-                    ndv_subjects: 0,
-                    datatypes: vec![(ValueTypeTag::INT, 5), (ValueTypeTag::LONG, 5)],
-                },
-            )]),
+        let stats = stats_with(
+            vec![(ValueTypeTag::INT, 5), (ValueTypeTag::LONG, 5)],
+            vec![ValueTypeTag::INT, ValueTypeTag::LONG],
         );
 
         assert!(infer_exact_datatype_sid_from_stats(
@@ -3529,5 +3709,113 @@ mod tests {
             &FlakeValue::Long(42),
         )
         .is_none());
+    }
+
+    /// #1738's mechanism, pinned at the consumer: a spurious retraction can
+    /// zero a tag out of the count breakdown while its data still exists, so
+    /// the counts saying "one tag" while the observed set remembers two must
+    /// NOT narrow — the set wins.
+    #[test]
+    fn observed_set_vetoes_narrowing_when_counts_dropped_a_tag() {
+        let stats = stats_with(
+            vec![(ValueTypeTag::LONG, 5)],
+            vec![ValueTypeTag::INT, ValueTypeTag::LONG],
+        );
+
+        assert!(infer_exact_datatype_sid_from_stats(
+            Some(&stats),
+            0,
+            RuntimePredicateId::from_u32(7),
+            &FlakeValue::Long(42),
+        )
+        .is_none());
+    }
+
+    /// An empty observed set means "unknown" (a read below the historical
+    /// accumulation boundary, or a producer that could not fill it) and must
+    /// fail closed, even when the counts look conclusive.
+    #[test]
+    fn empty_observed_set_declines_narrowing() {
+        let stats = stats_with(vec![(ValueTypeTag::INT, 10)], vec![]);
+
+        assert!(infer_exact_datatype_sid_from_stats(
+            Some(&stats),
+            0,
+            RuntimePredicateId::from_u32(7),
+            &FlakeValue::Long(42),
+        )
+        .is_none());
+    }
+
+    /// Every upper-bound builder in the tree must pin `t` to `i64::MAX` and
+    /// `op` to `true`.
+    ///
+    /// That pin is what makes the `FlakeMeta::max()` narrowing unreachable
+    /// (see its doc in `fluree-db-core/src/flake.rs`): `{lang: Some(_),
+    /// i: Some(i32::MAX)}` sorts strictly above `FlakeMeta::max()`, so an
+    /// inclusive upper bound would exclude it — except that all four index
+    /// comparators compare `t` and `op` *before* the metadata tiebreak, and
+    /// no real flake carries `t == i64::MAX`. The guard therefore lives in
+    /// the builders, and this test quantifies over all six of them: the four
+    /// `Flake::max_*` in `fluree-db-core` (`max_psot` delegates to
+    /// `max_spot`, asserted anyway so de-aliasing it can't drop the pin),
+    /// plus `predicate_walk_bounds` in `fast_path_common` and
+    /// `overlay_walk_bounds` here.
+    ///
+    /// A new bound builder belongs in this list; one that deliberately does
+    /// not pin `t` must instead show why reaching the narrowing is safe.
+    #[test]
+    fn every_bound_builder_pins_the_sentinel_guard() {
+        let s = Sid::new(3, "s");
+        let p = Sid::new(5, "p");
+
+        let assert_pinned = |name: &str, upper: &Flake| {
+            assert_eq!(
+                upper.t,
+                i64::MAX,
+                "{name} must pin t to i64::MAX — it is the guard that keeps \
+                 FlakeMeta::max()'s narrowing unreachable"
+            );
+            assert!(upper.op, "{name} must pin op to true");
+        };
+
+        // The four core builders (plus the max_spot alias).
+        assert_pinned("Flake::max_spot", &Flake::max_spot());
+        assert_pinned("Flake::max_psot", &Flake::max_psot());
+        assert_pinned("Flake::max_for_subject", &Flake::max_for_subject(s.clone()));
+        assert_pinned(
+            "Flake::max_for_subject_predicate",
+            &Flake::max_for_subject_predicate(s.clone(), p.clone()),
+        );
+        assert_pinned(
+            "Flake::max_for_predicate",
+            &Flake::max_for_predicate(p.clone()),
+        );
+
+        // The two query-side builders.
+        let (_, rhs) = crate::fast_path_common::predicate_walk_bounds(&p);
+        assert_pinned("predicate_walk_bounds", &rhs);
+
+        // `overlay_walk_bounds` needs an operator instance; a bound-s/bound-p
+        // pattern routes to Spot, whose leading component is pinned, so the
+        // builder returns bounds. Exercise both `o_bounds` arms — the
+        // unbound-object full range and the bound-object pin — since each
+        // constructs its own `rhs`.
+        let pattern = TriplePattern::new(
+            Ref::Sid(s.clone()),
+            Ref::Sid(p.clone()),
+            Term::Var(VarId(0)),
+        );
+        let mut operator = BinaryScanOperator::new(pattern, None, vec![]);
+        let (_, rhs) = operator
+            .overlay_walk_bounds(&Some(s.clone()), &Some(p.clone()))
+            .expect("Spot with a bound subject must produce walk bounds");
+        assert_pinned("overlay_walk_bounds (unbound object)", &rhs);
+
+        operator.bound_o = Some(FlakeValue::Long(42));
+        let (_, rhs) = operator
+            .overlay_walk_bounds(&Some(s), &Some(p))
+            .expect("bound-object arm must still produce walk bounds");
+        assert_pinned("overlay_walk_bounds (bound object)", &rhs);
     }
 }

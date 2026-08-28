@@ -8,6 +8,7 @@ use crate::context::WellKnownDatatypes;
 use crate::error::{QueryError, Result};
 use crate::ir::{Expression, Function};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use fluree_db_core::temporal::CalendarField;
 use fluree_db_core::{FlakeValue, ObjKind};
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
@@ -681,6 +682,49 @@ pub fn parse_datetime_from_binding(
     }
 }
 
+/// Promote a calendar fragment (`xsd:gYear` and friends) to a whole instant,
+/// filling the fields it does not carry from [`CalendarField::promotion_default`].
+///
+/// The filler is for whole-value uses only — comparison, ordering,
+/// `TZ`/`TIMEZONE`. Reading a field back off the result is only valid once
+/// [`TemporalKind::carries`] says the value carries it; the SPARQL accessors
+/// check that first (see `eval::datetime`), because reporting a filled field as
+/// data is exactly what made `DAY("2005"^^xsd:gYear)` answer 1.
+/// The date a value carrying no date at all promotes to, from the shared
+/// defaults: the Unix epoch's 1970-01-01.
+fn promotion_default_date() -> Option<NaiveDate> {
+    NaiveDate::from_ymd_opt(
+        i32::try_from(CalendarField::Year.promotion_default()).ok()?,
+        u32::try_from(CalendarField::Month.promotion_default()).ok()?,
+        u32::try_from(CalendarField::Day.promotion_default()).ok()?,
+    )
+}
+
+fn promote_calendar_fragment(
+    tz_offset: Option<FixedOffset>,
+    year: Option<i32>,
+    month: Option<u32>,
+    day: Option<u32>,
+) -> Option<DateTime<FixedOffset>> {
+    let offset = tz_offset.unwrap_or(FixedOffset::east_opt(0)?);
+    let naive = NaiveDate::from_ymd_opt(
+        year.unwrap_or(i32::try_from(CalendarField::Year.promotion_default()).ok()?),
+        month.unwrap_or(u32::try_from(CalendarField::Month.promotion_default()).ok()?),
+        day.unwrap_or(u32::try_from(CalendarField::Day.promotion_default()).ok()?),
+    )?
+    .and_hms_opt(
+        u32::try_from(CalendarField::Hour.promotion_default()).ok()?,
+        u32::try_from(CalendarField::Minute.promotion_default()).ok()?,
+        u32::try_from(CalendarField::Second.promotion_default()).ok()?,
+    )?;
+    Some(
+        offset
+            .from_local_datetime(&naive)
+            .single()
+            .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
+    )
+}
+
 /// Convert a FlakeValue to a DateTime, handling all XSD temporal types.
 ///
 /// The `dt_sid` parameter is used only for the `FlakeValue::Long` fallback
@@ -709,7 +753,8 @@ fn flake_value_to_datetime(
         }
         FlakeValue::Time(t) => {
             let offset = t.tz_offset().unwrap_or(utc);
-            let date = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+            // A time carries no date; fill it from the shared defaults.
+            let date = promotion_default_date()?;
             let naive = NaiveDateTime::new(date, t.time());
             Some(
                 offset
@@ -719,69 +764,26 @@ fn flake_value_to_datetime(
             )
         }
         FlakeValue::GYear(gy) => {
-            let offset = gy.tz_offset().unwrap_or(utc);
-            let naive = NaiveDate::from_ymd_opt(gy.year(), 1, 1)?.and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
+            promote_calendar_fragment(gy.tz_offset(), Some(gy.year()), None, None)
         }
         FlakeValue::GYearMonth(gym) => {
-            let offset = gym.tz_offset().unwrap_or(utc);
-            let naive =
-                NaiveDate::from_ymd_opt(gym.year(), gym.month(), 1)?.and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
+            promote_calendar_fragment(gym.tz_offset(), Some(gym.year()), Some(gym.month()), None)
         }
         FlakeValue::GMonth(gm) => {
-            let offset = gm.tz_offset().unwrap_or(utc);
-            let naive = NaiveDate::from_ymd_opt(1970, gm.month(), 1)?.and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
+            promote_calendar_fragment(gm.tz_offset(), None, Some(gm.month()), None)
         }
         FlakeValue::GDay(gd) => {
-            let offset = gd.tz_offset().unwrap_or(utc);
-            let naive = NaiveDate::from_ymd_opt(1970, 1, gd.day())?.and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
+            promote_calendar_fragment(gd.tz_offset(), None, None, Some(gd.day()))
         }
         FlakeValue::GMonthDay(gmd) => {
-            let offset = gmd.tz_offset().unwrap_or(utc);
-            let naive =
-                NaiveDate::from_ymd_opt(1970, gmd.month(), gmd.day())?.and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
+            promote_calendar_fragment(gmd.tz_offset(), None, Some(gmd.month()), Some(gmd.day()))
         }
         FlakeValue::String(s) => DateTime::parse_from_rfc3339(s).ok().or_else(|| {
             let with_time = format!("{s}T00:00:00+00:00");
             DateTime::parse_from_rfc3339(&with_time).ok()
         }),
         FlakeValue::Long(y) if dt_sid == Some(&datatypes.xsd_g_year) => {
-            let year = i32::try_from(*y).ok()?;
-            let naive = NaiveDate::from_ymd_opt(year, 1, 1)?.and_hms_opt(0, 0, 0)?;
-            Some(
-                utc.from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| utc.from_utc_datetime(&naive)),
-            )
+            promote_calendar_fragment(None, Some(i32::try_from(*y).ok()?), None, None)
         }
         _ => None,
     }

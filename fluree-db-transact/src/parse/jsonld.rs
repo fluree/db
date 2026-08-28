@@ -117,6 +117,20 @@ pub fn parse_transaction(
     }
     let lpg_mode = opts.lpg_edge_lifecycle.unwrap_or(false);
 
+    // Requested SHACL validation mode ("warn" / "reject"), same JSON-over-
+    // programmatic precedence as the opts above. Whether the request is
+    // honored is decided later against the ledger config's override control
+    // (see TxnOpts::validation_mode); an unrecognized string is ignored.
+    if opts.validation_mode.is_none() {
+        opts.validation_mode = json
+            .as_object()
+            .and_then(|m| m.get("opts"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("validationMode"))
+            .and_then(Value::as_str)
+            .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
+    }
+
     // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
     // `f:reifies*` system encoding before JSON-LD expansion, rejecting
     // user-authored `f:reifies*` IRIs and every deferred shape (literal-
@@ -161,6 +175,56 @@ pub fn parse_transaction(
         TxnType::Upsert => parse_upsert(&lowered, opts, ns_registry),
         TxnType::Update => parse_update(&lowered, opts, ns_registry),
     }
+}
+
+/// Transaction-local graph id assigned to the sync target graph. The
+/// payload may not address named graphs itself (rejected below), so the
+/// assigner never hands this id to anything else.
+const SYNC_GRAPH_LOCAL_ID: u16 = 2;
+
+/// Parse a graph-sync transaction (see [`Txn::sync_graph`]).
+///
+/// The payload is an ordinary insert-shaped JSON-LD document describing the
+/// target graph's DESIRED full contents. Parsing is exactly insert parsing
+/// (same context handling, annotation lowering, txn-meta extraction), after
+/// which every template is re-homed onto `graph_iri` and the sync directive
+/// is stamped on the transaction.
+///
+/// Differences from insert:
+/// - an explicitly empty document (`"@graph": []`) is allowed — it means
+///   "the graph's desired contents are empty" (the API layer gates this
+///   behind an explicit opt-in before it becomes a whole-graph clear);
+/// - a payload that addresses named graphs itself (`@graph` with a graph
+///   `@id`) is rejected: the sync scope is exactly one graph, named by the
+///   caller, never inferred from the data.
+pub fn parse_sync_transaction(
+    json: &Value,
+    graph_iri: &str,
+    opts: TxnOpts,
+    ns_registry: &mut NamespaceRegistry,
+) -> Result<Txn> {
+    let explicitly_empty = json
+        .get("@graph")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty);
+    let mut txn = if explicitly_empty {
+        Txn::insert().with_opts(opts)
+    } else {
+        parse_transaction(json, TxnType::Insert, opts, ns_registry)?
+    };
+    if !txn.graph_delta.is_empty() {
+        return Err(TransactError::Parse(
+            "sync payload must not address named graphs; the target graph is the sync scope"
+                .to_string(),
+        ));
+    }
+    for t in &mut txn.insert_templates {
+        t.graph_id = Some(SYNC_GRAPH_LOCAL_ID);
+    }
+    txn.graph_delta
+        .insert(SYNC_GRAPH_LOCAL_ID, graph_iri.to_string());
+    txn.sync_graph = Some(graph_iri.to_string());
+    Ok(txn)
 }
 
 /// Parse an insert transaction

@@ -261,8 +261,15 @@ async fn poll_remote_import(
             }
             Some("running" | "awaiting-upload") => {}
             other => {
+                // `other` is `Option<&str>`; Debug-printing it rendered the
+                // Rust container — `unexpected remote import status:
+                // Some("weird")`. Show the status the way the server sent it,
+                // and fall back to the raw JSON when the field is absent or
+                // isn't a string (`null`, a number, an object) so the message
+                // still names what arrived.
+                let shown = other.map_or_else(|| status["status"].to_string(), ToString::to_string);
                 return Err(CliError::Remote(format!(
-                    "unexpected remote import status: {other:?}"
+                    "unexpected remote import status: {shown}"
                 )));
             }
         }

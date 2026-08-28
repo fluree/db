@@ -731,6 +731,11 @@ impl PropertyJoinOperator {
     }
 }
 
+/// Charge the fused lane's row work at a chunk/batch boundary.
+///
+/// The fused star lanes drain scans, probes, and SPOT walks whose per-row
+/// work never crosses the fuel-charging surfaces (leaflet touches are far
+
 #[async_trait]
 impl Operator for PropertyJoinOperator {
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
@@ -997,6 +1002,7 @@ impl Operator for PropertyJoinOperator {
                 scan.open(ctx).await?;
 
                 while let Some(batch) = scan.next_batch(ctx).await? {
+                    // Rows here are priced by the inner scan's emission charge.
                     ctx.check_cancelled()?;
                     // Schema for this scan is either:
                     // - emitted predicate: [subject_var, temp_obj_var]

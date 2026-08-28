@@ -1086,6 +1086,7 @@ fn lower_insert_data(
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
+        sync_graph: None,
     })
 }
 
@@ -1138,6 +1139,7 @@ fn lower_delete_data(
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
+        sync_graph: None,
     })
 }
 
@@ -1239,6 +1241,7 @@ fn lower_delete_where(
         graph_delta: FxHashMap::default(),
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
+        sync_graph: None,
     })
 }
 
@@ -1301,6 +1304,7 @@ fn lower_delete_where_with_graphs(
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
+        sync_graph: None,
     })
 }
 
@@ -1543,6 +1547,7 @@ fn lower_modify(
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
+        sync_graph: None,
     })
 }
 

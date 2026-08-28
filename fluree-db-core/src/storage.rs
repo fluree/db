@@ -213,6 +213,29 @@ pub trait StorageRead: Debug + Send + Sync {
     /// the range, which may be shorter than requested if the object is
     /// smaller than `range.end`.
     ///
+    /// **Clamping is the contract, not an implementation detail.** An
+    /// implementation must size its result from the object, never from the
+    /// width of the range: `mid..u64::MAX` is the established spelling of
+    /// "read to the end" against this trait, so a `range.end` past the object
+    /// is normal input rather than an error. A `range.start` at or past the
+    /// end of the object returns `Ok(vec![])`, the same answer an empty range
+    /// gives — absence of bytes is not an error here, and callers distinguish
+    /// "no bytes" from "no object" by the `NotFound` error, not by this.
+    ///
+    /// Two known divergences, named so this paragraph stays authoritative
+    /// rather than optimistic — a contract doc that names one exception as if
+    /// it were the only one is how a backend drifts out from under it:
+    ///
+    /// - `S3Storage` returns 416 rather than an empty vec for a start past
+    ///   the end. That predates this doc and is tracked in #1712; the
+    ///   clamping half of the contract holds on every backend.
+    /// - A **zero-length object** reads as `NotFound` from `FileStorage` —
+    ///   the #1599 debris guard treats an empty blob as absent on every read
+    ///   surface, this one included — where `MemoryStorage` and this default
+    ///   implementation return `Ok(vec![])`. Deliberate, and callers relying
+    ///   on the guard want exactly that answer, but it is a divergence in
+    ///   this method's observable behavior all the same.
+    ///
     /// The default implementation fetches the full object and slices.
     /// StorageBackends that support native range reads (S3, HTTP) should override
     /// for efficiency.
@@ -669,11 +692,15 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
         let address = self.cid_to_address(id)?;
-        match self.storage.read_bytes(&address).await {
+        // Keep the primary miss's message rather than discarding it: it carries
+        // the resolved path, and — for a zero-length blob — the reason the
+        // backend called it absent. Rebuilding a bare `not_found(address)` here
+        // throws both away, and this is the error a caller actually sees.
+        let primary = match self.storage.read_bytes(&address).await {
             Ok(bytes) => return Ok(bytes),
-            Err(crate::error::Error::NotFound(_)) => {}
+            Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
-        }
+        };
         // Fallback: dicts moved from per-branch to @shared namespace
         if let Some(legacy) = self.legacy_dict_address(id) {
             return self.storage.read_bytes(&legacy).await;
@@ -682,7 +709,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         if let Some(legacy) = self.legacy_index_root_address(id) {
             return self.storage.read_bytes(&legacy).await;
         }
-        Err(crate::error::Error::not_found(address))
+        Err(crate::error::Error::not_found(primary))
     }
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
@@ -747,11 +774,12 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
         let address = self.cid_to_address(id)?;
-        match self.storage.read_byte_range(&address, range.clone()).await {
+        // Same reason-preservation as `get` above.
+        let primary = match self.storage.read_byte_range(&address, range.clone()).await {
             Ok(bytes) => return Ok(bytes),
-            Err(crate::error::Error::NotFound(_)) => {}
+            Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
-        }
+        };
         // Fallback: dicts moved from per-branch to @shared namespace
         if let Some(legacy) = self.legacy_dict_address(id) {
             match self.storage.read_byte_range(&legacy, range.clone()).await {
@@ -764,7 +792,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         if let Some(legacy) = self.legacy_index_root_address(id) {
             return self.storage.read_byte_range(&legacy, range).await;
         }
-        Err(crate::error::Error::not_found(address))
+        Err(crate::error::Error::not_found(primary))
     }
 }
 

@@ -20,9 +20,11 @@
 # OS
 .DS_Store
 
-# Claude Code — track commands/ (team skills) but not local settings
+# Claude Code — track commands/ (team skills) and CLAUDE.md (shared conventions),
+# but not local settings or personal notes
 .claude/settings.local.json
 .claude/dev-docs/
+CLAUDE.local.md
 
 # Fluree data (storage, indexes, etc.)
 .fluree/

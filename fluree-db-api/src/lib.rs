@@ -99,6 +99,7 @@ pub mod validate;
 pub mod vector_worker;
 #[cfg(feature = "aws")]
 pub mod vended_credentials;
+pub mod verify;
 pub mod view;
 pub mod wire;
 
@@ -120,6 +121,8 @@ pub use admin::{
     IndexStatusResult,
     ReindexOptions,
     ReindexResult,
+    SyncGraphOpts,
+    SyncGraphReport,
     TriggerIndexOptions,
     TriggerIndexResult,
 };
@@ -196,6 +199,7 @@ pub use tx::{
     TransactResultRef,
 };
 pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged};
+pub use verify::{LedgerVerifyReport, VerifyProblem, VerifySeverity};
 pub use view::{
     ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput,
     ReasoningModePrecedence, StreamDatasetPlan, StreamQueryPlan,
@@ -611,6 +615,16 @@ impl fluree_db_nameservice::NameServiceLookup for NameServiceMode {
         fluree_db_nameservice::NameServiceError,
     > {
         self.reader().all_records().await
+    }
+
+    async fn heads(
+        &self,
+        ledger_id: &str,
+    ) -> std::result::Result<
+        Option<fluree_db_nameservice::LedgerHeads>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().heads(ledger_id).await
     }
 }
 
@@ -1092,6 +1106,7 @@ async fn build_s3_storage_from_config(
             .endpoint
             .as_ref()
             .map(std::string::ToString::to_string),
+        force_path_style: s3_config.force_path_style,
         // Consolidate per-op timeouts to a single SDK operation timeout.
         // Use the maximum to avoid unexpectedly shortening slower operations.
         timeout_ms: {
@@ -1144,6 +1159,10 @@ fn build_local_storage_from_config(
                 .as_ref()
                 .ok_or_else(|| ApiError::config("File storage requires filePath"))?;
             let storage = FileStorage::new(path.as_ref());
+            // Address-identifier storages are opened at client build — that
+            // is startup, so the startup sweep of crash-orphaned staging
+            // files is taken here explicitly.
+            storage.sweep_orphaned_staging();
             if let Some(key_str) = storage_config.aes256_key.as_ref() {
                 let key = decode_encryption_key_base64(key_str.as_ref())?;
                 let encryption_key = EncryptionKey::new(key, 0);
@@ -1555,6 +1574,7 @@ impl FlureeBuilder {
             bucket: Arc::from(bucket),
             prefix: None,
             endpoint: Some(Arc::from(endpoint)),
+            force_path_style: None,
             read_timeout_ms: None,
             write_timeout_ms: None,
             list_timeout_ms: None,
@@ -1609,6 +1629,19 @@ impl FlureeBuilder {
     pub fn s3_prefix(mut self, prefix: impl Into<String>) -> Self {
         if let StorageType::S3(s3) = &mut self.config.index_storage.storage_type {
             s3.prefix = Some(Arc::from(prefix.into()));
+        }
+        self
+    }
+
+    /// Address the bucket in the URL path rather than as a virtual host.
+    ///
+    /// Needed for S3-compatible stores without bucket-subdomain DNS —
+    /// a plain MinIO at `http://minio:9000`, typically. An endpoint
+    /// override alone still produces `http://bucket.minio:9000/...`.
+    #[cfg(feature = "aws")]
+    pub fn s3_force_path_style(mut self, path_style: bool) -> Self {
+        if let StorageType::S3(s3) = &mut self.config.index_storage.storage_type {
+            s3.force_path_style = Some(path_style);
         }
         self
     }
@@ -2018,6 +2051,11 @@ impl FlureeBuilder {
             .ok_or_else(|| ApiError::config("File storage requires a path"))?;
 
         let storage = FileStorage::new(&path);
+        // Building the instance is startup: reclaim staging files a crash
+        // left behind. Explicit here rather than a side effect of `new`, and
+        // once per base path per process — the nameservice below shares this
+        // tree and needs no sweep of its own.
+        storage.sweep_orphaned_staging();
         let nameservice = FileNameService::new(&path);
         let event_bus = self.resolve_event_bus();
         let notifying =
@@ -2156,6 +2194,10 @@ impl FlureeBuilder {
             .ok_or_else(|| ApiError::config("File storage requires a path"))?;
 
         let file_storage = FileStorage::new(&path);
+        // Startup sweep, before the encryption wrapper hides the concrete
+        // storage. Staging debris is on-disk state, not content, so the
+        // sweep is the same for an encrypted tree.
+        file_storage.sweep_orphaned_staging();
         let encryption_key = EncryptionKey::new(key, 0);
         let key_provider = StaticKeyProvider::new(encryption_key);
         let storage = EncryptedStorage::new(file_storage, key_provider);
@@ -2359,6 +2401,7 @@ impl FlureeBuilder {
                     .endpoint
                     .as_ref()
                     .map(std::string::ToString::to_string),
+                force_path_style: s3_cfg.force_path_style,
                 timeout_ms,
                 max_retries: s3_cfg.max_retries.map(|n| n as u32),
                 retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
@@ -2449,6 +2492,7 @@ impl FlureeBuilder {
                     .as_ref()
                     .map(std::string::ToString::to_string)
                     .filter(|e| !e.is_empty()),
+                force_path_style: s3_cfg.force_path_style,
                 timeout_ms,
                 max_retries: s3_cfg.max_retries.map(|n| n as u32),
                 retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
@@ -2546,6 +2590,7 @@ impl FlureeBuilder {
                     .endpoint
                     .as_ref()
                     .map(std::string::ToString::to_string),
+                force_path_style: s3_cfg.force_path_style,
                 timeout_ms,
                 max_retries: s3_cfg.max_retries.map(|n| n as u32),
                 retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
@@ -2916,6 +2961,9 @@ impl FlureeBuilder {
                 .clone();
 
             let file_storage = FileStorage::new(path.as_ref());
+            // Client build is startup: take the explicit sweep of
+            // crash-orphaned staging files here, where startup is known.
+            file_storage.sweep_orphaned_staging();
             let base_storage: Arc<dyn Storage> = if let Some(key) = self.encryption_key {
                 let encryption_key = EncryptionKey::new(key, 0);
                 let key_provider = StaticKeyProvider::new(encryption_key);
@@ -3242,7 +3290,12 @@ impl Fluree {
     ///
     /// Set from `FlureeBuilder::with_indexing_thresholds()` for builder paths,
     /// or derived from `ConnectionConfig::defaults.indexing` for JSON-LD paths.
-    pub(crate) fn default_index_config(&self) -> IndexConfig {
+    ///
+    /// Public so a process that runs the Raft commit workers alongside
+    /// this engine can hand them the same thresholds. A worker staging
+    /// against different thresholds than the engine's novelty
+    /// backpressure silently diverges the two.
+    pub fn default_index_config(&self) -> IndexConfig {
         self.index_config.clone()
     }
 
@@ -4286,7 +4339,14 @@ impl Fluree {
     /// }
     /// ```
     pub async fn ledger_exists(&self, ledger_id: &str) -> Result<bool> {
-        Ok(self.nameservice().lookup(ledger_id).await?.is_some())
+        // Retracted counts as absent: tombstoning backends (the raft
+        // nameservice) keep serving the record so admin tooling can read
+        // the flag, but "exists" is a query-path question.
+        Ok(self
+            .nameservice()
+            .lookup(ledger_id)
+            .await?
+            .is_some_and(|r| !r.retracted))
     }
 
     /// Get a cached ledger handle (loads if not cached).
@@ -4929,10 +4989,15 @@ mod tests {
         assert_eq!(fluree.config.cache.max_mb, 500);
     }
 
+    // A tempdir, not a hardcoded path: `build()` is a startup path, and
+    // startup sweeps crash-orphaned staging files — pointing it at a shared
+    // directory like /tmp/test would have this test unlinking an operator's
+    // stale `.tmp` files.
     #[tokio::test]
     #[cfg(feature = "native")]
     async fn test_fluree_builder_file() {
-        let result = FlureeBuilder::file("/tmp/test")
+        let dir = tempfile::tempdir().unwrap();
+        let result = FlureeBuilder::file(dir.path().to_str().unwrap())
             .without_indexing()
             .parallelism(8)
             .cache_max_mb(1000)
@@ -4941,6 +5006,38 @@ mod tests {
         assert!(result.is_ok());
         let fluree = result.unwrap();
         assert_eq!(fluree.config.parallelism, 8);
+    }
+
+    /// Moving the sweep out of `FileStorage::new` must not cost the builder
+    /// path its sweep: building a file-backed instance is startup, and
+    /// startup reclaims what a crash left behind. Built without a runtime
+    /// (no indexer, no ledger cache — nothing to spawn) so the walk runs
+    /// inline and the assertion cannot race it.
+    #[test]
+    #[cfg(feature = "native")]
+    fn building_a_file_instance_sweeps_orphaned_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        // A stale orphan in the staging format, another process's token,
+        // aged well past the 24h threshold.
+        let orphan = dir.path().join("leaf.json.4242.fedcba9876543210.0.tmp");
+        std::fs::write(&orphan, b"half a leaf").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600))
+            .unwrap();
+
+        let _fluree = FlureeBuilder::file(dir.path().to_str().unwrap())
+            .without_indexing()
+            .without_ledger_caching()
+            .build()
+            .unwrap();
+
+        assert!(
+            !orphan.exists(),
+            "the builder startup path lost the staging sweep"
+        );
     }
 
     #[test]

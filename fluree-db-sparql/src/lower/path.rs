@@ -40,10 +40,10 @@ const MAX_SEQUENCE_EXPANSION: usize = 64;
 #[derive(Clone)]
 pub(super) struct PathObject {
     term: Term,
-    /// Datatype / language constraint for a literal endpoint. Set only by the
-    /// annotation-block surface, whose objects pin the scan to their exact
-    /// datatype; the plain path surface leaves it `None` so a path's final hop
-    /// matches exactly like the equivalent hand-written triple pattern.
+    /// Datatype / language constraint for a literal endpoint. The annotation
+    /// surface pins every literal to its exact datatype; the plain surface
+    /// pins only language-tagged and explicitly typed literals (see
+    /// `lower_object_with_term_constraint`).
     dtc: Option<DatatypeConstraint>,
 }
 
@@ -118,8 +118,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let s = self.lower_subject(subject)?;
 
         // The object may legally be a literal (`?s ex:ofMaker/ex:name "Acme"`);
-        // arms that cannot represent one narrow it themselves.
-        let o = PathObject::new(self.lower_object(object)?, None);
+        // arms that cannot represent one narrow it themselves. A tagged or
+        // explicitly typed literal keeps its constraint so the final hop
+        // matches that exact term.
+        let (term, dtc) = self.lower_object_with_term_constraint(object)?;
+        let o = PathObject::new(term, dtc);
 
         self.lower_path_dispatch(&s, path, &o, span)
     }

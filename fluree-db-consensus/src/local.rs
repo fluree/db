@@ -149,6 +149,9 @@ impl Committer for LocalCommitter {
                 TransactionBody::JsonLdInsert(json) => staged.insert(json),
                 TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
                 TransactionBody::JsonLdUpdate(json) => staged.update(json),
+                TransactionBody::JsonLdGraphSync { graph_iri, body } => {
+                    staged.sync_graph(graph_iri.as_str(), body)
+                }
                 TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
                 TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
                     staged.upsert_turtle(text.as_str())
@@ -331,6 +334,9 @@ impl Committer for LocalCommitter {
                 .into_iter()
                 .map(|(k, v)| (k, Base64Bytes(v)))
                 .collect(),
+            // The staged bundle carries every blob it resolved; a gap it
+            // could not resolve is not distinguished here yet.
+            missing_blobs: Vec::new(),
         };
 
         let response = self
