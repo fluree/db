@@ -60,12 +60,17 @@ const PREFIX: &str = "PREFIX ex: <http://example.org/ns/>\n";
 
 /// Base ledger, reindexed so these facts live in the persisted index and
 /// leave the novelty window.
+/// `ex:w4` is deliberately imported **untyped**: the second commit gives it a
+/// `@type` while restating its name verbatim, which is the shape that separates
+/// "is this fact in the base index?" from "did the base rollup count it under
+/// this class?". See `novelty_doc`.
 fn base_doc() -> Value {
     json!({
         "@context": {"ex": "http://example.org/ns/"},
         "@graph": [
             {"@id": "ex:w1", "@type": "ex:Widget", "ex:name": "w1", "ex:size": 1},
             {"@id": "ex:w2", "@type": "ex:Widget", "ex:name": "w2"},
+            {"@id": "ex:w4", "ex:name": "w4"},
             {"@id": "ex:g1", "@type": "ex:Gadget", "ex:name": "g1",
              "ex:partOf": {"@id": "ex:w1"}}
         ]
@@ -78,12 +83,19 @@ fn base_doc() -> Value {
 /// * `ex:w1` is restated verbatim — three pure duplicates (type, name, size);
 /// * `ex:w2` restates its type and name and adds one genuinely new name;
 /// * `ex:w3` is entirely new;
+/// * `ex:w4` gains a `@type` it never had while restating an already-indexed
+///   name — the whole-document re-upsert of an untyped import;
 /// * `ex:g1` restates its type and one `partOf` edge and adds a new one.
 ///
 /// Each subject restates its `@type` so novelty-side class attribution can
 /// see it — a novel property on a subject whose only type fact is already
 /// indexed is a separate, documented staleness gap in these shims, not this
 /// bug, and mixing the two would muddy the pin.
+///
+/// `ex:w4` is the exception that earns its place: its name is base-present, so
+/// reconciliation charges it zero, but the base rollup filed it under no class
+/// at all. Attributing it under `ex:Widget` anyway is the only thing that makes
+/// `ex:Widget ex:name` agree with a scan.
 fn novelty_doc() -> Value {
     json!({
         "@context": {"ex": "http://example.org/ns/"},
@@ -91,6 +103,7 @@ fn novelty_doc() -> Value {
             {"@id": "ex:w1", "@type": "ex:Widget", "ex:name": "w1", "ex:size": 1},
             {"@id": "ex:w2", "@type": "ex:Widget", "ex:name": ["w2", "w2-alt"]},
             {"@id": "ex:w3", "@type": "ex:Widget", "ex:name": "w3"},
+            {"@id": "ex:w4", "@type": "ex:Widget", "ex:name": "w4"},
             {"@id": "ex:g1", "@type": "ex:Gadget",
              "ex:partOf": [{"@id": "ex:w1"}, {"@id": "ex:w3"}]}
         ]
@@ -126,8 +139,10 @@ const CASES: &[(&str, &str, &str, u64)] = &[
         "ex:Widget",
         "ex:name",
         "SELECT (COUNT(?o) AS ?c) WHERE { ?s a ex:Widget . ?s ex:name ?o }",
-        // w1:"w1", w2:"w2", w2:"w2-alt", w3:"w3"
-        4,
+        // w1:"w1", w2:"w2", w2:"w2-alt", w3:"w3", w4:"w4" — w4's name is
+        // base-present, so it counts only if a class gained in the window
+        // still attracts a restatement.
+        5,
     ),
     (
         "ex:Widget",
@@ -157,7 +172,7 @@ const LEDGER_CASES: &[(&str, &str, u64)] = &[
     (
         "ex:name",
         "SELECT (COUNT(?o) AS ?c) WHERE { ?s ex:name ?o }",
-        5,
+        6,
     ),
     (
         "ex:partOf",
@@ -186,7 +201,7 @@ const CLASS_CASES: &[(&str, &str, u64)] = &[
     (
         "ex:Widget",
         "SELECT (COUNT(?s) AS ?c) WHERE { ?s a ex:Widget }",
-        3,
+        4,
     ),
     (
         "ex:Gadget",
@@ -473,15 +488,16 @@ async fn issue_1391_duplicate_novelty_asserts_do_not_inflate_stats_counts() {
     // took the estimate lane, or one walking a window with nothing duplicated
     // in it.
     //
-    // The fixture restates seven already-indexed facts (w1's type/name/size,
-    // w2's type/name, g1's type/partOf). `apoc.meta.data`'s rollup skips
-    // `rdf:type` — it tracks class membership separately — so it sees four of
-    // them; the whole-window walks see all seven.
+    // The fixture restates eight already-indexed facts (w1's type/name/size,
+    // w2's type/name, w4's name, g1's type/partOf). `apoc.meta.data`'s rollup
+    // counts `rdf:type` separately — it reads the resolver there only to learn
+    // which memberships are new — so its property pass sees five of them; the
+    // whole-window walks see all eight.
     for (site, floor) in [
-        ("ledger-info-full", 7),
-        ("ledger-info-fast", 7),
-        ("apoc-meta-data", 4),
-        ("merged-stats", 7),
+        ("ledger-info-full", 8),
+        ("ledger-info-fast", 8),
+        ("apoc-meta-data", 5),
+        ("merged-stats", 8),
     ] {
         let reconciled: Vec<&Stamp> = merges
             .iter()

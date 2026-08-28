@@ -170,9 +170,36 @@ pub fn assemble_fast_stats_with(
     merge: NoveltyMerge,
 ) -> IndexStats {
     let mut deltas = NoveltyDeltaResolver::new(indexed, snapshot, novelty, merge);
-    let stats = assemble_fast_stats_inner(indexed, snapshot, novelty, to_t, lookup, &mut deltas);
+    let stats = assemble_fast_stats_inner(
+        indexed,
+        snapshot,
+        novelty,
+        to_t,
+        lookup,
+        &mut deltas,
+        RestatedAttribution::IntraPass,
+    );
     deltas.finish();
     stats
+}
+
+/// Who attributes a base-present restatement to a class its subject only gains
+/// inside the novelty window.
+///
+/// The base rollup filed that fact under the subject's *base* classes, so it
+/// never counted it under the gained one — the reconciled delta of `0` is right
+/// for the flat counts and wrong for that class. Exactly one pass may make up
+/// the difference or the class-property breakdown doubles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestatedAttribution {
+    /// No class-attributing second pass follows, so
+    /// [`assemble_fast_stats_inner`]'s intra-pass `rdf:type` side table is the
+    /// only class information there is: it does the attribution itself.
+    IntraPass,
+    /// [`assemble_full_stats_with`]'s second pass follows and resolves classes
+    /// through [`StatsLookup::lookup_subject_classes`], which is authoritative
+    /// and independent of where `rdf:type` lands in POST order. Leave it there.
+    DeferredToLookup,
 }
 
 /// Full (class-attributing) assembly with planner-grade
@@ -209,8 +236,15 @@ pub async fn assemble_full_stats_with(
     merge: NoveltyMerge,
 ) -> Result<IndexStats, StatsAssemblyError> {
     let mut deltas = NoveltyDeltaResolver::new(indexed, snapshot, novelty, merge);
-    let mut stats =
-        assemble_fast_stats_inner(indexed, snapshot, novelty, to_t, Some(lookup), &mut deltas);
+    let mut stats = assemble_fast_stats_inner(
+        indexed,
+        snapshot,
+        novelty,
+        to_t,
+        Some(lookup),
+        &mut deltas,
+        RestatedAttribution::DeferredToLookup,
+    );
     // Second pass over the same POST stream: restarting run tracking replays
     // the same first-flake-per-identity decisions, and the probe's per-(g,s,p)
     // cache is already warm, so reconciliation costs no extra index reads here.
@@ -218,6 +252,18 @@ pub async fn assemble_full_stats_with(
     let mut touched_by_graph: HashMap<GraphId, HashSet<Sid>> = HashMap::new();
     let mut object_refs_by_graph: HashMap<GraphId, HashSet<Sid>> = HashMap::new();
     let mut subject_props: HashMap<(GraphId, Sid), HashMap<Sid, PropertyDelta>> = HashMap::new();
+    // Facts the base index already holds, restated inside this window. They move
+    // no count, so they belong under a class only if the base rollup could not
+    // already have counted them there — see `gained_classes`.
+    let mut restated_props: HashMap<(GraphId, Sid), HashMap<Sid, PropertyDelta>> = HashMap::new();
+    // `(graph, subject)` → the classes whose membership is new in this window.
+    // A base-present fact on such a subject is still attributable under these,
+    // because the base rollup attributed it under the subject's *base* classes
+    // and the subject did not have this one at index time. Only built when
+    // reconciling: the blind delta log resolves nothing to zero, so it would
+    // never be read.
+    let track_gained = deltas.is_reconciling();
+    let mut gained_classes: HashMap<(GraphId, Sid), HashSet<Sid>> = HashMap::new();
 
     for flake in novelty.iter_flakes(IndexType::Post) {
         // Mirror the delta pass's filter order exactly, so this resolver walks
@@ -230,13 +276,13 @@ pub async fn assemble_full_stats_with(
         if !include_in_runtime_stats(flake, to_t) {
             continue;
         }
-        if delta == 0 {
-            // The fact's presence is unchanged from the base index (an
-            // idempotent re-assert, or a retraction of something that was
-            // never there): it contributes no datatype/lang/ref-target churn.
-            continue;
-        }
         if is_rdf_type(&flake.p) {
+            if delta == 0 {
+                // Membership unchanged from base: no attribution moves, and the
+                // subject gains nothing this window's facts must be re-filed
+                // under.
+                continue;
+            }
             touched_by_graph
                 .entry(g_id)
                 .or_default()
@@ -246,7 +292,32 @@ pub async fn assemble_full_stats_with(
                     .entry(g_id)
                     .or_default()
                     .insert(target_class.clone());
+                if track_gained && delta > 0 {
+                    gained_classes
+                        .entry((g_id, flake.s.clone()))
+                        .or_default()
+                        .insert(target_class.clone());
+                }
             }
+            continue;
+        }
+        if delta == 0 && !flake.op {
+            // Retraction of a fact the base never held: nothing changes, under
+            // any class.
+            continue;
+        }
+
+        if delta == 0 {
+            // Base-present and restated. It contributes no datatype/lang/ref
+            // churn under the classes the base rollup already filed it under,
+            // but the rollup could not have filed it under a class the subject
+            // only gains here.
+            restated_props
+                .entry((g_id, flake.s.clone()))
+                .or_default()
+                .entry(flake.p.clone())
+                .or_default()
+                .apply_flake(flake);
             continue;
         }
 
@@ -272,7 +343,24 @@ pub async fn assemble_full_stats_with(
 
     deltas.finish();
 
-    if subject_props.is_empty() {
+    // A restated fact on a subject that gained no class is exactly the no-op the
+    // reconciliation says it is. Dropping those here keeps the class lookups
+    // proportional to the subjects that actually moved: every surviving subject
+    // is already in `touched_by_graph`, put there by the type flake that made it
+    // gain.
+    restated_props.retain(|key, _| gained_classes.contains_key(key));
+    for ((g_id, _), props) in &restated_props {
+        for delta in props.values() {
+            for target in &delta.ref_targets {
+                object_refs_by_graph
+                    .entry(*g_id)
+                    .or_default()
+                    .insert(target.clone());
+            }
+        }
+    }
+
+    if subject_props.is_empty() && restated_props.is_empty() {
         return Ok(stats);
     }
 
@@ -304,25 +392,40 @@ pub async fn assemble_full_stats_with(
         .map(|(idx, entry)| (entry.g_id, idx))
         .collect();
 
-    for ((g_id, subject), props) in subject_props {
-        let Some(class_sids) = graph_subject_classes.get(&(g_id, subject.clone())) else {
-            continue;
-        };
-        let graph_entry = get_or_insert_graph_entry(graphs, &mut graph_index, g_id);
-        let classes = graph_entry.classes.get_or_insert_with(Vec::new);
+    // KNOWN DRIFT, pre-existing and not addressed here: a subject whose
+    // `rdf:type` lands in this same window is attributed TWICE for its property
+    // flakes — once by the first pass, off its intra-pass `graph_subject_classes`
+    // side table, and again here off `lookup_subject_classes`. One fact then
+    // reports a class-property count of 2, under either merge mode. Closing it
+    // means deciding which pass owns class attribution for the two-pass
+    // assembly, which is a bigger change than reconciliation; see the residuals
+    // list on #1391.
+    for (props_by_subject, gained_only) in [(subject_props, false), (restated_props, true)] {
+        for ((g_id, subject), props) in props_by_subject {
+            let Some(class_sids) = graph_subject_classes.get(&(g_id, subject.clone())) else {
+                continue;
+            };
+            let gained = gained_classes.get(&(g_id, subject.clone()));
+            let graph_entry = get_or_insert_graph_entry(graphs, &mut graph_index, g_id);
+            let classes = graph_entry.classes.get_or_insert_with(Vec::new);
 
-        for class_sid in class_sids {
-            let class_entry = get_or_insert_class_entry(classes, class_sid);
-            for (property_sid, delta) in &props {
-                let prop_usage = get_or_insert_class_property(class_entry, property_sid);
-                merge_datatypes(&mut prop_usage.datatypes, &delta.datatypes);
-                merge_langs(&mut prop_usage.langs, &delta.langs);
+            for class_sid in class_sids {
+                if gained_only && !gained.is_some_and(|gained| gained.contains(class_sid)) {
+                    continue;
+                }
+                let class_entry = get_or_insert_class_entry(classes, class_sid);
+                for (property_sid, delta) in &props {
+                    let prop_usage = get_or_insert_class_property(class_entry, property_sid);
+                    merge_datatypes(&mut prop_usage.datatypes, &delta.datatypes);
+                    merge_langs(&mut prop_usage.langs, &delta.langs);
 
-                for target in &delta.ref_targets {
-                    if let Some(target_classes) = graph_subject_classes.get(&(g_id, target.clone()))
-                    {
-                        for target_class in target_classes {
-                            increment_ref_class(&mut prop_usage.ref_classes, target_class, 1);
+                    for target in &delta.ref_targets {
+                        if let Some(target_classes) =
+                            graph_subject_classes.get(&(g_id, target.clone()))
+                        {
+                            for target_class in target_classes {
+                                increment_ref_class(&mut prop_usage.ref_classes, target_class, 1);
+                            }
                         }
                     }
                 }
@@ -352,6 +455,7 @@ pub async fn assemble_full_stats_with(
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assemble_fast_stats_inner(
     indexed: &IndexStats,
     snapshot: &LedgerSnapshot,
@@ -359,6 +463,7 @@ fn assemble_fast_stats_inner(
     to_t: i64,
     lookup: Option<&dyn StatsLookup>,
     deltas: &mut NoveltyDeltaResolver<'_>,
+    restated: RestatedAttribution,
 ) -> IndexStats {
     if novelty.is_empty() || to_t <= indexed_t(indexed, snapshot) {
         return indexed.clone();
@@ -378,6 +483,12 @@ fn assemble_fast_stats_inner(
         .collect();
     let mut flakes_delta: i64 = 0;
     let mut graph_subject_classes: HashMap<(GraphId, Sid), HashSet<Sid>> = HashMap::new();
+    // The subset of `graph_subject_classes` whose membership is new relative to
+    // the base index — see [`RestatedAttribution`]. Only built when this pass
+    // is the one that will use it, so the planner's blind delta log (where no
+    // flake resolves to zero and the question never arises) pays nothing.
+    let track_gained = restated == RestatedAttribution::IntraPass && deltas.is_reconciling();
+    let mut gained_classes: HashMap<(GraphId, Sid), HashSet<Sid>> = HashMap::new();
 
     for flake in novelty.iter_flakes(IndexType::Post) {
         if flake.t > to_t {
@@ -412,6 +523,16 @@ fn assemble_fast_stats_inner(
                 } else {
                     subject_classes.remove(class_sid);
                 }
+                if track_gained && delta > 0 {
+                    gained_classes
+                        .entry((g_id, flake.s.clone()))
+                        .or_default()
+                        .insert(class_sid.clone());
+                } else if track_gained && delta < 0 {
+                    if let Some(gained) = gained_classes.get_mut(&(g_id, flake.s.clone())) {
+                        gained.remove(class_sid);
+                    }
+                }
             }
             continue;
         }
@@ -435,16 +556,34 @@ fn assemble_fast_stats_inner(
         }
 
         if let Some(class_sids) = graph_subject_classes.get(&(g_id, flake.s.clone())) {
+            let gained = gained_classes.get(&(g_id, flake.s.clone()));
             for class_sid in class_sids {
+                // A restatement of a fact the base index already holds moves no
+                // count — except under a class the subject only gains in this
+                // window, which the base rollup could not have filed it under.
+                let class_delta = if delta == 0
+                    && flake.op
+                    && gained.is_some_and(|gained| gained.contains(class_sid))
+                {
+                    1
+                } else {
+                    delta
+                };
                 let class = class_data.entry(class_sid.clone()).or_default();
                 let prop = class.properties.entry(flake.p.clone()).or_default();
-                prop.count_delta += delta;
+                prop.count_delta += class_delta;
 
                 let graph_entry = get_or_insert_graph_entry(&mut graphs, &mut graph_index, g_id);
                 let classes = graph_entry.classes.get_or_insert_with(Vec::new);
                 let class_entry = get_or_insert_class_entry(classes, class_sid);
                 let prop_usage = get_or_insert_class_property(class_entry, &flake.p);
-                update_class_property_usage(prop_usage, flake, delta, &graph_subject_classes, g_id);
+                update_class_property_usage(
+                    prop_usage,
+                    flake,
+                    class_delta,
+                    &graph_subject_classes,
+                    g_id,
+                );
             }
         }
     }
@@ -572,14 +711,26 @@ impl<'a> BaseIndexProbe<'a> {
     /// Is `flake`'s fact identity `(s, p, o, dt, m)` currently asserted in the
     /// base index of graph `g_id`?
     ///
-    /// Identity comparison uses `Ord`, matching both the index comparators and
-    /// `NoveltyFactState`'s key ordering — `FlakeValue`'s `Eq` is looser across
-    /// numeric representations, and equating `Long(3)` with `Double(3.0)` here
-    /// would suppress a legitimate assertion.
+    /// `o` and `dt` are compared with `Ord` because the cached facts are kept
+    /// sorted on `(o, dt)` for the binary search below, and that ordering is
+    /// the one the index comparators and `NoveltyFactState`'s keys already use.
     ///
-    /// The cached facts are sorted on `(o, dt)`, so this binary-searches to the
-    /// matching block and walks only that. A `(s, p)` with large base fan-out —
-    /// an RDF list, a heavily multi-valued predicate — would otherwise cost
+    /// `Ord` is not the stricter relation here — on numerics it is the same
+    /// one. `FlakeValue`'s `cmp` and its `eq` both route cross-representation
+    /// numerics through `numeric_cmp`, so `Long(3)` and `Double(3.0)` compare
+    /// `Equal` under either. What keeps them from being one identity is the
+    /// `dt` tiebreak applied alongside `o`; drop that and this would suppress a
+    /// legitimate assertion whichever relation `o` used.
+    ///
+    /// `m` is matched with `==` rather than `cmp` because it is not part of the
+    /// sort key: the block the search lands on is ordered on `(o, dt)` only, so
+    /// `m` filters that block rather than continuing the ordering. (#1727
+    /// brings `FlakeMeta`'s `Ord` into agreement with its `Eq`, so the pairing
+    /// holds either way.)
+    ///
+    /// Binary-searching to the matching block and walking only that is what
+    /// keeps the work bounded: a `(s, p)` with large base fan-out — an RDF
+    /// list, a heavily multi-valued predicate — would otherwise cost
     /// `O(identities x fan-out)` on the surface whose whole point is bounded work.
     fn base_contains(&mut self, g_id: GraphId, flake: &Flake) -> bool {
         let key = (g_id, flake.s.clone(), flake.p.clone());
@@ -685,6 +836,15 @@ fn stamp_merge(site: &'static str, outcome: &'static str, scans: usize, duplicat
 /// assemblers here, `apoc.meta.data`'s per-`(class, property)` rollup — should
 /// take its deltas from one of these rather than reading `flake.op` directly,
 /// or it inherits #1391.
+///
+/// One caveat for consumers that attribute per class rather than counting flat:
+/// a delta of `0` says the fact's presence is unchanged from the base index, not
+/// that the base rollup counted it under the class you are about to file it
+/// under. The rollup filed each base fact under the classes its subject held AT
+/// INDEX TIME, so a class the subject gains inside this window has no base
+/// contribution to double, and a restatement is the only thing that can put the
+/// fact there. `delta > 0` on the `rdf:type` flake is the signal, and both
+/// assemblers here and `meta_data_rows` use it.
 ///
 /// # Ordering contract
 ///
@@ -1999,5 +2159,240 @@ mod tests {
             vec![(ValueTypeTag::STRING.as_u8(), 1)],
             "the per-datatype breakdown must not double-count either"
         );
+    }
+
+    // -- Class attribution on a subject typed inside the window -------------
+    //
+    // The base-presence probe answers "is this fact in the base index?", but
+    // class attribution needs "did the base rollup count this fact under THIS
+    // class?". Those diverge exactly when the subject's class membership is new
+    // in the window: the fact is base-present, so it charges zero, yet the
+    // rollup filed it under the subject's classes AS OF THE INDEX and this one
+    // was not among them. The ordinary trigger is a whole-document re-upsert
+    // that adds `@type` to documents imported untyped.
+
+    /// Indexed stats for a base holding `alice ex:name "n"` under `classes`.
+    fn indexed_with_classes(classes: Option<Vec<ClassStatEntry>>) -> IndexStats {
+        IndexStats {
+            flakes: 1,
+            size: 0,
+            properties: Some(vec![PropertyStatEntry {
+                sid: (10, "name".to_string()),
+                count: 1,
+                ndv_values: 1,
+                ndv_subjects: 1,
+                last_modified_t: 1,
+                datatypes: vec![(ValueTypeTag::STRING.as_u8(), 1)],
+            }]),
+            classes: classes.clone(),
+            graphs: Some(vec![GraphStatsEntry {
+                g_id: 0,
+                flakes: 1,
+                size: 0,
+                properties: vec![],
+                classes,
+            }]),
+        }
+    }
+
+    /// One class rolled up with `ex:name` used once by its instances.
+    fn class_with_name(class_sid: &Sid, name: &Sid) -> ClassStatEntry {
+        ClassStatEntry {
+            class_sid: class_sid.clone(),
+            count: 1,
+            properties: vec![ClassPropertyUsage {
+                property_sid: name.clone(),
+                datatypes: vec![(ValueTypeTag::STRING.as_u8(), 1)],
+                langs: Vec::new(),
+                ref_classes: Vec::new(),
+            }],
+        }
+    }
+
+    /// `ex:name`'s per-datatype counts under `class`, on both assembly arms.
+    /// Returns `(fast_arm, full_arm)`.
+    async fn name_usage_under(
+        indexed: &IndexStats,
+        snapshot: &LedgerSnapshot,
+        novelty: &Novelty,
+        lookup: &StubLookup,
+        class: &Sid,
+        name: &Sid,
+        merge: NoveltyMerge,
+    ) -> (Vec<(u8, u64)>, Vec<(u8, u64)>) {
+        let read = |stats: IndexStats| -> Vec<(u8, u64)> {
+            stats
+                .graphs
+                .as_ref()
+                .and_then(|graphs| graphs.iter().find(|g| g.g_id == 0))
+                .and_then(|graph| graph.classes.as_ref())
+                .and_then(|classes| classes.iter().find(|c| c.class_sid == *class))
+                .and_then(|c| c.properties.iter().find(|u| u.property_sid == *name))
+                .map(|u| u.datatypes.clone())
+                .unwrap_or_default()
+        };
+        let fast = read(assemble_fast_stats_with(
+            indexed,
+            snapshot,
+            novelty,
+            2,
+            Some(lookup as &dyn StatsLookup),
+            merge,
+        ));
+        let full = read(
+            assemble_full_stats_with(indexed, snapshot, novelty, novelty, 2, lookup, merge)
+                .await
+                .expect("full stats"),
+        );
+        (fast, full)
+    }
+
+    #[tokio::test]
+    async fn reconcile_attributes_a_restatement_under_a_class_gained_in_the_window() {
+        let alice = sid(10, "alice");
+        let name = sid(10, "name");
+        let person = sid(10, "Person");
+        // Base holds the name and NO type for alice, so the base rollup has no
+        // `Person` at all. Novelty types her and restates the name verbatim.
+        let (snapshot, _, _) =
+            reconciling_snapshot(vec![string_flake(&alice, &name, "n", 1, true, None)]);
+        let indexed = indexed_with_classes(None);
+        let mut novelty = Novelty::new(1);
+        novelty
+            .apply_commit(
+                vec![
+                    type_flake(alice.clone(), person.clone(), 2),
+                    string_flake(&alice, &name, "n", 2, true, None),
+                ],
+                2,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let lookup = StubLookup {
+            p_ids: HashMap::from([(name.clone(), RuntimePredicateId::from_u32(7))]),
+            classes: HashMap::from([(alice.clone(), vec![person.clone()])]),
+        };
+
+        let (fast, full) = name_usage_under(
+            &indexed,
+            &snapshot,
+            &novelty,
+            &lookup,
+            &person,
+            &name,
+            TEST_RECONCILE,
+        )
+        .await;
+        let one = vec![(ValueTypeTag::STRING.as_u8(), 1)];
+        // Charging the restatement zero here drops the only contribution
+        // `Person ex:name` has — `apoc.meta.data` skips zero-count datatypes,
+        // so the row disappears entirely: #1391's own shape, inverted.
+        assert_eq!(fast, one, "fast arm lost the newly typed subject's name");
+        assert_eq!(full, one, "full arm lost the newly typed subject's name");
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_a_restatement_alone_when_the_class_set_is_unchanged() {
+        let alice = sid(10, "alice");
+        let name = sid(10, "name");
+        let person = sid(10, "Person");
+        // Both facts already indexed and both restated: the rollup already
+        // counted the name under `Person`, so the window must add nothing.
+        let (snapshot, _, _) = reconciling_snapshot(vec![
+            string_flake(&alice, &name, "n", 1, true, None),
+            type_flake(alice.clone(), person.clone(), 1),
+        ]);
+        let indexed = indexed_with_classes(Some(vec![class_with_name(&person, &name)]));
+        let mut novelty = Novelty::new(1);
+        novelty
+            .apply_commit(
+                vec![
+                    type_flake(alice.clone(), person.clone(), 2),
+                    string_flake(&alice, &name, "n", 2, true, None),
+                ],
+                2,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let lookup = StubLookup {
+            p_ids: HashMap::from([(name.clone(), RuntimePredicateId::from_u32(7))]),
+            classes: HashMap::from([(alice.clone(), vec![person.clone()])]),
+        };
+
+        let (fast, full) = name_usage_under(
+            &indexed,
+            &snapshot,
+            &novelty,
+            &lookup,
+            &person,
+            &name,
+            TEST_RECONCILE,
+        )
+        .await;
+        let one = vec![(ValueTypeTag::STRING.as_u8(), 1)];
+        assert_eq!(fast, one, "a restated type is not a gained one");
+        assert_eq!(full, one, "a restated type is not a gained one");
+    }
+
+    #[tokio::test]
+    async fn reconcile_credits_only_the_gained_class_not_the_ones_base_already_filed() {
+        let alice = sid(10, "alice");
+        let name = sid(10, "name");
+        let employee = sid(10, "Employee");
+        let person = sid(10, "Person");
+        // alice is an indexed `Employee` with an indexed name; the window adds
+        // `Person`. The restated name belongs under `Person` (the rollup could
+        // not have filed it there) and NOT again under `Employee` (it did).
+        let (snapshot, _, _) = reconciling_snapshot(vec![
+            string_flake(&alice, &name, "n", 1, true, None),
+            type_flake(alice.clone(), employee.clone(), 1),
+        ]);
+        let indexed = indexed_with_classes(Some(vec![class_with_name(&employee, &name)]));
+        let mut novelty = Novelty::new(1);
+        novelty
+            .apply_commit(
+                vec![
+                    type_flake(alice.clone(), person.clone(), 2),
+                    string_flake(&alice, &name, "n", 2, true, None),
+                ],
+                2,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let lookup = StubLookup {
+            p_ids: HashMap::from([(name.clone(), RuntimePredicateId::from_u32(7))]),
+            classes: HashMap::from([(alice.clone(), vec![employee.clone(), person.clone()])]),
+        };
+
+        let one = vec![(ValueTypeTag::STRING.as_u8(), 1)];
+        let (fast_person, full_person) = name_usage_under(
+            &indexed,
+            &snapshot,
+            &novelty,
+            &lookup,
+            &person,
+            &name,
+            TEST_RECONCILE,
+        )
+        .await;
+        assert_eq!(fast_person, one, "the gained class needs the restatement");
+        assert_eq!(full_person, one, "the gained class needs the restatement");
+
+        let (fast_employee, full_employee) = name_usage_under(
+            &indexed,
+            &snapshot,
+            &novelty,
+            &lookup,
+            &employee,
+            &name,
+            TEST_RECONCILE,
+        )
+        .await;
+        assert_eq!(
+            fast_employee, one,
+            "the base class already counted it — charging it again is the \
+             over-count this whole change exists to remove"
+        );
+        assert_eq!(full_employee, one, "same, on the class-lookup arm");
     }
 }
