@@ -50,7 +50,7 @@ pub(crate) fn cached_stats_view_for_db(
         // the persisted indexed stats, which is correct since policy overlays don't
         // produce new statistical flakes.
         let novelty = db.overlay.as_any().downcast_ref::<Novelty>();
-        let stats = if let Some(novelty) = novelty {
+        let mut stats = if let Some(novelty) = novelty {
             let lookup = BinaryStoreStatsLookup {
                 store: binary_store.map(std::convert::AsRef::as_ref),
                 runtime_small_dicts: db.runtime_small_dicts,
@@ -65,6 +65,53 @@ pub(crate) fn cached_stats_view_for_db(
         } else {
             indexed
         };
+
+        // Time travel below the published index `t`: the base index is
+        // current state as of the publish, and novelty only ever carries
+        // flakes *after* it, so nothing in `stats` describes the graph at
+        // `db.t`. For counts that is the usual estimate-drift the planner
+        // tolerates, but the observed-tag sets are read as soundness licences
+        // (`StatsView::property_ref_only` for the equijoin-filter fold,
+        // `GraphPropertyStatData::observed_datatypes` for exact-datatype scan
+        // narrowing), and there they are wrong in the unsafe direction: a
+        // predicate whose literals were legitimately deleted before the
+        // publish has no literal tag left in the current-state set, so it
+        // reads as all-ref and licenses a rewrite for a `t` at which it
+        // demonstrably carried literals.
+        //
+        // The index persists a second set for exactly this read: the
+        // historical tags, accumulated monotonically across publishes since
+        // `historical_since_t`. For any `db.t` at or above that boundary the
+        // historical set contains every tag visible at `db.t` (see the
+        // invariant on `IndexStats::historical_since_t`), and since extra
+        // tags only ever *decline* a rewrite, substituting it for the
+        // current-state set keeps every licence sound — a never-literal
+        // predicate keeps the fold at historical `t`s, instead of losing it
+        // wholesale. Below the boundary (or on an index that predates the
+        // historical wire tail) there is no sound set, so the observed sets
+        // are cleared: empty means "unknown" and every consumer fails closed.
+        // The counts are left alone in all cases.
+        if db.t < db.snapshot.t {
+            let licensed = stats.historical_since_t.is_some_and(|since| db.t >= since);
+            for property in stats.properties.iter_mut().flatten() {
+                if licensed {
+                    property.observed_datatypes =
+                        std::mem::take(&mut property.historical_datatypes);
+                } else {
+                    property.observed_datatypes.clear();
+                }
+            }
+            for graph in stats.graphs.iter_mut().flatten() {
+                for property in &mut graph.properties {
+                    if licensed {
+                        property.observed_datatypes =
+                            std::mem::take(&mut property.historical_datatypes);
+                    } else {
+                        property.observed_datatypes.clear();
+                    }
+                }
+            }
+        }
 
         let mut view = StatsView::from_db_stats_with_namespaces(&stats, db.snapshot.namespaces());
         // Per-(class, predicate) coverage counts may be consulted for semantic
@@ -221,9 +268,12 @@ mod tests {
                 ndv_subjects: 0,
                 last_modified_t: 1,
                 datatypes: vec![],
+                observed_datatypes: vec![],
+                historical_datatypes: vec![],
             }]),
             classes: None,
             graphs: None,
+            historical_since_t: None,
         });
 
         let mut novelty = Novelty::new(1);
@@ -366,5 +416,112 @@ mod tests {
             trusted.class_coverage_trustworthy,
             "vouch=true + empty novelty must trust coverage"
         );
+    }
+
+    /// A published index describes current state as of the publish. Read at the
+    /// index's own `t` its tag set is a fact about the graph; read below it, it
+    /// is a fact about a *later* graph, and the direction it is wrong in is the
+    /// unsafe one — a predicate whose literals were deleted before the publish
+    /// has no literal tag left, so it would license the equijoin-filter fold for
+    /// a `t` at which those literals are still visible.
+    ///
+    /// The historical tag set exists so this does not cost the fold wholesale:
+    /// below the index `t` the builder substitutes it (sound for every `t` at
+    /// or above `historical_since_t`), so a predicate whose history is all-ref
+    /// keeps the licence, one whose history carries a literal loses it, and
+    /// reads below the boundary — or against an index that predates the
+    /// historical wire tail — fall back to "unknown".
+    #[test]
+    fn below_the_index_t_the_historical_set_gates_the_ref_only_fold() {
+        let ref_tag = fluree_db_core::ValueTypeTag::JSON_LD_ID.as_u8();
+        let int_tag = fluree_db_core::ValueTypeTag::INTEGER.as_u8();
+        // Two predicates, both all-ref in current state as of the publish:
+        // `knows` has never carried anything else, `age` carried an integer
+        // that was deleted before the publish.
+        // The store-less stats cache is process-global and keyed by
+        // (ledger, snapshot.t, db.t, epoch, content_version) — none of which
+        // see the index root's historical boundary. Scenarios that differ
+        // only in `historical_since_t` therefore need distinct ledger ids,
+        // or the second read is served the first scenario's cached view.
+        let stats_at = |ledger: &str, t: i64, since: Option<i64>| {
+            let mut snapshot = fluree_db_core::LedgerSnapshot::genesis(ledger);
+            snapshot.t = t;
+            let entry = |name: &str, historical: Vec<u8>| PropertyStatEntry {
+                sid: (10, name.to_string()),
+                count: 1,
+                ndv_values: 1,
+                ndv_subjects: 1,
+                last_modified_t: t,
+                datatypes: vec![(ref_tag, 1)],
+                observed_datatypes: vec![ref_tag],
+                historical_datatypes: historical,
+            };
+            snapshot.stats = Some(IndexStats {
+                flakes: 2,
+                size: 20,
+                properties: Some(vec![
+                    entry("age", vec![int_tag, ref_tag]),
+                    entry("knows", vec![ref_tag]),
+                ]),
+                classes: None,
+                graphs: None,
+                historical_since_t: since,
+            });
+            snapshot
+        };
+        let novelty = Novelty::new(1); // empty: the base index answers all reads
+        let knows = Sid::new(10, "knows");
+        let age = Sid::new(10, "age");
+
+        // Current-state read: both licence the fold, historical sets unused.
+        let snapshot = stats_at("hist-boundary:main", 5, Some(0));
+        let current =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 5), None, false)
+                .expect("view");
+        assert_eq!(
+            current.is_property_ref_only(&knows),
+            Some(true),
+            "a read at the index's own t must still license the fold"
+        );
+        assert_eq!(current.is_property_ref_only(&age), Some(true));
+
+        // Historical read at or above the boundary: the historical set is the
+        // licence. Never-literal keeps the fold; deleted-literal loses it.
+        let historical =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 3), None, false)
+                .expect("view");
+        assert_eq!(
+            historical.is_property_ref_only(&knows),
+            Some(true),
+            "a never-literal predicate lost the fold for a historical read the \
+             historical set covers"
+        );
+        assert_eq!(
+            historical.is_property_ref_only(&age),
+            Some(false),
+            "a read below the index t took the current-state tag set as if it \
+             described that t"
+        );
+
+        // Below the adoption boundary: no coverage, everything falls back to
+        // "unknown" — even the never-literal predicate.
+        let adopted = stats_at("hist-adopted:main", 5, Some(3));
+        let pre_adoption =
+            cached_stats_view_for_db(GraphDbRef::new(&adopted, 0, &novelty, 2), None, false)
+                .expect("view");
+        assert_eq!(
+            pre_adoption.is_property_ref_only(&knows),
+            Some(false),
+            "a read below the adoption boundary has no sound tag set and must \
+             fail closed"
+        );
+
+        // An index without the boundary (an old blob) keeps today's
+        // conservative behavior for every historical read.
+        let old_blob = stats_at("hist-oldblob:main", 5, None);
+        let old_historical =
+            cached_stats_view_for_db(GraphDbRef::new(&old_blob, 0, &novelty, 3), None, false)
+                .expect("view");
+        assert_eq!(old_historical.is_property_ref_only(&knows), Some(false));
     }
 }

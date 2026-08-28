@@ -6673,54 +6673,19 @@ where
             use fluree_db_core::index_stats as is;
 
             // Aggregate across graphs by p_id (deprecated SID-keyed view).
-            struct PropAgg {
-                count: u64,
-                ndv_values: u64,
-                ndv_subjects: u64,
-                last_modified_t: i64,
-                datatypes: Vec<(u8, u64)>,
-            }
-            let mut agg: std::collections::HashMap<u32, PropAgg> = std::collections::HashMap::new();
-            for g in &id_stats.graphs {
-                for p in &g.properties {
-                    let e = agg.entry(p.p_id).or_insert(PropAgg {
-                        count: 0,
-                        ndv_values: 0,
-                        ndv_subjects: 0,
-                        last_modified_t: 0,
-                        datatypes: Vec::new(),
-                    });
-                    e.count += p.count;
-                    e.ndv_values = e.ndv_values.max(p.ndv_values);
-                    e.ndv_subjects = e.ndv_subjects.max(p.ndv_subjects);
-                    e.last_modified_t = e.last_modified_t.max(p.last_modified_t);
-                    for &(dt, cnt) in &p.datatypes {
-                        if let Some(existing) = e.datatypes.iter_mut().find(|(d, _)| *d == dt) {
-                            existing.1 += cnt;
-                        } else {
-                            e.datatypes.push((dt, cnt));
-                        }
-                    }
-                }
-            }
-
-            let properties: Vec<is::PropertyStatEntry> = agg
-                .into_iter()
-                .map(|(p_id, pa)| {
-                    let (ns, name) = predicate_sids_v6
-                        .get(p_id as usize)
-                        .cloned()
-                        .unwrap_or((0u16, String::new()));
-                    is::PropertyStatEntry {
-                        sid: (ns, name),
-                        count: pa.count,
-                        ndv_values: pa.ndv_values,
-                        ndv_subjects: pa.ndv_subjects,
-                        last_modified_t: pa.last_modified_t,
-                        datatypes: pa.datatypes,
-                    }
-                })
-                .collect();
+            // Shared with the incremental and rebuild pipelines so
+            // `observed_datatypes` — which is fail-closed, and so goes wrong
+            // quietly — has one producer rather than one per pipeline.
+            let properties: Vec<is::PropertyStatEntry> =
+                fluree_db_indexer::stats::aggregate_property_entries_by_sid(
+                    &id_stats.graphs,
+                    |p_id| {
+                        predicate_sids_v6
+                            .get(p_id as usize)
+                            .cloned()
+                            .unwrap_or((0u16, String::new()))
+                    },
+                );
 
             let mut graphs = id_stats.graphs;
             if let Some(ref cs) = spot_class_stats {
@@ -6750,6 +6715,11 @@ where
                 properties: Some(properties),
                 classes: None,
                 graphs: Some(graphs),
+                // An import replays its entire input as the ledger's full
+                // history, so the stats hook has observed the tag of every
+                // record at every `t` — historical coverage is complete from
+                // genesis.
+                historical_since_t: Some(0),
             };
             // Wire `total_commit_size` into `stats.size` and per-graph sizes,
             // mirroring `root_assembly::compose_root_v6` for the normal indexing
