@@ -1085,3 +1085,112 @@ async fn ac9_cyclic_bgp_operator_spans() {
         })
         .await;
 }
+
+// =============================================================================
+// overlay_translate — novelty→overlay-op translation on binary scan open
+// =============================================================================
+
+/// Seed + reindex + one novelty commit against a file-backed ledger, so a
+/// query's scan open takes the binary path and runs `overlay_translate`
+/// (memory-only ledgers never open a binary cursor).
+#[cfg(feature = "native")]
+async fn seed_overlay_ledger() -> (fluree_db_api::Fluree, tempfile::TempDir) {
+    use fluree_db_api::ReindexOptions;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let ledger = fluree
+        .create_ledger("tracing-overlay:main")
+        .await
+        .expect("create");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:name": "a", "ex:tag": "t"},
+            {"@id": "ex:b", "ex:name": "b", "ex:tag": "t"}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &insert).await.expect("seed").ledger;
+    fluree
+        .reindex("tracing-overlay:main", ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let update = json!({
+        "@context": {"ex": "http://example.org/"},
+        "where":  {"@id": "ex:a", "ex:name": "?n"},
+        "delete": {"@id": "ex:a", "ex:name": "?n"},
+        "insert": {"@id": "ex:a", "ex:name": "a2"}
+    });
+    fluree
+        .update(ledger, &update)
+        .await
+        .expect("novelty commit");
+    (fluree, dir)
+}
+
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "current_thread")]
+async fn overlay_translate_span_emits_at_debug_with_fields() {
+    use fluree_db_api::QueryInput;
+
+    let (fluree, _dir) = seed_overlay_ledger().await;
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let view = fluree.db("tracing-overlay:main").await.expect("view");
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?p", "?o"],
+        "where": {"@id": "ex:a", "?p": "?o"}
+    });
+    fluree
+        .query(&view, QueryInput::JsonLd(&q))
+        .await
+        .expect("query");
+
+    let span = store
+        .find_span("overlay_translate")
+        .expect("overlay_translate span should be emitted on a novelty-backed binary scan");
+    assert_eq!(span.level, tracing::Level::DEBUG);
+    assert!(
+        span.fields.contains_key("bounded"),
+        "fields: {:?}",
+        span.fields
+    );
+    assert!(
+        span.fields.contains_key("cache_hit"),
+        "deferred cache_hit field missing: {:?}",
+        span.fields
+    );
+    assert!(
+        span.fields.contains_key("ops_len"),
+        "deferred ops_len field missing: {:?}",
+        span.fields
+    );
+}
+
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "current_thread")]
+async fn overlay_translate_not_visible_at_info() {
+    use fluree_db_api::QueryInput;
+
+    let (fluree, _dir) = seed_overlay_ledger().await;
+    let (store, _guard) = span_capture::init_info_only_tracing();
+
+    let view = fluree.db("tracing-overlay:main").await.expect("view");
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?p", "?o"],
+        "where": {"@id": "ex:a", "?p": "?o"}
+    });
+    fluree
+        .query(&view, QueryInput::JsonLd(&q))
+        .await
+        .expect("query");
+
+    assert!(
+        !store.has_span("overlay_translate"),
+        "overlay_translate must be zero-noise at info level"
+    );
+}
