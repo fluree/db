@@ -567,5 +567,15 @@ mod tests {
                 fluree_vocab::xsd_names::INTEGER
             ),
         )));
+        // …including one a cast builds string-backed. `xsd:float(?o)` yields a
+        // `String` value under `xsd:float`, and constraining a probe with it
+        // would narrow a join that never touches the string dictionary.
+        assert!(!is_string_dict_term(&Binding::lit(
+            FlakeValue::String("1.5".to_string()),
+            Sid::new(
+                fluree_vocab::namespaces::XSD,
+                fluree_vocab::xsd_names::FLOAT
+            ),
+        )));
     }
 }
