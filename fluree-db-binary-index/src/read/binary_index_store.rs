@@ -272,6 +272,17 @@ pub struct BinaryIndexStore {
     /// O(1) lookup: o_type value → index into o_type_table.
     o_type_index: HashMap<u16, usize>,
     cas: Option<Arc<dyn ContentStore>>,
+    /// Cached at construction: whether `cas` carries a sync residency tier.
+    ///
+    /// This is a fixed property of the store — `cas` is assigned once in each
+    /// constructor and never reassigned — but reading it went through
+    /// `dyn ContentStore::miss_register`, a vtable call, at six sites and up
+    /// to ~3 times per leaf open. Caching it also takes dyn dispatch out of
+    /// the `residency`-enabled build, which is the build the api benches
+    /// compile (see the dev-dependency note in `fluree-db-api/Cargo.toml`),
+    /// narrowing the gap between what is measured and what ships.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    residency_mode: bool,
     cache_dir: PathBuf,
     /// Shared disk artifact cache — kept alive here so the global `CACHE_REGISTRY`
     /// weak ref survives across calls, avoiding repeated dir scans on every write.
@@ -425,6 +436,8 @@ impl BinaryIndexStore {
             graph_indexes,
             o_type_table,
             o_type_index,
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            residency_mode: cs.miss_register().is_some(),
             cas: Some(cs),
             cache_dir: cache_dir.to_path_buf(),
             disk_cache,
@@ -666,9 +679,7 @@ impl BinaryIndexStore {
     /// (tests) by exposing a register.
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     pub(crate) fn residency_mode(&self) -> bool {
-        self.cas
-            .as_ref()
-            .is_some_and(|cs| cs.miss_register().is_some())
+        self.residency_mode
     }
 
     /// The CAS content store backing this index, when one is configured.
@@ -3289,6 +3300,8 @@ pub(crate) mod tests {
             graph_indexes: HashMap::new(),
             o_type_table: Vec::new(),
             o_type_index: HashMap::new(),
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            residency_mode: cs.miss_register().is_some(),
             cas: Some(cs),
             disk_cache: crate::read::artifact_cache::DiskArtifactCache::for_dir(&cache_dir),
             cache_dir,
