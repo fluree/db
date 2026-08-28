@@ -1008,11 +1008,24 @@ impl NestedLoopJoinOperator {
                                         fluree_db_core::DatatypeConstraint::LangTag(Arc::from(tag))
                                     })
                                 } else {
-                                    crate::eval::rdf::reserved_datatype_sid(dt)
-                                        .or_else(|| {
-                                            gv.store().dt_sids().get(*dt_id as usize).cloned()
-                                        })
-                                        .map(fluree_db_core::DatatypeConstraint::Explicit)
+                                    let sid = crate::eval::rdf::reserved_datatype_sid(dt);
+                                    // Unreachable fallback by the argument
+                                    // above: only the three reserved ids can
+                                    // appear on an encoded string-dict
+                                    // binding, and the two non-langString
+                                    // ones both have well-known Sids. Loud
+                                    // when a future widening of the encoded
+                                    // set forgets this probe site.
+                                    debug_assert!(
+                                        sid.is_some(),
+                                        "encoded string-dict binding carries non-reserved \
+                                         dt_id {dt_id}; late_materialized_object_binding \
+                                         keeps those datatypes materialized"
+                                    );
+                                    sid.or_else(|| {
+                                        gv.store().dt_sids().get(*dt_id as usize).cloned()
+                                    })
+                                    .map(fluree_db_core::DatatypeConstraint::Explicit)
                                 };
                                 if dtc.is_some() {
                                     pattern.dtc = dtc;
