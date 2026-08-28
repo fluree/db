@@ -101,6 +101,15 @@ export class PeerTransport implements LiveTransport {
   private enginePromise: Promise<PeerEngine> | undefined;
   private connState: ConnectionState = "connecting";
   private closed = false;
+  /**
+   * The failure that took the engine out, if any. Remembered because a
+   * subscribe can arrive AFTER it — an expired token fails the connect, the
+   * first route's queries correctly show `unauthorized`, the user navigates,
+   * and the new route mounts fresh `useQuery`s. Without a replay those are
+   * stored and never acted on: `loading` forever, no error, no cycle, which
+   * is the silent freeze this transport exists to prevent.
+   */
+  private failure: QueryError | undefined;
 
   /** Cache subId -> registration. */
   private readonly subs = new Map<number, Registration>();
@@ -155,6 +164,7 @@ export class PeerTransport implements LiveTransport {
       } else if (state === "ready") {
         // A recycled engine has no subscriptions: re-register everything
         // this transport still holds, or every component freezes silently.
+        this.failure = undefined; // the engine came back
         this.setConnection("live");
         for (const [subId, reg] of this.subs) {
           reg.sub = undefined;
@@ -162,11 +172,12 @@ export class PeerTransport implements LiveTransport {
         }
       } else {
         this.setConnection("closed");
-        this.failAll({
+        this.failure = {
           code: "engine_unavailable",
           message: "the peer engine stopped and could not be restarted",
           status: 503,
-        });
+        };
+        this.failAll(this.failure);
       }
     });
     this.setConnection("live");
@@ -178,7 +189,8 @@ export class PeerTransport implements LiveTransport {
   private onEngineFailed(err: unknown): void {
     if (this.closed) return;
     this.setConnection("closed");
-    this.failAll(toQueryError(err));
+    this.failure = toQueryError(err);
+    this.failAll(this.failure);
   }
 
   /** Report an error for every live subscription, grouped per ledger so each
@@ -201,29 +213,51 @@ export class PeerTransport implements LiveTransport {
     this.sink?.onConnection(state);
   }
 
-  subscribe(spec: SubscriptionSpec): void {
-    if (this.closed) return;
-
+  /**
+   * The two things peer mode cannot answer, checked in one place because
+   * they must hold on EVERY public path. Both refusals exist so switching
+   * client modes can never change a component's data shape; enforcing one on
+   * a path and not the other is worse than having neither, because the half
+   * that is missing fails silently.
+   */
+  private unsupported(spec: ResolvedSpec): QueryError | undefined {
     // The engine has no notion of a past watermark: `snapshot` freezes the
     // CURRENT head, and a subscription is always against the live ledger.
     // Silently serving current data for a time-travel query would be a
     // correctness bug, so say so.
     if (spec.at !== undefined) {
-      this.reject(spec, {
+      return {
         code: "unsupported",
         message:
           `peer mode cannot serve a time-anchored query (at: ${spec.at}) — ` +
           "the in-browser engine has no historical view. Use remote mode for time travel.",
-      });
-      return;
+      };
     }
+    // The engine has no format parameter — a query's results are always its
+    // language's — so a different `opts.format` cannot be honoured here.
     if (spec.format !== nativeFormat(spec.kind)) {
-      this.reject(spec, {
+      return {
         code: "unsupported",
         message:
           `peer mode cannot serve format "${spec.format}" for a ${spec.kind} query — ` +
           `the engine always produces "${nativeFormat(spec.kind)}". Use remote mode for other formats.`,
-      });
+      };
+    }
+    return undefined;
+  }
+
+  subscribe(spec: SubscriptionSpec): void {
+    if (this.closed) return;
+
+    const refused = this.unsupported(spec);
+    if (refused) {
+      this.reject(spec, refused);
+      return;
+    }
+    if (this.failure) {
+      // The engine is already gone. Storing this registration would leave
+      // the component loading forever; nothing will ever drain it.
+      this.reject(spec, this.failure);
       return;
     }
 
@@ -337,12 +371,11 @@ export class PeerTransport implements LiveTransport {
   }
 
   async fetchOnce(spec: ResolvedSpec): Promise<unknown> {
-    if (spec.at !== undefined) {
-      throw {
-        code: "unsupported",
-        message: `peer mode cannot serve a time-anchored query (at: ${spec.at})`,
-      } satisfies QueryError;
-    }
+    // `LiveClient.query()` routes straight here with the caller's `opts`, so
+    // this is a public path and both refusals have to hold on it.
+    const refused = this.unsupported(spec);
+    if (refused) throw refused;
+    if (this.failure) throw this.failure;
     const engine = this.engine ?? (await this.enginePromise);
     if (!engine) throw { code: "closed", message: "peer engine is not available" };
     const ledger = await engine.ledger(spec.ledger);

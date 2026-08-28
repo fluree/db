@@ -443,6 +443,94 @@ describe("one-shot queries", () => {
       }),
     ).rejects.toMatchObject({ code: "unsupported" });
   });
+
+  it("rejects a one-shot whose format the engine cannot produce", async () => {
+    // `LiveClient.query()` hands its caller's `opts` straight to `fetchOnce`,
+    // so this is a public path. Enforcing the `at` refusal here and not the
+    // `format` one would mean `client.query(l, q, { format: "text/turtle" })`
+    // returns the engine's JSON in peer mode and Turtle in remote mode —
+    // silently, which is the whole reason both refusals exist.
+    const { engine, transport } = setup();
+    await flush();
+    await expect(
+      transport.fetchOnce({
+        ledger: LEDGER,
+        kind: "sparql",
+        text: "ASK {}",
+        format: "text/turtle",
+      }),
+    ).rejects.toMatchObject({
+      code: "unsupported",
+      message: expect.stringContaining("text/turtle"),
+    });
+    expect(engine.queries).toHaveLength(0);
+  });
+});
+
+describe("subscribing to an engine that is already gone", () => {
+  it("answers a subscribe that arrives after connect failed", async () => {
+    // Expired token on page load: the first route's queries correctly show
+    // `unauthorized`, the user navigates, and the new route's `useQuery`s
+    // mount into a transport whose engine will never exist. Storing those
+    // registrations and never draining them is `loading` forever with no
+    // error — the silent freeze this transport exists to prevent.
+    const err = { code: "unauthorized", message: "token expired", status: 401 };
+    const sink = recordingSink();
+    const transport = new PeerTransport({
+      connect: () => Promise.reject(err),
+      url: "https://srv/v1/fluree",
+    });
+    transport.start(sink);
+
+    const first = spec();
+    transport.subscribe(first); // mounted before the connect settled
+    await flush();
+    expect(sink.cycles.at(-1)!.errored).toEqual([{ subId: first.subId, error: err }]);
+
+    const later = spec({ text: "mounted after the failure" });
+    transport.subscribe(later);
+    await flush();
+    expect(sink.cycles.at(-1)!.errored).toEqual([{ subId: later.subId, error: err }]);
+  });
+
+  it("answers a subscribe that arrives after the engine went terminal", async () => {
+    const { engine, sink, transport } = setup();
+    await flush();
+    engine.emitState("terminal");
+
+    const later = spec();
+    transport.subscribe(later);
+    await flush();
+
+    expect(engine.subscribes).toHaveLength(0);
+    expect(sink.cycles.at(-1)!.errored).toEqual([
+      {
+        subId: later.subId,
+        error: {
+          code: "engine_unavailable",
+          message: "the peer engine stopped and could not be restarted",
+          status: 503,
+        },
+      },
+    ]);
+  });
+
+  it("takes subscriptions again once an engine reports ready", async () => {
+    // Defensive: nothing in the shell drives terminal -> ready today, but the
+    // remembered failure must not outlive the engine that caused it, or a
+    // recovered transport would refuse every new query forever.
+    const { engine, transport } = setup();
+    await flush();
+    engine.emitState("terminal");
+    transport.subscribe(spec());
+    await flush();
+    expect(engine.subscribes).toHaveLength(0);
+
+    engine.emitState("ready");
+    transport.subscribe(spec({ text: "after recovery" }));
+    await flush();
+    expect(engine.subscribes.map((c) => c.query)).toEqual(["after recovery"]);
+  });
 });
 
 describe("close", () => {
