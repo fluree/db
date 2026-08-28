@@ -1291,6 +1291,18 @@ pub struct FlureeBuilder {
     /// enabling background indexing — useful for CLI or embedded scenarios where
     /// the process is too short-lived for a background indexer.
     novelty_thresholds: Option<IndexConfig>,
+    /// True once indexing configuration was explicitly supplied via
+    /// [`with_indexing`], [`with_indexing_thresholds`], or
+    /// [`with_indexer_config`] — as opposed to a constructor default
+    /// (persistent builders pre-populate `indexing_config`, so
+    /// `indexing_config.is_some()` cannot distinguish the two). Build
+    /// paths that construct with background indexing disabled use this
+    /// to warn instead of silently discarding an explicit config.
+    ///
+    /// [`with_indexing`]: FlureeBuilder::with_indexing
+    /// [`with_indexing_thresholds`]: FlureeBuilder::with_indexing_thresholds
+    /// [`with_indexer_config`]: FlureeBuilder::with_indexer_config
+    indexer_config_user_set: bool,
     /// Remote Fluree connection registry for SERVICE federation.
     remote_connections: remote_service::RemoteConnectionRegistry,
     /// Externally-supplied event bus. When set, `Fluree` uses this
@@ -1517,6 +1529,7 @@ impl FlureeBuilder {
             ledger_cache_config: Some(LedgerManagerConfig::default()),
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
+            indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
@@ -1535,6 +1548,7 @@ impl FlureeBuilder {
             ledger_cache_config: Some(LedgerManagerConfig::default()),
             indexing_config: None,
             novelty_thresholds: None,
+            indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
@@ -1606,6 +1620,7 @@ impl FlureeBuilder {
             ledger_cache_config: Some(LedgerManagerConfig::default()),
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
+            indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
@@ -1802,6 +1817,7 @@ impl FlureeBuilder {
             ledger_cache_config: Some(LedgerManagerConfig::default()),
             indexing_config,
             novelty_thresholds: None,
+            indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
@@ -1894,6 +1910,7 @@ impl FlureeBuilder {
     /// [`without_indexing`]: FlureeBuilder::without_indexing
     pub fn with_indexing(mut self) -> Self {
         self.indexing_config = Some(default_indexing_builder_config());
+        self.indexer_config_user_set = true;
         self
     }
 
@@ -1907,6 +1924,10 @@ impl FlureeBuilder {
     /// accumulate novelty until the hard ceiling blocks writes.
     pub fn without_indexing(mut self) -> Self {
         self.indexing_config = None;
+        // An explicit opt-out makes any later discard intentional, not
+        // surprising — reset the flag so indexing-disabled build paths
+        // don't warn.
+        self.indexer_config_user_set = false;
         self
     }
 
@@ -1926,6 +1947,7 @@ impl FlureeBuilder {
                 .unwrap_or_default(),
             index_config,
         });
+        self.indexer_config_user_set = true;
         self
     }
 
@@ -1937,10 +1959,25 @@ impl FlureeBuilder {
     /// [`with_indexing_thresholds`] are preserved; otherwise the
     /// production defaults apply.
     ///
+    /// Two of these knobs deserve precision. `data_dir` is **not** a
+    /// durability lever: the directories under it hold ephemeral,
+    /// content-addressed build artifacts, and the canonical index lives in
+    /// the content store afterward — nothing is lost by leaving the
+    /// default. What it governs is where index builds stage their I/O and
+    /// how much RAM that staging can consume: the default is
+    /// `{system temp dir}/fluree-index`, usually a different filesystem
+    /// from the ledger data and, on many Linux hosts, tmpfs — build
+    /// artifacts staged in RAM, fast until a large build isn't. Set it
+    /// when build staging should land on a specific disk.
+    /// `incremental_max_commits` is two-sided rather than bigger-is-better:
+    /// a commit gap above it falls back to a full rebuild, but larger
+    /// windows touch more leaves and erode the incremental advantage.
+    ///
     /// Takes effect on the build paths that start an in-process indexer:
-    /// [`build`], `build_s3*`, and the encrypted variants. It is a silent
-    /// no-op under [`build_memory`] (background indexing is unconditionally
-    /// disabled there) and is not honored by [`build_with`],
+    /// [`build`], `build_s3*`, and the encrypted variants. It is a no-op
+    /// under [`build_memory`] (background indexing is unconditionally
+    /// disabled there; a `tracing::warn!` is emitted when an explicitly-set
+    /// config is discarded) and is not honored by [`build_with`],
     /// [`Fluree::from_backend`], or [`Fluree::with_indexing_mode`], which
     /// construct without an in-process worker. Provider hooks set on the
     /// supplied config (`fulltext_config_provider`,
@@ -1960,6 +1997,7 @@ impl FlureeBuilder {
             indexer_config,
             index_config,
         });
+        self.indexer_config_user_set = true;
         self
     }
 
@@ -2099,11 +2137,34 @@ impl FlureeBuilder {
     /// Honors the builder's cache settings and novelty thresholds, but does
     /// **not** start background indexing (`indexing_mode` is `Disabled`);
     /// use `build()` / `build_s3*()` when an in-process indexer is needed.
+    /// Warn when explicitly-supplied indexing configuration is about to be
+    /// discarded by a build path that constructs with background indexing
+    /// disabled.
+    ///
+    /// Keyed on `indexer_config_user_set` rather than
+    /// `indexing_config.is_some()`: persistent builders (`file`, `s3`, …)
+    /// pre-populate a default config, so `is_some()` would warn on every
+    /// defaulted builder routed through these paths. Only an explicit
+    /// setter call makes the discard surprising. Note the narrow scope:
+    /// novelty thresholds still flow through `derive_indexing()` as commit
+    /// backpressure on every build path — what these paths discard is the
+    /// in-process background indexer (and any `IndexerConfig` knobs such
+    /// as `data_dir` or `incremental_max_commits`).
+    fn warn_if_discarding_indexer_config(&self, build_path: &'static str) {
+        if self.indexer_config_user_set {
+            tracing::warn!(
+                build_path,
+                "explicitly-set indexing configuration is ignored: this build path constructs with background indexing disabled"
+            );
+        }
+    }
+
     pub fn build_with(
         self,
         storage: impl Storage + 'static,
         nameservice: NameServiceMode,
     ) -> Fluree {
+        self.warn_if_discarding_indexer_config("build_with");
         let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
         Self::finalize_with_backend(
@@ -2247,6 +2308,7 @@ impl FlureeBuilder {
     /// if you need it, or switch to a persistent builder (`file`, `s3`,
     /// `ipfs`), which enable indexing by default.
     pub fn build_memory(self) -> Fluree {
+        self.warn_if_discarding_indexer_config("build_memory");
         let storage = MemoryStorage::new();
         let nameservice = MemoryNameService::new();
         let event_bus = self.resolve_event_bus();
@@ -2280,6 +2342,7 @@ impl FlureeBuilder {
     ///
     /// * `key` - 32-byte AES-256 encryption key
     pub fn build_memory_encrypted(self, key: [u8; 32]) -> Fluree {
+        self.warn_if_discarding_indexer_config("build_memory_encrypted");
         let mem_storage = MemoryStorage::new();
         let encryption_key = EncryptionKey::new(key, 0);
         let key_provider = StaticKeyProvider::new(encryption_key);
@@ -5068,6 +5131,103 @@ mod tests {
     async fn test_indexer_handle_none_without_background_indexing() {
         let fluree = FlureeBuilder::memory().build_memory();
         assert!(fluree.indexer_handle().is_none());
+    }
+
+    /// Shared-buffer writer for asserting on emitted tracing output.
+    #[derive(Clone, Default)]
+    struct WarnBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl WarnBuf {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("utf8 log output")
+        }
+    }
+
+    impl std::io::Write for WarnBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarnBuf {
+        type Writer = WarnBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_warnings() -> (WarnBuf, tracing::subscriber::DefaultGuard) {
+        let buf = WarnBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (buf, guard)
+    }
+
+    const DISCARD_WARNING: &str = "explicitly-set indexing configuration is ignored";
+
+    #[tokio::test]
+    async fn test_explicit_indexer_config_into_build_memory_warns() {
+        let (buf, _guard) = capture_warnings();
+
+        let _fluree = FlureeBuilder::memory()
+            .with_indexer_config(IndexerConfig::default())
+            .build_memory();
+
+        let out = buf.contents();
+        assert!(
+            out.contains(DISCARD_WARNING),
+            "expected discard warning, got: {out:?}"
+        );
+        assert!(
+            out.contains("build_memory"),
+            "warning should name the build path, got: {out:?}"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn test_default_file_builder_into_build_with_does_not_warn() {
+        let (buf, _guard) = capture_warnings();
+
+        // `file()` pre-populates `indexing_config` by default; routing that
+        // builder through an indexing-disabled build path must NOT warn —
+        // only an explicit setter call makes the discard surprising.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let _fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string()).build_with(
+            MemoryStorage::new(),
+            NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new())),
+        );
+
+        let out = buf.contents();
+        assert!(
+            !out.contains(DISCARD_WARNING),
+            "default-config discard must not warn, got: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_without_indexing_resets_the_discard_warning() {
+        let (buf, _guard) = capture_warnings();
+
+        // An explicit opt-out after an explicit opt-in makes the discard
+        // intentional — no warning.
+        let _fluree = FlureeBuilder::memory()
+            .with_indexer_config(IndexerConfig::default())
+            .without_indexing()
+            .build_memory();
+
+        let out = buf.contents();
+        assert!(
+            !out.contains(DISCARD_WARNING),
+            "explicit without_indexing() must clear the warning, got: {out:?}"
+        );
     }
 
     #[test]
