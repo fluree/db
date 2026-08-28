@@ -41,7 +41,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use openraft::error::{
-    Fatal, InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
+    ClientWriteError, Fatal, InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError,
+    Unreachable,
 };
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -55,6 +56,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const PATH_APPEND_ENTRIES: &str = "/append-entries";
+/// Client-write relay: a follower posts a command here on the LEADER's
+/// router when its own `client_write` answered `ForwardToLeader`. JSON
+/// both ways — unlike the Raft RPCs, application responses may carry
+/// `serde_json::Value` state, which postcard cannot decode.
+const PATH_PROPOSE: &str = "/propose";
 const PATH_VOTE: &str = "/vote";
 const PATH_INSTALL_SNAPSHOT: &str = "/install-snapshot";
 
@@ -496,7 +502,58 @@ pub fn router<C: FlureeRaftConfig>(raft: Arc<Raft<C>>, config: &RaftTransportCon
                 config.install_snapshot_max_body_bytes,
             )),
         )
+        .route(
+            PATH_PROPOSE,
+            post(handle_propose::<C>)
+                .layer(DefaultBodyLimit::max(config.append_entries_max_body_bytes)),
+        )
         .with_state(raft)
+}
+
+/// The receiving half of [`crate::forward::propose_via_leader`]: decode
+/// the JSON command, `client_write` it locally, answer the JSON response.
+/// Leadership can move between the caller's lookup and this apply — that
+/// answers 503 so the caller re-resolves and retries, exactly the
+/// contract the peer-trusted listener's other endpoints keep.
+async fn handle_propose<C: FlureeRaftConfig>(
+    State(raft): State<Arc<Raft<C>>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cmd: C::D = match serde_json::from_slice(&body) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("propose decode error: {e}"),
+            )
+                .into_response()
+        }
+    };
+    match raft.client_write(cmd).await {
+        Ok(resp) => match serde_json::to_vec(&resp.data) {
+            Ok(bytes) => (
+                StatusCode::OK,
+                [(reqwest::header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("propose response encode error: {e}"),
+            )
+                .into_response(),
+        },
+        Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not the leader; re-resolve and retry".to_string(),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("propose failed: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 /// Decode a postcard-encoded request body. Failure → 400.

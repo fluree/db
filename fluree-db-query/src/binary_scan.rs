@@ -3746,4 +3746,76 @@ mod tests {
         )
         .is_none());
     }
+
+    /// Every upper-bound builder in the tree must pin `t` to `i64::MAX` and
+    /// `op` to `true`.
+    ///
+    /// That pin is what makes the `FlakeMeta::max()` narrowing unreachable
+    /// (see its doc in `fluree-db-core/src/flake.rs`): `{lang: Some(_),
+    /// i: Some(i32::MAX)}` sorts strictly above `FlakeMeta::max()`, so an
+    /// inclusive upper bound would exclude it — except that all four index
+    /// comparators compare `t` and `op` *before* the metadata tiebreak, and
+    /// no real flake carries `t == i64::MAX`. The guard therefore lives in
+    /// the builders, and this test quantifies over all six of them: the four
+    /// `Flake::max_*` in `fluree-db-core` (`max_psot` delegates to
+    /// `max_spot`, asserted anyway so de-aliasing it can't drop the pin),
+    /// plus `predicate_walk_bounds` in `fast_path_common` and
+    /// `overlay_walk_bounds` here.
+    ///
+    /// A new bound builder belongs in this list; one that deliberately does
+    /// not pin `t` must instead show why reaching the narrowing is safe.
+    #[test]
+    fn every_bound_builder_pins_the_sentinel_guard() {
+        let s = Sid::new(3, "s");
+        let p = Sid::new(5, "p");
+
+        let assert_pinned = |name: &str, upper: &Flake| {
+            assert_eq!(
+                upper.t,
+                i64::MAX,
+                "{name} must pin t to i64::MAX — it is the guard that keeps \
+                 FlakeMeta::max()'s narrowing unreachable"
+            );
+            assert!(upper.op, "{name} must pin op to true");
+        };
+
+        // The four core builders (plus the max_spot alias).
+        assert_pinned("Flake::max_spot", &Flake::max_spot());
+        assert_pinned("Flake::max_psot", &Flake::max_psot());
+        assert_pinned("Flake::max_for_subject", &Flake::max_for_subject(s.clone()));
+        assert_pinned(
+            "Flake::max_for_subject_predicate",
+            &Flake::max_for_subject_predicate(s.clone(), p.clone()),
+        );
+        assert_pinned(
+            "Flake::max_for_predicate",
+            &Flake::max_for_predicate(p.clone()),
+        );
+
+        // The two query-side builders.
+        let (_, rhs) = crate::fast_path_common::predicate_walk_bounds(&p);
+        assert_pinned("predicate_walk_bounds", &rhs);
+
+        // `overlay_walk_bounds` needs an operator instance; a bound-s/bound-p
+        // pattern routes to Spot, whose leading component is pinned, so the
+        // builder returns bounds. Exercise both `o_bounds` arms — the
+        // unbound-object full range and the bound-object pin — since each
+        // constructs its own `rhs`.
+        let pattern = TriplePattern::new(
+            Ref::Sid(s.clone()),
+            Ref::Sid(p.clone()),
+            Term::Var(VarId(0)),
+        );
+        let mut operator = BinaryScanOperator::new(pattern, None, vec![]);
+        let (_, rhs) = operator
+            .overlay_walk_bounds(&Some(s.clone()), &Some(p.clone()))
+            .expect("Spot with a bound subject must produce walk bounds");
+        assert_pinned("overlay_walk_bounds (unbound object)", &rhs);
+
+        operator.bound_o = Some(FlakeValue::Long(42));
+        let (_, rhs) = operator
+            .overlay_walk_bounds(&Some(s), &Some(p))
+            .expect("bound-object arm must still produce walk bounds");
+        assert_pinned("overlay_walk_bounds (bound object)", &rhs);
+    }
 }

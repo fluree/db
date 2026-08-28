@@ -413,12 +413,13 @@ fluree-db/
 
 **Responsibilities:**
 - SHACL shapes parsing
-- Constraint validation
+- Constraint validation (core constraints + `sh:sparql` SPARQL-based constraints)
 - Validation reports
 
 **Dependencies:**
 - fluree-db-core
 - fluree-db-query
+- fluree-db-sparql (parsing `sh:select` constraint queries)
 - fluree-vocab
 
 ## Reasoning

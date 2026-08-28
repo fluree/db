@@ -13,6 +13,11 @@
 //! string constraint, and novelty-side filters honour the tag. Bare numerics
 //! keep their lenient cross-subtype matching, as does a plain JSON string in
 //! the JSON-LD query surface (pinned below so a change there is deliberate).
+//!
+//! The same holds for the rest of the string dictionary — `xsd:anyURI`,
+//! `xsd:token`, `xsd:normalizedString` and customer-defined datatypes all
+//! intern their lexical form alongside `xsd:string`, and an indexed read used
+//! to decode them onto `xsd:string` outright.
 
 #![cfg(feature = "native")]
 
@@ -179,6 +184,225 @@ async fn string_literals_match_by_term_identity_in_novelty_and_index() {
                     "{phase}: json-ld plain string stays lenient"
                 );
             }
+        })
+        .await;
+}
+
+/// The rest of the string dictionary. `xsd:string`, `rdf:langString` and
+/// `@fulltext` are the only string datatypes with a reserved `DatatypeDictId`,
+/// so an indexed read used to decode `"abc"^^xsd:anyURI`, `"abc"^^xsd:token`
+/// and `"abc"^^ex:custom` onto `xsd:string`: `DATATYPE()` reported the wrong
+/// IRI, `FILTER(?x = ?y)` called all four literals equal, and a self-join
+/// swapped each one's identity row for a pairing with the plain string (#1729).
+///
+/// Both a standard XSD subtype and a customer-defined datatype are pinned, on
+/// both surfaces, and in all three lanes — novelty-only, index-only, and
+/// novelty layered over a published index, where the two representations meet.
+#[tokio::test]
+async fn string_dict_datatypes_keep_their_identity_in_novelty_and_index() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let id = "it/string-dict-identity:main";
+            let ledger = fluree.create_ledger(id).await.unwrap();
+            let data = json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": [
+                {"@id": "ex:s1", "ex:p": "abc"},
+                {"@id": "ex:s2", "ex:p": {"@value": "abc", "@type": "http://example.org/ns/custom"}},
+                {"@id": "ex:s3", "ex:p": {"@value": "abc", "@type": "http://www.w3.org/2001/XMLSchema#anyURI"}},
+                {"@id": "ex:s4", "ex:p": {"@value": "abc", "@type": "http://www.w3.org/2001/XMLSchema#token"}}
+            ]});
+            let r = fluree.insert(ledger, &data).await.unwrap();
+
+            let identity_pairs = json!([
+                ["ex:s1", "ex:s1"],
+                ["ex:s2", "ex:s2"],
+                ["ex:s3", "ex:s3"],
+                ["ex:s4", "ex:s4"]
+            ]);
+
+            for phase in ["novelty", "indexed"] {
+                if phase == "indexed" {
+                    trigger_index_and_wait_outcome(&handle, id, r.receipt.t).await;
+                }
+                let view = fluree.ledger(id).await.unwrap();
+                assert_eq!(
+                    view.snapshot.range_provider.is_some(),
+                    phase == "indexed",
+                    "{phase}: setup"
+                );
+
+                let cases: &[(&str, &str, Value)] = &[
+                    // Four distinct RDF terms, so a self-join pairs each with
+                    // itself and nothing else.
+                    (
+                        "self-join keeps each literal's own identity row",
+                        "SELECT ?a ?b WHERE { ?a ex:p ?o . ?b ex:p ?o } ORDER BY ?a ?b",
+                        identity_pairs.clone(),
+                    ),
+                    // `=` is value equality, which for non-numeric literals
+                    // requires matching datatypes.
+                    (
+                        "FILTER(?x = ?y) separates the datatypes",
+                        "SELECT ?a ?b WHERE { ?a ex:p ?x . ?b ex:p ?y FILTER(?x = ?y) } ORDER BY ?a ?b",
+                        identity_pairs.clone(),
+                    ),
+                    (
+                        "sameTerm agrees with =",
+                        "SELECT ?a ?b WHERE { ?a ex:p ?x . ?b ex:p ?y FILTER(sameTerm(?x, ?y)) }
+                         ORDER BY ?a ?b",
+                        identity_pairs.clone(),
+                    ),
+                    // The decoded binding carries its own datatype, so
+                    // projection reports it.
+                    (
+                        "DATATYPE reports the stored datatype",
+                        "SELECT ?s (DATATYPE(?o) AS ?d) WHERE { ?s ex:p ?o } ORDER BY ?s",
+                        json!([
+                            ["ex:s1", "xsd:string"],
+                            ["ex:s2", "ex:custom"],
+                            ["ex:s3", "xsd:anyURI"],
+                            ["ex:s4", "xsd:token"]
+                        ]),
+                    ),
+                    (
+                        "DISTINCT counts four terms",
+                        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:p ?o }",
+                        json!([[4]]),
+                    ),
+                    (
+                        "OPTIONAL probe is term-exact",
+                        "SELECT ?a ?b WHERE { ?a ex:p ?o .
+                                            OPTIONAL { ?b ex:p ?o FILTER(?a != ?b) } }
+                         ORDER BY ?a",
+                        json!([["ex:s1", null], ["ex:s2", null], ["ex:s3", null], ["ex:s4", null]]),
+                    ),
+                    (
+                        "constant custom datatype",
+                        r#"SELECT ?s WHERE { ?s ex:p "abc"^^<http://example.org/ns/custom> }"#,
+                        json!([["ex:s2"]]),
+                    ),
+                    (
+                        "constant xsd:anyURI",
+                        r#"SELECT ?s WHERE { ?s ex:p "abc"^^xsd:anyURI }"#,
+                        json!([["ex:s3"]]),
+                    ),
+                    (
+                        "constant xsd:token",
+                        r#"SELECT ?s WHERE { ?s ex:p "abc"^^xsd:token }"#,
+                        json!([["ex:s4"]]),
+                    ),
+                    (
+                        "constant xsd:string",
+                        r#"SELECT ?s WHERE { ?s ex:p "abc"^^xsd:string }"#,
+                        json!([["ex:s1"]]),
+                    ),
+                ];
+                for (name, body, expected) in cases {
+                    let got = sparql(&fluree, &view, body).await;
+                    assert_eq!(&got, expected, "{phase}: {name}");
+                }
+
+                // JSON-LD twin: value objects select one datatype, and the
+                // self-join is term-exact on this surface too.
+                let jl = |o: Value| {
+                    json!({"@context": {"ex": "http://example.org/ns/"},
+                           "select": "?s", "where": {"@id": "?s", "ex:p": o}})
+                };
+                for (dt, expected) in [
+                    ("http://example.org/ns/custom", "ex:s2"),
+                    ("http://www.w3.org/2001/XMLSchema#anyURI", "ex:s3"),
+                    ("http://www.w3.org/2001/XMLSchema#token", "ex:s4"),
+                    ("http://www.w3.org/2001/XMLSchema#string", "ex:s1"),
+                ] {
+                    let got =
+                        query_jsonld_formatted(&fluree, &view, &jl(json!({"@value": "abc", "@type": dt})))
+                            .await
+                            .unwrap();
+                    assert_eq!(got, json!([expected]), "{phase}: json-ld @type {dt}");
+                }
+                // A bare JSON string in the constant-object position stays
+                // lenient across the whole string family — unchanged here, and
+                // a product decision like the numeric one above.
+                let mut plain = query_jsonld_formatted(&fluree, &view, &jl(json!("abc")))
+                    .await
+                    .unwrap();
+                plain
+                    .as_array_mut()
+                    .unwrap()
+                    .sort_by_key(std::string::ToString::to_string);
+                assert_eq!(
+                    plain,
+                    json!(["ex:s1", "ex:s2", "ex:s3", "ex:s4"]),
+                    "{phase}: json-ld plain string stays lenient"
+                );
+                let mut got = query_jsonld_formatted(
+                    &fluree,
+                    &view,
+                    &json!({"@context": {"ex": "http://example.org/ns/"},
+                            "select": ["?a", "?b"],
+                            "where": [{"@id": "?a", "ex:p": "?o"}, {"@id": "?b", "ex:p": "?o"}]}),
+                )
+                .await
+                .unwrap();
+                got.as_array_mut()
+                    .unwrap()
+                    .sort_by_key(std::string::ToString::to_string);
+                assert_eq!(got, identity_pairs, "{phase}: json-ld self-join");
+            }
+
+            // Third lane: novelty layered over the published index, where a
+            // decoded `Lit` from novelty meets an `EncodedLit` from the index
+            // at the join and DISTINCT keys. `ex:s5` repeats `ex:s2`'s custom
+            // literal and `ex:s6` repeats `ex:s1`'s plain one.
+            let more = json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": [
+                {"@id": "ex:s5", "ex:p": {"@value": "abc", "@type": "http://example.org/ns/custom"}},
+                {"@id": "ex:s6", "ex:p": "abc"}
+            ]});
+            let head = fluree.ledger(id).await.unwrap();
+            fluree.insert(head, &more).await.unwrap();
+            let view = fluree.ledger(id).await.unwrap();
+            assert!(view.snapshot.range_provider.is_some(), "mixed: setup");
+            assert_eq!(
+                sparql(
+                    &fluree,
+                    &view,
+                    "SELECT ?a ?b WHERE { ?a ex:p ?o . ?b ex:p ?o } ORDER BY ?a ?b"
+                )
+                .await,
+                json!([
+                    ["ex:s1", "ex:s1"],
+                    ["ex:s1", "ex:s6"],
+                    ["ex:s2", "ex:s2"],
+                    ["ex:s2", "ex:s5"],
+                    ["ex:s3", "ex:s3"],
+                    ["ex:s4", "ex:s4"],
+                    ["ex:s5", "ex:s2"],
+                    ["ex:s5", "ex:s5"],
+                    ["ex:s6", "ex:s1"],
+                    ["ex:s6", "ex:s6"]
+                ]),
+                "mixed: self-join across the lane switch"
+            );
+            assert_eq!(
+                sparql(
+                    &fluree,
+                    &view,
+                    "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ex:p ?o }"
+                )
+                .await,
+                json!([[4]]),
+                "mixed: the two lanes agree on one key per term"
+            );
         })
         .await;
 }

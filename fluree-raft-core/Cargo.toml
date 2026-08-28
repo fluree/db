@@ -24,7 +24,7 @@ default = []
 # rendezvous ownership — and monolithic Fluree builds, which reach this
 # crate through `fluree-db-consensus` for `http::is_hop_by_hop` — do not
 # compile or link openraft.
-raft = ["dep:openraft", "dep:axum", "dep:reqwest", "dep:http-body-util", "dep:tokio-util"]
+raft = ["dep:openraft", "dep:axum", "dep:reqwest", "dep:http-body-util", "dep:tokio-util", "dep:serde_json"]
 # Conformance fixture for `AppStateMachine` implementations. Separate
 # from `raft` so it can be enabled as a dev-dependency by consumers
 # without shipping the fixture in their release builds.
@@ -66,6 +66,10 @@ openraft = { version = "0.9", optional = true, features = [
 axum = { workspace = true, optional = true }
 # HTTP client for the same layer, and for follower->leader forwarding.
 reqwest = { workspace = true, optional = true }
+# The propose relay's wire (`/propose` + `forward::propose_via_leader`):
+# JSON both ways, because application RESPONSES never ride the log and
+# may carry `serde_json::Value` state postcard cannot decode.
+serde_json = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 # `CancellationToken` for the leader-task lifecycle.
 tokio-util = { version = "0.7", optional = true }

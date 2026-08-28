@@ -445,6 +445,76 @@ Specifics:
   cross-ledger source: both shape sets enforce. See
   [Cookbook: SHACL validation — Inline shapes per
   transaction](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
+- **Enforced surfaces**: JSON-LD transactions (insert / upsert /
+  update, including TriG upserts), direct-flake Turtle inserts,
+  and validation reports (`fluree validate` in ledger mode, the
+  HTTP validate endpoint, `Fluree::validate_ledger`). Commit
+  replay (graph-sync push) intentionally skips SHACL
+  re-validation for cross-ledger sources: the origin already
+  validated against M when the commit was authored, and
+  re-resolving M at replay time could see a different head.
+- **`sh:sparql` constraints travel over the wire** — the query
+  text, `sh:prefixes` declarations, and their `owl:imports`
+  closure are all projected. At write time the query lowers
+  against D's *staged* namespace registry, so a constraint
+  matches data from the very transaction that first introduces
+  its namespace; a constraint over vocabulary D has never seen
+  anywhere is silently inert (no rows, never an error).
+- **Steady-state cost is one nameservice lookup.** The wire is
+  cached per `(model, graph, resolved_t)` and the *compiled*
+  shapes (including parsed `sh:sparql` queries) are reused
+  across transactions while M's head and D's shape-affecting
+  epochs are unchanged. A commit on M invalidates both on the
+  next transaction — governance updates propagate immediately.
+
+### Installing a shape is equivalent to root read
+
+SHACL validation runs **unfiltered**: the constraint query's
+`ContextConfig` carries `policy_enforcer: None`. That is
+deliberate and pre-dates `sh:sparql` — validation has to see
+every flake bearing on a constraint, and a policy-filtered view
+would make it unsound, since data hidden from the validator
+would silently conform.
+
+`sh:sparql` makes that choice load-bearing in a new way. Every
+other SHACL constraint can only report values reachable from the
+focus node, so an unfiltered view leaks nothing the shape author
+had not already named. A `sh:sparql` body can read anywhere in
+the graph, and `sh:message` templates interpolate bound
+variables (`{?var}` / `{$var}`) into the result. Those messages
+reach a writer as the `ShaclViolation` error text and a
+`/validate` caller as `sh:resultMessage`, with the bound value
+also landing in `sh:value`.
+
+So on a ledger whose data is policy-restricted, **whoever can
+write to the shapes graph can read what the view policy hides**
+— by installing a constraint that binds the hidden value and
+echoes it through a message template. This holds for shapes
+attached locally exactly as it does for shapes projected from a
+model ledger.
+
+Treat shapes-graph write as a governance permission rather than
+a schema-authoring convenience, and size it to match unfiltered
+read. Where data readers are restricted but shape authorship is
+not, bring the two into line — either restrict writes to the
+shapes graph to the principals already trusted with unfiltered
+reads, or source shapes from a model ledger M whose write path
+is separately controlled, which is the pattern the rest of this
+page describes.
+
+Two related bounds, both off by default:
+
+- `sh:sparql` constraints run once per focus node with no
+  structural limit on what the body reads, so `/validate`
+  accepts `maxFuel` (micro-fuel ceiling for the pass) alongside
+  the server's configured query timeout and per-query memory
+  ceiling. Set `maxFuel` wherever untrusted parties can install
+  shapes.
+- A transaction-requested `opts.validationMode: "warn"` is
+  honored only where an operator has written an
+  `f:shaclDefaults` group whose `f:overrideControl` permits it.
+  A ledger with shapes but no `#config` graph enforces
+  unconditionally and ignores the request.
 
 ## Cross-ledger datalog rules
 

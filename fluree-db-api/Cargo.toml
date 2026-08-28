@@ -253,6 +253,10 @@ path = "tests/it_cyclic_bgp_novelty_pred.rs"
 name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
 
+[[test]]
+name = "it_cyclic_bgp_string_dict"
+path = "tests/it_cyclic_bgp_string_dict.rs"
+
 # Own binary: asserts on a tracing event to pin that the BM25 incremental sync
 # really narrows its indexing query. Same convention and same two hazards as the
 # capture tests above — process-global callsite-interest cache, thread-local

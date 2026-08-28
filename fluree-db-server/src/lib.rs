@@ -767,13 +767,24 @@ impl FlureeServerBuilder {
                     let nameservice: std::sync::Arc<
                         dyn fluree_db_nameservice::IndexingNameService,
                     > = raft_ns.clone();
-                    let (worker, _handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
+                    let (worker, handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
                         backend.clone(),
                         nameservice,
                         indexer_config.clone(),
                     );
                     let worker = worker.with_event_bus(Arc::clone(&event_bus));
-                    let mut tasks = vec![tokio::spawn(worker.run())];
+                    // The handle owns the worker's ShutdownTrigger:
+                    // dropping it fires the shutdown oneshot and `run()`
+                    // exits on its FIRST select — silently, before its
+                    // first log line — leaving a raft cluster with no
+                    // indexer at all and every read walking the commit
+                    // chain unindexed. Move it into the worker's task so
+                    // they live and die together; the leader watcher's
+                    // abort on leadership loss releases both.
+                    let mut tasks = vec![tokio::spawn(async move {
+                        let _keepalive = handle;
+                        worker.run().await;
+                    })];
                     // BM25 auto-sync is leader-only for the same reason
                     // the indexer is: it publishes through the
                     // nameservice, which under Raft proposes to the

@@ -3266,7 +3266,7 @@ pub async fn stage_with_shacl(
     // `enabled_graphs` means "validate every graph with staged flakes" —
     // this legacy path doesn't consult per-graph config.
     let report =
-        validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None).await?;
+        validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None, None).await?;
 
     // Reject on violations only — spec-level `conforms` is also false for
     // warnings/infos, which must not block a commit.
@@ -3339,6 +3339,7 @@ pub async fn validate_view_with_shacl(
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
     membership_g_ids: &[GraphId],
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
+    sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ShaclValidationOutcome> {
     // Fast path: if there are no SHACL shapes, elide validation entirely.
     if shacl_cache.is_empty() {
@@ -3362,6 +3363,7 @@ pub async fn validate_view_with_shacl(
         tracker,
         enabled_graphs.as_ref(),
         cross_ledger,
+        sparql_iri_encoder,
     )
     .await?;
 
@@ -3412,6 +3414,7 @@ async fn validate_staged_nodes(
     tracker: Option<&fluree_db_core::Tracker>,
     enabled_graphs: Option<&HashSet<GraphId>>,
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
+    sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ValidationReport> {
     use fluree_vocab::namespaces::RDF;
     use fluree_vocab::rdf_names;
@@ -3520,7 +3523,7 @@ async fn validate_staged_nodes(
             // SubjectsOf/ObjectsOf handling there for why hints can't be
             // reliably built from staged flakes alone.
             let report = engine
-                .validate_node(db, subject, &node_types, cross_ledger)
+                .validate_node(db, subject, &node_types, cross_ledger, sparql_iri_encoder)
                 .await?;
             // Tag each result with the graph it was validated under so the
             // caller can route warn vs reject per-graph (see

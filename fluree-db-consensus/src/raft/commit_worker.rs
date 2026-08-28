@@ -747,11 +747,12 @@ impl Worker {
     /// blob to CAS, finalize local state, and return the new head
     /// identity. NoOp short-circuits (the conflict strategy dropped
     /// every reverted flake) republish the existing head so the
-    /// queue entry completes cleanly without advancing — `ApplyHead`
-    /// against the same head is a stale-write that the state machine
-    /// surfaces via `QueueDesync::WrongFront` only if another
-    /// transactor jumped ahead, which is exactly the race the queue
-    /// already serializes against.
+    /// queue entry completes cleanly without advancing. `ApplyHead`
+    /// recognizes that republish — equal `t` AND equal commit id —
+    /// as the designed no-op completion: it consumes the queue entry
+    /// and leaves the ref untouched. Equal `t` with a DIFFERENT
+    /// commit id is still a stale writer and is still refused with
+    /// `HeadNotMonotonic`.
     async fn process_revert(&self, revert: QueuedRevert) -> Result<StagedOutcome, WorkerError> {
         use fluree_db_api::GuardedStagedCommit;
 

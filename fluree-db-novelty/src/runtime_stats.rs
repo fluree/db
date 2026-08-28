@@ -214,6 +214,29 @@ fn assemble_fast_stats_inner(
     }
 
     let mut property_deltas = build_property_deltas(indexed);
+
+    // Distinct-value / distinct-subject tracking for predicates whose indexed
+    // entry carries no ndv — i.e. every predicate on an unindexed (memory-
+    // mode) ledger, and brand-new predicates on indexed ones. The planner's
+    // bound-object estimate is `count / ndv_values`; with ndv stuck at 0 a
+    // one-value predicate and a unique-key predicate rank identically and
+    // lowering order picks the join order (a per-focus sh:sparql uniqueness
+    // query went quadratic in the group size exactly this way). Retraction
+    // pairs net each entry to zero, so positive entries = live facts.
+    // Predicates that already have indexed ndv skip this entirely.
+    let indexed_ndv: HashSet<(u16, &str)> = indexed
+        .properties
+        .as_ref()
+        .map(|props| {
+            props
+                .iter()
+                .filter(|p| p.ndv_values > 0 || p.ndv_subjects > 0)
+                .map(|p| (p.sid.0, p.sid.1.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    type NdvAcc = (HashMap<(FlakeValue, Sid), i64>, HashMap<Sid, i64>);
+    let mut ndv_acc: HashMap<(u16, &str), NdvAcc> = HashMap::new();
     let mut class_data = build_class_data(indexed);
     let mut graphs = indexed.graphs.clone().unwrap_or_default();
     let mut graph_index: HashMap<GraphId, usize> = graphs
@@ -262,9 +285,15 @@ fn assemble_fast_stats_inner(
         }
 
         let datatype_tag = runtime_datatype_tag(flake);
-        let property = property_deltas
-            .entry((flake.p.namespace_code, &*flake.p.name))
-            .or_default();
+        let sid_key = (flake.p.namespace_code, &*flake.p.name);
+        if !indexed_ndv.contains(&sid_key) {
+            let acc = ndv_acc.entry(sid_key).or_default();
+            *acc.0
+                .entry((flake.o.clone(), flake.dt.clone()))
+                .or_insert(0) += delta;
+            *acc.1.entry(flake.s.clone()).or_insert(0) += delta;
+        }
+        let property = property_deltas.entry(sid_key).or_default();
         property.count += delta;
         if flake.op {
             property.asserted_datatypes.insert(datatype_tag);
@@ -296,7 +325,20 @@ fn assemble_fast_stats_inner(
         }
     }
 
-    let mut stats = finalize_stats(indexed, property_deltas, class_data);
+    let novelty_ndv: HashMap<(u16, &str), (u64, u64)> = ndv_acc
+        .into_iter()
+        .map(|(sid, (values, subjects))| {
+            (
+                sid,
+                (
+                    values.values().filter(|&&c| c > 0).count() as u64,
+                    subjects.values().filter(|&&c| c > 0).count() as u64,
+                ),
+            )
+        })
+        .collect();
+
+    let mut stats = finalize_stats(indexed, property_deltas, class_data, &novelty_ndv);
     stats.flakes = (indexed.flakes as i64 + flakes_delta).max(0) as u64;
     stats.size = indexed.size + novelty.size as u64;
     if !graphs.is_empty() {
@@ -693,6 +735,7 @@ fn finalize_stats(
     indexed: &IndexStats,
     property_deltas: PropertyDeltaMap<'_>,
     class_data: HashMap<Sid, ClassDataMut>,
+    novelty_ndv: &HashMap<(u16, &str), (u64, u64)>,
 ) -> IndexStats {
     let properties = if property_deltas.is_empty() {
         indexed.properties.clone()
@@ -725,11 +768,23 @@ fn finalize_stats(
                         .unwrap_or(&[]),
                     &delta.asserted_datatypes,
                 );
+                // ndv: prefer the indexed figure; fall back to the live-set
+                // counts assembled from novelty for predicates the index has
+                // no (or zero) ndv for — without this, memory-mode planning
+                // saw every bound-object probe as equally unselective.
+                let (novelty_values, novelty_subjects) =
+                    novelty_ndv.get(&sid).copied().unwrap_or((0, 0));
                 PropertyStatEntry {
                     sid: (sid.0, sid.1.to_string()),
                     count: delta.count.max(0) as u64,
-                    ndv_values: indexed_entry.map(|e| e.ndv_values).unwrap_or(0),
-                    ndv_subjects: indexed_entry.map(|e| e.ndv_subjects).unwrap_or(0),
+                    ndv_values: indexed_entry
+                        .map(|e| e.ndv_values)
+                        .filter(|&v| v > 0)
+                        .unwrap_or(novelty_values),
+                    ndv_subjects: indexed_entry
+                        .map(|e| e.ndv_subjects)
+                        .filter(|&v| v > 0)
+                        .unwrap_or(novelty_subjects),
                     last_modified_t: indexed_entry.map(|e| e.last_modified_t).unwrap_or(0),
                     datatypes,
                     observed_datatypes,
