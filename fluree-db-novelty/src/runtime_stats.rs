@@ -203,6 +203,12 @@ fn assemble_fast_stats_inner(
     to_t: i64,
     lookup: Option<&dyn StatsLookup>,
 ) -> IndexStats {
+    // Below the published index `t` the base index already answers the query:
+    // novelty only ever holds flakes after it. Note the returned stats are
+    // current state *as of the publish*, not as of `to_t` — a caller that reads
+    // any of this as a statement about `to_t` (`observed_datatypes` is the one
+    // that matters, see `StatsView::property_ref_only`) has to handle the
+    // historical case itself.
     if novelty.is_empty() || to_t <= indexed_t(indexed, snapshot) {
         return indexed.clone();
     }

@@ -50,7 +50,7 @@ pub(crate) fn cached_stats_view_for_db(
         // the persisted indexed stats, which is correct since policy overlays don't
         // produce new statistical flakes.
         let novelty = db.overlay.as_any().downcast_ref::<Novelty>();
-        let stats = if let Some(novelty) = novelty {
+        let mut stats = if let Some(novelty) = novelty {
             let lookup = BinaryStoreStatsLookup {
                 store: binary_store.map(std::convert::AsRef::as_ref),
                 runtime_small_dicts: db.runtime_small_dicts,
@@ -65,6 +65,24 @@ pub(crate) fn cached_stats_view_for_db(
         } else {
             indexed
         };
+
+        // Time travel below the published index `t`: the base index is
+        // current state as of the publish, and novelty only ever carries
+        // flakes *after* it, so nothing in `stats` describes the graph at
+        // `db.t`. For counts that is the usual estimate-drift the planner
+        // tolerates, but `observed_datatypes` is read as a soundness licence
+        // (`StatsView::property_ref_only`), and there it is wrong in the
+        // unsafe direction: a predicate whose literals were legitimately
+        // deleted before the publish has no literal tag left in the base set,
+        // so it reads as all-ref and licenses the equijoin-filter fold for a
+        // `t` at which it demonstrably carried literals. Empty means
+        // "unknown", so clearing the set declines the fold for the historical
+        // read and leaves the counts alone.
+        if db.t < db.snapshot.t {
+            for property in stats.properties.iter_mut().flatten() {
+                property.observed_datatypes.clear();
+            }
+        }
 
         let mut view = StatsView::from_db_stats_with_namespaces(&stats, db.snapshot.namespaces());
         // Per-(class, predicate) coverage counts may be consulted for semantic
@@ -221,6 +239,57 @@ mod tests {
         assert!(
             trusted.class_coverage_trustworthy,
             "vouch=true + empty novelty must trust coverage"
+        );
+    }
+
+    /// A published index describes current state as of the publish. Read at the
+    /// index's own `t` its tag set is a fact about the graph; read below it, it
+    /// is a fact about a *later* graph, and the direction it is wrong in is the
+    /// unsafe one — a predicate whose literals were deleted before the publish
+    /// has no literal tag left, so it would license the equijoin-filter fold for
+    /// a `t` at which those literals are still visible.
+    #[test]
+    fn a_read_below_the_index_t_does_not_license_the_ref_only_fold() {
+        let ref_only_stats = |t: i64| {
+            let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            snapshot.t = t;
+            snapshot.stats = Some(IndexStats {
+                flakes: 1,
+                size: 10,
+                properties: Some(vec![PropertyStatEntry {
+                    sid: (10, "knows".to_string()),
+                    count: 1,
+                    ndv_values: 1,
+                    ndv_subjects: 1,
+                    last_modified_t: t,
+                    datatypes: vec![(fluree_db_core::ValueTypeTag::JSON_LD_ID.as_u8(), 1)],
+                    observed_datatypes: vec![fluree_db_core::ValueTypeTag::JSON_LD_ID.as_u8()],
+                }]),
+                classes: None,
+                graphs: None,
+            });
+            snapshot
+        };
+
+        let snapshot = ref_only_stats(5);
+        let novelty = Novelty::new(1); // empty: the base index answers both reads
+
+        let current =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 5), None, false)
+                .expect("view");
+        assert_eq!(
+            current.is_property_ref_only(&Sid::new(10, "knows")),
+            Some(true),
+            "a read at the index's own t must still license the fold"
+        );
+
+        let historical =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 3), None, false)
+                .expect("view");
+        assert_eq!(
+            historical.is_property_ref_only(&Sid::new(10, "knows")),
+            Some(false),
+            "a read below the index t read the index's tag set as if it described that t"
         );
     }
 }

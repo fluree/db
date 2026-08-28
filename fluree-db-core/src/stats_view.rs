@@ -47,6 +47,15 @@ pub struct StatsView {
     /// A `true` here is a soundness licence, so it is only ever allowed to be
     /// conservative: a property that has carried a literal reads `false` until a
     /// reindex genuinely removes the tag from the base index.
+    ///
+    /// That holds for a current-state read. It does not hold by itself for time
+    /// travel: the base index's tag set is current state *as of the publish*,
+    /// so a predicate whose literals were legitimately deleted before that
+    /// publish carries no literal tag, and a query at an earlier `t` — which
+    /// can still see those literals — would read `true`. A builder serving a
+    /// read below the published index `t` has to clear `observed_datatypes`
+    /// first so the flag falls back to "unknown"; `fluree-db-query`'s
+    /// `cached_stats_view_for_db` is the one that does.
     pub property_ref_only: HashMap<Sid, bool>,
     /// Property IRI -> ref-only flag (see [`Self::property_ref_only`]).
     pub property_ref_only_by_iri: HashMap<Arc<str>, bool>,

@@ -328,3 +328,96 @@ async fn issue_1721_no_op_delete_does_not_drift_a_published_index() {
         "a no-op delete drifted the stats read off a published index"
     );
 }
+
+/// The other way the tag set can describe a graph that is not the one being
+/// queried, and this one needs no spurious retraction at all.
+///
+/// A published index is current state as of the publish, and a read at
+/// `to_t <= indexed_t` is served from it verbatim. So delete every literal
+/// under a mixed predicate, publish, and the index's tag set is honestly
+/// all-ref — for `t = 2`. A query at `t = 1` still sees those literals, and
+/// without a guard it would read that same all-ref set as its licence and fold
+/// a `FILTER(?x = ?y)` that equates `"abc"` with `"abc"^^ex:custom`.
+///
+/// Nothing about the ledger is unusual here: the delete is a real one, the
+/// stats are honest, and the fold is simply reading a fact about the wrong `t`.
+#[tokio::test]
+async fn issue_1721_time_travel_below_the_index_t_does_not_license_the_fold() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "hazard1721-timetravel:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger1 = fluree
+        .insert(ledger0, &seed())
+        .await
+        .expect("insert")
+        .ledger;
+
+    // A legitimate delete of both literals: after this the predicate really is
+    // all-ref, and the next index publish will say so.
+    let delete_the_literals = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "delete": [
+            {"@id":"ex:s1","ex:p": "abc"},
+            {"@id":"ex:s2","ex:p": {"@value":"abc","@type":"ex:custom"}}
+        ]
+    });
+    let _ = fluree
+        .update(ledger1, &delete_the_literals)
+        .await
+        .expect("delete the literals")
+        .ledger;
+    support::build_and_publish_index(&fluree, ledger_id).await;
+
+    // Folded vs unfolded at the same `t`, rather than against a written-out
+    // expectation: projecting both compared variables makes `find_foldable`
+    // bail, so the second query is the shipping engine's own pre-rewrite
+    // answer. The historical read lane has a datatype-flattening defect of its
+    // own (#1729) that also moves this answer; comparing the two shapes inside
+    // one lane measures the fold and nothing else.
+    let foldable = format!(
+        r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?a ?b
+        FROM <{ledger_id}@t:1>
+        WHERE {{ ?a ex:p ?x . ?b ex:p ?y . FILTER(?x = ?y) }}
+    "
+    );
+    let unfolded = format!(
+        r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?a ?b ?x ?y
+        FROM <{ledger_id}@t:1>
+        WHERE {{ ?a ex:p ?x . ?b ex:p ?y . FILTER(?x = ?y) }}
+    "
+    );
+
+    assert_eq!(
+        subject_pairs(&fluree, &foldable).await,
+        subject_pairs(&fluree, &unfolded).await,
+        "a read below the published index t folded on the index's current-state tag set"
+    );
+}
+
+/// The `(?a, ?b)` prefix of every row, sorted — so a query that projects the
+/// compared variables to defeat the fold is still comparable to one that does
+/// not.
+async fn subject_pairs(fluree: &fluree_db_api::Fluree, sparql: &str) -> Vec<serde_json::Value> {
+    let jsonld = fluree
+        .query_from()
+        .sparql(sparql)
+        .format(fluree_db_api::FormatterConfig::jsonld())
+        .execute_formatted()
+        .await
+        .expect("historical query");
+    let pairs: Vec<serde_json::Value> = jsonld
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            let cells = row.as_array().expect("row cells");
+            json!([cells[0].clone(), cells[1].clone()])
+        })
+        .collect();
+    normalize_rows(&json!(pairs))
+}
