@@ -222,7 +222,7 @@ export class MockServer {
     try {
       const answer = Promise.resolve(this.respond(call, n));
       const signal = init?.signal;
-      if (!signal) return makeResponse(await answer);
+      if (!signal || this.ignoreAbort) return makeResponse(await answer);
       // Behave like a real fetch: an abort rejects the request rather than
       // letting it run to completion.
       if (signal.aborted) throw abortError();
@@ -243,6 +243,13 @@ export class MockServer {
   aliasFor: ((ledger: string) => string) | undefined;
   /** Set non-200 to make alias resolution fail. */
   infoStatus = 200;
+  /**
+   * Ignore `AbortSignal` on query calls. Not a hypothetical: a response the
+   * browser has already fully received completes regardless of a later
+   * abort, and any consumer-supplied `fetchImpl` may ignore the signal
+   * outright. Set this to test what holds when the abort does not.
+   */
+  ignoreAbort = false;
   /** Concurrency instrumentation for the cycle fan-out. */
   inFlight = 0;
   peakInFlight = 0;

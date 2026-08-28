@@ -562,6 +562,58 @@ describe("the advance-cycle", () => {
     });
   });
 
+  it("drops a stale response on its ticket when the abort does not stop it", async () => {
+    // The `AbortController` is the first line of defence and it is not the
+    // only one that has to hold: a response the browser has already fully
+    // received completes regardless of a later abort, and a consumer-supplied
+    // `fetchImpl` may ignore the signal outright. With aborts neutered, what
+    // keeps the subscription moving forward is the per-request ticket alone.
+    const server = new MockServer();
+    server.ignoreAbort = true;
+    const sink = recordingSink();
+    const transport = new RemoteTransport({
+      url: "https://srv",
+      fetchImpl: server.fetchImpl,
+      sseRefreshDebounceMs: DEBOUNCE,
+    });
+    transport.start(sink);
+
+    let release: (() => void) | undefined;
+    server.respond = (_c, n) =>
+      n === 0
+        ? new Promise((resolve) => {
+            release = () => resolve({ body: bindings("old") });
+          })
+        : { body: bindings("new") };
+    const s = spec();
+    transport.subscribe(s);
+    await settle(); // SSE is live; the initial fetch is still in flight
+
+    await head(server, 5);
+    expect(sink.cycles).toHaveLength(1);
+    expect(sink.cycles[0]!.changed[0]!.payload).toEqual(bindings("new"));
+
+    release!();
+    await flush();
+
+    // The stale answer arrived intact — nothing cancelled it — and was
+    // dropped because a newer ticket had already been delivered.
+    expect(sink.cycles).toHaveLength(1);
+
+    // ...and it must not have become the diff baseline either, or the next
+    // commit returning the same rows as `new` would be reported as a change
+    // and the component would render a result it is already showing.
+    server.respond = () => ({ body: bindings("new") });
+    await head(server, 6);
+    expect(sink.cycles.at(-1)).toEqual({
+      ledger: LEDGER,
+      t: 6,
+      changed: [],
+      unchanged: [s.subId],
+      errored: [],
+    });
+  });
+
   it("re-runs every live subscription on the ledger in one batch", async () => {
     const { server, sink, transport } = setup();
     server.respond = (call) => ({ body: bindings(call.body) });
@@ -870,7 +922,7 @@ describe("cancellation and fan-out", () => {
     expect(server.signals.map((s) => s!.aborted)).toEqual([true, true]);
   });
 
-  it("bounds how many of a cycle's queries run at once", async () => {
+  it("bounds how many queries run at once, at mount and per commit", async () => {
     const server = new MockServer();
     const sink = recordingSink();
     const transport = new RemoteTransport({
@@ -885,12 +937,20 @@ describe("cancellation and fan-out", () => {
     const specs = Array.from({ length: 10 }, (_, i) => spec({ text: `q${i}` }));
     for (const s of specs) transport.subscribe(s);
     await settle();
-    server.peakInFlight = 0;
 
+    // The MOUNT burst draws on the same permits. This is the case the bound
+    // exists for: ten components subscribing in one React pass, at first
+    // paint, when starving the connection pool costs most. `toBe` rather
+    // than `toBeLessThanOrEqual` — a limiter that serialized everything
+    // would satisfy the ceiling and be its own bug.
+    expect(server.peakInFlight).toBe(2);
+    expect(server.queries).toHaveLength(10);
+
+    server.peakInFlight = 0;
     server.respond = (call) => ({ body: bindings(`${call.body}!`) });
     await head(server, 5);
 
-    expect(server.peakInFlight).toBeLessThanOrEqual(2);
+    expect(server.peakInFlight).toBe(2);
     // ...and every subscription still got its answer in ONE cycle.
     expect(sink.cycles.at(-1)!.changed).toHaveLength(10);
     expect(sink.cycles.at(-1)!.t).toBe(5);

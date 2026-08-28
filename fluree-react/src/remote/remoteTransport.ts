@@ -46,47 +46,50 @@ export interface RemoteTransportOptions {
   backoffBaseMs?: number;
   backoffMaxMs?: number;
   /**
-   * How many of a cycle's queries may be in flight at once.
+   * How many query requests this transport may have in flight at once.
    *
    * Remote mode re-runs EVERY live subscription on a ledger per commit (the
    * v1 invalidation ladder), which on the peer is local CPU but here is one
-   * HTTP round-trip each. Firing thirty at once on a busy ledger buries the
-   * server and blocks the browser's connection pool for everything else on
-   * the page, so the fan-out is bounded. Default 6 — the classic per-host
-   * connection limit; raise it on HTTP/2, where requests multiplex.
+   * HTTP round-trip each. Firing thirty at once buries the server and blocks
+   * the browser's connection pool for everything else on the page, so the
+   * fan-out is bounded. Default 6 — the classic per-host connection limit;
+   * raise it on HTTP/2, where requests multiplex.
+   *
+   * The bound is on the transport, not on one cycle: mount and commit share
+   * it. A page whose thirty components all subscribe in the same pass is the
+   * worst case there is — it happens at first paint, when connection-pool
+   * starvation costs most — so bounding only the per-commit fan-out would
+   * leave the burst that matters unbounded.
    */
   maxConcurrency?: number;
 }
 
-/** Default cycle fan-out width. See `maxConcurrency`. */
+/** Default query fan-out width. See `maxConcurrency`. */
 const DEFAULT_MAX_CONCURRENCY = 6;
 
 /**
- * `Promise.allSettled` with a concurrency ceiling. Results stay aligned with
- * `items` by index — the caller pairs them back up with their specs.
+ * A permit pool. `acquire` resolves when a slot is free and hands back the
+ * releaser for it; releasing passes the slot straight to the next waiter
+ * rather than decrementing, so the ceiling holds without a scheduling gap.
  */
-async function settleWithLimit<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<PromiseSettledResult<R>[]> {
-  const out: PromiseSettledResult<R>[] = new Array(items.length);
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    for (;;) {
-      const i = next++;
-      const item = items[i];
-      if (i >= items.length || item === undefined) return;
-      try {
-        out[i] = { status: "fulfilled", value: await fn(item, i) };
-      } catch (reason) {
-        out[i] = { status: "rejected", reason };
-      }
-    }
-  };
-  const width = Math.max(1, Math.min(limit, items.length));
-  await Promise.all(Array.from({ length: width }, worker));
-  return out;
+class Semaphore {
+  private inUse = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async acquire(): Promise<() => void> {
+    if (this.inUse < this.limit) this.inUse++;
+    else await new Promise<void>((resolve) => this.waiters.push(resolve));
+    let released = false;
+    return () => {
+      if (released) return; // idempotent: a double release must not overrun
+      released = true;
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.inUse--;
+    };
+  }
 }
 
 /** Keep `/`, `:` and `@` literal in the greedy `*ledger` path segment. */
@@ -167,7 +170,9 @@ export class RemoteTransport implements LiveTransport {
    * while it does.
    */
   private readonly inflight = new Map<number, AbortController>();
-  private readonly maxConcurrency: number;
+  /** Shared by every query request: the mount burst and the per-commit
+   * fan-out draw on the same permits. */
+  private readonly limiter: Semaphore;
   private closed = false;
 
   constructor(options: RemoteTransportOptions) {
@@ -180,7 +185,9 @@ export class RemoteTransport implements LiveTransport {
     // in a real browser, on every request.
     this.fetchImpl = options.fetchImpl ?? fetch.bind(globalThis);
     this.getToken = options.getToken;
-    this.maxConcurrency = options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
+    this.limiter = new Semaphore(
+      Math.max(1, options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY),
+    );
     this.sseOptions = {
       sseRefreshDebounceMs: options.sseRefreshDebounceMs,
       backoffBaseMs: options.backoffBaseMs,
@@ -505,8 +512,8 @@ export class RemoteTransport implements LiveTransport {
 
     const tickets = specs.map(() => this.nextTicket++);
     const ctrls = specs.map((spec) => this.beginRequest(spec.subId));
-    const settled = await settleWithLimit(specs, this.maxConcurrency, (spec, i) =>
-      this.execute(spec, ctrls[i]?.signal),
+    const settled = await Promise.allSettled(
+      specs.map((spec, i) => this.execute(spec, ctrls[i]?.signal)),
     );
     specs.forEach((spec, i) => {
       const ctrl = ctrls[i];
@@ -545,6 +552,16 @@ export class RemoteTransport implements LiveTransport {
   }
 
   private async execute(spec: ResolvedSpec, signal?: AbortSignal): Promise<unknown> {
+    const release = await this.limiter.acquire();
+    try {
+      return await this.request(spec, signal);
+    } finally {
+      release();
+    }
+  }
+
+  /** The request itself, outside the permit accounting. */
+  private async request(spec: ResolvedSpec, signal?: AbortSignal): Promise<unknown> {
     const ledgerPath =
       spec.at !== undefined ? `${spec.ledger}@t:${spec.at}` : spec.ledger;
     const url = `${this.base}/v1/fluree/query/${encodeLedgerPath(ledgerPath)}`;
@@ -581,6 +598,8 @@ export class RemoteTransport implements LiveTransport {
       throw error;
     }
     const contentType = res.headers.get("content-type") ?? "";
-    return contentType.includes("json") ? res.json() : res.text();
+    // Awaited here rather than returned as a promise: the body read is part
+    // of the request, and the permit must not be handed on before it lands.
+    return contentType.includes("json") ? await res.json() : await res.text();
   }
 }
