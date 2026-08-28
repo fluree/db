@@ -65,26 +65,53 @@ impl EventsQuery {
     /// `?all=true` ever worked. The `Deserialize` derive stays for the
     /// in-process constructions and tests.
     ///
-    /// Unknown keys are ignored (forward compatibility). `all` is true for
-    /// `true`/`1`; anything else, including its absence, is false.
-    pub fn from_query_str(raw: &str) -> Self {
+    /// Unknown keys are ignored (forward compatibility), and so is an empty
+    /// `ledger=` / `graph-source=` — one alias among however many were
+    /// asked for, and dropping it changes the scope but never erases it.
+    ///
+    /// `all` is different, and is the one value this parser REJECTS. It is
+    /// the whole subscription request, so a value we do not understand can
+    /// only be resolved one of two ways: guess `false` and hand back a 200
+    /// SSE stream that matches nothing and emits nothing, forever, with no
+    /// error for the client to notice — or say so. `serde_urlencoded`, what
+    /// this parser replaced, said so (a non-boolean 400d), and the silent
+    /// never-emits stream is the exact failure class the repeated-key fix
+    /// above exists to remove. `?all` bare is the flag form and means true;
+    /// `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off` are accepted
+    /// case-insensitively; anything else, empty included, is a 400.
+    pub fn from_query_str(raw: &str) -> Result<Self, ServerError> {
         let mut query = EventsQuery::default();
         for pair in raw.split('&').filter(|p| !p.is_empty()) {
-            let (key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+            // `None` distinguishes a bare flag (`?all`) from an explicitly
+            // empty value (`?all=`), which are not the same request.
+            let (key, raw_value) = match pair.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (pair, None),
+            };
             // `+` is a space in application/x-www-form-urlencoded; percent
             // escapes cover everything else (`:` in `books:main` is commonly
             // sent as %3A).
-            let value = urlencoding::decode(&raw_value.replace('+', " "))
-                .map(std::borrow::Cow::into_owned)
-                .unwrap_or_else(|_| raw_value.to_string());
+            let value = raw_value.map(|v| {
+                urlencoding::decode(&v.replace('+', " "))
+                    .map(std::borrow::Cow::into_owned)
+                    .unwrap_or_else(|_| v.to_string())
+            });
             match key {
-                "all" => query.all = matches!(value.as_str(), "true" | "1"),
-                "ledger" if !value.is_empty() => query.ledgers.push(value),
-                "graph-source" if !value.is_empty() => query.graph_sources.push(value),
+                "all" => query.all = parse_all(value.as_deref())?,
+                "ledger" => {
+                    if let Some(v) = value.filter(|v| !v.is_empty()) {
+                        query.ledgers.push(v);
+                    }
+                }
+                "graph-source" => {
+                    if let Some(v) = value.filter(|v| !v.is_empty()) {
+                        query.graph_sources.push(v);
+                    }
+                }
                 _ => {}
             }
         }
-        query
+        Ok(query)
     }
 
     /// Check if this query matches a given resource ID and kind
@@ -98,6 +125,22 @@ impl EventsQuery {
             SSE_KIND_GRAPH_SOURCE => self.graph_sources.iter().any(|v| v == resource_id),
             _ => false,
         }
+    }
+}
+
+/// `?all` → true (flag form); `?all=<boolean>` → that boolean; anything
+/// else → 400 rather than a stream that silently never emits.
+fn parse_all(value: Option<&str>) -> Result<bool, ServerError> {
+    let Some(value) = value else {
+        return Ok(true);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(ServerError::BadRequest(format!(
+            "events: `all` must be a boolean (true/false, 1/0, yes/no, on/off); got {other:?}. \
+             Subscribing to specific resources uses `?ledger=` / `?graph-source=` instead."
+        ))),
     }
 }
 
@@ -456,7 +499,7 @@ pub async fn events(
     RawQuery(raw_query): RawQuery,
     MaybeBearer(principal): MaybeBearer,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ServerError> {
-    let params = EventsQuery::from_query_str(raw_query.as_deref().unwrap_or_default());
+    let params = EventsQuery::from_query_str(raw_query.as_deref().unwrap_or_default())?;
     // Peer mode: return 404 - events endpoint not available
     // Peers subscribe to the transaction server's events endpoint instead
     if state.config.server_role == ServerRole::Peer {
@@ -615,33 +658,72 @@ mod tests {
         assert!(query.matches("any:main", "graph-source"));
     }
 
+    /// Parse a query string that this test expects to be valid.
+    fn parsed(raw: &str) -> EventsQuery {
+        EventsQuery::from_query_str(raw).unwrap_or_else(|e| panic!("{raw} must parse: {e}"))
+    }
+
     /// The wire form, which nothing used to cover: every test above builds
     /// an `EventsQuery` in process, so the fact that no `?ledger=` request
     /// could ever be deserialized went unnoticed. Repeated keys must
     /// accumulate, and a percent-encoded `:` must survive.
     #[test]
     fn test_events_query_from_query_str() {
-        let one = EventsQuery::from_query_str("ledger=books%3Amain");
+        let one = parsed("ledger=books%3Amain");
         assert_eq!(one.ledgers, vec!["books:main".to_string()]);
         assert!(!one.all);
         assert!(one.matches("books:main", "ledger"));
 
-        let many = EventsQuery::from_query_str(
-            "ledger=books%3Amain&ledger=users%3Amain&graph-source=search%3Amain",
-        );
+        let many = parsed("ledger=books%3Amain&ledger=users%3Amain&graph-source=search%3Amain");
         assert_eq!(
             many.ledgers,
             vec!["books:main".to_string(), "users:main".to_string()]
         );
         assert_eq!(many.graph_sources, vec!["search:main".to_string()]);
 
-        assert!(EventsQuery::from_query_str("all=true").all);
-        assert!(EventsQuery::from_query_str("all=1").all);
-        assert!(!EventsQuery::from_query_str("all=false").all);
-        assert!(!EventsQuery::from_query_str("").all);
+        assert!(parsed("all=true").all);
+        assert!(parsed("all=1").all);
+        assert!(!parsed("all=false").all);
+        assert!(!parsed("").all);
 
         // Unknown keys and empty values are ignored, not fatal.
-        let odd = EventsQuery::from_query_str("ledger=&future=1&ledger=a%3Ab");
+        let odd = parsed("ledger=&future=1&ledger=a%3Ab");
         assert_eq!(odd.ledgers, vec!["a:b".to_string()]);
+    }
+
+    /// `?all=` is the whole subscription request. A value this parser does
+    /// not understand must NOT resolve to `false`: that hands the client a
+    /// 200 SSE stream matching nothing, emitting nothing, forever, with
+    /// nothing to notice — the silent-freeze class this endpoint's parser
+    /// exists to remove, and what `serde_urlencoded` used to 400 on.
+    #[test]
+    fn an_uninterpretable_all_is_rejected_rather_than_silently_false() {
+        for raw in ["all=ture", "all=maybe", "all=", "all=2", "all=null"] {
+            let err = EventsQuery::from_query_str(raw)
+                .err()
+                .unwrap_or_else(|| panic!("{raw} must not be accepted"));
+            assert_eq!(
+                err.status_code(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{raw}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("`all`"),
+                "must name the parameter: {message}"
+            );
+        }
+
+        // The spellings a human actually types all work, either case.
+        for raw in ["all=TRUE", "all=Yes", "all=on", "all=1", "all"] {
+            assert!(parsed(raw).all, "{raw} must mean true");
+        }
+        for raw in ["all=FALSE", "all=no", "all=off", "all=0"] {
+            assert!(!parsed(raw).all, "{raw} must mean false");
+        }
+
+        // And an unusable `ledger=` stays ignorable: it is one alias among
+        // however many, not the entire request.
+        assert!(EventsQuery::from_query_str("ledger=&ledger=a%3Ab").is_ok());
     }
 }
