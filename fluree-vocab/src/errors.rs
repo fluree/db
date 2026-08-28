@@ -70,6 +70,17 @@ pub const NOVELTY_AT_MAX: &str = "err:db/NoveltyAtMax";
 /// transaction into smaller pieces or raise `reindex_max_bytes`.
 pub const NOVELTY_DELTA_TOO_LARGE: &str = "err:db/NoveltyDeltaTooLarge";
 
+/// The HTTP request body exceeds the server's configured body-size limit
+/// (`--body-limit`), refused before any parsing or staging.
+///
+/// The other 413 this server emits: distinct from
+/// [`NOVELTY_DELTA_TOO_LARGE`], which means the *parsed transaction's
+/// novelty delta* alone meets or exceeds `reindex_max_bytes`. Clients must
+/// branch on `@type`, not the 413 status — the remedies differ (raise the
+/// HTTP body limit / send a smaller request here, vs. split the transaction
+/// or raise `reindex_max_bytes` there).
+pub const PAYLOAD_TOO_LARGE: &str = "err:db/PayloadTooLarge";
+
 /// Commit conflict (concurrent modification)
 pub const COMMIT_CONFLICT: &str = "err:db/CommitConflict";
 

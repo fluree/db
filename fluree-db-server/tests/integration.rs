@@ -3857,9 +3857,15 @@ fn assert_novelty_backpressure_response(
         "{json}"
     );
     assert_eq!(json.get("status").and_then(JsonValue::as_u64), Some(503));
+    let retry_after: u32 = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("503 must carry Retry-After, got headers: {headers:?}"));
+    // Jittered per response — assert the contract range, not an exact value.
     assert!(
-        headers.get("retry-after").is_some(),
-        "503 must carry Retry-After, got headers: {headers:?}"
+        (3..=8).contains(&retry_after),
+        "Retry-After {retry_after} outside the jitter range [3, 8]"
     );
     let msg = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(

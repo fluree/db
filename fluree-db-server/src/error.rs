@@ -83,6 +83,12 @@ impl ServerError {
                 401 => errors::UNAUTHORIZED,
                 403 => errors::ACCESS_DENIED,
                 409 => errors::COMMIT_CONFLICT,
+                // The HTTP body-size cap (`read_limited_body`). The other
+                // 413 — an oversized novelty delta — never takes this arm:
+                // it stays typed end-to-end (`ServerError::NoveltyDeltaTooLarge`
+                // / the `Transact` variant below) precisely so the two 413s
+                // carry distinct codes for clients to branch on.
+                413 => errors::PAYLOAD_TOO_LARGE,
                 422 => errors::INVALID_TRANSACTION,
                 _ => errors::INTERNAL,
             },
@@ -452,18 +458,65 @@ impl IntoResponse for ServerError {
         // Every 503 this server emits is retryable capacity pressure
         // (novelty at max, materialization deferred, committer overloaded),
         // and RFC 9110 says a 503 should tell the client when to come back.
-        // Static 1s: the indexer's drain time is not observable at the
-        // error site, and 1s is the shortest interval that stops a tight
-        // retry loop without penalizing recovery.
+        //
+        // The value is a conservative jittered constant, not the smallest
+        // non-zero one: many HTTP clients honor `Retry-After` IN PREFERENCE
+        // to their own exponential backoff, so a static 1s would pin every
+        // blocked client at 1 rps of rejected requests during exactly the
+        // window the server is capacity-stressed. Drain time isn't
+        // observable at the error site — which argues for a conservative
+        // constant, and the per-response jitter de-choruses clients that
+        // were refused in the same instant.
         if status == StatusCode::SERVICE_UNAVAILABLE {
+            debug_assert!(
+                RETRYABLE_503_TYPES.contains(&error_type),
+                "503 with unclassified @type {error_type}: every 503 this server \
+                 emits must be retryable capacity pressure (Retry-After attaches \
+                 unconditionally) — classify the new source in RETRYABLE_503_TYPES \
+                 or map it to a different status"
+            );
+            let secs: u32 = rand::Rng::gen_range(
+                &mut rand::thread_rng(),
+                RETRY_AFTER_SECS_MIN..=RETRY_AFTER_SECS_MAX,
+            );
             response.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static("1"),
+                axum::http::HeaderValue::from(secs),
             );
         }
         response
     }
 }
+
+/// Bounds for the jittered `Retry-After` on 503 responses (uniform integer
+/// seconds, inclusive). See the rationale at the attachment site in
+/// [`ServerError::into_response`].
+pub(crate) const RETRY_AFTER_SECS_MIN: u32 = 3;
+pub(crate) const RETRY_AFTER_SECS_MAX: u32 = 8;
+
+/// The `@type` codes a 503 response is allowed to carry.
+///
+/// `Retry-After` attaches to every 503 unconditionally, so "every 503 this
+/// server emits is retryable capacity pressure" is a load-bearing invariant:
+/// a non-retryable condition mapped to 503 would tell clients to hammer a
+/// request that can never succeed. The `debug_assert` in `into_response`
+/// fails any test that produces a 503 whose `@type` is not classified here,
+/// forcing a conscious decision for each new 503 source.
+///
+/// - `NOVELTY_AT_MAX`: novelty backpressure (stage-time at-max, or a
+///   drainable commit-time would-exceed) — clears when the indexer drains.
+/// - `NOVELTY_DEFERRED`: materialization deferred (including the
+///   deferral-only `MaterializePartial` split) — same capacity class.
+/// - `INTERNAL`: the status-passthrough hole — `SubmissionError::Overloaded`
+///   (committer in-flight cap, retryable by its contract) and any tracked
+///   error relayed via `ApiError::Http { status: 503 }` reach `error_type`'s
+///   `Http` catch-all. If a new 503 lands here, give it a typed code instead
+///   of relying on this entry.
+pub(crate) const RETRYABLE_503_TYPES: [&str; 3] = [
+    fluree_vocab::errors::NOVELTY_AT_MAX,
+    fluree_vocab::errors::NOVELTY_DEFERRED,
+    fluree_vocab::errors::INTERNAL,
+];
 
 /// Extract cause chain from error (only for high-value cases)
 fn extract_cause(error: &ServerError) -> Option<Box<ErrorResponse>> {
@@ -725,7 +778,10 @@ mod tests {
     }
 
     /// Every 503 carries `Retry-After` (all of this server's 503s are
-    /// retryable capacity pressure); non-503s must not.
+    /// retryable capacity pressure); non-503s must not. The value is
+    /// jittered, so assert presence + the configured range, not an exact
+    /// number — an exact pin would re-freeze the constant the jitter
+    /// exists to avoid.
     #[test]
     fn service_unavailable_responses_carry_retry_after() {
         let resp = ServerError::Api(ApiError::Transact(
@@ -733,15 +789,121 @@ mod tests {
         ))
         .into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            resp.headers()
-                .get(axum::http::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok()),
-            Some("1")
+        let secs = retry_after_secs(&resp).expect("503 must carry Retry-After");
+        assert!(
+            (RETRY_AFTER_SECS_MIN..=RETRY_AFTER_SECS_MAX).contains(&secs),
+            "Retry-After {secs} outside [{RETRY_AFTER_SECS_MIN}, {RETRY_AFTER_SECS_MAX}]"
         );
 
         let resp = ServerError::BadRequest("nope".into()).into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
+    }
+
+    fn retry_after_secs(resp: &Response) -> Option<u32> {
+        resp.headers()
+            .get(axum::http::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
+    }
+
+    /// The "every 503 is retryable capacity" invariant, pinned against an
+    /// explicit allowlist. Enumerates every 503-producing path in this
+    /// crate's mapping; each must carry an `@type` from
+    /// [`RETRYABLE_503_TYPES`] and a `Retry-After` in the jitter range. A
+    /// future arm that maps a new condition to 503 fails this test (or the
+    /// `debug_assert` in `into_response`, for paths this corpus misses)
+    /// until the code is consciously classified as retryable capacity.
+    #[test]
+    fn every_503_source_is_classified_retryable_capacity() {
+        // One entry per 503-producing path, with the code it must carry.
+        let sources: [(ServerError, &str, &str); 6] = [
+            (
+                ServerError::Api(ApiError::NoveltyDeferred { remaining: 3 }),
+                errors::NOVELTY_DEFERRED,
+                "materialization deferred (capacity)",
+            ),
+            (
+                partial(21, 1, 0),
+                errors::NOVELTY_DEFERRED,
+                "deferral-only partial window",
+            ),
+            (
+                ServerError::Api(ApiError::Transact(
+                    fluree_db_api::TransactError::NoveltyAtMax,
+                )),
+                errors::NOVELTY_AT_MAX,
+                "stage-time novelty at max",
+            ),
+            (
+                ServerError::Api(ApiError::Transact(
+                    fluree_db_api::TransactError::NoveltyWouldExceed {
+                        current_bytes: 90,
+                        delta_bytes: 20,
+                        max_bytes: 100,
+                    },
+                )),
+                errors::NOVELTY_AT_MAX,
+                "drainable commit-time would-exceed",
+            ),
+            (
+                ServerError::NoveltyBackpressure("novelty at max (flattened)".into()),
+                errors::NOVELTY_AT_MAX,
+                "consensus-flattened novelty backpressure",
+            ),
+            (
+                // `SubmissionError::Overloaded` reaches this shape via
+                // `submission_error_to_server_error` — retryable by its
+                // contract (in-flight cap), but its `@type` is the `Http`
+                // catch-all. Classified consciously; a typed code should
+                // replace this entry if the passthrough grows more cases.
+                ServerError::Api(ApiError::http(
+                    503,
+                    "committer overloaded; in-flight operation cap reached",
+                )),
+                errors::INTERNAL,
+                "committer-overload status passthrough",
+            ),
+        ];
+        for (se, expected_type, why) in sources {
+            assert_eq!(se.status_code(), StatusCode::SERVICE_UNAVAILABLE, "{why}");
+            assert_eq!(se.error_type(), expected_type, "{why}");
+            assert!(
+                RETRYABLE_503_TYPES.contains(&expected_type),
+                "{why}: {expected_type} missing from the allowlist"
+            );
+            let resp = se.into_response();
+            let secs = retry_after_secs(&resp)
+                .unwrap_or_else(|| panic!("{why}: 503 must carry Retry-After"));
+            assert!(
+                (RETRY_AFTER_SECS_MIN..=RETRY_AFTER_SECS_MAX).contains(&secs),
+                "{why}: Retry-After {secs} outside range"
+            );
+        }
+        // The allowlist itself is part of the contract: growing it is a
+        // conscious act, recorded here.
+        assert_eq!(RETRYABLE_503_TYPES.len(), 3);
+    }
+
+    /// The two 413s carry distinct codes for clients to branch on: the HTTP
+    /// body-size cap (`read_limited_body`'s `ApiError::http(413, ..)`) is
+    /// `err:db/PayloadTooLarge`, never the novelty code — and, like the
+    /// novelty 413, it must not invite a retry.
+    #[test]
+    fn body_limit_413_carries_payload_too_large_not_the_novelty_code() {
+        let se = ServerError::Api(ApiError::http(
+            413,
+            "request body exceeds the configured limit",
+        ));
+        assert_eq!(se.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(se.error_type(), errors::PAYLOAD_TOO_LARGE);
+        assert_ne!(se.error_type(), errors::NOVELTY_DELTA_TOO_LARGE);
+        let resp = se.into_response();
         assert!(resp
             .headers()
             .get(axum::http::header::RETRY_AFTER)
