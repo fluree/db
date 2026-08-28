@@ -54,7 +54,7 @@ fn classify_fetch_error(value: JsValue) -> TransportError {
 }
 
 fn timeout_millis(timeout: Duration) -> u32 {
-    u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX)
+    crate::config::timer_millis(timeout)
 }
 
 /// Execute one request against the global `fetch`.

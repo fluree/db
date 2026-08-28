@@ -363,8 +363,8 @@ async fn live_subscription_primes_and_tracks_commits() {
                 .collect::<Vec<_>>()
         );
     }
-    fn nth(
-        outcomes: &[(serde_json::Value, Vec<String>)],
+    fn nth<'a>(
+        outcomes: &'a [(serde_json::Value, Vec<String>)],
         ledger: &str,
         n: usize,
     ) -> (serde_json::Value, Vec<String>) {

@@ -301,9 +301,7 @@ async fn scan_meta(db: &IdbDatabase) -> Result<Vec<(String, u64, f64)>, JsValue>
 }
 
 fn spawn_flusher(cache: Weak<IdbCache>, interval: Duration) {
-    let ms = u32::try_from(interval.as_millis())
-        .unwrap_or(u32::MAX)
-        .max(1_000);
+    let ms = crate::config::timer_millis(interval).max(1_000);
     spawn_local(async move {
         loop {
             TimeoutFuture::new(ms).await;

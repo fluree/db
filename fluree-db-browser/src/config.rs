@@ -130,6 +130,25 @@ impl Default for CacheConfig {
     }
 }
 
+/// Milliseconds for a browser timer (`setTimeout`, and so every
+/// `gloo_timers::TimeoutFuture` in this crate).
+///
+/// The saturating conversion this replaces was reaching for "effectively
+/// never" and produced the exact opposite. A `setTimeout` delay is stored
+/// in a SIGNED 32-bit int, so anything above `i32::MAX` overflows and the
+/// timer fires IMMEDIATELY — a `u32::MAX` fallback is a zero-delay timer,
+/// not an infinite one. (Observed, not theorized: substituting `u32::MAX`
+/// for the cache-open bound made a wedged open resolve instantly.)
+///
+/// Clamping to `i32::MAX` (~24.8 days) keeps the intent: too long to
+/// matter, and still a real delay. Durations that large are absurd for
+/// every knob here, which is precisely why the failure would be so hard to
+/// believe if it ever happened.
+pub(crate) fn timer_millis(duration: Duration) -> u32 {
+    const MAX_TIMER_MILLIS: u128 = i32::MAX as u128;
+    duration.as_millis().min(MAX_TIMER_MILLIS) as u32
+}
+
 impl CacheConfig {
     /// The eviction target in bytes (`budget_bytes * low_water_ratio`),
     /// clamped to a sane range.
@@ -142,6 +161,29 @@ impl CacheConfig {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    /// The clamp is the whole point: a `u32::MAX` fallback overflows
+    /// `setTimeout`'s signed 32-bit delay and fires at once, so a bound
+    /// meant to be unreachable becomes a bound that always trips.
+    #[test]
+    fn timer_millis_clamps_below_the_setTimeout_overflow() {
+        assert_eq!(timer_millis(Duration::from_millis(0)), 0);
+        assert_eq!(timer_millis(Duration::from_secs(10)), 10_000);
+        // The largest delay a browser still treats as a delay.
+        let max = i32::MAX as u32;
+        assert_eq!(timer_millis(Duration::from_millis(u64::from(max))), max);
+        // Anything past it clamps DOWN to that, never wrapping to a small
+        // number and never reaching u32::MAX.
+        for absurd in [
+            Duration::from_millis(u64::from(max) + 1),
+            Duration::from_secs(60 * 60 * 24 * 365),
+            Duration::MAX,
+        ] {
+            let got = timer_millis(absurd);
+            assert_eq!(got, max, "{absurd:?}");
+            assert!(got <= max, "must never exceed a browser's signed delay");
+        }
+    }
 
     #[test]
     fn from_max_memory_derives_every_memory_knob_from_one_ceiling() {

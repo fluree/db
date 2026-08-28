@@ -200,7 +200,7 @@ impl WasmFetchTransport {
             // deadline that needs the driver to dispatch it could never
             // detect the driver failing to dispatch.
             let (fired, elapsed) = oneshot::channel::<()>();
-            let millis = u32::try_from(deadline.as_millis()).unwrap_or(u32::MAX);
+            let millis = crate::config::timer_millis(deadline);
             wasm_bindgen_futures::spawn_local(async move {
                 gloo_timers::future::TimeoutFuture::new(millis).await;
                 let _ = fired.send(());

@@ -93,7 +93,7 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
         let cache_config = config.cache.clone();
         let open_timeout = config.cache_open_timeout;
         spawn_local(async move {
-            let millis = u32::try_from(open_timeout.as_millis()).unwrap_or(u32::MAX);
+            let millis = crate::config::timer_millis(open_timeout);
             // The open runs in a task of its OWN and reports through a
             // oneshot; the timeout races the RECEIVER, never the open.
             // Dropping an in-flight `IdbCache::open` would drop the
@@ -242,7 +242,7 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                 spawn_local(sse::run(url, headers, ready, chunks));
             }
             IoJob::Sleep { duration, reply } => {
-                let millis = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);
+                let millis = crate::config::timer_millis(duration);
                 spawn_local(async move {
                     gloo_timers::future::TimeoutFuture::new(millis).await;
                     let _ = reply.send(());

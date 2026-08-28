@@ -53,7 +53,11 @@ fn cid_of(bytes: &[u8]) -> ContentId {
 /// Closing the returned holder releases the queue.
 ///
 /// An ABSENT database opens fine, which is why no fresh-profile test can
-/// produce this shape.
+/// produce this shape and why the bug this reproduces stayed invisible.
+///
+/// No leading delete: the name is wedged on purpose, and a delete of a
+/// wedged name would itself hang. The test runner starts a fresh browser,
+/// so each name here does not exist yet.
 async fn wedge(name: &'static str) -> std::rc::Rc<IdbCache> {
     let holder = IdbCache::open(&cache_config(name, 1024))
         .await
@@ -349,21 +353,8 @@ async fn a_slow_but_live_driver_still_wins_the_race() {
 /// profile this was first observed in.
 #[wasm_bindgen_test]
 async fn driver_serves_fetches_when_the_cache_never_opens() {
-    // No leading delete: this name is wedged on purpose below, and a delete
-    // of a wedged name would itself hang. The test runner starts a fresh
-    // browser, so the database does not exist yet.
     let name = "fluree-cas-test-wedged";
-
-    // Hold a live connection, then queue a delete behind it. The delete can
-    // never run while this connection is open, and every later open of this
-    // name queues behind the delete — silently, forever.
-    let holder = IdbCache::open(&cache_config(name, 1024))
-        .await
-        .expect("holder opens");
-    wasm_bindgen_futures::spawn_local(async move {
-        let _ = IdbCache::delete_database(name).await;
-    });
-    TimeoutFuture::new(100).await;
+    let holder = wedge(name).await;
 
     let config = BrowserIoConfig {
         cache: cache_config(name, 1024),
