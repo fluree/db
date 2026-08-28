@@ -5,6 +5,8 @@ mod support;
 mod it_issue_1721_repro;
 #[path = "it_issue_1723_sameterm_fold.rs"]
 mod it_issue_1723_sameterm_fold;
+#[path = "it_issue_1738_scan_narrowing.rs"]
+mod it_issue_1738_scan_narrowing;
 #[path = "it_query_ask.rs"]
 mod it_query_ask;
 #[path = "it_query_collect.rs"]

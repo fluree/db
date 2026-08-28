@@ -9,6 +9,11 @@
 //! - Graphs sorted by `g_id`, properties by `p_id`
 //! - Aggregate properties sorted by `(ns_code, suffix)`
 //! - Classes sorted by `(ns_code, suffix)`, properties within classes likewise
+//! - Historical tail entries sorted by sid / `(g_id, p_id)`, tags sorted
+//!
+//! An optional historical-datatypes tail follows the classes section — see
+//! `encode_historical_tail` for the layout and why appending is safe for
+//! readers on both sides of the change.
 //!
 //! ## Schema wire format
 //!
@@ -1202,16 +1207,18 @@ mod tests {
     }
 
     /// `PropertyStatEntry::observed_datatypes` is not on the wire — every
-    /// decoder re-derives it from the breakdown it just read. That makes a
-    /// decoder that forgot to fill it invisible to any round-trip assertion
-    /// about the *data*: the field would come back empty, which reads as
-    /// "unknown", which silently declines the equijoin-filter fold instead of
-    /// failing anything. So each decoder gets its own assertion, named after
-    /// the entry point, and this is the only thing that would catch a miss.
+    /// decoder re-derives it from the breakdown it just read (only the
+    /// *historical* sets travel, in the tail). That makes a decoder that
+    /// forgot to fill it invisible to any round-trip assertion about the
+    /// *data*: the field would come back empty, which reads as "unknown",
+    /// which silently declines the equijoin-filter fold instead of failing
+    /// anything. So each decoder gets its own assertion, named after the
+    /// entry point, and this is the only thing that would catch a miss.
     ///
-    /// The third decoder is `fluree-db-core`'s reader-only mirror of this
-    /// format — the memory backend reaches that one where the binary path
-    /// reaches these two, so all three are live and all three re-derive.
+    /// The other live decoder is `fluree-db-core`'s reader-only mirror of
+    /// this format — the memory backend reaches that one where the binary
+    /// path reaches this crate's (whose two entry points now share one
+    /// implementation), so both are live and both re-derive.
     #[test]
     fn every_stats_decoder_rederives_the_observed_datatype_tags() {
         let stats = IndexStats {
@@ -1256,6 +1263,175 @@ mod tests {
             expected,
             "fluree-db-core's mirror decoder did not re-derive observed_datatypes"
         );
+    }
+
+    // ---- Historical tail tests ----
+
+    /// A stats blob whose historical sets cannot all be re-derived from the
+    /// counts: `mixed` remembers a tag (9) no current count mentions, and the
+    /// graph-scoped entry likewise. If the tail were not genuinely on the
+    /// wire, these would come back empty.
+    fn stats_with_historical() -> IndexStats {
+        IndexStats {
+            flakes: 3,
+            size: 30,
+            properties: Some(vec![PropertyStatEntry {
+                sid: (10, "mixed".to_string()),
+                count: 3,
+                ndv_values: 3,
+                ndv_subjects: 3,
+                last_modified_t: 4,
+                datatypes: vec![(1, 2), (7, 1)],
+                observed_datatypes: vec![1, 7],
+                historical_datatypes: vec![1, 7, 9],
+            }]),
+            classes: None,
+            graphs: Some(vec![GraphStatsEntry {
+                g_id: 0,
+                flakes: 3,
+                size: 30,
+                properties: vec![GraphPropertyStatEntry {
+                    p_id: 42,
+                    count: 3,
+                    ndv_values: 3,
+                    ndv_subjects: 3,
+                    last_modified_t: 4,
+                    datatypes: vec![(1, 2), (7, 1)],
+                    observed_datatypes: vec![1, 7],
+                    historical_datatypes: vec![1, 7, 9],
+                }],
+                classes: None,
+            }]),
+            historical_since_t: Some(2),
+        }
+    }
+
+    /// The historical sets and their boundary genuinely round-trip through
+    /// the wire — in every decoder — while `observed_datatypes` stays
+    /// re-derived from the counts (tag 9 must NOT leak into it).
+    #[test]
+    fn historical_tail_round_trips_through_every_decoder() {
+        let bytes = encode_stats(&stats_with_historical());
+
+        let check = |decoded: &IndexStats, who: &str| {
+            assert_eq!(
+                decoded.historical_since_t,
+                Some(2),
+                "{who}: boundary lost"
+            );
+            let agg = &decoded.properties.as_ref().unwrap()[0];
+            assert_eq!(
+                agg.historical_datatypes,
+                vec![1, 7, 9],
+                "{who}: aggregate historical set lost"
+            );
+            assert_eq!(
+                agg.observed_datatypes,
+                vec![1, 7],
+                "{who}: observed set must stay re-derived from the counts"
+            );
+            let gp = &decoded.graphs.as_ref().unwrap()[0].properties[0];
+            assert_eq!(
+                gp.historical_datatypes,
+                vec![1, 7, 9],
+                "{who}: graph-scoped historical set lost"
+            );
+            assert_eq!(gp.observed_datatypes, vec![1, 7], "{who}: graph observed");
+        };
+
+        let (via_with_len, consumed) = decode_stats_with_len(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len(), "tail bytes left unconsumed");
+        check(&via_with_len, "decode_stats_with_len");
+
+        let (via_core, core_consumed) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        assert_eq!(core_consumed, bytes.len());
+        check(&via_core, "fluree-db-core mirror");
+    }
+
+    /// Cross-version, old blob → new reader: a blob encoded WITHOUT the tail
+    /// (`historical_since_t: None`) decodes with no boundary and empty
+    /// historical sets — the conservative fallback every consumer fails
+    /// closed on.
+    #[test]
+    fn a_blob_without_the_tail_decodes_conservatively() {
+        let mut stats = stats_with_historical();
+        stats.historical_since_t = None; // encoder writes no tail
+
+        let bytes = encode_stats(&stats);
+        let (decoded, consumed) = decode_stats_with_len(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.historical_since_t, None);
+        assert!(decoded.properties.as_ref().unwrap()[0]
+            .historical_datatypes
+            .is_empty());
+        assert!(decoded.graphs.as_ref().unwrap()[0].properties[0]
+            .historical_datatypes
+            .is_empty());
+
+        let (via_core, _) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        assert_eq!(via_core.historical_since_t, None);
+    }
+
+    /// Cross-version, new blob → old reader: the tail is strictly appended,
+    /// so a new blob's bytes are the old encoding plus a suffix. An old
+    /// reader parses a prefix and its caller advances by the root's length
+    /// prefix — meaning its parse of the new blob is byte-for-byte its parse
+    /// of the old one. This pins the structural fact that makes that true.
+    #[test]
+    fn the_tail_is_a_strict_suffix_of_the_old_encoding() {
+        let with_tail = encode_stats(&stats_with_historical());
+
+        let mut without = stats_with_historical();
+        without.historical_since_t = None;
+        let old_encoding = encode_stats(&without);
+
+        assert!(with_tail.len() > old_encoding.len());
+        assert_eq!(
+            &with_tail[..old_encoding.len()],
+            &old_encoding[..],
+            "the historical tail changed bytes an old reader parses"
+        );
+    }
+
+    /// Forward evolution: a tail carrying an unknown future tag reads as
+    /// absent (conservative), and the remainder is consumed so the section
+    /// length still accounts for every byte.
+    #[test]
+    fn an_unknown_tail_tag_reads_as_absent() {
+        let mut stats = stats_with_historical();
+        stats.historical_since_t = None;
+        let mut bytes = encode_stats(&stats);
+        bytes.push(255); // future tail version
+        bytes.extend_from_slice(&[1, 2, 3, 4]); // opaque future payload
+
+        let (decoded, consumed) = decode_stats_with_len(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.historical_since_t, None);
+
+        let (via_core, core_consumed) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        assert_eq!(core_consumed, bytes.len());
+        assert_eq!(via_core.historical_since_t, None);
+    }
+
+    /// Empty historical sets are represented by absence on the wire, so a
+    /// boundary can travel with no per-property entries at all.
+    #[test]
+    fn a_boundary_with_empty_sets_still_travels() {
+        let mut stats = stats_with_historical();
+        stats.properties.as_mut().unwrap()[0]
+            .historical_datatypes
+            .clear();
+        stats.graphs.as_mut().unwrap()[0].properties[0]
+            .historical_datatypes
+            .clear();
+
+        let bytes = encode_stats(&stats);
+        let (decoded, consumed) = decode_stats_with_len(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.historical_since_t, Some(2));
+        assert!(decoded.properties.as_ref().unwrap()[0]
+            .historical_datatypes
+            .is_empty());
     }
 
     // ---- Schema tests ----

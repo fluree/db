@@ -339,6 +339,17 @@ async fn issue_1721_no_op_delete_does_not_drift_a_published_index() {
 /// without a guard it would read that same all-ref set as its licence and fold
 /// a `FILTER(?x = ?y)` that equates `"abc"` with `"abc"^^ex:custom`.
 ///
+/// The guard is the *historical* tag set the index now persists: monotone
+/// across publishes, covering every `t` at or above
+/// `IndexStats::historical_since_t`, and substituted for the current-state
+/// set on any read below the index `t`. For `ex:p` — whose history carries
+/// the literals — that set correctly withholds the fold at `t = 1`, which
+/// the folded-vs-unfolded comparison below observes end to end. For a
+/// never-literal predicate it correctly KEEPS the fold at historical `t`s
+/// (`fluree_db_query::stats_cache` pins the licence around the boundary);
+/// this test pins the wire underneath that: a real publish writes the
+/// boundary and the historical sets, and a real reload reads them back.
+///
 /// Nothing about the ledger is unusual here: the delete is a real one, the
 /// stats are honest, and the fold is simply reading a fact about the wrong `t`.
 #[tokio::test]
@@ -369,6 +380,43 @@ async fn issue_1721_time_travel_below_the_index_t_does_not_license_the_fold() {
         .ledger;
     support::build_and_publish_index(&fluree, ledger_id).await;
 
+    // The wire, end to end: a full build walks the whole commit chain, so the
+    // published root claims historical coverage from genesis, remembers the
+    // deleted literals' tags in ex:p's historical set, and still re-derives
+    // the current-state set as honestly all-ref. This is what makes the
+    // historical read below sound — and what keeps the fold alive at
+    // historical `t`s for predicates that never carried a literal, instead of
+    // clearing every set below the index `t` wholesale.
+    let ledger = fluree.ledger(ledger_id).await.expect("reload after index");
+    let stats = ledger
+        .snapshot
+        .stats
+        .as_ref()
+        .expect("a published index carries stats");
+    assert_eq!(
+        stats.historical_since_t,
+        Some(0),
+        "a full build must claim historical coverage from genesis"
+    );
+    let ref_tag = fluree_db_core::ValueTypeTag::JSON_LD_ID.as_u8();
+    let p_entry = stats
+        .properties
+        .as_ref()
+        .expect("aggregate properties")
+        .iter()
+        .find(|e| e.sid.1 == "p")
+        .expect("ex:p entry");
+    assert_eq!(
+        p_entry.observed_datatypes,
+        vec![ref_tag],
+        "current state as of the publish is honestly all-ref"
+    );
+    assert!(
+        p_entry.historical_datatypes.iter().any(|&t| t != ref_tag),
+        "the historical set must remember the deleted literals' tags: {:?}",
+        p_entry.historical_datatypes
+    );
+
     // Folded vs unfolded at the same `t`, rather than against a written-out
     // expectation: projecting both compared variables makes `find_foldable`
     // bail, so the second query is the shipping engine's own pre-rewrite
@@ -396,6 +444,96 @@ async fn issue_1721_time_travel_below_the_index_t_does_not_license_the_fold() {
         subject_pairs(&fluree, &foldable).await,
         subject_pairs(&fluree, &unfolded).await,
         "a read below the published index t folded on the index's current-state tag set"
+    );
+}
+
+/// Monotone ACROSS publishes, not just within one: the second publish here is
+/// an incremental build over a base that already carries the historical tail,
+/// and its current state is honestly all-ref — the literals were deleted
+/// before it. A per-publish re-derivation would reset the set and lose the
+/// deleted literals' tags; the incremental path instead unions the base's
+/// persisted set with its window, so the tags survive and the boundary
+/// carries forward. This is the property that makes the historical set sound
+/// for every `t` back to the boundary, not just since the latest publish.
+#[tokio::test]
+async fn issue_1721_historical_tags_survive_an_incremental_publish() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "hazard1721-monotone:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger1 = fluree
+        .insert(ledger0, &seed())
+        .await
+        .expect("insert")
+        .ledger;
+
+    // First publish: mixed history is current state, tags in both sets.
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    drop(ledger1);
+
+    // Delete every literal, then publish AGAIN — this one routes through the
+    // incremental pipeline (an index head exists and the gap is one commit).
+    let delete_the_literals = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "delete": [
+            {"@id":"ex:s1","ex:p": "abc"},
+            {"@id":"ex:s2","ex:p": {"@value":"abc","@type":"ex:custom"}}
+        ]
+    });
+    let _ = fluree
+        .update(ledger, &delete_the_literals)
+        .await
+        .expect("delete the literals")
+        .ledger;
+    support::build_and_publish_index(&fluree, ledger_id).await;
+
+    // Third publish, and this is the one that isolates the union: its novelty
+    // window is an unrelated triple with no trace of the literals — the
+    // deleted tags can only reach its output through the base root's
+    // persisted historical sets. (The second publish's window still contained
+    // the delete retractions, whose records the walk observes on its own.)
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let unrelated = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [{"@id":"ex:s9","ex:other": "x"}]
+    });
+    let _ = fluree
+        .insert(ledger, &unrelated)
+        .await
+        .expect("unrelated insert")
+        .ledger;
+    support::build_and_publish_index(&fluree, ledger_id).await;
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload after reindex");
+    let stats = ledger
+        .snapshot
+        .stats
+        .as_ref()
+        .expect("a published index carries stats");
+    assert_eq!(
+        stats.historical_since_t,
+        Some(0),
+        "the incremental publish must carry the base's boundary forward"
+    );
+    let ref_tag = fluree_db_core::ValueTypeTag::JSON_LD_ID.as_u8();
+    let p_entry = stats
+        .properties
+        .as_ref()
+        .expect("aggregate properties")
+        .iter()
+        .find(|e| e.sid.1 == "p")
+        .expect("ex:p entry");
+    assert_eq!(
+        p_entry.observed_datatypes,
+        vec![ref_tag],
+        "current state after the delete is honestly all-ref"
+    );
+    assert!(
+        p_entry.historical_datatypes.iter().any(|&t| t != ref_tag),
+        "an incremental publish reset the historical set — the deleted \
+         literals' tags are gone: {:?}",
+        p_entry.historical_datatypes
     );
 }
 
