@@ -59,8 +59,9 @@ pub use fluree_db_core::commit::codec::format::{CommitSignature, ALGO_ED25519};
 pub use fluree_db_core::commit::codec::verify_commit_blob;
 pub use fluree_db_credential::SigningKey;
 pub use runtime_stats::{
-    assemble_fast_stats, assemble_full_stats, resolve_runtime_predicate_id, StatsAssemblyError,
-    StatsLookup,
+    assemble_fast_stats, assemble_fast_stats_with, assemble_full_stats, assemble_full_stats_with,
+    resolve_runtime_predicate_id, stats_merge_site, NoveltyDeltaResolver, NoveltyMerge,
+    StatsAssemblyError, StatsLookup, STATS_MERGE_TARGET,
 };
 pub use stats::current_stats;
 
