@@ -380,9 +380,13 @@ pub fn resolve_current_flakes(mut flakes: Vec<Flake>, index: IndexType) -> Vec<F
 /// Hashing the full identity is what makes that robust: it needs no
 /// adjacency between a fact's own flakes, so it does not care that the
 /// comparators order `t` before `m` and therefore interleave metadata
-/// siblings (see #1703), nor that `FlakeMeta`'s `Ord` disagrees with its
-/// `Eq` when both sides carry a list index (see #1711). `Hash`/`Eq` are
-/// derived together and agree.
+/// siblings (see #1703), nor that `FlakeMeta`'s `Ord` used to disagree with
+/// its `Eq` when both sides carried a list index (#1711, fixed in #1727).
+/// `Hash`/`Eq` are derived together and agree.
+///
+/// That fix does not make any of this redundant: this function was already
+/// correct — it never leaned on `Ord` in the first place — so the hashed
+/// fact key stays, and the #1273 collapse it prevents is unrelated to #1711.
 ///
 /// The winner is chosen explicitly rather than by taking the first hit of a
 /// reverse scan, so the equal-`t` tie resolves to the retraction (see
@@ -545,10 +549,11 @@ mod tests {
         assert_eq!(positions, vec![1, 2], "only position 0 goes");
     }
 
-    /// One list position under two language tags: `FlakeMeta::cmp` consults
-    /// only `i` when both sides carry a list index, so those two compare
-    /// `Equal` without being equal (#1711). The fact key hashes `Hash`/`Eq`,
-    /// which agree, so they stay distinct facts here.
+    /// One list position under two language tags. `FlakeMeta::cmp` used to
+    /// consult only `i` when both sides carried a list index, so those two
+    /// compared `Equal` without being equal (#1711, fixed in #1727). This
+    /// test never depended on that fix: the fact key hashes `Hash`/`Eq`,
+    /// which agree, so the two stayed distinct facts here either way.
     #[test]
     fn resolve_current_flakes_one_position_two_language_tags() {
         let tagged = |lang: &str, t: i64, op: bool| Flake {

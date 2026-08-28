@@ -99,10 +99,18 @@ impl FlakeMeta {
     /// sorts strictly above it, because [`Ord`] breaks an `i` tie on `lang`
     /// and `None < Some`. An inclusive upper bound built from this therefore
     /// excludes a language-tagged value sitting at list index `i32::MAX`.
-    /// Unreachable through [`Flake::max_for_subject`] and its siblings — those
-    /// also pin `o`, `dt`, `t` and `op` to their maxima, every one of which is
-    /// compared before the metadata tiebreak — but do not assume this value
-    /// dominates every [`FlakeMeta`].
+    ///
+    /// Unreachable through every bound builder in the tree — [`Flake::max_spot`],
+    /// [`Flake::max_for_subject`], [`Flake::max_for_subject_predicate`] and
+    /// [`Flake::max_for_predicate`] here, plus `predicate_walk_bounds` and
+    /// `overlay_walk_bounds` in `fluree-db-query`. What guards them is `t`: all
+    /// six pin `t` to `i64::MAX` and `op` to `true`, both compared before the
+    /// metadata tiebreak in all four comparators, and no real flake carries
+    /// `t == i64::MAX`. The `o`/`dt` maxima are incidental and are *not*
+    /// universal — `overlay_walk_bounds` pins `o` to the pattern's bound object
+    /// and `dt` to `Sid::max()` when the pattern has one. A new bound builder
+    /// that does not pin `t` to `i64::MAX` would reach the narrowing, so do not
+    /// assume this value dominates every [`FlakeMeta`].
     pub fn max() -> Self {
         Self {
             lang: None,
