@@ -38,6 +38,14 @@
 //! hosts that deliver outcomes themselves — such a host owns the
 //! ordering.)
 //!
+//! **Cost of the cycle guard.** It is held across the WHOLE cycle by
+//! design (step 2), so for the cycle's duration the resident set is pinned
+//! and grows with (subscriptions x their working set) rather than with the
+//! largest single query. That is the trade that keeps queries 2..N from
+//! re-fetching what query 1 just made resident; it also means a page with
+//! many large subscriptions on one ledger sets the residency high-water
+//! mark, not the biggest one of them.
+//!
 //! Invalidation is v1 of the ladder: re-run everything, diff before
 //! notify. The v2 footprint filter plugs into the [`FootprintFilter`]
 //! seam — [`run_cycle_with_flakes`](LiveQuerySet::run_cycle_with_flakes)
@@ -143,17 +151,23 @@ impl Coalescer {
         self.states.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// `true`: the caller runs the cycle now. `false`: a cycle is already
-    /// running — the signal folded into its follow-up.
-    fn begin(&self, ledger: &str) -> bool {
+    /// `Some(lease)`: the caller runs the cycle now, and holds the ledger's
+    /// cycle slot until the lease is finished or dropped. `None`: a cycle
+    /// is already running — the signal folded into its follow-up.
+    fn begin<'a>(&'a self, ledger: &'a str) -> Option<CycleLease<'a>> {
         let mut states = self.lock();
         let state = states.entry(ledger.to_string()).or_default();
         if state.running {
             state.pending = true;
-            false
+            None
         } else {
             state.running = true;
-            true
+            drop(states);
+            Some(CycleLease {
+                coalescer: self,
+                ledger,
+                held: true,
+            })
         }
     }
 
@@ -170,6 +184,57 @@ impl Coalescer {
         } else {
             state.running = false;
             false
+        }
+    }
+
+    /// Release a ledger's cycle slot without running the follow-up. Also
+    /// drops any signal folded into the abandoned cycle: nothing is left to
+    /// run it, and the next signal opens a fresh cycle at the latest head
+    /// anyway.
+    fn abandon(&self, ledger: &str) {
+        if let Some(state) = self.lock().get_mut(ledger) {
+            state.running = false;
+            state.pending = false;
+        }
+    }
+}
+
+/// RAII hold on one ledger's cycle slot.
+///
+/// The slot is a plain flag, and every emitting cycle runs behind it — so a
+/// cycle future that is DROPPED mid-await (a `select!`, an abort handle, a
+/// cancelled task) would leave the ledger marked running forever: no head
+/// change would ever advance it and no mounting subscription would ever
+/// prime, with no error anywhere. Neither host does that today, but the
+/// safety of the whole live-query path should not rest on a property of the
+/// callers, so the flag is released by `Drop` rather than by discipline.
+struct CycleLease<'a> {
+    coalescer: &'a Coalescer,
+    ledger: &'a str,
+    held: bool,
+}
+
+impl CycleLease<'_> {
+    /// Report a finished cycle. `true`: signals arrived meanwhile — run
+    /// exactly one more, still holding the slot. `false`: the slot is
+    /// released and this lease is spent.
+    fn finish(&mut self) -> bool {
+        if !self.held {
+            return false;
+        }
+        if self.coalescer.finish(self.ledger) {
+            true
+        } else {
+            self.held = false;
+            false
+        }
+    }
+}
+
+impl Drop for CycleLease<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            self.coalescer.abandon(self.ledger);
         }
     }
 }
@@ -346,19 +411,14 @@ impl LiveQuerySet {
     /// selection); every follow-up is a full cycle at the latest head.
     /// Returns the first cycle's outcome when `solo` asked for one.
     ///
-    /// The coalescer's `running` flag is cleared by `finish` on every
-    /// return path, so the only way to strand a ledger is to DROP this
-    /// future mid-await. Safe today as a property of the callers, not of
-    /// this driver: both hosts (`fluree-db-wasm`'s `spawn_local` prime and
-    /// advance tasks, and the peer's head-change drain) run it to
-    /// completion, and a panic on wasm32 aborts the instance rather than
-    /// unwinding. A refactor that introduces cancellation here — a
-    /// `select!`, an abort handle — needs an RAII guard on `running`
-    /// first.
+    /// The ledger's cycle slot is held by a [`CycleLease`] for the whole
+    /// loop, so every exit — normal return, panic-unwind, or this future
+    /// being dropped mid-await — releases it. Cancellation-safe by
+    /// construction rather than by a property of the callers.
     async fn run_serialized(&self, ledger: &str, solo: Option<Vec<SubId>>) -> Option<CycleOutcome> {
-        if !self.inner.coalescer.begin(ledger) {
+        let Some(mut lease) = self.inner.coalescer.begin(ledger) else {
             return None;
-        }
+        };
         let want_outcome = solo.is_some();
         let mut only = solo;
         let mut first: Option<CycleOutcome> = None;
@@ -369,7 +429,7 @@ impl LiveQuerySet {
                 first = Some(outcome);
             }
             only = None;
-            if !self.inner.coalescer.finish(ledger) {
+            if !lease.finish() {
                 return first;
             }
         }
@@ -673,20 +733,46 @@ mod tests {
     #[tokio::test]
     async fn coalescer_folds_signals_into_exactly_one_followup() {
         let c = Coalescer::default();
-        assert!(c.begin("l"), "idle: run now");
-        assert!(!c.begin("l"), "mid-cycle: coalesced");
-        assert!(!c.begin("l"), "still coalesced (folds, not queues)");
-        assert!(c.finish("l"), "one follow-up owed");
+        // Leases must be BOUND: a temporary one would drop straight away
+        // and release the slot, which is the point of the guard.
+        let mut lease = c.begin("l").expect("idle: run now");
+        assert!(c.begin("l").is_none(), "mid-cycle: coalesced");
+        assert!(
+            c.begin("l").is_none(),
+            "still coalesced (folds, not queues)"
+        );
+        assert!(lease.finish(), "one follow-up owed");
         // A signal during the follow-up cycle folds again — and earns
         // exactly one more cycle, never a queue.
-        assert!(!c.begin("l"), "the follow-up is the running cycle");
-        assert!(c.finish("l"), "that signal earns one more");
-        assert!(!c.finish("l"), "done");
-        assert!(c.begin("l"), "idle again");
-        assert!(!c.finish("l"));
+        assert!(c.begin("l").is_none(), "the follow-up is the running cycle");
+        assert!(lease.finish(), "that signal earns one more");
+        assert!(!lease.finish(), "done");
+        drop(lease);
+        let mut lease = c.begin("l").expect("idle again");
+        assert!(!lease.finish());
+        drop(lease);
         // Ledgers coalesce independently.
-        assert!(c.begin("a"));
-        assert!(c.begin("b"));
+        let _a = c.begin("a").expect("independent ledger");
+        let _b = c.begin("b").expect("independent ledger");
+    }
+
+    /// A cycle future dropped mid-await must not strand its ledger. The
+    /// slot is a plain flag behind which EVERY emitting cycle runs, so
+    /// leaking it means that ledger never advances and never primes again,
+    /// silently. Neither host cancels a cycle today; the guard is what
+    /// keeps that from being load-bearing.
+    #[tokio::test]
+    async fn a_dropped_cycle_lease_releases_the_ledger() {
+        let c = Coalescer::default();
+        {
+            let _lease = c.begin("l").expect("idle");
+            assert!(c.begin("l").is_none(), "a cycle is running");
+            // Scope end = the cycle future was dropped mid-await.
+        }
+        let mut lease = c
+            .begin("l")
+            .expect("a dropped lease must release the ledger, not strand it");
+        assert!(!lease.finish(), "and the slot is a clean one, not a fold");
     }
 
     #[tokio::test]
@@ -822,11 +908,14 @@ mod tests {
             seen[0].0
         };
 
-        // A cycle is now in flight for this ledger.
-        assert!(
-            live.inner.coalescer.begin(LEDGER),
-            "the ledger is idle, so this stands in for a cycle in flight"
-        );
+        // A cycle is now in flight for this ledger: holding its lease is
+        // exactly the state `advance` is in while it awaits its snapshot's
+        // queries.
+        let mut in_flight = live
+            .inner
+            .coalescer
+            .begin(LEDGER)
+            .expect("the ledger is idle, so this stands in for a cycle in flight");
 
         // A component mounts against the pre-commit head and primes.
         let late = live.subscribe(LEDGER, count_query());
@@ -847,11 +936,11 @@ mod tests {
         // Hand-off: the fold earned exactly ONE follow-up, which is what
         // `advance`'s loop runs (cycle, emit, finish).
         assert!(
-            live.inner.coalescer.finish(LEDGER),
+            in_flight.finish(),
             "the folded prime owes a follow-up cycle"
         );
         let follow_up = live.run_cycle(LEDGER).await;
-        assert!(!live.inner.coalescer.finish(LEDGER), "and owes exactly one");
+        assert!(!in_flight.finish(), "and owes exactly one");
 
         // The mounting subscription's FIRST result carries the NEWER
         // watermark. The un-serialized shape delivered it at `t1`, after
