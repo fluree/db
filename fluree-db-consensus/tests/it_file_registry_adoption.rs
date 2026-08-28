@@ -1,9 +1,11 @@
 //! The transition boot: a store that lived in the single-node FILE
 //! posture moves into raft, and `adopt_file_registry` carries every
 //! registry record — existence, both heads, config, status — into the
-//! replicated nameservice. Also pins the once-only marker semantics
-//! and the crash-retry idempotence (a re-run over a partially adopted
-//! machine converges instead of conflicting).
+//! replicated nameservice. Also pins the once-only marker semantics,
+//! the crash-retry idempotence (a re-run over a partially adopted
+//! machine converges instead of conflicting), and the two cases that
+//! must NOT write the marker: a registry root with no `ns@v2` subtree,
+//! and a record the replay cannot read.
 
 #![cfg(feature = "raft")]
 
@@ -15,7 +17,9 @@ use fluree_db_consensus::raft::integration::{RaftBootstrapConfig, RaftIntegratio
 use fluree_db_core::{ContentId, ContentKind};
 use fluree_db_nameservice::file::FileNameService;
 use fluree_db_nameservice::{
-    CasResult, LedgerLifecycle, NameServiceLookup, RefKind, RefLookup, RefPublisher, RefValue,
+    CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigPublisher, ConfigValue,
+    LedgerLifecycle, NameServiceLookup, RefKind, RefLookup, RefPublisher, RefValue,
+    StatusCasResult, StatusLookup, StatusPayload, StatusPublisher, StatusValue,
 };
 
 async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
@@ -61,6 +65,31 @@ async fn seed_file_registry(root: &std::path::Path) {
                 .await
                 .expect("index head"),
             CasResult::Updated
+        ));
+
+        // Config and status are part of a record's live state and
+        // must carry too. The file backend reads an unset config as
+        // `unborn` and an unset status as `initial`, so the seeding
+        // CAS expects exactly that.
+        let config = ConfigValue::new(
+            4,
+            Some(ConfigPayload::with_default_context(cid(
+                ContentKind::Commit,
+                commit_seed.wrapping_add(40),
+            ))),
+        );
+        assert!(matches!(
+            ns.push_config(ledger, Some(&ConfigValue::unborn()), &config)
+                .await
+                .expect("seed config"),
+            ConfigCasResult::Updated
+        ));
+        let status = StatusValue::new(6, StatusPayload::new(format!("seeded-{commit_seed}")));
+        assert!(matches!(
+            ns.push_status(ledger, Some(&StatusValue::initial()), &status)
+                .await
+                .expect("seed status"),
+            StatusCasResult::Updated
         ));
     }
     // A tombstone must NOT carry.
@@ -135,6 +164,32 @@ async fn a_file_registry_adopts_once_and_survives_a_partial_retry() {
         .expect("lookup")
         .is_none_or(|r| r.retracted));
 
+    // Config and status carry VERBATIM — watermark and payload both.
+    // The machine reads an unset value as `unborn` / `initial`, so
+    // these assertions fail against a replay that pushed with a `None`
+    // expectation (which can never match) as well as against one that
+    // dropped the values outright.
+    for (ledger, commit_seed) in [("adopted/one:main", 1u8), ("adopted/two:main", 3u8)] {
+        let config = ns
+            .get_config(ledger)
+            .await
+            .expect("config read")
+            .expect("config present");
+        assert_eq!(config.v, 4, "{ledger} config watermark");
+        assert_eq!(
+            config.payload.expect("config payload").default_context,
+            Some(cid(ContentKind::Commit, commit_seed.wrapping_add(40))),
+            "{ledger} config payload"
+        );
+        let status = ns
+            .get_status(ledger)
+            .await
+            .expect("status read")
+            .expect("status present");
+        assert_eq!(status.v, 6, "{ledger} status watermark");
+        assert_eq!(status.payload.state, format!("seeded-{commit_seed}"));
+    }
+
     // The marker makes a second call a no-op.
     assert_eq!(integration.adopt_file_registry().await.expect("re-run"), 0);
 
@@ -156,18 +211,38 @@ async fn a_file_registry_adopts_once_and_survives_a_partial_retry() {
             .commit_t,
         5
     );
+    // The re-run tolerated its own prior config/status write rather
+    // than diverging on the unchanged watermark.
+    assert_eq!(
+        ns.get_config("adopted/one:main")
+            .await
+            .expect("config read")
+            .expect("config present")
+            .v,
+        4
+    );
+    assert_eq!(
+        ns.get_status("adopted/one:main")
+            .await
+            .expect("status read")
+            .expect("status present")
+            .v,
+        6
+    );
 
     integration.raft.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
 async fn no_registry_and_no_config_both_answer_zero() {
-    // Configured path with no ns@v2 underneath: marker written, zero carried.
+    // Configured path with no ns@v2 underneath: zero carried and NO
+    // marker, so a mistyped registry root doesn't burn the one-shot
+    // adoption before the corrected config gets a turn.
     let raft_dir = tempfile::tempdir().expect("raft dir");
     let store_dir = tempfile::tempdir().expect("store dir");
     let integration = boot_initialized(9, raft_dir.path(), store_dir.path()).await;
     assert_eq!(integration.adopt_file_registry().await.expect("empty"), 0);
-    assert!(raft_dir.path().join("file-registry-adopted").is_file());
+    assert!(!raft_dir.path().join("file-registry-adopted").is_file());
 
     // No adoption configured at all: permanent no-op, no marker.
     let raft_dir2 = tempfile::tempdir().expect("raft dir");
@@ -195,4 +270,71 @@ async fn no_registry_and_no_config_both_answer_zero() {
 
     integration.raft.shutdown().await.expect("shutdown");
     bare.raft.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn an_unreadable_record_aborts_before_the_marker_is_written() {
+    // Adoption is once-only, so nothing it cannot READ may be skipped
+    // past: the run aborts and withholds the marker, leaving the
+    // operator a signal AND a second chance. Without that, a ledger
+    // arrives in raft with state silently absent and the marker
+    // makes every later call `Ok(0)`.
+    let raft_dir = tempfile::tempdir().expect("raft dir");
+    let store_dir = tempfile::tempdir().expect("store dir");
+    seed_file_registry(store_dir.path()).await;
+
+    // Truncate one record the way an unclean shutdown would, leaving
+    // the file present (so `all_records` still yields it) but its JSON
+    // unparseable.
+    let mut truncated = None;
+    for entry in walk(&store_dir.path().join("ns@v2")) {
+        if entry.to_string_lossy().contains("one") {
+            std::fs::write(&entry, b"{\"ledger\": ").expect("truncate");
+            truncated = Some(entry);
+            break;
+        }
+    }
+    let truncated = truncated.expect("a record file for adopted/one");
+
+    let integration = boot_initialized(13, raft_dir.path(), store_dir.path()).await;
+    let err = integration
+        .adopt_file_registry()
+        .await
+        .expect_err("a truncated record must not adopt silently");
+    // Surfaced by the registry read here; a corruption that survives
+    // `all_records` and fails a per-record read lands on the same
+    // abort-before-`finish` path through `Replay`.
+    assert!(
+        matches!(
+            err,
+            fluree_db_consensus::raft::integration::FileRegistryAdoptionError::Registry(_)
+                | fluree_db_consensus::raft::integration::FileRegistryAdoptionError::Replay { .. }
+        ),
+        "unreadable record surfaces as a read failure, not a marker write: {err}"
+    );
+    assert!(
+        !raft_dir.path().join("file-registry-adopted").is_file(),
+        "marker withheld so the operator can repair {} and re-run",
+        truncated.display()
+    );
+
+    integration.raft.shutdown().await.expect("shutdown");
+}
+
+/// Every file under `root`, recursively.
+fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
 }
