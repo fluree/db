@@ -136,6 +136,9 @@ fn decode_graph_property(data: &[u8], pos: &mut usize) -> io::Result<GraphProper
     })
 }
 
+/// One graph's rows in the tail: `(g_id, [(p_id, tags)])`.
+type GraphTagSets = Vec<(u16, Vec<(u32, Vec<u8>)>)>;
+
 /// The historical tail section appended after the classes section.
 ///
 /// This is the reader-only mirror of the format owned by
@@ -145,7 +148,7 @@ fn decode_graph_property(data: &[u8], pos: &mut usize) -> io::Result<GraphProper
 struct HistoricalTail {
     since_t: i64,
     agg: Vec<((u16, String), Vec<u8>)>,
-    graphs: Vec<(u16, Vec<(u32, Vec<u8>)>)>,
+    graphs: GraphTagSets,
 }
 
 /// Wire tag identifying the v1 historical tail.
@@ -210,7 +213,7 @@ fn apply_historical_tail(stats: &mut IndexStats, tail: Option<HistoricalTail>) {
     if let Some(props) = stats.properties.as_mut() {
         let mut by_sid: std::collections::HashMap<(u16, String), Vec<u8>> =
             tail.agg.into_iter().collect();
-        for entry in props.iter_mut() {
+        for entry in &mut *props {
             if let Some(tags) = by_sid.remove(&entry.sid) {
                 entry.historical_datatypes = tags;
             }
@@ -226,8 +229,8 @@ fn apply_historical_tail(stats: &mut IndexStats, tail: Option<HistoricalTail>) {
                     .map(move |(p_id, tags)| ((g_id, p_id), tags))
             })
             .collect();
-        for graph in graphs.iter_mut() {
-            for prop in graph.properties.iter_mut() {
+        for graph in &mut *graphs {
+            for prop in &mut graph.properties {
                 if let Some(tags) = by_key.remove(&(graph.g_id, prop.p_id)) {
                     prop.historical_datatypes = tags;
                 }

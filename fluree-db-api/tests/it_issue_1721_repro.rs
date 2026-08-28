@@ -505,7 +505,10 @@ async fn issue_1721_historical_tags_survive_an_incremental_publish() {
         .ledger;
     support::build_and_publish_index(&fluree, ledger_id).await;
 
-    let ledger = fluree.ledger(ledger_id).await.expect("reload after reindex");
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("reload after reindex");
     let stats = ledger
         .snapshot
         .stats

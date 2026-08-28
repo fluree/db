@@ -288,7 +288,7 @@ fn encode_historical_tail(buf: &mut Vec<u8>, stats: &IndexStats) {
 
     // Graph-scoped sets, keyed by (g_id, p_id).
     let graphs = stats.graphs.as_deref().unwrap_or(&[]);
-    let mut graph_sets: Vec<(u16, Vec<(u32, Vec<u8>)>)> = graphs
+    let mut graph_sets: GraphTagSets = graphs
         .iter()
         .filter_map(|g| {
             let mut props: Vec<(u32, Vec<u8>)> = g
@@ -559,12 +559,15 @@ fn decode_graph_property(data: &[u8], pos: &mut usize) -> io::Result<GraphProper
     })
 }
 
+/// One graph's rows in the tail: `(g_id, [(p_id, tags)])`.
+type GraphTagSets = Vec<(u16, Vec<(u32, Vec<u8>)>)>;
+
 /// Decoded historical tail section — see [`encode_historical_tail`] for the
 /// layout and the evolution rules.
 struct HistoricalTail {
     since_t: i64,
     agg: Vec<((u16, String), Vec<u8>)>,
-    graphs: Vec<(u16, Vec<(u32, Vec<u8>)>)>,
+    graphs: GraphTagSets,
 }
 
 fn read_tag_set(data: &[u8], pos: &mut usize) -> io::Result<Vec<u8>> {
@@ -626,7 +629,7 @@ fn apply_historical_tail(stats: &mut IndexStats, tail: Option<HistoricalTail>) {
     if let Some(props) = stats.properties.as_mut() {
         let mut by_sid: std::collections::HashMap<(u16, String), Vec<u8>> =
             tail.agg.into_iter().collect();
-        for entry in props.iter_mut() {
+        for entry in &mut *props {
             if let Some(tags) = by_sid.remove(&entry.sid) {
                 entry.historical_datatypes = tags;
             }
@@ -642,8 +645,8 @@ fn apply_historical_tail(stats: &mut IndexStats, tail: Option<HistoricalTail>) {
                     .map(move |(p_id, tags)| ((g_id, p_id), tags))
             })
             .collect();
-        for graph in graphs.iter_mut() {
-            for prop in graph.properties.iter_mut() {
+        for graph in &mut *graphs {
+            for prop in &mut graph.properties {
                 if let Some(tags) = by_key.remove(&(graph.g_id, prop.p_id)) {
                     prop.historical_datatypes = tags;
                 }
@@ -1314,11 +1317,7 @@ mod tests {
         let bytes = encode_stats(&stats_with_historical());
 
         let check = |decoded: &IndexStats, who: &str| {
-            assert_eq!(
-                decoded.historical_since_t,
-                Some(2),
-                "{who}: boundary lost"
-            );
+            assert_eq!(decoded.historical_since_t, Some(2), "{who}: boundary lost");
             let agg = &decoded.properties.as_ref().unwrap()[0];
             assert_eq!(
                 agg.historical_datatypes,
