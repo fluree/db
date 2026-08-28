@@ -184,12 +184,19 @@ function Composer() {
   );
 }
 
-function Header({ mode }: { mode: string }) {
-  const connection = useConnectionState();
+/**
+ * The ledger's newest watermark, which is NOT the same as any one query's
+ * `t` — a query whose results did not move keeps its own. Pushed, like
+ * everything else on this page: the client says when the head moves, so
+ * there is no timer behind this number.
+ *
+ * Its own component on purpose. Every commit moves the head, so whatever
+ * renders it re-renders on every commit; keeping that to this one badge is
+ * what lets the header around it stay still, and it is the same discipline
+ * the README asks of any app — subscribe at the leaf that needs it.
+ */
+function HeadBadge() {
   const client = useFlureeClient();
-  // The ledger's newest watermark, which is NOT the same as any one query's
-  // `t` — a query whose results did not move keeps its own. Pushed, like
-  // everything else on this page: the client tells us when the head moves.
   const head = useSyncExternalStore(
     useCallback(
       (onChange: () => void) => client.onLedgerHead(LEDGER, onChange),
@@ -198,6 +205,11 @@ function Header({ mode }: { mode: string }) {
     () => client.ledgerHead(LEDGER),
     () => undefined,
   );
+  return <span className="badge">ledger head t = {head ?? "—"}</span>;
+}
+
+function Header({ mode }: { mode: string }) {
+  const connection = useConnectionState();
 
   return (
     <header>
@@ -205,7 +217,7 @@ function Header({ mode }: { mode: string }) {
       <div className="meta">
         <span className={`dot ${connection}`} /> {connection}
         <span className="badge">{mode} mode</span>
-        <span className="badge">ledger head t = {head ?? "—"}</span>
+        <HeadBadge />
       </div>
       <p className="muted">
         Open this page in a second tab. Write in either one — the other
