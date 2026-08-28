@@ -239,6 +239,11 @@ path = "tests/it_exists_semijoin_correlation.rs"
 name = "it_repeated_var_fast_path_guards"
 path = "tests/it_repeated_var_fast_path_guards.rs"
 
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_count_star_row_multiplicity"
+path = "tests/it_count_star_row_multiplicity.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
@@ -429,6 +434,14 @@ harness = false
 
 [[bench]]
 name = "query_hot_bsbm"
+harness = false
+
+# Same-subject star with a fan-out predicate whose object var is unprojected —
+# the shape `PropertyJoinOperator`'s semijoin demotion serves. Its own fixture:
+# BSBM has no multi-valued same-subject predicate and adding one would move
+# `query_hot_bsbm`'s committed baseline for unrelated cases.
+[[bench]]
+name = "query_hot_fanout_star"
 harness = false
 
 [[bench]]
