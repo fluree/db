@@ -1398,6 +1398,10 @@ impl OverlayProvider for OverlayRef<'_> {
         self.0.epoch()
     }
 
+    fn overlay_flake_count(&self, g_id: fluree_db_core::GraphId) -> Option<usize> {
+        self.0.overlay_flake_count(g_id)
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: fluree_db_core::GraphId,

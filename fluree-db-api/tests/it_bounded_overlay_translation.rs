@@ -453,3 +453,167 @@ async fn every_subject_reads_back_correctly_after_scattered_retractions() {
         );
     }
 }
+
+// =============================================================================
+// Selectivity guard (BOUNDED_WALK_MAX_MATCH_PERCENT)
+// =============================================================================
+
+use crate::support::span_capture;
+
+/// A bound-predicate scan whose predicate covers (essentially) the WHOLE
+/// novelty window must abandon the bounded product and take the whole-graph
+/// cached path — observable as `overlay_translate{bounded=true fallback=true}`
+/// — with results identical to what the bounded product would have produced.
+#[tokio::test(flavor = "current_thread")]
+async fn unselective_bound_predicate_falls_back_to_whole_graph_path() {
+    let (fluree, _dir) = new_fluree().await;
+    let mut ledger = fluree.create_ledger(LEDGER).await.expect("create");
+
+    const N: usize = 20;
+    ledger = fluree
+        .insert(ledger, &seed_graph(N))
+        .await
+        .expect("seed")
+        .ledger;
+    fluree
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    // One commit touching ONLY `ex:tag`, for every subject: the graph's
+    // novelty window becomes ~100% ex:tag ops, far above the guard threshold.
+    let update = json!({
+        "@context": ctx(),
+        "where":  {"@id": "?s", "ex:tag": "?t"},
+        "delete": {"@id": "?s", "ex:tag": "?t"},
+        "insert": {"@id": "?s", "ex:tag": "retagged"}
+    });
+    fluree.update(ledger, &update).await.expect("retag all");
+
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let view = fluree.db(LEDGER).await.expect("view");
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?s", "?o"],
+        "where": {"@id": "?s", "ex:tag": "?o"}
+    });
+    let out = fluree
+        .query(&view, QueryInput::JsonLd(&q))
+        .await
+        .expect("query");
+    let rows = rows_to_pairs(&out.to_jsonld(&view.snapshot).expect("jsonld"));
+
+    // Results first: every subject's tag was replaced, none dropped, none stale.
+    assert_eq!(rows.len(), N, "one row per subject expected: {rows:?}");
+    assert!(
+        rows.iter().all(|r| r.contains("retagged")),
+        "stale or missing tag values after fallback: {rows:?}"
+    );
+
+    // The guard must have tripped: a bracket was constructible (bounded=true)
+    // and the walk was discarded for the whole-graph path (fallback=true).
+    let spans = store.find_spans("overlay_translate");
+    assert!(
+        spans.iter().any(|s| {
+            s.fields.get("bounded").map(String::as_str) == Some("true")
+                && s.fields.get("fallback").map(String::as_str) == Some("true")
+        }),
+        "no overlay_translate span took the selectivity-guard fallback: {:?}",
+        spans.iter().map(|s| &s.fields).collect::<Vec<_>>()
+    );
+}
+
+/// A SELECTIVE bracket — a predicate that is a small share of the novelty
+/// window, and likewise a bound subject — must stay on the bounded path (no
+/// fallback), with correct results.
+#[tokio::test(flavor = "current_thread")]
+async fn selective_brackets_stay_bounded() {
+    let (fluree, _dir) = new_fluree().await;
+    let mut ledger = fluree.create_ledger(LEDGER).await.expect("create");
+
+    const N: usize = 40;
+    ledger = fluree
+        .insert(ledger, &seed_graph(N))
+        .await
+        .expect("seed")
+        .ledger;
+    fluree
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    // One commit: colour churn for half the subjects (the bulk of the window)
+    // plus a single `ex:tag` edit — ex:tag ends up ~5% of novelty, well under
+    // the guard threshold.
+    let mut deletes: Vec<Value> = (0..N / 2)
+        .map(|i| json!({"@id": format!("ex:item{i}"), "ex:colour": format!("colour{i}")}))
+        .collect();
+    let mut inserts: Vec<Value> = (0..N / 2)
+        .map(|i| json!({"@id": format!("ex:item{i}"), "ex:colour": format!("recolour{i}")}))
+        .collect();
+    deletes.push(json!({"@id": "ex:item0", "ex:tag": "shared"}));
+    inserts.push(json!({"@id": "ex:item0", "ex:tag": "solo-retag"}));
+    let update = json!({"@context": ctx(), "delete": deletes, "insert": inserts});
+    fluree.update(ledger, &update).await.expect("churn");
+
+    // Bound PREDICATE, selective: stays bounded.
+    let (store, _guard) = span_capture::init_test_tracing();
+    let view = fluree.db(LEDGER).await.expect("view");
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?s", "?o"],
+        "where": {"@id": "?s", "ex:tag": "?o"}
+    });
+    let out = fluree
+        .query(&view, QueryInput::JsonLd(&q))
+        .await
+        .expect("query");
+    let rows = rows_to_pairs(&out.to_jsonld(&view.snapshot).expect("jsonld"));
+
+    assert_eq!(rows.len(), N, "one tag per subject expected: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("solo-retag")),
+        "novelty tag edit missing: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("item0\"") && r.contains("shared")),
+        "retracted tag still visible on item0: {rows:?}"
+    );
+
+    let spans = store.find_spans("overlay_translate");
+    assert!(
+        spans.iter().any(|s| {
+            s.fields.get("bounded").map(String::as_str) == Some("true")
+                && !s.fields.contains_key("fallback")
+        }),
+        "selective bound-predicate scan did not stay bounded: {:?}",
+        spans.iter().map(|s| &s.fields).collect::<Vec<_>>()
+    );
+    assert!(
+        !spans
+            .iter()
+            .any(|s| s.fields.get("fallback").map(String::as_str) == Some("true")),
+        "selective scan spuriously took the fallback: {:?}",
+        spans.iter().map(|s| &s.fields).collect::<Vec<_>>()
+    );
+
+    // Bound SUBJECT, selective: stays bounded.
+    let (store2, _guard2) = span_capture::init_test_tracing();
+    let p = props(&fluree, LEDGER, "ex:item3").await;
+    assert!(
+        p.iter().any(|s| s.contains("recolour3")),
+        "novelty recolour missing from bound-subject read: {p:?}"
+    );
+    let spans2 = store2.find_spans("overlay_translate");
+    assert!(
+        spans2.iter().any(|s| {
+            s.fields.get("bounded").map(String::as_str) == Some("true")
+                && !s.fields.contains_key("fallback")
+        }),
+        "bound-subject scan did not stay bounded: {:?}",
+        spans2.iter().map(|s| &s.fields).collect::<Vec<_>>()
+    );
+}

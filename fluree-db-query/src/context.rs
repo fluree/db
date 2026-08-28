@@ -193,7 +193,12 @@ pub type FulltextProviders = HashMap<(GraphId, u32, u16), Arc<FulltextArena>>;
 ///
 /// The key's `OverlayWalkScope` distinguishes the whole-overlay product from
 /// the subject-/predicate-bounded ones a bound-term scan builds instead, so the
-/// two never alias.
+/// two never alias. Only `Whole` products are actually inserted: a bounded
+/// walk is a sub-microsecond seek even uncached, and per-row join probes bind
+/// a distinct subject per left row — memoizing bounded products would grow
+/// this map by one entry per probed subject for the execution's lifetime with
+/// no eviction. The scope stays in the key as a type-level guard against a
+/// future bounded insert aliasing the whole product.
 pub type TranslatedOverlayCache = Arc<
     Mutex<
         FxHashMap<

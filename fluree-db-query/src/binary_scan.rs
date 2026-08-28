@@ -1643,13 +1643,24 @@ impl BinaryScanOperator {
     /// own `overlay_window_for_range` and row filters remain the correctness
     /// backstop, exactly as they are for the whole-overlay product.
     ///
-    /// A bound OBJECT is deliberately NOT used to narrow, even on OPST. Object
-    /// identity here is `FlakeValue` equality, which is not the cross-type
-    /// numeric equality the scan filter applies (`Long(5)` and `Double(5.0)` are
-    /// distinct values but can both satisfy one pattern). An object-narrowed
-    /// window could therefore omit a novelty retraction for a base row the
-    /// cursor still emits. Subjects and predicates are `Sid`s with exact
-    /// identity and no such coercion.
+    /// A bound OBJECT is deliberately NOT used to narrow, even on OPST — but
+    /// not because of cross-type numeric identity: `FlakeValue`'s `Ord` (and
+    /// `PartialEq`) route both-numeric comparisons through `numeric_cmp`
+    /// ("a number is a number", value.rs), so `Long(5)` and `Double(5.0)`
+    /// compare Equal and numerically-equal values form one contiguous run in
+    /// the comparator order. The actual obstacles are one step further down:
+    ///
+    /// - `cmp_object` breaks ties WITHIN an equal-value run by `dt`, so a
+    ///   sound bracket must pin the value while spanning the full `dt` range
+    ///   (`(v, Sid::min())..(v, Sid::max())`) — constructible, and it would
+    ///   capture every representation and datatype of the bound value.
+    /// - The remaining proof burden is what keeps it out for now: window
+    ///   completeness would rest on `FlakeValue::Ord` being a valid total
+    ///   order across the numeric corners (`numeric_cmp` returns `None` for
+    ///   NaN and falls back to discriminant order, so run contiguity is not
+    ///   unconditional), and on the scan filter's match set never exceeding
+    ///   the comparator's equal-value run. Subject/predicate brackets compare
+    ///   `Sid`s only and need none of that reasoning.
     ///
     /// The walk order is a property of the bracketed term, NOT of `self.index`:
     /// the *set* of novelty flakes for a subject is the same however it is
@@ -1666,13 +1677,12 @@ impl BinaryScanOperator {
         // sorts strictly below any real flake, so nothing is skipped. `rhs` is
         // inclusive and maxes every trailing component. Mirrors
         // `overlay_walk_bounds` / `predicate_walk_bounds`.
-        let bracket = |lead_min: Sid, lead_max: Sid, index: IndexType, scope: OverlayWalkScope| {
+        let bracket = |lead_min: Sid, lead_max: Sid, index: IndexType| {
             let (s_min, p_min, s_max, p_max) = match index {
                 IndexType::Spot => (lead_min, Sid::min(), lead_max, Sid::max()),
                 _ => (Sid::min(), lead_min, Sid::max(), lead_max),
             };
             BoundedOverlayWalk {
-                scope,
                 index,
                 first: Flake::new(
                     s_min,
@@ -1698,20 +1708,10 @@ impl BinaryScanOperator {
         // Prefer the subject: it is the more selective term in practice, and it
         // is the one the bound-subject write/probe shapes pin.
         if let Some(s) = s_sid.as_ref() {
-            return Some(bracket(
-                s.clone(),
-                s.clone(),
-                IndexType::Spot,
-                OverlayWalkScope::Subject(s.clone()),
-            ));
+            return Some(bracket(s.clone(), s.clone(), IndexType::Spot));
         }
         if let Some(p) = p_sid.as_ref() {
-            return Some(bracket(
-                p.clone(),
-                p.clone(),
-                IndexType::Psot,
-                OverlayWalkScope::Predicate(p.clone()),
-            ));
+            return Some(bracket(p.clone(), p.clone(), IndexType::Psot));
         }
         None
     }
@@ -2373,10 +2373,16 @@ impl Operator for BinaryScanOperator {
 
         // Overlay: translate novelty flakes to OverlayOp and attach to cursor.
         //
-        // Translation + sorting is a pure function of (overlay epoch, graph,
-        // index) within one execution, and per-row join probes re-open a scan
-        // per left row — so the translated product is memoized in the
-        // execution context and shared across cursors (see `OverlayOpsCache`).
+        // The WHOLE-graph translation + sort is a pure function of (overlay
+        // epoch, graph, index) within one execution, and per-row join probes
+        // re-open a scan per left row — so the whole-graph product is memoized
+        // in the execution context and shared across cursors (see
+        // `OverlayOpsCache`). Bounded (subject-/predicate-bracketed) products
+        // are deliberately NOT memoized: a bounded walk is a sub-microsecond
+        // seek even on a miss, while nested-loop probes bind a DIFFERENT
+        // subject per left row — memoizing per-scope products would grow the
+        // map by one entry per probed subject for the whole execution, with no
+        // eviction, to save ~a microsecond on a duplicate probe.
         if ctx.overlay.is_some() {
             let epoch = ctx.overlay().epoch();
             // A bound subject (or, failing that, a bound predicate) turns the
@@ -2388,132 +2394,160 @@ impl Operator for BinaryScanOperator {
             // afterwards by `overlay_window_for_range` — a binary search over an
             // array that cost O(novelty) to build (fluree/db#1722).
             let bounded = Self::bounded_overlay_walk(&s_sid, &p_sid);
-            let scope = bounded
-                .as_ref()
-                .map_or(OverlayWalkScope::Whole, |b| b.scope.clone());
 
             let translate_span = tracing::debug_span!(
                 "overlay_translate",
                 g_id = self.g_id,
                 index = ?self.index,
                 bounded = bounded.is_some(),
+                fallback = tracing::field::Empty,
                 cache_hit = tracing::field::Empty,
                 segments = tracing::field::Empty,
                 ops_len = tracing::field::Empty,
             );
             let _translate_guard = translate_span.enter();
 
-            let cache_key = (epoch, self.g_id, self.index, scope);
-            let translated = {
+            // The whole-graph product: per-execution memo, then the cross-query
+            // layer, then a fresh build. Taken when nothing brackets the walk,
+            // and as the selectivity-guard fallback below.
+            let whole_graph_product = || {
+                let cache_key = (epoch, self.g_id, self.index, OverlayWalkScope::Whole);
                 let mut cache = ctx
                     .translated_overlay_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(hit) = cache.get(&cache_key) {
                     translate_span.record("cache_hit", true);
-                    Arc::clone(hit)
+                    return Arc::clone(hit);
+                }
+                translate_span.record("cache_hit", false);
+                // `overlay_segments` allocates, so only pay for it when a
+                // subscriber is actually recording this span.
+                if !translate_span.is_disabled() {
+                    translate_span
+                        .record("segments", ctx.overlay().overlay_segments(self.g_id).len());
+                }
+                // Cross-query layer: the translation is also stable across
+                // executions for the same (ledger, snapshot, overlay epoch,
+                // store, to_t) state — large overlays (reasoning
+                // materializations) cost O(overlay × dict lookups) to
+                // translate, which would otherwise put a flat multi-second
+                // floor under every query at scale.
+                let global_key = GlobalTranslationKey {
+                    ledger_id: ctx.active_snapshot.ledger_id.as_str().into(),
+                    snapshot_t: ctx.active_snapshot.t,
+                    overlay_epoch: epoch,
+                    store_id: store_arc.store_id(),
+                    to_t: ctx.to_t,
+                    g_id: self.g_id,
+                    index: self.index,
+                };
+                let entry = if let Some(hit) = global_translation_cache().get(&global_key) {
+                    hit
+                } else {
+                    // Segment-aware path (raw Novelty): assemble from
+                    // per-segment caches so a write burst re-translates only
+                    // new segments. Falls back to the whole-graph translate
+                    // for non-segment-native overlays or an uncacheable
+                    // segment. Both paths return ops sorted by `order`; the
+                    // merged product is then resolved + cached per epoch.
+                    let (mut ops, mut untranslated, ephemeral_preds) =
+                        match collect_segment_merged_ops(
+                            ctx, &store_arc, self.g_id, self.index, ctx.to_t,
+                        ) {
+                            Some(triple) => triple,
+                            None => {
+                                let (mut ops, untrans, eph) =
+                                    translate_overlay_flakes_with_untranslated(
+                                        ctx.overlay(),
+                                        &store_arc,
+                                        ctx.dict_novelty.as_ref(),
+                                        ctx.runtime_small_dicts,
+                                        ctx.to_t,
+                                        self.g_id,
+                                    );
+                                sort_overlay_ops(&mut ops, order);
+                                (ops, untrans, eph)
+                            }
+                        };
+                    resolve_overlay_ops(&mut ops);
+                    if !untranslated.is_empty() {
+                        untranslated.sort_by(self.index.comparator());
+                        untranslated = resolve_overlay_retractions(untranslated);
+                    }
+                    let entry = Arc::new(TranslatedOverlayOps {
+                        ops: ops.into(),
+                        untranslated,
+                        ephemeral_preds,
+                    });
+                    global_translation_cache().insert(global_key, Arc::clone(&entry));
+                    entry
+                };
+                cache.insert(cache_key, Arc::clone(&entry));
+                entry
+            };
+
+            let translated = if let Some(walk) = bounded.as_ref() {
+                // Bounded path — uncached end to end. The per-execution memo
+                // is skipped (see the note atop this block), the cross-query
+                // `global_translation_cache` is skipped (its key has no scope
+                // dimension, and per-subject products are far too numerous to
+                // be worth evicting whole-overlay entries for), and the
+                // per-segment translation cache inside the whole-graph path is
+                // likewise bypassed — a seek that touches a handful of flakes
+                // has nothing to amortize.
+                if !translate_span.is_disabled() {
+                    translate_span
+                        .record("segments", ctx.overlay().overlay_segments(self.g_id).len());
+                }
+                let (mut ops, mut untranslated, ephemeral_preds) =
+                    translate_overlay_flakes_in_range(
+                        ctx.overlay(),
+                        &store_arc,
+                        ctx.dict_novelty.as_ref(),
+                        ctx.runtime_small_dicts,
+                        ctx.to_t,
+                        self.g_id,
+                        walk.index,
+                        Some(&walk.first),
+                        Some(&walk.rhs),
+                    );
+                // Selectivity guard: an UNselective bracket (a hot predicate —
+                // or pathologically a subject — matching a large share of the
+                // novelty window) has no complexity advantage left, and paying
+                // it uncached per execution forfeits the cross-query
+                // amortization `global_translation_cache` provides during
+                // read-heavy windows at a stable epoch. Discard the bounded
+                // product and take the whole-graph path, restoring that
+                // amortization exactly where it earned its keep. (Under epoch
+                // churn the cross-query cache missed anyway, so nothing is
+                // lost.) The walk already cost O(matched) either way; the
+                // guard only converts a repeated per-execution cost into a
+                // cached one.
+                let matched = ops.len() + untranslated.len();
+                let unselective = ctx
+                    .overlay()
+                    .overlay_flake_count(self.g_id)
+                    .is_some_and(|total| matched * 100 > total * BOUNDED_WALK_MAX_MATCH_PERCENT);
+                if unselective {
+                    translate_span.record("fallback", true);
+                    whole_graph_product()
                 } else {
                     translate_span.record("cache_hit", false);
-                    // `overlay_segments` allocates, so only pay for it when a
-                    // subscriber is actually recording this span — the bounded
-                    // path is a seek, and instrumentation must not be a
-                    // meaningful share of it.
-                    if !translate_span.is_disabled() {
-                        translate_span
-                            .record("segments", ctx.overlay().overlay_segments(self.g_id).len());
+                    sort_overlay_ops(&mut ops, order);
+                    resolve_overlay_ops(&mut ops);
+                    if !untranslated.is_empty() {
+                        untranslated.sort_by(self.index.comparator());
+                        untranslated = resolve_overlay_retractions(untranslated);
                     }
-                    let entry = if let Some(walk) = bounded.as_ref() {
-                        // Bounded path. The cross-query `global_translation_cache`
-                        // is deliberately skipped: its key has no scope dimension,
-                        // and a per-subject product is both cheap to rebuild and
-                        // far too numerous to be worth evicting whole-overlay
-                        // entries for. The per-segment translation cache inside
-                        // the whole-graph path is likewise bypassed — a seek that
-                        // touches a handful of flakes has nothing to amortize.
-                        let (mut ops, mut untranslated, ephemeral_preds) =
-                            translate_overlay_flakes_in_range(
-                                ctx.overlay(),
-                                &store_arc,
-                                ctx.dict_novelty.as_ref(),
-                                ctx.runtime_small_dicts,
-                                ctx.to_t,
-                                self.g_id,
-                                walk.index,
-                                Some(&walk.first),
-                                Some(&walk.rhs),
-                            );
-                        sort_overlay_ops(&mut ops, order);
-                        resolve_overlay_ops(&mut ops);
-                        if !untranslated.is_empty() {
-                            untranslated.sort_by(self.index.comparator());
-                            untranslated = resolve_overlay_retractions(untranslated);
-                        }
-                        Arc::new(TranslatedOverlayOps {
-                            ops: ops.into(),
-                            untranslated,
-                            ephemeral_preds,
-                        })
-                    } else {
-                        // Cross-query layer: the translation is also stable across
-                        // executions for the same (ledger, snapshot, overlay epoch,
-                        // store, to_t) state — large overlays (reasoning
-                        // materializations) cost O(overlay × dict lookups) to
-                        // translate, which would otherwise put a flat multi-second
-                        // floor under every query at scale.
-                        let global_key = GlobalTranslationKey {
-                            ledger_id: ctx.active_snapshot.ledger_id.as_str().into(),
-                            snapshot_t: ctx.active_snapshot.t,
-                            overlay_epoch: epoch,
-                            store_id: store_arc.store_id(),
-                            to_t: ctx.to_t,
-                            g_id: self.g_id,
-                            index: self.index,
-                        };
-                        if let Some(hit) = global_translation_cache().get(&global_key) {
-                            hit
-                        } else {
-                            // Segment-aware path (raw Novelty): assemble from
-                            // per-segment caches so a write burst re-translates only
-                            // new segments. Falls back to the whole-graph translate
-                            // for non-segment-native overlays or an uncacheable
-                            // segment. Both paths return ops sorted by `order`; the
-                            // merged product is then resolved + cached per epoch.
-                            let (mut ops, mut untranslated, ephemeral_preds) =
-                                match collect_segment_merged_ops(
-                                    ctx, &store_arc, self.g_id, self.index, ctx.to_t,
-                                ) {
-                                    Some(triple) => triple,
-                                    None => {
-                                        let (mut ops, untrans, eph) =
-                                            translate_overlay_flakes_with_untranslated(
-                                                ctx.overlay(),
-                                                &store_arc,
-                                                ctx.dict_novelty.as_ref(),
-                                                ctx.runtime_small_dicts,
-                                                ctx.to_t,
-                                                self.g_id,
-                                            );
-                                        sort_overlay_ops(&mut ops, order);
-                                        (ops, untrans, eph)
-                                    }
-                                };
-                            resolve_overlay_ops(&mut ops);
-                            if !untranslated.is_empty() {
-                                untranslated.sort_by(self.index.comparator());
-                                untranslated = resolve_overlay_retractions(untranslated);
-                            }
-                            let entry = Arc::new(TranslatedOverlayOps {
-                                ops: ops.into(),
-                                untranslated,
-                                ephemeral_preds,
-                            });
-                            global_translation_cache().insert(global_key, Arc::clone(&entry));
-                            entry
-                        }
-                    };
-                    cache.insert(cache_key, Arc::clone(&entry));
-                    entry
+                    Arc::new(TranslatedOverlayOps {
+                        ops: ops.into(),
+                        untranslated,
+                        ephemeral_preds,
+                    })
                 }
+            } else {
+                whole_graph_product()
             };
             translate_span.record("ops_len", translated.ops.len());
 
@@ -2824,7 +2858,11 @@ pub struct TranslatedOverlayOps {
 ///
 /// Part of the per-execution memo key ([`crate::context::TranslatedOverlayCache`]):
 /// a whole-overlay product and a subject-bounded one are different values and
-/// must not alias. See [`BinaryScanOperator::bounded_overlay_walk`].
+/// must not alias. Only [`OverlayWalkScope::Whole`] products are ever inserted
+/// (bounded products are rebuilt per scan — see `open()`); the scope stays in
+/// the key as a type-level guard so a future cached bounded product cannot be
+/// served to a whole-overlay consumer. See
+/// [`BinaryScanOperator::bounded_overlay_walk`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OverlayWalkScope {
     /// Every flake in the graph (the historical behaviour).
@@ -2835,14 +2873,32 @@ pub enum OverlayWalkScope {
     Predicate(Sid),
 }
 
-/// A leading-term-bracketed novelty walk: the memo scope, the index order to
-/// seek in, and the (exclusive, inclusive) boundary flakes.
+/// A leading-term-bracketed novelty walk: the index order to seek in and the
+/// (exclusive, inclusive) boundary flakes. Bounded products are rebuilt per
+/// scan rather than memoized, so no scope key travels with the walk (see
+/// [`OverlayWalkScope`]).
 struct BoundedOverlayWalk {
-    scope: OverlayWalkScope,
     index: IndexType,
     first: Flake,
     rhs: Flake,
 }
+
+/// Selectivity guard for the bounded overlay walk: when the bracketed walk
+/// matches MORE than this percentage of the graph's novelty window, the
+/// bounded product is discarded and the scan takes the whole-graph translate
+/// path instead.
+///
+/// Rationale: the bounded product is uncached by design (see `open()`), which
+/// is a pure win while the bracket is selective — a sub-microsecond seek needs
+/// no cache. But an unselective bracket (a hot predicate over a large novelty
+/// window) makes the walk O(novelty) per execution, where the whole-graph path
+/// amortizes the same work across executions via `global_translation_cache`
+/// during read-heavy windows at a stable epoch. Past this share of the window
+/// the bounded walk has no complexity advantage left, so the fallback costs
+/// at most one extra translate and restores the old amortization. Applied to
+/// both scopes uniformly — a subject matching a quarter of novelty is
+/// pathological, but the guard is nearly free.
+const BOUNDED_WALK_MAX_MATCH_PERCENT: usize = 25;
 
 /// Translate overlay flakes to V3 overlay ops, also returning flakes that cannot be translated
 /// and the mapping of novelty-only predicate IRIs to ephemeral p_ids.
@@ -4175,7 +4231,9 @@ mod bounded_overlay_walk_tests {
             BinaryScanOperator::bounded_overlay_walk(&Some(sid(100, "s1")), &Some(sid(101, "p1")))
                 .expect("bracket");
         assert_eq!(w.index, IndexType::Spot);
-        assert_eq!(w.scope, OverlayWalkScope::Subject(sid(100, "s1")));
+        // The SPOT bracket pins the SUBJECT as its leading term.
+        assert_eq!(w.first.s, sid(100, "s1"));
+        assert_eq!(w.rhs.s, sid(100, "s1"));
     }
 }
 
