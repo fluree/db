@@ -920,3 +920,119 @@ mod tests {
         assert_eq!(incoming_hop_count(&h), 0);
     }
 }
+
+// ─── Follower-side propose ───────────────────────────────────────────────
+
+/// Why [`propose_via_leader`] could not land a command.
+#[derive(Debug, thiserror::Error)]
+pub enum ProposeError {
+    /// No leader is known — mid-election, or the group has no quorum.
+    #[error("no leader known for this group; retry once one is elected")]
+    NoLeader,
+    /// The membership-recorded leader address failed [`is_valid_leader_url`].
+    #[error("leader address rejected: {0}")]
+    BadLeaderAddress(String),
+    /// The relay could not reach the leader, or the leader refused.
+    #[error("propose relay failed: {0}")]
+    Relay(String),
+    /// The local or relayed apply failed with an application error.
+    #[error("{0}")]
+    Apply(String),
+}
+
+/// Propose `cmd` to this group from ANY node: a plain `client_write` when
+/// this node leads, an HTTP relay of the JSON-encoded command to the
+/// leader's network router (`{raft_addr}/propose`) when it does not. One
+/// retry after a relayed "leadership moved" answer, with a fresh leader
+/// lookup in between.
+///
+/// The wire is JSON in both directions — commands are constrained to
+/// postcard-safe shapes by the log, but RESPONSES never ride the log and
+/// may carry `serde_json::Value` state postcard cannot decode.
+///
+/// The relay dials a membership-supplied URL, so it uses a no-redirect
+/// client and [`is_valid_leader_url`] — the same SSRF posture as the
+/// request-forwarding middleware above.
+pub async fn propose_via_leader<C>(raft: &Raft<C>, cmd: C::D) -> Result<C::R, ProposeError>
+where
+    C: crate::config::FlureeRaftConfig,
+    C::D: Clone + serde::Serialize,
+{
+    let mut last_relay_error: Option<ProposeError> = None;
+    for _attempt in 0..2 {
+        match raft.client_write(cmd.clone()).await {
+            Ok(resp) => return Ok(resp.data),
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(fwd),
+            )) => {
+                let Some(node) = fwd.leader_node else {
+                    return Err(ProposeError::NoLeader);
+                };
+                match relay_propose::<C>(&node.raft_addr, &cmd).await {
+                    Ok(data) => return Ok(data),
+                    Err(e @ ProposeError::Relay(_)) => {
+                        // Leadership may have moved mid-relay; loop for
+                        // one fresh lookup.
+                        last_relay_error = Some(e);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ChangeMembershipError(e),
+            )) => return Err(ProposeError::Apply(format!("membership error: {e}"))),
+            Err(openraft::error::RaftError::Fatal(f)) => {
+                return Err(ProposeError::Apply(format!("raft fatal: {f}")))
+            }
+        }
+    }
+    Err(last_relay_error.unwrap_or(ProposeError::NoLeader))
+}
+
+async fn relay_propose<C>(leader_raft_addr: &str, cmd: &C::D) -> Result<C::R, ProposeError>
+where
+    C: crate::config::FlureeRaftConfig,
+    C::D: serde::Serialize,
+{
+    if !is_valid_leader_url(leader_raft_addr, true) {
+        return Err(ProposeError::BadLeaderAddress(leader_raft_addr.to_string()));
+    }
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            // Membership-supplied URL: never follow a redirect off it.
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("propose relay client builds")
+    });
+    let url = format!("{}/propose", leader_raft_addr.trim_end_matches('/'));
+    let body = serde_json::to_vec(cmd)
+        .map_err(|e| ProposeError::Apply(format!("command encode error: {e}")))?;
+    let resp = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| ProposeError::Relay(format!("POST {url}: {e}")))?;
+    let status = resp.status();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ProposeError::Relay(format!("read {url}: {e}")))?;
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err(ProposeError::Relay(format!(
+            "leader at {url} stepped down mid-relay"
+        )));
+    }
+    if !status.is_success() {
+        return Err(ProposeError::Apply(format!(
+            "{url} answered {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| ProposeError::Apply(format!("response decode error: {e}")))
+}
