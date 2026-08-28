@@ -219,13 +219,23 @@ async fn issue_1721_replayed_delete_keeps_filter_equality_results() {
     );
 }
 
-/// The fold has to keep working. The ref-only flag now reads a field that every
-/// producer of `PropertyStatEntry` has to fill, and an unfilled one reads as
-/// "unknown" — fail-closed, so a miss would cost the optimization silently
-/// rather than break a query. This walks the producer chain a real deployment
-/// uses (indexer aggregate -> stats wire encode -> decode -> view) and asserts
-/// an all-ref predicate still licenses the fold, with a literal-valued sibling
-/// for contrast.
+/// The fold has to keep working: an all-ref predicate still licenses it after a
+/// real index publish, with a literal-valued sibling for contrast.
+///
+/// Scope, because it is narrower than it looks. `observed_datatypes` is not on
+/// the wire — every decoder re-derives it from the breakdown — so a round trip
+/// can only ever observe the decoder it happens to route through, and this one
+/// routes through `fluree-db-core`'s (the memory backend's), not
+/// `fluree-db-binary-index`'s. It cannot see the index-build aggregate at all,
+/// since encoding discards whatever that produced. Each producer is therefore
+/// pinned where it lives:
+/// `fluree_db_binary_index::format::stats_wire::tests::every_stats_decoder_rederives_the_observed_datatype_tags`
+/// covers all three decoders, and
+/// `fluree_db_indexer::stats::tests::aggregate_carries_the_observed_datatype_tags_across_graphs`
+/// covers the build-side aggregate that both the index pipelines and the import
+/// now share. That matters more than usual here: the field is fail-closed, so a
+/// producer that stopped filling it would cost the optimization silently
+/// instead of failing anything.
 #[tokio::test]
 async fn ref_only_survives_a_published_index_round_trip() {
     assert_index_defaults();

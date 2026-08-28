@@ -1066,6 +1066,61 @@ mod tests {
         assert_eq!(decoded.flakes, 42);
     }
 
+    /// `PropertyStatEntry::observed_datatypes` is not on the wire — every
+    /// decoder re-derives it from the breakdown it just read. That makes a
+    /// decoder that forgot to fill it invisible to any round-trip assertion
+    /// about the *data*: the field would come back empty, which reads as
+    /// "unknown", which silently declines the equijoin-filter fold instead of
+    /// failing anything. So each decoder gets its own assertion, named after
+    /// the entry point, and this is the only thing that would catch a miss.
+    ///
+    /// The third decoder is `fluree-db-core`'s reader-only mirror of this
+    /// format — the memory backend reaches that one where the binary path
+    /// reaches these two, so all three are live and all three re-derive.
+    #[test]
+    fn every_stats_decoder_rederives_the_observed_datatype_tags() {
+        let stats = IndexStats {
+            flakes: 3,
+            size: 30,
+            properties: Some(vec![PropertyStatEntry {
+                sid: (10, "mixed".to_string()),
+                count: 3,
+                ndv_values: 3,
+                ndv_subjects: 3,
+                last_modified_t: 4,
+                // A ref tag and a literal tag: the set the fold's guard reads.
+                datatypes: vec![(1, 2), (7, 1)],
+                observed_datatypes: vec![1, 7],
+            }]),
+            classes: None,
+            graphs: None,
+        };
+        let bytes = encode_stats(&stats);
+        let expected = vec![1u8, 7];
+
+        let via_decode_stats = decode_stats(&bytes).unwrap();
+        assert_eq!(
+            via_decode_stats.properties.as_ref().unwrap()[0].observed_datatypes,
+            expected,
+            "binary-index decode_stats did not re-derive observed_datatypes"
+        );
+
+        let (via_with_len, consumed) = decode_stats_with_len(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            via_with_len.properties.as_ref().unwrap()[0].observed_datatypes,
+            expected,
+            "binary-index decode_stats_with_len did not re-derive observed_datatypes"
+        );
+
+        let (via_core, _) = fluree_db_core::stats_wire::decode_stats(&bytes).unwrap();
+        assert_eq!(
+            via_core.properties.as_ref().unwrap()[0].observed_datatypes,
+            expected,
+            "fluree-db-core's mirror decoder did not re-derive observed_datatypes"
+        );
+    }
+
     // ---- Schema tests ----
 
     #[test]
