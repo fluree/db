@@ -16,7 +16,11 @@
 //!    scan misses handled in-frame by the operator and one-shot paths
 //!    (fast paths, dir walks, policy sub-queries) by the entry loop;
 //! 3. ledger LOAD prefetches novelty's overlay-translation miss sources
-//!    (F8: reverse-dict leaves), so translation lookups are pure hits.
+//!    (F8: reverse-dict leaves), so translation lookups are pure hits;
+//! 4. FORMATTING — the second miss frame — recovers through its own loop.
+//!    Encoded bindings are materialized late, through dictionary leaves the
+//!    execution round often never touches, so a query that completed can
+//!    still miss while being formatted.
 //!
 //! Every test asserts a positive "miss fired" marker; recovery is never
 //! inferred from the absence of an error.
@@ -772,4 +776,76 @@ async fn catch_up_applies_commits_and_prefetches_translation() {
         "persisted + caught-up novelty rows visible"
     );
     assert!(storage.register.is_empty(), "wants drained");
+}
+
+// ============================================================================
+// 8. FORMATTING is the SECOND residency frame, with a retry loop of its own.
+//    Execution emits `Binding::Encoded*` for late materialization; those ids
+//    are resolved to IRIs and literals only during formatting, through
+//    dictionary and forward-pack leaves the execution round often never
+//    touches. So a peer whose query round succeeded can still take its first
+//    miss here — which is what `format::format_results_async`'s loop exists
+//    for. Every other test in this file formats through the SYNC `to_jsonld`
+//    (`rows_of`), so none of them can reach it.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn formatting_completes_through_its_own_residency_loop() {
+    support::assert_index_defaults();
+    let (shared, ns, fluree_a) = build_indexed_fixture().await;
+
+    // Selecting the subject IRI, not just the literal, is what forces
+    // materialization through a dictionary leaf during formatting.
+    let query = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "select": ["?item", "?name"],
+        "where": [{ "@id": "?item", "ex:name": "?name" }]
+    });
+
+    let ledger_a = fluree_a.ledger(LEDGER).await.expect("ledger A");
+    let db_a = GraphDb::from_ledger_state(&ledger_a);
+    let expected = rows_of(
+        &fluree_a.query(&db_a, &query).await.expect("query A"),
+        &ledger_a,
+    );
+    assert_eq!(expected.len(), PEOPLE as usize, "fixture sanity");
+
+    // (a) The loop is load-bearing, not decorative: on a cold residency
+    //     instance the production query round succeeds and the SYNC formatter
+    //     — the one every other test here uses — still fails, not resident.
+    let (fluree_c, storage_c) = residency_instance(&shared, &ns);
+    let ledger_c = ledger_with_recovery(&fluree_c, &storage_c).await;
+    let db_c = GraphDb::from_ledger_state(&ledger_c);
+    let result_c = fluree_c.query(&db_c, &query).await.expect("query C");
+    let sync_err = result_c
+        .to_jsonld(&ledger_c.snapshot)
+        .expect_err("formatting must miss where execution did not")
+        .to_string();
+    assert!(
+        sync_err.contains("not resident"),
+        "the formatting-time failure must be a residency miss: {sync_err}"
+    );
+
+    // (b) The async formatter absorbs it, on a FRESH instance so nothing (a)
+    //     made resident can carry over.
+    let (fluree_b, storage_b) = residency_instance(&shared, &ns);
+    let ledger_b = ledger_with_recovery(&fluree_b, &storage_b).await;
+    let db_b = GraphDb::from_ledger_state(&ledger_b);
+    let result_b = fluree_b.query(&db_b, &query).await.expect("query B");
+    let misses_before = storage_b.miss_count();
+
+    let formatted = result_b
+        .to_jsonld_async(db_b.as_graph_db_ref())
+        .await
+        .expect("the formatting retry loop must absorb every residency miss");
+
+    assert!(
+        storage_b.miss_count() > misses_before,
+        "the miss must fire DURING formatting (positive marker), not before it"
+    );
+    assert!(
+        storage_b.register.is_empty(),
+        "every want recorded while formatting must have been drained"
+    );
+    assert_eq!(normalize_rows(&formatted), expected, "identical results");
 }

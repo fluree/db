@@ -682,6 +682,13 @@ pub async fn format_results_async_dataset(
                 "Hydration only supports JSON-LD and TypedJson output formats".to_string(),
             ));
         }
+        // SEAM: this branch calls hydration directly and is NOT wrapped in the
+        // residency drain/fetch/re-run loop that `format_results_async` puts
+        // around single-ledger formatting. Harmless for v1 — the browser peer
+        // is single-ledger, so no residency store reaches here — but a
+        // multi-ledger peer would take an unrecoverable formatting miss on
+        // this path. Wrap it (or hoist the loop into a shared helper) before
+        // datasets go to a residency target.
         let v = hydration::format_async_dataset(result, dataset, context, config, tracker).await?;
         return if result.output.is_select_one() {
             match v {
