@@ -2194,14 +2194,15 @@ async fn datalog_malformed_filter_does_not_silently_vanish() {
 
 /// The bare-local-name filter form — `(= ?p knows)` — was the only operand
 /// shape that ever matched a bound IRI before #1556 was fixed, so a rule
-/// written as a workaround uses exactly it. It now correctly derives nothing,
-/// because a bare name is a string literal and a string is never an IRI.
-///
-/// The risk is that it does so in silence: RDFterm-equal makes IRI-vs-literal
-/// a clean `False` rather than an `Error`, so the "could not compare its
-/// operands" path cannot see it. A stale rule must still say something.
+/// written as a workaround uses exactly it. Read as a string literal the form
+/// is a trap in BOTH directions: `=` derives nothing (a string never equals an
+/// IRI) and `!=` derives everything, including the fact the filter was written
+/// to exclude. Neither failure is visible at run time — RDFterm-equal makes
+/// IRI-vs-literal a clean `True`/`False`, never an `Error` — so the bare form
+/// is rejected at parse time with a message naming the operand and both
+/// rewrites (quote it for a string, prefix it for an IRI).
 #[tokio::test(flavor = "current_thread")]
-async fn datalog_bare_local_name_filter_warns_instead_of_going_quiet() {
+async fn datalog_bare_token_filter_operand_is_rejected_with_named_operand() {
     let (store, _guard) = support::span_capture::init_test_tracing();
 
     let fluree = FlureeBuilder::memory().build_memory();
@@ -2252,22 +2253,31 @@ async fn datalog_bare_local_name_filter_warns_instead_of_going_quiet() {
 
     assert!(
         results.is_empty(),
-        "a bare local name is a string literal and must not match an IRI \
-         namespace-blindly, got {results:?}"
+        "a bare local name must never match an IRI namespace-blindly — the rule \
+         is rejected at parse time and derives nothing, got {results:?}"
     );
 
     let diagnostics: Vec<String> = store
         .all_events()
         .into_iter()
         .filter(|e| e.level == tracing::Level::WARN)
-        .map(|e| e.message().to_string())
+        .flat_map(|e| {
+            let mut parts: Vec<String> = e.fields.values().cloned().collect();
+            parts.push(e.message().to_string());
+            parts
+        })
         .collect();
+    assert!(
+        diagnostics.iter().any(|d| d.contains("`knows`")),
+        "a bare-token filter operand must be rejected with a diagnostic naming \
+         the operand, got {diagnostics:?}"
+    );
     assert!(
         diagnostics
             .iter()
-            .any(|d| d.contains("compared an IRI against a literal")),
-        "a stale bare-local-name filter must not fail silently — it needs a \
-         diagnostic pointing at the operand form, got {diagnostics:?}"
+            .any(|d| d.contains("\"knows\"") && d.contains("ex:knows")),
+        "the rejection must offer both rewrites — quoted string and prefixed \
+         IRI, got {diagnostics:?}"
     );
 }
 
@@ -2338,5 +2348,363 @@ async fn datalog_iri_versus_literal_filter_that_keeps_rows_is_not_flagged() {
         noisy.is_empty(),
         "an IRI-vs-literal filter that keeps rows is correct usage and must not \
          be flagged, got {noisy:?}"
+    );
+}
+
+/// The headline failure mode of #1556, reached through the `!=` direction of
+/// the workaround operand form. `(!= ?prop ssn)` read as a string comparison
+/// keeps every row — an IRI-bound `?prop` never equals the string `"ssn"` —
+/// so the copy-properties rule derives exactly the fact its filter was written
+/// to withhold, and no run-time gate can see it (every row surviving looks
+/// like success). The bare operand must therefore be rejected at parse time:
+/// the rule derives nothing, and the diagnostic names the operand.
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_bare_token_exclusion_filter_must_not_leak_the_excluded_fact() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/bare-token-exclusion");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                // Sound rule: must keep deriving even though its sibling is rejected.
+                "@id": "ex:grandparentRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+                        "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+                    }
+                }
+            },
+            {
+                // The pre-#1556 workaround form, in the direction that leaks:
+                // as a string comparison `(!= ?prop ssn)` is true for every
+                // IRI-bound ?prop, so the rule would copy ex:ssn.
+                "@id": "ex:copyPropsRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "ex:sameAs": {"@id": "?other"}},
+                            {"@id": "?other", "?prop": "?val"},
+                            ["filter", "(!= ?prop ssn)"]
+                        ],
+                        "insert": {"@id": "?s", "?prop": "?val"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}, "ex:parent": {"@id": "ex:dan"}},
+            {"@id": "ex:dan", "ex:parent": {"@id": "ex:erin"}},
+            {"@id": "ex:bob", "ex:name": "Bob", "ex:ssn": "123-45-6789"}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?prop", "?val"],
+        "where": {"@id": "ex:alice", "?prop": "?val"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    let rendered = serde_json::to_string(&results).unwrap();
+    assert!(
+        !rendered.contains("123-45-6789"),
+        "a bare-token exclusion filter must fail CLOSED — the rule must not run \
+         and copy the value its filter was meant to exclude, got {results:?}"
+    );
+    assert!(
+        results.contains(&json!(["ex:grandparent", "ex:erin"])),
+        "the sound sibling rule must keep deriving, got {results:?}"
+    );
+
+    let diagnostics: Vec<String> = store
+        .all_events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .flat_map(|e| {
+            let mut parts: Vec<String> = e.fields.values().cloned().collect();
+            parts.push(e.message().to_string());
+            parts
+        })
+        .collect();
+    assert!(
+        diagnostics.iter().any(|d| d.contains("`ssn`")),
+        "the rejected rule must produce a diagnostic naming the operand, \
+         got {diagnostics:?}"
+    );
+}
+
+/// Bare numeric and boolean operands are legitimately unquoted — they classify
+/// as number/boolean literals before the bare-token rejection can see them —
+/// and must keep working exactly as documented.
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_bare_numeric_and_boolean_filter_operands_still_parse() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/bare-numeric-boolean");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:adultRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?person", "ex:age": "?age"},
+                            ["filter", "(> ?age 20)"]
+                        ],
+                        "insert": {"@id": "?person", "ex:status": "adult"}
+                    }
+                }
+            },
+            {
+                "@id": "ex:activeRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?person", "ex:enabled": "?flag"},
+                            ["filter", "(= ?flag true)"]
+                        ],
+                        "insert": {"@id": "?person", "ex:status": "active"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:age": 34, "ex:enabled": true},
+            {"@id": "ex:bob", "ex:age": 12, "ex:enabled": false}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?person", "?status"],
+        "where": {"@id": "?person", "ex:status": "?status"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!(["ex:alice", "adult"]))
+            && results.contains(&json!(["ex:alice", "active"])),
+        "bare numeric and boolean operands must keep filtering, got {results:?}"
+    );
+    assert!(
+        !results.iter().any(|r| r[0] == json!("ex:bob")),
+        "the filters must still exclude non-matching rows, got {results:?}"
+    );
+
+    let noisy: Vec<String> = store
+        .all_events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .map(|e| e.message().to_string())
+        .collect();
+    assert!(
+        noisy.is_empty(),
+        "legitimate numeric/boolean operands must not produce diagnostics, \
+         got {noisy:?}"
+    );
+}
+
+/// The run-time complement of the parse-time bare-token rejection: a QUOTED
+/// operand that spells a CURIE — `(= ?p "ex:knows")` — is an explicit string
+/// comparison, so it parses, and against IRI-bound rows it eliminates
+/// everything (RDFterm-equal: an IRI never equals a literal). When that
+/// filter empties the rule's rows entirely, the run-time gate must say so.
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_quoted_curie_lookalike_that_empties_rows_gets_the_runtime_hint() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/quoted-curie-lookalike");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:staleQuotedRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "?p": {"@id": "?o"}},
+                            ["filter", "(= ?p \"ex:knows\")"]
+                        ],
+                        "insert": {"@id": "?s", "ex:derivedKnows": {"@id": "?o"}}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [{"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}}]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?who",
+        "where": {"@id": "ex:alice", "ex:derivedKnows": "?who"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.is_empty(),
+        "a quoted operand is a string and must not match an IRI, got {results:?}"
+    );
+
+    let diagnostics: Vec<String> = store
+        .all_events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .map(|e| e.message().to_string())
+        .collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.contains("compared an IRI against a literal")),
+        "a quoted CURIE-lookalike that empties every row must get the run-time \
+         hint, got {diagnostics:?}"
+    );
+}
+
+// =============================================================================
+// Per-pattern insert instantiation (multi-head rules)
+// =============================================================================
+
+/// A multi-head rule with one bad head must keep deriving from its good heads.
+/// `execute_rule_with_bindings` instantiates each insert pattern independently
+/// — that per-pattern semantic predates the #1560 diagnostic and must survive
+/// it: only a rule where NO insert pattern can ever instantiate is rejected
+/// outright. The bad head is skipped with a warning naming the variable.
+#[tokio::test(flavor = "current_thread")]
+async fn datalog_multi_head_rule_keeps_deriving_when_one_head_is_unbound() {
+    let (store, _guard) = support::span_capture::init_test_tracing();
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/multi-head-partial");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                // Two heads: the first is sound, the second says ?rel where the
+                // where clause binds ?relation.
+                "@id": "ex:twoHeadRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?s", "ex:relType": {"@id": "?relation"}},
+                        "insert": [
+                            {"@id": "?s", "ex:hasRelation": {"@id": "?relation"}},
+                            {"@id": "?s", "?rel": {"@id": "?s"}}
+                        ]
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:relType": {"@id": "ex:friendOf"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?rel",
+        "where": {"@id": "ex:alice", "ex:hasRelation": "?rel"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+
+    assert!(
+        results.contains(&json!("ex:friendOf")),
+        "the sound head of a multi-head rule must keep deriving when a sibling \
+         head cannot instantiate, got {results:?}"
+    );
+
+    let diagnostics: Vec<String> = store
+        .all_events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .flat_map(|e| {
+            let mut parts: Vec<String> = e.fields.values().cloned().collect();
+            parts.push(e.message().to_string());
+            parts
+        })
+        .collect();
+    assert!(
+        diagnostics.iter().any(|d| d.contains("?rel")),
+        "the skipped head must produce a diagnostic naming ?rel, got {diagnostics:?}"
     );
 }

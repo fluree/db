@@ -236,11 +236,37 @@ fn parse_rule_definition(
         .ok_or_else(|| QueryError::InvalidQuery("Rule missing 'insert' clause".to_string()))?;
     let insert_patterns = parse_insert_patterns(insert_json, &context, snapshot)?;
 
-    // Reject an insert pattern that references a variable nothing can bind
-    // (#1560). Left alone it is invisible: every binding row is dropped inside
-    // `instantiate_pattern`, so the rule "runs" and derives nothing.
-    if let Some(message) = unsafe_insert_variables_message(&where_patterns, &insert_patterns) {
-        return Err(QueryError::InvalidQuery(message));
+    // Range restriction (#1560), enforced PER insert pattern to preserve the
+    // runtime semantic: `execute_rule_with_bindings` instantiates each insert
+    // pattern independently, so one head that can never instantiate must not
+    // silence the others. A head referencing a variable nothing can bind is
+    // skipped with a diagnostic naming the variable, and the remaining heads
+    // keep deriving; only a rule with NO instantiable head — which can never
+    // derive anything at all — is rejected outright. Left alone either case is
+    // invisible: every binding row is dropped inside `instantiate_pattern`, so
+    // the rule "runs" and derives nothing (or less than it was written to).
+    let bound = authored_bound_vars(&where_patterns);
+    let (insert_patterns, skipped): (Vec<RuleTriplePattern>, Vec<RuleTriplePattern>) =
+        insert_patterns
+            .into_iter()
+            .partition(|p| insert_pattern_is_instantiable(p, &bound));
+    if !skipped.is_empty() {
+        if insert_patterns.is_empty() {
+            let message = unsafe_insert_variables_message(&where_patterns, &skipped)
+                .expect("skipped insert patterns reference unbound variables");
+            return Err(QueryError::InvalidQuery(message));
+        }
+        let description = unbound_insert_description(&where_patterns, &skipped)
+            .expect("skipped insert patterns reference unbound variables");
+        tracing::warn!(
+            rule_id = %rule_id,
+            skipped = skipped.len(),
+            kept = insert_patterns.len(),
+            "datalog rule insert pattern skipped — {}. Every variable used in \
+             `insert` must also appear in `where`; the rule's remaining insert \
+             patterns still derive",
+            description
+        );
     }
 
     let mut rule = DatalogRule::new(rule_id.clone(), where_patterns, insert_patterns);
@@ -341,11 +367,7 @@ fn unbound_insert_variables(
     where_patterns: &[RuleTriplePattern],
     insert_patterns: &[RuleTriplePattern],
 ) -> Vec<Arc<str>> {
-    let mut bound: HashSet<Arc<str>> = HashSet::new();
-    for pattern in where_patterns {
-        bind_pattern_vars(pattern, &mut bound);
-    }
-    bound.retain(|v| !v.starts_with(IMPLICIT_VAR_PREFIX));
+    let bound = authored_bound_vars(where_patterns);
 
     let mut unbound: Vec<Arc<str>> = Vec::new();
     for pattern in insert_patterns {
@@ -360,15 +382,38 @@ fn unbound_insert_variables(
     unbound
 }
 
-/// Actionable message for a rule that violates range restriction, or `None`
-/// when the rule is safe.
+/// The author-written variables a where clause binds. Parser-generated names
+/// are excluded — see [`unbound_insert_variables`] for why they must never be
+/// treated as binding.
+fn authored_bound_vars(where_patterns: &[RuleTriplePattern]) -> HashSet<Arc<str>> {
+    let mut bound: HashSet<Arc<str>> = HashSet::new();
+    for pattern in where_patterns {
+        bind_pattern_vars(pattern, &mut bound);
+    }
+    bound.retain(|v| !v.starts_with(IMPLICIT_VAR_PREFIX));
+    bound
+}
+
+/// Whether every variable `pattern` references is in `bound` — i.e. whether
+/// `instantiate_pattern` can ever produce a flake from it.
+fn insert_pattern_is_instantiable(pattern: &RuleTriplePattern, bound: &HashSet<Arc<str>>) -> bool {
+    [&pattern.subject, &pattern.predicate, &pattern.object]
+        .into_iter()
+        .all(|term| match term {
+            RuleTerm::Var(v) => bound.contains(v),
+            _ => true,
+        })
+}
+
+/// Human-readable description of why `insert_patterns` violate range
+/// restriction, or `None` when they are all safe.
 ///
 /// Names the offending variables, because "this rule derives nothing" without
 /// them sends an author reading engine source (#1560). Auto-generated
 /// variables get their own wording: the author never wrote `?__implicit_0`, so
 /// naming it would be useless — what they need to know is that a node in the
 /// insert clause has no `@id`.
-fn unsafe_insert_variables_message(
+fn unbound_insert_description(
     where_patterns: &[RuleTriplePattern],
     insert_patterns: &[RuleTriplePattern],
 ) -> Option<String> {
@@ -398,11 +443,22 @@ fn unsafe_insert_variables_message(
         );
     }
 
-    Some(format!(
-        "Rule cannot derive anything: {}. Every variable used in `insert` must \
-         also appear in `where`.",
-        parts.join("; ")
-    ))
+    Some(parts.join("; "))
+}
+
+/// Actionable message for a rule that violates range restriction in EVERY
+/// insert pattern — such a rule can never derive anything — or `None` when at
+/// least the given patterns are safe.
+fn unsafe_insert_variables_message(
+    where_patterns: &[RuleTriplePattern],
+    insert_patterns: &[RuleTriplePattern],
+) -> Option<String> {
+    unbound_insert_description(where_patterns, insert_patterns).map(|description| {
+        format!(
+            "Rule cannot derive anything: {description}. Every variable used in \
+             `insert` must also appear in `where`."
+        )
+    })
 }
 
 /// Check if an array is a filter expression (starts with "filter")
@@ -578,6 +634,9 @@ fn split_filter_tokens(inner: &str) -> Result<Vec<&str>> {
 /// or `_`), which keeps colon-bearing *literals* — `12:30:00`,
 /// `2026-08-25T09:30:00Z` — out of IRI classification, since no NCName starts
 /// with a digit. Returns `None` for anything that is not CURIE-shaped.
+/// (A non-CURIE unquoted token is then rejected by [`parse_filter_term`], with
+/// quoting as the escape hatch — so a colon-bearing literal is never misread
+/// as an IRI, and never silently read as a string either.)
 fn curie_prefix(s: &str) -> Option<&str> {
     let colon = s.find(':')?;
     let prefix = &s[..colon];
@@ -612,18 +671,32 @@ fn quoted_literal(s: &str) -> Option<&str> {
 ///    literal that happens to look like a compact IRI.
 /// 2. `?x` is a variable.
 /// 3. Numbers and booleans are literals.
-/// 4. An absolute `http(s)` IRI, or a [`curie_prefix`]-shaped token, is an
-///    IRI: it is expanded through the rule's `@context` and resolved to a Sid,
-///    exactly as [`parse_term`] resolves a node-pattern term.
-/// 5. Anything else is a plain string literal.
+/// 4. A [`curie_prefix`]-shaped token is an IRI (an absolute `http(s)` IRI is
+///    itself CURIE-shaped — `http`/`https` parse as the prefix — so one
+///    classification covers both forms, and [`expand_iri`] passes an absolute
+///    IRI through unchanged): it is expanded through the rule's `@context` and
+///    resolved to a Sid, exactly as [`parse_term`] resolves a node-pattern
+///    term.
+/// 5. Anything else — a bare unquoted token — is **rejected**.
 ///
-/// Step 4 **fails closed**. When an IRI-shaped operand cannot be resolved to a
-/// namespace registered on this ledger, the rule is rejected instead of
-/// falling back to a string comparison. That fallback is precisely the #1556
-/// defect: `(!= ?prop ex:ssn)` compared the string `"ex:ssn"` against the bare
-/// local name `"ssn"`, was therefore always true, and copied the property the
-/// author wrote the rule to withhold. A rule that refuses to run is recoverable;
-/// a rule that silently derives an excluded fact is not.
+/// Steps 4 and 5 both **fail closed**. When an IRI-shaped operand cannot be
+/// resolved to a namespace registered on this ledger, the rule is rejected
+/// instead of falling back to a string comparison. That fallback is precisely
+/// the #1556 defect: `(!= ?prop ex:ssn)` compared the string `"ex:ssn"`
+/// against the bare local name `"ssn"`, was therefore always true, and copied
+/// the property the author wrote the rule to withhold.
+///
+/// A bare token is rejected for the same reason: before #1556 was fixed, the
+/// bare form — `(!= ?prop ssn)` — was the only operand shape that ever matched
+/// a bound IRI, so it is exactly what a workaround rule looks like. Silently
+/// reading it as a string now would fail invisibly in BOTH directions: `=`
+/// derives nothing (a string never equals an IRI) and `!=` keeps every row and
+/// derives the very fact the filter was written to exclude — and no run-time
+/// gate can see the `!=` case, because every row surviving looks like success.
+/// Rejection covers both directions symmetrically, at zero per-row cost. A
+/// string comparison is still one keystroke away (quote the operand), and a
+/// rule that refuses to run is recoverable; a rule that silently derives an
+/// excluded fact is not.
 fn parse_filter_term(s: &str, context: &JsonValue, snapshot: &LedgerSnapshot) -> Result<RuleTerm> {
     if let Some(inner) = quoted_literal(s) {
         return Ok(RuleTerm::Value(RuleValue::String(inner.to_string())));
@@ -644,8 +717,7 @@ fn parse_filter_term(s: &str, context: &JsonValue, snapshot: &LedgerSnapshot) ->
         return Ok(RuleTerm::Value(RuleValue::Boolean(false)));
     }
 
-    let absolute = s.starts_with("http://") || s.starts_with("https://");
-    if absolute || curie_prefix(s).is_some() {
+    if curie_prefix(s).is_some() {
         let expanded = expand_iri(s, context)?;
         // `encode_iri_strict` (unlike `encode_iri`) refuses to mint a Sid in
         // the EMPTY namespace for an unrecognized IRI, which is what makes the
@@ -669,7 +741,14 @@ fn parse_filter_term(s: &str, context: &JsonValue, snapshot: &LedgerSnapshot) ->
         };
     }
 
-    Ok(RuleTerm::Value(RuleValue::String(s.to_string())))
+    Err(QueryError::InvalidQuery(format!(
+        "Filter operand `{s}` is a bare unquoted token. Quote it (\"{s}\") to \
+         compare it as a string, or write a prefixed or absolute IRI (ex:{s}) \
+         to compare it as an IRI. Refusing to guess: read as a string the bare \
+         form fails invisibly against an IRI-bound variable — `=` derives \
+         nothing, and `!=` keeps every row, so an exclusion rule derives the \
+         fact it was written to exclude."
+    )))
 }
 
 /// Parse a node-map pattern into triple patterns
@@ -1040,21 +1119,26 @@ pub async fn execute_rule_matching(
             );
         } else if rows_before > 0 && binding_rows.is_empty() && diagnostics.iri_vs_literal > 0 {
             // Every row was eliminated, and at least one comparison put an IRI
-            // against a literal. That is the signature of a filter written
-            // against a bare local name — `(= ?p knows)` — which was the only
-            // operand form that matched a bound IRI before #1556 was fixed, so
-            // it is exactly what a rule authored as a workaround looks like.
-            // Such a rule now correctly derives nothing, and without this it
-            // would do so in complete silence: RDFterm-equal makes IRI-vs-literal
-            // a clean `False`, not an `Error`, so the branch above cannot see it.
+            // against a literal. The bare-local-name workaround form —
+            // `(= ?p knows)` — is rejected at parse time now, so what reaches
+            // here is a QUOTED operand spelling out an IRI — `(= ?p "ex:knows")`
+            // — or a variable that binds a string where its partner binds an
+            // IRI. Either way the rule correctly derives nothing, and without
+            // this it would do so in complete silence: RDFterm-equal makes
+            // IRI-vs-literal a clean `False`, not an `Error`, so the branch
+            // above cannot see it. (The `!=` twin of this mistake keeps every
+            // row instead of dropping them all, which no run-time gate can
+            // distinguish from success — that direction is exactly why the
+            // bare form is rejected at parse.)
             tracing::warn!(
                 rule = rule.name.as_deref().unwrap_or("<unnamed>"),
                 rule_id = %rule.id,
                 rows_before,
                 "datalog rule filter compared an IRI against a literal and excluded \
-                 every binding row; if the operand was meant to name an IRI, write it \
-                 as a prefixed or absolute IRI (`ex:knows`) rather than a bare local \
-                 name (`knows`) — a bare name is a string literal and never equals an IRI"
+                 every binding row; a quoted operand is a string literal and never \
+                 equals an IRI — if the operand was meant to name an IRI, write it \
+                 unquoted as a prefixed or absolute IRI (`ex:knows`, not \
+                 `\"ex:knows\"`)"
             );
         }
     }
@@ -1069,8 +1153,9 @@ struct FilterDiagnostics {
     errored_rows: usize,
     /// Comparisons that put an IRI against a literal. Well-defined (and false)
     /// per RDFterm-equal, so it never drops a row on its own — but when it
-    /// coincides with "every row eliminated" it is the fingerprint of a stale
-    /// bare-local-name filter.
+    /// coincides with "every row eliminated" it is the fingerprint of a filter
+    /// whose operand spells an IRI as a string (a quoted `"ex:knows"`, or a
+    /// string-bound variable compared against an IRI-bound one).
     iri_vs_literal: usize,
 }
 
@@ -2371,6 +2456,39 @@ mod tests {
         let message = unsafe_insert_variables_message(&where_patterns, &insert_patterns)
             .expect("collision must not suppress the diagnostic");
         assert!(message.contains("@id"), "got: {message}");
+    }
+
+    #[test]
+    fn instantiability_is_judged_per_insert_pattern() {
+        // A two-head rule with one typo'd head: the good head must be
+        // recognized as instantiable on its own, so parsing can keep it while
+        // skipping the bad one — matching `execute_rule_with_bindings`, which
+        // instantiates each insert pattern independently.
+        let where_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "relType")),
+            RuleTerm::var("?relation"),
+        )];
+        let good = triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "hasRelation")),
+            RuleTerm::var("?relation"),
+        );
+        let bad = triple(
+            RuleTerm::var("?s"),
+            RuleTerm::var("?rel"),
+            RuleTerm::var("?s"),
+        );
+
+        let bound = authored_bound_vars(&where_patterns);
+        assert!(insert_pattern_is_instantiable(&good, &bound));
+        assert!(!insert_pattern_is_instantiable(&bad, &bound));
+
+        // The description for the skipped head names only its own variable.
+        let description = unbound_insert_description(&where_patterns, std::slice::from_ref(&bad))
+            .expect("the bad head must produce a description");
+        assert!(description.contains("?rel"), "got: {description}");
+        assert!(!description.contains("?relation"), "got: {description}");
     }
 
     #[test]
