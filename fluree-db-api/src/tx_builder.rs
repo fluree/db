@@ -148,7 +148,9 @@ fn is_retryable_commit_conflict(e: &ApiError) -> bool {
 ///
 /// The write lock is held from `detach` until the slot is refilled, so on
 /// every path that does not unwind, the placeholder left in the slot is never
-/// observable.
+/// observable — except the eviction repairs (`recover`'s storage-down fallback
+/// and `evict`), which release the lock a beat before the entry leaves the
+/// manager; see the comments there.
 struct DetachedCacheSlot {
     /// Held until the slot is refilled. `None` only after `Drop` has taken it.
     guard: Option<LedgerWriteGuard>,
@@ -210,7 +212,10 @@ impl DetachedCacheSlot {
         // correct in isolation.
         let mut guard = self.guard.take().expect("slot holds its guard");
 
-        match fluree.ledger(&self.ledger_id).await {
+        // `load_ledger_uncached` (not the manager): this runs while holding
+        // the ledger's state write lock, which the manager's own load/reload
+        // paths would try to take again.
+        match fluree.load_ledger_uncached(&self.ledger_id).await {
             Ok(fresh) => {
                 let ledger = guard.ledger().clone();
                 ledger.sync_binary_store_from_state(&fresh).await;
@@ -219,11 +224,14 @@ impl DetachedCacheSlot {
             Err(error) => {
                 // Storage is unreachable — often the very reason the commit
                 // failed. Drop the entry so the next access loads fresh rather
-                // than leaving a placeholder cached. Accepted residual: callers
-                // *already* holding this handle read the placeholder until they
-                // re-fetch. It takes a double failure to get here (the commit
-                // failed and the reload failed), and with storage down there is
-                // no good state left to install.
+                // than leaving a placeholder cached. Accepted residuals, both
+                // taking a double failure to reach (the commit failed and the
+                // reload failed): callers *already* holding this handle read
+                // the placeholder until they re-fetch; and — a distinct case —
+                // between the `drop(guard)` below and the `disconnect`, a NEW
+                // lookup through the manager still finds the cached entry and
+                // briefly gets the placeholder too. With storage down there is
+                // no good state left to install either way.
                 tracing::warn!(
                     ledger_id = %self.ledger_id,
                     %error,
@@ -236,6 +244,33 @@ impl DetachedCacheSlot {
             }
         }
 
+        self.detached = false;
+    }
+
+    /// The commit failed in a flow whose *caller* repairs the durable head
+    /// after seeing the error — merge and revert roll the nameservice ref back
+    /// via `reset_head` once their apply step returns `Err`.
+    ///
+    /// For those flows `recover`'s reload-first repair would be wrong: it runs
+    /// *before* the caller's rollback, so a post-publish failure would cache
+    /// the very head that is about to be reset — served as live until the next
+    /// write conflict reconciles it. Evicting instead means the next access
+    /// loads whatever head the rollback settles on. Residuals match
+    /// `recover`'s eviction fallback: callers already holding the handle read
+    /// the placeholder until they re-fetch, and a new lookup racing the gap
+    /// between the guard release and the disconnect briefly sees it too —
+    /// acceptable on the failure path of an admin-frequency operation.
+    async fn evict(mut self) {
+        let guard = self.guard.take().expect("slot holds its guard");
+        let ledger_id = self.ledger_id.clone();
+        tracing::warn!(
+            ledger_id = %ledger_id,
+            "branch-op commit failed with the ledger cache detached; evicting the entry"
+        );
+        drop(guard);
+        if let Some(manager) = self.manager.take() {
+            manager.disconnect(&ledger_id).await;
+        }
         self.detached = false;
     }
 }
@@ -1875,6 +1910,88 @@ impl Fluree {
             .await;
 
         Ok((receipt, indexing_status))
+    }
+
+    /// Apply an already-built [`StagedCommit`] against the cached handle with
+    /// the cache slot detached for the window — the branch-op counterpart of
+    /// [`commit_and_finalize`]'s shielded tail, shared by the local merge and
+    /// revert apply steps (`apply_merge` / `apply_revert`).
+    ///
+    /// Those flows stage against a `clone_state()` of the locked cache exactly
+    /// like a transact does, so without the detach their `staged.apply()` —
+    /// which runs the same `finalize_state_with_base` dictionary `make_mut`s —
+    /// deep-clones the dictionaries once per operation. Spawned-and-awaited
+    /// for the same reason as [`commit_shielded`]: merge and revert run inside
+    /// HTTP request futures (`LocalCommitter::{merge,revert}`), and a client
+    /// disconnect mid-window must abandon the wait, never the window.
+    ///
+    /// Failure repair is [`DetachedCacheSlot::evict`], not `recover`: both
+    /// callers roll the nameservice head back (`reset_head`) *after* this
+    /// returns `Err`, so reloading here would cache the head that rollback is
+    /// about to withdraw.
+    ///
+    /// [`StagedCommit`]: fluree_db_transact::StagedCommit
+    /// [`commit_and_finalize`]: Fluree::commit_and_finalize
+    /// [`commit_shielded`]: Fluree::commit_shielded
+    pub(crate) async fn apply_staged_detached(
+        &self,
+        write_guard: LedgerWriteGuard,
+        staged: fluree_db_transact::StagedCommit,
+    ) -> Result<fluree_db_transact::CommitReceipt> {
+        let shielded = tokio::spawn(tracing::Instrument::instrument(
+            Self::apply_staged_shielded(self.clone(), write_guard, staged),
+            tracing::Span::current(),
+        ));
+
+        shielded.await.map_err(|e| {
+            // The apply task panicked. Its `DetachedCacheSlot` unwound with
+            // it, so the cache is already being repaired out of band.
+            ApiError::internal(format!("branch-op commit task failed: {e}"))
+        })?
+    }
+
+    /// The cancellation-shielded window of [`apply_staged_detached`]: detach
+    /// the cache slot, apply the staged commit (blob writes + head publish +
+    /// state finalization), install the result, refill the slot.
+    ///
+    /// [`apply_staged_detached`]: Fluree::apply_staged_detached
+    async fn apply_staged_shielded(
+        fluree: Fluree,
+        write_guard: LedgerWriteGuard,
+        staged: fluree_db_transact::StagedCommit,
+    ) -> Result<fluree_db_transact::CommitReceipt> {
+        let ledger_id = write_guard.state().ledger_id().to_string();
+        // Resolve the publisher before detaching so a missing publisher fails
+        // without ever emptying the slot.
+        let publisher = fluree.publisher()?;
+        let content_store = fluree.content_store(&ledger_id);
+
+        let mut slot = DetachedCacheSlot::detach(write_guard, fluree.ledger_manager.clone());
+
+        let (receipt, new_state) = match staged.apply(&content_store, publisher).await {
+            Ok(committed) => committed,
+            Err(e) => {
+                slot.evict().await;
+                return Err(e.into());
+            }
+        };
+
+        let needs_reindex = new_state.should_reindex(&fluree.index_config);
+        if let Err(e) = fluree
+            .install_committed_state(slot.guard_mut(), new_state)
+            .await
+        {
+            slot.evict().await;
+            return Err(e);
+        }
+
+        // Lock released here, before the (potentially slow) reindex trigger.
+        let ledger = slot.refilled();
+        fluree
+            .trigger_reindex_if_needed(&ledger, receipt.t, needs_reindex)
+            .await;
+
+        Ok(receipt)
     }
 
     /// Stage a transaction against a cached ledger handle and return
