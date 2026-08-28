@@ -165,7 +165,11 @@ fn is_process_token(s: &str) -> bool {
 /// `.tmp` producer emits that shape, so this is an operator's own file rather
 /// than a collision with anything we ship, and narrowing it further means
 /// gating legacy reclaim behind an opt-in, which is an upgrade-behavior
-/// decision rather than a parser one.
+/// decision rather than a parser one. The residual is tolerable *because*
+/// the sweep is a deliberate startup action an operator can see and disable
+/// ([`FileStorage::sweep_orphaned_staging`], [`FileStorage::SWEEP_ENV_VAR`])
+/// — not a side effect of constructing a storage, which is what would let a
+/// stray unit test or inspection tool reach it.
 ///
 /// Returns `None` for anything else. That is the safe direction in the only
 /// sense that matters: failing to reclaim an orphan wastes disk, and reclaiming
@@ -248,7 +252,17 @@ struct StagingSweep {
 /// 1. **Never this process's own.** The staging name carries a 64-bit token
 ///    drawn once per process, so a name bearing our token is ours — in flight
 ///    or already leaked, and a directory entry cannot tell those apart. Both
-///    are left alone. This rule is exact, not a heuristic.
+///    are left alone. This rule is exact, not a heuristic — but exact for the
+///    *current* name format only. A legacy `<name>.<pid>.<seq>.tmp` name (see
+///    [`staging_token`]) carries a pid in the token slot, and a pid can never
+///    equal a 16-hex process token, so for legacy names this rule is inert
+///    and rule 2 stands alone. That case is not a corner but the upgrade
+///    path itself: in a rolling upgrade, a still-running v4.1.5/v4.1.6
+///    process stages into the shared tree in the legacy format, and the age
+///    heuristic is the only thing protecting its in-flight writes. Tolerable
+///    — a staging write is open for milliseconds against a one-day threshold
+///    — but the rules do not layer there, and this doc should not pretend
+///    they do.
 /// 2. **Never a file touched recently.** Anything modified within `older_than`
 ///    is left for whoever is writing it. This rule *is* a heuristic: it reads
 ///    the writer's clock through ours, and it assumes no legitimate staging
@@ -348,10 +362,11 @@ fn sweep_orphaned_staging_files(
 
 /// Base paths this process has already swept.
 ///
-/// `FileStorage::new` runs once per connection, once per nameservice and again
-/// for the API's own handle, frequently on the same directory. Only the first
-/// walk can find anything; the rest would re-walk the tree to look at exactly
-/// the files the first one declined to touch.
+/// Startup opens several handles on one directory — the connection's storage,
+/// the API's own handle — and more than one startup layer calls
+/// [`FileStorage::sweep_orphaned_staging`] on the way up. Only the first walk
+/// can find anything; the rest would re-walk the tree to look at exactly the
+/// files the first one declined to touch.
 ///
 /// Canonicalized first, so the guarantee is about the *directory* and not about
 /// how a caller spelled it — `/x`, `/x/.` and `/x/` are one base path, not
@@ -501,17 +516,15 @@ impl FileStorage {
     /// process by [`Durability::ENV_VAR`] or per instance by
     /// [`Self::with_durability`].
     ///
-    /// Constructing the storage also reclaims staging files orphaned by an
-    /// earlier crash — see [`sweep_orphaned_staging_files`] for what it will
-    /// and will not delete, and [`Self::SWEEP_ENV_VAR`] to tune or disable it.
-    /// The walk is bounded, runs at most once per base path per process, and is
-    /// handed to the blocking pool when there is a runtime to hand it to, so
-    /// constructing a storage never waits on it.
+    /// Constructing a storage touches nothing on disk. In particular it does
+    /// **not** reclaim orphaned staging files: unlinking is a startup
+    /// decision, and only the startup layer knows it is starting up. A test
+    /// or a tool that constructs a `FileStorage` on a directory it does not
+    /// own must not mutate that directory — the connection and builder
+    /// startup paths call [`Self::sweep_orphaned_staging`] explicitly.
     pub fn new(base_path: impl Into<std::path::PathBuf>) -> Self {
-        let base_path = base_path.into();
-        let _ = Self::sweep_on_construction(&base_path);
         Self {
-            base_path,
+            base_path: base_path.into(),
             durability: Durability::from_env(),
             fsyncs: Arc::new(AtomicU64::new(0)),
         }
@@ -581,26 +594,43 @@ impl FileStorage {
         )
     }
 
-    /// Reclaim orphaned staging files under `base_path`, at most once per path
-    /// per process.
+    /// Reclaim staging files orphaned by an earlier crash under this
+    /// storage's base path — see [`sweep_orphaned_staging_files`] for what
+    /// the walk will and will not delete, and [`Self::SWEEP_ENV_VAR`] /
+    /// [`Self::SWEEP_BUDGET_ENV_VAR`] to disable or widen it.
+    ///
+    /// **A deliberate startup action, not a constructor side effect.** The
+    /// sweep unlinks files, and every argument for its rules leans on it
+    /// being a startup decision — so it is mounted where startup is actually
+    /// known to be happening: the file arms of `create_sync_connection` /
+    /// `create_async_connection` in `fluree-db-connection`, and the
+    /// file-backed build paths in `fluree-db-api`. Constructing a
+    /// `FileStorage` deletes nothing, so a unit test or a tool holding a
+    /// handle on a directory it does not own cannot unlink an operator's
+    /// files by existing.
+    ///
+    /// The walk is bounded ([`SWEEP_ENTRY_BUDGET`]), runs at most once per
+    /// base path per process however many handles startup opens on it, and
+    /// is handed to the blocking pool when there is a runtime to hand it to,
+    /// so the caller never waits on it.
     ///
     /// Returns the spawned task when the walk was handed to the blocking pool,
     /// so a test can await it. Production ignores it — the sweep is best-effort
     /// and nothing waits on the result.
-    fn sweep_on_construction(base_path: &Path) -> Option<tokio::task::JoinHandle<()>> {
+    pub fn sweep_orphaned_staging(&self) -> Option<tokio::task::JoinHandle<()>> {
         let budget = Self::sweep_budget_from_env()?;
-        if !claim_sweep(base_path) {
+        if !claim_sweep(&self.base_path) {
             return None;
         }
-        let base = base_path.to_path_buf();
-        // A RECURSIVE `read_dir` IS BLOCKING I/O, AND `new` IS REACHABLE FROM
-        // ASYNC CONNECTION SETUP (`create_async_connection`, and
-        // `build_from_config`'s async path), so running it here would park a
-        // runtime worker for the whole walk — measured at ~1s warm on local
-        // APFS for the default budget, and a readdir on the shared mount this
-        // design targets is a network round trip rather than a page-cache hit.
-        // #1620 asked for the walk to be bounded *or* backgrounded; it is worth
-        // being both.
+        let base = self.base_path.clone();
+        // A RECURSIVE `read_dir` IS BLOCKING I/O, AND THIS IS CALLED FROM
+        // ASYNC STARTUP (`create_async_connection`, and the API's async
+        // client builds), so running it on the caller would park a runtime
+        // worker for the whole walk — measured at ~1s warm on local APFS for
+        // the default budget, and a readdir on the shared mount this design
+        // targets is a network round trip rather than a page-cache hit.
+        // #1620 asked for the walk to be bounded *or* backgrounded; it is
+        // worth being both.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => Some(handle.spawn_blocking(move || Self::run_sweep(&base, budget))),
             // No runtime: a plain synchronous caller (`create_sync_connection`),
@@ -1683,9 +1713,15 @@ mod tests {
 
     /// A crash between `File::create` and the rename leaves a full copy of the
     /// object behind, and `list_prefix` hides it from every reader — which is
-    /// exactly why nothing ever removed it. Opening the storage has to.
+    /// exactly why nothing ever removed it. The explicit startup sweep has to.
+    ///
+    /// The intermediate assertion is a pin of its own: **constructing a
+    /// storage deletes nothing.** A bare `FileStorage::new` is reachable from
+    /// unit tests and tooling pointed at directories the process does not own
+    /// (a Debug-formatting test on a hardcoded `/tmp/test` was the
+    /// demonstrated case), so the unlink must wait for the deliberate call.
     #[test]
-    fn construction_reclaims_an_orphaned_staging_file() {
+    fn construction_is_pure_and_the_explicit_sweep_reclaims_an_orphan() {
         let dir = tempfile::tempdir().unwrap();
         let orphan = plant_staging_file(
             &dir.path().join("a/b"),
@@ -1694,11 +1730,19 @@ mod tests {
             STALE_STAGING_AGE * 2,
         );
 
-        let _storage = FileStorage::new(dir.path());
+        let storage = FileStorage::new(dir.path());
+        assert!(
+            orphan.exists(),
+            "constructing a FileStorage must not delete anything: {}",
+            orphan.display()
+        );
 
+        // No runtime in a plain #[test], so the walk runs inline and is
+        // finished when the call returns.
+        storage.sweep_orphaned_staging();
         assert!(
             !orphan.exists(),
-            "an orphan older than the threshold survived construction: {}",
+            "an orphan older than the threshold survived the startup sweep: {}",
             orphan.display()
         );
     }
@@ -1708,7 +1752,7 @@ mod tests {
     /// takes that process's rename out from under it. A file young enough to
     /// belong to a live write is not the sweep's business at any age policy.
     #[test]
-    fn construction_leaves_a_live_looking_staging_file_alone() {
+    fn the_sweep_leaves_a_live_looking_staging_file_alone() {
         let dir = tempfile::tempdir().unwrap();
         // Another instance's token, written a moment ago — the shape of a
         // write that is in flight right now.
@@ -1719,7 +1763,7 @@ mod tests {
             Duration::from_secs(0),
         );
 
-        let _storage = FileStorage::new(dir.path());
+        FileStorage::new(dir.path()).sweep_orphaned_staging();
 
         assert!(
             live.exists(),
@@ -1900,10 +1944,10 @@ mod tests {
         );
     }
 
-    /// `FileStorage::new` is called from inside `create_async_connection`, so a
-    /// synchronous recursive `read_dir` there parks a runtime worker for the
-    /// whole walk. Awaiting the handle rather than polling for the file keeps
-    /// this deterministic.
+    /// The sweep is called from inside `create_async_connection` and the
+    /// API's async client builds, so a synchronous recursive `read_dir` there
+    /// parks a runtime worker for the whole walk. Awaiting the handle rather
+    /// than polling for the file keeps this deterministic.
     #[tokio::test]
     async fn the_walk_is_handed_to_the_blocking_pool_when_a_runtime_exists() {
         let dir = tempfile::tempdir().unwrap();
@@ -1914,7 +1958,8 @@ mod tests {
             STALE_STAGING_AGE * 2,
         );
 
-        let handle = FileStorage::sweep_on_construction(dir.path())
+        let handle = FileStorage::new(dir.path())
+            .sweep_orphaned_staging()
             .expect("a sweep inside a runtime must be spawned, not run inline");
         handle.await.expect("sweep task panicked");
 
@@ -1923,7 +1968,7 @@ mod tests {
 
     /// Without a runtime there is nothing to hand the walk to, and a plain
     /// synchronous caller can afford to block — so it runs inline and is
-    /// *finished* by the time construction returns. Asserting the orphan is
+    /// *finished* by the time the call returns. Asserting the orphan is
     /// already gone is the part that carries the coverage; `is_none()` alone
     /// would also be satisfied by a sweep that never ran.
     #[test]
@@ -1937,12 +1982,14 @@ mod tests {
         );
 
         assert!(
-            FileStorage::sweep_on_construction(dir.path()).is_none(),
+            FileStorage::new(dir.path())
+                .sweep_orphaned_staging()
+                .is_none(),
             "no runtime, so there is no task to return"
         );
         assert!(
             !orphan.exists(),
-            "the inline sweep had not finished when construction returned"
+            "the inline sweep had not finished when the call returned"
         );
     }
 
@@ -2038,7 +2085,7 @@ mod tests {
         );
     }
 
-    /// The walk is on the construction path, so a huge volume must not turn
+    /// The walk is on the startup path, so a huge volume must not turn
     /// opening a ledger into a startup stall. Running out of budget stops the
     /// walk and says so, rather than running to completion.
     #[test]
@@ -2059,10 +2106,10 @@ mod tests {
         assert_eq!(sweep.reclaimed, 3, "the walk went past its budget");
     }
 
-    /// One walk per base path per process. `FileStorage::new` runs once per
-    /// connection, once per nameservice and again for the API's own handle,
-    /// often on the same directory; re-walking the tree each time would only
-    /// re-examine the files the first walk declined to touch.
+    /// One walk per base path per process. Startup opens several handles on
+    /// one directory and more than one startup layer sweeps on the way up;
+    /// re-walking the tree each time would only re-examine the files the
+    /// first walk declined to touch.
     #[test]
     fn a_base_path_is_swept_at_most_once_per_process() {
         let dir = tempfile::tempdir().unwrap();

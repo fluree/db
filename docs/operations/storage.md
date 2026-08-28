@@ -393,9 +393,13 @@ named `<file>.<pid>.<token>.<seq>.tmp`. These are never served — listings skip
 them, so they can't be read back as content — but they are a full copy of the
 object being written, and a crash loop produces one per attempt.
 
-Opening a file-backed storage reclaims them. The sweep is deliberately timid,
-because the directory it walks is shared — by other instances in a
-multi-instance deployment, and by other subsystems even in a single process:
+Starting a file-backed Fluree instance — opening a connection, or building an
+API client — reclaims them. The sweep is a deliberate startup action, taken
+explicitly by those startup paths: merely constructing a storage handle (as a
+test or an inspection tool might, on a directory it does not own) never
+deletes anything. The sweep is also deliberately timid, because the directory
+it walks is shared — by other instances in a multi-instance deployment, and by
+other subsystems even in a single process:
 
 - Only files named the way this backend's own staging writer names them are
   considered at all. `.tmp` is a suffix, not a namespace — the indexer, the
@@ -404,6 +408,11 @@ multi-instance deployment, and by other subsystems even in a single process:
   ours is ignored outright, whatever its age.
 - A staging file carrying **this process's token** is never removed, at any
   age. In flight and already-leaked look identical from a directory entry.
+  Staging files written by a pre-token build (v4.1.5/v4.1.6) carry a pid where
+  the token now sits, so this rule cannot recognize them as anyone's — for
+  those, the 24-hour rule below is the only protection. The deployment where
+  that matters is a rolling upgrade, with an old-format process still staging
+  into the shared tree.
 - A staging file **modified within the last 24 hours** is never removed. A
   staging write is a single write of one in-memory buffer, so a day is far past
   any real one.
@@ -417,8 +426,7 @@ unlinked. Even then nothing is corrupted — on POSIX the writer keeps its open
 descriptor, so only its final rename fails and the write reports an error.
 
 The walk runs at most once per directory per process, and is handed to a
-background thread when one is available, so opening a storage never waits on
-it.
+background thread when one is available, so startup never waits on it.
 
 It is also bounded, at 100,000 directory entries by default — a walk bounded in
 entries is not bounded in wall-clock on a network mount, where every directory
