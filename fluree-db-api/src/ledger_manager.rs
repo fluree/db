@@ -405,8 +405,11 @@ impl LedgerHandle {
     /// Apply a v2 binary index root to this handle.
     ///
     /// All I/O (root read, BinaryIndexStore load) happens outside any lock.
-    /// The state lock is held for the brief atomic swap of both `state` and
-    /// `binary_store`, ensuring coherence between `db.range_provider` and
+    /// The state lock is held while the snapshot is applied — novelty trim
+    /// and runtime-dict reseed scale with accumulated novelty, so this is
+    /// not a constant-time swap; see the `index_install_wait` /
+    /// `index_install_lock` spans — and both `state` and `binary_store` are
+    /// swapped under it, ensuring coherence between `db.range_provider` and
     /// `binary_store` (lock ordering: state → binary_store).
     ///
     /// `cs` MUST be branch-aware for branched ledgers (built via
@@ -422,7 +425,7 @@ impl LedgerHandle {
     ) -> Result<()> {
         use tracing::Instrument as _;
         let span = tracing::debug_span!(
-            "apply_index_v2",
+            "index_install",
             ledger_id = %self.id(),
             index_t = tracing::field::Empty,
         );
@@ -476,20 +479,27 @@ impl LedgerHandle {
         let db = LedgerSnapshot::new_meta(meta)
             .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;
 
-        // Brief lock: apply snapshot (trims novelty, rebuilds dict_novelty),
+        // Exclusive lock: apply snapshot (trims novelty, rebuilds dict_novelty),
         // then wire up range_provider with the correct dict_novelty.
         // Lock ordering: state → binary_store (same as snapshot()).
         //
-        // The span brackets the exclusive-lock section so a commit-latency
-        // spike can be attributed to an index install; the two novelty walks
-        // inside (apply_loaded_db, reseed_runtime_small_dicts) scale with
-        // accumulated novelty, so this is not a constant-time swap.
-        let install = async {
-            let mut state = self.inner.state.write().await;
-            // Splits the span into wait-vs-hold: the span opens before the
-            // write().await above, so under contention its duration is
-            // acquisition wait + hold; this event's timestamp marks the seam.
-            tracing::debug!("install lock acquired");
+        // Wait and hold are bracketed by separate spans so each aggregates
+        // independently: a long `index_install_wait` is contention on the
+        // state lock (points at backpressure or install batching), while a
+        // long `index_install_lock` is the guarded work itself — the two
+        // novelty walks inside (apply_loaded_db, reseed_runtime_small_dicts)
+        // scale with accumulated novelty, so this is not a constant-time
+        // swap. No event fires inside the lock: under a default `fmt`
+        // subscriber, span lifecycle is in-memory bookkeeping rather than a
+        // formatted write to a shared writer.
+        let state_guard = self
+            .inner
+            .state
+            .write()
+            .instrument(tracing::debug_span!("index_install_wait"))
+            .await;
+        let install = async move {
+            let mut state = state_guard;
 
             // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
             state
@@ -528,7 +538,7 @@ impl LedgerHandle {
             Ok::<(), ApiError>(())
         };
         install
-            .instrument(tracing::debug_span!("apply_index_install_lock"))
+            .instrument(tracing::debug_span!("index_install_lock"))
             .await?;
 
         Ok(())
