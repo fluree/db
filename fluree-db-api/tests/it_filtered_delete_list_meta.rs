@@ -816,22 +816,225 @@ async fn novelty_only_predicate_resolves_metadata_siblings() {
                 "the @en fact goes; the @fr fact sharing its lexical form stays"
             );
 
-            // The COMBINATION of the two legs above — one list position
-            // carrying two language tags — is pinned at the unit level
-            // instead (`binary_range::tests::
-            // one_list_position_under_two_language_tags_resolves_independently`),
-            // because it cannot currently be built through this path at all.
-            //
-            // `FlakeMeta`'s `Ord` ignores `lang` whenever both sides carry a
-            // list index, so `{en, i: 0}` and `{fr, i: 0}` compare equal
-            // without being equal (#1711). Asserting the second tag at the
-            // same position commits (receipt says one flake at its own `t`)
-            // but never appears in the live view: novelty keys the fact by
-            // that same ordering and folds it onto the first tag. So the
-            // write side collapses the shape before the read side can be
-            // asked about it. Worth knowing when #1711 is fixed — repairing
-            // the type will make this shape constructible, and this is the
-            // test that should then grow an end-to-end leg.
+            // The COMBINATION of the two legs above: one list position
+            // carrying two language tags. Until #1711 this shape could not be
+            // built through this path at all — `FlakeMeta`'s `Ord` ignored
+            // `lang` whenever both sides carried a list index, so `{en, i: 0}`
+            // and `{fr, i: 0}` compared equal without being equal, and novelty
+            // (which keys facts by that ordering) folded the second tag onto
+            // the first. Now that the type's `Ord` agrees with its `Eq`, both
+            // facts reach the overlay and the resolver has to tell them apart.
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:pair", "ex:names": {"@list": [
+                        {"@value": "hello", "@language": "en"}
+                    ]}}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:pair", "ex:names": {"@list": [
+                        {"@value": "hello", "@language": "fr"}
+                    ]}}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_items(&fluree, &ledger, "ex:pair", "ex:names").await,
+                vec!["hello@en", "hello@fr"],
+                "a second language tag at an occupied list position is its own \
+                 fact, not a duplicate of the first"
+            );
+
+            // And the resolver splits them: retracting one tag at position 0
+            // must leave its twin at position 0 alone. Deleting the one that
+            // sorts FIRST is the failing direction, as with the legs above.
+            let del_pair_en = json!({
+                "@context": ctx(),
+                "where": [{"@id": "ex:pair", "ex:names": {"@value": "hello", "@language": "en"}}],
+                "delete": [{"@id": "ex:pair", "ex:names": {"@value": "hello", "@language": "en"}}]
+            });
+            let r = fluree
+                .update_with_opts(ledger, &del_pair_en, TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 1);
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_items(&fluree, &ledger, "ex:pair", "ex:names").await,
+                vec!["hello@fr"],
+                "one tag goes; its twin at the same list position stays"
+            );
+        })
+        .await;
+}
+
+/// Two language tags at one list position must read the same from the novelty
+/// overlay, from a rebuilt index, and from a replayed commit chain.
+///
+/// This is the end-to-end shape behind #1711, and the divergence is the point.
+/// Novelty keyed facts through `FlakeMeta`'s `Ord`, which used to ignore `lang`
+/// whenever both sides carried a list index — so `{en, i: 0}` and `{fr, i: 0}`
+/// were one slot and the second tag was folded onto the first. The persisted
+/// index keys by its own integer columns (`o_type` absorbs the language id,
+/// `o_i` the position) and always kept them apart. Nothing was durably lost:
+/// the flake was in the commit blob and the index build recovered it. What the
+/// user saw was the same query returning one entry before indexing and two
+/// after, with no write in between — an answer that flipped on a background
+/// maintenance event.
+///
+/// So each leg asserts the two views are EQUAL, not merely that each is right.
+/// Equality is the sharper assertion: it fails whichever side regresses.
+#[tokio::test]
+async fn language_tagged_list_entries_agree_across_the_index_boundary() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(dir.clone()).build().unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            // Leg A: two separate commits, each a one-entry `@list` under the
+            // same predicate — both entries land at position 0.
+            let seq_a = json!({"@context": ctx(), "@id": "ex:seq", "ex:names": {"@list": [
+                {"@value": "hello", "@language": "en"}
+            ]}});
+            let seq_b = json!({"@context": ctx(), "@id": "ex:seq", "ex:names": {"@list": [
+                {"@value": "hello", "@language": "fr"}
+            ]}});
+            // Leg B: ONE commit carrying two sibling `@list`s under one
+            // predicate. Within a single batch both flakes always survived
+            // novelty, so this leg exercises the read side rather than the
+            // per-commit dedup.
+            let sib = json!({"@context": ctx(), "@id": "ex:sib", "ex:names": [
+                {"@list": [{"@value": "bonjour", "@language": "en"}]},
+                {"@list": [{"@value": "bonjour", "@language": "fr"}]}
+            ]});
+
+            let write_legs = |fluree: &fluree_db_api::Fluree, id: &'static str| {
+                let (seq_a, seq_b, sib) = (seq_a.clone(), seq_b.clone(), sib.clone());
+                let fluree = fluree.clone();
+                async move {
+                    let mut last_t = 0;
+                    for doc in [&seq_a, &seq_b, &sib] {
+                        let ledger = fluree.ledger(id).await.unwrap();
+                        last_t = fluree
+                            .insert_with_opts(
+                                ledger,
+                                doc,
+                                TxnOpts::default(),
+                                CommitOpts::default(),
+                                &index_cfg(),
+                            )
+                            .await
+                            .unwrap()
+                            .receipt
+                            .t;
+                    }
+                    last_t
+                }
+            };
+
+            // ---- index boundary ----
+            let indexed_id = "it/list-meta-tag-boundary:main";
+            fluree.create_ledger(indexed_id).await.unwrap();
+            let last_t = write_legs(&fluree, indexed_id).await;
+
+            let ledger = fluree.ledger(indexed_id).await.unwrap();
+            let nov_seq = list_items(&fluree, &ledger, "ex:seq", "ex:names").await;
+            let nov_sib = list_items(&fluree, &ledger, "ex:sib", "ex:names").await;
+            assert_eq!(nov_seq, vec!["hello@en", "hello@fr"]);
+            assert_eq!(nov_sib, vec!["bonjour@en", "bonjour@fr"]);
+
+            trigger_index_and_wait_outcome(&handle, indexed_id, last_t).await;
+            let ledger = fluree.ledger(indexed_id).await.unwrap();
+            assert!(ledger.snapshot.range_provider.is_some(), "index built");
+            assert_eq!(
+                list_items(&fluree, &ledger, "ex:seq", "ex:names").await,
+                nov_seq,
+                "leg A: the index build must not change the answer"
+            );
+            assert_eq!(
+                list_items(&fluree, &ledger, "ex:sib", "ex:names").await,
+                nov_sib,
+                "leg B: the index build must not change the answer"
+            );
+
+            // Retracting one tag once both are indexed leaves the twin — the
+            // half that was already correct before the fix, kept so a change
+            // in the other direction is caught too.
+            let del_en = json!({
+                "@context": ctx(),
+                "where": [{"@id": "ex:seq", "ex:names": {"@value": "hello", "@language": "en"}}],
+                "delete": [{"@id": "ex:seq", "ex:names": {"@value": "hello", "@language": "en"}}]
+            });
+            let r = fluree
+                .update_with_opts(
+                    ledger,
+                    &del_en,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 1);
+            let ledger = fluree.ledger(indexed_id).await.unwrap();
+            assert_eq!(
+                list_items(&fluree, &ledger, "ex:seq", "ex:names").await,
+                vec!["hello@fr"],
+                "retracting one tag over an indexed base leaves its twin"
+            );
+
+            // ---- cold reload: a second ledger that is never indexed, so the
+            // reload replays the commit chain into a fresh novelty ----
+            let cold_id = "it/list-meta-tag-cold:main";
+            fluree.create_ledger(cold_id).await.unwrap();
+            write_legs(&fluree, cold_id).await;
+            let ledger = fluree.ledger(cold_id).await.unwrap();
+            assert_eq!(
+                list_items(&fluree, &ledger, "ex:seq", "ex:names").await,
+                nov_seq
+            );
+            assert_eq!(
+                list_items(&fluree, &ledger, "ex:sib", "ex:names").await,
+                nov_sib
+            );
+
+            drop(fluree);
+            let reloaded = FlureeBuilder::file(dir).build().unwrap();
+            let ledger = reloaded.ledger(cold_id).await.unwrap();
+            assert!(
+                ledger.snapshot.range_provider.is_none(),
+                "the cold ledger must have no index, so this really is a \
+                 commit-chain replay"
+            );
+            assert_eq!(
+                list_items(&reloaded, &ledger, "ex:seq", "ex:names").await,
+                nov_seq,
+                "leg E: replayed novelty must agree with the live view"
+            );
+            assert_eq!(
+                list_items(&reloaded, &ledger, "ex:sib", "ex:names").await,
+                nov_sib,
+                "leg E: replayed novelty must agree with the live view"
+            );
         })
         .await;
 }
