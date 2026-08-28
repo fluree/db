@@ -1897,6 +1897,81 @@ mem:fact-01kv6sahj5se39hv5hkmjytznz a mem:Fact ;
     mem:createdAt "2026-06-15T23:19:32.677756+00:00"^^xsd:dateTime ;
     mem:rationale "Serial writes (summed S3 round-trips) blew the 15-min Lambda cap on a real 21 GB/74k-artifact DBLP restore; user chose the parallelize-writes fix. Sequential-stream-read ceiling is still unaddressed." .
 
+mem:constraint-01m0sy4avrsbj4xs4tnaxw3xnr a mem:Constraint ;
+    mem:content "Every new TransactOperation variant MUST get an arm in `stage_under_lock` (tx_builder.rs), not only stage_plan / owned execute / owned stage. stage_under_lock is the path Raft (`build_commit_with_handle`) and every policy-gated, pre-built, SPARQL and Cypher local commit takes, and its JSON-like fallthrough silently stages an unknown op as `TxnType::Insert` into the default graph — the sync verb shipped that way until review." ;
+    mem:tag "new-verb-checklist" ;
+    mem:tag "raft" ;
+    mem:tag "stage-under-lock" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/src/tx_builder.rs" ;
+    mem:branch "feature/graph-sync-delta" ;
+    mem:createdAt "2026-08-24T13:07:35.420277+00:00"^^xsd:dateTime ;
+    mem:rationale "Local no-policy tests pass via the optimistic path, so the gap is invisible until raft or policy is involved; pinned by policy_gated_sync_targets_the_named_graph." .
+
+mem:constraint-01m0sy4gbwwx44d2yc3kepwv5a a mem:Constraint ;
+    mem:content "`BodyKind` and `TransactionBody` are postcard-positional in persisted Raft state (`QueueEntry.body_kind` in state snapshots): append new variants at the END only (pinned by body_kind_ordinals_are_append_only). Separately, `RefTransactBuilder::build_commit` returns `Ok(None)` for a zero-flake update/upsert/sync that registers no graph; the raft worker republishes the current head with `install: None` (mirroring revert NoOp). Before this, a no-change write under Raft failed with EmptyTransaction and poisoned the queued request." ;
+    mem:tag "consensus" ;
+    mem:tag "no-op" ;
+    mem:tag "postcard" ;
+    mem:tag "raft" ;
+    mem:tag "wire-format" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/src/tx_builder.rs" ;
+    mem:artifactRef "fluree-db-consensus/src/lib.rs" ;
+    mem:artifactRef "fluree-db-consensus/src/raft/commit_worker.rs" ;
+    mem:branch "feature/graph-sync-delta" ;
+    mem:createdAt "2026-08-24T13:07:41.052490+00:00"^^xsd:dateTime ;
+    mem:rationale "Mid-enum insertion shifts every later ordinal so existing snapshots/mixed-version nodes decode the wrong operation; the no-op terminal is the only way consensus can express committed=false." .
+
+mem:decision-01m0svwaqmb1h9dweex82pcxd7 a mem:Decision ;
+    mem:content "Graph sync (feature/graph-sync-delta) = Insert-typed Txn + `sync_graph: Option<IRI>` directive: staging adds a wave after the upsert wave pushing every scanned target-graph flake as a retraction; FlakeAccumulator::mixed nets A∩B to zero so the commit is exactly the delta. Chosen over a GraphMgmtOp variant (payload doesn't fit SPARQL-shaped ops) and over the materialize.rs text-diff pipeline (needs a built binary index + bulk-import path drops retractions; the accumulator path works on any live ledger and inherits policy/SHACL/cascade/no-op machinery). Retraction scan follows CLEAR's policy model (not view-filtered, O4). Zero-staged sync joins the Update|Upsert no-op skip via StageResult.sync_graph." ;
+    mem:tag "delta" ;
+    mem:tag "graph-sync" ;
+    mem:tag "named-graph" ;
+    mem:tag "staging" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/transactions/sync.md" ;
+    mem:artifactRef "fluree-db-api/src/admin.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_sync_graph.rs" ;
+    mem:artifactRef "fluree-db-transact/src/parse/jsonld.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "feature/graph-sync-delta" ;
+    mem:createdAt "2026-08-24T12:28:15.988437+00:00"^^xsd:dateTime ;
+    mem:rationale "Whole-graph ops that materialize scans + payload are the CLEAR-class memory profile; chunked staging remains the known follow-up. Bnode stability = deterministic graph-scoped skolem_txn_id (sync+doc_scope(doc_id)) set in stage_sync_transaction_tracked — label-unstable exporters (Protégé genid) still churn; RDFC canonicalization is the designed seam." ;
+    mem:alternatives "GraphMgmtOp::Sync variant; CLEAR+INSERT relying on accumulator (no explicit no-op detection); offline export/external-sort/diff pipeline (v2 scale path)" .
+
+mem:decision-01m0t021b2wwasg494g0yxre7w a mem:Decision ;
+    mem:content "`fluree sync` CLI grammar: top-level verb (not `graph sync`), target graph is the constant (`--graph <IRI>` required), the SOURCE of desired contents is pluggable via `commands/graph_sync.rs::SyncSource` (today RdfText; an R2RML-over-Iceberg/CSV/Excel source is one new variant that materializes to the same JSON-LD payload). Turtle converts client-side (endpoint is JSON-LD only). `--dry-run --json` is the scripting pre-flight; `--json` output = the server dry-run report shape on both local and remote paths. NOTE: `commands/sync.rs` already exists (fetch/pull/push/publish replication) — never reuse that name." ;
+    mem:tag "cli" ;
+    mem:tag "command-grammar" ;
+    mem:tag "graph-sync" ;
+    mem:tag "r2rml" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/cli/server-integration.md" ;
+    mem:artifactRef "docs/cli/sync.md" ;
+    mem:artifactRef "fluree-db-cli/src/commands/graph_sync.rs" ;
+    mem:branch "feature/graph-sync-delta" ;
+    mem:createdAt "2026-08-24T13:41:17.282471+00:00"^^xsd:dateTime ;
+    mem:rationale "User wants sync to later drive from Iceberg/CSV/Excel via R2RML (\"latest downstream\"); keeping the source a client-side seam means no new server endpoint or command per source, and --remote only moves where materialization happens." .
+
+mem:fact-01m0svwr4r77f4v4xy9k7w5q6e a mem:Fact ;
+    mem:content "CommitReceipt now carries assert_count/retract_count (count_ops in commit.rs, populated in finalize_state_with_base from commit_record.flakes). Raft-applied receipts report 0/0 — AppliedReceipt/idempotency records don't persist the split (raft wire-format stability), so sync reports over raft lack the convenience counts. Sync's HTTP dry-run path computes counts locally instead. New verbs need ALL of: TransactionBody variant + operation_tag + body_hash domain tag + BodyKind + BOTH appliers (local.rs and raft/commit_worker.rs body dispatch) + server route family + tx_builder TransactOperation/OpPlan/stage_plan arms + BOTH no-op skip conditions (tx_builder owned execute + commit_and_finalize, and the three tx.rs transact paths)." ;
+    mem:tag "commit-receipt" ;
+    mem:tag "consensus" ;
+    mem:tag "new-verb-checklist" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/tx_builder.rs" ;
+    mem:artifactRef "fluree-db-consensus/src/lib.rs" ;
+    mem:artifactRef "fluree-db-transact/src/commit.rs" ;
+    mem:branch "feature/graph-sync-delta" ;
+    mem:createdAt "2026-08-24T12:28:29.720563+00:00"^^xsd:dateTime ;
+    mem:rationale "The verb-seam checklist is easy to miss partially (a missed applier silently breaks the verb under raft only)." .
+
 mem:fact-01kzemcff3b773aq7yckej9dhk a mem:Fact ;
     mem:content "Local-filesystem Iceberg support (commit 15ca56807, E2E-verified against a real pyiceberg table): Direct table_location accepts file:///, file:/, and bare absolute paths. Adds FileIcebergStorage and an IcebergStorageBackend enum (S3|File) threaded through the api scan surface, session caches, and lazy path; the version-hint fallback lists metadata/ via a new list_files trait method. GOTCHA the E2E test caught: Direct location validation lives in TWO places — fluree_db_iceberg::config and fluree-db-api graph_source/config.rs validate() — and both must accept a new scheme." ;
     mem:tag "direct-mode" ;
@@ -2455,6 +2530,33 @@ mem:fact-01kta3264pg54aabvt97spk5qt a mem:Fact ;
     mem:createdAt "2026-06-04T19:51:46.070663+00:00"^^xsd:dateTime ;
     mem:rationale "A reviewer flagged \"use resolver fallback instead of sid_to_iri for novelty subjects\" as a major data-loss bug; it is a false positive due to the Sid-vs-integer-ID distinction." .
 
+mem:constraint-01m1035zyph3qqv6yc4bg25eva a mem:Constraint ;
+    mem:content "sh:sparql gotchas: (1) fluree-db-sparql lowering registers vars with the \"?\" prefix — VarRegistry lookups must use \"?this\"/\"?value\", bare \"this\" silently creates a second var and the VALUES injection stops constraining. (2) Sub-SELECT * must be REJECTED under pre-binding (W3C pre-binding-006 expects Failure; only explicit projection of $this is legal). (3) $PATH must be bound at validation time like $this, NOT text-substituted at compile time — compile-time decode_sid fails for inline-shapes namespaces staged in the same txn. (4) sh:value defaults to the focus node when ?value is unbound (spec §5.3.1; all pre-binding report tests depend on it)." ;
+    mem:tag "gotcha" ;
+    mem:tag "pre-binding" ;
+    mem:tag "sh-sparql" ;
+    mem:tag "shacl" ;
+    mem:tag "var-registry" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-shacl/src/sparql.rs" ;
+    mem:branch "fix/no-op-apply-head-completion" ;
+    mem:createdAt "2026-08-26T22:31:19.254258+00:00"^^xsd:dateTime .
+
+mem:fact-01m1035wc0tnshq7vzjmdpbypt a mem:Fact ;
+    mem:content "sh:sparql (SHACL-SPARQL §5) implemented in fluree-db-shacl/src/sparql.rs: sh:select parses at shape-compile time (snapshot-independent, stored as Arc<SparqlAst> in the constraint), lowers per validation against the DATA snapshot's ns registry (cross-ledger shapesSource safe), and pre-binds $this (+$PATH on property shapes) by injecting a one-row Pattern::Values into EVERY scope — top level, union branches, optionals, GRAPH bodies, subquery pattern lists (also pushing the var into sq.select). W3C sparql suite wired as shacl_sparql_w3c_testsuite: 17/22; remaining failures = constraint components (sh:validator) + $shapesGraph, both unimplemented by design." ;
+    mem:tag "pre-binding" ;
+    mem:tag "sh-sparql" ;
+    mem:tag "shacl" ;
+    mem:tag "validation" ;
+    mem:tag "w3c" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-shacl/src/compile.rs" ;
+    mem:artifactRef "fluree-db-shacl/src/sparql.rs" ;
+    mem:artifactRef "testsuite-shacl/tests/w3c_shacl.rs" ;
+    mem:branch "fix/no-op-apply-head-completion" ;
+    mem:createdAt "2026-08-26T22:31:15.584644+00:00"^^xsd:dateTime .
+
 mem:fact-01m0ghz0w7m3hhpnb8797vqjwj a mem:Fact ;
     mem:content "Planner bound-subject/bound-object fan-out (`estimate_triple_row_count`, planner.rs) is FRACTIONAL: `max(count/ndv, 1.0)` — no `ceil`. v4.1.6 regression (dblp `optional-join-3-star-2` 2.4x): `ceil` made `rdf:type` at 1.96/subject and `signatureDblpName` at 1.004/subject tie at 2 → seed ranking fell to source order. HLL256 (σ≈6.5%) puts a 1-per-subject predicate's ratio anywhere in ~[0.9,1.1], so `ceil` flipped plans on sketch noise (v4.1.2 had ndv_subjects > flake count for that reason; neither ndv was \"wrong\"). Estimate feeds rank_seed_candidates, HashJoinPlanner driving_est product, and the membership-join gate." ;
     mem:tag "cardinality" ;
@@ -2664,7 +2766,7 @@ mem:fact-01kynrrhdfqt0n6rx1wpcv5843 a mem:Fact ;
     mem:rationale "Answers \"would batching help existing-subject upserts?\" with measurements — avoids speculative batching work; documents the store-cached p_sid_table invariant (store immutable behind Arc → OnceLock safe)." .
 
 mem:fact-01m0srrpntk3mxseprnpcvey08 a mem:Fact ;
-    mem:content "REVERTED, do not re-land as written: lowering star-block VALUES to FILTER(?v IN ...) at block assembly (convert_star_values_to_membership_filters) did not work. inline_singleton_values_objects rewrites a singleton VALUES into the triple object but RETAINS the VALUES pattern, so its var is no longer produced by any star triple, membership_filter_from_values declines it, and the all-or-nothing gate declines the whole block — which is exactly the two-VALUES repro shape. Measured: 0 firings across the 6 tests that shipped with it, 1 across the whole 349-test SPARQL group. Where it does fire it is SLOWER: Function::In yields no range constraint from extract_range_constraints, so the block carries no object_bounds, has_selective_anchor is false, and it leaves the fused PropertyJoinOperator for the NLJ chain. Push the constraint down as a SEED that keeps the star anchored, not a filter that unanchors it." ;
+    mem:content "REVERTED, do not re-land as written: lowering star-block VALUES to FILTER(?v IN ...) at block assembly failed two ways. inline_singleton_values_objects rewrites a singleton VALUES into the triple object but RETAINS the VALUES pattern, so membership_filter_from_values declines its var and the all-or-nothing gate declines the whole block — exactly the two-VALUES repro shape; 1 firing across the 349-test SPARQL group. Where it does fire it is SLOWER: Function::In yields no object_bounds, has_selective_anchor goes false, and the block leaves the fused PropertyJoinOperator for the NLJ chain. Push the constraint down as a SEED that keeps the star anchored, not a filter that unanchors it." ;
     mem:tag "performance" ;
     mem:tag "planner" ;
     mem:tag "reverted" ;
@@ -2676,7 +2778,7 @@ mem:fact-01m0srrpntk3mxseprnpcvey08 a mem:Fact ;
     mem:artifactRef "fluree-db-query/src/planner.rs" ;
     mem:branch "fix/values-object-scan-constraint" ;
     mem:createdAt "2026-08-24T11:33:51.418875+00:00"^^xsd:dateTime ;
-    mem:updatedAt "2026-08-25T23:36:20.896572+00:00"^^xsd:dateTime ;
+    mem:updatedAt "2026-08-26T13:52:55.183934+00:00"^^xsd:dateTime ;
     mem:rationale "The approach looks obviously right and was already tried and reverted; the singleton-fold interaction and the missing object_bounds are the two things that kill it." .
 
 mem:fact-01m0srrz87xpy9dy11z0b084hv a mem:Fact ;

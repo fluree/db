@@ -2191,6 +2191,8 @@ pub fn parse_pre_index_manifest(bytes: &[u8]) -> std::result::Result<Vec<GraphSt
                 ndv_values,
                 ndv_subjects,
                 last_modified_t,
+                observed_datatypes: fluree_db_core::PropertyStatEntry::tags_of(&datatypes),
+                historical_datatypes: Vec::new(),
                 datatypes,
             });
         }

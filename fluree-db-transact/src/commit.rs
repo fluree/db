@@ -46,6 +46,17 @@ pub struct CommitReceipt {
     pub t: i64,
     /// Number of flakes in the commit
     pub flake_count: usize,
+    /// Asserted (`op = true`) flakes in the commit.
+    pub assert_count: usize,
+    /// Retracted (`op = false`) flakes in the commit.
+    pub retract_count: usize,
+}
+
+/// Count `(asserts, retracts)` in a flake slice — the split every
+/// [`CommitReceipt`] carries alongside its total.
+pub fn count_ops(flakes: &[Flake]) -> (usize, usize) {
+    let asserts = flakes.iter().filter(|f| f.op).count();
+    (asserts, flakes.len() - asserts)
 }
 
 /// Output of [`build_commit`].
@@ -910,6 +921,7 @@ fn finalize_state_with_base(
     // temporal metadata current so the next commit's event-time guard and
     // dual-stamp decision stay in-memory integer checks.
     let head_temporal = HeadTemporal::from_commit(&commit_record).or(base.head_temporal);
+    let (assert_count, retract_count) = count_ops(&commit_record.flakes);
 
     // 10. Generate commit metadata flakes
     let commit_metadata_flakes = {
@@ -1051,6 +1063,8 @@ fn finalize_state_with_base(
         commit_id: commit_cid,
         t: new_t,
         flake_count,
+        assert_count,
+        retract_count,
     };
     Ok((receipt, new_state))
 }

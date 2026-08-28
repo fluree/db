@@ -210,15 +210,32 @@ async fn ledger_exists_on_file_storage() {
         "a malformed id must be an Err, so callers cannot mistake it for absence",
     );
 
-    // A soft-dropped ledger still has a (retracted) record: `exists`
-    // is "is there a record", not "is it live".
+    // A soft drop keeps the RECORD but not the ledger: `exists` is a
+    // query-path question, and on the query path a retracted record reads
+    // identically to not-found. Tombstoning backends (the raft nameservice)
+    // keep serving the record so admin tooling can read the flag; answering
+    // `true` here is what let a dropped ledger keep loading and serving
+    // queries on those backends.
     fluree
         .drop_ledger("x", fluree_db_api::DropMode::Soft)
         .await
         .unwrap();
     assert!(
-        fluree.ledger_exists("x:main").await.unwrap(),
-        "exists() reports the record, which a soft drop keeps",
+        !fluree.ledger_exists("x:main").await.unwrap(),
+        "a retracted ledger must read as absent on the query path",
+    );
+
+    // ...but it is a SOFT drop: the record itself survives, carrying the
+    // flag, which is what distinguishes it from a hard drop.
+    let record = fluree
+        .nameservice()
+        .lookup("x:main")
+        .await
+        .unwrap()
+        .expect("a soft drop keeps the nameservice record");
+    assert!(
+        record.retracted,
+        "the surviving record must be marked retracted",
     );
 }
 

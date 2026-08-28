@@ -14,6 +14,7 @@
   - [graph](cli/graph.md)
   - [insert](cli/insert.md)
   - [upsert](cli/upsert.md)
+  - [sync](cli/sync.md)
   - [update](cli/update.md)
   - [load](cli/load.md)
   - [query](cli/query.md)
@@ -134,6 +135,7 @@
   - [Overview](transactions/overview.md)
   - [Insert](transactions/insert.md)
   - [Upsert](transactions/upsert.md)
+  - [Sync (graph synchronization)](transactions/sync.md)
   - [Update (WHERE/DELETE/INSERT)](transactions/update-where-delete-insert.md)
   - [Conditional updates (atomic / compare-and-swap)](transactions/conditional-updates.md)
   - [Retractions](transactions/retractions.md)
@@ -244,6 +246,7 @@
   - [Crate map](reference/crate-map.md)
 
 - [Contributing](contributing/README.md)
+  - [Linking issues from PRs](contributing/issue-linking.md)
   - [Dev setup](contributing/dev-setup.md)
   - [Tests](contributing/tests.md)
   - [Adding a benchmark](contributing/benches.md)

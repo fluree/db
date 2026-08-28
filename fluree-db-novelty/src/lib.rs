@@ -1995,6 +1995,72 @@ mod tests {
         assert_eq!(slice.len(), 3);
     }
 
+    /// [`Segment::range`]'s exclusive lower bound is the third site #1711
+    /// reached, and the only one no other test in this crate covers: the
+    /// `partition_point` skips every flake the ordering calls `<= first`, so a
+    /// sibling the comparator wrongly tied with `first` was skipped along with
+    /// it. Here `first` is the `@en` flake at list position 0 and `@fr` at the
+    /// same position is its sibling — pre-fix the seek returns `[]`.
+    ///
+    /// The two in-repo callers that pass `leftmost: false` today both build a
+    /// synthetic bound with `m: None` and `t: i64::MIN`
+    /// (`fluree-db-query`'s `predicate_walk_bounds` / `overlay_walk_bounds`),
+    /// and `t` is compared before the metadata tiebreak — so this hazard is
+    /// **latent** through today's callers rather than live. It is pinned
+    /// anyway because [`Novelty::range_flakes`] is `pub` and takes an
+    /// arbitrary `first`: the seek has to be correct on its own terms, not on
+    /// its callers'.
+    ///
+    /// Deliberately one commit, so `fact_state`'s dedup (updated only *after*
+    /// the accept loop) never sees either flake. That keeps this assertion
+    /// independent of the `FactKey` / `same_identity` route the other #1711
+    /// regression tests exercise — it fails for a different reason than they do.
+    #[test]
+    fn exclusive_seek_past_a_tagged_bound_keeps_its_sibling_tag() {
+        let tagged = |lang: &str| {
+            make_flake_with_meta(
+                1,
+                1,
+                100,
+                1,
+                true,
+                Some(FlakeMeta {
+                    lang: Some(lang.to_string()),
+                    i: Some(0),
+                }),
+            )
+        };
+        let en = tagged("en");
+        let fr = tagged("fr");
+
+        let mut novelty = Novelty::new(0);
+        novelty
+            .apply_commit(vec![en.clone(), fr.clone()], 1, &no_graphs())
+            .unwrap();
+        assert_eq!(
+            novelty.len(),
+            2,
+            "both language tags must land in the segment for the seek to be the thing under test"
+        );
+
+        let ids = novelty.slice_for_range(0, IndexType::Spot, Some(&en), None, false);
+        let langs: Vec<Option<String>> = ids
+            .iter()
+            .map(|&id| {
+                novelty
+                    .get_flake(id)
+                    .m
+                    .as_ref()
+                    .and_then(|m| m.lang.clone())
+            })
+            .collect();
+        assert_eq!(
+            langs,
+            vec![Some("fr".to_string())],
+            "seeking strictly past `@en` at list position 0 must still yield its `@fr` sibling"
+        );
+    }
+
     #[test]
     fn test_clear_up_to() {
         let mut novelty = Novelty::new(0);
@@ -2234,6 +2300,42 @@ mod tests {
         assert!(
             !same_identity(&f_lo, &f_hi),
             "identity must split on differing metadata values"
+        );
+
+        // The three metas above all have `i: None`, so they only exercise the
+        // branch where the ordering consults `lang` unconditionally. Two tags
+        // at the SAME list position are the case that used to collapse:
+        // `FlakeMeta::cmp` compared `lang` only when neither side carried an
+        // index, so `{en, 0}` and `{fr, 0}` were `Equal` without being equal,
+        // and `same_identity` — which tests `cmp_meta(..) == Equal` — folded
+        // two distinct facts into one (#1711). Read the assertions above as
+        // covering this and you would be wrong; this is the case that pins it.
+        let at = |lang: &str, i: i32| FlakeMeta {
+            lang: Some(lang.to_string()),
+            i: Some(i),
+        };
+        let f_en0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("en", 0)));
+        let f_fr0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("fr", 0)));
+        let f_en1 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("en", 1)));
+        assert_eq!(
+            cmp_meta(&f_en0, &f_fr0),
+            Ordering::Less,
+            "one list position under two tags must order, not tie"
+        );
+        assert!(
+            !same_identity(&f_en0, &f_fr0),
+            "two language tags at the same list position are two facts"
+        );
+        assert_ne!(
+            IndexType::Spot.compare(&f_en0, &f_fr0),
+            Ordering::Equal,
+            "SPOT comparator must disagree when only the language tag differs"
+        );
+        // The index still dominates the tag: position orders first.
+        assert_eq!(
+            cmp_meta(&f_fr0, &f_en1),
+            Ordering::Less,
+            "list index remains the primary discriminator"
         );
 
         // `cmp_object` mixes value and datatype: equal value + differing

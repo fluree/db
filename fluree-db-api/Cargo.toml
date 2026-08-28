@@ -239,6 +239,11 @@ path = "tests/it_exists_semijoin_correlation.rs"
 name = "it_repeated_var_fast_path_guards"
 path = "tests/it_repeated_var_fast_path_guards.rs"
 
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_count_star_row_multiplicity"
+path = "tests/it_count_star_row_multiplicity.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
@@ -252,6 +257,10 @@ path = "tests/it_cyclic_bgp_novelty_pred.rs"
 [[test]]
 name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
+
+[[test]]
+name = "it_cyclic_bgp_string_dict"
+path = "tests/it_cyclic_bgp_string_dict.rs"
 
 # Own binary: asserts on a tracing event to pin that the BM25 incremental sync
 # really narrows its indexing query. Same convention and same two hazards as the
@@ -400,6 +409,14 @@ name = "transact_commit"
 harness = false
 
 [[bench]]
+name = "transact_filtered_delete"
+harness = false
+
+[[bench]]
+name = "query_overlay_only_range"
+harness = false
+
+[[bench]]
 name = "query_cold_reload"
 harness = false
 
@@ -417,6 +434,14 @@ harness = false
 
 [[bench]]
 name = "query_hot_bsbm"
+harness = false
+
+# Same-subject star with a fan-out predicate whose object var is unprojected —
+# the shape `PropertyJoinOperator`'s semijoin demotion serves. Its own fixture:
+# BSBM has no multi-valued same-subject predicate and adding one would move
+# `query_hot_bsbm`'s committed baseline for unrelated cases.
+[[bench]]
+name = "query_hot_fanout_star"
 harness = false
 
 [[bench]]
@@ -451,6 +476,11 @@ harness = false
 [[bench]]
 name = "annotation_planner"
 harness = false
+
+[[test]]
+name = "it_batched_refs_overlay_lifecycle"
+path = "tests/it_batched_refs_overlay_lifecycle.rs"
+required-features = ["native"]
 
 [[test]]
 name = "it_filtered_delete_list_meta"

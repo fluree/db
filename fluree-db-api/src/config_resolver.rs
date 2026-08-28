@@ -472,26 +472,59 @@ pub struct EffectiveShaclConfig {
     pub validation_mode: ValidationMode,
 }
 
-/// Compute effective SHACL settings from resolved config.
+/// Compute effective SHACL settings from resolved config, honoring a
+/// transaction-requested validation mode under override control.
 ///
 /// Returns `None` if no SHACL config section is present. When `None`,
 /// callers fall back to the shapes-exist heuristic (see `stage_with_config_shacl`).
 ///
-/// Override control is recognized but not actively gated — there's no
-/// transaction-time SHACL override mechanism yet. When one is added
-/// (e.g., `TxnOpts.skip_shacl`), the gate goes here.
+/// `requested_mode` is the transaction's `opts.validationMode`
+/// (`TxnOpts::validation_mode`); `server_identity` is the auth-layer-verified
+/// identity (NOT the user-settable `opts.identity`). Gating is asymmetric:
+///
+/// - **Strengthening** (config `Warn`, request `Reject`) is always honored —
+///   asking for stricter validation needs no permission.
+/// - **Softening** (config `Reject`, request `Warn`) is honored only when the
+///   SHACL group's `f:overrideControl` permits it for `server_identity`
+///   (`f:OverrideAll` — the default — permits everyone; `f:OverrideNone`
+///   denies all; an identity-restricted list checks membership). A denied
+///   request keeps the configured posture and logs a warning; it does not
+///   fail the transaction.
+///
+/// The request can never toggle `enabled` — only the failure handling of
+/// validation that config already turned on.
 pub fn merge_shacl_opts(
     resolved: &ResolvedConfig,
-    _server_identity: Option<&str>,
+    requested_mode: Option<ValidationMode>,
+    server_identity: Option<&str>,
 ) -> Option<EffectiveShaclConfig> {
     let shacl = resolved.shacl.as_ref()?;
+    let config_mode = shacl.validation_mode.unwrap_or(ValidationMode::Reject);
+    let validation_mode = match requested_mode {
+        None => config_mode,
+        Some(ValidationMode::Reject) => ValidationMode::Reject,
+        Some(ValidationMode::Warn) => {
+            if config_mode == ValidationMode::Warn
+                || shacl.override_control.permits_override(server_identity)
+            {
+                ValidationMode::Warn
+            } else {
+                tracing::warn!(
+                    server_identity,
+                    "Transaction-requested SHACL warn mode denied by config override control \
+                     — keeping configured reject posture"
+                );
+                config_mode
+            }
+        }
+    };
     Some(EffectiveShaclConfig {
         // Default `false` per docs/ledger-config/setting-groups.md — opt-in is
         // the safer posture. Prior code defaulted to `true`, silently enabling
         // SHACL for any config that declared an `f:shaclDefaults` section
         // without setting `f:shaclEnabled`, diverging from documented behavior.
         enabled: shacl.enabled.unwrap_or(false),
-        validation_mode: shacl.validation_mode.unwrap_or(ValidationMode::Reject),
+        validation_mode,
     })
 }
 
@@ -2119,6 +2152,80 @@ mod tests {
         let resolved = resolve_effective_config(&config, None);
         let r = resolved.reasoning.unwrap();
         assert_eq!(r.modes.as_deref(), Some(&["rdfs".into()][..])); // ledger-wide wins
+    }
+
+    /// Asymmetric transaction-mode gating: strengthening is free, softening
+    /// obeys the SHACL group's override control against the verified identity.
+    #[test]
+    fn merge_shacl_opts_gates_requested_mode() {
+        use fluree_db_core::ledger_config::ShaclDefaults;
+
+        let resolved_with = |control: OverrideControl| ResolvedConfig {
+            shacl: Some(ShaclDefaults {
+                enabled: Some(true),
+                shapes_source: None,
+                validation_mode: Some(ValidationMode::Reject),
+                override_control: control,
+            }),
+            ..Default::default()
+        };
+
+        // AllowAll (default): softening honored for anyone, identity or not.
+        let cfg = resolved_with(OverrideControl::AllowAll);
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Warn
+        );
+
+        // OverrideNone: softening denied, configured posture kept.
+        let cfg = resolved_with(OverrideControl::None);
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:alice"))
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
+        // ...but strengthening a Warn posture never needs permission.
+        let warn_cfg = ResolvedConfig {
+            shacl: Some(ShaclDefaults {
+                enabled: Some(true),
+                shapes_source: None,
+                validation_mode: Some(ValidationMode::Warn),
+                override_control: OverrideControl::None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_shacl_opts(&warn_cfg, Some(ValidationMode::Reject), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
+
+        // IdentityRestricted: only the listed verified identity may soften.
+        let cfg = resolved_with(OverrideControl::IdentityRestricted {
+            allowed_identities: HashSet::from([std::sync::Arc::from("did:key:remediator")]),
+        });
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:remediator"))
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Warn
+        );
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:intruder"))
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
     }
 
     #[test]
