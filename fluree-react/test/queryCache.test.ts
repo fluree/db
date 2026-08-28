@@ -670,6 +670,84 @@ describe("errors: keep-last-good-data", () => {
     });
   });
 
+  it("errors a subscription reported unchanged before it ever delivered", () => {
+    // A contract violation, not a data state: "unchanged" means "identical
+    // to what this subscription last produced", and this one has produced
+    // nothing. Unreachable through either shipped transport — but
+    // `LiveTransport` is exported, and the alternative is a component that
+    // spins forever with nothing on screen to explain it.
+    const { cache, transport } = setup();
+    const h = cache.handleFor(spec("q"));
+    const obs = observe(h);
+
+    const violate = (t: number) =>
+      transport.emit({
+        ledger: "my/ledger",
+        t,
+        changed: [],
+        unchanged: [h.subId],
+        errored: [],
+      });
+    violate(3);
+
+    const snap = h.store.getSnapshot();
+    expect(snap.status).toBe("error");
+    expect(snap.error?.code).toBe("transport-contract");
+    expect(snap.error?.message).toContain(String(h.subId));
+    expect(snap.data).toBeUndefined();
+    expect(obs.calls).toHaveLength(1);
+
+    // A transport that keeps doing it re-renders once, not once per commit —
+    // and must NOT then be "recovered" into `ready` with nothing in it.
+    violate(4);
+    violate(5);
+    expect(h.store.getSnapshot()).toBe(snap);
+    expect(obs.calls).toHaveLength(1);
+
+    // A real result still rescues it.
+    transport.emit({
+      ledger: "my/ledger",
+      t: 6,
+      changed: [{ subId: h.subId, payload: { rows: ["a"] } }],
+      unchanged: [],
+      errored: [],
+    });
+    expect(h.store.getSnapshot()).toMatchObject({
+      status: "ready",
+      data: { rows: ["a"] },
+      t: 6,
+    });
+  });
+
+  it("does not recover a handle that errored before its first result", () => {
+    // The `unchanged` recovery branch keeps the last good data. A handle
+    // whose very first fetch failed has none, so recovering it would report
+    // `ready` with `data: undefined` — a component rendering an empty
+    // success it never received.
+    const { cache, transport } = setup();
+    const h = cache.handleFor(spec("q"));
+    observe(h);
+    transport.emit({
+      ledger: "my/ledger",
+      t: 1,
+      changed: [],
+      unchanged: [],
+      errored: [{ subId: h.subId, error: { code: "http", message: "boom" } }],
+    });
+    expect(h.store.getSnapshot().status).toBe("error");
+
+    transport.emit({
+      ledger: "my/ledger",
+      t: 2,
+      changed: [],
+      unchanged: [h.subId],
+      errored: [],
+    });
+    const snap = h.store.getSnapshot();
+    expect(snap.status).toBe("error");
+    expect(snap.data).toBeUndefined();
+  });
+
   it("recovers to ready when a later cycle reports the query unchanged", () => {
     const { cache, transport } = setup();
     const h = cache.handleFor(spec("q"));

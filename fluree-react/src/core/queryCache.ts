@@ -70,6 +70,10 @@ export class QueryHandle {
   /** Grace period this handle was created with; inherited by the handle
    * that replaces it if a store outlives a collection. */
   readonly gcTime: number;
+  /** Whether this subscription has ever produced a result. `status` cannot
+   * answer that — a handle reaches `error` from `loading` without one — and
+   * two branches below need to distinguish "no news" from "no data yet". */
+  hasResult = false;
   private readonly listeners = new Set<() => void>();
   private observerCount = 0;
   private gcTimer: ReturnType<typeof setTimeout> | undefined;
@@ -312,6 +316,7 @@ export class QueryCache {
         error: undefined,
         t: cycle.t,
       };
+      handle.hasResult = true;
       dirty.push(handle);
     }
 
@@ -319,8 +324,34 @@ export class QueryCache {
       const handle = this.bySubId.get(subId);
       if (!handle) continue;
       if (this.stale(handle, cycle)) continue;
-      if (handle.state.status === "error") {
+      if (!handle.hasResult) {
+        // Contract violation. "Unchanged" means "re-evaluated at `t` and
+        // identical to what this subscription last produced" — a handle that
+        // has never produced anything has nothing for that to be true
+        // against, so a transport saying it here has lost the initial
+        // delivery. Doing nothing strands the component in `loading` for
+        // good with nothing on screen to explain it, which is precisely the
+        // silent freeze this package exists to remove; say it out loud
+        // instead. Unreachable through either shipped transport, but
+        // `LiveTransport` is exported, and this is where the next
+        // implementor finds out. A transport that repeats the violation
+        // every cycle renders it once, not once per commit.
+        const error: QueryError = {
+          code: "transport-contract",
+          message:
+            `transport reported subscription ${subId} unchanged before it ` +
+            "ever delivered a result",
+        };
+        if (handle.state.status === "error" && sameError(handle.state.error, error)) {
+          continue;
+        }
+        handle.state = { data: undefined, status: "error", error, t: undefined };
+        dirty.push(handle);
+      } else if (handle.state.status === "error") {
         // Recovery: the re-run succeeded and matched the last good data.
+        // Guarded on `hasResult` above, so there IS last good data — without
+        // it this branch could flip a never-delivered handle to `ready` with
+        // nothing in it.
         handle.state = {
           data: handle.state.data,
           status: "ready",
