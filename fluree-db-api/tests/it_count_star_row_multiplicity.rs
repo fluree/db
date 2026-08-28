@@ -295,6 +295,74 @@ struct ConstructExpect {
     distinct_blanks: usize,
 }
 
+/// ASK over the same fixture, on both lanes and both surfaces.
+///
+/// ASK carries the dedup license too — its result is a boolean read off
+/// solution-sequence emptiness, so the fan-out rows are unobservable and the
+/// planner gives it the existence-only join (the plan shape is pinned by
+/// `ask_over_a_fanout_star_plans_the_existence_only_join` in
+/// `operator_tree.rs`; a result assertion alone cannot see the license, since
+/// the boolean is identical either way). What these cases guard is that the
+/// license did not *break* ASK: emptiness must survive the dedup in both
+/// directions, on the indexed lane where the demotion actually fires.
+fn ask_cases() -> Vec<(&'static str, &'static str, bool)> {
+    vec![
+        (
+            "ASK fan-out star (matching)",
+            "ASK { ?s a ex:Gadget . ?s ex:tag ?o }",
+            true,
+        ),
+        (
+            "ASK two-object cartesian (matching)",
+            "ASK { ?s a ex:Gadget . ?s ex:tag ?o . ?s ex:code ?c }",
+            true,
+        ),
+        (
+            "ASK star with an unmatched predicate",
+            "ASK { ?s a ex:Gadget . ?s ex:missing ?m }",
+            false,
+        ),
+        // Disjoint subjects: a cartesian of two blocks whose vars are all
+        // single-use, so the licensed plan may prune every column. Emptiness
+        // must still survive the zero-column join.
+        (
+            "ASK two disjoint bound-object triples (matching)",
+            "ASK { ?s a ex:Gadget . ?w a ex:Widget }",
+            true,
+        ),
+    ]
+}
+
+/// JSON-LD twins of the ASK shapes, per the three-surface parity rule.
+fn jsonld_ask_cases() -> Vec<(&'static str, Value, bool)> {
+    let ctx = json!({"ex": "http://example.org/"});
+    vec![
+        (
+            "jsonld ask fan-out star (matching)",
+            json!({
+                "@context": ctx,
+                "ask": {"@id": "?s", "@type": "ex:Gadget", "ex:tag": "?o"}
+            }),
+            true,
+        ),
+        (
+            "jsonld ask star with an unmatched predicate",
+            json!({
+                "@context": ctx,
+                "ask": {"@id": "?s", "@type": "ex:Gadget", "ex:missing": "?m"}
+            }),
+            false,
+        ),
+    ]
+}
+
+/// Read the boolean out of a SPARQL-JSON ASK envelope.
+fn summarize_ask(results: &Value) -> Result<bool, String> {
+    results["boolean"]
+        .as_bool()
+        .ok_or_else(|| format!("no boolean in {results}"))
+}
+
 /// Count graph nodes and distinct blank-node ids in a `to_construct` result.
 fn summarize_construct(graph: &Value) -> (usize, usize) {
     let nodes = graph["@graph"]
@@ -449,6 +517,39 @@ async fn count_star_counts_joined_rows_not_distinct_subjects() {
                     "[{lane}] {name}: got {got}, expected {expected} \
                      (SPARQL twin of the same shape)"
                 ));
+            }
+        }
+
+        for (name, sparql, expected) in &ask_cases() {
+            let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
+            let q = format!("{PREFIX}{sparql}");
+            match fluree.query(&db, q.as_str()).await {
+                Ok(r) => match r.to_sparql_json(&ledger.snapshot) {
+                    Ok(json) => match summarize_ask(&json) {
+                        Ok(got) if got == *expected => {}
+                        Ok(got) => failures
+                            .push(format!("[{lane}] {name}: got {got}, expected {expected}")),
+                        Err(e) => failures.push(format!("[{lane}] {name}: {e}")),
+                    },
+                    Err(e) => failures.push(format!("[{lane}] {name}: ERR:{e}")),
+                },
+                Err(e) => failures.push(format!("[{lane}] {name}: ERR:{e}")),
+            }
+        }
+
+        for (name, query, expected) in &jsonld_ask_cases() {
+            let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
+            match fluree.query(&db, query).await {
+                Ok(r) => match r.to_sparql_json(&ledger.snapshot) {
+                    Ok(json) => match summarize_ask(&json) {
+                        Ok(got) if got == *expected => {}
+                        Ok(got) => failures
+                            .push(format!("[{lane}] {name}: got {got}, expected {expected}")),
+                        Err(e) => failures.push(format!("[{lane}] {name}: {e}")),
+                    },
+                    Err(e) => failures.push(format!("[{lane}] {name}: ERR:{e}")),
+                },
+                Err(e) => failures.push(format!("[{lane}] {name}: ERR:{e}")),
             }
         }
     }

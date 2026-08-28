@@ -3,15 +3,20 @@
 //!
 //! This is the shape `PropertyJoinOperator`'s existence-only (semijoin)
 //! demotion exists to make cheap, and the shape whose plan #1700 changed. It
-//! had no bench coverage in either direction, which is how a 6.7x CONSTRUCT
-//! regression could land and be measured only by hand:
+//! had no bench coverage in either direction, which is how the fix's own cost
+//! profile — flat for CONSTRUCT only because of a license that recovers a
+//! ~6.2x slowdown the fix would otherwise introduce (0.1464s → 0.9026s →
+//! 0.1380s at 120k pairs; the middle number is the fix without the license,
+//! not anything that ever shipped) — had to be measured by hand:
 //!
 //! * **`construct_blank_free`** — the demotion is *licensed*: a CONSTRUCT result
 //!   is an RDF graph whose serializers canonicalize, so the fan-out rows are
 //!   discarded and pruning them is free. This is the regression guard. If the
-//!   license at `execute::operator_tree::construct_result_is_multiplicity_blind`
+//!   license at `execute::operator_tree::result_is_multiplicity_blind`
 //!   is lost, this case materializes the full cartesian product to produce a
-//!   byte-identical graph and the number moves by roughly the fan-out factor.
+//!   byte-identical graph and the number moves by roughly the fan-out factor —
+//!   that is a regression against the *pre-#1700 planner*, not merely against
+//!   an intermediate state of the fix.
 //! * **`select_unprojected_object`** — the demotion is *not* licensed: SPARQL
 //!   projects a bag, so every fan-out row is an answer row. This case is
 //!   deliberately the expensive one; it is here so the cost of correctness is
