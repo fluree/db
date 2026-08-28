@@ -111,6 +111,13 @@ impl FlakeMeta {
     /// and `dt` to `Sid::max()` when the pattern has one. A new bound builder
     /// that does not pin `t` to `i64::MAX` would reach the narrowing, so do not
     /// assume this value dominates every [`FlakeMeta`].
+    ///
+    /// The six-builder pin is enforced by
+    /// `every_bound_builder_pins_the_sentinel_guard` in
+    /// `fluree-db-query/src/binary_scan.rs`, which asserts `t == i64::MAX`
+    /// and `op == true` on each builder's upper bound — this paragraph is a
+    /// pointer to that gate, not the gate itself. A new bound builder
+    /// belongs in that test's list.
     pub fn max() -> Self {
         Self {
             lang: None,
