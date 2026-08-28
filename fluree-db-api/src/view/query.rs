@@ -402,21 +402,9 @@ impl Fluree {
                     QueryInput::Sparql(_) => Tracker::disabled(),
                 };
                 charge_query_floor(&round_tracker).map_err(fluree_db_query::QueryError::from)?;
-                let plan_start = fluree_db_core::clock::Instant::now();
-                let round: Result<_> = async {
-                    let executable = self.build_executable_for_view(db, &parsed).await?;
-                    let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
-                    let exec_start = fluree_db_core::clock::Instant::now();
-                    let batches = self
-                        .execute_view_internal(db, &vars, &executable, &round_tracker, &options)
-                        .await?;
-                    Ok((
-                        batches,
-                        plan_ms,
-                        exec_start.elapsed().as_secs_f64() * 1000.0,
-                    ))
-                }
-                .await;
+                let round = self
+                    .plan_and_execute_round(db, &vars, &parsed, &round_tracker, &options)
+                    .await;
                 match round {
                     Ok(v) => break v,
                     Err(e) => {
@@ -448,23 +436,9 @@ impl Fluree {
             }
         };
         #[cfg(not(any(target_arch = "wasm32", feature = "residency")))]
-        let (batches, plan_ms, exec_ms) = {
-            // 2. Build executable with optional reasoning override
-            let plan_start = fluree_db_core::clock::Instant::now();
-            let executable = self.build_executable_for_view(db, &parsed).await?;
-            let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
-
-            // 4. Execute
-            let exec_start = fluree_db_core::clock::Instant::now();
-            let batches = self
-                .execute_view_internal(db, &vars, &executable, &tracker, &options)
-                .await?;
-            (
-                batches,
-                plan_ms,
-                exec_start.elapsed().as_secs_f64() * 1000.0,
-            )
-        };
+        let (batches, plan_ms, exec_ms) = self
+            .plan_and_execute_round(db, &vars, &parsed, &tracker, &options)
+            .await?;
 
         tracing::info!(
             parse_ms = format!("{:.2}", parse_ms),
@@ -1249,6 +1223,42 @@ impl Fluree {
     /// `f:schemaSource` (with optional `owl:imports` closure), the resolved
     /// schema bundle is attached to `options.schema_bundle` so the runner
     /// can layer it as a `SchemaBundleOverlay` at prep time.
+    /// Plan and execute one round against a given fuel tracker, returning the
+    /// batches plus the plan/exec timings.
+    ///
+    /// Both cfg arms of the query entry path call this, so they differ only
+    /// in the retry wrapper around it and cannot drift apart. That matters
+    /// more than it looks: `fluree-db-api`'s dev-dependencies enable the
+    /// `residency` feature, and under `resolver = "2"` that unifies into
+    /// every target needing dev-deps — so `cargo test -p fluree-db-api` and
+    /// every api bench compile the *residency* arm, and the production
+    /// `cfg(not(...))` arm is not built there at all. Duplicated bodies would
+    /// mean nothing in the api suite exercised what ships.
+    ///
+    /// Once per query, not per row, so the extra call is not on any hot path.
+    async fn plan_and_execute_round(
+        &self,
+        db: &GraphDb,
+        vars: &crate::VarRegistry,
+        parsed: &fluree_db_query::ir::Query,
+        tracker: &Tracker,
+        options: &QueryExecutionOptions,
+    ) -> Result<(Vec<crate::Batch>, f64, f64)> {
+        let plan_start = fluree_db_core::clock::Instant::now();
+        let executable = self.build_executable_for_view(db, parsed).await?;
+        let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+
+        let exec_start = fluree_db_core::clock::Instant::now();
+        let batches = self
+            .execute_view_internal(db, vars, &executable, tracker, options)
+            .await?;
+        Ok((
+            batches,
+            plan_ms,
+            exec_start.elapsed().as_secs_f64() * 1000.0,
+        ))
+    }
+
     pub(crate) async fn build_executable_for_view(
         &self,
         db: &GraphDb,
