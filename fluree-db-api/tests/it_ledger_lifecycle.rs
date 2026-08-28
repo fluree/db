@@ -214,7 +214,7 @@ async fn ledger_exists_on_file_storage() {
     // tombstoning nameservice so admin tooling can read the retracted
     // flag, but `exists` is a query-path question: a dropped ledger must
     // not load or serve queries, so it must not report as existing
-    // either. See 43d758610.
+    // either. See 43d758610 (#1716).
     fluree
         .drop_ledger("x", fluree_db_api::DropMode::Soft)
         .await
