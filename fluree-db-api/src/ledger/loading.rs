@@ -60,13 +60,21 @@ impl Fluree {
     /// This loads the ledger state DIRECTLY from the nameservice and storage —
     /// it does not read, populate, or lock the connection-wide ledger cache.
     /// The ledger state combines the indexed database with any uncommitted novelty transactions.
-    ///
-    /// Keep it manager-free: the cached-handle commit path calls this from
-    /// `DetachedCacheSlot::recover` while holding a ledger's state write lock,
-    /// to repair the cache after a failed commit. Routing this through the
-    /// `LedgerManager` would deadlock that path against the lock it already
-    /// holds.
     pub async fn ledger(&self, ledger_id: &str) -> Result<LedgerState> {
+        self.load_ledger_uncached(ledger_id).await
+    }
+
+    /// Load a ledger's state straight from the nameservice and storage,
+    /// touching no ledger-manager state: no cache read, no cache populate, and
+    /// — the load-bearing part — **no lock acquisition**.
+    ///
+    /// The name is the constraint: the cached-handle commit path calls this
+    /// from `DetachedCacheSlot::recover` while holding that ledger's state
+    /// write lock, to repair the cache after a failed commit. Routing this
+    /// through the `LedgerManager` (whose `get_or_load`/`reload` take that
+    /// same lock) would deadlock the transact path — and the failure mode is
+    /// a hang, not a red test. Anything added here must stay manager-free.
+    pub(crate) async fn load_ledger_uncached(&self, ledger_id: &str) -> Result<LedgerState> {
         let mut state =
             LedgerState::load(&self.nameservice_mode, ledger_id, self.backend()).await?;
         self.attach_index(&mut state).await?;
