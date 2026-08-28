@@ -353,6 +353,14 @@ impl Date {
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         self.date.signed_duration_since(epoch).num_days() as i32
     }
+
+    /// Epoch microseconds of midnight in this date's timezone (implicit UTC
+    /// when the lexical form carries none). This is the reference instant
+    /// XPath's `op:subtract-dates` compares from, so unlike
+    /// [`Self::days_since_epoch`] it keeps the timezone offset.
+    pub fn epoch_micros(&self) -> i64 {
+        self.to_instant().timestamp_micros()
+    }
 }
 
 impl PartialEq for Date {
@@ -537,6 +545,17 @@ impl Time {
     pub fn micros_since_midnight(&self) -> i64 {
         let secs = self.time.num_seconds_from_midnight() as i64;
         let nanos = self.time.nanosecond() as i64;
+        secs * 1_000_000 + nanos / 1000
+    }
+
+    /// Microseconds since midnight after normalizing to UTC — the common
+    /// reference XPath's `op:subtract-times` compares against. Unlike
+    /// [`Self::micros_since_midnight`], which keeps the local wall-clock
+    /// reading, this folds in the timezone offset.
+    pub fn utc_micros_since_midnight(&self) -> i64 {
+        let utc = self.to_utc_time();
+        let secs = utc.num_seconds_from_midnight() as i64;
+        let nanos = utc.nanosecond() as i64;
         secs * 1_000_000 + nanos / 1000
     }
 }
