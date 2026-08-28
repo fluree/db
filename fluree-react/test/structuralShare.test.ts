@@ -159,3 +159,65 @@ describe("replaceEqualDeep", () => {
     expect(twice).toBe(once);
   });
 });
+
+describe("a __proto__ key in the data", () => {
+  // `?__proto__` is a legal SPARQL variable name, a JSON-LD context can
+  // compact a term to it, and `JSON.parse` delivers it as an own enumerable
+  // property that `Object.keys` reaches — so this arrives through the front
+  // door, not through an attack. The failure it used to cause is the worst
+  // kind for this module: nothing throws, the row just quietly loses its
+  // identity forever after.
+  const parse = (text: string) => JSON.parse(text) as Record<string, unknown>;
+
+  it("keeps the binding instead of dropping it into the prototype", () => {
+    const prev = parse('{"a":1,"__proto__":{"x":1}}');
+    const next = parse('{"a":2,"__proto__":{"x":1}}');
+    const out = replaceEqualDeep(prev, next) as Record<string, unknown>;
+
+    expect(out).not.toBe(prev); // `a` really did change
+    expect(out["a"]).toBe(2);
+    expect(Object.hasOwn(out, "__proto__")).toBe(true);
+    expect(out["__proto__"]).toEqual({ x: 1 });
+  });
+
+  it("shares the unchanged __proto__ subtree by identity", () => {
+    const prev = parse('{"a":1,"__proto__":{"x":1}}');
+    const next = parse('{"a":2,"__proto__":{"x":1}}');
+    const out = replaceEqualDeep(prev, next) as Record<string, unknown>;
+    // Read the OWN property deliberately. `out["__proto__"]` would go
+    // through the inherited accessor and return the rewritten prototype,
+    // which is the exact bug — so it reports success against the code that
+    // has it.
+    const own = Object.getOwnPropertyDescriptor(out, "__proto__");
+    expect(own?.value).toBe(prev["__proto__"]);
+  });
+
+  it("leaves the result plain, so the NEXT pass still shares", () => {
+    // This is the second-order effect and the expensive one. A rewritten
+    // prototype makes `isPlainObject(prev)` false on the following cycle,
+    // which replaces the whole subtree wholesale — structural sharing dead
+    // for that branch, silently, from then on.
+    const out = replaceEqualDeep(
+      parse('{"a":1,"__proto__":{"x":1}}'),
+      parse('{"a":2,"__proto__":{"x":1}}'),
+    ) as Record<string, unknown>;
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+    expect(replaceEqualDeep(out, parse('{"a":2,"__proto__":{"x":1}}'))).toBe(out);
+  });
+
+  it("does not read the inherited accessor when the key is new", () => {
+    // `key in prev` walks the prototype chain, so a `__proto__` key
+    // appearing for the first time read `Object.prototype` as its previous
+    // value — and `Object.prototype` has a null prototype and no enumerable
+    // keys, so an empty object from the server compared equal to it and was
+    // "shared" with it. The merged data then carried the global prototype
+    // object where the result said `{}`.
+    const out = replaceEqualDeep(
+      parse('{"a":1}'),
+      parse('{"a":1,"__proto__":{}}'),
+    ) as Record<string, unknown>;
+    expect(Object.hasOwn(out, "__proto__")).toBe(true);
+    expect(out["__proto__"]).not.toBe(Object.prototype);
+    expect(out["__proto__"]).toEqual({});
+  });
+});
