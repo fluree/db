@@ -188,12 +188,12 @@ async fn string_literals_match_by_term_identity_in_novelty_and_index() {
         .await;
 }
 
-/// The rest of the string dictionary. `xsd:string` and `rdf:langString` are the
-/// only string datatypes with a reserved `DatatypeDictId`, so an indexed read
-/// used to decode `"abc"^^xsd:anyURI`, `"abc"^^xsd:token` and `"abc"^^ex:custom`
-/// onto `xsd:string`: `DATATYPE()` reported the wrong IRI, `FILTER(?x = ?y)`
-/// called all four literals equal, and a self-join swapped each one's identity
-/// row for a pairing with the plain string (#1729).
+/// The rest of the string dictionary. `xsd:string`, `rdf:langString` and
+/// `@fulltext` are the only string datatypes with a reserved `DatatypeDictId`,
+/// so an indexed read used to decode `"abc"^^xsd:anyURI`, `"abc"^^xsd:token`
+/// and `"abc"^^ex:custom` onto `xsd:string`: `DATATYPE()` reported the wrong
+/// IRI, `FILTER(?x = ?y)` called all four literals equal, and a self-join
+/// swapped each one's identity row for a pairing with the plain string (#1729).
 ///
 /// Both a standard XSD subtype and a customer-defined datatype are pinned, on
 /// both surfaces, and in all three lanes — novelty-only, index-only, and
@@ -330,6 +330,21 @@ async fn string_dict_datatypes_keep_their_identity_in_novelty_and_index() {
                             .unwrap();
                     assert_eq!(got, json!([expected]), "{phase}: json-ld @type {dt}");
                 }
+                // A bare JSON string in the constant-object position stays
+                // lenient across the whole string family — unchanged here, and
+                // a product decision like the numeric one above.
+                let mut plain = query_jsonld_formatted(&fluree, &view, &jl(json!("abc")))
+                    .await
+                    .unwrap();
+                plain
+                    .as_array_mut()
+                    .unwrap()
+                    .sort_by_key(std::string::ToString::to_string);
+                assert_eq!(
+                    plain,
+                    json!(["ex:s1", "ex:s2", "ex:s3", "ex:s4"]),
+                    "{phase}: json-ld plain string stays lenient"
+                );
                 let mut got = query_jsonld_formatted(
                     &fluree,
                     &view,
