@@ -2062,6 +2062,7 @@ mod tests {
             provider.clone() as std::sync::Arc<dyn fluree_db_core::RangeProvider>
         );
         let indexed = IndexStats {
+            historical_since_t: None,
             flakes: 1,
             size: 0,
             properties: Some(Vec::new()),
@@ -2426,6 +2427,7 @@ mod tests {
         let (snapshot, _, provider) =
             reconciling_snapshot(vec![string_flake(&s, &p, "a", 1, true, None)]);
         let indexed = IndexStats {
+            historical_since_t: None,
             flakes: 1,
             size: 0,
             properties: Some(vec![PropertyStatEntry {
@@ -2435,6 +2437,8 @@ mod tests {
                 ndv_subjects: 1,
                 last_modified_t: 1,
                 datatypes: vec![(ValueTypeTag::STRING.as_u8(), 1)],
+                observed_datatypes: vec![ValueTypeTag::STRING.as_u8()],
+                historical_datatypes: vec![],
             }]),
             classes: None,
             graphs: None,
@@ -2485,6 +2489,7 @@ mod tests {
     /// Indexed stats for a base holding `alice ex:name "n"` under `classes`.
     fn indexed_with_classes(classes: Option<Vec<ClassStatEntry>>) -> IndexStats {
         IndexStats {
+            historical_since_t: None,
             flakes: 1,
             size: 0,
             properties: Some(vec![PropertyStatEntry {
@@ -2494,6 +2499,8 @@ mod tests {
                 ndv_subjects: 1,
                 last_modified_t: 1,
                 datatypes: vec![(ValueTypeTag::STRING.as_u8(), 1)],
+                observed_datatypes: vec![ValueTypeTag::STRING.as_u8()],
+                historical_datatypes: vec![],
             }]),
             classes: classes.clone(),
             graphs: Some(vec![GraphStatsEntry {
