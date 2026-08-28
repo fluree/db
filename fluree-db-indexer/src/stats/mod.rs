@@ -110,6 +110,7 @@ where
         ndv_subjects: u64,
         last_modified_t: i64,
         datatypes: Vec<(u8, u64)>,
+        historical_datatypes: Vec<u8>,
     }
 
     let mut agg: std::collections::HashMap<u32, PropAgg> = std::collections::HashMap::new();
@@ -121,11 +122,14 @@ where
                 ndv_subjects: 0,
                 last_modified_t: 0,
                 datatypes: Vec::new(),
+                historical_datatypes: Vec::new(),
             });
             e.count += p.count;
             e.ndv_values = e.ndv_values.max(p.ndv_values);
             e.ndv_subjects = e.ndv_subjects.max(p.ndv_subjects);
             e.last_modified_t = e.last_modified_t.max(p.last_modified_t);
+            e.historical_datatypes
+                .extend_from_slice(&p.historical_datatypes);
             for &(dt, cnt) in &p.datatypes {
                 if let Some(existing) = e.datatypes.iter_mut().find(|(d, _)| *d == dt) {
                     existing.1 += cnt;
@@ -137,8 +141,10 @@ where
     }
 
     agg.into_iter()
-        .map(|(p_id, pa)| {
+        .map(|(p_id, mut pa)| {
             let (ns, name) = resolve_predicate_sid(p_id);
+            pa.historical_datatypes.sort_unstable();
+            pa.historical_datatypes.dedup();
             PropertyStatEntry {
                 sid: (ns, name),
                 count: pa.count,
@@ -146,6 +152,7 @@ where
                 ndv_subjects: pa.ndv_subjects,
                 last_modified_t: pa.last_modified_t,
                 observed_datatypes: PropertyStatEntry::tags_of(&pa.datatypes),
+                historical_datatypes: pa.historical_datatypes,
                 datatypes: pa.datatypes,
             }
         })
@@ -229,7 +236,7 @@ mod tests {
     fn aggregate_carries_the_observed_datatype_tags_across_graphs() {
         use fluree_db_core::{GraphPropertyStatEntry, GraphStatsEntry};
 
-        let graph = |g_id, datatypes: Vec<(u8, u64)>| GraphStatsEntry {
+        let graph = |g_id, datatypes: Vec<(u8, u64)>, historical: Vec<u8>| GraphStatsEntry {
             g_id,
             flakes: 1,
             size: 10,
@@ -239,14 +246,22 @@ mod tests {
                 ndv_values: 1,
                 ndv_subjects: 1,
                 last_modified_t: 1,
+                observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
+                historical_datatypes: historical,
                 datatypes,
             }],
             classes: None,
         };
         // Tag 1 in one graph, tag 3 in another: the roll-up has to end up with
         // both, so the fold's "does this predicate carry literals?" question is
-        // answered over the whole ledger and not one graph of it.
-        let graphs = vec![graph(0, vec![(1, 2)]), graph(1, vec![(3, 5)])];
+        // answered over the whole ledger and not one graph of it. The
+        // historical sets carry a tag (9) that no current count mentions —
+        // a literal deleted in some earlier window — and the roll-up must
+        // keep it, or a time-travel read loses its coverage.
+        let graphs = vec![
+            graph(0, vec![(1, 2)], vec![1, 9]),
+            graph(1, vec![(3, 5)], vec![3]),
+        ];
 
         let entries = aggregate_property_entries_by_sid(&graphs, |p_id| (10, format!("p{p_id}")));
 
@@ -262,6 +277,11 @@ mod tests {
             entry.observed_datatypes,
             PropertyStatEntry::tags_of(&entry.datatypes),
             "the tag set and the breakdown it summarizes disagree"
+        );
+        assert_eq!(
+            entry.historical_datatypes,
+            vec![1, 3, 9],
+            "the roll-up lost a historical tag its current counts no longer mention"
         );
     }
 }

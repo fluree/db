@@ -53,9 +53,11 @@ pub struct StatsView {
     /// so a predicate whose literals were legitimately deleted before that
     /// publish carries no literal tag, and a query at an earlier `t` — which
     /// can still see those literals — would read `true`. A builder serving a
-    /// read below the published index `t` has to clear `observed_datatypes`
-    /// first so the flag falls back to "unknown"; `fluree-db-query`'s
-    /// `cached_stats_view_for_db` is the one that does.
+    /// read below the published index `t` has to substitute the persisted
+    /// `historical_datatypes` set (sound for every `t` at or above
+    /// `IndexStats::historical_since_t`) for `observed_datatypes` first — or,
+    /// below that boundary, clear it so the flag falls back to "unknown";
+    /// `fluree-db-query`'s `cached_stats_view_for_db` is the one that does.
     pub property_ref_only: HashMap<Sid, bool>,
     /// Property IRI -> ref-only flag (see [`Self::property_ref_only`]).
     pub property_ref_only_by_iri: HashMap<Arc<str>, bool>,
@@ -86,8 +88,18 @@ pub struct GraphPropertyStatData {
     pub ndv_values: u64,
     /// Estimated number of distinct subjects using this property (from HLL)
     pub ndv_subjects: u64,
-    /// Per-datatype flake counts
+    /// Per-datatype flake counts. Estimates: on the query path these are
+    /// novelty-merged as a blind ±1 delta log, so a spurious retraction can
+    /// drop a tag whose data still exists. Sum them; never read them as a set.
     pub datatypes: Vec<(ValueTypeTag, u64)>,
+    /// The datatype tags this property carries in this graph — the set
+    /// consumers must read instead of `datatypes` when the answer gates a
+    /// rewrite (scan narrowing to an exact datatype). Sourced from
+    /// [`crate::index_stats::GraphPropertyStatEntry::observed_datatypes`],
+    /// which is monotone under retraction within the novelty window and
+    /// substituted with the historical set (or cleared) for reads below the
+    /// published index `t`. Empty means "unknown": fail closed.
+    pub observed_datatypes: Vec<ValueTypeTag>,
 }
 
 /// Statistics for a single property.
@@ -136,6 +148,7 @@ impl StatsView {
                         size_of::<RuntimePredicateId>()
                             + size_of::<GraphPropertyStatData>()
                             + data.datatypes.len() * size_of::<(ValueTypeTag, u64)>()
+                            + data.observed_datatypes.len() * size_of::<ValueTypeTag>()
                     })
                     .sum::<usize>()
             })
@@ -217,6 +230,11 @@ impl StatsView {
                                 .datatypes
                                 .iter()
                                 .map(|&(dt, c)| (ValueTypeTag::from_u8(dt), c))
+                                .collect(),
+                            observed_datatypes: p_entry
+                                .observed_datatypes
+                                .iter()
+                                .map(|&dt| ValueTypeTag::from_u8(dt))
                                 .collect(),
                         },
                     );
@@ -591,9 +609,11 @@ mod tests {
                 last_modified_t: 1,
                 datatypes,
                 observed_datatypes,
+                historical_datatypes: vec![],
             }]),
             classes: None,
             graphs: None,
+            historical_since_t: None,
         }
     }
 
@@ -638,6 +658,7 @@ mod tests {
             properties: None,
             classes: None,
             graphs: None,
+            historical_since_t: None,
         };
         let view = StatsView::from_db_stats(&stats);
         assert!(!view.has_property_stats());
@@ -657,9 +678,11 @@ mod tests {
                 last_modified_t: 10,
                 datatypes: vec![],
                 observed_datatypes: vec![],
+                historical_datatypes: vec![],
             }]),
             classes: None,
             graphs: None,
+            historical_since_t: None,
         };
         let view = StatsView::from_db_stats(&stats);
         assert!(view.has_property_stats());
@@ -1002,6 +1025,7 @@ mod tests {
                 properties: vec![],
             }]),
             graphs: None,
+            historical_since_t: None,
         };
         let view = StatsView::from_db_stats(&stats);
         assert!(view.has_class_stats());

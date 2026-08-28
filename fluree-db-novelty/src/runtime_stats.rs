@@ -418,6 +418,8 @@ fn get_or_insert_graph_property(
         ndv_subjects: 0,
         last_modified_t: 0,
         datatypes: Vec::new(),
+        observed_datatypes: Vec::new(),
+        historical_datatypes: Vec::new(),
     });
     graph_entry.properties.last_mut().expect("just inserted")
 }
@@ -465,11 +467,18 @@ fn update_graph_property_datatypes(
     flake: &Flake,
     delta: i64,
 ) {
-    increment_count(
-        &mut prop_entry.datatypes,
-        runtime_datatype_tag(flake),
-        delta,
-    );
+    let tag = runtime_datatype_tag(flake);
+    increment_count(&mut prop_entry.datatypes, tag, delta);
+    // The graph-scoped twin of the aggregate lane's `asserted_datatypes`
+    // (#1738): the counts above are a blind ±1 delta log, so the *set* a
+    // consumer may license a rewrite on is maintained separately — assertions
+    // only ever add to it, so no retraction, spurious or not, can take a tag
+    // away. `historical_datatypes` is deliberately not touched here: the
+    // runtime merge's output is never consulted below the index `t`, and the
+    // historical sets are owned by the build pipelines and decoders.
+    if flake.op {
+        note_observed_tag(&mut prop_entry.observed_datatypes, tag);
+    }
 }
 
 fn update_class_property_usage(
@@ -501,6 +510,13 @@ fn runtime_datatype_tag(flake: &Flake) -> u8 {
         ValueTypeTag::JSON_LD_ID.as_u8()
     } else {
         ValueTypeTag::from_ns_name(flake.dt.namespace_code, &flake.dt.name).as_u8()
+    }
+}
+
+/// Insert `tag` into a sorted, deduplicated tag set.
+fn note_observed_tag(tags: &mut Vec<u8>, tag: u8) {
+    if let Err(idx) = tags.binary_search(&tag) {
+        tags.insert(idx, tag);
     }
 }
 
@@ -717,6 +733,12 @@ fn finalize_stats(
                     last_modified_t: indexed_entry.map(|e| e.last_modified_t).unwrap_or(0),
                     datatypes,
                     observed_datatypes,
+                    // Owned by the build pipelines: the runtime merge's output
+                    // is never consulted below the index `t`, so the base's
+                    // set passes through untouched.
+                    historical_datatypes: indexed_entry
+                        .map(|e| e.historical_datatypes.clone())
+                        .unwrap_or_default(),
                 }
             })
             .collect();
@@ -768,6 +790,7 @@ fn finalize_stats(
         properties,
         classes,
         graphs: indexed.graphs.clone(),
+        historical_since_t: indexed.historical_since_t,
     }
 }
 
@@ -827,10 +850,12 @@ mod tests {
                 ndv_subjects: 6,
                 last_modified_t: 1,
                 observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
+                historical_datatypes: vec![],
                 datatypes,
             }]),
             classes: None,
             graphs: None,
+            historical_since_t: None,
         }
     }
 
@@ -908,10 +933,12 @@ mod tests {
                 ndv_subjects: 5,
                 last_modified_t: 1,
                 observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
+                historical_datatypes: vec![],
                 datatypes,
             }]),
             classes: None,
             graphs: None,
+            historical_since_t: None,
         };
         assert_eq!(
             fluree_db_core::StatsView::from_db_stats(&indexed).is_property_ref_only(&p),
@@ -1024,6 +1051,7 @@ mod tests {
             properties: None,
             classes: None,
             graphs: None,
+            historical_since_t: None,
         };
         let alice = sid(10, "alice");
         let bob = sid(10, "bob");
@@ -1107,6 +1135,7 @@ mod tests {
                 last_modified_t: 1,
                 datatypes: vec![],
                 observed_datatypes: vec![],
+                historical_datatypes: vec![],
             }]),
             classes: None,
             graphs: Some(vec![GraphStatsEntry {
@@ -1116,6 +1145,7 @@ mod tests {
                 properties: vec![],
                 classes: Some(vec![]),
             }]),
+            historical_since_t: None,
         };
         let snapshot = LedgerSnapshot::genesis("test:main");
         let mut novelty = Novelty::new(1);
@@ -1174,6 +1204,7 @@ mod tests {
                     properties: Vec::new(),
                 }]),
             }]),
+            historical_since_t: None,
         };
         let snapshot = LedgerSnapshot::genesis("test:main");
         let mut novelty = Novelty::new(1);

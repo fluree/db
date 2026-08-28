@@ -6715,6 +6715,11 @@ where
                 properties: Some(properties),
                 classes: None,
                 graphs: Some(graphs),
+                // An import replays its entire input as the ledger's full
+                // history, so the stats hook has observed the tag of every
+                // record at every `t` — historical coverage is complete from
+                // genesis.
+                historical_since_t: Some(0),
             };
             // Wire `total_commit_size` into `stats.size` and per-graph sizes,
             // mirroring `root_assembly::compose_root_v6` for the normal indexing
