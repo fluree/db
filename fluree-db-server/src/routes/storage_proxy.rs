@@ -337,6 +337,22 @@ fn parse_range_header(headers: &HeaderMap) -> Option<std::ops::Range<u64>> {
 /// will relax this to `public` for ledgers that opt in.
 const OBJECT_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
 
+/// Paired with [`OBJECT_CACHE_CONTROL`], and load-bearing rather than
+/// decorative.
+///
+/// `private` keeps these bodies out of shared caches, but the browser's own
+/// cache is per *profile*, not per principal — and `immutable` means it never
+/// revalidates. Without the token in the cache key, principal A reading a
+/// ledger leaves entries that principal B, on the same browser profile, is
+/// served directly: the server never sees B's token and never gets to refuse
+/// it. `Vary` puts `Authorization` in that key, so a different token is a
+/// different entry.
+///
+/// The nameservice routes do not need this: [`NS_CACHE_CONTROL`] is
+/// `no-cache`, so every use revalidates and authorization re-runs on the
+/// server before anything is served.
+const OBJECT_VARY: &str = "Authorization";
+
 /// Cache policy for nameservice records: mutable state, so require
 /// revalidation — paired with the `ETag` this makes head polling a cheap
 /// 304 round-trip. `private` keeps shared caches from storing per-URL
@@ -827,6 +843,7 @@ pub async fn get_object_by_cid(
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, &etag)
             .header(header::CACHE_CONTROL, OBJECT_CACHE_CONTROL)
+            .header(header::VARY, OBJECT_VARY)
             .body(Body::empty())
             .map_err(|e| ServerError::internal(e.to_string()));
     }
@@ -876,6 +893,7 @@ pub async fn get_object_by_cid(
             .header("X-Fluree-Content-Kind", kind_label)
             .header(header::ETAG, &etag)
             .header(header::CACHE_CONTROL, OBJECT_CACHE_CONTROL)
+            .header(header::VARY, OBJECT_VARY)
             .header(
                 header::CONTENT_RANGE,
                 format!("bytes {}-{}/{total}", range.start, end - 1),
@@ -890,6 +908,7 @@ pub async fn get_object_by_cid(
         .header("X-Fluree-Content-Kind", kind_label)
         .header(header::ETAG, &etag)
         .header(header::CACHE_CONTROL, OBJECT_CACHE_CONTROL)
+        .header(header::VARY, OBJECT_VARY)
         .body(Body::from(bytes))
         .map_err(|e| ServerError::internal(e.to_string()))
 }
