@@ -207,19 +207,7 @@ fn assemble_fast_stats_inner(
         return indexed.clone();
     }
 
-    let mut property_counts = build_property_counts(indexed);
-    // Per-predicate (Sid) datatype deltas from novelty, so the aggregate
-    // `PropertyStatEntry.datatypes` breakdown reflects novelty and not just the
-    // index. These are estimates: novelty is read as a blind ±1 delta log with
-    // no probe of the base index, so a retraction of a fact that was never
-    // asserted charges a `-1` against a tag it does not own.
-    let mut property_datatype_deltas: HashMap<(u16, String), HashMap<u8, i64>> = HashMap::new();
-    // The tags novelty ASSERTED, per predicate. Unioned with the base index's
-    // tags this gives `PropertyStatEntry::observed_datatypes`, which is what the
-    // equijoin-filter fold's node-only soundness guard reads. Assertions only
-    // ever add to it, so no retraction — spurious or not — can take a literal
-    // tag away and make a mixed predicate read as all-ref.
-    let mut property_asserted_datatypes: HashMap<(u16, String), HashSet<u8>> = HashMap::new();
+    let mut property_deltas = build_property_deltas(indexed);
     let mut class_data = build_class_data(indexed);
     let mut graphs = indexed.graphs.clone().unwrap_or_default();
     let mut graph_index: HashMap<GraphId, usize> = graphs
@@ -267,20 +255,15 @@ fn assemble_fast_stats_inner(
             continue;
         }
 
-        let sid_key = (flake.p.namespace_code, flake.p.name.to_string());
         let datatype_tag = runtime_datatype_tag(flake);
-        *property_counts.entry(sid_key.clone()).or_insert(0) += delta;
+        let property = property_deltas
+            .entry((flake.p.namespace_code, &*flake.p.name))
+            .or_default();
+        property.count += delta;
         if flake.op {
-            property_asserted_datatypes
-                .entry(sid_key.clone())
-                .or_default()
-                .insert(datatype_tag);
+            property.asserted_datatypes.insert(datatype_tag);
         }
-        *property_datatype_deltas
-            .entry(sid_key)
-            .or_default()
-            .entry(datatype_tag)
-            .or_insert(0) += delta;
+        *property.datatype_deltas.entry(datatype_tag).or_insert(0) += delta;
 
         if let Some(stats_lookup) = lookup {
             if let Some(p_id) = stats_lookup.runtime_predicate_id_for_sid(&flake.p) {
@@ -307,13 +290,7 @@ fn assemble_fast_stats_inner(
         }
     }
 
-    let mut stats = finalize_stats(
-        indexed,
-        property_counts,
-        property_datatype_deltas,
-        property_asserted_datatypes,
-        class_data,
-    );
+    let mut stats = finalize_stats(indexed, property_deltas, class_data);
     stats.flakes = (indexed.flakes as i64 + flakes_delta).max(0) as u64;
     stats.size = indexed.size + novelty.size as u64;
     if !graphs.is_empty() {
@@ -566,16 +543,48 @@ fn increment_ref_class(entries: &mut Vec<ClassRefCount>, class_sid: &Sid, delta:
     entries.retain(|entry| entry.count > 0);
 }
 
-type PropertyCountMap = HashMap<(u16, String), i64>;
+/// Everything the novelty walk accumulates per predicate, in one entry.
+///
+/// The three quantities below are keyed by the same `(namespace_code, name)`
+/// pair, so keeping them in three maps cost three key constructions — three
+/// heap allocations, when the key owned its name — for every flake in the
+/// window. The walk covers the whole novelty window on every stats-cache
+/// rebuild (once per overlay epoch), so it is worth keying once. Borrowing the
+/// name from the flake (or from the index entry that seeded it) drops that to
+/// zero allocations per flake; the owned `String` the wire format wants is
+/// built once per distinct predicate in [`finalize_stats`].
+#[derive(Debug, Default)]
+struct PropertyStatDelta {
+    /// Index count, then novelty's ±1 per flake.
+    count: i64,
+    /// Per-datatype ±1 from novelty, so the aggregate `datatypes` breakdown
+    /// tracks novelty rather than the index alone. Estimates only — see
+    /// [`merge_property_datatypes`].
+    datatype_deltas: HashMap<u8, i64>,
+    /// The tags novelty **asserted**. Unioned with the base index's tags this
+    /// gives `PropertyStatEntry::observed_datatypes`, which is what the
+    /// equijoin-filter fold's node-only soundness guard reads. Assertions only
+    /// ever add to it, so no retraction — spurious or not — can take a literal
+    /// tag away and make a mixed predicate read as all-ref.
+    asserted_datatypes: HashSet<u8>,
+}
 
-fn build_property_counts(indexed: &IndexStats) -> PropertyCountMap {
-    let mut counts = HashMap::new();
+type PropertyDeltaMap<'a> = HashMap<(u16, &'a str), PropertyStatDelta>;
+
+fn build_property_deltas(indexed: &IndexStats) -> PropertyDeltaMap<'_> {
+    let mut deltas = PropertyDeltaMap::new();
     if let Some(ref props) = indexed.properties {
         for entry in props {
-            counts.insert(entry.sid.clone(), entry.count as i64);
+            deltas.insert(
+                (entry.sid.0, entry.sid.1.as_str()),
+                PropertyStatDelta {
+                    count: entry.count as i64,
+                    ..PropertyStatDelta::default()
+                },
+            );
         }
     }
-    counts
+    deltas
 }
 
 #[derive(Debug, Default)]
@@ -624,15 +633,10 @@ fn build_class_data(indexed: &IndexStats) -> HashMap<Sid, ClassDataMut> {
 /// base index never held still charges its `-1`, so a tag can vanish while the
 /// data it described is still there. Read [`union_observed_datatypes`] instead
 /// of this if you need the *set* of datatypes a property carries.
-fn merge_property_datatypes(
-    index: &[(u8, u64)],
-    deltas: Option<&HashMap<u8, i64>>,
-) -> Vec<(u8, u64)> {
+fn merge_property_datatypes(index: &[(u8, u64)], deltas: &HashMap<u8, i64>) -> Vec<(u8, u64)> {
     let mut merged: HashMap<u8, i64> = index.iter().map(|&(t, c)| (t, c as i64)).collect();
-    if let Some(deltas) = deltas {
-        for (&tag, &d) in deltas {
-            *merged.entry(tag).or_insert(0) += d;
-        }
+    for (&tag, &d) in deltas {
+        *merged.entry(tag).or_insert(0) += d;
     }
     let mut out: Vec<(u8, u64)> = merged
         .into_iter()
@@ -655,11 +659,9 @@ fn merge_property_datatypes(
 /// only ever be conservative: after legitimately deleting every literal under a
 /// predicate the fold stays declined until the next index publish reissues the
 /// base tag set without it.
-fn union_observed_datatypes(base: &[u8], asserted: Option<&HashSet<u8>>) -> Vec<u8> {
+fn union_observed_datatypes(base: &[u8], asserted: &HashSet<u8>) -> Vec<u8> {
     let mut tags: Vec<u8> = base.to_vec();
-    if let Some(asserted) = asserted {
-        tags.extend(asserted.iter().copied());
-    }
+    tags.extend(asserted.iter().copied());
     tags.sort_unstable();
     tags.dedup();
     tags
@@ -667,40 +669,43 @@ fn union_observed_datatypes(base: &[u8], asserted: Option<&HashSet<u8>>) -> Vec<
 
 fn finalize_stats(
     indexed: &IndexStats,
-    property_counts: PropertyCountMap,
-    property_datatype_deltas: HashMap<(u16, String), HashMap<u8, i64>>,
-    property_asserted_datatypes: HashMap<(u16, String), HashSet<u8>>,
+    property_deltas: PropertyDeltaMap<'_>,
     class_data: HashMap<Sid, ClassDataMut>,
 ) -> IndexStats {
-    let properties = if property_counts.is_empty() {
+    let properties = if property_deltas.is_empty() {
         indexed.properties.clone()
     } else {
-        let indexed_props: HashMap<(u16, String), &PropertyStatEntry> = indexed
+        let indexed_props: HashMap<(u16, &str), &PropertyStatEntry> = indexed
             .properties
             .as_ref()
-            .map(|props| props.iter().map(|p| (p.sid.clone(), p)).collect())
+            .map(|props| {
+                props
+                    .iter()
+                    .map(|p| ((p.sid.0, p.sid.1.as_str()), p))
+                    .collect()
+            })
             .unwrap_or_default();
 
-        let mut entries: Vec<_> = property_counts.into_iter().collect();
+        let mut entries: Vec<_> = property_deltas.into_iter().collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         let props: Vec<PropertyStatEntry> = entries
             .into_iter()
-            .filter(|(_, count)| *count > 0)
-            .map(|(sid, count)| {
+            .filter(|(_, delta)| delta.count > 0)
+            .map(|(sid, delta)| {
                 let indexed_entry = indexed_props.get(&sid);
                 let datatypes = merge_property_datatypes(
                     indexed_entry.map(|e| e.datatypes.as_slice()).unwrap_or(&[]),
-                    property_datatype_deltas.get(&sid),
+                    &delta.datatype_deltas,
                 );
                 let observed_datatypes = union_observed_datatypes(
                     indexed_entry
                         .map(|e| e.observed_datatypes.as_slice())
                         .unwrap_or(&[]),
-                    property_asserted_datatypes.get(&sid),
+                    &delta.asserted_datatypes,
                 );
                 PropertyStatEntry {
-                    sid,
-                    count: count.max(0) as u64,
+                    sid: (sid.0, sid.1.to_string()),
+                    count: delta.count.max(0) as u64,
                     ndv_values: indexed_entry.map(|e| e.ndv_values).unwrap_or(0),
                     ndv_subjects: indexed_entry.map(|e| e.ndv_subjects).unwrap_or(0),
                     last_modified_t: indexed_entry.map(|e| e.last_modified_t).unwrap_or(0),
