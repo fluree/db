@@ -94,6 +94,11 @@ struct ClassMembershipCtx<'a> {
     /// over a namespace the in-flight transaction introduced matches its
     /// staged data; `None` falls back to the data snapshot's registry.
     iri_encoder: Option<&'a (dyn fluree_db_query::parse::IriEncoder + Sync)>,
+    /// Cooperative cancellation for `sh:sparql` constraint queries. Carries
+    /// the request deadline AND the per-query memory ceiling — the ceiling is
+    /// only installed when a cancellation is present, so without one a
+    /// constraint body runs unbounded. `None` outside a request scope.
+    cancellation: Option<&'a fluree_db_core::QueryCancellation>,
 }
 
 /// SHACL validation engine
@@ -116,6 +121,9 @@ pub struct ShaclEngine {
     membership_g_ids: Vec<GraphId>,
     /// Per-transaction memo of resolved `sh:class` membership verdicts.
     class_cache: ClassMembershipCache,
+    /// Cooperative cancellation handed to `sh:sparql` constraint queries.
+    /// See [`ShaclEngine::with_cancellation`].
+    cancellation: Option<fluree_db_core::QueryCancellation>,
 }
 
 impl ShaclEngine {
@@ -128,6 +136,7 @@ impl ShaclEngine {
             hierarchy: None,
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
+            cancellation: None,
         }
     }
 
@@ -141,6 +150,7 @@ impl ShaclEngine {
             hierarchy: Some(hierarchy),
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
+            cancellation: None,
         }
     }
 
@@ -154,6 +164,7 @@ impl ShaclEngine {
             hierarchy,
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
+            cancellation: None,
         }
     }
 
@@ -223,6 +234,7 @@ impl ShaclEngine {
             hierarchy,
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
+            cancellation: None,
         })
     }
 
@@ -233,6 +245,25 @@ impl ShaclEngine {
     /// data lives in a different graph.
     pub fn with_membership_graphs(mut self, g_ids: Vec<GraphId>) -> Self {
         self.membership_g_ids = g_ids;
+        self
+    }
+
+    /// Attach the request's cooperative cancellation handle, bounding
+    /// `sh:sparql` constraint queries.
+    ///
+    /// `sh:sparql` is the first SHACL construct whose reach is not
+    /// structurally limited to the focus node: pre-binding `$this` constrains
+    /// where the query STARTS, not how much of the graph its body walks. A
+    /// constraint runs once per focus node, so without a handle here a single
+    /// validation pass has no deadline and — because
+    /// `execute_prepared_into` installs the per-query memory ceiling only
+    /// when a cancellation is present — no memory ceiling either.
+    ///
+    /// Callers inside a request scope should always set this. Fuel is carried
+    /// separately, on the `GraphDbRef`'s tracker.
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = Some(cancellation);
         self
     }
 
@@ -346,6 +377,7 @@ impl ShaclEngine {
             cross_ledger,
             hierarchy: self.hierarchy.as_ref(),
             iri_encoder,
+            cancellation: self.cancellation.as_ref(),
         };
         let active = ActiveShapeChecks::default();
         for shape in applicable_shapes {
@@ -416,6 +448,7 @@ impl ShaclEngine {
             cross_ledger,
             hierarchy: self.hierarchy.as_ref(),
             iri_encoder,
+            cancellation: self.cancellation.as_ref(),
         };
         // Class-target focus nodes are constant across the shape loop (same
         // `db`, same hierarchy), so memoize them per class: several shapes
@@ -790,7 +823,10 @@ fn validate_shape<'a>(
                 None,
                 shape.severity,
                 &shape.id,
-                class_ctx.and_then(|c| c.iri_encoder),
+                crate::sparql::SparqlConstraintCtx {
+                    iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
+                    cancellation: class_ctx.and_then(|c| c.cancellation),
+                },
             )
             .await?;
             results.extend(sparql_results);
@@ -1789,7 +1825,10 @@ async fn validate_property_shape<'a>(
                 prop_shape.path.as_predicate(),
                 prop_shape.severity,
                 &prop_shape.id,
-                class_ctx.and_then(|c| c.iri_encoder),
+                crate::sparql::SparqlConstraintCtx {
+                    iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
+                    cancellation: class_ctx.and_then(|c| c.cancellation),
+                },
             )
             .await?,
         );

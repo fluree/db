@@ -64,7 +64,6 @@ pub struct SparqlConstraint {
     pub deactivated: bool,
     /// The query references `$PATH` — valid only on a property shape with a
     /// plain predicate path, bound at validation time like `$this`.
-    pub uses_path: bool,
     /// Parse + pre-binding-restriction outcome. `Err` is raised as a
     /// validation *failure* (an engine error) when the owning shape fires.
     pub parsed: std::result::Result<Arc<SparqlAst>, String>,
@@ -81,7 +80,6 @@ pub(crate) fn build_constraint(
     messages: Vec<String>,
     deactivated: bool,
 ) -> SparqlConstraint {
-    let uses_path = select.contains("$PATH") || select.contains("?PATH");
     let query_text = if prefix_header.is_empty() {
         select.to_string()
     } else {
@@ -94,7 +92,6 @@ pub(crate) fn build_constraint(
         query_text,
         messages,
         deactivated,
-        uses_path,
         parsed,
     }
 }
@@ -112,7 +109,6 @@ pub(crate) fn invalid_constraint(
         query_text: String::new(),
         messages,
         deactivated,
-        uses_path: false,
         parsed: Err(error),
     }
 }
@@ -410,6 +406,20 @@ fn materialize_binding(
 /// transaction introduced matches its staged data. Either way, an IRI whose
 /// namespace the ledger has never seen lowers to a never-matching Sid: a
 /// constraint over vocabulary with no data is silently inert, never an error.
+/// The two per-request inputs a constraint query needs beyond the shape
+/// itself: how IRIs lower, and what bounds the query.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SparqlConstraintCtx<'a> {
+    /// Lowering-time IRI resolver override. Staging passes the staged
+    /// namespace registry so a constraint over a namespace the in-flight
+    /// transaction introduced matches its staged data; `None` falls back to
+    /// the data snapshot's registry.
+    pub iri_encoder: Option<&'a (dyn fluree_db_query::parse::IriEncoder + Sync)>,
+    /// Request deadline and per-query memory ceiling. `None` leaves the
+    /// constraint body unbounded — see [`crate::ShaclEngine::with_cancellation`].
+    pub cancellation: Option<&'a fluree_db_core::QueryCancellation>,
+}
+
 pub(crate) async fn validate_sparql_constraint(
     db: GraphDbRef<'_>,
     focus: &Sid,
@@ -417,7 +427,7 @@ pub(crate) async fn validate_sparql_constraint(
     fallback_path: Option<&Sid>,
     severity: Severity,
     source_shape: &Sid,
-    iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
+    exec: SparqlConstraintCtx<'_>,
 ) -> Result<Vec<ValidationResult>> {
     if constraint.deactivated {
         return Ok(Vec::new());
@@ -436,7 +446,7 @@ pub(crate) async fn validate_sparql_constraint(
     // snapshot-independent (the shapes cache can outlive namespace
     // allocations on the data ledger).
     let mut vars = VarRegistry::new();
-    let lowered = match iri_encoder {
+    let lowered = match exec.iri_encoder {
         Some(encoder) => fluree_db_sparql::lower_sparql(ast, &encoder, &mut vars),
         None => fluree_db_sparql::lower_sparql(ast, db.snapshot, &mut vars),
     };
@@ -459,7 +469,11 @@ pub(crate) async fn validate_sparql_constraint(
         .collect();
 
     let mut bound = vec![(this_var, focus.clone())];
-    if constraint.uses_path {
+    // Whether the constraint uses `$PATH` is read off the LOWERED variable
+    // set, which is exact. Scanning the query text instead would fire on a
+    // `$PATH` inside a string literal and turn a valid node-shape constraint
+    // into a hard validation failure.
+    if vars.get("?PATH").is_some() {
         // $PATH is only meaningful on a property shape with a plain
         // predicate path; bind it exactly like $this.
         let Some(path) = fallback_path else {
@@ -482,6 +496,11 @@ pub(crate) async fn validate_sparql_constraint(
             // Charge the constraint query against the validation's fuel
             // budget when the caller tracks one.
             tracker: db.tracker,
+            // The deadline AND the per-query memory ceiling: the ceiling is
+            // installed only when a cancellation is present, so a constraint
+            // body without one walks as far as it likes. Pre-binding `$this`
+            // bounds where the query starts, not how much it reads.
+            cancellation: exec.cancellation.cloned(),
             ..Default::default()
         },
     )

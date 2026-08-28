@@ -3600,6 +3600,77 @@ async fn shacl_txn_validation_mode_denied_by_override_none() {
     );
 }
 
+/// The shapes-exist heuristic (shapes present, NO config graph) fails closed:
+/// a transaction-requested warn does NOT soften it.
+///
+/// This path never reaches `merge_shacl_opts`, so it consults no
+/// `f:overrideControl` and no identity. Honoring the request here would let
+/// anyone who can write downgrade enforcement on every ledger that has shapes
+/// but no `#config` graph — the back-compat default — with the violations
+/// reduced to a log line.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_heuristic_without_config_ignores_requested_warn_mode() {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "it/shacl-heuristic-no-config:main");
+    // Shapes, deliberately with no config graph written afterwards.
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "sh": "http://www.w3.org/ns/shacl#",
+                    "ex": "http://example.org/"
+                },
+                "@id": "ex:PersonShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"},
+                "sh:property": [{
+                    "sh:path": {"@id": "ex:name"},
+                    "sh:minCount": 1
+                }]
+            }),
+        )
+        .await
+        .expect("shape insert");
+
+    // Baseline: the heuristic enforces without any opt.
+    let err = fluree
+        .insert(result.ledger.clone(), &violating_person())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "shapes-exist heuristic must reject: {err:?}"
+    );
+
+    // The same write asking for warn is still rejected — no config group
+    // exists to permit the override, so the request is not honored.
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Warn),
+        ..Default::default()
+    };
+    let err = fluree
+        .stage_owned(result.ledger)
+        .txn_opts(opts)
+        .insert(&violating_person())
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "requested warn must NOT soften the ungated no-config heuristic: {err:?}"
+    );
+}
+
 /// Strengthening needs no permission: on a warn-mode ledger, a transaction
 /// may request reject for itself even under `f:OverrideNone`.
 #[cfg(feature = "shacl")]

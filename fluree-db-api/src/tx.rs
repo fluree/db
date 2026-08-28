@@ -1261,22 +1261,15 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     }
     let compactor = violation_iri_compactor(view, &ctx);
 
-    // Shapes-exist heuristic path (no config graph): there is no
-    // `f:overrideControl` to consult, so the group default (`f:OverrideAll`)
-    // governs and a transaction-requested warn mode softens the heuristic's
-    // reject posture. Config-present paths never reach this branch with an
-    // unhonored request — the gate already ran inside `merge_shacl_opts`.
-    let heuristic_softened = !has_config
-        && ctx.requested_validation_mode
-            == Some(fluree_db_core::ledger_config::ValidationMode::Warn);
-
-    let (warn_violations, reject_violations) = if heuristic_softened {
-        let mut warns = outcome.warn_violations;
-        warns.extend(outcome.reject_violations);
-        (warns, Vec::new())
-    } else {
-        (outcome.warn_violations, outcome.reject_violations)
-    };
+    // The shapes-exist heuristic path (no config graph) FAILS CLOSED: a
+    // transaction-requested warn mode does not soften it. There is no
+    // `f:overrideControl` to consult here, and `merge_shacl_opts` — which
+    // carries the whole `permits_override` gate — is never reached, so
+    // honoring the request would let any writer downgrade enforcement with
+    // no identity check and no operator opt-in. Softening requires an
+    // operator to have written a config group that permits it; that path
+    // runs the gate inside `merge_shacl_opts` and never reaches here.
+    let (warn_violations, reject_violations) = (outcome.warn_violations, outcome.reject_violations);
 
     if !warn_violations.is_empty() {
         tracing::warn!(

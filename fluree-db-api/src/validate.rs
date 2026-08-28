@@ -51,6 +51,18 @@ pub struct ValidateOptions {
     /// When the shapes source is not [`ShapesSource::Attached`], also union
     /// in the ledger's attached shapes instead of replacing them.
     pub include_attached: bool,
+    /// Micro-fuel ceiling for the whole validation pass. `None` / `Some(0)`
+    /// = unbounded.
+    ///
+    /// Matters because of `sh:sparql`: every other SHACL constraint can only
+    /// read what is reachable from the focus node, but a `sh:sparql` body may
+    /// walk anywhere in the graph, once per focus node. Fuel is what makes
+    /// that reading bounded.
+    pub max_fuel: Option<u64>,
+    /// Request-scoped cooperative cancellation: the deadline, and the carrier
+    /// for the per-query memory ceiling (which is installed only when a
+    /// cancellation is present). Server callers should always pass one.
+    pub cancellation: Option<fluree_db_core::QueryCancellation>,
 }
 
 impl Default for ValidateOptions {
@@ -59,6 +71,8 @@ impl Default for ValidateOptions {
             graph: None,
             shapes: ShapesSource::Attached,
             include_attached: false,
+            max_fuel: None,
+            cancellation: None,
         }
     }
 }
@@ -412,6 +426,21 @@ pub async fn validate_view(
     validate_view_inner(view, ledger_id, options, config, None).await
 }
 
+/// Fuel tracker for one validation pass. `None` / `Some(0)` = unbounded,
+/// matching `tracker_for_limits` on the query and transact paths.
+fn validate_tracker(max_fuel: Option<u64>) -> fluree_db_core::tracking::Tracker {
+    use fluree_db_core::tracking::{Tracker, TrackingOptions};
+    match max_fuel.filter(|limit| *limit > 0) {
+        Some(limit) => Tracker::new(TrackingOptions {
+            track_time: false,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel: Some(limit),
+        }),
+        None => Tracker::disabled(),
+    }
+}
+
 async fn validate_view_inner(
     view: &LedgerView,
     ledger_id: &str,
@@ -577,11 +606,14 @@ async fn validate_view_inner(
         shapes,
         hierarchy.as_ref(),
     );
-    let engine = match hierarchy {
+    let mut engine = match hierarchy {
         Some(h) => ShaclEngine::new_with_hierarchy(cache, h),
         None => ShaclEngine::new(cache),
     }
     .with_membership_graphs(membership);
+    if let Some(cancellation) = options.cancellation.clone() {
+        engine = engine.with_cancellation(cancellation);
+    }
 
     let shape_count = engine.shape_count();
     if engine.is_empty() {
@@ -592,7 +624,13 @@ async fn validate_view_inner(
         });
     }
 
-    let data_db = GraphDbRef::new(snapshot, data_g_id, novelty, to_t);
+    // Fuel bounds how much the pass may READ. `sh:sparql` runs one query per
+    // focus node whose body is not limited to the focus node's neighbourhood,
+    // so without a tracker a single request can walk the whole ledger
+    // repeatedly. `with_tracker` is a no-op on a disabled tracker, so the
+    // unbounded default costs nothing.
+    let tracker = validate_tracker(options.max_fuel);
+    let data_db = GraphDbRef::new(snapshot, data_g_id, novelty, to_t).with_tracker(&tracker);
     // The engine takes one external membership source. Inline shapes carry
     // their own value-set facts (same term space), so an explicit inline
     // document keeps precedence; the cross-ledger probe serves the attached
