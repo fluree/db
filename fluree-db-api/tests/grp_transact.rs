@@ -33,6 +33,8 @@ mod it_transact_update_indexed;
 mod it_transact_upsert;
 #[path = "it_transact_upsert_indexed.rs"]
 mod it_transact_upsert_indexed;
+#[path = "it_turtle_empty_collection.rs"]
+mod it_turtle_empty_collection;
 #[path = "it_txn_meta.rs"]
 mod it_txn_meta;
 #[path = "it_update_wildcard_delete_indexed.rs"]
