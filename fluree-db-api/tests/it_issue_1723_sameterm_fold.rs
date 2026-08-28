@@ -171,19 +171,44 @@ async fn issue_1723_value_equality_answer_is_unchanged() {
     // (12), the two dateTime spellings (2), and the two string pairs sameTerm
     // also accepts (4).
     assert_eq!(folded.len(), 31, "`=` rows: {folded:?}");
-    // The join is looser than `=` here: it also equates `"abc"^^ex:custom` with
-    // the rest of the string family. That is exactly what the node-valued guard
-    // keeps out of the answer.
+    // What the fold actually rewrites into, measured directly. Two things are
+    // asserted about it, and both are chosen to say something that stays true.
     const HAND_WRITTEN_JOIN: &str = r"
         PREFIX ex: <http://example.org/ns/>
         SELECT ?a ?b WHERE { ?a ex:p ?x . ?b ex:p ?x . }
     ";
     let join = pairs_for(&fluree, &ledger, HAND_WRITTEN_JOIN).await;
-    assert!(
-        join.len() > folded.len(),
-        "the fold's target join is expected to be looser than `=` on this data; \
-         join={} eq={}",
-        join.len(),
-        folded.len()
-    );
+
+    // (1) The join is not term equality, and the half of that which outlives
+    // any encoding change is the numeric one: `1`, `"1"^^xsd:long`, `1.0` and
+    // `"1.0"^^xsd:decimal` are four distinct RDF terms sharing one normalized
+    // numeric key, so the join equates them. `=` accepts those pairs too —
+    // value equality promotes across numeric types — which is exactly why
+    // folding `=` on this predicate is fine and folding `sameTerm` is not.
+    //
+    // Named rather than counted, deliberately. The join answers four rows more
+    // than `=` here today, but all four are `"abc"^^ex:custom` pairings that
+    // the indexed-read datatype flattening manufactures (#1729), so a
+    // `join.len() > eq.len()` assertion would go red the day that is fixed —
+    // for a fix, not a regression. These pairs do not go away. (This ledger is
+    // novelty-only; the same numeric leniency is currently lane-dependent once
+    // the ledger is indexed, which is #1737.)
+    for pair in ["ex:i_int ~ ex:i_dbl", "ex:i_long ~ ex:i_dec"] {
+        assert!(
+            join.contains(&pair.to_string()),
+            "the fold's target join stopped equating numeric subtypes ({pair}); join={join:?}"
+        );
+    }
+
+    // (2) The join accepts everything `=` does on this data, so the fold can
+    // only ever *add* rows to a `=` answer, never drop one. That is what makes
+    // the node-valued guard the whole of the soundness argument: on a ref-only
+    // predicate the two coincide, and off it the join is strictly the looser
+    // relation.
+    for pair in &folded {
+        assert!(
+            join.contains(pair),
+            "the fold's target join dropped a row `=` answers ({pair}); join={join:?}"
+        );
+    }
 }
