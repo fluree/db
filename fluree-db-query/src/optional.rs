@@ -2294,8 +2294,9 @@ pub struct OptionalOperator {
     /// one of them UNBOUND is still compatible with an optional solution that
     /// binds it, and SPARQL merge (§18.2.4) says the merged solution carries
     /// the optional side's value — so `combine_rows` patches these columns.
-    /// Empty for the overwhelmingly common OPTIONAL that shares only
-    /// already-bound correlation vars, which keeps the merge off the hot path.
+    /// For the canonical `OPTIONAL { ?s :email ?e }` this holds one entry
+    /// (`?s`): the per-row cost is one `is_unbound` test per merge column, and
+    /// the fill scan itself only runs on a column that is actually `Unbound`.
     shared_merge_cols: Vec<(usize, VarId)>,
     /// Memoized optional-side results keyed by correlation bindings.
     ///
