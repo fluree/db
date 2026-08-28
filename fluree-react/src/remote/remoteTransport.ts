@@ -394,7 +394,7 @@ export class RemoteTransport implements LiveTransport {
   }
 
   /**
-   * Resolve an event's `resource_id` to the ledger key this transport is
+   * Resolve an event's `resource_id` to EVERY ledger key this transport is
    * watching under.
    *
    * The server announces the NORMALIZED id — `name:branch`, e.g.
@@ -402,18 +402,25 @@ export class RemoteTransport implements LiveTransport {
    * it passed to `useQuery`, which is usually the bare name whose branch the
    * server filled in. Comparing them directly silently drops every head
    * event: the subscription stays open, nothing errors, and no query ever
-   * updates. So try the id as given, then the id with its branch suffix
+   * updates. So try the id as given, AND the id with its branch suffix
    * removed. (Deriving the default branch name instead would be a guess;
    * this needs none.)
+   *
+   * Both, not the first match: one page can perfectly well hold
+   * `useQuery("demo/board", …)` and `useQuery("demo/board:main", …)`, and
+   * returning only the exact hit leaves the bare-name subscription open,
+   * reporting `live`, erroring nothing, and never updating again — the same
+   * silence this mapping exists to remove, one case over.
    */
-  private watchedLedgerFor(resourceId: string): string | undefined {
-    if (this.byLedger.has(resourceId)) return resourceId;
+  private watchedLedgersFor(resourceId: string): string[] {
+    const out: string[] = [];
+    if (this.byLedger.has(resourceId)) out.push(resourceId);
     const cut = resourceId.lastIndexOf(":");
     if (cut > 0) {
       const base = resourceId.slice(0, cut);
-      if (this.byLedger.has(base)) return base;
+      if (this.byLedger.has(base)) out.push(base);
     }
-    return undefined;
+    return out;
   }
 
   private handleSse(event: string, dataText: string): void {
@@ -430,36 +437,42 @@ export class RemoteTransport implements LiveTransport {
       record?: { commit_t?: unknown };
     };
     if (d.kind !== "ledger" || typeof d.resource_id !== "string") return;
-    const ledger = this.watchedLedgerFor(d.resource_id);
-    if (ledger === undefined) return;
-    const set = this.byLedger.get(ledger);
-    if (!set || set.size === 0) return;
+    const ledgers = this.watchedLedgersFor(d.resource_id);
+    if (ledgers.length === 0) return;
 
     if (event === "ns-retracted") {
       // The ledger is gone: error every live subscription on it (data is
       // kept by the cache per keep-last-good-data).
-      const error: QueryError = {
-        code: "ledger-retracted",
-        message: `ledger ${ledger} was retracted`,
-      };
-      const retractedAt = this.heads.get(ledger);
-      this.sink?.onCycle({
-        ledger,
-        t: retractedAt,
-        changed: [],
-        unchanged: [],
-        errored: [...set].map((subId) => ({ subId, error })),
-      });
+      for (const ledger of ledgers) {
+        const set = this.byLedger.get(ledger);
+        if (!set || set.size === 0) continue;
+        const error: QueryError = {
+          code: "ledger-retracted",
+          message: `ledger ${ledger} was retracted`,
+        };
+        const retractedAt = this.heads.get(ledger);
+        this.sink?.onCycle({
+          ledger,
+          t: retractedAt,
+          changed: [],
+          unchanged: [],
+          errored: [...set].map((subId) => ({ subId, error })),
+        });
+      }
       return;
     }
     if (event !== "ns-record") return;
 
     const commitT = d.record?.commit_t;
     if (typeof commitT !== "number") return;
-    const known = this.heads.get(ledger);
-    if (known !== undefined && commitT <= known) return;
-    this.heads.set(ledger, commitT);
-    this.scheduleCycle(ledger, commitT);
+    for (const ledger of ledgers) {
+      const set = this.byLedger.get(ledger);
+      if (!set || set.size === 0) continue;
+      const known = this.heads.get(ledger);
+      if (known !== undefined && commitT <= known) continue;
+      this.heads.set(ledger, commitT);
+      this.scheduleCycle(ledger, commitT);
+    }
   }
 
   private scheduleCycle(ledger: string, t: number): void {

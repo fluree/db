@@ -411,6 +411,55 @@ describe("the advance-cycle", () => {
     expect(server.queries).toHaveLength(2);
   });
 
+  it("advances both the bare and the branch-qualified subscription", async () => {
+    // One page can perfectly well hold `useQuery("my/ledger", …)` and
+    // `useQuery("my/ledger:main", …)`. The server announces the qualified id
+    // once; resolving it to only the FIRST key that matches leaves the other
+    // subscription open, reporting `live`, and permanently frozen.
+    const { server, sink, transport } = setup();
+    server.respond = (call, n) => ({ body: bindings(`${call.body}-${n}`) });
+    const bare = spec({ text: "bare" });
+    const qualified = spec({ ledger: "my/ledger:main", text: "qualified" });
+    transport.subscribe(bare);
+    transport.subscribe(qualified);
+    await settle();
+    const initial = server.queries.length;
+
+    server.stream.frame("ns-record", {
+      kind: "ledger",
+      resource_id: "my/ledger:main",
+      record: { commit_t: 2 },
+    });
+    await flush();
+
+    expect(server.queries).toHaveLength(initial + 2);
+    const advanced = sink.cycles
+      .filter((c) => c.t === 2)
+      .flatMap((c) => c.changed.map((ch) => ch.subId));
+    expect(advanced.sort()).toEqual([bare.subId, qualified.subId].sort());
+  });
+
+  it("retracts both the bare and the branch-qualified subscription", async () => {
+    const { server, sink, transport } = setup();
+    const bare = spec({ text: "bare" });
+    const qualified = spec({ ledger: "my/ledger:main", text: "qualified" });
+    transport.subscribe(bare);
+    transport.subscribe(qualified);
+    await settle();
+
+    server.stream.frame("ns-retracted", {
+      kind: "ledger",
+      resource_id: "my/ledger:main",
+    });
+    await flush();
+
+    const errored = sink.cycles
+      .flatMap((c) => c.errored)
+      .filter((e) => e.error.code === "ledger-retracted")
+      .map((e) => e.subId);
+    expect(errored.sort()).toEqual([bare.subId, qualified.subId].sort());
+  });
+
   it("does not confuse a different branch of the same ledger", async () => {
     const { server, transport } = setup();
     transport.subscribe(spec({ ledger: "my/ledger:main" }));
