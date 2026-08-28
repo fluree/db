@@ -851,10 +851,7 @@ mod tests {
             "the folded prime owes a follow-up cycle"
         );
         let follow_up = live.run_cycle(LEDGER).await;
-        assert!(
-            !live.inner.coalescer.finish(LEDGER),
-            "and owes exactly one"
-        );
+        assert!(!live.inner.coalescer.finish(LEDGER), "and owes exactly one");
 
         // The mounting subscription's FIRST result carries the NEWER
         // watermark. The un-serialized shape delivered it at `t1`, after
