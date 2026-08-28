@@ -362,7 +362,9 @@ impl RaftIntegration {
     ///   this node just initialized — after that, the file registry
     ///   beside the store goes stale on every raft write and must
     ///   never be consulted again (embedders should guard their
-    ///   non-raft boot path accordingly).
+    ///   non-raft boot path accordingly). A configured root with no
+    ///   `ns@v2` subtree answers `Ok(0)` WITHOUT the marker, so a
+    ///   mistyped path stays correctable.
     /// - Each non-retracted record replays as ordinary proposals:
     ///   ledger init, commit head, index head, and the config / status
     ///   values VERBATIM. Retracted records are skipped — a tombstone
@@ -371,14 +373,19 @@ impl RaftIntegration {
     ///   replay and the marker write re-runs the replay next boot, and
     ///   every step tolerates its own prior success (`AlreadyExists`
     ///   on init; a head CAS conflict where the machine already holds
-    ///   a value at least as new; a config/status conflict).
+    ///   a value at least as new; a config/status watermark already at
+    ///   or above the registry's).
+    /// - Any step that cannot be READ or replayed aborts the whole
+    ///   adoption before the marker is written, so the operator can
+    ///   repair the record and re-run. Nothing is carried in partially
+    ///   and silently.
     ///
     /// Returns how many ledger records were carried.
     pub async fn adopt_file_registry(&self) -> Result<usize, FileRegistryAdoptionError> {
         use fluree_db_nameservice::{
-            CasResult, ConfigLookup, ConfigPublisher, LedgerLifecycle, NameServiceError,
-            NameServiceLookup, RefKind, RefLookup, RefPublisher, RefValue, StatusLookup,
-            StatusPublisher,
+            CasResult, ConfigCasResult, ConfigLookup, ConfigPublisher, LedgerLifecycle,
+            NameServiceError, NameServiceLookup, RefKind, RefLookup, RefPublisher, RefValue,
+            StatusCasResult, StatusLookup, StatusPublisher,
         };
 
         let Some(adoption) = &self.adoption else {
@@ -396,8 +403,13 @@ impl RaftIntegration {
             .map_err(FileRegistryAdoptionError::Marker)?;
             Ok(adopted)
         };
+        // Nothing to carry — and deliberately NO marker. A mistyped
+        // registry root would otherwise burn the one-shot adoption
+        // before the corrected config ever got a turn, exactly like
+        // the unconfigured case above, which also answers zero
+        // without writing one.
         if !registry.is_dir() {
-            return finish(0);
+            return Ok(0);
         }
         let file_ns = fluree_db_nameservice::file::FileNameService::new(&adoption.registry_root);
         let records = file_ns
@@ -487,20 +499,78 @@ impl RaftIntegration {
                     }
                 }
             }
-            if let Ok(Some(config)) = file_ns.get_config(ledger_id).await {
-                match publisher.push_config(ledger_id, None, &config).await {
-                    // A conflict is a retried replay's own prior write.
-                    Ok(_) => {}
-                    Err(e) => {
-                        return Err(FileRegistryAdoptionError::replay(ledger_id, "config", e))
+            // Config and status replay read-then-CAS, exactly like the
+            // index head above, for two reasons. An unreadable record
+            // must refuse loudly rather than carry the ledger in with
+            // its config silently absent — adoption is once-only, so a
+            // swallowed read error loses that config permanently and
+            // tells nobody. And the machine reads an unset value as
+            // the `unborn` / `initial` watermark rather than as
+            // missing, so `apply_versioned_push` demands `expected`
+            // match that watermark exactly: pushing `None` conflicts
+            // every time and would carry nothing at all.
+            let config = file_ns
+                .get_config(ledger_id)
+                .await
+                .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "config", e))?;
+            if let Some(config) = config {
+                let current = publisher
+                    .get_config(ledger_id)
+                    .await
+                    .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "config", e))?;
+                // A retried replay finds its own prior write at the
+                // same or a higher watermark; so does a registry whose
+                // config never moved off `unborn`. Nothing to carry.
+                if !current.as_ref().is_some_and(|c| c.v >= config.v) {
+                    match publisher
+                        .push_config(ledger_id, current.as_ref(), &config)
+                        .await
+                    {
+                        Ok(ConfigCasResult::Updated) => {}
+                        Ok(ConfigCasResult::Conflict { actual }) => {
+                            return Err(FileRegistryAdoptionError::Diverged {
+                                ledger_id: ledger_id.clone(),
+                                kind: "config",
+                                detail: format!(
+                                    "machine holds {actual:?}, registry carries v={}",
+                                    config.v
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            return Err(FileRegistryAdoptionError::replay(ledger_id, "config", e))
+                        }
                     }
                 }
             }
-            if let Ok(Some(status)) = file_ns.get_status(ledger_id).await {
-                match publisher.push_status(ledger_id, None, &status).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        return Err(FileRegistryAdoptionError::replay(ledger_id, "status", e))
+            let status = file_ns
+                .get_status(ledger_id)
+                .await
+                .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "status", e))?;
+            if let Some(status) = status {
+                let current = publisher
+                    .get_status(ledger_id)
+                    .await
+                    .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "status", e))?;
+                if !current.as_ref().is_some_and(|c| c.v >= status.v) {
+                    match publisher
+                        .push_status(ledger_id, current.as_ref(), &status)
+                        .await
+                    {
+                        Ok(StatusCasResult::Updated) => {}
+                        Ok(StatusCasResult::Conflict { actual }) => {
+                            return Err(FileRegistryAdoptionError::Diverged {
+                                ledger_id: ledger_id.clone(),
+                                kind: "status",
+                                detail: format!(
+                                    "machine holds {actual:?}, registry carries v={}",
+                                    status.v
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            return Err(FileRegistryAdoptionError::replay(ledger_id, "status", e))
+                        }
                     }
                 }
             }

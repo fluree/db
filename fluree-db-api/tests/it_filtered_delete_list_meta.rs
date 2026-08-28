@@ -15,6 +15,11 @@
 //!
 //! These pin the flag's three states through a real index build and the
 //! list-retraction semantics on the merged path.
+//!
+//! The last case sits one layer down, on the read side: when no bound
+//! component of the pattern resolves to a persisted id, the range provider
+//! serves the pattern from the overlay alone, and that overlay is a log —
+//! it must be lifecycle-resolved, not filtered to asserts.
 
 #![cfg(feature = "native")]
 
@@ -552,6 +557,399 @@ async fn stale_base_list_candidate_resolves_before_hydration() {
                 list_values(&fluree, &ledger, "ex:stale").await,
                 vec!["x"],
                 "hydrated from the live b@1, not the retracted base b@0"
+            );
+        })
+        .await;
+}
+
+/// The predicate itself exists ONLY in novelty: the indexed base has never
+/// seen `ex:items` in any form (the seed rows carry `ex:name` only), so no
+/// bound component of the crawl's `(subject, predicate)` seek resolves to a
+/// persisted id and the range provider serves the pattern straight from the
+/// overlay. That overlay is a LOG — the assert at `t=2` and its retraction
+/// at `t=3` both sit in novelty — so serving it assert-only resurrected the
+/// deleted entry: the receipt said one flake retracted and the value stayed
+/// readable.
+///
+/// Nothing about this is list-specific, so the plain-valued leg rides along
+/// on a second novelty-only predicate. The reload leg pins that the durable
+/// commit chain agrees with the live view (the bug was symmetric: a reload
+/// replays the same novelty and read it the same wrong way).
+#[tokio::test]
+async fn novelty_only_predicate_retraction_takes_effect() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(dir.clone()).build().unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/list-meta-novpred:main";
+            let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+
+            // Seed rows WITHOUT the predicate, so `ex:items` never reaches
+            // the persisted predicate dictionary.
+            let graph: Vec<_> = (0..50)
+                .map(|n| json!({"@id": format!("ex:r{n}"), "ex:name": format!("r{n}")}))
+                .collect();
+            let r = fluree
+                .upsert_with_opts(ledger, &json!({"@context": ctx(), "@graph": graph}), TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            trigger_index_and_wait_outcome(&handle, ledger_id, r.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert!(ledger.snapshot.range_provider.is_some());
+
+            // The list AND its predicate live only in novelty.
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:nov1", "ex:items": {"@list": ["a", "b", "c"]}}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(list_values(&fluree, &ledger, "ex:nov1").await, vec!["a", "b", "c"]);
+
+            let del = json!({
+                "@context": ctx(),
+                "where": [{"@id": "?s", "ex:items": "b"}],
+                "delete": [{"@id": "?s", "ex:items": "b"}]
+            });
+            let r = fluree
+                .update_with_opts(ledger, &del, TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 1);
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_values(&fluree, &ledger, "ex:nov1").await,
+                vec!["a", "c"],
+                "live handle must observe the retraction"
+            );
+            // The BGP path resolved the overlay correctly all along; pin it so
+            // the two read paths stay in agreement.
+            let q_sel = json!({
+                "@context": ctx(),
+                "select": ["?s", "?o"],
+                "where": {"@id": "?s", "ex:items": "?o"}
+            });
+            assert_eq!(
+                query_jsonld_formatted(&fluree, &ledger, &q_sel)
+                    .await
+                    .unwrap()
+                    .as_array()
+                    .map(Vec::len),
+                Some(2),
+                "BGP path agrees with the crawl"
+            );
+
+            // Same mechanism, plain values: a second novelty-only predicate
+            // with no `@list` anywhere.
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:nov2", "ex:tags": ["p", "q"]}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            let del_p = json!({
+                "@context": ctx(),
+                "where": [{"@id": "ex:nov2", "ex:tags": "p"}],
+                "delete": [{"@id": "ex:nov2", "ex:tags": "p"}]
+            });
+            let r = fluree
+                .update_with_opts(ledger, &del_p, TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 1);
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_items(&fluree, &ledger, "ex:nov2", "ex:tags").await,
+                vec!["q"],
+                "plain-valued novelty-only predicate retracts too"
+            );
+
+            // Reload: a fresh process replays the commit chain and must agree.
+            drop(fluree);
+            let reloaded = FlureeBuilder::file(dir).build().unwrap();
+            let ledger = reloaded.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_values(&reloaded, &ledger, "ex:nov1").await,
+                vec!["a", "c"],
+                "replayed commit chain must observe the retraction"
+            );
+            assert_eq!(
+                list_items(&reloaded, &ledger, "ex:nov2", "ex:tags").await,
+                vec!["q"]
+            );
+        })
+        .await;
+}
+
+/// Two facts that share `(s, p, o, dt)` and differ only in `m` — a `@list`
+/// repeating a value, and one lexical form under two language tags.
+///
+/// These are distinct facts, but every comparator orders `t` before `m`, so
+/// the sibling's assert lands between a fact's own assert and its retraction.
+/// Resolution that cuts groups on run adjacency over full identity therefore
+/// closes early and hands back the retracted entry as live — the same
+/// resurrection this file exists to pin, one layer down in the resolver.
+///
+/// Both legs delete the entry whose metadata sorts FIRST: that is the failing
+/// direction. Deleting the last position passes even with the grouping bug,
+/// so a pin that only covered it would be vacuous.
+#[tokio::test]
+async fn novelty_only_predicate_resolves_metadata_siblings() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/list-meta-novpred-siblings:main";
+            let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+
+            // Indexed base that has never seen either predicate, so both
+            // patterns below are served straight from the overlay.
+            let graph: Vec<_> = (0..50)
+                .map(|n| json!({"@id": format!("ex:r{n}"), "ex:name": format!("r{n}")}))
+                .collect();
+            let r = fluree
+                .upsert_with_opts(ledger, &json!({"@context": ctx(), "@graph": graph}), TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            trigger_index_and_wait_outcome(&handle, ledger_id, r.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert!(ledger.snapshot.range_provider.is_some());
+
+            // `["a", "b", "a"]` — "a" at positions 0 and 2.
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:dup", "ex:items": {"@list": ["a", "b", "a"]}}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_values(&fluree, &ledger, "ex:dup").await,
+                vec!["a", "b", "a"]
+            );
+
+            // One WHERE binding retracts exactly one positional entry, and
+            // hydration copies the FIRST candidate meta — position 0.
+            let del_a = json!({
+                "@context": ctx(),
+                "where": [{"@id": "ex:dup", "ex:items": "a"}],
+                "delete": [{"@id": "ex:dup", "ex:items": "a"}]
+            });
+            let r = fluree
+                .update_with_opts(ledger, &del_a, TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 1);
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_values(&fluree, &ledger, "ex:dup").await,
+                vec!["b", "a"],
+                "the position-0 entry goes; its twin at position 2 stays"
+            );
+
+            // Same lexical form under two language tags on a second
+            // novelty-only predicate.
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:tagged", "ex:labels": [
+                        {"@value": "hello", "@language": "en"},
+                        {"@value": "hello", "@language": "fr"}
+                    ]}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_items(&fluree, &ledger, "ex:tagged", "ex:labels").await,
+                vec!["hello@en", "hello@fr"]
+            );
+
+            let del_en = json!({
+                "@context": ctx(),
+                "where": [{"@id": "ex:tagged", "ex:labels": {"@value": "hello", "@language": "en"}}],
+                "delete": [{"@id": "ex:tagged", "ex:labels": {"@value": "hello", "@language": "en"}}]
+            });
+            let r = fluree
+                .update_with_opts(ledger, &del_en, TxnOpts::default(), CommitOpts::default(), &index_cfg())
+                .await
+                .unwrap();
+            assert_eq!(r.receipt.flake_count, 1);
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert_eq!(
+                list_items(&fluree, &ledger, "ex:tagged", "ex:labels").await,
+                vec!["hello@fr"],
+                "the @en fact goes; the @fr fact sharing its lexical form stays"
+            );
+
+            // The COMBINATION of the two legs above — one list position
+            // carrying two language tags — is pinned at the unit level
+            // instead (`binary_range::tests::
+            // one_list_position_under_two_language_tags_resolves_independently`),
+            // because it cannot currently be built through this path at all.
+            //
+            // `FlakeMeta`'s `Ord` ignores `lang` whenever both sides carry a
+            // list index, so `{en, i: 0}` and `{fr, i: 0}` compare equal
+            // without being equal (#1711). Asserting the second tag at the
+            // same position commits (receipt says one flake at its own `t`)
+            // but never appears in the live view: novelty keys the fact by
+            // that same ordering and folds it onto the first tag. So the
+            // write side collapses the shape before the read side can be
+            // asked about it. Worth knowing when #1711 is fixed — repairing
+            // the type will make this shape constructible, and this is the
+            // test that should then grow an end-to-end leg.
+        })
+        .await;
+}
+
+/// `offset` / `limit` on the overlay-only path apply to the RESOLVED current
+/// state, not to the log.
+///
+/// The fix moved when they apply relative to resolution, and nothing else
+/// pins the order — a later refactor could reorder it silently and only fail
+/// on a ledger where a retraction happens to sit inside the first page.
+/// Here `ex:page` carries ten novelty-only values with the first two
+/// retracted: paging that ran before resolution would spend its window on
+/// retracted rows and hand back a short or wrong page.
+#[tokio::test]
+async fn novelty_only_predicate_paging_applies_after_resolution() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/list-meta-novpred-paging:main";
+            let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+
+            let graph: Vec<_> = (0..50)
+                .map(|n| json!({"@id": format!("ex:r{n}"), "ex:name": format!("r{n}")}))
+                .collect();
+            let r = fluree
+                .upsert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@graph": graph}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+            trigger_index_and_wait_outcome(&handle, ledger_id, r.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            assert!(ledger.snapshot.range_provider.is_some());
+
+            // v0..v9 under a novelty-only predicate.
+            let values: Vec<String> = (0..10).map(|n| format!("v{n}")).collect();
+            let _ = fluree
+                .insert_with_opts(
+                    ledger,
+                    &json!({"@context": ctx(), "@id": "ex:page", "ex:vals": values}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg(),
+                )
+                .await
+                .unwrap();
+
+            // Retract the two that sort first.
+            for v in ["v0", "v1"] {
+                let ledger = fluree.ledger(ledger_id).await.unwrap();
+                let del = json!({
+                    "@context": ctx(),
+                    "where": [{"@id": "ex:page", "ex:vals": v}],
+                    "delete": [{"@id": "ex:page", "ex:vals": v}]
+                });
+                let r = fluree
+                    .update_with_opts(
+                        ledger,
+                        &del,
+                        TxnOpts::default(),
+                        CommitOpts::default(),
+                        &index_cfg(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(r.receipt.flake_count, 1, "retracting {v}");
+            }
+
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            let mut live = list_items(&fluree, &ledger, "ex:page", "ex:vals").await;
+            live.sort();
+            assert_eq!(
+                live,
+                vec!["v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9"],
+                "the two retracted values are gone from the unpaged read"
+            );
+
+            // A LIMIT smaller than the retracted prefix: every returned row
+            // must be a live value. Resolution-before-paging is what makes
+            // that true — paging the log first would surface `v0`/`v1`.
+            let paged = json!({
+                "@context": ctx(),
+                "select": ["?o"],
+                "where": {"@id": "ex:page", "ex:vals": "?o"},
+                "limit": 3
+            });
+            let rows = query_jsonld_formatted(&fluree, &ledger, &paged)
+                .await
+                .unwrap();
+            let got: Vec<String> = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| {
+                    r.as_array()
+                        .and_then(|c| c.first())
+                        .and_then(|v| v.as_str())
+                })
+                .map(String::from)
+                .collect();
+            assert_eq!(got.len(), 3, "a full page of live rows, got {got:?}");
+            assert!(
+                got.iter().all(|v| v != "v0" && v != "v1"),
+                "retracted values must never enter a page, got {got:?}"
             );
         })
         .await;
