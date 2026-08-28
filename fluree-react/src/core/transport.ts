@@ -74,6 +74,24 @@ export interface TransportSink {
   onConnection(state: ConnectionState): void;
 }
 
+/**
+ * A transport's obligations beyond the method signatures.
+ *
+ * **Monotonic delivery, per subscription.** Cycles naming a given `subId`
+ * must reach the sink in non-decreasing `t` order. A subscription's requests
+ * genuinely overlap — a commit can land while that query's very first fetch
+ * is still open — so this is work the transport has to do, not a property it
+ * gets for free: `RemoteTransport` pays for it with per-subscription tickets
+ * (`nextTicket`/`outranked`), and the browser peer pays for it with the
+ * engine-side coalescer that serializes cycles per ledger.
+ *
+ * The cache defends itself — `applyCycle` drops a cycle older than what a
+ * handle already carries — but it can only drop, never repair: a transport
+ * whose own change gate has already recorded the stale result as its
+ * baseline will report the next commit that restores it as `unchanged` with
+ * no payload, and no amount of cache-side care recovers that. Order the
+ * deliveries here.
+ */
 export interface LiveTransport {
   /** Wire the sink. Called exactly once, before any subscribe. */
   start(sink: TransportSink): void;

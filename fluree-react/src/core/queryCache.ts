@@ -12,6 +12,14 @@
  * - a handle created during render but never observed (interrupted render,
  *   suspended tree) is janitored by the same timer.
  *
+ * A store is addressed by KEY, not by the handle that minted it: a component
+ * memoizes the store it first obtained and can outlive that handle (React
+ * runs subscribe cleanup on trees that stay mounted — Activity/Offscreen —
+ * so a still-mounted component's query can be collected and then re-observed).
+ * Every `subscribe`/`getSnapshot` therefore re-resolves whichever handle owns
+ * the key now, which is what keeps `byKey` authoritative: one key can never
+ * hold two live handles on two timelines.
+ *
  * Referential stability: `handle.state` is THE snapshot object handed to
  * `useSyncExternalStore`. It is replaced only when this query's results,
  * status, or error actually change — structural sharing against the
@@ -20,12 +28,14 @@
  *
  * Version coherence: `applyCycle` swaps EVERY affected handle's state
  * before notifying ANY observer, so two components rendering in the same
- * pass can never see different watermarks' data.
+ * pass can never see different watermarks' data. That holds within a cycle;
+ * ACROSS cycles it is `applyCycle`'s staleness skip that keeps a handle from
+ * moving backwards when a transport delivers out of order.
  */
 
 import { replaceEqualDeep } from "./structuralShare.js";
 import type { LiveTransport, CycleUpdate } from "./transport.js";
-import type { QueryResult, ResolvedSpec } from "./types.js";
+import type { QueryError, QueryResult, ResolvedSpec } from "./types.js";
 import { specKey } from "./types.js";
 
 /** What the React adapter needs: a subscribable, snapshottable store. */
@@ -41,18 +51,29 @@ const INITIAL_STATE: QueryResult = Object.freeze({
   t: undefined,
 });
 
+function sameError(a: QueryError | undefined, b: QueryError): boolean {
+  return (
+    a !== undefined &&
+    a.code === b.code &&
+    a.message === b.message &&
+    a.status === b.status
+  );
+}
+
 export class QueryHandle {
   state: QueryResult = INITIAL_STATE;
   readonly store: QueryStore;
   readonly key: string;
   readonly spec: ResolvedSpec;
-  /** Transport subscription id. Reassigned if the handle is resurrected
-   * after collection (see `QueryCache.ensureSubscribed`). */
-  subId: number;
+  /** Transport subscription id. Fixed for the life of the handle. */
+  readonly subId: number;
+  /** Grace period this handle was created with; inherited by the handle
+   * that replaces it if a store outlives a collection. */
+  readonly gcTime: number;
   private readonly listeners = new Set<() => void>();
   private observerCount = 0;
   private gcTimer: ReturnType<typeof setTimeout> | undefined;
-  private readonly gcTime: number;
+  private disposed = false;
   private readonly cache: QueryCache;
 
   constructor(
@@ -67,16 +88,19 @@ export class QueryHandle {
     this.subId = subId;
     this.gcTime = gcTime;
     // Bound once: `useSyncExternalStore` requires stable function
-    // identities, and components share this store across renders.
+    // identities, and components share this store across renders. Both
+    // members go through the cache BY KEY (see the module docs) so a store
+    // whose handle was collected transparently re-binds to the live one.
     this.store = {
-      subscribe: (onChange: () => void) => this.addObserver(onChange),
-      getSnapshot: () => this.state,
+      subscribe: (onChange: () => void) =>
+        this.cache.observe(this.key, this.spec, this.gcTime, onChange),
+      getSnapshot: () =>
+        this.cache.snapshotFor(this.key, this.spec, this.gcTime),
     };
-    // Janitor for never-observed handles (see module docs).
-    this.scheduleGc();
   }
 
-  private addObserver(onChange: () => void): () => void {
+  /** Called only by the cache, and only on the handle that owns the key. */
+  addObserver(onChange: () => void): () => void {
     this.listeners.add(onChange);
     this.observerCount++;
     this.cancelGc();
@@ -101,8 +125,17 @@ export class QueryHandle {
     return this.observerCount > 0;
   }
 
+  /** Janitor for a handle nobody ever observes. Armed by the cache on
+   * creation, so a closed cache cannot arm one. */
+  armJanitor(): void {
+    this.scheduleGc();
+  }
+
   private scheduleGc(): void {
     this.cancelGc();
+    // A disposed handle is off the books: re-arming here is how a detach
+    // that arrives after `close()` used to leave a live timer behind.
+    if (this.disposed) return;
     this.gcTimer = setTimeout(() => this.cache.collect(this), this.gcTime);
   }
 
@@ -115,6 +148,7 @@ export class QueryHandle {
 
   /** Called only by the cache on GC / client close. */
   dispose(): void {
+    this.disposed = true;
     this.cancelGc();
     this.listeners.clear();
   }
@@ -136,17 +170,45 @@ export class QueryCache {
   /** Get-or-create the shared handle for a spec. Pure lookup on the hot
    * path: safe to call during React render. */
   handleFor(spec: ResolvedSpec, gcTime?: number): QueryHandle {
-    const key = specKey(spec);
-    const existing = this.byKey.get(key);
-    if (existing) return existing;
-    const handle = new QueryHandle(
-      this,
+    return this.liveHandleFor(
+      specKey(spec),
       spec,
-      this.nextSubId++,
       gcTime ?? this.defaultGcTime,
     );
+  }
+
+  /** Attach an observer to whichever handle owns `key` right now. */
+  observe(
+    key: string,
+    spec: ResolvedSpec,
+    gcTime: number,
+    onChange: () => void,
+  ): () => void {
+    if (this.closed) return () => {};
+    return this.liveHandleFor(key, spec, gcTime).addObserver(onChange);
+  }
+
+  /** The snapshot of whichever handle owns `key` right now. */
+  snapshotFor(key: string, spec: ResolvedSpec, gcTime: number): QueryResult {
+    const existing = this.byKey.get(key);
+    if (existing) return existing.state;
+    // A closed cache mints nothing: handles survive `close()` precisely so
+    // a still-mounted component keeps rendering what it last had.
+    if (this.closed) return INITIAL_STATE;
+    return this.liveHandleFor(key, spec, gcTime).state;
+  }
+
+  private liveHandleFor(
+    key: string,
+    spec: ResolvedSpec,
+    gcTime: number,
+  ): QueryHandle {
+    const existing = this.byKey.get(key);
+    if (existing) return existing;
+    const handle = new QueryHandle(this, spec, this.nextSubId++, gcTime);
     this.byKey.set(key, handle);
     this.bySubId.set(handle.subId, handle);
+    if (!this.closed) handle.armJanitor();
     return handle;
   }
 
@@ -154,31 +216,21 @@ export class QueryCache {
    * remount within the grace period finds it already open). */
   ensureSubscribed(handle: QueryHandle): void {
     if (this.closed) return;
-    if (this.bySubId.get(handle.subId) !== handle) {
-      // Resurrection. A component can hold this handle's memoized store
-      // across a collection — React runs subscribe cleanup on trees that
-      // stay mounted (Activity/Offscreen, and any future re-subscribe) —
-      // and would then own a store the cache had forgotten, so every cycle
-      // for it would be dropped and the component would freeze on stale
-      // data with no error. Re-adopt it under a FRESH id, which also means
-      // a late cycle addressed to the released subscription cannot land.
-      handle.subId = this.nextSubId++;
-      this.bySubId.set(handle.subId, handle);
-      // Only claim the key if nothing else has taken it meanwhile; a rival
-      // handle for the same key stays the one new callers dedup onto.
-      if (!this.byKey.has(handle.key)) this.byKey.set(handle.key, handle);
-    } else if (this.subscribed.has(handle.subId)) {
-      return;
-    }
+    // Stores resolve their handle by key on every call, so anything that
+    // reaches here is the handle `byKey` holds. The check is the assertion,
+    // not a fallback: a handle that lost the key must never open a second
+    // subscription on it.
+    if (this.byKey.get(handle.key) !== handle) return;
+    if (this.subscribed.has(handle.subId)) return;
     this.subscribed.add(handle.subId);
     this.transport.subscribe({ ...handle.spec, subId: handle.subId });
   }
 
   /** GC timer fired: release the subscription and drop the handle. */
   collect(handle: QueryHandle): void {
-    if (this.bySubId.get(handle.subId) !== handle) return; // already collected
     if (handle.hasObservers()) return; // re-observed; the detach reschedules
-    if (this.byKey.get(handle.key) === handle) this.byKey.delete(handle.key);
+    if (this.byKey.get(handle.key) !== handle) return; // already collected
+    this.byKey.delete(handle.key);
     this.bySubId.delete(handle.subId);
     if (this.subscribed.delete(handle.subId) && !this.closed) {
       this.transport.unsubscribe(handle.subId);
@@ -192,15 +244,42 @@ export class QueryCache {
   }
 
   /**
+   * True when `cycle` is older than what this handle already carries.
+   *
+   * A transport is meant to deliver a subscription's cycles in watermark
+   * order, but the shipped two pay for that separately (`RemoteTransport`
+   * with per-subscription tickets, the peer engine with its coalescer) and a
+   * consumer-supplied transport may not pay for it at all. A late cycle
+   * landing on top of a newer one pins that component below its siblings —
+   * and because the transport's change gate then holds the STALE result as
+   * its baseline, a later commit restoring that result is reported
+   * `unchanged` with no payload and the component never recovers. Dropping
+   * the stale entry is the only recovery the cache can perform by itself.
+   *
+   * Per handle rather than per ledger: a t-anchored subscription's `t` is
+   * its anchor, not a delivery watermark, so it is exempt.
+   */
+  private stale(handle: QueryHandle, cycle: CycleUpdate): boolean {
+    return (
+      cycle.t !== undefined &&
+      handle.spec.at === undefined &&
+      handle.state.t !== undefined &&
+      cycle.t < handle.state.t
+    );
+  }
+
+  /**
    * Apply one advance-cycle batch. Two phases: swap every affected handle's
    * state, THEN notify — the coherence guarantee lives here.
    */
   applyCycle(cycle: CycleUpdate): void {
+    if (this.closed) return;
     const dirty: QueryHandle[] = [];
 
     for (const { subId, payload } of cycle.changed) {
       const handle = this.bySubId.get(subId);
       if (!handle) continue; // unsubscribed while the cycle was in flight
+      if (this.stale(handle, cycle)) continue;
       const shared = replaceEqualDeep(handle.state.data, payload);
       if (shared === handle.state.data && handle.state.status === "ready") {
         // Transport said "changed" but the parsed trees are deep-equal
@@ -220,6 +299,7 @@ export class QueryCache {
     for (const subId of cycle.unchanged) {
       const handle = this.bySubId.get(subId);
       if (!handle) continue;
+      if (this.stale(handle, cycle)) continue;
       if (handle.state.status === "error") {
         // Recovery: the re-run succeeded and matched the last good data.
         handle.state = {
@@ -237,6 +317,15 @@ export class QueryCache {
     for (const { subId, error } of cycle.errored) {
       const handle = this.bySubId.get(subId);
       if (!handle) continue;
+      if (this.stale(handle, cycle)) continue;
+      if (handle.state.status === "error" && sameError(handle.state.error, error)) {
+        // A persistent failure is re-reported every cycle by design. Minting
+        // an identical error state would re-render this component (and every
+        // memo boundary under it) on every commit, for a message that did
+        // not change — worst on exactly the busy, failing ledger where the
+        // page is already under stress.
+        continue;
+      }
       // Keep-last-good-data: `data` and its watermark survive the error.
       handle.state = {
         data: handle.state.data,
@@ -247,7 +336,7 @@ export class QueryCache {
       dirty.push(handle);
     }
 
-    if (cycle.t !== undefined) {
+    if (cycle.t !== undefined && cycle.t >= 0) {
       const head = this.heads.get(cycle.ledger);
       if (head === undefined || cycle.t > head) {
         this.heads.set(cycle.ledger, cycle.t);
@@ -259,9 +348,10 @@ export class QueryCache {
 
   close(): void {
     this.closed = true;
-    for (const handle of this.byKey.values()) handle.dispose();
-    this.byKey.clear();
-    this.bySubId.clear();
+    // Every handle, not just the keyed ones — and the maps are KEPT, so a
+    // component still mounted when the client closes keeps rendering its
+    // last snapshot instead of flipping back to `loading`.
+    for (const handle of this.bySubId.values()) handle.dispose();
     this.subscribed.clear();
   }
 }

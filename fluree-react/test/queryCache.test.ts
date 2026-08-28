@@ -164,11 +164,12 @@ describe("refcounting and grace-period GC", () => {
     expect(transport.unsubscribes).toEqual([h.subId]);
   });
 
-  it("re-subscribes a handle that is observed again after collection", () => {
+  it("re-subscribes through a memoized store observed again after collection", () => {
     // A component can hold a memoized store across a collection (React can
     // run subscribe cleanup on a still-mounted tree). If the cache forgot
     // the handle, its cycles would be silently dropped and that component
-    // would freeze forever with stale data.
+    // would freeze forever with stale data. The store is addressed by KEY,
+    // so observing it again resolves whichever handle owns the key now.
     const { cache, transport } = setup(100);
     const h = cache.handleFor(spec("q"));
     const firstId = h.subId;
@@ -178,7 +179,10 @@ describe("refcounting and grace-period GC", () => {
 
     observe(h); // same store object, re-subscribed
     expect(transport.subscribes).toHaveLength(2);
-    const secondId = h.subId;
+    const secondId = transport.subId(1);
+    expect(secondId).not.toBe(firstId);
+    // Exactly one handle owns the key, and the memoized store speaks for it.
+    expect(cache.handleFor(spec("q")).subId).toBe(secondId);
 
     transport.emit({
       ledger: "my/ledger",
@@ -199,6 +203,45 @@ describe("refcounting and grace-period GC", () => {
       errored: [],
     });
     expect(h.store.getSnapshot()).toBe(before);
+  });
+
+  it("re-binds a re-shown component onto the handle that now owns its key", () => {
+    // The Activity/Offscreen case. X mounts; X is hidden and its effects are
+    // torn down; the grace period elapses and X's handle is collected; Y
+    // mounts the SAME query and takes the key; X is shown again and React
+    // re-subscribes X's memoized store. X must join Y's handle. Re-adopting
+    // X's own handle instead leaves one query key with two live
+    // subscriptions on two timelines — permanently — so every commit runs
+    // the query twice and a cycle naming only Y leaves X untouched.
+    const { cache, transport } = setup(100);
+    const x = cache.handleFor(spec("q"));
+    const xStore = x.store;
+    observe(x).detach();
+    vi.advanceTimersByTime(100);
+    expect(transport.unsubscribes).toEqual([x.subId]);
+
+    const y = cache.handleFor(spec("q"));
+    expect(y).not.toBe(x);
+    observe(y);
+    expect(transport.subscribes).toHaveLength(2);
+
+    const detachX = xStore.subscribe(() => {});
+    // No third subscription: X re-bound rather than resurrecting.
+    expect(transport.subscribes).toHaveLength(2);
+    expect(transport.subId(1)).toBe(y.subId);
+
+    transport.emit({
+      ledger: "my/ledger",
+      t: 4,
+      changed: [{ subId: y.subId, payload: { rows: ["v"] } }],
+      unchanged: [],
+      errored: [],
+    });
+
+    // One handle, one snapshot object: X and Y cannot disagree.
+    expect(xStore.getSnapshot()).toBe(y.store.getSnapshot());
+    expect(xStore.getSnapshot().data).toEqual({ rows: ["v"] });
+    detachX();
   });
 });
 
@@ -356,6 +399,135 @@ describe("applying an advance-cycle", () => {
     cycle(8);
     expect(cache.ledgerHead("my/ledger")).toBe(8);
     expect(cache.ledgerHead("unknown/ledger")).toBeUndefined();
+
+    // A watermark below zero is not a ledger state; it must not become one.
+    transport.emit({
+      ledger: "other/ledger",
+      t: -1,
+      changed: [],
+      unchanged: [],
+      errored: [],
+    });
+    expect(cache.ledgerHead("other/ledger")).toBeUndefined();
+  });
+});
+
+describe("delivery order: a handle never moves backwards", () => {
+  // A transport is meant to deliver a subscription's cycles in watermark
+  // order, but the guarantee is paid for differently by each one and not at
+  // all by a consumer-supplied transport. These pin what the cache does on
+  // its own when a cycle lands late.
+
+  it("drops a stale changed entry while its siblings stay at the newer head", () => {
+    const { cache, transport } = setup();
+    const a = cache.handleFor(spec("qa"));
+    const b = cache.handleFor(spec("qb"));
+    const obsA = observe(a);
+    observe(b);
+
+    // The fast cycle finishes first and both queries advance together.
+    transport.emit({
+      ledger: "my/ledger",
+      t: 6,
+      changed: [
+        { subId: a.subId, payload: { rows: ["a6"] } },
+        { subId: b.subId, payload: { rows: ["b6"] } },
+      ],
+      unchanged: [],
+      errored: [],
+    });
+    const a6 = a.store.getSnapshot();
+    expect(a6.t).toBe(6);
+
+    // The slow cycle — opened BEFORE the commit, still in flight when the
+    // faster one finished — lands afterwards carrying pre-commit data.
+    transport.emit({
+      ledger: "my/ledger",
+      t: 5,
+      changed: [{ subId: a.subId, payload: { rows: ["a5"] } }],
+      unchanged: [],
+      errored: [],
+    });
+
+    // Same object, so not even a re-render: A is not pinned below B.
+    expect(a.store.getSnapshot()).toBe(a6);
+    expect(a.store.getSnapshot().data).toEqual({ rows: ["a6"] });
+    expect(obsA.calls).toHaveLength(1);
+    expect(b.store.getSnapshot().t).toBe(6);
+    expect(cache.ledgerHead("my/ledger")).toBe(6);
+
+    // Dropping the stale cycle must not wedge the handle: the next real one
+    // lands normally.
+    transport.emit({
+      ledger: "my/ledger",
+      t: 7,
+      changed: [{ subId: a.subId, payload: { rows: ["a7"] } }],
+      unchanged: [],
+      errored: [],
+    });
+    expect(a.store.getSnapshot().data).toEqual({ rows: ["a7"] });
+    expect(a.store.getSnapshot().t).toBe(7);
+    expect(obsA.calls).toHaveLength(2);
+  });
+
+  it("drops a stale error rather than failing a handle that already advanced", () => {
+    const { cache, transport } = setup();
+    const h = cache.handleFor(spec("q"));
+    const obs = observe(h);
+    transport.emit({
+      ledger: "my/ledger",
+      t: 6,
+      changed: [{ subId: h.subId, payload: { rows: ["a6"] } }],
+      unchanged: [],
+      errored: [],
+    });
+    const at6 = h.store.getSnapshot();
+
+    transport.emit({
+      ledger: "my/ledger",
+      t: 5,
+      changed: [],
+      unchanged: [],
+      errored: [{ subId: h.subId, error: { code: "http", message: "boom" } }],
+    });
+
+    // The failure is about a watermark this query has already left behind.
+    expect(h.store.getSnapshot()).toBe(at6);
+    expect(h.store.getSnapshot().status).toBe("ready");
+    expect(obs.calls).toHaveLength(1);
+  });
+
+  it("delivers a t-anchored query at its anchor even when the ledger is ahead", () => {
+    const { cache, transport } = setup();
+    const live = cache.handleFor(spec("q"));
+    observe(live);
+    transport.emit({
+      ledger: "my/ledger",
+      t: 9,
+      changed: [{ subId: live.subId, payload: { rows: ["now"] } }],
+      unchanged: [],
+      errored: [],
+    });
+    expect(cache.ledgerHead("my/ledger")).toBe(9);
+
+    // Time travel: this subscription is pinned to t=3 and its cycle carries
+    // that watermark, below the ledger head. A staleness guard written per
+    // LEDGER rather than per handle would drop this delivery and leave the
+    // component in `loading` forever.
+    const past = cache.handleFor(resolveSpec("my/ledger", "q", { at: 3 }));
+    observe(past);
+    transport.emit({
+      ledger: "my/ledger",
+      t: 3,
+      changed: [{ subId: past.subId, payload: { rows: ["then"] } }],
+      unchanged: [],
+      errored: [],
+    });
+
+    expect(past.store.getSnapshot().data).toEqual({ rows: ["then"] });
+    expect(past.store.getSnapshot().t).toBe(3);
+    // ...and the anchored cycle did not drag the ledger head back with it.
+    expect(cache.ledgerHead("my/ledger")).toBe(9);
   });
 });
 
@@ -391,6 +563,57 @@ describe("errors: keep-last-good-data", () => {
     expect(snap.data).toBe(good);
     expect(snap.t).toBe(1);
     expect(obs.calls).toHaveLength(2);
+  });
+
+  it("re-renders once for a persistent identical error, not once per cycle", () => {
+    // Errors repeat every cycle by design. A server 503ing on a ledger
+    // committing ~10×/s would otherwise re-render this component (and every
+    // memo boundary under it) ten times a second to show a string that never
+    // changed — the exact churn this package exists to prevent, in the case
+    // where the page is already under stress.
+    const { cache, transport } = setup();
+    const h = cache.handleFor(spec("q"));
+    const obs = observe(h);
+    for (let t = 1; t <= 5; t++) {
+      transport.emit({
+        ledger: "my/ledger",
+        t,
+        changed: [],
+        unchanged: [],
+        errored: [
+          {
+            subId: h.subId,
+            // A fresh object each cycle: equality is by value, as a real
+            // transport re-minting its error shape would produce.
+            error: { code: "http", message: "service unavailable", status: 503 },
+          },
+        ],
+      });
+    }
+    expect(h.store.getSnapshot().status).toBe("error");
+    expect(obs.calls).toHaveLength(1);
+    const stuck = h.store.getSnapshot();
+
+    // A DIFFERENT failure is still news and must get through.
+    transport.emit({
+      ledger: "my/ledger",
+      t: 6,
+      changed: [],
+      unchanged: [],
+      errored: [
+        {
+          subId: h.subId,
+          error: { code: "http", message: "gateway timeout", status: 504 },
+        },
+      ],
+    });
+    expect(obs.calls).toHaveLength(2);
+    expect(h.store.getSnapshot()).not.toBe(stuck);
+    expect(h.store.getSnapshot().error).toEqual({
+      code: "http",
+      message: "gateway timeout",
+      status: 504,
+    });
   });
 
   it("recovers to ready when a later cycle reports the query unchanged", () => {
@@ -555,21 +778,42 @@ describe("version coherence", () => {
 });
 
 describe("close", () => {
-  it("stops notifying and forgets every handle", () => {
+  it("stops notifying and applies nothing, but keeps the last snapshot", () => {
     const { cache, transport } = setup();
     const h = cache.handleFor(spec("q"));
     const obs = observe(h);
+    transport.emit({
+      ledger: "my/ledger",
+      t: 1,
+      changed: [{ subId: h.subId, payload: { rows: ["before"] } }],
+      unchanged: [],
+      errored: [],
+    });
+    const last = h.store.getSnapshot();
     cache.close();
 
     transport.emit({
       ledger: "my/ledger",
-      t: 1,
-      changed: [{ subId: h.subId, payload: { rows: [] } }],
+      t: 2,
+      changed: [{ subId: h.subId, payload: { rows: ["after"] } }],
       unchanged: [],
       errored: [],
     });
-    expect(obs.calls).toHaveLength(0);
-    expect(cache.handleFor(spec("q"))).not.toBe(h);
+    expect(obs.calls).toHaveLength(1); // the pre-close cycle only
+    // A component still mounted when the client closed keeps rendering what
+    // it last had rather than flipping back to `loading`.
+    expect(h.store.getSnapshot()).toBe(last);
+    expect(cache.handleFor(spec("q"))).toBe(h);
+  });
+
+  it("arms no new GC timer for a detach that arrives after close", () => {
+    const { cache } = setup();
+    const h = cache.handleFor(spec("q"));
+    const obs = observe(h);
+    cache.close();
+    expect(vi.getTimerCount()).toBe(0);
+    obs.detach(); // React unmounting the tree after the client closed
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("does not open new transport subscriptions after close", () => {
