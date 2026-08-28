@@ -954,5 +954,9 @@ describe("close", () => {
     const h = cache.handleFor(spec("q"));
     observe(h);
     expect(transport.subscribes).toHaveLength(0);
+    // ...and creating that handle armed no janitor either: a cache entry
+    // minted by a render that outlived `close()` must not hold a 30s timer
+    // and, in a server process, the event loop with it.
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

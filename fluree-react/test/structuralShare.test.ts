@@ -5,9 +5,12 @@
  * time", which is what makes `React.memo` and `useMemo` deps work down the
  * tree.
  *
- * Every assertion here is `toBe` (identity), not `toEqual` (deep equality).
- * A deep-equality assertion would pass against an implementation that shared
- * nothing at all, so it would prove nothing about the property we care about.
+ * Every SHARING claim here is `toBe` (identity), never `toEqual` (deep
+ * equality): a deep-equality assertion passes against an implementation that
+ * shares nothing at all, so it proves nothing about the property we care
+ * about. `toEqual` appears only alongside those, to pin that the merged tree
+ * is also CORRECT — an implementation that returned `prev` unconditionally
+ * would ace every identity assertion in this file.
  */
 
 import { describe, expect, it } from "vitest";
@@ -167,7 +170,13 @@ describe("a __proto__ key in the data", () => {
   // door, not through an attack. The failure it used to cause is the worst
   // kind for this module: nothing throws, the row just quietly loses its
   // identity forever after.
+  //
+  // Read the OWN property throughout. `out["__proto__"]` goes through the
+  // inherited accessor and returns the rewritten prototype, so the obvious
+  // spelling reports success against the code that has the bug.
   const parse = (text: string) => JSON.parse(text) as Record<string, unknown>;
+  const own = (o: unknown) =>
+    Object.getOwnPropertyDescriptor(o as object, "__proto__")?.value;
 
   it("keeps the binding instead of dropping it into the prototype", () => {
     const prev = parse('{"a":1,"__proto__":{"x":1}}');
@@ -177,19 +186,13 @@ describe("a __proto__ key in the data", () => {
     expect(out).not.toBe(prev); // `a` really did change
     expect(out["a"]).toBe(2);
     expect(Object.hasOwn(out, "__proto__")).toBe(true);
-    expect(out["__proto__"]).toEqual({ x: 1 });
   });
 
   it("shares the unchanged __proto__ subtree by identity", () => {
     const prev = parse('{"a":1,"__proto__":{"x":1}}');
     const next = parse('{"a":2,"__proto__":{"x":1}}');
-    const out = replaceEqualDeep(prev, next) as Record<string, unknown>;
-    // Read the OWN property deliberately. `out["__proto__"]` would go
-    // through the inherited accessor and return the rewritten prototype,
-    // which is the exact bug — so it reports success against the code that
-    // has it.
-    const own = Object.getOwnPropertyDescriptor(out, "__proto__");
-    expect(own?.value).toBe(prev["__proto__"]);
+    const out = replaceEqualDeep(prev, next);
+    expect(own(out)).toBe(prev["__proto__"]);
   });
 
   it("leaves the result plain, so the NEXT pass still shares", () => {
@@ -200,7 +203,7 @@ describe("a __proto__ key in the data", () => {
     const out = replaceEqualDeep(
       parse('{"a":1,"__proto__":{"x":1}}'),
       parse('{"a":2,"__proto__":{"x":1}}'),
-    ) as Record<string, unknown>;
+    );
     expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
     expect(replaceEqualDeep(out, parse('{"a":2,"__proto__":{"x":1}}'))).toBe(out);
   });
@@ -211,13 +214,12 @@ describe("a __proto__ key in the data", () => {
     // value — and `Object.prototype` has a null prototype and no enumerable
     // keys, so an empty object from the server compared equal to it and was
     // "shared" with it. The merged data then carried the global prototype
-    // object where the result said `{}`.
-    const out = replaceEqualDeep(
-      parse('{"a":1}'),
-      parse('{"a":1,"__proto__":{}}'),
-    ) as Record<string, unknown>;
-    expect(Object.hasOwn(out, "__proto__")).toBe(true);
-    expect(out["__proto__"]).not.toBe(Object.prototype);
-    expect(out["__proto__"]).toEqual({});
+    // object where the result said `{}`. With nothing to share against, the
+    // merged value must be the one the transport delivered.
+    const next = parse('{"a":1,"__proto__":{}}');
+    const out = replaceEqualDeep(parse('{"a":1}'), next);
+    expect(Object.hasOwn(out as object, "__proto__")).toBe(true);
+    expect(own(out)).not.toBe(Object.prototype);
+    expect(own(out)).toBe(next["__proto__"]);
   });
 });
