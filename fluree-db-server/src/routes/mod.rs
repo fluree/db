@@ -400,8 +400,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// Mirroring covers `authorization` and every other header the API reads
 /// (the `fluree-*` policy/tracking headers, `idempotency-key`, trace ids,
 /// `range`, `if-none-match`, `last-event-id`, …) without a list to keep in
-/// sync; with `allow_origin(Any)` and no credentials it has exactly the
-/// trust posture `*` had. The expose list makes response metadata — the
+/// sync.
+///
+/// This is **strictly more permissive** than the `*` it replaces, and
+/// deliberately so — the difference is the point of the change, not a side
+/// effect of it. Because `*` excludes `Authorization`, cross-origin
+/// *authenticated* requests were impossible before and are possible now. The
+/// consequence is real for an internal deployment: a page the user visits can
+/// reach an internal Fluree server with an `Authorization` header and read the
+/// response. That is not CSRF — there are no ambient credentials, so the page
+/// must already hold a token — but it does widen the browser-as-pivot surface,
+/// and it is the reason browser clients being first-class now makes an origin
+/// allow-list worth having (`cors_enabled` is currently a bool with
+/// `allow_origin(Any)` hardcoded).
+///
+/// The expose list makes response metadata — the
 /// Range/CAS headers and the `x-fdb-*` tracking headers — readable by
 /// browser JavaScript, which otherwise sees only the CORS-safelisted
 /// response headers.
