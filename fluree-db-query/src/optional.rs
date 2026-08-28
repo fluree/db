@@ -398,10 +398,12 @@ impl PatternOptionalBuilder {
                         Binding::Lit { val, dtc, .. } => {
                             pattern.o = Term::Value(val.clone());
                             // A string binding is one RDF term: `"bob"`,
-                            // `"bob"@en` and `"bob"@fr` must not probe each
-                            // other's rows. Numeric/other constraints are left
-                            // off so cross-subtype matching stays as before.
-                            if crate::binding::is_string_term_constraint(dtc) {
+                            // `"bob"@en`, `"bob"^^xsd:anyURI` and
+                            // `"bob"^^ex:custom` share a dictionary key and
+                            // must not probe each other's rows. Numeric/other
+                            // constraints are left off so cross-subtype
+                            // matching stays as before.
+                            if crate::binding::is_string_dict_term(binding) {
                                 pattern.dtc = Some(dtc.clone());
                             }
                         }

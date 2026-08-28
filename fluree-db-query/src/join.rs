@@ -412,21 +412,6 @@ fn is_batched_subject_exists_eligible(
 /// When a shared variable is `Unbound` on the left (e.g., from VALUES with UNDEF),
 /// `combine_rows` falls back to the right-side value so the concrete binding
 /// propagates through the join.
-/// `xsd:string` as a term constraint, built once.
-///
-/// The `EncodedLit` probe arm tags every plain-string binding with this, once
-/// per driving row; `Sid::new` allocates an `Arc<str>` per call, a clone is a
-/// refcount bump.
-fn xsd_string_sid() -> &'static Sid {
-    static SID: std::sync::OnceLock<Sid> = std::sync::OnceLock::new();
-    SID.get_or_init(|| {
-        Sid::new(
-            fluree_vocab::namespaces::XSD,
-            fluree_vocab::xsd_names::STRING,
-        )
-    })
-}
-
 pub struct NestedLoopJoinOperator {
     /// Left (driving) operator
     left: Box<dyn Operator>,
@@ -963,10 +948,12 @@ impl NestedLoopJoinOperator {
                         Binding::Lit { val, dtc, .. } => {
                             pattern.o = Term::Value(val.clone());
                             // A string binding is one RDF term: `"bob"`,
-                            // `"bob"@en` and `"bob"@fr` must not probe each
-                            // other's rows. Numeric/other constraints are left
-                            // off so cross-subtype matching stays as before.
-                            if crate::binding::is_string_term_constraint(dtc) {
+                            // `"bob"@en`, `"bob"^^xsd:anyURI` and
+                            // `"bob"^^ex:custom` share a dictionary key and
+                            // must not probe each other's rows. Numeric/other
+                            // constraints are left off so cross-subtype
+                            // matching stays as before.
+                            if crate::binding::is_string_dict_term(binding) {
                                 pattern.dtc = Some(dtc.clone());
                             }
                         }
@@ -1002,25 +989,30 @@ impl NestedLoopJoinOperator {
                                 pattern.o = Term::Value(val);
                                 // Same term-identity rule as the `Lit` arm:
                                 // a string binding probes only rows with its
-                                // exact tag / `xsd:string` datatype.
+                                // exact tag / datatype.
                                 //
                                 // Read straight off the encoded triple: the
-                                // datatype id already says which of the two it
-                                // is, so this needs neither an `OTypeRegistry`
-                                // (a 15-element `Vec`, and `decode_value_from_kind`
-                                // above builds one already) nor a fresh datatype
-                                // `Sid` — both were per-driving-row allocations.
+                                // datatype id already names the datatype, so
+                                // this needs no `OTypeRegistry` (a 15-element
+                                // `Vec`, and `decode_value_from_kind` above
+                                // builds one already). Only the three reserved
+                                // string-dictionary ids can appear here —
+                                // `late_materialized_object_binding` keeps
+                                // every other string datatype materialized, so
+                                // those reach the `Lit` arm above instead.
                                 let dt = DatatypeDictId::from_u16(*dt_id);
-                                let dtc = if dt == DatatypeDictId::LANG_STRING {
+                                let dtc = if !crate::binding::is_string_dict_term(binding) {
+                                    None
+                                } else if dt == DatatypeDictId::LANG_STRING {
                                     gv.store().lang_tag_for_id(*lang_id).map(|tag| {
                                         fluree_db_core::DatatypeConstraint::LangTag(Arc::from(tag))
                                     })
-                                } else if dt == DatatypeDictId::STRING {
-                                    Some(fluree_db_core::DatatypeConstraint::Explicit(
-                                        xsd_string_sid().clone(),
-                                    ))
                                 } else {
-                                    None
+                                    crate::eval::rdf::reserved_datatype_sid(dt)
+                                        .or_else(|| {
+                                            gv.store().dt_sids().get(*dt_id as usize).cloned()
+                                        })
+                                        .map(fluree_db_core::DatatypeConstraint::Explicit)
                                 };
                                 if dtc.is_some() {
                                     pattern.dtc = dtc;

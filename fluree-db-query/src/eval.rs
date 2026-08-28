@@ -33,7 +33,7 @@ mod metadata;
 pub(crate) mod metadata_resolve;
 mod numeric;
 mod path;
-mod rdf;
+pub(crate) mod rdf;
 mod string;
 mod types;
 mod uuid;

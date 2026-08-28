@@ -258,16 +258,31 @@ const _: () = assert!(
     "size_of::<Binding>() regressed past 88 bytes — box the large variant instead of widening the enum"
 );
 
-/// Whether a literal constraint pins a *string* term (`xsd:string` or a
-/// language tag). Probe substitution carries exactly these onto the scan
-/// pattern so string bindings match by RDF term identity.
-pub fn is_string_term_constraint(dtc: &DatatypeConstraint) -> bool {
-    match dtc {
-        DatatypeConstraint::LangTag(_) => true,
-        DatatypeConstraint::Explicit(sid) => {
-            sid.namespace_code == fluree_vocab::namespaces::XSD
-                && sid.name_str() == fluree_vocab::xsd_names::STRING
+/// Whether this binding is a **string-dictionary term**: a literal whose
+/// lexical form is interned in the shared string dictionary, so the stored key
+/// alone does not identify the RDF term — the datatype (or language tag) is the
+/// rest of it.
+///
+/// One relation, read off either shape a literal binding takes. A decoded
+/// literal is in the lane exactly when its value is a string:
+/// `FlakeValue::String` is what `DecodeKind::StringDict` decodes to, and
+/// nothing else — JSON, vectors and geo points are their own variants. An
+/// encoded literal is in the lane exactly when its object kind is `LEX_ID`,
+/// the string dictionary's kind.
+///
+/// Probe substitution (join, OPTIONAL) carries these bindings' datatype /
+/// language constraint onto the scan pattern, so `"abc"`, `"abc"@en`,
+/// `"abc"^^xsd:anyURI` and `"abc"^^ex:custom` stop probing each other's rows.
+/// Numeric and temporal literals are deliberately left out: the join is lenient
+/// across numeric subtypes (`1` ≡ `"1"^^xsd:long` ≡ `1.0`), a product decision
+/// pinned by `it_literal_identity.rs`.
+pub fn is_string_dict_term(binding: &Binding) -> bool {
+    match binding {
+        Binding::Lit { val, .. } => matches!(val, FlakeValue::String(_)),
+        Binding::EncodedLit { o_kind, .. } => {
+            *o_kind == fluree_db_core::value_id::ObjKind::LEX_ID.as_u8()
         }
+        _ => false,
     }
 }
 
