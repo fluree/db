@@ -364,6 +364,21 @@ pub struct ExecutionContext<'a> {
     /// SIDs — encoded in the original namespace space — can be decoded
     /// correctly (see `reencode_sid` in `build_match_val_for_snapshot`).
     pub original_snapshot: &'a LedgerSnapshot,
+    /// When set, every scan boundary in this context stamps its output rows'
+    /// `Binding::Sid`s to `Binding::IriMatch` decoded in this ledger (the
+    /// single-graph lane of `DatasetOperator` honors it — the multi-graph lane
+    /// already stamps its members unconditionally).
+    ///
+    /// Set ONLY by the cross-ledger `SERVICE` path (`service.rs`), where the
+    /// subtree executes against a foreign snapshot: raw scan `Sid`s there are
+    /// target-encoded, but the scan layer's pattern-constant contract decodes
+    /// constant SIDs against `original_snapshot` (see [`reencode_sid`]) — so a
+    /// target-encoded `Sid` substituted back into a pattern by an intra-body
+    /// join is decoded through the wrong namespace table. Stamping at the scan
+    /// boundary keeps every binding in the subtree namespace-neutral, exactly
+    /// as the multi-ledger dataset lane does. `None` everywhere else: the
+    /// common paths pay one `Option` check per scan open.
+    pub scan_provenance_ledger: Option<Arc<str>>,
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
@@ -455,6 +470,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             reasoning_active: false,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -512,6 +528,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             reasoning_active: false,
             original_snapshot: db.snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -573,6 +590,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             reasoning_active: false,
             original_snapshot: db.snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -623,6 +641,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             reasoning_active: false,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -672,6 +691,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             reasoning_active: false,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -723,6 +743,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             reasoning_active: false,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -1322,6 +1343,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
+            scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
@@ -1382,6 +1404,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
+            scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
@@ -1438,6 +1461,11 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
+            // A fresh per-graph scope: dataset members are stamped at the
+            // member boundary by their owning `DatasetOperator`, and the
+            // cross-ledger SERVICE path re-arms this explicitly on the
+            // context it builds (`service.rs`).
+            scan_provenance_ledger: None,
             // This per-graph context switches to `graph`'s own store/snapshot
             // (see `binary_store`/`active_snapshot` above) while clearing
             // `multi_ledger`, so the single-ledger const→s_id fast path DOES run

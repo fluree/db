@@ -287,3 +287,183 @@ async fn service_cross_ledger_join_matches_on_shared_iri() {
     .await;
     assert_eq!(joined, vec![json!([format!("{SHARED}thing")])]);
 }
+
+/// A SERVICE body with two patterns sharing `?s` must return the joined rows,
+/// exactly as the same body evaluated via `GRAPH` does (issue #1665).
+///
+/// The join key crosses between the body's patterns as a raw scan binding, so
+/// this is the shape where a target-encoded SID substituted back into a
+/// pattern gets decoded against the requester's namespace table — the
+/// `seed_pair` fixture's same-code/different-prefix tables make that visible
+/// as zero rows rather than a coincidental match.
+#[tokio::test]
+async fn service_multi_pattern_body_returns_rows() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alpha, beta) = seed_pair(&fluree, "mp").await;
+    let dataset = dataset_for(&fluree, &alpha, &beta).await;
+    let svc = format!("fluree:ledger:{beta}");
+
+    let graph_control = rows(
+        &fluree,
+        &dataset,
+        &format!(
+            r#"SELECT ?s ?r WHERE {{ GRAPH <{beta}> {{ ?s ?p "shared" . ?s <{BETA}rank> ?r }} }}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        graph_control,
+        vec![
+            json!([format!("{BETA}b1"), 2]),
+            json!([format!("{BETA}b2"), 1])
+        ],
+        "GRAPH control must return the joined rows"
+    );
+
+    let service = rows(
+        &fluree,
+        &dataset,
+        &format!(
+            r#"SELECT ?s ?r WHERE {{ SERVICE <{svc}> {{ ?s ?p "shared" . ?s <{BETA}rank> ?r }} }}"#
+        ),
+    )
+    .await;
+    assert_eq!(service, graph_control, "SERVICE body must join like GRAPH");
+}
+
+/// Three patterns chained on the same subject: each hop's binding crosses back
+/// into a pattern, so every hop after the first exercises the substitution.
+#[tokio::test]
+async fn service_three_pattern_body_returns_rows() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alpha, beta) = seed_pair(&fluree, "mp3").await;
+    let dataset = dataset_for(&fluree, &alpha, &beta).await;
+    let svc = format!("fluree:ledger:{beta}");
+
+    let body = format!(r#"?s ?p "shared" . ?s <{BETA}rank> ?r . ?s <{BETA}tag> ?t"#);
+    let graph_control = rows(
+        &fluree,
+        &dataset,
+        &format!(r"SELECT ?s ?r ?t WHERE {{ GRAPH <{beta}> {{ {body} }} }}"),
+    )
+    .await;
+    assert_eq!(
+        graph_control,
+        vec![
+            json!([format!("{BETA}b1"), 2, "shared"]),
+            json!([format!("{BETA}b2"), 1, "shared"])
+        ],
+        "GRAPH control must return the joined rows"
+    );
+
+    let service = rows(
+        &fluree,
+        &dataset,
+        &format!(r"SELECT ?s ?r ?t WHERE {{ SERVICE <{svc}> {{ {body} }} }}"),
+    )
+    .await;
+    assert_eq!(service, graph_control, "SERVICE body must join like GRAPH");
+}
+
+/// A shared-variable join with no constants at all in the second pattern —
+/// the pure form of the intra-body join, no predicate/object narrowing to
+/// hide behind.
+#[tokio::test]
+async fn service_multi_pattern_all_variable_join() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alpha, beta) = seed_pair(&fluree, "mpv").await;
+    let dataset = dataset_for(&fluree, &alpha, &beta).await;
+    let svc = format!("fluree:ledger:{beta}");
+
+    let body = r#"?s ?p "shared" . ?s ?p2 ?o2"#;
+    let graph_control = rows(
+        &fluree,
+        &dataset,
+        &format!(r"SELECT ?s ?p2 ?o2 WHERE {{ GRAPH <{beta}> {{ {body} }} }}"),
+    )
+    .await;
+    assert_eq!(
+        graph_control.len(),
+        4,
+        "each beta subject carries two facts: {graph_control:?}"
+    );
+
+    let service = rows(
+        &fluree,
+        &dataset,
+        &format!(r"SELECT ?s ?p2 ?o2 WHERE {{ SERVICE <{svc}> {{ {body} }} }}"),
+    )
+    .await;
+    assert_eq!(service, graph_control, "SERVICE body must join like GRAPH");
+}
+
+/// Two patterns with NO shared variable (a cross product) worked before this
+/// fix — no binding crosses back into a pattern — and must keep working.
+#[tokio::test]
+async fn service_multi_pattern_cross_product_unaffected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alpha, beta) = seed_pair(&fluree, "mpx").await;
+    let dataset = dataset_for(&fluree, &alpha, &beta).await;
+    let svc = format!("fluree:ledger:{beta}");
+
+    let body = format!(r#"?s <{BETA}tag> "shared" . ?x <{BETA}rank> ?r"#);
+    let graph_control = rows(
+        &fluree,
+        &dataset,
+        &format!(r"SELECT ?s ?x ?r WHERE {{ GRAPH <{beta}> {{ {body} }} }}"),
+    )
+    .await;
+    assert_eq!(graph_control.len(), 4, "2 x 2 cross product");
+
+    let service = rows(
+        &fluree,
+        &dataset,
+        &format!(r"SELECT ?s ?x ?r WHERE {{ SERVICE <{svc}> {{ {body} }} }}"),
+    )
+    .await;
+    assert_eq!(service, graph_control, "SERVICE body must join like GRAPH");
+}
+
+/// Aligned-namespace control: both ledgers allocate their first code to the
+/// SAME prefix, so the wrong-table decode coincidentally produces the right
+/// IRI and the bug is masked. This pins the passing case so the divergent
+/// fixtures above can't silently degrade into it, and so the fix costs the
+/// aligned case nothing but the stamp.
+#[tokio::test]
+async fn service_multi_pattern_aligned_namespaces() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    const COMMON: &str = "http://common.example/";
+    seed(
+        &fluree,
+        "xl-alpha-aligned:main",
+        json!([{"@id": format!("{COMMON}a1"), format!("{COMMON}tag"): "shared"}]),
+    )
+    .await;
+    seed(
+        &fluree,
+        "xl-beta-aligned:main",
+        json!([
+            {"@id": format!("{COMMON}b1"), format!("{COMMON}tag"): "shared", format!("{COMMON}rank"): 2},
+            {"@id": format!("{COMMON}b2"), format!("{COMMON}tag"): "shared", format!("{COMMON}rank"): 1}
+        ]),
+    )
+    .await;
+    let dataset = dataset_for(&fluree, "xl-alpha-aligned:main", "xl-beta-aligned:main").await;
+
+    let service = rows(
+        &fluree,
+        &dataset,
+        &format!(
+            r#"SELECT ?s ?r WHERE {{ SERVICE <fluree:ledger:xl-beta-aligned:main>
+               {{ ?s ?p "shared" . ?s <{COMMON}rank> ?r }} }}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        service,
+        vec![
+            json!([format!("{COMMON}b1"), 2]),
+            json!([format!("{COMMON}b2"), 1])
+        ]
+    );
+}

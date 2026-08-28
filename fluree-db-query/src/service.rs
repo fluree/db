@@ -193,6 +193,15 @@ impl ServiceOperator {
         // for its own members; mirror it here, including forcing the range
         // fallback so inner scans yield `Binding::Sid` rather than an
         // `EncodedSid` that `stamp_binding` cannot decode.
+        //
+        // Stamping only at this boundary is not enough when the block holds
+        // more than one pattern: the joins INSIDE the subtree substitute
+        // bindings back into patterns, and the scan layer decodes constant
+        // SIDs against `original_snapshot` — the requester — while a raw scan
+        // `Sid` here is target-encoded (issue #1665). `scan_provenance_ledger`
+        // arms the same per-scan stamping the multi-ledger dataset lane uses,
+        // so every binding inside the subtree is namespace-neutral `IriMatch`
+        // before any join touches it.
         let target_ctx;
         let mut cross_ledger: Option<Arc<str>> = None;
         let ctx_to_use: &ExecutionContext<'_> = if let Some(gref) = graph_ref {
@@ -201,6 +210,7 @@ impl ServiceOperator {
                 per_graph_ctx.binary_store = None;
                 per_graph_ctx.dict_novelty = None;
                 per_graph_ctx.runtime_small_dicts = None;
+                per_graph_ctx.scan_provenance_ledger = Some(Arc::clone(&gref.ledger_id));
                 cross_ledger = Some(Arc::clone(&gref.ledger_id));
             }
             target_ctx = per_graph_ctx;
