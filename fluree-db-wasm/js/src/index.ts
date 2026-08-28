@@ -341,7 +341,19 @@ class Channel {
         // cause is never swallowed — it becomes the next terminal message.
         void this.call({ ...this.initMsg, reinit: true })
           .then((res) => {
-            if (res.ok) this.markInitialized();
+            if (res.ok) {
+              this.markInitialized();
+              return;
+            }
+            // A NON-fatal re-init failure lands here and used to stop: not
+            // initialized, not terminal, no respawn scheduled. That is the
+            // one state a consumer cannot act on — it saw the crash and
+            // then silence, forever. It is reachable on the ordinary path:
+            // a `getToken` rejection mints `unauthorized`/401 (worker.ts),
+            // and only RuntimeError/RangeError are fatalized. Re-enter the
+            // ladder so this either recovers or spends the budget and
+            // becomes a terminal error the consumer is told about.
+            this.recycle(res.error);
           })
           .catch(() => {});
       }
@@ -415,10 +427,27 @@ function queryKindOf(query: string | object): QueryKind {
 /** Routes batched `cycleOutcome` events to per-subscription callbacks —
  * ONE worker message per advance-cycle in, per-sub `LiveUpdate`s out. */
 class LiveRegistry {
-  private readonly subs = new Map<number, (update: LiveUpdate) => void>();
+  private subs = new Map<number, (update: LiveUpdate) => void>();
   private wired = false;
+  /** The engine generation `subs` belongs to. Subscription ids are minted
+   * by `LiveQuerySet::next_id`, which restarts at 1 in a fresh engine, so
+   * ids from before a crash recycle ALIAS the new engine's ids — the same
+   * hazard `Ledger`/`Snapshot` stamp against (review H-4). */
+  private generation: number;
 
-  constructor(private readonly channel: Channel) {}
+  constructor(private readonly channel: Channel) {
+    this.generation = channel.generation;
+  }
+
+  /** Drop everything registered against a previous engine. Subscriptions do
+   * not survive a recycle, and keeping their callbacks would hand the next
+   * engine's subId 1 to the previous engine's subscriber. */
+  private syncGeneration(): void {
+    if (this.channel.generation !== this.generation) {
+      this.generation = this.channel.generation;
+      this.subs = new Map();
+    }
+  }
 
   async subscribe(
     ledger: string,
@@ -434,8 +463,18 @@ class LiveRegistry {
         text: asJsonText(query),
       }),
     );
+    // AFTER the await: a recycle during the round trip must not leave this
+    // registration in a map belonging to the dead engine.
+    this.syncGeneration();
+    const generation = this.channel.generation;
     this.subs.set(res.subId, onUpdate);
     return new LiveSubscription(res.subId, async () => {
+      // Tidying a stale handle from before a recycle must be a NO-OP. The
+      // docs tell consumers to re-subscribe after a crash and then release
+      // the old handle; without this check that release deletes the NEW
+      // subscription's callback and posts `unsubscribe` for its id, killing
+      // a live subscription silently.
+      if (this.channel.generation !== generation) return;
       this.subs.delete(res.subId);
       await this.channel.call({ op: "unsubscribe", subId: res.subId }).then(unwrap);
     });
@@ -446,6 +485,9 @@ class LiveRegistry {
     this.wired = true;
     this.channel.addEventListener((event, payloads) => {
       if (event.kind !== "cycleOutcome") return;
+      // Events only ever come from the CURRENT worker, so a generation
+      // change means everything still in `subs` is from a dead engine.
+      this.syncGeneration();
       event.changed.forEach((c, i) => {
         const cb = this.subs.get(c.subId);
         const buf = payloads?.[i];

@@ -231,7 +231,10 @@ try {
     );
   }
   if (nsLookups.length === 0) throw new Error("no /storage/ns/ head resolution was recorded");
-  if (sse.length === 0) throw new Error("no /events SSE stream was recorded");
+  // Exactly one: a reconnect loop (the peer re-opening the stream on every
+  // head event, say) would satisfy "at least one" and stay green, and a
+  // stream-per-commit is precisely the shape peer mode exists to avoid.
+  check("SSE streams", sse.length, 1);
   if (queries.length > 0) {
     throw new Error(`the peer query-shipped: ${queries.length} request(s) to /query — local compute not proven`);
   }

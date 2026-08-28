@@ -20,7 +20,9 @@ const off = peer.on("headChange", ({ ledger, t }) => rerender(ledger, t));
 peer.close();
 ```
 
-**Peer credentials:** `getToken` is the single source — the token is requested from the main thread over the worker's event channel at connect AND at every post-crash reconnect; it is never embedded in a replayable init message. There is no mid-session re-auth hook yet: when a token expires, requests fail typed and you reconnect (`close()` + `connect()`) with a fresh token.
+**Peer credentials:** `getToken` is the single source — the token is requested from the main thread over the worker's event channel at connect AND at every post-crash reconnect; it is never embedded in a replayable init message. There is no mid-session re-auth op on this package's surface: when a token expires, requests fail typed and you reconnect (`close()` + `connect()`) with a fresh token, which costs every subscription, snapshot, and the warm residency tier.
+
+The engine below this package can already do better — `fluree-db-browser`'s `BrowserPeer::set_token` swaps the bearer through a shared cell that every I/O surface reads, with no teardown, and it is natively tested. It is deliberately NOT exposed here yet, because wiring it needs a decision this package has not made: which side owns the token once both paths exist. Today `getToken` is asked on connect and re-asked on every recycle, so it is the single source of truth; a pushed `setToken` would be silently superseded by the next recycle's `getToken` unless the two are reconciled. Expect a `setToken` op once that is settled.
 
 ## Install & use
 
