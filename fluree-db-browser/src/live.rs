@@ -430,9 +430,7 @@ impl LiveQuerySet {
     /// being dropped mid-await — releases it. Cancellation-safe by
     /// construction rather than by a property of the callers.
     async fn run_serialized(&self, ledger: &str, solo: Option<Vec<SubId>>) -> Option<CycleOutcome> {
-        let Some(mut lease) = self.inner.coalescer.begin(ledger) else {
-            return None;
-        };
+        let mut lease = self.inner.coalescer.begin(ledger)?;
         let want_outcome = solo.is_some();
         let mut only = solo;
         let mut first: Option<CycleOutcome> = None;
