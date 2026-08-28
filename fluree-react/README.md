@@ -155,7 +155,7 @@ the default), a peer token needs **both** claim families.
 | `getToken` | remote | `() => string \| undefined \| Promise<...>`, called per request and per SSE reconnect. |
 | `fetchImpl` | remote | Override `fetch` (tests, non-browser runtimes). |
 | `sseRefreshDebounceMs`, `backoffBaseMs`, `backoffMaxMs` | remote | SSE reconnect tuning. |
-| `maxConcurrency` | remote | How many of a cycle's queries may be in flight at once. Default 6. |
+| `maxConcurrency` | remote | How many query requests may be in flight at once, across mount and every commit. Default 6. |
 | `peer.connect` | peer | `connect` from `@fluree/db-wasm`. |
 | `peer.url` | peer | The versioned API base, e.g. `https://host/v1/fluree`. |
 | `peer.getToken` | peer | `(reason) => string \| Promise<string>`; asked on connect and after a crash recycle. |
@@ -208,10 +208,18 @@ never re-renders your query components.
 A one-shot `Promise`, outside the subscription system — for imperative
 code (event handlers, loaders). No cache entry, no subscription.
 
-### `client.ledgerHead(ledger)` / `client.close()`
+### `client.ledgerHead(ledger)` / `client.onLedgerHead(ledger, fn)`
 
-The newest watermark any cycle has reported for a ledger, and a full
-teardown (releases every subscription and the SSE stream).
+The newest watermark any cycle has reported for a ledger, and a subscription
+to it moving (returns a detach function; fires only on an actual advance,
+inside the same notify phase as the queries, so a header and a row cannot
+disagree). The head is not any one query's `t` — a query whose results did
+not move keeps its own — so rendering it needs its own subscription rather
+than a timer. The demo's head badge is a `useSyncExternalStore` over this.
+
+### `client.close()`
+
+A full teardown: releases every subscription and the SSE stream.
 
 ## How it behaves
 
@@ -233,7 +241,10 @@ that recovery costs zero re-renders.
 
 **Version coherence.** One commit produces one advance-cycle. Every
 subscription in that cycle is updated *before any component is notified*, so
-two sibling components can never render data from different watermarks.
+two sibling components can never render data from different watermarks. And
+a cycle that lands late — one opened before the commit and slower than the
+one after it — is dropped for any query that has already moved past it,
+rather than dragging that component back below its siblings.
 
 **Structural sharing.** Results arrive as freshly-parsed JSON — over HTTP in
 remote mode, and in peer mode because `postMessage` clones. Referential
@@ -252,11 +263,18 @@ dependencies work on rows.
 
 **Superseded work is cancelled (remote).** A commit that lands while a
 query's request is still open aborts that request rather than letting the
-server finish an answer nobody will read. And because remote mode re-runs
-*every* live subscription on a ledger per commit, the fan-out is bounded
-(`maxConcurrency`, default 6) so a page with thirty subscriptions does not
-fire thirty simultaneous requests and starve everything else in the browser's
-connection pool.
+server finish an answer nobody will read. A response that arrives anyway —
+already fully received, or from a `fetchImpl` that ignores its signal — is
+dropped on a per-subscription ticket, so a subscription's results can only
+move forward.
+
+**The request fan-out is bounded (remote).** Remote mode re-runs *every* live
+subscription on a ledger per commit, so `maxConcurrency` (default 6) caps how
+many query requests are in flight at once. The cap is on the client, not on
+one cycle: a page with thirty subscriptions does not fire thirty simultaneous
+requests when they all mount in the same React pass either, which is the
+burst that matters — it lands at first paint, when starving the browser's
+connection pool costs the page most.
 
 **Engine crashes are visible (peer).** A wasm engine that traps is recycled,
 and a recycled engine has no subscriptions — nothing errors, and no cycle
@@ -297,7 +315,7 @@ one tab re-rendering exactly the affected row in another, with no polling
 code in the app. Both are reliable there, including peer mode with **no
 usable block cache at all**. Peer mode is still slower to first paint than
 remote mode, and a separate engine-side cold-open cost is still open.
-Everything in the automated suite is mocked: 178 tests, no network, no wasm.
+Everything in the automated suite is mocked: 194 tests, no network, no wasm.
 One known blocker remains, listed at the end.
 
 ### Proven in a real browser, against a real server
@@ -331,23 +349,23 @@ Also executed for real: the demo builds through a real bundler in CI (`vite
 build`), which is the only thing exercising this as a *package* rather than
 as source files a test imported.
 
-### Proven by executed tests — 178 (`npx vitest run`), all real package code
+### Proven by executed tests — 194 (`npx vitest run`), all real package code
 
 | Suite | Tests | What it actually proves |
 | --- | --- | --- |
 | `structuralShare` | 11 | Unchanged rows keep **object identity** across an advance; an all-equal result returns the previous object itself. Every assertion is `toBe`, not `toEqual` — a deep-equality test here would pass against an implementation that shares nothing. |
-| `queryCache` | 23 | Dedup by key; the transport subscription opens on the first observer and is released only after `gcTime` with none; the janitor collects never-observed handles; **version coherence** (observers verify the whole cache already carries the new watermark at notify time); keep-last-good-data and both recovery paths; an unchanged cycle produces the identical snapshot object and no notification. |
-| `liveClient` | 13 | Query-kind inference and the language-matched format defaults; cache keying; one-shot queries; connection fan-out; teardown releases timers. |
+| `queryCache` | 31 | Dedup by key; the transport subscription opens on the first observer and is released only after `gcTime` with none; the janitor collects never-observed handles; **version coherence** (observers verify the whole cache already carries the new watermark at notify time); a stale cycle cannot move a handle backwards while its siblings hold the newer head; a re-shown component re-binds to the handle that now owns its key rather than resurrecting a second subscription on it; keep-last-good-data and both recovery paths; a persistent identical error re-renders once; an unchanged cycle produces the identical snapshot object and no notification. |
+| `liveClient` | 14 | Query-kind inference and the language-matched format defaults; cache keying; one-shot queries; connection fan-out; head-movement fan-out; teardown releases timers. |
 | `useQuery` (react-dom + jsdom) | 19 | Real components: a memoized row does **not** re-render when a sibling row changes; an unchanged cycle costs zero renders; `getSnapshot` is referentially stable across unrelated parent re-renders (a fresh object per call is the canonical infinite-loop bug with `useSyncExternalStore`); StrictMode double-mount keeps one subscription; siblings advance in lock-step. |
 | `sse` | 19 | The hand-rolled frame parser against a real `ReadableStream`: frames split across chunks, multi-line `data`, keep-alive comments, CRLF, `Last-Event-ID` replay, debounced re-resolve of the watched-ledger URL, jittered exponential backoff (jitter pinned, so the doubling is asserted exactly), and per-reconnect auth re-resolution. |
-| `remoteTransport` | 48 | Request construction; the SSE-triggered cycle; the client-side change gate; coalescing of head events arriving mid-cycle; ledger-path encoding; time anchors; structured errors; per-subscription delivery ordering; cancellation of superseded requests; the bounded fan-out (mutation-checked — removing the bound fails the test). |
-| `peerTransport` | 25 | Engine-id mapping; the batch preserved as one cycle; async-registration races (including an unsubscribe that beats its own registration); the two refusals (`at`, non-native `format`); and crash recycles — re-registration on `"ready"`, stale-id invalidation, and loud failure on `"terminal"`. |
+| `remoteTransport` | 51 | Request construction; the SSE-triggered cycle; the client-side change gate; coalescing of head events arriving mid-cycle; ledger-path encoding; time anchors; structured errors; a head event advancing **every** ledger key it names, bare and branch-qualified; per-subscription delivery ordering (mutation-checked, and with the `AbortSignal` neutered so the ticket is what holds it up — the two mechanisms are separate belts and the test is now on the one that had none); cancellation of superseded requests; the bounded fan-out at mount and per commit (mutation-checked — removing the bound fails the test). |
+| `peerTransport` | 29 | Engine-id mapping; the batch preserved as one cycle; async-registration races (including an unsubscribe that beats its own registration); the two refusals (`at`, non-native `format`) on **both** the subscribe and the one-shot path; a subscribe arriving after the engine is gone answered rather than stored; and crash recycles — re-registration on `"ready"`, stale-id invalidation, and loud failure on `"terminal"`. |
 | `peerIntegration` (react-dom) | 7 | Peer mode through the real hooks: memoized rows survive `postMessage` cloning, an unchanged cycle costs zero renders, and a crash recycle keeps data on screen and then picks updates back up under the fresh engine's ids. |
 | `protocolCompat` | 2 | The seam. Imports the **real** `@fluree/db-wasm` types and asserts assignability both ways, so `tsc` fails on drift. Mutation-checked against three drifts: a changed cycle shape, a removed method, and a new lifecycle state. |
 | `integration` | 7 | The public barrel and `createClient` composed as an app uses them: an SSE head event drives a re-query that re-renders a component. |
 | `ssr` | 4 | `renderToString` yields the loading snapshot and performs no I/O. |
 
-### What the live runs found that 178 green tests could not
+### What the live runs found that 194 green tests could not
 
 Every one of these was invisible to the mocked suite, and the first three
 share a failure mode: **silence**. That is the argument for making the live
