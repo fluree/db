@@ -10,6 +10,9 @@ mod tracking;
 pub(crate) use bearer::extract_bearer_token;
 pub use bearer::{EventsPrincipal, MaybeBearer};
 pub use credential::{CredentialPayload, ExtractedCredential, MaybeCredential};
+// Only the Bolt listener uses it directly; the extractor itself is always
+// compiled.
+#[cfg(feature = "bolt")]
 pub(crate) use data_bearer::verify_data_principal;
 pub use data_bearer::{DataPrincipal, MaybeDataBearer};
 pub use headers::FlureeHeaders;

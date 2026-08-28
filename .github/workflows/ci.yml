@@ -372,6 +372,18 @@ jobs:
     env:
       RUSTFLAGS: --cfg getrandom_backend="wasm_js"
     steps:
+      # This job carries a wasm32 target dir AND a native one (the peer
+      # gate's server binary), which is what pushed it into the same disk
+      # pressure `clippy`, `test`, `testsuite-sparql` and `bench-compare`
+      # all clear first.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
@@ -435,9 +447,20 @@ jobs:
         # is invalid for a native target — clear it for this one native build.
         # (`.cargo/config.toml` scopes that cfg to wasm32 already; only the env
         # restatement leaks across targets.)
+        #
+        # Only the features the gate actually uses. The server's DEFAULT set
+        # is native+credential+iceberg+shacl+bolt, and `iceberg` drags in
+        # `fluree-db-iceberg/aws` — the whole AWS SDK plus Arrow/Parquet, 56
+        # crates this gate never touches (641 -> 473 unique dependencies).
+        # `credential` IS needed: the gate mints an Ed25519 did:key identity
+        # and a `fluree.storage.ledgers` JWS, and starts the server trusting
+        # exactly that issuer, so the storage proxy has to verify a signed
+        # token rather than run `--insecure`.
         env:
           RUSTFLAGS: ""
-        run: cargo build -p fluree-db-server --bin fluree-server
+        run: |
+          cargo build -p fluree-db-server --bin fluree-server \
+            --no-default-features --features native,credential
 
       - name: Peer gate (browser peer ↔ real fluree-db-server)
         working-directory: fluree-db-wasm/js

@@ -11,6 +11,10 @@ mod export;
 pub mod graphql;
 #[cfg(feature = "iceberg")]
 mod iceberg;
+// Its only consumer is `iceberg.rs` above, and the api function it delegates
+// to is itself iceberg-gated — leaving this ungated made
+// `--no-default-features --features native` fail to compile.
+#[cfg(feature = "iceberg")]
 mod iceberg_ssrf;
 mod import;
 mod ledger;
