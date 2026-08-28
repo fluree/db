@@ -479,6 +479,14 @@ jobs:
       - name: Size report
         run: cat fluree-db-wasm/js/pkg/size-report.json
 
+  # NOTE on the filter below: `fluree-db-wasm/js/` is in it because the
+  # react-sdk job genuinely compiles that tree — `test/protocolCompat.test.ts`
+  # imports `../../fluree-db-wasm/js/src/index.js` and `.../protocol.js` by
+  # relative path and tsconfig's `include` covers `test/**`, so Type-check
+  # compiles it, Test loads it, and Demo type-checks it again through
+  # `demo/tsconfig.json`. Without it a change to `connect()`'s signature or the
+  # protocol types merges green and the NEXT unrelated fluree-react PR goes red
+  # for someone else's change — the failure landing on the wrong author.
   react-paths:
     # Same reason bench-paths exists: GitHub's `paths:` filter is
     # workflow-scoped and the rest of this workflow must run on every PR, so
@@ -505,7 +513,7 @@ jobs:
           fi
           changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
           echo "changed files:"; echo "$changed"
-          if echo "$changed" | grep -qE '^fluree-react/|^\.github/workflows/ci\.yml$'; then
+          if echo "$changed" | grep -qE '^fluree-react/|^fluree-db-wasm/js/|^\.github/workflows/ci\.yml$'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
