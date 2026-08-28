@@ -375,6 +375,78 @@ ex:StrictPersonShape a sh:NodeShape ;
 
 A closed shape forbids any property not explicitly declared (or listed in `sh:ignoredProperties`). Per the SHACL spec, `rdf:type` is **not** implicitly ignored — a closed shape with `sh:targetClass` (whose instances necessarily carry `rdf:type`) must list it in `sh:ignoredProperties`, as above.
 
+### SPARQL-based constraints (`sh:sparql`)
+
+When no core constraint expresses a rule, attach a SPARQL SELECT query. The
+query runs once per focus node with `$this` pre-bound; **every solution row
+is a violation**:
+
+```turtle
+# A user's personal and work email must differ.
+ex:UserShape a sh:NodeShape ;
+  sh:targetClass ex:User ;
+  sh:sparql [
+    sh:message "personal and work email must differ" ;
+    sh:select """
+      SELECT $this ?value
+      WHERE {
+        $this ex:personalEmail ?value .
+        $this ex:workEmail ?value .
+      }""" ;
+  ] .
+```
+
+Result mapping follows the spec: `sh:focusNode` is `$this`; `sh:value` is the
+`?value` binding (defaulting to the focus node); `sh:resultPath` is the
+`?path` binding when it is an IRI, else the owning property shape's path;
+`sh:resultMessage` is the `?message` binding, else the constraint's
+`sh:message` with `{?var}` / `{$var}` templates substituted from the
+solution. `sh:sourceConstraintComponent` is `sh:SPARQLConstraintComponent`.
+
+On a **property shape**, `$PATH` stands for the shape's predicate path
+(plain predicate paths only):
+
+```turtle
+ex:GermanLabelShape a sh:PropertyShape ;
+  sh:targetClass ex:Country ;
+  sh:path ex:germanLabel ;
+  sh:sparql [
+    sh:message "Values must be literals with a German language tag" ;
+    sh:select """
+      SELECT $this ?value
+      WHERE {
+        $this $PATH ?value .
+        FILTER (!isLiteral(?value) || !langMatches(lang(?value), "de"))
+      }""" ;
+  ] .
+```
+
+Prefixes for the query come from `sh:prefixes`, which points at an ontology
+carrying `sh:declare [ sh:prefix "ex" ; sh:namespace "…"^^xsd:anyURI ]`
+entries (followed through `owl:imports`) — or simply write full IRIs.
+
+The spec's **pre-binding restrictions** are enforced: the query must be a
+SELECT and must not use `MINUS`, `SERVICE`, `VALUES`, reassign `$this`
+(`BIND (… AS $this)`), or use a sub-`SELECT` that fails to project `$this`
+(including `SELECT *`). A query that breaks these — or does not parse — is a
+validation *failure*: transactions on focus nodes the shape targets are
+rejected with the reason, scoped to that shape rather than wedging the
+ledger. `$shapesGraph` / `$currentShape` (optional per spec) are not
+supported.
+
+Like every other constraint, `sh:sparql` runs at transaction staging time
+against the staged view — the query sees the transaction's writes exactly as
+they would commit.
+
+`sh:sparql` constraints also work when the shapes live in another ledger
+(cross-ledger `f:shapesSource`) — the query text and its prefix declarations
+travel with the shapes. At write time the query lowers against the *staged*
+namespace registry, so a constraint matches data from the very transaction
+that first introduces its namespace. A constraint over vocabulary the data
+ledger has never seen anywhere is silently inert — it lowers to terms that
+match no data and yields no rows, never an error — so shapes can ship rules
+for classes and predicates the data doesn't use yet.
+
 ## RDFS entailment in enforcement
 
 SHACL enforcement applies RDFS subclass and subproperty inference
@@ -621,6 +693,41 @@ become part of permanent ledger state.
   Identifiers are compacted against the transaction's own `@context`, using its explicit prefixes and `@base` (never `@vocab`), so a violation names the terms you wrote. Where there is no context to compact against — a Turtle insert, or commit replay — the same fields report full IRIs instead.
 - **`f:ValidationWarn`**: violations are logged via `tracing::warn!` and the transaction proceeds. Any **non-violation** error from the SHACL pipeline (compile failure, range-scan failure) still propagates — Warn mode never silently admits a broken validation pipeline.
 
+### Per-transaction mode override
+
+A transaction can request a mode for itself with `opts.validationMode`
+(`"warn"` or `"reject"`):
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "insert": {"@id": "ex:duplicate-candidate", "...": "..."},
+  "opts": {"validationMode": "warn"}
+}
+```
+
+Strengthening (`warn` → `reject`) is always honored. Softening (`reject` →
+`warn`) is granted only when the SHACL group's `f:overrideControl` permits
+it for the request's verified identity — `f:OverrideAll` (the default)
+permits everyone, `f:OverrideNone` pins the configured posture, and an
+identity-restricted list limits softening to named identities. A denied
+request keeps the configured mode; it does not fail the transaction. The
+request never toggles `f:shaclEnabled`.
+
+This is the tool for surgical exceptions — e.g. a remediation agent whose
+merge writes transiently violate uniqueness shapes softens its own writes
+instead of flipping the graph's standing posture for every writer. To limit
+softening to that agent alone:
+
+```trig
+<urn:config:shacl> f:overrideControl [
+  f:controlMode f:IdentityRestricted ;
+  f:allowedIdentities ( <did:key:remediation-agent> )
+] .
+```
+
+See [Override control](../ledger-config/override-control.md#shacl-fshacldefaults).
+
 ## Working with shapes across write surfaces
 
 SHACL validation runs consistently on every write surface:
@@ -661,7 +768,11 @@ with per-result constraint-component IRIs, severities, and messages, plus
 
 ## Not yet supported
 
-- `sh:sparql` (SPARQL-based constraints).
+- SPARQL-based constraint *components* (`sh:ConstraintComponent`,
+  `sh:validator`, `sh:parameter`) — reusable parameterized components are
+  ignored; use `sh:sparql` directly instead.
+- `$shapesGraph` / `$currentShape` in `sh:sparql` queries (optional per
+  spec; queries using them fail closed).
 
 These are tracked in the SHACL compliance effort.
 

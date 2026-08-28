@@ -4982,3 +4982,301 @@ async fn shacl_target_subjects_of_sees_subproperties() {
         .unwrap_err();
     assert_shacl_violation(err, "at least 1");
 }
+
+/// sh:sparql on a node shape: the SELECT runs per focus node with $this
+/// pre-bound; solutions reject the transaction, conforming data commits.
+#[tokio::test]
+async fn shacl_sparql_node_constraint() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    // A user may not have both ex:personalEmail and ex:workEmail equal.
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UserShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:sparql": {
+            "@id": "ex:UserShape-sparql",
+            "sh:message": "personal and work email must differ",
+            "sh:select": "SELECT $this ?value WHERE { $this <http://example.org/ns/personalEmail> ?value . $this <http://example.org/ns/workEmail> ?value . }"
+        }
+    });
+
+    let ledger = fluree
+        .create_ledger("shacl/sparql-node:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    // Conforming: distinct emails.
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:ok",
+                "@type": "ex:User",
+                "ex:personalEmail": "a@example.org",
+                "ex:workEmail": "b@example.org"
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    // Violating: same value on both predicates.
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:bad",
+                "@type": "ex:User",
+                "ex:personalEmail": "same@example.org",
+                "ex:workEmail": "same@example.org"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "personal and work email must differ");
+}
+
+/// `/validate` must be able to BOUND a `sh:sparql` constraint.
+///
+/// Every other SHACL constraint can only read what is reachable from the
+/// focus node; a `sh:sparql` body can walk anywhere, once per focus node.
+/// Before the tracker was attached on this path, `GraphDbRef::new` left
+/// `tracker: None`, so no fuel was ever charged and an expensive constraint
+/// ran to completion (or didn't) with nothing to stop it.
+#[tokio::test]
+async fn validate_sparql_constraint_is_bounded_by_fuel() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    // A deliberately unselective body: every ex:Doc pairs with every ex:Doc.
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:DocShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Doc"},
+        "sh:sparql": {
+            "@id": "ex:DocShape-sparql",
+            "sh:message": "cross product",
+            "sh:select": "SELECT $this ?value WHERE { $this <http://example.org/ns/tag> ?value . ?other <http://example.org/ns/tag> ?value2 . ?third <http://example.org/ns/tag> ?value3 . }"
+        }
+    });
+
+    let mut ledger = fluree
+        .create_ledger("shacl/validate-fuel:main")
+        .await
+        .unwrap();
+
+    // Data first: the shape lands last so staging never enforces it during
+    // seeding (this test is about the /validate path, not the write path).
+    for i in 0..40 {
+        ledger = fluree
+            .upsert(
+                ledger,
+                &json!({
+                    "@context": context.clone(),
+                    "@id": format!("ex:doc{i}"),
+                    "@type": "ex:Doc",
+                    "ex:tag": format!("t{}", i % 4)
+                }),
+            )
+            .await
+            .unwrap()
+            .ledger;
+    }
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+
+    // Unbounded (the CLI / default posture): the pass completes.
+    let unbounded = crate::validate::validate_view(
+        &view,
+        "shacl/validate-fuel:main",
+        &crate::validate::ValidateOptions::default(),
+    )
+    .await
+    .expect("control: the same pass completes without a fuel ceiling");
+    assert!(
+        !unbounded.conforms,
+        "control: the constraint really does run and report"
+    );
+
+    // Bounded: the ceiling is reached and the request is refused rather than
+    // running the constraint once per focus node to completion.
+    let bounded = crate::validate::validate_view(
+        &view,
+        "shacl/validate-fuel:main",
+        &crate::validate::ValidateOptions {
+            max_fuel: Some(500),
+            ..Default::default()
+        },
+    )
+    .await;
+    let err = bounded.expect_err("a fuel ceiling must bound sh:sparql validation");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.to_lowercase().contains("fuel"),
+        "expected a fuel-exceeded refusal, got: {rendered}"
+    );
+}
+
+/// A node-shape constraint whose query merely MENTIONS `$PATH` inside a
+/// string literal still runs. `$PATH` is only available on property shapes,
+/// so treating the literal as a use would hard-error the constraint
+/// ("$PATH is only supported ... on property shapes") instead of validating.
+/// The decision is read off the lowered variable set, which is exact.
+#[tokio::test]
+async fn shacl_sparql_node_constraint_with_path_in_a_literal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    // Flags any ex:Config whose ex:pattern is literally the string "$PATH".
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@type": "sh:NodeShape",
+        "@id": "ex:ConfigShape",
+        "sh:targetClass": {"@id": "ex:Config"},
+        "sh:sparql": {
+            "@id": "ex:ConfigShape-sparql",
+            "sh:message": "ex:pattern must not be the literal $PATH",
+            "sh:select": "SELECT $this ?value WHERE { $this <http://example.org/ns/pattern> ?value . FILTER(?value = \"$PATH\") }"
+        }
+    });
+
+    let ledger = fluree
+        .create_ledger("shacl/sparql-path-literal:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    // Conforming data validates rather than erroring on the missing $PATH.
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:okConfig",
+                "@type": "ex:Config",
+                "ex:pattern": "/usr/bin"
+            }),
+        )
+        .await
+        .expect("a $PATH string literal must not make a node-shape constraint unusable")
+        .ledger;
+
+    // And the constraint genuinely runs: the matching value is caught.
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:badConfig",
+                "@type": "ex:Config",
+                "ex:pattern": "$PATH"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "ex:pattern must not be the literal $PATH");
+}
+
+/// sh:sparql on a property shape: $PATH binds to the shape's predicate path
+/// and violations report the property shape's path.
+#[tokio::test]
+async fn shacl_sparql_property_constraint_with_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    // Every ex:score value must be non-negative (expressed via SPARQL rather
+    // than sh:minInclusive to exercise the $PATH lane).
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:ScoreShape",
+        "@type": "sh:PropertyShape",
+        "sh:targetClass": {"@id": "ex:Player"},
+        "sh:path": {"@id": "ex:score"},
+        "sh:sparql": {
+            "@id": "ex:ScoreShape-sparql",
+            "sh:message": "score {?value} must be >= 0",
+            "sh:select": "SELECT $this ?value WHERE { $this $PATH ?value . FILTER (?value < 0) }"
+        }
+    });
+
+    let ledger = fluree
+        .create_ledger("shacl/sparql-path:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:alice",
+                "@type": "ex:Player",
+                "ex:score": 10
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:bob",
+                "@type": "ex:Player",
+                "ex:score": -5
+            }),
+        )
+        .await
+        .unwrap_err();
+    // Message template substitutes the solution's ?value binding.
+    assert_shacl_violation(err, "score -5 must be >= 0");
+}
+
+/// An invalid sh:select (here: MINUS, forbidden under pre-binding) is a
+/// validation FAILURE: the transaction errors when the shape fires, and the
+/// error names the restriction rather than reporting a violation.
+#[tokio::test]
+async fn shacl_sparql_invalid_query_fails_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:BadShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Thing"},
+        "sh:sparql": {
+            "@id": "ex:BadShape-sparql",
+            "sh:select": "SELECT $this WHERE { $this ?p ?o . MINUS { $this ?p \"x\" } }"
+        }
+    });
+
+    let ledger = fluree
+        .create_ledger("shacl/sparql-invalid:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:thing1",
+                "@type": "ex:Thing"
+            }),
+        )
+        .await
+        .unwrap_err();
+    let message = format!("{err:?}");
+    assert!(
+        message.contains("MINUS"),
+        "expected pre-binding restriction error naming MINUS, got: {message}"
+    );
+}

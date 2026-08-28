@@ -131,7 +131,61 @@ pub(crate) fn cached_stats_view_for_db(
         return Some(cache.get_or_build_stats_view(cache_key, build_view));
     }
 
+    // No binary store (memory-mode / unindexed ledger): the leaflet-cache
+    // home for stats views doesn't exist, and rebuilding per call walks the
+    // whole novelty in `assemble_fast_stats` — per-query loops (SHACL
+    // sh:sparql validation, transaction WHEREs) paid O(novelty) planning per
+    // execution, which made file-mode sh:sparql validation quadratic in
+    // focus nodes. Fall back to a small process-global cache, keyed by the
+    // same key PLUS the overlay's `content_version()` — the documented
+    // globally-unique content stamp — since `epoch()` alone is only unique
+    // within one overlay instance's lifetime. No version stamp → no caching
+    // (identical to before).
+    if let Some(version) = db.overlay.content_version() {
+        return Some(storeless_stats_cache_get_or_build(
+            cache_key, version, build_view,
+        ));
+    }
+
     Some(build_view())
+}
+
+/// Tiny LRU for stats views of store-less (memory-mode) ledgers. A handful
+/// of slots suffices: one validation or transaction loop reuses a single
+/// entry thousands of times, and distinct concurrently-active memory ledgers
+/// are rare. Capacity-bounded so long-lived processes can't accumulate views.
+fn storeless_stats_cache_get_or_build(
+    cache_key: u128,
+    content_version: u64,
+    build_view: impl FnOnce() -> Arc<StatsView>,
+) -> Arc<StatsView> {
+    use parking_lot::Mutex;
+
+    const CAPACITY: usize = 8;
+    type Slot = (u128, u64, Arc<StatsView>);
+    static CACHE: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
+
+    {
+        let mut cache = CACHE.lock();
+        if let Some(pos) = cache
+            .iter()
+            .position(|(k, v, _)| *k == cache_key && *v == content_version)
+        {
+            let hit = cache.remove(pos);
+            let view = Arc::clone(&hit.2);
+            cache.push(hit); // most-recently-used at the back
+            return view;
+        }
+    }
+
+    // Build outside the lock — assembly walks the overlay and can be slow.
+    let view = build_view();
+    let mut cache = CACHE.lock();
+    if cache.len() >= CAPACITY {
+        cache.remove(0);
+    }
+    cache.push((cache_key, content_version, Arc::clone(&view)));
+    view
 }
 
 #[cfg(test)]
@@ -195,6 +249,97 @@ mod tests {
                 .count,
             2
         );
+    }
+
+    /// A second call at the same `content_version` returns the SAME view
+    /// object rather than rebuilding. This is the property the store-less
+    /// cache exists for: without it, per-query loops (sh:sparql validation,
+    /// transaction WHEREs) pay a full `assemble_fast_stats` novelty walk on
+    /// every execution.
+    #[test]
+    fn storeless_stats_view_is_reused_at_the_same_content_version() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("cache-hit:main");
+        let mut novelty = Novelty::new(1);
+        novelty
+            .apply_commit(
+                vec![prop_flake(
+                    Sid::new(10, "alice"),
+                    Sid::new(10, "score"),
+                    42,
+                    2,
+                )],
+                2,
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        let first =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 2), None, false)
+                .expect("first view");
+        let second =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &novelty, 2), None, false)
+                .expect("second view");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged overlay must hit the cache, not rebuild"
+        );
+    }
+
+    /// Two clones that diverge from the same base carry the SAME `epoch` —
+    /// `epoch` is only unique within one instance's lifetime — so keying on
+    /// it alone would serve one clone's stats for the other. The
+    /// `content_version` stamp is what separates them.
+    #[test]
+    fn storeless_stats_view_misses_when_content_version_diverges() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("cache-miss:main");
+        let base = Novelty::new(1);
+
+        let mut one_flake = base.clone();
+        one_flake
+            .apply_commit(
+                vec![prop_flake(Sid::new(10, "a"), Sid::new(10, "score"), 1, 2)],
+                2,
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        let mut two_flakes = base.clone();
+        two_flakes
+            .apply_commit(
+                vec![
+                    prop_flake(Sid::new(10, "b"), Sid::new(10, "score"), 2, 2),
+                    prop_flake(Sid::new(10, "c"), Sid::new(10, "score"), 3, 2),
+                ],
+                2,
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        // The precondition that makes this test meaningful.
+        assert_eq!(
+            one_flake.epoch, two_flakes.epoch,
+            "divergent clones must collide on epoch, or this proves nothing"
+        );
+        assert_ne!(
+            OverlayProvider::content_version(&one_flake),
+            OverlayProvider::content_version(&two_flakes),
+            "content versions must diverge"
+        );
+
+        let view_one =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &one_flake, 2), None, false)
+                .expect("view one");
+        let view_two =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &two_flakes, 2), None, false)
+                .expect("view two");
+
+        let count = |v: &Arc<StatsView>| {
+            v.get_property(&Sid::new(10, "score"))
+                .expect("score stat")
+                .count
+        };
+        assert_eq!(count(&view_one), 1, "one-flake clone sees its own novelty");
+        assert_eq!(count(&view_two), 2, "two-flake clone sees its own novelty");
     }
 
     #[test]

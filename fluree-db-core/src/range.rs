@@ -122,10 +122,26 @@ where
         None if snapshot.t == 0 => {
             // Genesis Db: no base data, return overlay flakes only.
             // Per-graph novelty returns only the requested graph's flakes.
+            //
+            // Seek instead of scanning: when the equality match's bound
+            // components form a prefix of `index` order, hand the overlay
+            // min/max prefix bounds so it can binary-search its segments
+            // rather than yielding every flake it holds. Without this,
+            // point probes against an unindexed (all-novelty) ledger paid a
+            // full clone+sort of the overlay PER CALL — per-focus-node
+            // loops like SHACL validation went quadratic (`fluree validate
+            // <file>`: 4k subjects 16.9s, 31.6k killed at 26min; linear
+            // after this seek).
             let to_t = opts.to_t.unwrap_or(i64::MAX);
-            let mut flakes = collect_overlay_only(overlay, g_id, index, to_t);
-            // Apply RangeMatch filtering — collect_overlay_only returns all
-            // overlay flakes for this graph; narrow them to the requested range.
+            let bounds = overlay_eq_bounds(index, test, &match_val);
+            let (first, rhs) = match &bounds {
+                Some((lo, hi)) => (Some(lo), Some(hi)),
+                None => (None, None),
+            };
+            let mut flakes = collect_overlay_only(overlay, g_id, index, to_t, first, rhs);
+            // Exact narrowing — the seek is a prefix bound (and a
+            // non-prefix match takes the unbounded walk), so the requested
+            // range still needs the full filter either way.
             apply_range_filter(&mut flakes, test, &match_val);
             // Apply RangeOptions semantics for overlay-only path (object bounds, offset, limits).
             //
@@ -172,9 +188,13 @@ where
             // Per-graph novelty returns only the requested graph's flakes.
             let to_t = opts.to_t.unwrap_or(i64::MAX);
             let cmp = index.comparator();
-            let mut flakes = collect_overlay_only(overlay, g_id, index, to_t);
-            // Apply start/end bounds — collect_overlay_only returns all
-            // overlay flakes for this graph; narrow to the [start_bound, end_bound] range.
+            // Upper-bound-only seek: the overlay's left bound is EXCLUSIVE
+            // (`> first`), while this API's `start_bound` is inclusive — a
+            // flake exactly equal to `start_bound` would be dropped by a
+            // left seek, so only the right bound (inclusive on both sides)
+            // prunes the walk. The retain below applies both bounds exactly.
+            let mut flakes =
+                collect_overlay_only(overlay, g_id, index, to_t, None, Some(&end_bound));
             flakes.retain(|f| {
                 cmp(f, &start_bound) != std::cmp::Ordering::Less
                     && cmp(f, &end_bound) != std::cmp::Ordering::Greater
@@ -326,22 +346,89 @@ fn apply_overlay_only_options(flakes: &mut Vec<Flake>, opts: &RangeOptions) {
 ///
 /// Queries the overlay for all flakes matching the graph and index, applies time
 /// filtering, sorts by index comparator, and removes stale flakes.
+/// Derive overlay seek bounds for an equality range match.
+///
+/// Returns min/max prefix bound flakes in `index` order when the match's
+/// bound components form a prefix of that order (SPOT: `s` / `s+p`;
+/// PSOT: `p`; POST: `p` / `p+o`; OPST: `o`), letting the overlay
+/// binary-search its segments instead of yielding everything it holds. The
+/// min/max sentinels carry `t = i64::MIN / i64::MAX`, so every real flake
+/// compares strictly inside them — the overlay's left-EXCLUSIVE
+/// `(first, rhs]` contract still yields every matching flake. Non-equality
+/// tests post-filter at call sites and take the unbounded walk.
+///
+/// OPST bounds stop at the object: `cmp_object` orders by value THEN
+/// datatype, and the predicate compares after both — so with the datatype
+/// unmatched, an `o+p` bound covers exactly the same span as `o` alone.
+fn overlay_eq_bounds(
+    index: IndexType,
+    test: RangeTest,
+    match_val: &RangeMatch,
+) -> Option<(Flake, Flake)> {
+    if test != RangeTest::Eq {
+        return None;
+    }
+    match index {
+        IndexType::Spot => match (&match_val.s, &match_val.p) {
+            (Some(s), Some(p)) => Some((
+                Flake::min_for_subject_predicate(s.clone(), p.clone()),
+                Flake::max_for_subject_predicate(s.clone(), p.clone()),
+            )),
+            (Some(s), None) => Some((
+                Flake::min_for_subject(s.clone()),
+                Flake::max_for_subject(s.clone()),
+            )),
+            _ => None,
+        },
+        IndexType::Psot => match_val.p.as_ref().map(|p| {
+            (
+                Flake::min_for_predicate(p.clone()),
+                Flake::max_for_predicate(p.clone()),
+            )
+        }),
+        IndexType::Post => match (&match_val.p, &match_val.o) {
+            (Some(p), Some(o)) => Some((
+                Flake::min_for_predicate_object(p.clone(), o.clone()),
+                Flake::max_for_predicate_object(p.clone(), o.clone()),
+            )),
+            (Some(p), None) => Some((
+                Flake::min_for_predicate(p.clone()),
+                Flake::max_for_predicate(p.clone()),
+            )),
+            _ => None,
+        },
+        IndexType::Opst => match_val.o.as_ref().map(|o| {
+            (
+                Flake::min_for_object(o.clone()),
+                Flake::max_for_object(o.clone()),
+            )
+        }),
+    }
+}
+
 fn collect_overlay_only<O: OverlayProvider + ?Sized>(
     overlay: &O,
     g_id: GraphId,
     index: IndexType,
     to_t: i64,
+    first: Option<&Flake>,
+    rhs: Option<&Flake>,
 ) -> Vec<Flake> {
     let cmp = index.comparator();
     let mut flakes: Vec<Flake> = Vec::new();
 
-    // Request all overlay flakes for this graph+index (leftmost=true, rhs=None → full range).
-    overlay.for_each_overlay_flake(g_id, index, None, None, true, to_t, &mut |f| {
+    // `leftmost=true` (start from the beginning) exactly when no lower bound
+    // was derived; a lower bound is a min-sentinel every real flake compares
+    // strictly above, so the exclusive `> first` semantics lose nothing.
+    overlay.for_each_overlay_flake(g_id, index, first, rhs, first.is_none(), to_t, &mut |f| {
         if f.t <= to_t {
             flakes.push(f.clone());
         }
     });
 
+    // Providers must yield in index order already; this sort is a cheap
+    // (now typically bounded-set) safety net for non-compliant overlays,
+    // and `remove_stale_flakes` depends on that order.
     flakes.sort_by(cmp);
 
     // Remove stale: keep newest occurrence of each fact key, drop retractions.
@@ -844,5 +931,177 @@ mod tests {
         assert!(bounds.matches(&FlakeValue::Long(0)));
         assert!(bounds.matches(&FlakeValue::Long(i64::MAX)));
         assert!(bounds.matches(&FlakeValue::String("anything".to_string())));
+    }
+
+    /// Sorted-vec overlay that records the bounds each walk received and
+    /// honors them the way novelty does (`(first, rhs]`, left-exclusive
+    /// unless `leftmost`). Lets the tests below pin BOTH properties of the
+    /// overlay-only seek: results stay correct, and prefix probes actually
+    /// arrive bounded instead of walking everything.
+    struct RecordingOverlay {
+        flakes: Vec<Flake>, // pre-sorted in SPOT order by the test
+        bounded_calls: std::sync::atomic::AtomicUsize,
+        yielded: std::sync::atomic::AtomicUsize,
+    }
+
+    impl OverlayProvider for RecordingOverlay {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn epoch(&self) -> u64 {
+            1
+        }
+
+        fn for_each_overlay_flake(
+            &self,
+            _g_id: GraphId,
+            index: IndexType,
+            first: Option<&Flake>,
+            rhs: Option<&Flake>,
+            leftmost: bool,
+            to_t: i64,
+            callback: &mut dyn FnMut(&Flake),
+        ) {
+            use std::sync::atomic::Ordering::Relaxed;
+            if first.is_some() || rhs.is_some() {
+                self.bounded_calls.fetch_add(1, Relaxed);
+            }
+            let cmp = index.comparator();
+            for f in &self.flakes {
+                if f.t > to_t {
+                    continue;
+                }
+                if !leftmost {
+                    if let Some(lo) = first {
+                        if cmp(f, lo) != std::cmp::Ordering::Greater {
+                            continue;
+                        }
+                    }
+                }
+                if let Some(hi) = rhs {
+                    if cmp(f, hi) == std::cmp::Ordering::Greater {
+                        continue;
+                    }
+                }
+                self.yielded.fetch_add(1, Relaxed);
+                callback(f);
+            }
+        }
+    }
+
+    fn subject_flake(s: &str, p: &str, o: &str) -> Flake {
+        Flake {
+            g: None,
+            s: Sid::new(1, s),
+            p: Sid::new(2, p),
+            o: FlakeValue::String(o.to_string()),
+            dt: Sid::new(3, "string"),
+            t: 1,
+            op: true,
+            m: None,
+        }
+    }
+
+    /// A subject+predicate Eq probe against a genesis (overlay-only) view
+    /// must seek — the overlay sees prefix bounds and yields only the
+    /// matching flakes — and still return exactly the right rows. This is
+    /// the per-focus-node probe SHACL validation hammers; unbounded it made
+    /// `fluree validate <file>` quadratic in focus nodes.
+    #[tokio::test]
+    async fn overlay_only_eq_probe_is_bounded_and_correct() {
+        let mut flakes: Vec<Flake> = (0..100)
+            .flat_map(|i| {
+                let s = format!("s{i:03}");
+                vec![
+                    subject_flake(&s, "name", &format!("name-{i}")),
+                    subject_flake(&s, "kind", "widget"),
+                ]
+            })
+            .collect();
+        flakes.sort_by(IndexType::Spot.comparator());
+        let overlay = RecordingOverlay {
+            flakes,
+            bounded_calls: Default::default(),
+            yielded: Default::default(),
+        };
+
+        let snapshot = crate::LedgerSnapshot::genesis("test/main");
+        let out = range_with_overlay(
+            &snapshot,
+            0,
+            &overlay,
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject_predicate(Sid::new(1, "s042"), Sid::new(2, "name")),
+            RangeOptions::default().with_to_t(10),
+        )
+        .await
+        .expect("range");
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].o, FlakeValue::String("name-42".into()));
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(
+            overlay.bounded_calls.load(Relaxed),
+            1,
+            "prefix Eq probe must pass seek bounds to the overlay"
+        );
+        assert_eq!(
+            overlay.yielded.load(Relaxed),
+            1,
+            "bounded walk must not yield the whole overlay"
+        );
+    }
+
+    /// Bare-subject and predicate-prefix probes bound too; an OPST probe
+    /// (object-led order, no prefix constructor) legitimately does not.
+    #[test]
+    fn overlay_eq_bounds_cover_index_prefixes() {
+        let s = Sid::new(1, "s");
+        let p = Sid::new(2, "p");
+
+        let sp = overlay_eq_bounds(
+            IndexType::Spot,
+            RangeTest::Eq,
+            &RangeMatch::subject_predicate(s.clone(), p.clone()),
+        );
+        assert!(sp.is_some());
+
+        let s_only = overlay_eq_bounds(IndexType::Spot, RangeTest::Eq, &RangeMatch::subject(s));
+        assert!(s_only.is_some());
+
+        for index in [IndexType::Psot, IndexType::Post] {
+            assert!(
+                overlay_eq_bounds(index, RangeTest::Eq, &RangeMatch::predicate(p.clone()))
+                    .is_some()
+            );
+        }
+
+        // Object-led prefixes: POST narrows to p+o, OPST to the object.
+        let o = FlakeValue::String("v".into());
+        assert!(overlay_eq_bounds(
+            IndexType::Post,
+            RangeTest::Eq,
+            &RangeMatch::predicate_object(p.clone(), o.clone())
+        )
+        .is_some());
+        assert!(overlay_eq_bounds(
+            IndexType::Opst,
+            RangeTest::Eq,
+            &RangeMatch::predicate_object(p.clone(), o)
+        )
+        .is_some());
+
+        // Non-prefix / non-Eq shapes stay unbounded.
+        assert!(overlay_eq_bounds(
+            IndexType::Opst,
+            RangeTest::Eq,
+            &RangeMatch::predicate(p.clone())
+        )
+        .is_none());
+        assert!(
+            overlay_eq_bounds(IndexType::Psot, RangeTest::Ge, &RangeMatch::predicate(p)).is_none()
+        );
     }
 }
