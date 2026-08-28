@@ -214,6 +214,16 @@ pub enum FormatError {
     /// Fuel limit exceeded during formatting (expansion)
     #[error(transparent)]
     FuelExceeded(#[from] FuelExceededError),
+
+    /// A residency FETCH failed while recovering a formatting-time miss
+    /// (wasm32 / the `residency` feature). Distinct from
+    /// [`InvalidBinding`](Self::InvalidBinding) on purpose: the bindings are
+    /// fine and the request is fine — the bytes needed to materialize them
+    /// could not be retrieved. Folding it into `InvalidBinding` made the
+    /// shell's mapping read a network failure as "your data is malformed"
+    /// and answer 400 to something a retry can fix.
+    #[error("Residency fetch failed: {0}")]
+    ResidencyFetch(String),
 }
 
 /// Result type for formatting operations
@@ -536,9 +546,7 @@ pub async fn format_results_async(
                             fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
                         )
                         .await
-                        .map_err(|re| {
-                            FormatError::InvalidBinding(format!("residency retry failed: {re}"))
-                        })?;
+                        .map_err(|re| FormatError::ResidencyFetch(re.to_string()))?;
                     if retried {
                         tracing::debug!(
                             rounds = budget.rounds(),
