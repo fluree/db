@@ -1274,14 +1274,27 @@ struct DeferredPattern {
 /// question: it unions a `UNION`'s branches (`ir/pattern.rs`) and recurses
 /// straight through a nested `Optional`. Reading it as "already bound" is what
 /// let a variable bound in only ONE union branch suppress
-/// [`values_needs_optional_barrier`] for a later sibling OPTIONAL that genuinely
-/// introduces it — the barrier stopped firing and #1690 came back one UNION
-/// away from the shape it was written for.
+/// [`values_optional_barrier_indices`] for a later sibling OPTIONAL that
+/// genuinely introduces it — the barrier stopped firing and #1690 came back one
+/// UNION away from the shape it was written for.
 ///
-/// Shared with [`subquery_correlation_vars`], which needs the identical rule to
+/// **`Bind` is a known may-bind variant this function deliberately counts, so
+/// the contract above is not unconditional.** `Pattern::Bind` binds nothing on
+/// a row whose expression errors — `bind.rs` yields `Binding::Unbound` — and a
+/// BIND-then-OPTIONAL lead can therefore fabricate exactly as a UNION lead
+/// does. It is counted anyway because [`subquery_correlation_vars`] needs it
+/// counted: a variable the subquery produces through a WITH-pipeline binder
+/// must not be read as an external correlation, or the subquery is deferred on
+/// a variable only it can bind. That is the one concept where the two call
+/// sites genuinely want different answers, and it is resolved in the
+/// correlation site's favour — so tightening `Bind` here on the strength of the
+/// stated contract would quietly break subquery correlation. It needs a fix at
+/// both sites or at neither.
+///
+/// Shared with [`subquery_correlation_vars`], which needs the same rule to
 /// decide whether a shared SELECT-list variable is a join key or a correlation
 /// input — it used to state it as an inline `matches!` allow-list. One relation
-/// over one concept, so the two cannot drift.
+/// over one concept, with `Bind` above as the single knowing exception.
 ///
 /// Note `collect_guaranteed_vars` is NOT this function despite the name: it is
 /// plain `produced_vars`, with the branch intersection done at its
@@ -1348,8 +1361,34 @@ fn must_bind_vars(pattern: &Pattern) -> HashSet<VarId> {
             vars.extend(body.iter().flat_map(must_bind_vars));
             vars
         }
-        // Triples, property paths, BIND/UNWIND/VALUES, search adapters: every
-        // solution they emit carries their produced vars.
+        // A constant table guarantees only the columns with no UNDEF cell. Both
+        // surfaces lower `UNDEF` to `Binding::Unbound` — SPARQL in
+        // `lower_values_pattern`, JSON-LD in `lower_values_cell` — so such a
+        // column does not bind its variable in every row, and a leading
+        // `VALUES (?s ?f) { (ex:alice UNDEF) … }` otherwise recorded `?f` as
+        // required-bound and SUPPRESSED the barrier for a following OPTIONAL
+        // that genuinely introduces it. Same suppressor class as the UNION
+        // above, and UNDEF-in-VALUES is the parameterized-query idiom #1690
+        // names as its motivating usage, so it is not a corner.
+        //
+        // A zero-row table is vacuously must-bind on every column: it emits no
+        // solutions at all (the missing-predicate sentinel in `parse/lower.rs`
+        // and `empty_path_result` are both this). Cypher's WITH-pipeline
+        // binders never emit `Unbound`, so this narrowing cannot reach the
+        // `self_produced` set [`subquery_correlation_vars`] builds for them.
+        Pattern::Values { vars, rows } => vars
+            .iter()
+            .enumerate()
+            .filter(|(col, _)| {
+                rows.iter().all(|row| {
+                    row.get(*col)
+                        .is_some_and(|cell| !matches!(cell, crate::binding::Binding::Unbound))
+                })
+            })
+            .map(|(_, v)| *v)
+            .collect(),
+        // Triples, property paths, BIND/UNWIND, search adapters: every solution
+        // they emit carries their produced vars.
         other => other.produced_vars().into_iter().collect(),
     }
 }
@@ -1521,7 +1560,7 @@ pub fn reorder_patterns(
     // seed via the demotion's non-empty-pool fallback.
     //
     // A VALUES held behind an OPTIONAL barrier (see
-    // [`values_needs_optional_barrier`]) is deliberately excluded: it is not
+    // [`values_optional_barrier_indices`]) is deliberately excluded: it is not
     // seeding anything, so letting it demote a class anchor would cost that
     // anchor its seed with nothing taking its place.
     let mut seed_anchor_vars: HashSet<VarId> = subquery_output_vars.clone();
@@ -4577,6 +4616,111 @@ mod tests {
         assert!(
             values_at > optional_at,
             "a UNION branch binding the var must not suppress the barrier: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn an_undef_column_does_not_suppress_the_optional_barrier() {
+        // `?ev :entity1 ?a . VALUES (?ev ?b) { (1 UNDEF) (2 UNDEF) }
+        //  OPTIONAL { ?ev :entity2 ?b } . VALUES ?b { … }`
+        //
+        // `Values::produced_vars` is its whole variable list, so a leading table
+        // with an all-UNDEF `?b` column read as "?b is required-bound", the
+        // barrier didn't fire for the OPTIONAL that genuinely introduces `?b`,
+        // and the trailing VALUES went back to seed position — the #1690
+        // fabrication, one UNDEF away from the shape the barrier was written
+        // for. `must_bind_vars` counts only the columns with no `Unbound` cell,
+        // so `?ev` stays required-bound and `?b` correctly does not.
+        //
+        // UNDEF is not a corner here: parameterized VALUES is the usage #1690
+        // is filed over.
+        //
+        // Asserted on the PLAN, not the rows, for the same reason as
+        // `union_may_bind_does_not_suppress_the_optional_barrier`: this shape's
+        // ANSWER is also wrong for the independent, pre-existing reason filed as
+        // #1713 (an OPTIONAL over a variable already present as `Unbound`
+        // matches the triples and then doesn't write the binding), so pinning
+        // rows would pin that defect's output.
+        let (ev, a, b) = (VarId(0), VarId(1), VarId(2));
+        let anchor = Pattern::Triple(make_pattern(ev, "entity1", a));
+        let parameterized = Pattern::Values {
+            vars: vec![ev, b],
+            rows: (0..2)
+                .map(|i| {
+                    vec![
+                        crate::binding::Binding::lit(FlakeValue::Long(i), Sid::new(2, "long")),
+                        crate::binding::Binding::Unbound,
+                    ]
+                })
+                .collect(),
+        };
+        let optional = Pattern::Optional(vec![Pattern::Triple(make_pattern(ev, "entity2", b))]);
+        let values = Pattern::Values {
+            vars: vec![b],
+            rows: vec![vec![crate::binding::Binding::lit(
+                FlakeValue::Long(1),
+                Sid::new(2, "long"),
+            )]],
+        };
+
+        let ordered = reorder_patterns(
+            &[anchor, parameterized, optional, values],
+            None,
+            &HashSet::new(),
+        );
+        let optional_at = position_of(&ordered, |p| matches!(p, Pattern::Optional(_)));
+        let values_at = position_of(
+            &ordered,
+            |p| matches!(p, Pattern::Values { vars, .. } if vars == &vec![b]),
+        );
+        assert!(
+            values_at > optional_at,
+            "an UNDEF column must not suppress the barrier: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn a_bound_values_column_still_seeds_past_an_optional() {
+        // The over-fire direction for the arm above: the SAME leading table with
+        // `?b` actually bound in every row really does make `?b` required-bound,
+        // so the OPTIONAL only RESTRICTS it and the trailing VALUES keeps its
+        // exact-cardinality seed. Excluding a column on the mere presence of the
+        // variable — rather than on an `Unbound` cell — would cost that seed.
+        let (ev, a, b) = (VarId(0), VarId(1), VarId(2));
+        let anchor = Pattern::Triple(make_pattern(ev, "entity1", a));
+        let bound_table = Pattern::Values {
+            vars: vec![ev, b],
+            rows: (0..2)
+                .map(|i| {
+                    vec![
+                        crate::binding::Binding::lit(FlakeValue::Long(i), Sid::new(2, "long")),
+                        crate::binding::Binding::lit(FlakeValue::Long(1), Sid::new(2, "long")),
+                    ]
+                })
+                .collect(),
+        };
+        let optional = Pattern::Optional(vec![Pattern::Triple(make_pattern(ev, "entity2", b))]);
+        let values = Pattern::Values {
+            vars: vec![b],
+            rows: vec![vec![crate::binding::Binding::lit(
+                FlakeValue::Long(1),
+                Sid::new(2, "long"),
+            )]],
+        };
+
+        let ordered = reorder_patterns(
+            &[anchor, bound_table, optional, values],
+            None,
+            &HashSet::new(),
+        );
+        let optional_at = position_of(&ordered, |p| matches!(p, Pattern::Optional(_)));
+        let values_at = position_of(
+            &ordered,
+            |p| matches!(p, Pattern::Values { vars, .. } if vars == &vec![b]),
+        );
+        assert!(
+            values_at < optional_at,
+            "a fully-bound VALUES column must keep the trailing seed: {ordered:?}"
         );
     }
 

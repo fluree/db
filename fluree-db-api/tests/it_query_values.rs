@@ -753,6 +753,58 @@ async fn a_union_binding_the_var_does_not_suppress_the_barrier() {
 }
 
 #[tokio::test]
+async fn an_undef_values_column_does_not_suppress_the_barrier() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_values_dataset(&fluree, "values-test:main").await;
+
+    // The same suppressor class as the UNION above, reached through a leading
+    // VALUES instead. `Values::produced_vars` is its whole variable list, but
+    // both surfaces lower `UNDEF` to `Binding::Unbound`, so an all-UNDEF `?f`
+    // column binds `?f` in no row at all while reading as "required-bound" —
+    // the barrier didn't fire and the trailing `VALUES ?f` went back to seed
+    // position. `must_bind_vars` now counts only the columns with no `Unbound`
+    // cell.
+    //
+    // Not a synthetic corner: an UNDEF placeholder column is the parameterized
+    // -query idiom #1690 names as its motivating usage.
+    //
+    // Asserted on the PLAN, not the rows, for the same reason as
+    // `a_union_binding_the_var_does_not_suppress_the_barrier` — this query's
+    // answer is wrong for the second, independent reason filed as #1713.
+    // Without the arm the plan is
+    // `ProjectOperator > OptionalOperator > NestedLoopJoin > Values > Values`
+    // and the answer is the 5-row fabrication (`["ex:alice","ex:alice"]`, whose
+    // only `ex:friend` is `ex:brian`; the reference answer is 4). With it the
+    // trailing VALUES lands above the left join as it must — and the answer
+    // becomes 8 rows still carrying that fabricated one, because #1713 leaves
+    // `?f` Null on every row the OPTIONAL matched. Pinning rows here would pin
+    // that defect's output.
+    let ops = physical_plan_ops(
+        &ledger,
+        "SELECT ?s ?f WHERE { ?s schema:name ?name . \
+         VALUES (?s ?f) { (ex:alice UNDEF) (ex:cam UNDEF) (ex:liam UNDEF) \
+         (ex:brian UNDEF) (ex:nikola UNDEF) } \
+         OPTIONAL { ?s ex:friend ?f } VALUES ?f { ex:alice } }",
+    )
+    .await;
+
+    let optional_at = ops
+        .iter()
+        .position(|o| o.contains("Optional"))
+        .unwrap_or_else(|| panic!("the OPTIONAL must survive planning: {ops:?}"));
+    // Pre-order walk of the physical tree, so an earlier index is HIGHER in the
+    // plan: the trailing VALUES applying above the left join is the fix.
+    let values_at = ops
+        .iter()
+        .position(|o| o == "ValuesOperator")
+        .unwrap_or_else(|| panic!("the VALUES must be applied somewhere: {ops:?}"));
+    assert!(
+        values_at < optional_at,
+        "an all-UNDEF VALUES column must not suppress the barrier: {ops:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_subquery_exposing_an_optional_bound_var_still_joins() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_values_dataset(&fluree, "values-test:main").await;
