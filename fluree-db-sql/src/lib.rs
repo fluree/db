@@ -23,6 +23,7 @@ pub use dialect::{
     CmpOp, Literal, LogicalSource, Predicate, RenderedScan, ScanRequest, SqlDialect,
 };
 pub use error::{Result, SqlError};
+pub use net::validate_endpoint as validate_sql_endpoint;
 pub use trino::{SqlBatchStream, TrinoClient};
 
 // Re-exported so callers wire auth/secret resolution with one import.

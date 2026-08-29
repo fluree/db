@@ -130,9 +130,24 @@ pub(crate) struct IcebergCatalogSession {
     /// build (not once per table). Always cached (independent of the loadTable
     /// cache toggle) — the listing is stable for the build.
     warehouse_listings: Mutex<HashMap<String, Arc<Vec<String>>>>,
+    /// Graph sources this session has scanned that are SQL-backed. A SQL source
+    /// has no snapshot to pin, so the loadTable-cache precondition in
+    /// `verify_build_snapshot_integrity` does not apply to it.
+    sql_sources: Mutex<std::collections::HashSet<String>>,
 }
 
 impl IcebergCatalogSession {
+    pub(crate) fn mark_sql_source(&self, graph_source_id: &str) {
+        self.sql_sources
+            .lock()
+            .unwrap()
+            .insert(graph_source_id.to_string());
+    }
+
+    pub(crate) fn is_sql_source(&self, graph_source_id: &str) -> bool {
+        self.sql_sources.lock().unwrap().contains(graph_source_id)
+    }
+
     /// Cache key for a `loadTable` response: source id + fully-qualified table.
     pub(crate) fn load_table_key(graph_source_id: &str, namespace: &str, table: &str) -> String {
         format!("{graph_source_id}\u{1f}{namespace}.{table}")

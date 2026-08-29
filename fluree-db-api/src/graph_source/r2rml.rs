@@ -93,6 +93,24 @@ fn iceberg_scan_concurrency(num_files: usize) -> usize {
 /// reference, so rotating the underlying secret leaves the fingerprint unchanged
 /// — the client cache's TTL (see `cache::DEFAULT_REST_CLIENT_TTL_SECS`), not this
 /// fingerprint, is what bounds staleness in that case.
+/// The R2RML mapping reference carried by a mapped graph-source record, per
+/// source family. `None` for a non-mapped type, an unparseable config, or a
+/// record registered without a mapping.
+fn mapping_source_of(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> Option<fluree_db_iceberg::config::MappingSource> {
+    match record.source_type {
+        GraphSourceType::R2rml | GraphSourceType::Iceberg => {
+            IcebergGsConfig::from_json(&record.config)
+                .ok()
+                .and_then(|c| c.mapping)
+        }
+        #[cfg(feature = "sql")]
+        GraphSourceType::Sql => super::sql::mapping_source(record),
+        _ => None,
+    }
+}
+
 fn config_fingerprint(config: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -684,7 +702,7 @@ impl crate::Fluree {
     /// `media_type` is given. Format selection goes through the shared
     /// [`fluree_db_r2rml::loader::MappingFormat`] resolver (default Turtle) so
     /// registration and query time can never disagree (issue #1397).
-    fn compile_r2rml_content(
+    pub(crate) fn compile_r2rml_content(
         content: &str,
         media_type: Option<&str>,
         source: &str,
@@ -734,7 +752,7 @@ impl crate::Fluree {
 
     /// Collect the distinct logical table names referenced by a compiled
     /// mapping, sorted for deterministic reporting.
-    fn sorted_table_names(compiled: &CompiledR2rmlMapping) -> Vec<String> {
+    pub(crate) fn sorted_table_names(compiled: &CompiledR2rmlMapping) -> Vec<String> {
         let mut names: Vec<String> = compiled
             .table_names()
             .into_iter()
@@ -779,6 +797,26 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Self {
             fluree,
             session: std::sync::Arc::new(super::catalog_session::IcebergCatalogSession::default()),
+        }
+    }
+
+    /// The SQL source behind `graph_source_id`, or `None` when it is Iceberg-backed.
+    #[cfg(feature = "sql")]
+    async fn sql_source(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<Option<super::sql::SqlSource>> {
+        let record = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+        match record {
+            Some(r) if r.source_type == GraphSourceType::Sql => {
+                Ok(Some(super::sql::SqlSource::open(self.fluree, &r).await?))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1402,21 +1440,7 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             .lookup_graph_source(graph_source_id)
             .await
         {
-            Ok(Some(record)) => {
-                // First check if this is an R2RML or Iceberg graph source type
-                if !matches!(
-                    record.source_type,
-                    GraphSourceType::R2rml | GraphSourceType::Iceberg
-                ) {
-                    return false;
-                }
-
-                // Parse into typed config to stay aligned with real config schema
-                match IcebergGsConfig::from_json(&record.config) {
-                    Ok(config) => config.mapping.is_some(),
-                    Err(_) => false,
-                }
-            }
+            Ok(Some(record)) => mapping_source_of(&record).is_some(),
             Ok(None) => false,
             Err(_) => false,
         }
@@ -1441,29 +1465,23 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
 
-        // Verify it's an R2RML or Iceberg graph source
-        if !matches!(
-            record.source_type,
-            GraphSourceType::R2rml | GraphSourceType::Iceberg
-        ) {
+        if !record
+            .source_type
+            .kind()
+            .eq(&fluree_db_nameservice::GraphSourceKind::Mapped)
+        {
             return Err(QueryError::InvalidQuery(format!(
                 "Graph source '{}' is not an R2RML graph source (type: {:?})",
                 graph_source_id, record.source_type
             )));
         }
 
-        // Parse into typed config
-        let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
-            QueryError::Internal(format!(
-                "Failed to parse graph source config for '{graph_source_id}': {e}"
-            ))
-        })?;
-
-        let mapping_config = iceberg_config.mapping.as_ref().ok_or_else(|| {
+        let mapping_config = mapping_source_of(&record).ok_or_else(|| {
             QueryError::InvalidQuery(format!(
                 "Graph source '{graph_source_id}' is missing 'mapping' in config"
             ))
         })?;
+        let mapping_config = &mapping_config;
 
         let mapping_source = &mapping_config.source;
         let media_type = mapping_config.media_type.as_deref();
@@ -1587,7 +1605,12 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
         graph_source_id: &str,
     ) -> std::result::Result<(), fluree_db_r2rml::R2rmlError> {
         use fluree_db_r2rml::R2rmlError;
-        if !super::catalog_session::cache_enabled() {
+        // A SQL source pins nothing (its watermark is endpoint+table+time), so
+        // the loadTable-cache precondition is meaningless for it. Known only
+        // once a scan has run, which is fine: the up-front check at build start
+        // still applies to a mixed session's Iceberg sources.
+        if !super::catalog_session::cache_enabled() && !self.session.is_sql_source(graph_source_id)
+        {
             return Err(R2rmlError::BuildSnapshotIntegrity(
                 "the loadTable metadata cache is disabled (FLUREE_ICEBERG_LOADTABLE_CACHE=0), so \
                  Iceberg snapshot pinning is a no-op and the twin's stamped watermark cannot be \
@@ -1966,6 +1989,12 @@ impl FlureeR2rmlProvider<'_> {
         non_null_cols: &[String],
         _as_of_t: Option<i64>,
     ) -> QueryResult<Option<u64>> {
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            return sql
+                .row_count(&self.session, table_name, non_null_cols)
+                .await;
+        }
         // Same pinned context as the scan: one Iceberg snapshot per query (the
         // shared `self.session` pin), so a count and a scan cannot disagree.
         // GREP: r2rml-as-of-t — `as_of_t` is ignored here exactly as the scan path
@@ -2688,6 +2717,12 @@ impl FlureeR2rmlProvider<'_> {
         // `_as_of_t` is deliberately ignored. If as-of semantics ever land here,
         // `table_row_count_inner` MUST honor them identically (matching breadcrumb
         // there): a COUNT and a scan in one query must read the same snapshot.
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            return sql
+                .scan(&self.session, table_name, projection, filters)
+                .await;
+        }
         info!(
             graph_source_id = %graph_source_id,
             table_name = %table_name,

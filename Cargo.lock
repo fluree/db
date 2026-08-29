@@ -2650,6 +2650,7 @@ dependencies = [
  "fluree-db-shacl",
  "fluree-db-sparql",
  "fluree-db-spatial",
+ "fluree-db-sql",
  "fluree-db-storage-aws",
  "fluree-db-storage-ipfs",
  "fluree-db-tabular",
@@ -2685,6 +2686,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
  "xxhash-rust",
  "zstd",
 ]

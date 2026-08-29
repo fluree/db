@@ -1,0 +1,283 @@
+//! End-to-end over a SQL graph source: registration, the R2RML query path,
+//! typed filter pushdown and the exact COUNT shortcut — against a fake
+//! Trino-protocol endpoint, so the SQL the engine actually sends is asserted.
+
+#![cfg(all(feature = "sql", feature = "native"))]
+
+use fluree_db_api::{FlureeBuilder, SqlCreateConfig};
+use serde_json::{json, Value};
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+const PEOPLE_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#People>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "sales.people" ] ;
+        rr:subjectMap [
+            rr:template "http://example.org/person/{id}" ;
+            rr:class ex:Person
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "name" ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:score ;
+            rr:objectMap [ rr:column "score" ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:born ;
+            rr:objectMap [ rr:column "born" ]
+        ] .
+"#;
+
+fn columns() -> Value {
+    json!([
+        {"name": "id", "type": "bigint"},
+        {"name": "name", "type": "varchar"},
+        {"name": "score", "type": "double"},
+        {"name": "born", "type": "date"}
+    ])
+}
+
+fn finished(data: Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "id": "q",
+        "columns": columns(),
+        "data": data,
+        "stats": {"state": "FINISHED"}
+    }))
+}
+
+/// The fake endpoint. Mocks are tried in priority order (lower first).
+async fn fake_trino() -> MockServer {
+    let server = MockServer::start().await;
+    // SELECT 1 — the registration-time connection test.
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .and(body_string_contains("SELECT 1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "t", "columns": [{"name": "_col0", "type": "integer"}], "data": [[1]], "stats": {"state": "FINISHED"}
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // Schema probe.
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .and(body_string_contains("LIMIT 0"))
+        .respond_with(finished(json!([])))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    // Exact count.
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .and(body_string_contains("COUNT(*)"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c", "columns": [{"name": "_col0", "type": "bigint"}], "data": [[3]], "stats": {"state": "FINISHED"}
+        })))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+    // A pushed equality on name.
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .and(body_string_contains(r#""name" = 'bob'"#))
+        .respond_with(finished(json!([[2, "bob", 7.5, "1990-05-04"]])))
+        .with_priority(4)
+        .mount(&server)
+        .await;
+    // Any other scan of the table: every row.
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .and(body_string_contains(r#"FROM "sales"."people""#))
+        .respond_with(finished(json!([
+            [1, "alice", 9.25, "1985-01-02"],
+            [2, "bob", 7.5, "1990-05-04"],
+            [3, null, null, null]
+        ])))
+        .with_priority(5)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// SPARQL JSON results → the binding rows.
+fn bindings(v: &Value) -> Vec<Value> {
+    v.pointer("/results/bindings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| panic!("not SPARQL JSON results: {v}"))
+}
+
+async fn statements(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method == "POST")
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn sql_graph_source_end_to_end() {
+    let server = fake_trino().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // 1. Register.
+    let mut config = SqlCreateConfig::new("people-sql", server.uri(), PEOPLE_R2RML);
+    config.catalog = Some("pg".into());
+    let created = fluree
+        .create_sql_graph_source(config)
+        .await
+        .expect("create sql graph source");
+    assert_eq!(created.graph_source_id, "people-sql:main");
+    assert!(created.connection_tested, "SELECT 1 probe succeeded");
+    assert!(created.mapping_validated);
+    assert_eq!(created.table_names, vec!["sales.people".to_string()]);
+    assert_eq!(created.triples_map_count, 1);
+
+    let info = fluree
+        .nameservice()
+        .lookup_graph_source("people-sql:main")
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert_eq!(
+        info.source_type,
+        fluree_db_nameservice::GraphSourceType::Sql
+    );
+
+    // 2. A plain scan.
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "people-sql:main",
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("query sql source");
+    let names: Vec<String> = rows
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    assert_eq!(
+        names.len(),
+        2,
+        "the null-name row yields no ex:name triple: {names:?}"
+    );
+    assert!(names.iter().any(|n| n.contains("alice")) && names.iter().any(|n| n.contains("bob")));
+
+    let sent = statements(&server).await;
+    let probe = sent
+        .iter()
+        .find(|s| s.contains("LIMIT 0"))
+        .expect("schema probe was issued");
+    assert_eq!(probe, r#"SELECT * FROM "sales"."people" LIMIT 0"#);
+    let scan = sent
+        .iter()
+        .find(|s| s.starts_with("SELECT \"") && !s.contains("WHERE"))
+        .expect("scan statement");
+    assert!(
+        scan.contains(r#""id""#) && scan.contains(r#""name""#),
+        "{scan}"
+    );
+    assert!(
+        !scan.contains(r#""score""#),
+        "only mapped+needed columns are projected: {scan}"
+    );
+
+    // 3. A constant object is pushed as a typed WHERE.
+    let sparql = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?score FROM <people-sql:main>
+        WHERE { ?s ex:name "bob" ; ex:score ?score }
+    "#;
+    let rows = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("filtered query");
+    let rows = bindings(&rows);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].to_string().contains("person/2"), "{rows:?}");
+    let sent = statements(&server).await;
+    assert!(
+        sent.iter().any(|s| s.contains(r#"WHERE "name" = 'bob'"#)),
+        "equality pushed to SQL: {sent:?}"
+    );
+
+    // 4. Typed decoding: a date column round-trips as xsd:date.
+    let sparql = "
+        PREFIX ex: <http://example.org/>
+        SELECT ?born FROM <people-sql:main>
+        WHERE { <http://example.org/person/1> ex:born ?born }
+    ";
+    let rows = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("date query");
+    assert!(rows.to_string().contains("1985-01-02"), "{rows}");
+
+    // 5. COUNT over the class answers 3 whether the exact shortcut fired or
+    //    the scan counted (the fake is consistent); record which.
+    let sparql = "
+        PREFIX ex: <http://example.org/>
+        SELECT (COUNT(?s) AS ?n) FROM <people-sql:main>
+        WHERE { ?s a ex:Person }
+    ";
+    let rows = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("count query");
+    assert!(rows.to_string().contains('3'), "{rows}");
+    let sent = statements(&server).await;
+    eprintln!(
+        "COUNT(*) shortcut fired: {}",
+        sent.iter().any(|s| s.contains("COUNT(*)"))
+    );
+}
+
+#[tokio::test]
+async fn registration_survives_an_unreachable_endpoint() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = SqlCreateConfig::new("dead-sql", "http://127.0.0.1:9", PEOPLE_R2RML);
+    let created = fluree
+        .create_sql_graph_source(config)
+        .await
+        .expect("registration does not require a live endpoint");
+    assert!(!created.connection_tested);
+    assert!(created.mapping_validated);
+
+    // Querying it surfaces the transport error rather than empty results.
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "dead-sql:main",
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    });
+    let err = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect_err("unreachable endpoint fails the query");
+    assert!(err.to_string().contains("dead-sql:main"), "{err}");
+}

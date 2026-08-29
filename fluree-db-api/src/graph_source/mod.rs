@@ -141,6 +141,12 @@ mod ephemeral;
 #[cfg(feature = "iceberg")]
 mod r2rml_materialize;
 
+#[cfg(feature = "sql")]
+mod sql;
+
+#[cfg(feature = "sql")]
+pub use sql::{SqlCreateConfig, SqlCreateResult};
+
 // Re-export configuration types
 pub use config::Bm25CreateConfig;
 

@@ -220,6 +220,13 @@ pub use graph_source::{
     ValidateR2rmlResponse,
 };
 
+#[cfg(feature = "sql")]
+pub use fluree_db_sql::{
+    validate_sql_endpoint, AuthConfig as SqlAuthConfig, SqlDialect, SqlGsConfig, WireProtocol,
+};
+#[cfg(feature = "sql")]
+pub use graph_source::{SqlCreateConfig, SqlCreateResult};
+
 /// Secret-resolution injection point for `ConfigValue::SecretRef` in Iceberg
 /// graph-source auth. The host constructs a [`SecretResolver`] with the tenant
 /// captured and injects it via [`Fluree::with_secret_resolver`]; db stays
