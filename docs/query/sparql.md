@@ -701,8 +701,14 @@ Also supported from SEP-0002: ordering and equality over `xsd:date`,
 and the `YEAR`/`MONTH`/`DAY` and `HOURS`/`MINUTES`/`SECONDS` accessors over
 `xsd:date` and `xsd:time`.
 
-The one part still missing is `ADJUST()`, which is absent from the grammar — so
-it is a parse error rather than an unbound result.
+`ADJUST()` is **not supported and not planned**. SEP-0002 adds it (SPARQL 1.1
+and the 1.2 draft define no such function), but its whole purpose is to set or
+change a value's timezone offset — the one property Fluree deliberately does not
+keep. A result whose only distinguishing feature is an offset would be discarded
+on write and reported as `Z` on read, so supporting it would suggest offsets are
+preserved when they are not. Calling it is a parse error. To render an instant
+in a particular zone, do it in the application, or store the offset as its own
+property.
 
 ### Type Conversion
 
