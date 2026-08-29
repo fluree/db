@@ -159,6 +159,23 @@ See [Iceberg / Parquet](iceberg.md) for full configuration details and examples.
 }
 ```
 
+### 4. SQL Endpoints
+
+**Backend:** Tables behind a Trino-protocol HTTP endpoint (Trino / Starburst / PrestoDB, or the `fluree-sql-bridge` sidecar), via R2RML mapping
+
+**Purpose:** Virtual graph over a relational database or warehouse, read live
+
+SQL sources use the same [R2RML mapping](r2rml.md) as Iceberg sources and additionally accept `rr:sqlQuery`. The engine pushes one typed single-table `SELECT` per triples map and performs joins itself. No database driver is linked into Fluree; the endpoint holds the connections.
+
+See [SQL endpoints](sql.md) for configuration, pushdown rules and the bridge.
+
+**Query:**
+```sparql
+PREFIX ex: <http://example.org/>
+SELECT ?name ?total FROM <warehouse:main>
+WHERE { ?o ex:customer ?c ; ex:total ?total . ?c ex:name ?name . FILTER(?total > 100) }
+```
+
 ## Creating Graph Sources
 
 ### Via Rust API

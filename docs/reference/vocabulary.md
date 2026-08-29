@@ -302,6 +302,7 @@ Nameservice records use `@type` to classify what kind of graph source a record r
 | `f:GeoIndex` | `https://ns.flur.ee/db#GeoIndex` | Geospatial index |
 | `f:IcebergMapping` | `https://ns.flur.ee/db#IcebergMapping` | Iceberg-mapped database |
 | `f:R2rmlMapping` | `https://ns.flur.ee/db#R2rmlMapping` | R2RML relational mapping |
+| `f:SqlMapping` | `https://ns.flur.ee/db#SqlMapping` | R2RML mapping over a SQL (Trino-protocol) endpoint |
 
 ---
 

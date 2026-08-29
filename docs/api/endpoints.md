@@ -3042,6 +3042,73 @@ By default the server does not sync on commit, so an index only advances when so
 
 See also the CLI equivalent: [fluree bm25 sync](../cli/bm25.md#fluree-bm25-sync).
 
+### POST {api_base_url}/sql/map
+
+Map tables behind a SQL endpoint as an R2RML graph source. The endpoint speaks the Trino client protocol (Trino, Starburst, PrestoDB, or a `fluree-sql-bridge` sidecar). Admin-protected — requires the admin Bearer token when an admin token is configured. Available only when the server is built with the `sql` feature (on by default). See [SQL graph sources](../graph-sources/sql.md).
+
+**URL:**
+```
+POST {api_base_url}/sql/map
+```
+
+**Request Body:**
+
+```json
+{
+  "name": "warehouse",
+  "endpoint": "https://trino.example.com:8443",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle",
+  "branch": "main",
+  "dialect": "trino",
+  "protocol": "trino",
+  "catalog": "hive",
+  "schema": "sales",
+  "user": "fluree",
+  "auth_bearer": "…",
+  "session": { "query_max_run_time": "5m" }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Graph source name (required) |
+| `endpoint` | string | Statement endpoint base URL (required); `/v1/statement` is appended. Loopback/private hosts are allowed; the link-local/metadata range is refused. |
+| `r2rml` | string | Inline R2RML mapping (required). `rr:tableName` and `rr:sqlQuery` logical tables are both accepted. |
+| `r2rml_type` | string | Media type of `r2rml` (`text/turtle`, `application/ld+json`) |
+| `branch` | string | Branch name (default: `main`) |
+| `dialect` | string | `trino` (default), `postgres`, `mysql`, `sqlite` — the engine behind a bridge |
+| `protocol` | string | `trino` (default, `X-Trino-*` headers) or `presto` |
+| `catalog`, `schema` | string | Defaults for unqualified table names |
+| `user` | string | Protocol user header (default `fluree`) |
+| `auth_bearer` | string | Static bearer token |
+| `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client-credentials flow (refreshes); `oauth2_token_url` is guarded against internal hosts |
+| `session` | object | Session properties sent as `X-Trino-Session` |
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "warehouse:main",
+  "endpoint": "https://trino.example.com:8443",
+  "connection_tested": true,
+  "mapping_source": "bafy…",
+  "triples_map_count": 3,
+  "table_count": 2,
+  "table_names": ["sales.customers", "sales.orders"],
+  "mapping_validated": true
+}
+```
+
+`connection_tested` reports whether `SELECT 1` succeeded against the endpoint; a failure does not block registration.
+
+**Status Codes:**
+- `201 Created` — graph source created
+- `400 Bad Request` — invalid body, unknown `dialect`/`protocol`, endpoint refused by the SSRF guard, or an invalid mapping
+- `401 Unauthorized` — admin token required
+
+---
+
 ### POST {api_base_url}/iceberg/materialize
 
 Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-`(source, target, table)` watermark persisted in a shared `fluree_materialize_state:main` ledger, or fully with `force_full`. `target` may be a template that fans out into one ledger per partition (see the field table). Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
