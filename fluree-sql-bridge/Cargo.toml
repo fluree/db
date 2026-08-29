@@ -1,0 +1,47 @@
+[package]
+name = "fluree-sql-bridge"
+version = "4.1.6"
+edition = "2021"
+license = "BUSL-1.1"
+repository = "https://github.com/fluree/db"
+description = "Trino-protocol HTTP front for a single Postgres, MySQL or SQLite database — a sidecar for Fluree SQL graph sources"
+publish = false
+
+# Standalone package, deliberately outside the repo workspace: it links sqlx
+# and three database drivers, none of which belong in the `fluree` binary. It
+# has its own Cargo.lock.
+[workspace]
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "mysql",
+    "sqlite",
+    "chrono",
+    "bigdecimal",
+    "json",
+    "uuid",
+] }
+bigdecimal = "0.4"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+strip = true
+lto = "thin"

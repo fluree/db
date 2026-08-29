@@ -395,3 +395,78 @@ async fn registration_survives_an_unreachable_endpoint() {
         .expect_err("unreachable endpoint fails the query");
     assert!(err.to_string().contains("dead-sql:main"), "{err}");
 }
+
+/// Against a live `fluree-sql-bridge` (or Trino) serving a `people(id, name,
+/// score, born)` table — run with `FLUREE_SQL_BRIDGE_URL=http://127.0.0.1:8080`
+/// and, for a bridge, `FLUREE_SQL_BRIDGE_DIALECT=sqlite|postgres|mysql`.
+/// Skips (loudly) when unset, so CI without a bridge does not silently pass it.
+#[tokio::test]
+async fn live_bridge_round_trip() {
+    let Ok(endpoint) = std::env::var("FLUREE_SQL_BRIDGE_URL") else {
+        eprintln!("SKIPPED live_bridge_round_trip: FLUREE_SQL_BRIDGE_URL not set");
+        return;
+    };
+    let mapping = PEOPLE_R2RML.replace("sales.people", "people");
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut config = SqlCreateConfig::new("live-sql", endpoint, mapping);
+    config.dialect = match std::env::var("FLUREE_SQL_BRIDGE_DIALECT").as_deref() {
+        Ok("sqlite") => fluree_db_api::SqlDialect::Sqlite,
+        Ok("postgres") => fluree_db_api::SqlDialect::Postgres,
+        Ok("mysql") => fluree_db_api::SqlDialect::Mysql,
+        _ => fluree_db_api::SqlDialect::Trino,
+    };
+    let created = fluree
+        .create_sql_graph_source(config)
+        .await
+        .expect("create");
+    assert!(
+        created.connection_tested,
+        "SELECT 1 against the live endpoint"
+    );
+
+    let sparql = "
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?name ?score ?born FROM <live-sql:main>
+        WHERE { ?s ex:name ?name . OPTIONAL { ?s ex:score ?score } OPTIONAL { ?s ex:born ?born } }
+        ORDER BY ?s
+    ";
+    let rows = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("live query");
+    let rows = bindings(&rows);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let text = rows[0].to_string();
+    assert!(
+        text.contains("alice") && text.contains("9.25") && text.contains("1985-01-02"),
+        "{text}"
+    );
+
+    let sparql = "
+        PREFIX ex: <http://example.org/>
+        SELECT (COUNT(?s) AS ?n) FROM <live-sql:main> WHERE { ?s a ex:Person }
+    ";
+    let rows = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("live count");
+    assert!(rows.to_string().contains('3'), "{rows}");
+
+    let sparql = "
+        PREFIX ex: <http://example.org/>
+        SELECT ?s FROM <live-sql:main> WHERE { ?s ex:name \"bob\" }
+    ";
+    let rows = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("live pushed filter");
+    let rows = bindings(&rows);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].to_string().contains("person/2"), "{rows:?}");
+}

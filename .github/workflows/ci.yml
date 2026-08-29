@@ -125,6 +125,32 @@ jobs:
         timeout-minutes: 45
         run: cargo test
 
+  sql-bridge:
+    # fluree-sql-bridge is a standalone workspace (it links sqlx + three
+    # database drivers, none of which belong in the fluree binary), so the
+    # workspace gates above never reach it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: "fluree-sql-bridge -> target"
+
+      - name: Format
+        working-directory: fluree-sql-bridge
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: fluree-sql-bridge
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test (SQLite-backed protocol tests)
+        working-directory: fluree-sql-bridge
+        run: cargo test
+
   bench-paths:
     # Cost gate for bench-compare below, which is a ~30-minute job. GitHub's
     # `paths:` filter is workflow-scoped and the rest of this workflow must run
