@@ -1348,6 +1348,12 @@ pub enum Commands {
         action: IcebergAction,
     },
 
+    /// Manage SQL graph sources (R2RML over a Trino-protocol endpoint)
+    Sql {
+        #[command(subcommand)]
+        action: SqlAction,
+    },
+
     /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg)
     /// graph source: bulk-build every triple, verify it against the source, and
     /// write it as a native ledger or a .flpack pack (DEC-003 Deliverable 1).
@@ -3031,6 +3037,127 @@ pub enum IcebergAction {
         #[arg(long)]
         remote: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SqlAction {
+    /// Map tables behind a SQL endpoint as an R2RML graph source
+    ///
+    /// The endpoint speaks the Trino client protocol: Trino, Starburst,
+    /// PrestoDB, or a `fluree-sql-bridge` sidecar in front of Postgres,
+    /// MySQL or SQLite.
+    ///
+    /// Examples:
+    ///   fluree sql map warehouse --endpoint https://trino.example.com:8443 --r2rml mappings/orders.ttl --auth-bearer $TOKEN
+    ///   fluree sql map crm --endpoint http://localhost:8080 --catalog pg --schema public --r2rml crm.ttl
+    Map(Box<SqlMapArgs>),
+
+    /// List mapped graph sources (SQL, Iceberg and R2RML)
+    List {
+        /// List graph sources on a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show details for a mapped graph source
+    Info {
+        /// Graph source name
+        name: String,
+
+        /// Query a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Drop a mapped graph source
+    Drop {
+        /// Graph source name
+        name: String,
+
+        /// Required flag to confirm deletion
+        #[arg(long)]
+        force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Arguments for mapping a SQL endpoint as a graph source.
+#[derive(Debug, Clone, clap::Args)]
+pub struct SqlMapArgs {
+    /// Graph source name (e.g., "warehouse")
+    pub name: String,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    /// Statement endpoint base URL (e.g., "https://trino.example.com:8443")
+    #[arg(long)]
+    pub endpoint: String,
+
+    /// R2RML mapping file. Each rr:tableName names a table reachable through
+    /// the endpoint; rr:sqlQuery is also accepted.
+    #[arg(long)]
+    pub r2rml: PathBuf,
+
+    /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
+    #[arg(long)]
+    pub r2rml_type: Option<String>,
+
+    /// Branch name (defaults to "main")
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// SQL rendering dialect: trino (default), postgres, mysql, sqlite
+    #[arg(long)]
+    pub dialect: Option<String>,
+
+    /// Header family: trino (default) or presto
+    #[arg(long)]
+    pub protocol: Option<String>,
+
+    /// Default catalog for unqualified table names
+    #[arg(long)]
+    pub catalog: Option<String>,
+
+    /// Default schema for unqualified table names
+    #[arg(long)]
+    pub schema: Option<String>,
+
+    /// Protocol user (X-Trino-User); defaults to "fluree"
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Bearer token for endpoint authentication
+    #[arg(long)]
+    pub auth_bearer: Option<String>,
+
+    /// OAuth2 token URL for client credentials auth
+    #[arg(long)]
+    pub oauth2_token_url: Option<String>,
+
+    /// OAuth2 client ID
+    #[arg(long)]
+    pub oauth2_client_id: Option<String>,
+
+    /// OAuth2 client secret
+    #[arg(long)]
+    pub oauth2_client_secret: Option<String>,
+
+    /// OAuth2 scope
+    #[arg(long)]
+    pub oauth2_scope: Option<String>,
+
+    /// OAuth2 audience
+    #[arg(long)]
+    pub oauth2_audience: Option<String>,
+
+    /// Session property (repeatable): --session query_max_run_time=5m
+    #[arg(long = "session", value_name = "KEY=VALUE")]
+    pub session: Vec<String>,
 }
 
 /// Arguments for mapping an Iceberg table as a graph source.

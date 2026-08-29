@@ -13,6 +13,7 @@ use std::sync::Arc;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{ColumnBatchStream, ScanFilter, ScanValue, TableWatermark};
+use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use fluree_db_sql::{
     AuthConfig, CmpOp, Literal, LogicalSource, MappingSource, Predicate, ScanRequest, SqlDialect,
     SqlError, SqlGsConfig, TrinoClient, WireProtocol,
@@ -301,8 +302,12 @@ impl SqlSource {
         })
     }
 
-    fn source(&self, table_name: &str) -> LogicalSource {
-        LogicalSource::Table(table_name.to_string())
+    /// A table name, or the `rr:sqlQuery` text behind a query alias.
+    fn source(&self, mapping: &CompiledR2rmlMapping, table_name: &str) -> LogicalSource {
+        match mapping.sql_query_for_table(table_name) {
+            Some(sql) => LogicalSource::Query(sql.to_string()),
+            None => LogicalSource::Table(table_name.to_string()),
+        }
     }
 
     /// Stamp this table into the build watermark on first touch.
@@ -329,11 +334,12 @@ impl SqlSource {
     pub(crate) async fn scan(
         &self,
         session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
         table_name: &str,
         projection: &[String],
         filters: &[ScanFilter],
     ) -> QueryResult<ColumnBatchStream> {
-        let source = self.source(table_name);
+        let source = self.source(mapping, table_name);
         let schema = self
             .client
             .schema(&source)
@@ -376,10 +382,11 @@ impl SqlSource {
     pub(crate) async fn row_count(
         &self,
         session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
         table_name: &str,
         non_null_cols: &[String],
     ) -> QueryResult<Option<u64>> {
-        let source = self.source(table_name);
+        let source = self.source(mapping, table_name);
         self.record_watermark(session, table_name);
         let n = self
             .client

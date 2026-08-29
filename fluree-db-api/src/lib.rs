@@ -222,7 +222,8 @@ pub use graph_source::{
 
 #[cfg(feature = "sql")]
 pub use fluree_db_sql::{
-    validate_sql_endpoint, AuthConfig as SqlAuthConfig, SqlDialect, SqlGsConfig, WireProtocol,
+    validate_sql_endpoint, AuthConfig as SqlAuthConfig, ConfigValue as SqlConfigValue, SqlDialect,
+    SqlGsConfig, WireProtocol,
 };
 #[cfg(feature = "sql")]
 pub use graph_source::{SqlCreateConfig, SqlCreateResult};

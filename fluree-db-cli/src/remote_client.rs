@@ -2763,6 +2763,23 @@ impl RemoteLedgerClient {
     // Iceberg graph source operations
     // =========================================================================
 
+    /// Map a SQL endpoint as a graph source on the remote server.
+    ///
+    /// Calls `POST {base_url}/sql/map`.
+    pub async fn sql_map(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("sql/map");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
     /// Map an Iceberg table as a graph source on the remote server.
     ///
     /// Calls `POST {base_url}/iceberg/map`.

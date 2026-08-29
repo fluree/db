@@ -22,6 +22,8 @@ mod push;
 pub(crate) mod query;
 pub(crate) mod serving;
 mod show;
+#[cfg(feature = "sql")]
+mod sql;
 mod storage_proxy;
 mod stream_query;
 mod stubs;
@@ -119,6 +121,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/iceberg/materialize", post(iceberg::iceberg_materialize))
         .route("/iceberg/track", post(iceberg::iceberg_track))
         .route("/iceberg/untrack", post(iceberg::iceberg_untrack));
+
+    #[cfg(feature = "sql")]
+    let v1_admin_protected_writes = v1_admin_protected_writes.route("/sql/map", post(sql::sql_map));
 
     // Admin auth runs BEFORE leader-forward. Axum runs the
     // last-applied layer outermost, so `require_admin_token`

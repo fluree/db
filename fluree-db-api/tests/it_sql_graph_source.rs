@@ -255,6 +255,120 @@ async fn sql_graph_source_end_to_end() {
     );
 }
 
+const ORDERS_SQLQUERY_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#OpenOrders>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:sqlQuery "SELECT id, total FROM sales.orders WHERE status = 'open'" ] ;
+        rr:subjectMap [
+            rr:template "http://example.org/order/{id}" ;
+            rr:class ex:Order
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:total ;
+            rr:objectMap [ rr:column "total" ]
+        ] .
+"#;
+
+/// An `rr:sqlQuery` logical table is scanned as a derived table, with the
+/// projection and pushed filters applied on top of the mapping's query.
+#[tokio::test]
+async fn sql_query_logical_table_is_scanned_as_a_derived_table() {
+    let server = MockServer::start().await;
+    let orders_columns =
+        json!([{"name": "id", "type": "bigint"}, {"name": "total", "type": "decimal(10,2)"}]);
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .and(body_string_contains("SELECT 1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "t", "columns": [{"name": "_col0", "type": "integer"}], "data": [[1]], "stats": {"state": "FINISHED"}
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .and(body_string_contains("LIMIT 0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "p", "columns": orders_columns, "data": [], "stats": {"state": "FINISHED"}
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .and(body_string_contains(r#"AS "__fluree_q""#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "s", "columns": orders_columns, "data": [[10, "99.50"], [11, "5.00"]], "stats": {"state": "FINISHED"}
+        })))
+        .with_priority(3)
+        .mount(&server)
+        .await;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let created = fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "orders-sql",
+            server.uri(),
+            ORDERS_SQLQUERY_R2RML,
+        ))
+        .await
+        .expect("create");
+    assert_eq!(created.table_count, 1);
+    assert!(
+        created.table_names[0].starts_with("sqlQuery:"),
+        "{:?}",
+        created.table_names
+    );
+
+    let sparql = "
+        PREFIX ex: <http://example.org/>
+        SELECT ?o ?total FROM <orders-sql:main>
+        WHERE { ?o ex:total ?total } ORDER BY ?o
+    ";
+    let rows = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("query over rr:sqlQuery");
+    let rows = bindings(&rows);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(
+        rows[0].to_string().contains("order/10") && rows[0].to_string().contains("99.50"),
+        "{rows:?}"
+    );
+
+    let sent = statements(&server).await;
+    let scan = sent
+        .iter()
+        .find(|s| s.contains(r#"AS "__fluree_q""#) && !s.contains("LIMIT 0"))
+        .expect("derived-table scan");
+    assert_eq!(
+        scan,
+        r#"SELECT "id", "total" FROM (SELECT id, total FROM sales.orders WHERE status = 'open') AS "__fluree_q""#
+    );
+}
+
+/// The Iceberg-backed registration path refuses `rr:sqlQuery` up front.
+#[tokio::test]
+async fn iceberg_sources_refuse_sql_query_mappings() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = fluree_db_api::R2rmlCreateConfig::new(
+        "ice",
+        "https://polaris.example.invalid",
+        "default.default",
+        ORDERS_SQLQUERY_R2RML,
+    );
+    let err = fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect_err("rr:sqlQuery is not for Iceberg");
+    assert!(err.to_string().contains("rr:sqlQuery"), "{err}");
+}
+
 #[tokio::test]
 async fn registration_survives_an_unreachable_endpoint() {
     let fluree = FlureeBuilder::memory().build_memory();

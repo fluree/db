@@ -111,6 +111,19 @@ fn mapping_source_of(
     }
 }
 
+/// An Iceberg-backed source scans tables, never queries: refuse a mapping with
+/// `rr:sqlQuery` at registration rather than at first query.
+fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> {
+    if compiled.has_sql_queries() {
+        return Err(crate::ApiError::Config(
+            "rr:sqlQuery logical tables are only supported by SQL graph sources; \
+             use rr:tableName for Iceberg-backed mappings"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn config_fingerprint(config: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -569,6 +582,7 @@ impl crate::Fluree {
                 // CID address, which is also extensionless).
                 let compiled =
                     Self::compile_r2rml_content(content, config.mapping_media_type.as_deref(), "")?;
+                reject_sql_queries(&compiled)?;
                 let count = compiled.len();
                 let tables = Self::sorted_table_names(&compiled);
                 let gs_id = config.graph_source_id();
@@ -1991,8 +2005,9 @@ impl FlureeR2rmlProvider<'_> {
     ) -> QueryResult<Option<u64>> {
         #[cfg(feature = "sql")]
         if let Some(sql) = self.sql_source(graph_source_id).await? {
+            let mapping = self.compiled_mapping(graph_source_id, None).await?;
             return sql
-                .row_count(&self.session, table_name, non_null_cols)
+                .row_count(&self.session, &mapping, table_name, non_null_cols)
                 .await;
         }
         // Same pinned context as the scan: one Iceberg snapshot per query (the
@@ -2209,6 +2224,12 @@ impl FlureeR2rmlProvider<'_> {
         graph_source_id: &str,
         table_name: &str,
     ) -> QueryResult<(Arc<LazyS3Storage<'static>>, Arc<TableMetadata>, String)> {
+        if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
+            return Err(QueryError::InvalidQuery(format!(
+                "Graph source '{graph_source_id}': rr:sqlQuery logical tables are only \
+                 supported by SQL graph sources"
+            )));
+        }
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
@@ -2719,8 +2740,9 @@ impl FlureeR2rmlProvider<'_> {
         // there): a COUNT and a scan in one query must read the same snapshot.
         #[cfg(feature = "sql")]
         if let Some(sql) = self.sql_source(graph_source_id).await? {
+            let mapping = self.compiled_mapping(graph_source_id, None).await?;
             return sql
-                .scan(&self.session, table_name, projection, filters)
+                .scan(&self.session, &mapping, table_name, projection, filters)
                 .await;
         }
         info!(
