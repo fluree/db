@@ -1,0 +1,31 @@
+[package]
+name = "fluree-db-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQL-over-HTTP graph source support for Fluree DB (Trino wire protocol)"
+
+[dependencies]
+fluree-db-tabular = { path = "../fluree-db-tabular" }
+# `ConfigValue` / `SecretResolver` / `AuthConfig` / `MappingSource` are shared with
+# the Iceberg graph source. The base crate (no `aws` feature) is HTTP + serde only.
+fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false }
+
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+futures.workspace = true
+async-stream = "0.3"
+
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+base64 = "0.22"
+tracing.workspace = true
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio = { workspace = true, features = ["full"] }

@@ -3408,6 +3408,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluree-db-sql"
+version = "4.1.6"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "fluree-db-iceberg",
+ "fluree-db-tabular",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "fluree-db-storage-aws"
 version = "4.1.6"
 dependencies = [

@@ -30,6 +30,7 @@ members = [
     "fluree-db-iceberg",
     "fluree-db-tabular",
     "fluree-db-r2rml",
+    "fluree-db-sql",
     "fluree-db-server",
     "fluree-db-bolt",
     "fluree-db-peer",
