@@ -634,11 +634,45 @@ SELECT ?event ?elapsed WHERE {
 
 Defined for three operand pairs, matching the XPath operators of the same names:
 
+**Differences** — subtracting two values of the same kind gives the elapsed time:
+
 | Expression | XPath operator | Result |
 | --- | --- | --- |
 | `?dateTime - ?dateTime` | `op:subtract-dateTimes` | `xsd:dayTimeDuration` |
 | `?date - ?date` | `op:subtract-dates` | `xsd:dayTimeDuration` |
 | `?time - ?time` | `op:subtract-times` | `xsd:dayTimeDuration` |
+
+**Shifts** — adding or subtracting a duration gives back the left operand's kind:
+
+| Expression | Result |
+| --- | --- |
+| `?dateTime ± ?dayTimeDuration` | `xsd:dateTime` |
+| `?dateTime ± ?yearMonthDuration` | `xsd:dateTime` |
+| `?date ± ?dayTimeDuration` | `xsd:date` |
+| `?date ± ?yearMonthDuration` | `xsd:date` |
+| `?time ± ?dayTimeDuration` | `xsd:time` |
+| `?dayTimeDuration ± ?dayTimeDuration` | `xsd:dayTimeDuration` |
+| `?yearMonthDuration ± ?yearMonthDuration` | `xsd:yearMonthDuration` |
+
+```sparql
+BIND(?start + "P1M"^^xsd:yearMonthDuration AS ?renewal)
+BIND(?deadline - "PT48H"^^xsd:dayTimeDuration AS ?reminder)
+```
+
+Shifting is calendar-aware, with three behaviours worth knowing:
+
+- **Month arithmetic clamps to the end of the month.** `2026-01-31 + P1M` is
+  `2026-02-28`, not March 3rd — and `2028-01-31 + P1M` is `2028-02-29`, since
+  2028 is a leap year.
+- **`xsd:time` wraps within the day**, having no date to carry into:
+  `23:00:00Z + PT2H` is `01:00:00Z`.
+- **`xsd:date ± dayTimeDuration` keeps only the date part**, so a sub-day
+  duration moves nothing: `2026-01-01 + PT5H` is still `2026-01-01`.
+
+The two duration families never mix — `?dayTimeDuration + ?yearMonthDuration` is
+a type error, because months have no fixed length. So is `?time ± ?yearMonthDuration`,
+since a time carries no months. Computed values render in UTC.
+
 
 **Semantics:**
 
@@ -662,15 +696,13 @@ Defined for three operand pairs, matching the XPath operators of the same names:
 > Queries relying on this are not portable to processors that implement only the
 > published spec.
 
-Already supported from the rest of SEP-0002: ordering and equality over
-`xsd:date`, `xsd:time`, `xsd:dayTimeDuration` and `xsd:yearMonthDuration`
-(`<`, `>`, `=`), and the `YEAR`/`MONTH`/`DAY` and `HOURS`/`MINUTES`/`SECONDS`
-accessors over `xsd:date` and `xsd:time`.
+Also supported from SEP-0002: ordering and equality over `xsd:date`,
+`xsd:time`, `xsd:dayTimeDuration` and `xsd:yearMonthDuration` (`<`, `>`, `=`),
+and the `YEAR`/`MONTH`/`DAY` and `HOURS`/`MINUTES`/`SECONDS` accessors over
+`xsd:date` and `xsd:time`.
 
-Not yet supported: adding or subtracting a duration (`?dateTime + ?duration`
-and its `date`/`time` variants), arithmetic between two durations, and
-`ADJUST()` — which is not yet in the grammar, so it is a parse error rather
-than an unbound result.
+The one part still missing is `ADJUST()`, which is absent from the grammar — so
+it is a parse error rather than an unbound result.
 
 ### Type Conversion
 

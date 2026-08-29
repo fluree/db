@@ -19,8 +19,8 @@
 //! Values without timezone are treated as UTC for comparison purposes.
 
 use chrono::{
-    DateTime as ChronoDateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime,
-    Timelike, Utc,
+    DateTime as ChronoDateTime, Datelike, FixedOffset, Months, NaiveDate, NaiveDateTime, NaiveTime,
+    TimeDelta, Timelike, Utc,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
@@ -182,6 +182,63 @@ impl DateTime {
     /// Get epoch microseconds (for higher precision Parquet storage)
     pub fn epoch_micros(&self) -> i64 {
         self.instant.timestamp_micros()
+    }
+
+    /// Shift by an `xsd:dayTimeDuration`, in microseconds
+    /// (XPath `op:add-dayTimeDuration-to-dateTime`; pass a negative value to
+    /// subtract). The result is rendered in UTC — see [`add_months`] for why.
+    pub fn checked_add_day_time_micros(&self, micros: i64) -> Option<Self> {
+        let shifted = self
+            .instant
+            .checked_add_signed(TimeDelta::microseconds(micros))?;
+        Self::parse(&format_utc_instant(shifted)).ok()
+    }
+
+    /// Shift by an `xsd:yearMonthDuration`, in months (XPath
+    /// `op:add-yearMonthDuration-to-dateTime`; negative subtracts).
+    ///
+    /// Calendar arithmetic, so the day is clamped to the last day of the
+    /// resulting month: `2026-01-31 + P1M` is `2026-02-28`, not March 3rd.
+    ///
+    /// The result is rendered in UTC rather than in the left operand's original
+    /// offset, which XPath would preserve. Fluree normalizes temporals to UTC
+    /// and that offset survives only pre-index, so carrying it into a computed
+    /// value would make the same expression render differently before and after
+    /// a reindex. Deriving from the instant keeps the answer stable.
+    pub fn checked_add_months(&self, months: i32) -> Option<Self> {
+        let shifted = add_months_to_naive(self.instant.naive_utc(), months)?;
+        Self::parse(&format_utc_instant(shifted.and_utc())).ok()
+    }
+}
+
+/// Canonical UTC lexical for a computed instant: fractional seconds only when
+/// they are non-zero, so whole seconds render as `…:05Z`, not `…:05.000000Z`.
+fn format_utc_instant(dt: ChronoDateTime<Utc>) -> String {
+    if dt.timestamp_subsec_micros() == 0 {
+        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    } else {
+        dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+    }
+}
+
+/// Add a signed month count with end-of-month clamping, the XPath rule for
+/// `yearMonthDuration` arithmetic.
+fn add_months_to_naive(dt: NaiveDateTime, months: i32) -> Option<NaiveDateTime> {
+    let magnitude = Months::new(months.unsigned_abs());
+    if months >= 0 {
+        dt.checked_add_months(magnitude)
+    } else {
+        dt.checked_sub_months(magnitude)
+    }
+}
+
+/// The same clamped month shift over a bare date.
+fn add_months_to_date(date: NaiveDate, months: i32) -> Option<NaiveDate> {
+    let magnitude = Months::new(months.unsigned_abs());
+    if months >= 0 {
+        date.checked_add_months(magnitude)
+    } else {
+        date.checked_sub_months(magnitude)
     }
 }
 
@@ -360,6 +417,25 @@ impl Date {
     /// [`Self::days_since_epoch`] it keeps the timezone offset.
     pub fn epoch_micros(&self) -> i64 {
         self.to_instant().timestamp_micros()
+    }
+
+    /// Shift by an `xsd:dayTimeDuration`, in microseconds (XPath
+    /// `op:add-dayTimeDuration-to-date`; negative subtracts).
+    ///
+    /// Per XPath the date is taken to midnight, shifted, and the *date part* of
+    /// the result kept — so a sub-day duration can leave the date unchanged.
+    pub fn checked_add_day_time_micros(&self, micros: i64) -> Option<Self> {
+        let shifted = self
+            .to_instant()
+            .checked_add_signed(TimeDelta::microseconds(micros))?;
+        Self::parse(&shifted.format("%Y-%m-%d").to_string()).ok()
+    }
+
+    /// Shift by an `xsd:yearMonthDuration`, in months, with the same
+    /// end-of-month clamping as [`DateTime::checked_add_months`].
+    pub fn checked_add_months(&self, months: i32) -> Option<Self> {
+        let shifted = add_months_to_date(self.date, months)?;
+        Self::parse(&shifted.format("%Y-%m-%d").to_string()).ok()
     }
 }
 
@@ -557,6 +633,29 @@ impl Time {
         let secs = utc.num_seconds_from_midnight() as i64;
         let nanos = utc.nanosecond() as i64;
         secs * 1_000_000 + nanos / 1000
+    }
+
+    /// Shift by an `xsd:dayTimeDuration`, in microseconds (XPath
+    /// `op:add-dayTimeDuration-to-time`; negative subtracts).
+    ///
+    /// A time has no date to carry into, so the result wraps within the day:
+    /// `23:00:00Z + PT2H` is `01:00:00Z`. Rendered in UTC, like the other
+    /// computed temporals.
+    pub fn checked_add_day_time_micros(&self, micros: i64) -> Option<Self> {
+        const DAY_MICROS: i64 = 86_400 * 1_000_000;
+        let shifted = self
+            .utc_micros_since_midnight()
+            .checked_add(micros)?
+            .rem_euclid(DAY_MICROS);
+        let secs = (shifted / 1_000_000) as u32;
+        let micros_part = (shifted % 1_000_000) as u32;
+        let time = NaiveTime::from_num_seconds_from_midnight_opt(secs, micros_part * 1000)?;
+        let lexical = if micros_part == 0 {
+            time.format("%H:%M:%SZ").to_string()
+        } else {
+            time.format("%H:%M:%S%.6fZ").to_string()
+        };
+        Self::parse(&lexical).ok()
     }
 }
 

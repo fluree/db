@@ -10,6 +10,7 @@ use crate::ir::ArithmeticOp;
 use bigdecimal::BigDecimal;
 use fluree_db_core::temporal::{
     Date as FlureeDate, DateTime as FlureeDateTime, DayTimeDuration, Time as FlureeTime,
+    YearMonthDuration,
 };
 use fluree_db_core::{coerce_value, FlakeValue, GeoPointBits};
 use num_bigint::BigInt;
@@ -319,9 +320,130 @@ impl ArithmeticOp {
                     b.utc_micros_since_midnight(),
                 )
             }
+            // Temporal ± duration, per XPath / SEP-0002. `xsd:time` has no
+            // months to carry, so `time ± yearMonthDuration` is not defined and
+            // falls through to the type error, as XPath has it.
+            (ComparableValue::DateTime(a), rhs) if self.is_additive() => {
+                match Duration::from_operand(&rhs).ok_or(ArithmeticError::TypeMismatch)? {
+                    Duration::DayTime(micros) => a
+                        .checked_add_day_time_micros(self.signed(micros))
+                        .map(ComparableValue::DateTime),
+                    Duration::YearMonth(months) => a
+                        .checked_add_months(self.signed_months(months))
+                        .map(ComparableValue::DateTime),
+                }
+                .ok_or(ArithmeticError::Overflow)
+            }
+            (ComparableValue::Date(a), rhs) if self.is_additive() => {
+                match Duration::from_operand(&rhs).ok_or(ArithmeticError::TypeMismatch)? {
+                    Duration::DayTime(micros) => a
+                        .checked_add_day_time_micros(self.signed(micros))
+                        .map(ComparableValue::Date),
+                    Duration::YearMonth(months) => a
+                        .checked_add_months(self.signed_months(months))
+                        .map(ComparableValue::Date),
+                }
+                .ok_or(ArithmeticError::Overflow)
+            }
+            (ComparableValue::Time(a), rhs) if self.is_additive() => {
+                match Duration::from_operand(&rhs).ok_or(ArithmeticError::TypeMismatch)? {
+                    Duration::DayTime(micros) => a
+                        .checked_add_day_time_micros(self.signed(micros))
+                        .map(ComparableValue::Time)
+                        .ok_or(ArithmeticError::Overflow),
+                    Duration::YearMonth(_) => Err(ArithmeticError::TypeMismatch),
+                }
+            }
+            // Duration ± duration. XPath defines these; SEP-0002's operator
+            // table does not list them, but it says outright that it does not
+            // enumerate every relevant operator, and summing durations is the
+            // first thing a caller reaches for after computing one. Mixing the
+            // two duration families has no XPath operator and stays an error.
+            (ref lhs, ref rhs)
+                if self.is_additive()
+                    && Duration::from_operand(lhs).is_some()
+                    && Duration::from_operand(rhs).is_some() =>
+            {
+                match (
+                    Duration::from_operand(lhs).expect("checked by guard"),
+                    Duration::from_operand(rhs).expect("checked by guard"),
+                ) {
+                    (Duration::DayTime(a), Duration::DayTime(b)) => a
+                        .checked_add(self.signed(b))
+                        .map(day_time_duration)
+                        .ok_or(ArithmeticError::Overflow),
+                    (Duration::YearMonth(a), Duration::YearMonth(b)) => a
+                        .checked_add(self.signed_months(b))
+                        .map(year_month_duration)
+                        .ok_or(ArithmeticError::Overflow),
+                    _ => Err(ArithmeticError::TypeMismatch),
+                }
+            }
             // Non-numeric types can't do arithmetic
             _ => Err(ArithmeticError::TypeMismatch),
         }
+    }
+
+    /// Whether this is `+` or `-`, the only operators defined over a temporal
+    /// or duration operand.
+    fn is_additive(self) -> bool {
+        matches!(self, ArithmeticOp::Add | ArithmeticOp::Sub)
+    }
+
+    /// Flip the sign of a microsecond magnitude for `-`.
+    fn signed(self, micros: i64) -> i64 {
+        if self == ArithmeticOp::Sub {
+            -micros
+        } else {
+            micros
+        }
+    }
+
+    /// Flip the sign of a month magnitude for `-`.
+    fn signed_months(self, months: i32) -> i32 {
+        if self == ArithmeticOp::Sub {
+            -months
+        } else {
+            months
+        }
+    }
+}
+
+/// A duration operand, in the unit its family is measured in. The two families
+/// are deliberately not interconvertible: months have no fixed length.
+enum Duration {
+    DayTime(i64),
+    YearMonth(i32),
+}
+
+impl Duration {
+    /// Durations have no dedicated `ComparableValue` variant — they ride as a
+    /// `TypedLiteral` wrapping the `FlakeValue`.
+    fn from_operand(v: &ComparableValue) -> Option<Self> {
+        let ComparableValue::TypedLiteral { val, .. } = v else {
+            return None;
+        };
+        match val {
+            FlakeValue::DayTimeDuration(d) => Some(Duration::DayTime(d.micros())),
+            FlakeValue::YearMonthDuration(d) => Some(Duration::YearMonth(d.months())),
+            _ => None,
+        }
+    }
+}
+
+/// Wrap a microsecond count as an `xsd:dayTimeDuration` result.
+fn day_time_duration(micros: i64) -> ComparableValue {
+    ComparableValue::TypedLiteral {
+        val: FlakeValue::DayTimeDuration(Box::new(DayTimeDuration::from_micros(micros))),
+        dtc: None,
+    }
+}
+
+/// Wrap a month count as an `xsd:yearMonthDuration` result.
+fn year_month_duration(months: i32) -> ComparableValue {
+    ComparableValue::TypedLiteral {
+        val: FlakeValue::YearMonthDuration(Box::new(YearMonthDuration::from_months(months))),
+        dtc: None,
     }
 }
 
@@ -334,10 +456,7 @@ fn day_time_duration_between(
     let micros = lhs_micros
         .checked_sub(rhs_micros)
         .ok_or(ArithmeticError::Overflow)?;
-    Ok(ComparableValue::TypedLiteral {
-        val: FlakeValue::DayTimeDuration(Box::new(DayTimeDuration::from_micros(micros))),
-        dtc: None,
-    })
+    Ok(day_time_duration(micros))
 }
 
 /// Comparable value extracted from expression evaluation
@@ -978,6 +1097,151 @@ mod tests {
             duration_of(ArithmeticOp::Sub.apply(time("11:00:00-05:00"), time("21:30:00+05:30"))),
             "PT0S"
         );
+    }
+
+    fn dtd(s: &str) -> ComparableValue {
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::DayTimeDuration(Box::new(
+                fluree_db_core::temporal::DayTimeDuration::parse(s).expect("dayTimeDuration"),
+            )),
+            dtc: None,
+        }
+    }
+
+    fn ymd(s: &str) -> ComparableValue {
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::YearMonthDuration(Box::new(
+                YearMonthDuration::parse(s).expect("yearMonthDuration"),
+            )),
+            dtc: None,
+        }
+    }
+
+    /// Lexical form of a temporal-valued arithmetic result.
+    fn lexical_of(v: Result<ComparableValue, ArithmeticError>) -> String {
+        match v.expect("temporal arithmetic should succeed") {
+            ComparableValue::DateTime(d) => d.original().to_string(),
+            ComparableValue::Date(d) => d.original().to_string(),
+            ComparableValue::Time(t) => t.original().to_string(),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::DayTimeDuration(d),
+                ..
+            } => d.to_canonical_string(),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::YearMonthDuration(d),
+                ..
+            } => d.to_canonical_string(),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn datetime_plus_and_minus_day_time_duration() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2026-01-01T09:30:00Z"), dtd("PT2H30M"))),
+            "2026-01-01T12:00:00Z"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(dt("2026-01-01T09:30:00Z"), dtd("PT2H30M"))),
+            "2026-01-01T07:00:00Z"
+        );
+        // Crossing a day boundary carries into the date.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2026-01-01T23:00:00Z"), dtd("PT2H"))),
+            "2026-01-02T01:00:00Z"
+        );
+    }
+
+    #[test]
+    fn datetime_plus_year_month_duration_clamps_to_end_of_month() {
+        // The XPath rule: the day is clamped to the last day of the resulting
+        // month rather than overflowing into the next one.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2026-01-31T00:00:00Z"), ymd("P1M"))),
+            "2026-02-28T00:00:00Z"
+        );
+        // 2028 is a leap year, so the same shift lands on the 29th.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2028-01-31T00:00:00Z"), ymd("P1M"))),
+            "2028-02-29T00:00:00Z"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(dt("2026-03-31T00:00:00Z"), ymd("P1M"))),
+            "2026-02-28T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn date_plus_duration_keeps_the_date_part() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(date("2026-01-01"), ymd("P1Y2M"))),
+            "2027-03-01"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(date("2026-01-01"), dtd("P2D"))),
+            "2026-01-03"
+        );
+        // Per XPath the date is taken to midnight and the date part of the
+        // shifted instant kept, so a sub-day duration moves nothing.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(date("2026-01-01"), dtd("PT5H"))),
+            "2026-01-01"
+        );
+    }
+
+    #[test]
+    fn time_plus_day_time_duration_wraps_within_the_day() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(time("09:30:00Z"), dtd("PT2H"))),
+            "11:30:00Z"
+        );
+        // A time has no date to carry into, so it wraps.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(time("23:00:00Z"), dtd("PT2H"))),
+            "01:00:00Z"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(time("01:00:00Z"), dtd("PT2H"))),
+            "23:00:00Z"
+        );
+    }
+
+    #[test]
+    fn durations_add_and_subtract_within_their_family() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dtd("PT2H"), dtd("PT3H30M"))),
+            "PT5H30M"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(dtd("PT3H"), dtd("PT2H"))),
+            "PT1H"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(ymd("P1Y"), ymd("P2M"))),
+            "P1Y2M"
+        );
+    }
+
+    #[test]
+    fn temporal_duration_arithmetic_rejects_undefined_combinations() {
+        // Months have no fixed length, so the two duration families do not mix.
+        assert_eq!(
+            ArithmeticOp::Add.apply(dtd("PT2H"), ymd("P1Y")),
+            Err(ArithmeticError::TypeMismatch)
+        );
+        // A time carries no months.
+        assert_eq!(
+            ArithmeticOp::Add.apply(time("09:30:00Z"), ymd("P1Y")),
+            Err(ArithmeticError::TypeMismatch)
+        );
+        // Only + and - are defined over these operands.
+        for op in [ArithmeticOp::Mul, ArithmeticOp::Div, ArithmeticOp::Mod] {
+            assert_eq!(
+                op.apply(dt("2026-01-01T00:00:00Z"), dtd("PT2H")),
+                Err(ArithmeticError::TypeMismatch),
+                "{op:?} over dateTime and a duration must stay a type error"
+            );
+        }
     }
 
     #[test]

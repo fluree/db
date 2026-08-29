@@ -1,4 +1,4 @@
-//! Subtracting two temporal values yields an `xsd:dayTimeDuration`.
+//! Temporal arithmetic: differences, and shifting by a duration.
 //!
 //! `?end - ?start` over two `xsd:dateTime`s used to answer *unbound*. The
 //! expression evaluator had no temporal arm, so the pair fell to the
@@ -7,12 +7,21 @@
 //! rather than surfacing. The query returned a row with an empty column and no
 //! diagnostic, which reads like missing data rather than a missing operator.
 //!
-//! Neither SPARQL 1.1 nor the 1.2 editor's draft maps `-` over temporal
+//! Fluree implements the operator rows SEP-0002 specifies over temporal and
+//! duration operands: the three differences (`dateTime`/`date`/`time` minus its
+//! own kind, yielding an `xsd:dayTimeDuration`) and the shifts (`± duration`,
+//! yielding the same kind as the left operand). Duration ± duration is included
+//! too — XPath defines it, and SEP-0002 says outright that its table does not
+//! enumerate every relevant operator.
+//!
+//! Neither SPARQL 1.1 nor the 1.2 editor's draft maps these over temporal
 //! operands, so answering a type error was conformant — but every engine that
 //! implements this at all (Stardog, GraphDB, RDFox, Jena, Comunica, Oxigraph
 //! behind its `sep-0002` feature) agrees on the XPath semantics that SEP-0002
-//! writes down: the result is an `xsd:dayTimeDuration`, signed, timezone-
-//! normalized. That is what is pinned here.
+//! writes down. Differences are signed and timezone-normalized; shifts are
+//! calendar-aware, so a `yearMonthDuration` clamps to the end of the month
+//! rather than overflowing it, and a `time` wraps within its day because it has
+//! no date to carry into. That is what is pinned here.
 //!
 //! Two things beyond the arithmetic are load-bearing:
 //!
@@ -57,6 +66,15 @@ ex:d1 ex:to   "2000-10-30"^^xsd:date .
 
 ex:t1 ex:from "04:00:00Z"^^xsd:time .
 ex:t1 ex:to   "11:12:00Z"^^xsd:time .
+
+# Duration operands. ex:eom is the end-of-month clamping case: adding a month
+# to January 31st must land on February 28th, not overflow into March.
+ex:p1 ex:at  "2026-01-01T09:30:00Z"^^xsd:dateTime .
+ex:p1 ex:day "2026-01-01"^^xsd:date .
+ex:p1 ex:tod "23:00:00Z"^^xsd:time .
+ex:p1 ex:dur "PT2H30M"^^xsd:dayTimeDuration .
+ex:p1 ex:mon "P1M"^^xsd:yearMonthDuration .
+ex:eom ex:at "2026-01-31T00:00:00Z"^^xsd:dateTime .
 "#;
 
 /// The formatter compacts against the query's `@context`, which declares the
@@ -135,6 +153,89 @@ fn cases() -> Vec<Case> {
             jsonld_where: json!([
                 {"@id": "ex:e1", "ex:start": "?s", "ex:end": "?e"},
                 ["bind", "?d", "(+ ?e ?s)"]
+            ]),
+            expected: None,
+        },
+        // --- temporal ± duration (SEP-0002 / XPath) ---
+        Case {
+            name: "dateTime + dayTimeDuration",
+            sparql: "SELECT ?d WHERE { ex:p1 ex:at ?a . ex:p1 ex:dur ?u . \
+                     BIND(?a + ?u AS ?d) }",
+            jsonld_where: json!([
+                {"@id": "ex:p1", "ex:at": "?a", "ex:dur": "?u"},
+                ["bind", "?d", "(+ ?a ?u)"]
+            ]),
+            expected: Some("2026-01-01T12:00:00Z"),
+        },
+        Case {
+            name: "dateTime - dayTimeDuration",
+            sparql: "SELECT ?d WHERE { ex:p1 ex:at ?a . ex:p1 ex:dur ?u . \
+                     BIND(?a - ?u AS ?d) }",
+            jsonld_where: json!([
+                {"@id": "ex:p1", "ex:at": "?a", "ex:dur": "?u"},
+                ["bind", "?d", "(- ?a ?u)"]
+            ]),
+            expected: Some("2026-01-01T07:00:00Z"),
+        },
+        Case {
+            name: "dateTime + yearMonthDuration clamps to end of month",
+            sparql: "SELECT ?d WHERE { ex:eom ex:at ?a . ex:p1 ex:mon ?m . \
+                     BIND(?a + ?m AS ?d) }",
+            jsonld_where: json!([
+                {"@id": "ex:eom", "ex:at": "?a"},
+                {"@id": "ex:p1", "ex:mon": "?m"},
+                ["bind", "?d", "(+ ?a ?m)"]
+            ]),
+            expected: Some("2026-02-28T00:00:00Z"),
+        },
+        Case {
+            name: "date + yearMonthDuration",
+            sparql: "SELECT ?d WHERE { ex:p1 ex:day ?a . ex:p1 ex:mon ?m . \
+                     BIND(?a + ?m AS ?d) }",
+            jsonld_where: json!([
+                {"@id": "ex:p1", "ex:day": "?a", "ex:mon": "?m"},
+                ["bind", "?d", "(+ ?a ?m)"]
+            ]),
+            expected: Some("2026-02-01"),
+        },
+        Case {
+            name: "time + dayTimeDuration wraps within the day",
+            sparql: "SELECT ?d WHERE { ex:p1 ex:tod ?a . ex:p1 ex:dur ?u . \
+                     BIND(?a + ?u AS ?d) }",
+            jsonld_where: json!([
+                {"@id": "ex:p1", "ex:tod": "?a", "ex:dur": "?u"},
+                ["bind", "?d", "(+ ?a ?u)"]
+            ]),
+            expected: Some("01:30:00Z"),
+        },
+        Case {
+            name: "duration + duration",
+            sparql: "SELECT ?d WHERE { ex:p1 ex:dur ?u . BIND(?u + ?u AS ?d) }",
+            jsonld_where: json!([
+                {"@id": "ex:p1", "ex:dur": "?u"},
+                ["bind", "?d", "(+ ?u ?u)"]
+            ]),
+            expected: Some("PT5H"),
+        },
+        // The two duration families do not mix: months have no fixed length.
+        Case {
+            name: "dayTimeDuration + yearMonthDuration stays unbound",
+            sparql: "SELECT ?d WHERE { ex:p1 ex:dur ?u . ex:p1 ex:mon ?m . \
+                     BIND(?u + ?m AS ?d) }",
+            jsonld_where: json!([
+                {"@id": "ex:p1", "ex:dur": "?u", "ex:mon": "?m"},
+                ["bind", "?d", "(+ ?u ?m)"]
+            ]),
+            expected: None,
+        },
+        // A time carries no months.
+        Case {
+            name: "time + yearMonthDuration stays unbound",
+            sparql: "SELECT ?d WHERE { ex:p1 ex:tod ?a . ex:p1 ex:mon ?m . \
+                     BIND(?a + ?m AS ?d) }",
+            jsonld_where: json!([
+                {"@id": "ex:p1", "ex:tod": "?a", "ex:mon": "?m"},
+                ["bind", "?d", "(+ ?a ?m)"]
             ]),
             expected: None,
         },
@@ -245,7 +346,7 @@ fn lexical(cell: &Value) -> String {
 }
 
 #[tokio::test]
-async fn temporal_subtraction_on_both_query_surfaces() {
+async fn temporal_arithmetic_on_both_query_surfaces() {
     let (_dir, fluree, alias) = setup().await;
 
     let mut failures: Vec<String> = Vec::new();

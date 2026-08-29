@@ -234,8 +234,8 @@ path = "tests/it_timezone_accessors.rs"
 required-features = ["native"]
 
 [[test]]
-name = "it_temporal_subtraction"
-path = "tests/it_temporal_subtraction.rs"
+name = "it_temporal_arithmetic"
+path = "tests/it_temporal_arithmetic.rs"
 required-features = ["native"]
 
 # Own binary: asserts fast-path routing via process-scoped tracing capture.
