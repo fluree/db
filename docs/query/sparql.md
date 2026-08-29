@@ -356,6 +356,14 @@ WHERE {
 }
 ```
 
+**Expression errors leave the variable unbound.** Per SPARQL 1.1 §18.5, when a
+`BIND` expression raises a *value* error — arithmetic on operands that have no
+operator between them, an out-of-range comparison — the row is kept and the
+target variable is simply not bound. The query does not fail and no diagnostic
+is emitted, so an unexpectedly empty column is worth reading as "this expression
+had no answer for this row", not necessarily as missing data. Use `BOUND(?var)`
+to distinguish the two.
+
 ### VALUES
 
 Provide initial bindings:
@@ -594,6 +602,53 @@ the graphs listed.
 - `HOURS(?time)` - Hours
 - `MINUTES(?time)` - Minutes
 - `SECONDS(?time)` - Seconds
+
+### Date/Time Arithmetic
+
+Subtracting one temporal value from another yields the elapsed time as an
+`xsd:dayTimeDuration`:
+
+```sparql
+SELECT ?event ?elapsed WHERE {
+  ?event ex:start ?start ;
+         ex:end   ?end .
+  BIND(?end - ?start AS ?elapsed)     # e.g. "P1DT2H30M"^^xsd:dayTimeDuration
+}
+```
+
+Defined for three operand pairs, matching the XPath operators of the same names:
+
+| Expression | XPath operator | Result |
+| --- | --- | --- |
+| `?dateTime - ?dateTime` | `op:subtract-dateTimes` | `xsd:dayTimeDuration` |
+| `?date - ?date` | `op:subtract-dates` | `xsd:dayTimeDuration` |
+| `?time - ?time` | `op:subtract-times` | `xsd:dayTimeDuration` |
+
+**Semantics:**
+
+- **Signed.** `?end - ?start` is negative when the end precedes the start, e.g.
+  `-P1D`. It is an elapsed difference, not an absolute magnitude.
+- **Timezone-normalized.** Both operands are compared against a shared origin, so
+  `"2026-01-01T13:00:00+03:00" - "2026-01-01T10:00:00Z"` is `PT0S` — the same
+  instant written two ways — not the three hours the wall-clock readings differ
+  by. A value whose lexical form carries no timezone is read as UTC.
+- **Subtraction only.** `+`, `*`, `/` and `%` are not defined over temporal
+  operands, and neither are mixed pairs such as `?dateTime - ?date`. These are
+  type errors, which inside `BIND` means the variable is left **unbound** rather
+  than raising — see [Expression errors](#bind).
+
+> **Beyond the standard.** SPARQL 1.1 maps `-` only over numeric operands, and
+> the SPARQL 1.2 draft does not extend it either — a conformant processor is
+> free to answer a type error here. Fluree follows
+> [SEP-0002](https://github.com/w3c/sparql-dev/blob/main/SEP/SEP-0002/sep-0002.md),
+> the community proposal that specifies these operators, so the behaviour agrees
+> with the other engines that implement them (Stardog, GraphDB, RDFox, Jena).
+> Queries relying on this are not portable to processors that implement only the
+> published spec.
+
+Not yet supported from SEP-0002: adding or subtracting a duration
+(`?dateTime + ?duration`), arithmetic between two durations, ordering
+comparisons on durations, and `ADJUST()`.
 
 ### Type Conversion
 

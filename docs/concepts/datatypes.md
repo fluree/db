@@ -146,6 +146,11 @@ Temporal types:
 Additional types include:
 - **xsd:anyURI**: Web addresses and identifiers
 - **xsd:duration**: Time periods (ISO 8601 format)
+- **xsd:dayTimeDuration**, **xsd:yearMonthDuration**: The two `xsd:duration`
+  subtypes. Unlike `xsd:duration` these are totally ordered, so they sort and
+  compare. `xsd:dayTimeDuration` is also the type queries *produce* when
+  subtracting two temporal values — see
+  [Date/Time Arithmetic](../query/sparql.md#datetime-arithmetic).
 - **xsd:gYear**, **xsd:gMonth**, **xsd:gDay**: Partial date components
 
 ## RDF Datatypes
