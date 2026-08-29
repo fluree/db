@@ -113,6 +113,40 @@ pub const SPARQL11_EXISTS: &[&str] = &[
 pub const SPARQL11_FUNCTIONS: &[&str] = &[
     // fully green: concat02 (CONCAT type-errors on a non-string argument) and
     // strlang03-rdf11 (case-insensitive language-tag comparison) — PR-X2
+    //
+    // TZ / TIMEZONE report UTC for every temporal value rather than the source
+    // offset. Deliberate, and not a burn-down item — see rule 2 of "Managing
+    // the Skip List".
+    //
+    // Fluree normalizes temporals to UTC and does not persist the source
+    // offset: `ObjKey::encode_datetime` stores epoch micros and nothing else,
+    // and the decoder re-renders with a `Z`. The offset therefore survives only
+    // while a value sits in novelty. Reading it back would make these two
+    // functions answer "-08:00" before a background reindex and "Z" after —
+    // the same query over unchanged data returning a different result, with no
+    // write behind it and no way for a caller to predict which they will get.
+    // We chose an answer that does not change under indexing.
+    //
+    // These two tests passed until 2026-08-29 only because this harness loads
+    // into a fresh in-memory ledger and never reindexes, so it exercised the
+    // novelty lane exclusively. On an indexed ledger — the steady state of any
+    // real deployment — they already failed 3 of 4 rows apiece. Registering
+    // them records a choice that was, in practice, already made.
+    //
+    // Storing the offset would fix it, but it does not fit: an `ObjKey` is a
+    // u64 and holds 59 bits of microsecond-range instant, leaving no room for
+    // the 11 bits an offset needs. The alternatives are an arena handle (which
+    // would destroy the inline key ordering that dateTime range pushdown
+    // depends on) or a sidecar consulted only by these two functions — real
+    // cost for an accessor whose value the caller can supply themselves by
+    // rendering in whichever zone they want.
+    //
+    // Spec: https://www.w3.org/TR/sparql11-query/#func-timezone (§17.4.5.8)
+    //       https://www.w3.org/TR/sparql11-query/#func-tz       (§17.4.5.9)
+    // Behaviour + rationale: docs/reference/compatibility.md
+    // NEEDS: second reviewer per "Managing the Skip List" rule 4.
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#timezone",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#tz",
 ];
 
 pub const SPARQL11_GROUPING: &[&str] = &[];

@@ -602,6 +602,22 @@ the graphs listed.
 - `HOURS(?time)` - Hours
 - `MINUTES(?time)` - Minutes
 - `SECONDS(?time)` - Seconds
+- `TZ(?dateTime)` - Timezone as a plain string. **Always `"Z"`** — see below.
+- `TIMEZONE(?dateTime)` - Timezone as an `xsd:dayTimeDuration`. **Always `"PT0S"`.**
+
+> **Timezones are normalized, not preserved.** Fluree stores temporal values as
+> UTC instants and does not keep the offset the literal was written with, so
+> `"2010-12-21T15:38:02-08:00"` and `"2010-12-21T23:38:02Z"` are the same stored
+> value. `TZ` and `TIMEZONE` therefore report UTC for everything rather than the
+> source offset, which SPARQL 1.1 §17.4.5.8-9 would expect.
+>
+> This is deliberate: the offset is only recoverable before a value is indexed,
+> so reporting it would mean the same query returned a different answer once a
+> background reindex ran — with no write in between. A constant answer is the
+> only one that does not change underneath you.
+>
+> Ordering, comparison and range queries are unaffected; they use the normalized
+> instant. If you need a wall-clock offset, store it as its own property.
 
 ### Date/Time Arithmetic
 
