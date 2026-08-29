@@ -662,9 +662,15 @@ Defined for three operand pairs, matching the XPath operators of the same names:
 > Queries relying on this are not portable to processors that implement only the
 > published spec.
 
-Not yet supported from SEP-0002: adding or subtracting a duration
-(`?dateTime + ?duration`), arithmetic between two durations, ordering
-comparisons on durations, and `ADJUST()`.
+Already supported from the rest of SEP-0002: ordering and equality over
+`xsd:date`, `xsd:time`, `xsd:dayTimeDuration` and `xsd:yearMonthDuration`
+(`<`, `>`, `=`), and the `YEAR`/`MONTH`/`DAY` and `HOURS`/`MINUTES`/`SECONDS`
+accessors over `xsd:date` and `xsd:time`.
+
+Not yet supported: adding or subtracting a duration (`?dateTime + ?duration`
+and its `date`/`time` variants), arithmetic between two durations, and
+`ADJUST()` — which is not yet in the grammar, so it is a parse error rather
+than an unbound result.
 
 ### Type Conversion
 
