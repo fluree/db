@@ -172,7 +172,7 @@ See [SQL endpoints](sql.md) for configuration, pushdown rules and the bridge.
 **Query:**
 ```sparql
 PREFIX ex: <http://example.org/>
-SELECT ?name ?total FROM <warehouse:main>
+SELECT ?name ?total FROM <orders-db:main>
 WHERE { ?o ex:customer ?c ; ex:total ?total . ?c ex:name ?name . FILTER(?total > 100) }
 ```
 

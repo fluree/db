@@ -28,7 +28,7 @@ fluree sql map <NAME> --endpoint <URL> --r2rml <PATH> [OPTIONS]
 
 | Argument | Description |
 |----------|-------------|
-| `<NAME>` | Graph source name (e.g., "warehouse") |
+| `<NAME>` | Graph source name (e.g., "orders-db") |
 
 ### Options
 
@@ -73,7 +73,7 @@ fluree sql map <NAME> --endpoint <URL> --r2rml <PATH> [OPTIONS]
 
 ```bash
 # Trino with a bearer token; tables are qualified inside hive.sales
-fluree sql map warehouse \
+fluree sql map orders-db \
   --endpoint https://trino.example.com:8443 \
   --catalog hive --schema sales \
   --auth-bearer "$TRINO_TOKEN" \
@@ -89,7 +89,7 @@ fluree sql map crm \
 ### Output
 
 ```
-Mapped SQL endpoint as graph source 'warehouse:main'
+Mapped SQL endpoint as graph source 'orders-db:main'
   Endpoint:    https://trino.example.com:8443
   R2RML:       bafy…
   TriplesMaps: 3
@@ -105,8 +105,8 @@ still registered and the first query reports the underlying error.
 
 ```bash
 fluree sql list
-fluree sql info warehouse
-fluree sql drop warehouse --force
+fluree sql info orders-db
+fluree sql drop orders-db --force
 ```
 
 Behave exactly as the [`fluree iceberg`](iceberg.md) equivalents; SQL sources

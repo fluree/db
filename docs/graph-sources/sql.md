@@ -27,7 +27,7 @@ credentials; dropping a result stream cancels the statement server-side.
 === CLI
 
 ```bash
-fluree sql map warehouse \
+fluree sql map orders-db \
   --endpoint https://trino.example.com:8443 \
   --catalog hive --schema sales \
   --auth-bearer "$TRINO_TOKEN" \
@@ -42,7 +42,7 @@ curl -X POST http://localhost:8090/v1/fluree/sql/map \
   -H "Content-Type: application/json" \
   -d @- <<'JSON'
 {
-  "name": "warehouse",
+  "name": "orders-db",
   "endpoint": "https://trino.example.com:8443",
   "catalog": "hive",
   "schema": "sales",
@@ -58,7 +58,7 @@ JSON
 use fluree_db_api::{FlureeBuilder, SqlCreateConfig};
 
 let fluree = FlureeBuilder::memory().build_memory();
-let mut config = SqlCreateConfig::new("warehouse", "https://trino.example.com:8443", MAPPING_TTL);
+let mut config = SqlCreateConfig::new("orders-db", "https://trino.example.com:8443", MAPPING_TTL);
 config.catalog = Some("hive".into());
 config.schema = Some("sales".into());
 fluree.create_sql_graph_source(config).await?;
@@ -115,7 +115,7 @@ A SQL source is queried like any other mapped source — as a `from` target, in
 ```sparql
 PREFIX ex: <http://example.org/>
 SELECT ?name ?total
-FROM <warehouse:main>
+FROM <orders-db:main>
 WHERE {
   ?o a ex:Order ; ex:customer ?c ; ex:total ?total .
   ?c ex:name ?name .

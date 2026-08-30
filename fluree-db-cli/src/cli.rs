@@ -3048,7 +3048,7 @@ pub enum SqlAction {
     /// MySQL or SQLite.
     ///
     /// Examples:
-    ///   fluree sql map warehouse --endpoint https://trino.example.com:8443 --r2rml mappings/orders.ttl --auth-bearer $TOKEN
+    ///   fluree sql map orders-db --endpoint https://trino.example.com:8443 --r2rml mappings/orders.ttl --auth-bearer $TOKEN
     ///   fluree sql map crm --endpoint http://localhost:8080 --catalog pg --schema public --r2rml crm.ttl
     Map(Box<SqlMapArgs>),
 
@@ -3087,7 +3087,7 @@ pub enum SqlAction {
 /// Arguments for mapping a SQL endpoint as a graph source.
 #[derive(Debug, Clone, clap::Args)]
 pub struct SqlMapArgs {
-    /// Graph source name (e.g., "warehouse")
+    /// Graph source name (e.g., "orders-db")
     pub name: String,
 
     /// Execute against a remote server (by remote name, e.g., "origin")

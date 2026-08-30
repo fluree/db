@@ -1750,7 +1750,7 @@ A flat array of ledgers and graph sources. Retracted entries are omitted.
   {"name": "mydb", "branch": "dev", "type": "Ledger", "t": 3},
   {"name": "docsearch", "branch": "main", "type": "BM25", "t": 5,
    "dependencies": ["mydb:main"]},
-  {"name": "warehouse", "branch": "main", "type": "Iceberg", "t": 0,
+  {"name": "orders-db", "branch": "main", "type": "Iceberg", "t": 0,
    "dependencies": ["mydb:main"]}
 ]
 ```
@@ -3055,7 +3055,7 @@ POST {api_base_url}/sql/map
 
 ```json
 {
-  "name": "warehouse",
+  "name": "orders-db",
   "endpoint": "https://trino.example.com:8443",
   "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
   "r2rml_type": "text/turtle",
@@ -3089,7 +3089,7 @@ POST {api_base_url}/sql/map
 
 ```json
 {
-  "graph_source_id": "warehouse:main",
+  "graph_source_id": "orders-db:main",
   "endpoint": "https://trino.example.com:8443",
   "connection_tested": true,
   "mapping_source": "bafy…",
