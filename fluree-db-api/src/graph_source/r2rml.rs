@@ -814,24 +814,33 @@ impl<'a> FlureeR2rmlProvider<'a> {
         }
     }
 
-    /// The SQL source behind `graph_source_id`, or `None` when it is Iceberg-backed.
+    /// The SQL source behind `graph_source_id`, or `None` when it is
+    /// Iceberg-backed. Decided once per query session: the nameservice lookup
+    /// is not free on a storage-backed nameservice, and a query scans a source
+    /// once per triples map it touches.
     #[cfg(feature = "sql")]
     async fn sql_source(
         &self,
         graph_source_id: &str,
-    ) -> QueryResult<Option<super::sql::SqlSource>> {
+    ) -> QueryResult<Option<Arc<super::sql::SqlSource>>> {
+        if let Some(decision) = self.session.sql_dispatch(graph_source_id) {
+            return Ok(decision);
+        }
         let record = self
             .fluree
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
             .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
-        match record {
-            Some(r) if r.source_type == GraphSourceType::Sql => {
-                Ok(Some(super::sql::SqlSource::open(self.fluree, &r).await?))
-            }
-            _ => Ok(None),
-        }
+        let decision = match record {
+            Some(r) if r.source_type == GraphSourceType::Sql => Some(Arc::new(
+                super::sql::SqlSource::open(self.fluree, &r).await?,
+            )),
+            _ => None,
+        };
+        self.session
+            .memo_sql_dispatch(graph_source_id, decision.clone());
+        Ok(decision)
     }
 
     /// Resolve a graph source's storage backend, parsed table metadata, and

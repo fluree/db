@@ -134,6 +134,12 @@ pub(crate) struct IcebergCatalogSession {
     /// has no snapshot to pin, so the loadTable-cache precondition in
     /// `verify_build_snapshot_integrity` does not apply to it.
     sql_sources: Mutex<std::collections::HashSet<String>>,
+    /// Per-query memo of the SQL-dispatch decision: `None` = Iceberg-backed.
+    /// Without it every `scan_table` / `table_row_count` would repeat the
+    /// nameservice lookup (two object reads on a storage-backed nameservice)
+    /// just to learn the source family.
+    #[cfg(feature = "sql")]
+    sql_dispatch: Mutex<HashMap<String, Option<Arc<super::sql::SqlSource>>>>,
 }
 
 impl IcebergCatalogSession {
@@ -146,6 +152,30 @@ impl IcebergCatalogSession {
 
     pub(crate) fn is_sql_source(&self, graph_source_id: &str) -> bool {
         self.sql_sources.lock().unwrap().contains(graph_source_id)
+    }
+
+    #[cfg(feature = "sql")]
+    pub(crate) fn sql_dispatch(
+        &self,
+        graph_source_id: &str,
+    ) -> Option<Option<Arc<super::sql::SqlSource>>> {
+        self.sql_dispatch
+            .lock()
+            .unwrap()
+            .get(graph_source_id)
+            .cloned()
+    }
+
+    #[cfg(feature = "sql")]
+    pub(crate) fn memo_sql_dispatch(
+        &self,
+        graph_source_id: &str,
+        decision: Option<Arc<super::sql::SqlSource>>,
+    ) {
+        self.sql_dispatch
+            .lock()
+            .unwrap()
+            .insert(graph_source_id.to_string(), decision);
     }
 
     /// Cache key for a `loadTable` response: source id + fully-qualified table.
