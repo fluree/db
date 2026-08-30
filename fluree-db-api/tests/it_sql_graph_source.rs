@@ -4,7 +4,7 @@
 
 #![cfg(all(feature = "sql", feature = "native"))]
 
-use fluree_db_api::{FlureeBuilder, SqlCreateConfig};
+use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, SqlCreateConfig, TxnOpts};
 use serde_json::{json, Value};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -398,7 +398,8 @@ async fn registration_survives_an_unreachable_endpoint() {
 
 /// Against a live `fluree-sql-bridge` (or Trino) serving a `people(id, name,
 /// score, born)` table — run with `FLUREE_SQL_BRIDGE_URL=http://127.0.0.1:8080`
-/// and, for a bridge, `FLUREE_SQL_BRIDGE_DIALECT=sqlite|postgres|mysql`.
+/// and, for a bridge, `FLUREE_SQL_BRIDGE_DIALECT=sqlite|postgres|mysql`;
+/// `FLUREE_SQL_BRIDGE_CATALOG` / `FLUREE_SQL_BRIDGE_SCHEMA` qualify the table.
 /// Skips (loudly) when unset, so CI without a bridge does not silently pass it.
 #[tokio::test]
 async fn live_bridge_round_trip() {
@@ -415,6 +416,8 @@ async fn live_bridge_round_trip() {
         Ok("mysql") => fluree_db_api::SqlDialect::Mysql,
         _ => fluree_db_api::SqlDialect::Trino,
     };
+    config.catalog = std::env::var("FLUREE_SQL_BRIDGE_CATALOG").ok();
+    config.schema = std::env::var("FLUREE_SQL_BRIDGE_SCHEMA").ok();
     let created = fluree
         .create_sql_graph_source(config)
         .await
@@ -469,4 +472,68 @@ async fn live_bridge_round_trip() {
     let rows = bindings(&rows);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(rows[0].to_string().contains("person/2"), "{rows:?}");
+}
+
+/// A ledger joined with a SQL source in one query: the ledger holds facts
+/// about the same subjects the SQL rows mint, and the join happens in-engine.
+#[tokio::test]
+async fn ledger_and_sql_source_join_in_one_dataset() {
+    let server = fake_trino().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "people-sql",
+            server.uri(),
+            PEOPLE_R2RML,
+        ))
+        .await
+        .expect("create sql source");
+
+    let ledger = fluree.create_ledger("teams:main").await.expect("ledger");
+    fluree
+        .insert_turtle_with_opts(
+            ledger,
+            "@prefix ex: <http://example.org/> .\n\
+             <http://example.org/person/1> ex:team \"red\" .\n\
+             <http://example.org/person/2> ex:team \"blue\" .",
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &IndexConfig {
+                reindex_min_bytes: 5_000_000_000,
+                reindex_max_bytes: 5_000_000_000,
+            },
+            None,
+        )
+        .await
+        .expect("insert");
+
+    // Joining a ledger with a mapped source: the ledger is the default graph,
+    // the source is a GRAPH block — and on the dataset path it must be listed
+    // with FROM NAMED, exactly as for an Iceberg source (without it the GRAPH
+    // block resolves to nothing and the join is empty).
+    let sparql = "
+        PREFIX ex: <http://example.org/>
+        SELECT ?name ?team FROM <teams:main> FROM NAMED <people-sql:main>
+        WHERE { ?p ex:team ?team . GRAPH <people-sql:main> { ?p ex:name ?name } }
+        ORDER BY ?name
+    ";
+    let rows = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("join query");
+    let rows = bindings(&rows);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let row = |i: usize, var: &str| rows[i][var]["value"].as_str().unwrap_or("").to_string();
+    assert_eq!(
+        (row(0, "name"), row(0, "team")),
+        ("alice".into(), "red".into()),
+        "{rows:?}"
+    );
+    assert_eq!(
+        (row(1, "name"), row(1, "team")),
+        ("bob".into(), "blue".into()),
+        "{rows:?}"
+    );
 }

@@ -96,7 +96,26 @@ fn iceberg_scan_concurrency(num_files: usize) -> usize {
 /// The R2RML mapping reference carried by a mapped graph-source record, per
 /// source family. `None` for a non-mapped type, an unparseable config, or a
 /// record registered without a mapping.
-fn mapping_source_of(
+/// The Iceberg-only paths (snapshot pinning, incremental materialization,
+/// tracking) parse the record as `IcebergGsConfig`; a SQL record would fail
+/// that parse with a misleading message. Refuse it by name instead.
+fn require_iceberg_backed(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+    graph_source_id: &str,
+) -> QueryResult<()> {
+    #[cfg(feature = "sql")]
+    if record.source_type == GraphSourceType::Sql {
+        return Err(QueryError::InvalidQuery(format!(
+            "Graph source '{graph_source_id}' is SQL-backed: snapshot pinning and \
+             materialization are not available for SQL graph sources (they read the \
+             live tables); query it directly instead"
+        )));
+    }
+    let _ = (record, graph_source_id);
+    Ok(())
+}
+
+pub(crate) fn mapping_source_of(
     record: &fluree_db_nameservice::GraphSourceRecord,
 ) -> Option<fluree_db_iceberg::config::MappingSource> {
     match record.source_type {
@@ -866,6 +885,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
 
+        require_iceberg_backed(&record, graph_source_id)?;
         let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
             QueryError::Internal(format!(
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
@@ -1157,6 +1177,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
+        require_iceberg_backed(&record, graph_source_id)?;
         let config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
             QueryError::Internal(format!(
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
@@ -2251,6 +2272,7 @@ impl FlureeR2rmlProvider<'_> {
             })?;
 
         // Parse the Iceberg graph source config
+        require_iceberg_backed(&record, graph_source_id)?;
         let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
             QueryError::Internal(format!(
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"

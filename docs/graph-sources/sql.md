@@ -123,6 +123,25 @@ WHERE {
 }
 ```
 
+### Joining with a ledger
+
+Put the ledger in `FROM`, the SQL source in `FROM NAMED`, and address it with
+`GRAPH`. The join runs in the engine over the rows the source returns:
+
+```sparql
+PREFIX ex: <http://example.org/>
+SELECT ?name ?team
+FROM <teams:main>
+FROM NAMED <orders-db:main>
+WHERE {
+  ?p ex:team ?team .
+  GRAPH <orders-db:main> { ?p ex:name ?name }
+}
+```
+
+Without the `FROM NAMED`, the `GRAPH` block resolves to nothing and the join is
+empty — the same dataset rule that applies to Iceberg sources.
+
 ### What is pushed to SQL
 
 The query engine asks the source for **one table at a time** — a projection,
@@ -188,11 +207,11 @@ A SQL source has no snapshot: every query reads the tables as they are at that
 moment. Consequently
 
 - `as-of` time travel is not available on a SQL source;
-- a [materialized twin](iceberg.md#materialization) built from a SQL source is
-  stamped with `sql://<endpoint>/<table>@<time>` per table rather than a
-  snapshot id, and is always rebuilt in full — there is no incremental delta
-  between two reads of a mutable table;
-- `fluree iceberg track` (snapshot polling) does not apply.
+- [materialization](iceberg.md#materialization) into a twin ledger and
+  `fluree iceberg track` are **not yet supported** for SQL sources — both are
+  built on Iceberg snapshot windows, and a mutable table has no delta between
+  two reads. Attempting either returns a clear error naming the source. A
+  full-rebuild materialization is a planned follow-up.
 
 ## Security
 
