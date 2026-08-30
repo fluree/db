@@ -101,7 +101,28 @@ impl NestedSelectSpec {
                     ForwardItem::Property {
                         predicate,
                         sub_spec,
+                        ..
                     } if predicate == pred => Some(sub_spec.as_deref()),
+                    _ => None,
+                })
+            }
+        }
+    }
+
+    /// The per-value modifiers for a forward predicate at this level, if any.
+    ///
+    /// A wildcard level carries no modifiers: `*` names no predicate to attach
+    /// them to, and a refinement is a sub-selection rather than a selection.
+    pub fn predicate_modifiers(&self, pred: &Sid) -> Option<&NestedModifiers> {
+        match self {
+            NestedSelectSpec::Wildcard { .. } => None,
+            NestedSelectSpec::Explicit { forward, .. } => {
+                forward.iter().find_map(|item| match item {
+                    ForwardItem::Property {
+                        predicate,
+                        modifiers,
+                        ..
+                    } if predicate == pred => modifiers.as_deref(),
                     _ => None,
                 })
             }
@@ -118,7 +139,43 @@ pub enum ForwardItem {
     Property {
         predicate: Sid,
         sub_spec: Option<Box<NestedSelectSpec>>,
+        /// Ordering and paging applied to *this property's* values, after they
+        /// are materialized. `None` is the historical behaviour: every value,
+        /// in index order.
+        modifiers: Option<Box<NestedModifiers>>,
     },
+}
+
+/// Ordering and paging for one property's values inside a hydration.
+///
+/// These act on the values a property already produced for one subject, not on
+/// the query's solutions — a nested `limit` bounds how many friends each person
+/// shows, which is a different question from how many rows the query returns and
+/// is not expressible in the WHERE clause.
+///
+/// Ordering runs before paging, so `offset`/`limit` cut a stable window.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NestedModifiers {
+    /// Sort keys, most significant first. Empty means index order.
+    pub order: Vec<NestedOrderKey>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+impl NestedModifiers {
+    /// Whether this would change anything, so callers can skip the work.
+    pub fn is_noop(&self) -> bool {
+        self.order.is_empty() && self.offset.is_none() && self.limit.is_none()
+    }
+}
+
+/// One sort key for [`NestedModifiers`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct NestedOrderKey {
+    /// The predicate to read from each value. `None` orders by the value
+    /// itself, which is the only option for a literal-valued property.
+    pub predicate: Option<Sid>,
+    pub descending: bool,
 }
 
 /// Top-level hydration spec (resolved, with Sids).

@@ -12,6 +12,7 @@ members = [
     "fluree-db-query",
     "fluree-db-sparql",
     "fluree-db-cypher",
+    "fluree-db-graphql",
     "fluree-db-nameservice",
     "fluree-db-novelty",
     "fluree-db-ledger",
@@ -67,6 +68,12 @@ thiserror = "1.0"
 # Used by fluree-db-novelty's current-state fact index.
 imbl = "3"
 winnow = "0.7"
+
+# GraphQL runtime (fluree-db-graphql): parse/validate/introspect/execute over a
+# schema built at runtime from ledger metadata. `default-features = false` drops
+# the multipart-upload (`tempfile`) and bundled GraphiQL (`askama`) features; the
+# `dynamic-schema` API is all this repo uses.
+async-graphql = { version = "7.2", default-features = false, features = ["dynamic-schema"] }
 indexmap = { version = "2", features = ["serde"] }
 
 # For content addressing and hashing

@@ -93,6 +93,7 @@ defaults to `/v1/fluree`.
 
 **POST /query**
 - Execute queries (JSON-LD Query, SPARQL, or Cypher — Cypher on the ledger-scoped `/query/{ledger}` route with `Content-Type: application/cypher`)
+- Execute GraphQL against a derived schema (`/graphql/{ledger}`), or read that schema as SDL (`/graphql-schema/{ledger}`)
 - Parameters: None (ledger specified in query body)
 - Returns: Query results
 - Supports history queries via time range in `from` clause (see [Time Travel](../concepts/time-travel.md))

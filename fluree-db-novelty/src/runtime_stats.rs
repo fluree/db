@@ -79,6 +79,9 @@ pub mod stats_merge_site {
     /// The Cypher catalog shims — `db.labels` / `db.relationshipTypes` /
     /// `db.propertyKeys` / `db.schema.visualization`.
     pub const MERGED_STATS: &str = "merged-stats";
+    /// GraphQL schema derivation: which classes are types and which properties
+    /// are their fields.
+    pub const GRAPHQL_SCHEMA: &str = "graphql-schema";
 }
 
 /// Above this many novelty flakes an assembly that asked for

@@ -7,6 +7,8 @@ mod commits;
 mod context;
 mod events;
 mod export;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 #[cfg(feature = "iceberg")]
 mod iceberg;
 mod iceberg_ssrf;
@@ -334,6 +336,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         "/validate/*ledger",
         get(validate::validate_ledger_tail).post(validate::validate_ledger_tail),
     );
+
+    // GraphQL over the schema derived from the ledger's own data. The SDL sits
+    // on its own path rather than a `/schema` suffix: the ledger tail is greedy
+    // and ledger names may contain `/`.
+    #[cfg(feature = "graphql")]
+    let v1 = v1
+        .route(
+            "/graphql/*ledger",
+            get(graphql::graphql_ledger_tail).post(graphql::graphql_ledger_tail),
+        )
+        .route(
+            "/graphql-schema/*ledger",
+            get(graphql::graphql_schema_ledger_tail),
+        );
 
     let mut router = Router::new()
         // Health check

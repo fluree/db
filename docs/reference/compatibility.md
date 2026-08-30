@@ -214,11 +214,12 @@ These features are controlled at compile time via Cargo:
 | `credential` | No | DID/JWS/VerifiableCredential support for signed queries/transactions. Pulls in crypto dependencies (`ed25519-dalek`, `bs58`). |
 | `iceberg` | No | Apache Iceberg/R2RML graph source support |
 | `shacl` | No | SHACL constraint validation (requires fluree-db-transact + fluree-db-shacl). Default in server/CLI. |
+| `graphql` | No | GraphQL endpoint over a schema derived from ledger data and SHACL shapes. Implies `shacl` (tier 2 reads shapes); pulls in `async-graphql`. Default in server/CLI. |
 | `vector` | No | Embedded vector similarity search (HNSW indexes via usearch) |
 | `ipfs` | No | IPFS-backed storage via Kubo HTTP RPC |
 | `search-remote-client` | No | HTTP client for remote BM25 and vector search services |
 | `aws-testcontainers` | No | Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers) |
-| `full` | No | Convenience bundle: `native`, `credential`, `iceberg`, `shacl`, `ipfs` |
+| `full` | No | Convenience bundle: `native`, `credential`, `iceberg`, `shacl`, `ipfs`, `graphql` |
 
 Example:
 ```toml

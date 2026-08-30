@@ -61,6 +61,8 @@ pub mod graph_query_builder;
 pub mod graph_snapshot;
 pub mod graph_source;
 pub mod graph_transact_builder;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 pub mod import;
 pub mod import_source;
 mod indexer_attachment_provider;

@@ -63,6 +63,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`load`](load.md) | Stream a CSV into a ledger as batched Cypher/JSON-LD upserts (`LOAD CSV`) |
 | [`query`](query.md) | Query a ledger |
 | [`multi-query`](multi-query.md) | Run multiple queries against a single consistent snapshot |
+| [`graphql`](graphql.md) | Query a ledger through a schema derived from its data |
 | [`validate`](validate.md) | Validate data against SHACL shapes (report) |
 | [`model`](model.md) | Governance model tooling — access profiles, SHACL entity shapes, class hierarchy |
 | [`history`](history.md) | Show change history for an entity |

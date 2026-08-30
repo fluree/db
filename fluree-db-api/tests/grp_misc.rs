@@ -35,6 +35,23 @@ mod it_join_batched_overlay;
 // its assertions are about instrumentation, and tracing's process-global
 // callsite-interest cache + thread-local capture make that fragile next to
 // parallel siblings under bare `cargo test`.
+// GraphQL is behind a feature flag (async-graphql is a heavy dependency), so
+// this module only compiles when it is on.
+#[cfg(feature = "graphql")]
+#[path = "it_graphql.rs"]
+mod it_graphql;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_curated.rs"]
+mod it_graphql_curated;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_mutations.rs"]
+mod it_graphql_mutations;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_polish.rs"]
+mod it_graphql_polish;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_shapes.rs"]
+mod it_graphql_shapes;
 #[path = "it_minmax_string_fast_path.rs"]
 mod it_minmax_string_fast_path;
 #[path = "it_mixed_representation.rs"]
