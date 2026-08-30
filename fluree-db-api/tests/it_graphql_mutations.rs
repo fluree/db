@@ -414,6 +414,45 @@ async fn the_input_type_refuses_what_it_cannot_write() {
 }
 
 #[tokio::test]
+async fn minted_ids_are_distinct_across_creates() {
+    // Minting must not depend on a clock: `SystemTime::now()` panics on
+    // wasm32-unknown-unknown, and it compiles fine on the way there.
+    let (fluree, ledger) = seeded("gql-mut-mint", mutations_enabled()).await;
+    let (data, ledger) = mutate(
+        &fluree,
+        ledger,
+        r#"mutation {
+            a: create_Person(input: { name: "A" }) { id }
+            b: create_Person(input: { name: "B" }) { id }
+            c: create_Person(input: { name: "C" }) { id }
+        }"#,
+    )
+    .await;
+
+    let ids: Vec<&str> = ["a", "b", "c"]
+        .iter()
+        .map(|k| data[*k]["id"].as_str().expect("minted id"))
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 3, "minted ids collided: {ids:?}");
+    for id in &ids {
+        assert!(
+            id.starts_with("ex:"),
+            "minted under the declared base: {id}"
+        );
+    }
+
+    // And all three are really there.
+    let read = fluree
+        .graphql(&view(&ledger), &GraphQlRequest::new("{ persons_count }"))
+        .await
+        .unwrap();
+    assert_eq!(read["data"], json!({ "persons_count": 3 }));
+}
+
+#[tokio::test]
 async fn a_mutation_with_no_ids_is_refused() {
     let (fluree, ledger) = seeded("gql-mut-empty", mutations_enabled()).await;
     let (msg, _) = mutate_expecting_error(

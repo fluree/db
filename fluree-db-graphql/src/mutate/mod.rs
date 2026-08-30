@@ -404,17 +404,23 @@ fn render_value(
 
 /// A fresh local name for a minted subject.
 ///
-/// Random rather than sequential: a predictable identifier would let a caller
-/// guess the IRI of a subject someone else created.
+/// A process-lifetime counter supplies uniqueness; hashing it under a
+/// per-process random seed keeps the minted IRIs from reading as a visible
+/// sequence. Uniqueness is the property relied on — knowing another subject's
+/// IRI grants nothing on its own, since reads are governed by policy.
+///
+/// Deliberately no clock: `SystemTime::now()` *panics* on
+/// `wasm32-unknown-unknown`, and it would compile fine on the way there.
 fn new_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let entropy = std::collections::hash_map::RandomState::new();
+    use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
-    let mut hasher = entropy.build_hasher();
-    hasher.write_u128(nanos);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static SEED: OnceLock<RandomState> = OnceLock::new();
+
+    let mut hasher = SEED.get_or_init(RandomState::new).build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
     format!("{:016x}", hasher.finish())
 }
