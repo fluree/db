@@ -6,7 +6,7 @@ are stored as [edge annotations](../concepts/edge-annotations.md) — so data
 written here is readable from every surface.
 
 Examples assume a ledger whose default `@context` maps the bare names
-(`Person`, `KNOWS`, `name`, …) — see [IRI mapping](../query/cypher.md#iri-mapping-for-bare-identifiers).
+(`Person`, `KNOWS`, `name`, …) — see [IRI mapping](../query/cypher.md#names-and-opting-into-iris).
 For how to send these statements (Rust / CLI / HTTP), see
 [Running Cypher](../query/cypher.md#running-cypher).
 

@@ -2659,7 +2659,7 @@ Returns simplified nameservice-only metadata:
 | `commitId` | string | No | Head commit CID (non-proxy mode) |
 | `commit_head_id` | string | No | Head commit CID (proxy mode) |
 
-> **Important:** The `t` field is required by the CLI for push/pull/clone operations. See [CLI-Server API Contract](../design/cli-server-contract.md) for details.
+> **Important:** The `t` field is required by the CLI for push/pull/clone operations — clone and pull read it as a remote-head preflight before requesting a pack. See [Implementing Server Support For Fluree CLI](../cli/server-integration.md#minimum-endpoints-by-cli-feature) for the per-command endpoint contract.
 
 **Optional query parameters:**
 
