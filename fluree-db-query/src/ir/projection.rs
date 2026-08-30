@@ -109,6 +109,32 @@ impl NestedSelectSpec {
         }
     }
 
+    /// [`Self::select_predicate`] and [`Self::predicate_modifiers`] in one pass.
+    ///
+    /// Hydration needs both for every (subject, predicate) it renders, and an
+    /// `Explicit` level answers each by scanning `forward`. Asking separately
+    /// walks that list twice per predicate; this walks it once.
+    pub fn select_predicate_with_modifiers(
+        &self,
+        pred: &Sid,
+    ) -> Option<(Option<&NestedSelectSpec>, Option<&NestedModifiers>)> {
+        match self {
+            NestedSelectSpec::Wildcard { refinements, .. } => {
+                Some((refinements.get(pred).map(|b| &**b), None))
+            }
+            NestedSelectSpec::Explicit { forward, .. } => {
+                forward.iter().find_map(|item| match item {
+                    ForwardItem::Property {
+                        predicate,
+                        sub_spec,
+                        modifiers,
+                    } if predicate == pred => Some((sub_spec.as_deref(), modifiers.as_deref())),
+                    _ => None,
+                })
+            }
+        }
+    }
+
     /// The per-value modifiers for a forward predicate at this level, if any.
     ///
     /// A wildcard level carries no modifiers: `*` names no predicate to attach

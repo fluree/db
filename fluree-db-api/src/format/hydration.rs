@@ -1361,11 +1361,14 @@ impl<'a> HydrationFormatter<'a> {
                     continue;
                 }
 
-                // `select_predicate` returns `None` when the level is Explicit
-                // and the predicate isn't listed; otherwise it returns
-                // `Some(sub_spec)` (which may itself be `None` for "select but
-                // don't recurse").
-                let Some(explicit_sub_spec) = level.select_predicate(&pred) else {
+                // Returns `None` when the level is Explicit and the predicate
+                // isn't listed; otherwise the sub-spec (itself `None` for
+                // "select but don't recurse") and this predicate's per-value
+                // modifiers. One lookup, because an Explicit level answers both
+                // by scanning the same list.
+                let Some((explicit_sub_spec, level_modifiers)) =
+                    level.select_predicate_with_modifiers(&pred)
+                else {
                     continue;
                 };
 
@@ -1396,7 +1399,7 @@ impl<'a> HydrationFormatter<'a> {
                 // what they act on — a nested `limit` bounds how many of *this
                 // subject's* values are shown, which the WHERE clause (which
                 // bounds solutions, not values) cannot express.
-                if let Some(modifiers) = level.predicate_modifiers(&pred) {
+                if let Some(modifiers) = level_modifiers {
                     apply_nested_modifiers(&mut values, modifiers, self.compactor)?;
                 }
 
