@@ -187,10 +187,15 @@ fn float_typed_literal(f: f32) -> ComparableValue {
     }
 }
 
-/// Format an f32 value for xsd:float output.
+/// Format an `f32` the way an XSD *cast* renders it.
 ///
-/// Rust's default f32 Display uses minimal decimal digits. This is acceptable
-/// for the W3C tests which compare float values numerically.
+/// Deliberately NOT the canonical XSD lexical form `STR()` produces
+/// (`fluree_graph_ir::canonical_xsd_float`): SPARQL §17.5 defers casting to
+/// XPath, whose float/double→string rule uses plain decimal notation for
+/// values in `[1e-6, 1e6)` rather than always-scientific. W3C `cast-string`
+/// pins it: `xsd:string("1E0"^^xsd:float)` is `"1"`, not `"1.0E0"`. The two
+/// renderings answer two different questions and must stay separate (#1695).
+/// Only the special values agree: `NaN`/`INF`/`-INF` in both.
 pub(crate) fn format_f32(f: f32) -> String {
     if f.is_nan() {
         "NaN".to_string()
@@ -203,6 +208,25 @@ pub(crate) fn format_f32(f: f32) -> String {
     } else {
         // Use f32 Display which gives minimal-length representation
         f.to_string()
+    }
+}
+
+/// `f64` counterpart of [`format_f32`], for the `xsd:string()` cast of a
+/// double. Rust's `Display` supplies the decimal mantissa; the special values
+/// take their XSD spellings — `f64::to_string()` alone yields `"inf"`, which
+/// is not a valid lexical form under either the cast rules or the canonical
+/// ones (#1695).
+fn format_f64(d: f64) -> String {
+    if d.is_nan() {
+        "NaN".to_string()
+    } else if d.is_infinite() {
+        if d.is_sign_positive() {
+            "INF".to_string()
+        } else {
+            "-INF".to_string()
+        }
+    } else {
+        d.to_string()
     }
 }
 
@@ -319,6 +343,21 @@ fn cast_to_string(
     if let ComparableValue::Decimal(ref d) = v {
         let s = canonical_decimal_string(d);
         return Some(ComparableValue::String(Arc::from(s)));
+    }
+    // Doubles and floats likewise render by the XPath *cast* rule, not the
+    // canonical XSD lexical form `STR()` returns — see `format_f32` (#1695).
+    // Without these arms the cast would fall through to `into_string_value`
+    // and pick up STR()'s canonical form, failing W3C `cast-string`.
+    match &v {
+        ComparableValue::Double(d)
+        | ComparableValue::TypedLiteral {
+            val: FlakeValue::Double(d),
+            ..
+        } => return Some(ComparableValue::String(Arc::from(format_f64(*d)))),
+        ComparableValue::Float(f) => {
+            return Some(ComparableValue::String(Arc::from(format_f32(*f))))
+        }
+        _ => {}
     }
     let namespace_codes = ctx.map(|c| c.active_snapshot.namespaces());
     v.into_string_value_with_namespaces(namespace_codes)

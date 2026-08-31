@@ -26,6 +26,44 @@ async fn assert_query_bind_error(
     }
 }
 
+/// Issue #1695 twin (SPARQL↔JSON-LD parity): `(str ?d)` on an `xsd:double`
+/// binding must produce the W3C canonical lexical form (`1.0E0`) — the same
+/// string the SPARQL surface's `STR()` and the RDF-lexical serializers emit —
+/// while `?d` itself stays a native JSON number on this surface.
+#[tokio::test]
+async fn jsonld_bind_str_double_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "query/str-double-canonical");
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@id": "ex:y1",
+        "ex:d": {"@value": "1E0", "@type": "xsd:double"}
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where": [
+            {"@id": "ex:y1", "ex:d": "?d"},
+            ["bind", "?lex", "(str ?d)"]
+        ],
+        "select": ["?d", "?lex"]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("bind str(double) query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(json_rows, json!([[1.0, "1.0E0"]]));
+    assert!(
+        json_rows[0][0].is_number(),
+        "JSON-LD double must stay a native number: {json_rows}"
+    );
+}
+
 #[tokio::test]
 async fn jsonld_filter_single_filter() {
     // Mirrors `fluree.snapshot.query.filter-query-test/filter-test` ("single filter")
