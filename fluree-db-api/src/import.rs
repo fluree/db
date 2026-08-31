@@ -43,6 +43,45 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
 
+/// Publish the import's commit head by fast-forwarding the ref directly.
+///
+/// Bulk import is a one-shot admin flow: nothing is staged on the
+/// per-branch transaction queue, so `publish_commit` — whose contract on
+/// queue-backed nameservices (the raft data plane) is "apply the staged
+/// queue front" — fails there with "per-branch queue is empty". A
+/// ref-level fast-forward carries the exact strictly-newer semantics the
+/// file/S3 nameservices give `publish_commit`, and every nameservice
+/// implements it via `RefPublisher`, so the bulk importer works under
+/// all data planes without touching the transactor's queue contract.
+///
+/// An equal-or-newer head is a no-op success, mirroring `publish_commit`:
+/// the final publish re-states the last checkpoint's `t`, and a re-run
+/// may find its own earlier head already in place.
+async fn publish_import_commit_head(
+    nameservice: &dyn crate::NameServicePublisher,
+    alias: &str,
+    t: i64,
+    commit_id: &ContentId,
+) -> std::result::Result<(), ImportError> {
+    use fluree_db_nameservice::{CasResult, RefValue};
+
+    let new_ref = RefValue {
+        id: Some(commit_id.clone()),
+        t,
+    };
+    match nameservice
+        .fast_forward_commit(alias, &new_ref, 5)
+        .await
+        .map_err(|e| ImportError::Storage(e.to_string()))?
+    {
+        CasResult::Updated => Ok(()),
+        CasResult::Conflict { actual } if actual.as_ref().is_some_and(|a| a.t >= t) => Ok(()),
+        CasResult::Conflict { actual } => Err(ImportError::Storage(format!(
+            "import commit-head publish for {alias} lost a race: head is {actual:?}, wanted t={t}"
+        ))),
+    }
+}
+
 const IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS: u128 = 50;
 const LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY: usize = 2;
 
@@ -4180,10 +4219,13 @@ where
                 if env.config.publish_every > 0
                     && (next_expected + 1).is_multiple_of(env.config.publish_every)
                 {
-                    env.nameservice
-                        .publish_commit(env.alias, result.t, &result.commit_id)
-                        .await
-                        .map_err(|e| ImportError::Storage(e.to_string()))?;
+                    publish_import_commit_head(
+                        env.nameservice,
+                        env.alias,
+                        result.t,
+                        &result.commit_id,
+                    )
+                    .await?;
                     tracing::info!(
                         t = result.t,
                         chunk = next_expected + 1,
@@ -5050,10 +5092,7 @@ where
                 elapsed_secs: run_start.elapsed().as_secs_f64(),
             });
             if config.publish_every > 0 && (idx + 1).is_multiple_of(config.publish_every) {
-                nameservice
-                    .publish_commit(alias, result.t, &result.commit_id)
-                    .await
-                    .map_err(|e| ImportError::Storage(e.to_string()))?;
+                publish_import_commit_head(nameservice, alias, result.t, &result.commit_id).await?;
             }
         }
 
@@ -5312,10 +5351,8 @@ where
                     elapsed_secs: run_start.elapsed().as_secs_f64(),
                 });
                 if config.publish_every > 0 && (i + 1).is_multiple_of(config.publish_every) {
-                    nameservice
-                        .publish_commit(alias, result.t, &result.commit_id)
-                        .await
-                        .map_err(|e| ImportError::Storage(e.to_string()))?;
+                    publish_import_commit_head(nameservice, alias, result.t, &result.commit_id)
+                        .await?;
                 }
             }
         }
@@ -5327,10 +5364,7 @@ where
         .clone()
         .ok_or_else(|| ImportError::Storage("no commit head after import".to_string()))?;
 
-    nameservice
-        .publish_commit(alias, state.t, &commit_head_id)
-        .await
-        .map_err(|e| ImportError::Storage(e.to_string()))?;
+    publish_import_commit_head(nameservice, alias, state.t, &commit_head_id).await?;
     tracing::info!(t = state.t, "published final commit head");
 
     // ---- Spawn txn-meta "meta chunk" build in background ----
@@ -7608,5 +7642,61 @@ mod resource_model_tests {
         assert_eq!(parallel[0].0, 0);
         assert_eq!(parallel[1].0, 1);
         assert_eq!(parallel[2].0, 2);
+    }
+}
+
+#[cfg(test)]
+mod publish_import_commit_head_tests {
+    use super::*;
+    use fluree_db_nameservice::memory::MemoryNameService;
+    use fluree_db_nameservice::{LedgerLifecycle, RefKind, RefLookup};
+
+    fn cid(label: &str) -> ContentId {
+        ContentId::new(ContentKind::Commit, label.as_bytes())
+    }
+
+    /// The four publish shapes the import pipeline produces: creation on
+    /// a freshly-initialized ledger, a checkpoint fast-forwarding past
+    /// the importer's own head, the final publish restating the last
+    /// checkpoint's `t`, and a stale republish — the last two are no-op
+    /// successes, mirroring `publish_commit`'s advance-if-newer contract.
+    #[tokio::test]
+    async fn creates_advances_and_tolerates_republishes() {
+        let ns = MemoryNameService::new();
+        let alias = "importdb:main";
+
+        // The importer initializes the ledger before its first publish.
+        ns.init(alias).await.expect("init");
+
+        publish_import_commit_head(&ns, alias, 1, &cid("t1"))
+            .await
+            .expect("initial publish creates the head");
+        let head = ns
+            .get_ref(alias, RefKind::CommitHead)
+            .await
+            .expect("get_ref")
+            .expect("head exists");
+        assert_eq!(head.t, 1);
+        assert_eq!(head.id, Some(cid("t1")));
+
+        publish_import_commit_head(&ns, alias, 5, &cid("t5"))
+            .await
+            .expect("checkpoint fast-forwards");
+
+        publish_import_commit_head(&ns, alias, 5, &cid("t5"))
+            .await
+            .expect("equal-t republish is a no-op success");
+
+        publish_import_commit_head(&ns, alias, 3, &cid("t3"))
+            .await
+            .expect("stale republish is a no-op success");
+
+        let head = ns
+            .get_ref(alias, RefKind::CommitHead)
+            .await
+            .expect("get_ref")
+            .expect("head exists");
+        assert_eq!(head.t, 5, "no-op republishes leave the head alone");
+        assert_eq!(head.id, Some(cid("t5")));
     }
 }
