@@ -607,7 +607,14 @@ fn lower_triple_pattern<E: IriEncoder>(
             Some(DatatypeConstraint::Explicit(dt_sid))
         }
         Some(UnresolvedDatatypeConstraint::LangTag(tag)) => {
-            Some(DatatypeConstraint::LangTag(tag.clone()))
+            // BCP 47 tags compare case-insensitively; match the stored
+            // (lowercase) form.
+            Some(DatatypeConstraint::LangTag(
+                match fluree_db_core::normalize_lang_tag(tag) {
+                    std::borrow::Cow::Borrowed(_) => tag.clone(),
+                    std::borrow::Cow::Owned(s) => Arc::from(s),
+                },
+            ))
         }
         None => None,
     };

@@ -199,6 +199,14 @@ impl LedgerState {
         let record = ns
             .lookup(ledger_id)
             .await?
+            // Backends that tombstone (the raft nameservice keeps serving
+            // retracted records so admin tooling can read the flag) must
+            // not let a dropped ledger LOAD: on the query path, retracted
+            // reads identically to not-found — matching the backends that
+            // hide the record outright. Without this, a raft-mode server
+            // re-loads and serves a dropped ledger the moment its cache
+            // eviction lands.
+            .filter(|r| !r.retracted)
             .ok_or_else(|| LedgerError::not_found(ledger_id))?;
 
         // For branched ledgers, build a recursive content store that falls

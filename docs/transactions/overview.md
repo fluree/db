@@ -221,13 +221,14 @@ See [SPARQL UPDATE](../query/sparql.md#sparql-update) for complete documentation
 
 ## Transaction Endpoints
 
-Fluree exposes three transaction endpoints (all under `/v1/fluree/`):
+Fluree exposes four transaction endpoints (all under `/v1/fluree/`):
 
 - `POST /insert` — add triples (JSON-LD or Turtle)
 - `POST /update` — WHERE/DELETE/INSERT (JSON-LD) and SPARQL UPDATE
 - `POST /upsert` — replace values for the predicates you supply (JSON-LD, Turtle, TriG)
+- `POST /sync` — make one named graph's contents exactly the payload, committing only the delta (JSON-LD)
 
-See [Insert](insert.md), [Update](update-where-delete-insert.md), and [Upsert](upsert.md) for details.
+See [Insert](insert.md), [Update](update-where-delete-insert.md), [Upsert](upsert.md), and [Sync](sync.md) for details.
 
 ## Transaction Semantics
 
@@ -379,6 +380,12 @@ Committed data is durable:
 - Written to persistent storage
 - Replicated (if configured)
 - Immutable
+
+A transaction that has started committing runs to completion even if the
+client disconnects mid-request: the server finishes the write and the data
+is committed, the client just never sees the receipt. A client that times
+out or drops the connection should therefore re-query (or retry
+idempotently) rather than assume the write was lost.
 
 ## Error Handling
 

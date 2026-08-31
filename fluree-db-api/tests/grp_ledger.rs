@@ -27,3 +27,5 @@ mod it_revert;
 mod it_revert_preview;
 #[path = "it_stable_hashes.rs"]
 mod it_stable_hashes;
+#[path = "it_sync_graph.rs"]
+mod it_sync_graph;

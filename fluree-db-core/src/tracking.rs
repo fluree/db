@@ -72,7 +72,11 @@ pub mod schedule {
     /// Per row/flake materialized from in-memory state: `db.range` flakes,
     /// overlay/novelty rows, and history rows. The same 1 µf-per-unit rate also
     /// applies to staged flakes during transactions and bulk imports, where it
-    /// is charged as a raw count (`flakes.len()`) at those call sites.
+    /// is charged as a raw count (`flakes.len()`) at those call sites, and to
+    /// rows handled by the fused join lanes (`PropertyJoinOperator` scan/probe
+    /// drains, `ValuesOperator` join input), charged per batch/chunk at the
+    /// existing cancellation boundaries — never per iteration inside the merge
+    /// loops (hot-loop purity).
     pub const PER_ROW_MICRO_FUEL: u64 = 1;
 
     /// Transaction/commit baseline, charged once per `stage` and once per

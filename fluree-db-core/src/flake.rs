@@ -37,6 +37,19 @@ pub struct FlakeMeta {
     pub i: Option<i32>,
 }
 
+/// Canonical form of a BCP 47 language tag: ASCII-lowercased. RDF 1.1 defines
+/// the value space of language tags as lowercase and compares them
+/// case-insensitively, so `"x"@EN` and `"x"@en` are one term. Every tag that
+/// enters a [`FlakeMeta`], a language dictionary, or a query constraint goes
+/// through here so a single lexical form is stored and looked up.
+pub fn normalize_lang_tag(tag: &str) -> std::borrow::Cow<'_, str> {
+    if tag.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(tag.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(tag)
+    }
+}
+
 impl FlakeMeta {
     /// Create empty metadata
     pub fn new() -> Self {
@@ -46,8 +59,20 @@ impl FlakeMeta {
     /// Create metadata with language tag
     pub fn with_lang(lang: impl Into<String>) -> Self {
         Self {
-            lang: Some(lang.into()),
+            lang: Some(normalize_lang_tag(&lang.into()).into_owned()),
             i: None,
+        }
+    }
+
+    /// Metadata for a value with an optional language tag and/or list
+    /// position; the tag is normalized like [`with_lang`](Self::with_lang).
+    pub fn from_parts(lang: Option<&str>, i: Option<i32>) -> Option<Self> {
+        match (lang, i) {
+            (None, None) => None,
+            (lang, i) => Some(Self {
+                lang: lang.map(|l| normalize_lang_tag(l).into_owned()),
+                i,
+            }),
         }
     }
 
@@ -68,6 +93,31 @@ impl FlakeMeta {
     }
 
     /// Maximum metadata for range bounds
+    ///
+    /// This is an upper bound for the metadata a query can reach, **not** a
+    /// maximum over the whole type: `{lang: Some(_), i: Some(i32::MAX)}`
+    /// sorts strictly above it, because [`Ord`] breaks an `i` tie on `lang`
+    /// and `None < Some`. An inclusive upper bound built from this therefore
+    /// excludes a language-tagged value sitting at list index `i32::MAX`.
+    ///
+    /// Unreachable through every bound builder in the tree — [`Flake::max_spot`],
+    /// [`Flake::max_for_subject`], [`Flake::max_for_subject_predicate`] and
+    /// [`Flake::max_for_predicate`] here, plus `predicate_walk_bounds` and
+    /// `overlay_walk_bounds` in `fluree-db-query`. What guards them is `t`: all
+    /// six pin `t` to `i64::MAX` and `op` to `true`, both compared before the
+    /// metadata tiebreak in all four comparators, and no real flake carries
+    /// `t == i64::MAX`. The `o`/`dt` maxima are incidental and are *not*
+    /// universal — `overlay_walk_bounds` pins `o` to the pattern's bound object
+    /// and `dt` to `Sid::max()` when the pattern has one. A new bound builder
+    /// that does not pin `t` to `i64::MAX` would reach the narrowing, so do not
+    /// assume this value dominates every [`FlakeMeta`].
+    ///
+    /// The six-builder pin is enforced by
+    /// `every_bound_builder_pins_the_sentinel_guard` in
+    /// `fluree-db-query/src/binary_scan.rs`, which asserts `t == i64::MAX`
+    /// and `op == true` on each builder's upper bound — this paragraph is a
+    /// pointer to that gate, not the gate itself. A new bound builder
+    /// belongs in that test's list.
     pub fn max() -> Self {
         Self {
             lang: None,
@@ -85,23 +135,21 @@ impl PartialOrd for FlakeMeta {
 impl Ord for FlakeMeta {
     /// Compare metadata for ordering
     ///
-    /// Compares by list index, then by presence/absence of fields.
+    /// List index first — it is the discriminator a `@list` range walks —
+    /// then the language tag as a tiebreak. `None` sorts before `Some` on
+    /// both fields.
+    ///
+    /// The tiebreak is what makes this relation agree with the derived
+    /// [`Eq`]: `cmp(a, b) == Equal` if and only if `a == b`. Without it,
+    /// `{lang: Some("en"), i: Some(0)}` and `{lang: Some("fr"), i: Some(0)}`
+    /// compared `Equal` while being unequal, and every caller that expressed
+    /// identity through this ordering — an `OrdMap` key, a `cmp(..) == Equal`
+    /// test, an exclusive `partition_point` seek — folded the two distinct
+    /// facts into one.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Compare by i (list index) - primary discriminator
-        match (&self.i, &other.i) {
-            (Some(a), Some(b)) => a.cmp(b),
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (None, None) => {
-                // Compare by lang
-                match (&self.lang, &other.lang) {
-                    (Some(a), Some(b)) => a.cmp(b),
-                    (Some(_), None) => std::cmp::Ordering::Greater,
-                    (None, Some(_)) => std::cmp::Ordering::Less,
-                    (None, None) => std::cmp::Ordering::Equal,
-                }
-            }
-        }
+        self.i
+            .cmp(&other.i)
+            .then_with(|| self.lang.cmp(&other.lang))
     }
 }
 
@@ -307,6 +355,66 @@ impl Flake {
             s: Sid::max(),
             p,
             o: FlakeValue::max(),
+            dt: Sid::max(),
+            t: i64::MAX,
+            op: true,
+            m: Some(FlakeMeta::max()),
+        }
+    }
+
+    /// Create a minimum flake with specific predicate and object (for POST index)
+    ///
+    /// The datatype is left at its minimum: `cmp_object` orders by value then
+    /// datatype, so a value-only bound covers every datatype variant of `o`
+    /// and callers narrow by `dt` afterward if they matched one.
+    pub fn min_for_predicate_object(p: Sid, o: FlakeValue) -> Self {
+        Self {
+            g: None,
+            s: Sid::min(),
+            p,
+            o,
+            dt: Sid::min(),
+            t: i64::MIN,
+            op: false,
+            m: Some(FlakeMeta::min()),
+        }
+    }
+
+    /// Create a maximum flake with specific predicate and object (for POST index)
+    pub fn max_for_predicate_object(p: Sid, o: FlakeValue) -> Self {
+        Self {
+            g: None,
+            s: Sid::max(),
+            p,
+            o,
+            dt: Sid::max(),
+            t: i64::MAX,
+            op: true,
+            m: Some(FlakeMeta::max()),
+        }
+    }
+
+    /// Create a minimum flake with a specific object (for OPST index)
+    pub fn min_for_object(o: FlakeValue) -> Self {
+        Self {
+            g: None,
+            s: Sid::min(),
+            p: Sid::min(),
+            o,
+            dt: Sid::min(),
+            t: i64::MIN,
+            op: false,
+            m: Some(FlakeMeta::min()),
+        }
+    }
+
+    /// Create a maximum flake with a specific object (for OPST index)
+    pub fn max_for_object(o: FlakeValue) -> Self {
+        Self {
+            g: None,
+            s: Sid::max(),
+            p: Sid::max(),
+            o,
             dt: Sid::max(),
             t: i64::MAX,
             op: true,
@@ -622,5 +730,178 @@ mod tests {
 
         assert!(m1 < m2);
         assert!(m3 < m1); // None < Some for i
+    }
+
+    // ===== `FlakeMeta` ordering laws =====
+    //
+    // `FlakeMeta` derives `PartialEq`/`Eq`/`Hash` over both fields but hand
+    // writes `Ord`, so the two can drift apart. They did (#1711): the old
+    // `cmp` compared `lang` only when neither side carried a list index, so
+    // `{en, 0}` and `{fr, 0}` were `Equal` without being equal. These three
+    // tests pin the relation the type now promises, and pin it against the
+    // relation it used to have.
+
+    /// Every `(lang, i)` combination that matters, as a domain to quantify
+    /// the laws below over. Two `Option` states on `i` plus the extremes the
+    /// sentinels use, crossed with absent/present language tags.
+    fn meta_domain() -> Vec<FlakeMeta> {
+        let langs = [None, Some("de"), Some("en"), Some("fr")];
+        let indices = [
+            None,
+            Some(i32::MIN),
+            Some(-1),
+            Some(0),
+            Some(1),
+            Some(i32::MAX),
+        ];
+        let mut out = Vec::with_capacity(langs.len() * indices.len());
+        for lang in &langs {
+            for i in &indices {
+                out.push(FlakeMeta {
+                    lang: lang.map(str::to_string),
+                    i: *i,
+                });
+            }
+        }
+        out
+    }
+
+    /// `FlakeMeta::cmp` as it stood before #1711, held verbatim so the change
+    /// can be checked rather than taken on trust.
+    fn legacy_cmp(a: &FlakeMeta, b: &FlakeMeta) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (&a.i, &b.i) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => match (&a.lang, &b.lang) {
+                (Some(x), Some(y)) => x.cmp(y),
+                (Some(_), None) => Ordering::Greater,
+                (None, Some(_)) => Ordering::Less,
+                (None, None) => Ordering::Equal,
+            },
+        }
+    }
+
+    /// The new ordering is a strict *refinement* of the old one: wherever the
+    /// old comparator was decisive it still decides the same way, and the
+    /// entire change is pairs it called `Equal` while `Eq` called them
+    /// distinct. Nothing is reordered, so nothing that merely sorts by this
+    /// relation can observe the change.
+    ///
+    /// This is the test that makes the one-line comparator edit reviewable.
+    #[test]
+    fn new_ord_refines_old_ord() {
+        use std::cmp::Ordering;
+        let domain = meta_domain();
+        let mut newly_split = 0usize;
+
+        for a in &domain {
+            for b in &domain {
+                let old = legacy_cmp(a, b);
+                let new = a.cmp(b);
+                if old != Ordering::Equal {
+                    assert_eq!(
+                        new, old,
+                        "a decision the old comparator made was reversed: \
+                         {a:?} vs {b:?} was {old:?}, is now {new:?}"
+                    );
+                    continue;
+                }
+                if new != Ordering::Equal {
+                    newly_split += 1;
+                    assert_ne!(
+                        a, b,
+                        "the refinement may only separate values that are \
+                         genuinely unequal: {a:?} vs {b:?}"
+                    );
+                }
+            }
+        }
+
+        // Non-vacuity: the refinement has to actually refine something, or
+        // this test would pass against the very bug it exists to pin.
+        assert!(
+            newly_split > 0,
+            "no pair was newly separated — the ordering fix is not in effect"
+        );
+
+        // The one behavioral consequence of the refinement, pinned where the
+        // change is described. `FlakeMeta::max()` is a query range bound, not
+        // a maximum of the type: a language-tagged value at list index
+        // `i32::MAX` now sorts strictly above it, so an inclusive upper bound
+        // built from it no longer admits that (unreachable) case. See the doc
+        // on `FlakeMeta::max`.
+        let sentinel = FlakeMeta::max();
+        let tagged_at_max = FlakeMeta {
+            lang: Some("en".to_string()),
+            i: Some(i32::MAX),
+        };
+        assert_eq!(legacy_cmp(&tagged_at_max, &sentinel), Ordering::Equal);
+        assert_eq!(tagged_at_max.cmp(&sentinel), Ordering::Greater);
+    }
+
+    /// The law the type was violating: `cmp` returns `Equal` exactly when
+    /// `==` says equal. Callers that express identity through this ordering —
+    /// an `OrdMap` key, a `cmp(..) == Equal` test, an exclusive seek — are
+    /// only correct while this holds.
+    #[test]
+    fn ord_agrees_with_eq() {
+        use std::cmp::Ordering;
+        for a in &meta_domain() {
+            for b in &meta_domain() {
+                assert_eq!(
+                    a.cmp(b) == Ordering::Equal,
+                    a == b,
+                    "Ord and Eq disagree on {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    /// `Ord`'s own contract: antisymmetric, and transitive on both the
+    /// strict relation and equality.
+    #[test]
+    fn ord_is_a_total_order() {
+        use std::cmp::Ordering;
+        let domain = meta_domain();
+
+        for a in &domain {
+            assert_eq!(a.cmp(a), Ordering::Equal, "not reflexive at {a:?}");
+            for b in &domain {
+                assert_eq!(
+                    a.cmp(b),
+                    b.cmp(a).reverse(),
+                    "not antisymmetric: {a:?} vs {b:?}"
+                );
+                // `PartialOrd` must agree with `Ord`, since it delegates.
+                assert_eq!(a.partial_cmp(b), Some(a.cmp(b)));
+            }
+        }
+
+        for a in &domain {
+            for b in &domain {
+                let ab = a.cmp(b);
+                for c in &domain {
+                    let bc = b.cmp(c);
+                    // Whenever `a?b` and `b?c` force `a?c`, check the forced
+                    // answer: equality composes both ways, and two strict
+                    // steps in the same direction compose.
+                    let forced = match (ab, bc) {
+                        (Ordering::Equal, _) => Some(bc),
+                        (_, Ordering::Equal) => Some(ab),
+                        _ if ab == bc => Some(ab),
+                        _ => None,
+                    };
+                    if let Some(expected) = forced {
+                        assert_eq!(
+                            a.cmp(c),
+                            expected,
+                            "not transitive: {a:?} {ab:?} {b:?} {bc:?} {c:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

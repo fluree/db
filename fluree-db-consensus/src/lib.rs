@@ -23,7 +23,10 @@
 //! outcome. Callers who don't need those guarantees may omit the key.
 
 pub mod caching;
-pub mod http;
+// Moved to `fluree-raft-core`; re-exported so
+// `fluree_db_consensus::http::is_hop_by_hop` keeps resolving for
+// the server's peer-mode forwarder, which does not enable `raft`.
+pub use fluree_raft_core::http;
 pub mod local;
 #[cfg(feature = "raft")]
 pub mod raft;
@@ -191,6 +194,14 @@ pub enum TransactionBody {
         /// object map, matching `fluree_db_cypher::ParamMap`.
         params: Option<serde_json::Map<String, JsonValue>>,
     },
+    /// JSON-LD document staged as a graph sync: `graph_iri`'s contents
+    /// become exactly the document, committing only the delta (whole-graph
+    /// retraction wave + accumulator cancellation).
+    ///
+    /// Appended last: the queue envelope and its [`BodyKind`] discriminator
+    /// are postcard-encoded in persisted Raft state, where variant ordinals
+    /// are positional — never insert a variant mid-enum.
+    JsonLdGraphSync { graph_iri: String, body: JsonValue },
 }
 
 impl TransactionBody {
@@ -202,6 +213,7 @@ impl TransactionBody {
             Self::JsonLdInsert(_) | Self::TurtleInsert(_) => "insert",
             Self::JsonLdUpsert(_) | Self::TurtleUpsert(_) | Self::TrigUpsert(_) => "upsert",
             Self::JsonLdUpdate(_) => "update",
+            Self::JsonLdGraphSync { .. } => "graph-sync",
             Self::Sparql(_) => "sparql-update",
             Self::Cypher { .. } => "cypher",
         }
@@ -233,6 +245,12 @@ impl TransactionBody {
             Self::JsonLdUpdate(json) => {
                 hasher.update(b"jsonld-update");
                 hasher.update(json.to_string().as_bytes());
+            }
+            Self::JsonLdGraphSync { graph_iri, body } => {
+                hasher.update(b"jsonld-graph-sync");
+                hasher.update(graph_iri.as_bytes());
+                hasher.update([0u8]);
+                hasher.update(body.to_string().as_bytes());
             }
             Self::TurtleInsert(text) => {
                 hasher.update(b"turtle-insert");
@@ -301,6 +319,12 @@ pub enum BodyKind {
     /// conflict strategy. Worker re-runs `prepare_rebase` and
     /// advances the branch's head.
     Rebase,
+    /// Graph sync (delta-only whole-graph replacement). Appended last:
+    /// `BodyKind` is postcard-encoded in persisted Raft state snapshots
+    /// (`QueueEntry.body_kind`), where variant ordinals are positional —
+    /// inserting mid-enum would make existing snapshots and mixed-version
+    /// nodes decode every later variant as the wrong operation.
+    JsonLdGraphSync,
 }
 
 impl From<&TransactionBody> for BodyKind {
@@ -309,6 +333,7 @@ impl From<&TransactionBody> for BodyKind {
             TransactionBody::JsonLdInsert(_) => BodyKind::JsonLdInsert,
             TransactionBody::JsonLdUpsert(_) => BodyKind::JsonLdUpsert,
             TransactionBody::JsonLdUpdate(_) => BodyKind::JsonLdUpdate,
+            TransactionBody::JsonLdGraphSync { .. } => BodyKind::JsonLdGraphSync,
             TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
             TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
             TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
@@ -749,6 +774,28 @@ pub enum SubmissionError {
     #[error("{message}")]
     Execution { status: u16, message: String },
 
+    /// The submission was refused by novelty backpressure: the ledger's
+    /// in-memory novelty is at `reindex_max_bytes` (or this transaction
+    /// would cross it, while still fitting once novelty drains) and the
+    /// indexer must drain before new commits are accepted. Retryable.
+    /// Distinct from [`Self::Execution`] so the HTTP layer can surface
+    /// the dedicated `err:db/NoveltyAtMax` code and a `Retry-After`
+    /// header instead of a generic failure — an `Execution` status alone
+    /// cannot identify the condition because other retryable paths
+    /// (leader transition, stranded waiter) share the 5xx range.
+    #[error("{message}")]
+    NoveltyBackpressure { message: String },
+
+    /// The transaction's own delta meets or exceeds `reindex_max_bytes`,
+    /// so no amount of indexer draining can ever admit it — a permanent
+    /// refusal of this payload at this configuration (HTTP 413,
+    /// `err:db/NoveltyDeltaTooLarge`, no `Retry-After`), unlike the
+    /// retryable [`Self::NoveltyBackpressure`]. Typed for the same
+    /// reason: an `Execution` status alone cannot carry the code (413
+    /// is also produced by the HTTP body-size limit).
+    #[error("{message}")]
+    NoveltyDeltaTooLarge { message: String },
+
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
@@ -774,6 +821,19 @@ impl SubmissionError {
             // Admission refusals and racing-submission signals —
             // this submission was never executed.
             Self::KeyCollision | Self::AlreadyInFlight | Self::Overloaded => false,
+            // SETTLED, even though the client is told to retry. The
+            // unsettled rule exists for maybe-still-commits outcomes
+            // (leader transitions); a novelty refusal is decided before
+            // commit construction on the local path (and Raft never
+            // produces these variants), so recording `Failed` is
+            // truthful — and it is what makes retry-after-drain WORK
+            // for keyed clients: `try_claim_slot` replaces a `Failed`
+            // entry with a matching body hash and re-executes, whereas
+            // an unsettled error is skipped by `record_outcome` while
+            // `guard.commit()` still disarms the `InFlight` cleanup,
+            // pinning the slot so every keyed retry gets
+            // `AlreadyInFlight` (409) for the full cache TTL.
+            Self::NoveltyBackpressure { .. } | Self::NoveltyDeltaTooLarge { .. } => true,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }
@@ -904,5 +964,36 @@ mod tests {
             IdempotencyKey::new(over),
             Err(InvalidIdempotencyKey::TooLong { len })
         );
+    }
+}
+
+#[cfg(all(test, feature = "raft"))]
+mod body_kind_wire_tests {
+    use super::BodyKind;
+
+    /// `BodyKind` is postcard-encoded in persisted Raft state snapshots
+    /// (`QueueEntry.body_kind`), where variant ordinals are positional.
+    /// This pins every ordinal so a new variant can only ever be appended.
+    #[test]
+    fn body_kind_ordinals_are_append_only() {
+        let expected = [
+            (BodyKind::JsonLdInsert, 0u8),
+            (BodyKind::JsonLdUpsert, 1),
+            (BodyKind::JsonLdUpdate, 2),
+            (BodyKind::TurtleInsert, 3),
+            (BodyKind::TurtleUpsert, 4),
+            (BodyKind::TrigUpsert, 5),
+            (BodyKind::Sparql, 6),
+            (BodyKind::Cypher, 7),
+            (BodyKind::Pushed, 8),
+            (BodyKind::Revert, 9),
+            (BodyKind::Merge, 10),
+            (BodyKind::Rebase, 11),
+            (BodyKind::JsonLdGraphSync, 12),
+        ];
+        for (kind, ordinal) in expected {
+            let bytes = postcard::to_allocvec(&kind).expect("encode");
+            assert_eq!(bytes, vec![ordinal], "{kind:?} ordinal moved");
+        }
     }
 }

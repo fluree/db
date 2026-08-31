@@ -147,6 +147,32 @@ impl Operator for DistinctOperator {
             // equality check, and only allocate the full signature for rows that
             // are genuinely new.
             let num_cols = self.schema.len();
+
+            // Zero-column input: every WHERE variable was projected away, so every
+            // row is the empty tuple and they are all duplicates of one another —
+            // DISTINCT over N of them is exactly one row, or none if the child was
+            // empty. This needs its own arm because a column-less `Batch` carries no
+            // row count (`Batch::new` reads it off `columns.first()`), so the
+            // general path below would build a zero-row batch and its
+            // `columns.first() … unwrap_or(true)` guard would read "all duplicates"
+            // forever, swallowing the whole stream. `Batch::empty_schema_with_len`
+            // is the constructor that preserves a row count without columns.
+            //
+            // Reachable from a CONSTRUCT whose template is entirely constant
+            // (`CONSTRUCT { <s> <p> "x" } WHERE { ?s ?p ?o }`): the graph result
+            // licenses WHERE-level dedup while the template needs no variable, so
+            // the block prunes to an empty schema.
+            if num_cols == 0 {
+                if batch.is_empty() {
+                    continue;
+                }
+                if self.seen.is_empty() {
+                    self.seen.insert(RowSignature::new(), ());
+                    return Ok(Some(Batch::empty_schema_with_len(1)));
+                }
+                continue;
+            }
+
             let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
 
             for row_idx in 0..batch.len() {
@@ -335,6 +361,62 @@ mod tests {
         // Should be exhausted
         let result2 = distinct_op.next_batch(&ctx).await.unwrap();
         assert!(result2.is_none());
+    }
+
+    /// Zero-column input: every row is the empty tuple, so DISTINCT over any
+    /// number of them is exactly one row — and one row *total*, across every
+    /// batch in the stream.
+    ///
+    /// A column-less `Batch` carries no row count through `Batch::new` (it reads
+    /// the count off `columns.first()`), so the general dedup path built a
+    /// zero-row batch and then its `columns.first() … unwrap_or(true)` guard
+    /// read "all rows were duplicates" on every batch and swallowed the whole
+    /// stream. `CONSTRUCT { <s> <p> "x" } WHERE { ?s ?p ?o }` reaches this: the
+    /// graph result licenses WHERE-level dedup while the constant template needs
+    /// no variable, so the block prunes to an empty schema and the query
+    /// returned an empty graph instead of its one triple.
+    #[tokio::test]
+    async fn test_distinct_zero_column_batches_yield_exactly_one_row() {
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // Three batches of empty tuples: 4 rows, then 0, then 2.
+        let mock = MockOperator::new(vec![
+            Batch::empty_schema_with_len(4),
+            Batch::empty_schema_with_len(0),
+            Batch::empty_schema_with_len(2),
+        ]);
+
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        let first = distinct_op.next_batch(&ctx).await.unwrap();
+        assert!(
+            first.is_some(),
+            "zero-column DISTINCT must emit the single empty-tuple row"
+        );
+        assert_eq!(first.unwrap().len(), 1);
+
+        assert!(
+            distinct_op.next_batch(&ctx).await.unwrap().is_none(),
+            "the remaining empty tuples are duplicates of the first"
+        );
+    }
+
+    /// The other half: a child that produced no rows at all must stay empty —
+    /// the fix must not manufacture a row out of an empty solution sequence.
+    #[tokio::test]
+    async fn test_distinct_zero_column_empty_child_stays_empty() {
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let mock = MockOperator::new(vec![Batch::empty_schema_with_len(0)]);
+        let mut distinct_op = DistinctOperator::new(Box::new(mock));
+        distinct_op.open(&ctx).await.unwrap();
+
+        assert!(distinct_op.next_batch(&ctx).await.unwrap().is_none());
     }
 
     #[tokio::test]

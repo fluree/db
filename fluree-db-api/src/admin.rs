@@ -141,6 +141,44 @@ pub struct DropNamedGraphReport {
     pub t: i64,
 }
 
+/// Options for [`Fluree::sync_named_graph`].
+#[derive(Debug, Clone, Default)]
+pub struct SyncGraphOpts {
+    /// Compute the delta and report counts without committing anything.
+    pub dry_run: bool,
+    /// Allow an explicitly empty payload (`"@graph": []`), which clears the
+    /// graph. Off by default so a truncated or accidentally-empty export
+    /// cannot silently wipe the graph.
+    pub allow_empty: bool,
+}
+
+/// Report of a [`Fluree::sync_named_graph`] call.
+///
+/// Graph sync is **transactional and history-preserving**: it produces one
+/// normal commit containing exactly the delta between the graph's current
+/// contents and the payload (`current − payload` retracted, `payload −
+/// current` asserted; unchanged facts produce no flakes). An identical
+/// payload produces no commit (`committed = false`).
+#[derive(Debug, Clone, Default)]
+pub struct SyncGraphReport {
+    /// Full `ledger:branch` identifier the sync targeted.
+    pub ledger_id: String,
+    /// Graph IRI that was synchronized (echoed for clarity).
+    pub graph_iri: String,
+    /// Flakes asserted by the delta (`payload − current`).
+    pub asserted: usize,
+    /// Flakes retracted by the delta (`current − payload`).
+    pub retracted: usize,
+    /// Whether a new commit was created. `false` when the payload matched
+    /// the graph exactly, and always `false` for a dry run.
+    pub committed: bool,
+    /// Whether this was a dry run (staged and counted, nothing committed).
+    pub dry_run: bool,
+    /// Current commit `t` for the branch after the call. Equal to the
+    /// pre-sync `t` when nothing was committed.
+    pub t: i64,
+}
+
 /// Report of a branch drop operation
 #[derive(Debug, Clone, Default)]
 pub struct BranchDropReport {
@@ -968,6 +1006,173 @@ impl crate::Fluree {
             retracted,
             committed,
             t: new_t,
+        })
+    }
+
+    /// Synchronize a named graph's contents with `data`, committing only the
+    /// delta (see [`SyncGraphReport`]).
+    ///
+    /// `data` is an insert-shaped JSON-LD document describing the graph's
+    /// DESIRED full contents. Staging retracts `current − payload` and
+    /// asserts `payload − current`; unchanged facts produce no flakes, so an
+    /// identical payload reports `committed = false` without creating a
+    /// commit. The scope is exactly the named graph — the payload may not
+    /// address named graphs itself, and reserved system graphs (and the
+    /// default graph) are rejected.
+    ///
+    /// Like `CLEAR`/`COPY`/`MOVE` (and unlike DELETE-WHERE), the
+    /// current-contents scan is not view-policy filtered: sync is an
+    /// authoritative whole-graph replacement, and a view-filtered scan would
+    /// leave rows the caller cannot see in place. Modify-policy is still
+    /// enforced on the resulting delta.
+    pub async fn sync_named_graph(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+        data: &serde_json::Value,
+        opts: SyncGraphOpts,
+    ) -> Result<SyncGraphReport> {
+        self.sync_named_graph_with(
+            ledger_id,
+            graph_iri,
+            data,
+            opts,
+            fluree_db_transact::TxnOpts::default(),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::sync_named_graph`] with explicit transaction options and an
+    /// optional policy context — the form the HTTP layer uses so a dry run
+    /// stages under exactly the policy / inline-constraint inputs the real
+    /// (consensus-submitted) run will, and therefore reports the same delta
+    /// or fails the same way. `policy: None` runs as root.
+    pub async fn sync_named_graph_with(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+        data: &serde_json::Value,
+        opts: SyncGraphOpts,
+        txn_opts: fluree_db_transact::TxnOpts,
+        policy: Option<crate::PolicyContext>,
+    ) -> Result<SyncGraphReport> {
+        use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+
+        let bad_request = |msg: String| ApiError::Http {
+            status: 400,
+            message: msg,
+        };
+
+        if graph_iri.is_empty() {
+            return Err(bad_request(
+                "graph IRI is required; sync targets exactly one named graph".to_string(),
+            ));
+        }
+        validate_absolute_iri(graph_iri).map_err(bad_request)?;
+
+        let ledger_id = normalize_ledger_id(ledger_id);
+
+        // Reject system graphs by IRI shape (staging re-checks by g_id).
+        if graph_iri == txn_meta_graph_iri(&ledger_id) {
+            return Err(bad_request(format!(
+                "Cannot sync the txn-meta system graph '{graph_iri}'"
+            )));
+        }
+        if graph_iri == config_graph_iri(&ledger_id) {
+            return Err(bad_request(format!(
+                "Cannot sync the config system graph '{graph_iri}'"
+            )));
+        }
+
+        // An explicitly empty payload clears the graph — require the
+        // explicit opt-in so a truncated export cannot wipe it silently.
+        let explicitly_empty = data
+            .get("@graph")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if explicitly_empty && !opts.allow_empty {
+            return Err(bad_request(
+                "sync payload is empty; this would clear the graph — set allowEmpty to confirm"
+                    .to_string(),
+            ));
+        }
+
+        info!(ledger_id = %ledger_id, graph_iri = %graph_iri, dry_run = opts.dry_run, "Syncing named graph");
+
+        let handle = self.ledger_cached(&ledger_id).await?;
+        let pre_t = handle.t().await;
+
+        if opts.dry_run {
+            let snap = handle.snapshot().await;
+            let ledger_state = snap.to_ledger_state();
+            // Report the `t` of the state the delta was actually computed
+            // against, not a separately-read head.
+            let staged_against_t = ledger_state.t();
+            let stage_result = self
+                .stage_sync_transaction_tracked(
+                    ledger_state,
+                    graph_iri,
+                    data,
+                    txn_opts,
+                    None,
+                    None,
+                    policy.as_ref(),
+                )
+                .await?;
+            let flakes = stage_result.view.staged_flakes();
+            let asserted = flakes.iter().filter(|f| f.op).count();
+            let retracted = flakes.len() - asserted;
+            return Ok(SyncGraphReport {
+                ledger_id,
+                graph_iri: graph_iri.to_string(),
+                asserted,
+                retracted,
+                committed: false,
+                dry_run: true,
+                t: staged_against_t,
+            });
+        }
+
+        let mut builder = self
+            .stage(&handle)
+            .sync_graph(graph_iri, data)
+            .txn_opts(txn_opts);
+        if let Some(policy) = policy {
+            builder = builder.policy(policy);
+        }
+        let result = builder.execute().await?;
+        // A delta commit always carries flakes. The only zero-flake commit a
+        // sync can produce is a registration-only one (an explicitly empty
+        // payload into a never-registered graph), which advances `t` under a
+        // real commit id; a no-change sync returns either the no-op sentinel
+        // id (local path) or the unchanged head (consensus path). Keying on
+        // the flake count first keeps the common cases exact even when an
+        // unrelated writer advances the head concurrently.
+        let noop_sentinel =
+            fluree_db_core::ContentId::new(fluree_db_core::ContentKind::Commit, &[]);
+        let committed = result.receipt.flake_count > 0
+            || (result.receipt.t > pre_t && result.receipt.commit_id != noop_sentinel);
+        let t = if committed { result.receipt.t } else { pre_t };
+
+        info!(
+            ledger_id = %ledger_id,
+            graph_iri = %graph_iri,
+            asserted = result.receipt.assert_count,
+            retracted = result.receipt.retract_count,
+            committed,
+            t,
+            "Named graph synced",
+        );
+
+        Ok(SyncGraphReport {
+            ledger_id,
+            graph_iri: graph_iri.to_string(),
+            asserted: result.receipt.assert_count,
+            retracted: result.receipt.retract_count,
+            committed,
+            dry_run: false,
+            t,
         })
     }
 

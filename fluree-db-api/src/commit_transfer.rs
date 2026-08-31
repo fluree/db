@@ -189,7 +189,7 @@ impl<'de> Deserialize<'de> for Base64Bytes {
 }
 
 /// Request body for pushing commits to a transactor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PushCommitsRequest {
     /// Commit v2 blobs, in order (oldest -> newest).
     pub commits: Vec<Base64Bytes>,
@@ -198,6 +198,18 @@ pub struct PushCommitsRequest {
     /// Map key is a CID string or legacy address string.
     #[serde(default)]
     pub blobs: HashMap<String, Base64Bytes>,
+    /// CIDs the sender knows it cannot supply — a provenance gap it is
+    /// declaring rather than hiding. Mirrors `missing_blobs` on
+    /// [`ExportCommitsResponse`], so the two halves of the replication
+    /// protocol describe a gap the same way.
+    ///
+    /// Additive on the wire. The receiver currently tolerates *undeclared*
+    /// gaps too (see [`validate_required_blobs`]) so that a sender predating
+    /// this field can still replicate a ledger that has one; declaring is
+    /// what lets a later release tighten that back to a 400 without
+    /// stranding those ledgers.
+    #[serde(default)]
+    pub missing_blobs: Vec<String>,
 }
 
 /// Response body for a successful push.
@@ -347,7 +359,8 @@ impl Fluree {
             .map_err(PushError::into_api_error)?;
 
         // 3) Validate referenced blobs are provided (if any) and pre-validate hashes.
-        validate_required_blobs(&decoded, &request.blobs).map_err(PushError::into_api_error)?;
+        validate_required_blobs(&decoded, &request.blobs, &request.missing_blobs)
+            .map_err(PushError::into_api_error)?;
 
         // 4) Validate each commit against evolving server view.
         //
@@ -384,9 +397,21 @@ impl Fluree {
             PushError::Invalid(format!("base snapshot namespace corruption: {e}")).into_api_error()
         })?;
 
+        // The namespaces these commits introduce, which reach the snapshot only
+        // in `apply_pushed_commits_to_state` — after validation. Kept as a plain
+        // map so a rejected commit's violation can name the terms it brought in,
+        // including ones an earlier commit of the same push introduced.
+        let mut pushed_namespaces: HashMap<u16, String> = HashMap::new();
+
         for c in &decoded {
             // Current state is base db + evolving novelty.
             let current_t = base_state.snapshot.t.max(evolving_novelty.t);
+            pushed_namespaces.extend(
+                c.commit
+                    .namespace_delta
+                    .iter()
+                    .map(|(code, prefix)| (*code, prefix.clone())),
+            );
 
             // 4.0.1 Cross-commit namespace validation: namespace delta must be
             // conflict-free against the accumulated namespace table from parent + prior commits.
@@ -463,12 +488,27 @@ impl Fluree {
                         // re-validate same-ledger only.
                         cross_ledger_shapes: None,
                         staged_ns: None,
+                        // These commits' own namespaces do not reach the
+                        // snapshot until after validation, so a violation on a
+                        // term they introduce resolves through here or not at
+                        // all.
+                        uncommitted_namespaces: Some(&pushed_namespaces),
+                        // Replay carries no `opts` payload, so there is no
+                        // authoring context to compact against — violations
+                        // here name full IRIs.
+                        txn_context: None,
                         cross_ledger_schema: None,
                         // Inline shapes are an authoring-time
                         // construct; commit replay carries no
                         // `opts` payload.
                         inline_shape_bundle: None,
                         cross_ledger_membership: None,
+                        // Replay re-validates under the configured posture:
+                        // any authoring-time softening was already applied
+                        // (or denied) when the commit was first staged.
+                        requested_validation_mode: None,
+                        request_identity: None,
+                        origin_validated_replay: true,
                     },
                     // Commit replay resolves config internally.
                     None,
@@ -865,9 +905,21 @@ fn preflight_strict_next_t_and_prev(
     Ok(())
 }
 
+/// Check the txn blobs a push bundle carries against what its commits
+/// reference. A referenced blob the client did not provide is tolerated
+/// (logged): the source may itself have a dangling reference, and refusing
+/// the push would make that ledger impossible to replicate. Blobs that ARE
+/// provided must hash-verify.
+///
+/// A gap the sender listed in `declared_missing` is expected and logged at
+/// debug. An undeclared gap is accepted too — a sender predating
+/// `PushCommitsRequest::missing_blobs` cannot declare one — but warns,
+/// because it is indistinguishable from a client that simply forgot to
+/// attach `blobs`.
 fn validate_required_blobs(
     decoded: &[PushCommitDecoded],
     provided: &HashMap<String, Base64Bytes>,
+    declared_missing: &[String],
 ) -> std::result::Result<(), PushError> {
     let mut required: HashSet<String> = HashSet::new();
     for c in decoded {
@@ -876,11 +928,21 @@ fn validate_required_blobs(
         }
     }
 
+    let declared: HashSet<&str> = declared_missing.iter().map(String::as_str).collect();
     for addr in &required {
-        if !provided.contains_key(addr) {
-            return Err(PushError::Invalid(format!(
-                "missing required blob for referenced address: {addr}"
-            )));
+        if provided.contains_key(addr) {
+            continue;
+        }
+        if declared.contains(addr.as_str()) {
+            tracing::debug!(
+                txn_cid = %addr,
+                "pushed commit references a txn blob the sender declared missing; accepting commit without it"
+            );
+        } else {
+            tracing::warn!(
+                txn_cid = %addr,
+                "pushed commit references a txn blob the client neither provided nor declared missing; accepting commit without it"
+            );
         }
     }
 
@@ -1040,11 +1102,10 @@ where
             )));
         }
 
-        let bytes = provided
-            .get(addr)
-            .ok_or_else(|| PushError::Invalid(format!("missing required blob: {addr}")))?
-            .0
-            .clone();
+        let Some(bytes) = provided.get(addr).map(|b| b.0.clone()) else {
+            // Tolerated — see `validate_required_blobs`.
+            continue;
+        };
 
         // Integrity: server MUST re-hash bytes and verify the derived CID.
         if !txn_id.verify(&bytes) {
@@ -1247,6 +1308,12 @@ pub struct ExportCommitsResponse {
     /// Referenced blobs (txn blobs) keyed by CID string.
     #[serde(default)]
     pub blobs: HashMap<String, Base64Bytes>,
+    /// Txn CIDs referenced by commits in this page that the source could
+    /// not read (dangling provenance). The commits themselves are intact
+    /// and exported; consumers should carry the reference without the
+    /// bytes rather than refuse the chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_blobs: Vec<String>,
     /// Highest `t` in this page.
     pub newest_t: i64,
     /// Lowest `t` in this page.
@@ -1319,6 +1386,7 @@ impl Fluree {
 
         let mut commits = Vec::with_capacity(effective_limit);
         let mut blobs: HashMap<String, Base64Bytes> = HashMap::new();
+        let mut missing_blobs: Vec<String> = Vec::new();
         let mut newest_t: Option<i64> = None;
         let mut oldest_t: Option<i64> = None;
         let mut frontier = vec![start_cid];
@@ -1363,14 +1431,30 @@ impl Fluree {
 
             commits.push(Base64Bytes(raw_bytes));
 
-            // Collect referenced txn blob via ContentStore.
+            // Collect referenced txn blob via ContentStore. A missing blob is
+            // a provenance gap, not a chain break: report it and keep going.
             if let Some(ref txn_cid) = env.txn {
                 let txn_key = txn_cid.to_string();
                 if let std::collections::hash_map::Entry::Vacant(e) = blobs.entry(txn_key.clone()) {
-                    let txn_bytes = content_store.get(txn_cid).await.map_err(|e| {
-                        ApiError::internal(format!("failed to read txn blob {txn_key}: {e}"))
-                    })?;
-                    e.insert(Base64Bytes(txn_bytes));
+                    match content_store.get(txn_cid).await {
+                        Ok(txn_bytes) => {
+                            e.insert(Base64Bytes(txn_bytes));
+                        }
+                        Err(fluree_db_core::Error::NotFound(_)) => {
+                            tracing::warn!(
+                                commit = %current_cid,
+                                t,
+                                txn_cid = %txn_key,
+                                "commit references a txn blob that is missing from storage; exporting without it"
+                            );
+                            missing_blobs.push(txn_key);
+                        }
+                        Err(e) => {
+                            return Err(ApiError::internal(format!(
+                                "failed to read txn blob {txn_key}: {e}"
+                            )));
+                        }
+                    }
                 }
             }
 
@@ -1391,6 +1475,7 @@ impl Fluree {
             head_t,
             commits,
             blobs,
+            missing_blobs,
             newest_t: newest_t.unwrap_or(0),
             oldest_t: oldest_t.unwrap_or(0),
             next_cursor_id,
@@ -1995,6 +2080,7 @@ impl Fluree {
         let request = PushCommitsRequest {
             commits,
             blobs: blobs.clone(),
+            missing_blobs: Vec::new(),
         };
 
         // 3) Decode and validate chain.
@@ -2006,7 +2092,8 @@ impl Fluree {
             .map_err(PushError::into_api_error)?;
 
         // 5) Validate referenced blobs are provided.
-        validate_required_blobs(&decoded, &request.blobs).map_err(PushError::into_api_error)?;
+        validate_required_blobs(&decoded, &request.blobs, &request.missing_blobs)
+            .map_err(PushError::into_api_error)?;
 
         // 6) Write blobs + commit bytes to local CAS.
         let storage = self.backend().admin_storage_cloned().ok_or_else(|| {

@@ -258,6 +258,37 @@ pub struct IndexRoot {
     ///   `true` via the `|| annotation_index.is_some()` coercion
     ///   (matches "indexer already sealed an arena here").
     pub had_annotation_arena: bool,
+
+    /// Whether any indexed row carries an RDF-list position (`o_i !=
+    /// LIST_INDEX_NONE`, i.e. a `@list` value).
+    ///
+    /// - `Some(false)` — the indexer observed every row and none carried a
+    ///   list index. Write-path consumers (filtered-DELETE list-meta
+    ///   hydration in `fluree-db-transact::stage`) may skip their
+    ///   per-retraction lookups entirely when novelty agrees.
+    /// - `Some(true)` — at least one list-carrying row exists (sticky:
+    ///   never cleared by any root assembly path, retractions included).
+    /// - `None` — untracked: the root predates this flag (legacy FIR6
+    ///   roots decode here) or was produced by a path that did not observe
+    ///   the rows. Consumers must behave as if lists may exist. A full
+    ///   rebuild, or any incremental pass that observes a list row, moves
+    ///   the root out of this state.
+    ///
+    /// Carried in the FIR6 extended-flags byte as two bits
+    /// (`FLAG_EXT_LIST_META_TRACKED`, `FLAG_EXT_HAS_LIST_META`) so a
+    /// legacy zero byte reads as "untracked" rather than "none".
+    pub has_list_meta: Option<bool>,
+}
+
+/// Decode the two-bit `has_list_meta` state from the FIR6 extended-flags
+/// byte. Shared with `fluree-db-core`'s metadata-only decoder, which reads
+/// the same byte with the same bit assignments.
+pub fn decode_list_meta_flags(flags_ext: u8, tracked_bit: u8, has_bit: u8) -> Option<bool> {
+    if flags_ext & tracked_bit == 0 {
+        None
+    } else {
+        Some(flags_ext & has_bit != 0)
+    }
 }
 
 impl IndexRoot {
@@ -567,6 +598,12 @@ impl IndexRoot {
     /// See `IndexRoot.had_annotation_arena` for the full state
     /// machine.
     const FLAG_EXT_HAD_ANNOTATION_ARENA: u8 = 1 << 0;
+    /// Extended-flags bit: `has_list_meta` is tracked (`Some(_)`).
+    /// Zero on legacy roots, which therefore decode to `None`.
+    const FLAG_EXT_LIST_META_TRACKED: u8 = 1 << 1;
+    /// Extended-flags bit: at least one indexed row carries a list index.
+    /// Only meaningful when `FLAG_EXT_LIST_META_TRACKED` is set.
+    const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
 
     /// Encode to the binary FIR6 wire format.
     ///
@@ -647,11 +684,18 @@ impl IndexRoot {
         // bootstrap scan-fallback.
         let had_annotation_arena_on_wire =
             self.had_annotation_arena || self.annotation_index.is_some();
-        let flags_ext = if had_annotation_arena_on_wire {
+        let mut flags_ext = if had_annotation_arena_on_wire {
             Self::FLAG_EXT_HAD_ANNOTATION_ARENA
         } else {
             0
         };
+        match self.has_list_meta {
+            Some(true) => {
+                flags_ext |= Self::FLAG_EXT_LIST_META_TRACKED | Self::FLAG_EXT_HAS_LIST_META;
+            }
+            Some(false) => flags_ext |= Self::FLAG_EXT_LIST_META_TRACKED,
+            None => {}
+        }
         buf.push(flags_ext);
         buf.push(0); // reserved high pad byte
         buf.extend_from_slice(&self.index_t.to_le_bytes());
@@ -847,6 +891,11 @@ impl IndexRoot {
         let lex_sorted_string_ids = (flags & Self::FLAG_LEX_SORTED_STRING_IDS) != 0;
         let has_annotations = (flags & Self::FLAG_HAS_ANNOTATIONS) != 0;
         let had_annotation_arena = (flags_ext & Self::FLAG_EXT_HAD_ANNOTATION_ARENA) != 0;
+        let has_list_meta = decode_list_meta_flags(
+            flags_ext,
+            Self::FLAG_EXT_LIST_META_TRACKED,
+            Self::FLAG_EXT_HAS_LIST_META,
+        );
 
         // Ledger ID
         let ledger_id = read_string(data, &mut pos)?;
@@ -1107,6 +1156,7 @@ impl IndexRoot {
             // losing the dropped arena's history.
             had_annotation_arena: had_annotation_arena || annotation_index.is_some(),
             annotation_index,
+            has_list_meta,
         })
     }
     /// Collect all CAS content-artifact CIDs referenced **directly** by this root.
@@ -1407,6 +1457,7 @@ mod tests {
             has_annotations: false,
             annotation_index: None,
             had_annotation_arena: false,
+            has_list_meta: None,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }
     }
@@ -1503,6 +1554,62 @@ mod tests {
         assert!(snap.has_annotations, "snapshot path also sees sticky bit");
         let snap_ann = snap.annotation_index.expect("metadata path roundtrip");
         assert_eq!(snap_ann, ann);
+    }
+
+    #[test]
+    fn fir6_round_trip_has_list_meta_three_state() {
+        // Two bits in the extended-flags byte: TRACKED distinguishes a
+        // root that observed its rows from a legacy root whose byte is
+        // simply zero, so "untracked" never decodes as "no lists".
+        let mut root = minimal_root_v6();
+        root.has_list_meta = None;
+        let bytes_none = root.encode();
+        assert_eq!(bytes_none[6] & IndexRoot::FLAG_EXT_LIST_META_TRACKED, 0);
+        assert_eq!(IndexRoot::decode(&bytes_none).unwrap().has_list_meta, None);
+
+        root.has_list_meta = Some(false);
+        let bytes_false = root.encode();
+        assert_ne!(bytes_false[6] & IndexRoot::FLAG_EXT_LIST_META_TRACKED, 0);
+        assert_eq!(bytes_false[6] & IndexRoot::FLAG_EXT_HAS_LIST_META, 0);
+        assert_eq!(
+            IndexRoot::decode(&bytes_false).unwrap().has_list_meta,
+            Some(false)
+        );
+        assert_eq!(
+            fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes_false)
+                .unwrap()
+                .has_list_meta,
+            Some(false),
+            "metadata-only decode agrees"
+        );
+
+        root.has_list_meta = Some(true);
+        let bytes_true = root.encode();
+        assert_ne!(bytes_true[6] & IndexRoot::FLAG_EXT_HAS_LIST_META, 0);
+        assert_eq!(
+            IndexRoot::decode(&bytes_true).unwrap().has_list_meta,
+            Some(true)
+        );
+        assert_eq!(
+            fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes_true)
+                .unwrap()
+                .has_list_meta,
+            Some(true)
+        );
+
+        // Legacy: a zeroed extended-flags byte decodes to untracked.
+        let mut bytes_legacy = bytes_true;
+        bytes_legacy[6] = 0;
+        assert_eq!(
+            IndexRoot::decode(&bytes_legacy).unwrap().has_list_meta,
+            None
+        );
+        assert_eq!(
+            fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes_legacy)
+                .unwrap()
+                .has_list_meta,
+            None
+        );
     }
 
     #[test]

@@ -126,6 +126,9 @@ async fn vended_grant_mints_and_reads_ledger_objects() {
         root_prefix: Some("ledgers".to_string()),
         region: Some(REGION.to_string()),
         endpoint: Some(endpoint.clone()),
+        // LocalStack accepts virtual-hosted addressing; leaving this unset
+        // keeps the SDK default, as before.
+        force_path_style: None,
     };
     let grant = mint_scoped_credentials(
         &sts,

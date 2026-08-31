@@ -115,7 +115,7 @@ pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};
 pub use dict_novelty::DictNovelty;
 pub use edge::{id_datatype_sid, xsd_string_datatype_sid, EdgeKey, EdgeKeyDecodeError};
 pub use error::{Error, Result};
-pub use flake::{Flake, FlakeMeta};
+pub use flake::{normalize_lang_tag, Flake, FlakeMeta};
 pub use graph_db_ref::GraphDbRef;
 pub use graph_registry::{
     config_graph_iri, txn_meta_graph_iri, GraphRegistry, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,

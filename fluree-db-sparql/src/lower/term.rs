@@ -52,6 +52,15 @@ pub(super) fn parse_big_integer_value(
         .map_err(|_| LowerError::invalid_integer(value, span))
 }
 
+/// Language tags compare case-insensitively (BCP 47); store and match the
+/// canonical lowercase form so `"x"@EN` finds `"x"@en`.
+fn normalized_lang_arc(lang: &Arc<str>) -> Arc<str> {
+    match fluree_db_core::normalize_lang_tag(lang) {
+        std::borrow::Cow::Borrowed(_) => Arc::clone(lang),
+        std::borrow::Cow::Owned(s) => Arc::from(s),
+    }
+}
+
 impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Register a SPARQL variable with the variable registry.
     pub(super) fn register_var(&mut self, v: &Var) -> VarId {
@@ -206,6 +215,34 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
     }
 
+    /// Object lowering for ordinary triple patterns and property-path
+    /// endpoints. String literals carry their exact term identity — plain
+    /// `"bob"` is `xsd:string`, `"bob"@en` is that one language tag, and
+    /// `"bob"^^xsd:string` is explicit — so the scan matches the RDF term
+    /// the query wrote. Without the constraint all three collapsed to one
+    /// string-dictionary key and matched each other. Bare numerics,
+    /// booleans and dates stay unconstrained so `25` keeps matching a stored
+    /// `"25"^^xsd:int` as before; tightening numeric subtypes is a separate
+    /// decision.
+    pub(super) fn lower_object_with_term_constraint(
+        &mut self,
+        term: &ObjectTerm,
+    ) -> Result<(Term, Option<DatatypeConstraint>)> {
+        match term {
+            SparqlTerm::Literal(lit)
+                if matches!(
+                    lit.value,
+                    LiteralValue::Simple(_)
+                        | LiteralValue::LangTagged { .. }
+                        | LiteralValue::Typed { .. }
+                ) =>
+            {
+                self.lower_literal_with_constraint(lit)
+            }
+            other => Ok((self.lower_object(other)?, None)),
+        }
+    }
+
     /// Like [`Self::lower_literal`] but also returns the
     /// datatype/language constraint that pins the lexical value to a
     /// specific RDF datatype or language tag.
@@ -220,7 +257,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             ),
             LiteralValue::LangTagged { value, lang } => (
                 FlakeValue::String(value.to_string()),
-                DatatypeConstraint::LangTag(lang.clone()),
+                DatatypeConstraint::LangTag(normalized_lang_arc(lang)),
             ),
             LiteralValue::Typed { value, datatype } => {
                 let fv = self.lower_typed_literal(value, datatype)?;

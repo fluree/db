@@ -523,7 +523,7 @@ impl<'a> NodeHydrator<'a> {
             .map_err(|e| FormatError::InvalidBinding(format!("policy class lookup failed: {e}")))?;
         let tracker = fluree_db_core::Tracker::disabled();
         enforcer
-            .filter_flakes_for_graph(db.snapshot, db.overlay, db.t, &tracker, flakes)
+            .filter_flakes_for_graph(db.snapshot, db.g_id, db.overlay, db.t, &tracker, flakes)
             .await
             .map_err(|e| FormatError::InvalidBinding(format!("policy filtering failed: {e}")))
     }
