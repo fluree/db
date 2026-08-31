@@ -1240,6 +1240,54 @@ fn build_single_pattern(
     }
 }
 
+/// Variables whose bindings must survive a `PropertyJoinOperator` block.
+///
+/// `PropertyJoinOperator` demotes any predicate whose object variable is absent
+/// from this set to an **existence-only** (semijoin) constraint: it records that
+/// the subject has *some* object under that predicate and drops the per-subject
+/// object list entirely. That is a set operation, so it collapses a subject's N
+/// objects down to a single row.
+///
+/// `where_dedup_safe` carries exactly the same license as the sequential chain's
+/// early dedup (see [`build_where_operators_with_needed`]): it asserts that
+/// nothing downstream can observe WHERE-output row multiplicity. When it is
+/// false the demotion is **not** sound — the dropped rows are answer rows, and
+/// every multiplicity-sensitive consumer (a plain `COUNT`, a grouped
+/// `COUNT(*)`, or a non-DISTINCT projection read as a bag) silently gets the
+/// subject count where it asked for the row count. So when the license is
+/// absent, every variable object in the block is pinned as needed and the block
+/// produces its full cartesian product.
+///
+/// Bound objects are unaffected: `?s a ex:Gadget` matches at most one flake per
+/// subject, so existence-only carries its multiplicity exactly.
+fn property_join_needed_vars(
+    triples: &[TriplePattern],
+    optional_triples: &[TriplePattern],
+    required_where_vars: Option<&[VarId]>,
+    var_counts: &HashMap<VarId, usize>,
+    protected_vars: &HashSet<VarId>,
+    where_dedup_safe: bool,
+) -> HashSet<VarId> {
+    let mut needed: HashSet<VarId> = HashSet::new();
+    if let Some(rwv) = required_where_vars {
+        needed.extend(rwv.iter().copied());
+    }
+    for (v, c) in var_counts {
+        if *c > 1 || protected_vars.contains(v) {
+            needed.insert(*v);
+        }
+    }
+    if !where_dedup_safe {
+        needed.extend(
+            triples
+                .iter()
+                .chain(optional_triples)
+                .filter_map(|tp| tp.o.as_var()),
+        );
+    }
+    needed
+}
+
 /// Build an operator tree for a property-join-eligible block of triples.
 ///
 /// Constructs a `PropertyJoinOperator` for the triples, then layers deferred
@@ -1255,17 +1303,17 @@ fn build_property_join_block(
     required_where_vars: Option<&[VarId]>,
     var_counts: &HashMap<VarId, usize>,
     protected_vars: &HashSet<VarId>,
+    where_dedup_safe: bool,
     planning: &PlanningContext,
 ) -> Result<Option<BoxedOperator>> {
-    let mut needed: HashSet<VarId> = HashSet::new();
-    if let Some(rwv) = required_where_vars {
-        needed.extend(rwv.iter().copied());
-    }
-    for (v, c) in var_counts {
-        if *c > 1 || protected_vars.contains(v) {
-            needed.insert(*v);
-        }
-    }
+    let mut needed = property_join_needed_vars(
+        triples,
+        optional_triples,
+        required_where_vars,
+        var_counts,
+        protected_vars,
+        where_dedup_safe,
+    );
 
     let mut available_vars: HashSet<VarId> = triples
         .iter()
@@ -2332,6 +2380,7 @@ pub fn build_where_operators_seeded_with_needed(
                         augmented_ref,
                         &var_counts,
                         &protected_vars,
+                        where_dedup_safe,
                         planning,
                     )?;
                 } else {
@@ -2792,13 +2841,27 @@ pub(crate) fn build_scan_or_join(
             // to amortize it; rows that do not fully ground the pattern keep
             // exact join semantics via a per-row fallback.
             if bounds.is_none() && inline_ops.is_empty() {
-                if let Some(key_vars) = membership_join_key_vars(
-                    &left_schema,
-                    tp,
-                    planning,
-                    hash_planner,
-                    left.estimated_rows(),
-                ) {
+                // The planner's running chain estimate — the same number the
+                // hash-join gate below is costed against and EXPLAIN reports as
+                // `driving-est` — with the operator's own estimate as the
+                // fallback for ledgers without statistics.
+                //
+                // Consulting the operator first instead meant the gate rarely
+                // saw the planner at all: `NestedLoopJoinOperator` reports
+                // `left × 10` per hop, so once a VALUES or subquery seeds a
+                // chain, every later probe was weighed against a compounding
+                // heuristic rather than the statistics. Producers are not lost
+                // by preferring `step_est` — `with_left_estimate` folds their
+                // estimate into it. Scans and nested loops over scans report
+                // `None`, and reading that as "large" built a whole-predicate
+                // hash set for ~20 driving rows (BSBM Q10).
+                let driving_rows = hash_planner
+                    .step_est()
+                    .map(|e| e.round().max(1.0) as usize)
+                    .or_else(|| left.estimated_rows());
+                if let Some(key_vars) =
+                    membership_join_key_vars(&left_schema, tp, planning, hash_planner, driving_rows)
+                {
                     return Box::new(crate::membership_join::MembershipJoinOperator::new(
                         left,
                         tp.clone(),
@@ -3120,16 +3183,16 @@ pub fn build_triple_operators(
         //
         // If an object var is not needed downstream (not in required_where_vars and not
         // otherwise protected), treat that predicate as existence-only (semijoin) to avoid
-        // cartesian-product blowups.
-        let mut needed: HashSet<VarId> = HashSet::new();
-        if let Some(rwv) = ctx.required_where_vars {
-            needed.extend(rwv.iter().copied());
-        }
-        for (v, c) in ctx.var_counts {
-            if *c > 1 || ctx.protected_vars.contains(v) {
-                needed.insert(*v);
-            }
-        }
+        // cartesian-product blowups — but only while `where_dedup_safe` licenses it. See
+        // `property_join_needed_vars`.
+        let needed = property_join_needed_vars(
+            &triples_for_exec,
+            &[],
+            ctx.required_where_vars,
+            ctx.var_counts,
+            ctx.protected_vars,
+            ctx.where_dedup_safe,
+        );
 
         let pj = PropertyJoinOperator::new_with_needed_vars(
             &triples_for_exec,
@@ -3578,6 +3641,47 @@ mod tests {
         assert!(
             !ops.contains(&"PropertyJoinOperator"),
             "the seeded star must not drain the class extent: {ops:?}"
+        );
+    }
+
+    /// #1690: a VALUES over a variable a preceding OPTIONAL introduces must
+    /// build ABOVE that OPTIONAL.
+    ///
+    /// Seeded below it, the VALUES binds `?b` before the left join runs; the
+    /// left join then matches an already-bound `?b` and — dropping nothing —
+    /// lets every driving row out carrying the seeded value, so rows whose
+    /// OPTIONAL bound `?b` to something else are reported with a value the data
+    /// never had. `plan_ops` is root-first, so "above" is the smaller index.
+    #[test]
+    fn values_after_optional_builds_above_the_optional() {
+        use crate::binding::Binding;
+
+        // ?ev <ex:entity1> ?a . OPTIONAL { ?ev <ex:entity2> ?b } . VALUES ?b { <ex:B> }
+        let (ev, a, b) = (VarId(0), VarId(1), VarId(2));
+        let patterns = vec![
+            Pattern::Triple(make_pattern(ev, "entity1", a)),
+            Pattern::Optional(vec![Pattern::Triple(make_pattern(ev, "entity2", b))]),
+            Pattern::Values {
+                vars: vec![b],
+                rows: vec![vec![Binding::iri("ex:B")]],
+            },
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        let values_at = ops
+            .iter()
+            .position(|o| *o == "ValuesOperator")
+            .unwrap_or_else(|| panic!("the VALUES must be applied somewhere: {ops:?}"));
+        let optional_at = ops
+            .iter()
+            .position(|o| o.contains("Optional"))
+            .unwrap_or_else(|| panic!("the OPTIONAL must survive planning: {ops:?}"));
+        assert!(
+            values_at < optional_at,
+            "ValuesOperator must sit ABOVE the OPTIONAL, not be seeded below it: {ops:?}"
         );
     }
 
@@ -4227,6 +4331,72 @@ mod tests {
             op.schema(),
             &[VarId(0), VarId(1), VarId(2)],
             "PropertyJoinOperator should be used (schema = [subject, obj1, obj2])"
+        );
+    }
+
+    /// `?0 rdf:type <C> . ?0 <tag> ?1` — a bound-object-anchored star whose
+    /// object var nothing downstream reads. This is the shape from #1700.
+    fn anchored_star() -> Vec<Pattern> {
+        vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from("http://ex/C")),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from("http://ex/tag")),
+                Term::Var(VarId(1)),
+            )),
+        ]
+    }
+
+    fn plan_anchored_star(where_dedup_safe: bool) -> BoxedOperator {
+        // Only the subject survives the WHERE stage — exactly what
+        // `COUNT(*)` / `SELECT ?s` / `SELECT DISTINCT ?s` all request.
+        let needed: HashSet<VarId> = [VarId(0)].into_iter().collect();
+        super::build_where_operators_with_needed(
+            &anchored_star(),
+            None,
+            &needed,
+            &[],
+            where_dedup_safe,
+            Some(&[VarId(0)]),
+            &crate::temporal_mode::PlanningContext::current(),
+        )
+        .expect("plan anchored star")
+    }
+
+    /// Regression (#1700): demoting a variable-object predicate to an
+    /// existence-only semijoin drops a subject's extra objects, so the WHERE
+    /// stage emits one row per subject instead of one row per solution. That is
+    /// a set operation and it is licensed only by `where_dedup_safe`. Without
+    /// the license the object var must stay in the schema so the block produces
+    /// its full cartesian product.
+    #[test]
+    fn test_property_join_keeps_object_var_when_multiplicity_is_observable() {
+        let op = plan_anchored_star(false);
+        assert!(
+            op.schema().contains(&VarId(1)),
+            "object var must survive when downstream can observe row \
+             multiplicity — pruning it collapses N objects to one row and \
+             turns COUNT(*) into a distinct-subject count; schema was {:?}",
+            op.schema()
+        );
+    }
+
+    /// The other direction: the fix must narrow the pruning, not disable it. A
+    /// dedup-safe consumer (`SELECT DISTINCT ?s`, `COUNT(DISTINCT ?s)`) cannot
+    /// observe the multiplicity, so the existence-only demotion must still fire
+    /// and keep the object column out of the schema.
+    #[test]
+    fn test_property_join_still_prunes_object_var_when_dedup_safe() {
+        let op = plan_anchored_star(true);
+        assert_eq!(
+            op.schema(),
+            &[VarId(0)],
+            "a dedup-safe consumer must still get the pruned, existence-only \
+             plan — otherwise the fix is a blanket disable"
         );
     }
 
@@ -5505,6 +5675,137 @@ mod tests {
             None,
         )
         .is_some());
+    }
+
+    /// BSBM Q10 at 1M: `?offer product <P> . ?offer vendor ?v . ?offer publisher ?v`.
+    /// The scan and the nested loop above it report no row estimate of their own,
+    /// so the gate used to read the driving side as unbounded and drain the whole
+    /// `dc:publisher` extension to answer ~20 offers. The planner's running
+    /// chain estimate (≈20 here) must stand in, keeping the nested loop.
+    fn bsbm_q10_prefix(product_ndv: u64) -> BoxedOperator {
+        let mut stats = StatsView::default();
+        for (name, count, ndv_values) in [
+            ("product", 55_700, product_ndv),
+            ("vendor", 55_700, 29),
+            ("publisher", 83_550, 29),
+        ] {
+            stats.properties.insert(
+                Sid::new(100, name),
+                PropertyStatData {
+                    count,
+                    ndv_values,
+                    ndv_subjects: count,
+                },
+            );
+        }
+        let (offer, vendor) = (VarId(0), VarId(1));
+        let product = TriplePattern::new(
+            Ref::Var(offer),
+            Ref::Sid(Sid::new(100, "product")),
+            Term::Sid(Sid::new(101, "Product749")),
+        );
+        let vendor_tp = make_pattern(offer, "vendor", vendor);
+        let publisher_tp = make_pattern(offer, "publisher", vendor);
+
+        let bounds = HashMap::new();
+        let planning = PlanningContext::current();
+        let mut planner = HashJoinPlanner::new(Some(&stats)).with_left_estimate(None);
+        let mut bound: HashSet<VarId> = HashSet::new();
+        let mut op: Option<BoxedOperator> = None;
+        for tp in [&product, &vendor_tp, &publisher_tp] {
+            planner.before_step(tp, &bound);
+            let next = build_scan_or_join(
+                op.take(),
+                tp,
+                &bounds,
+                Vec::new(),
+                None,
+                EmitMask::ALL,
+                &[],
+                &planning,
+                &planner,
+            );
+            bound.extend(next.schema().iter().copied());
+            op = Some(next);
+        }
+        op.unwrap()
+    }
+
+    #[test]
+    fn membership_lane_reads_planner_estimate_when_operator_has_none() {
+        // 55_700 offers / 2_785 products = 20 driving rows: below the floor.
+        let op = bsbm_q10_prefix(2_785);
+        assert_eq!(
+            op.describe().op,
+            "NestedLoopJoinOperator",
+            "~20 driving rows must not drain the publisher extension"
+        );
+    }
+
+    #[test]
+    fn membership_lane_still_fires_on_large_planner_estimate() {
+        // 55_700 / 10 = 5_570 driving rows: well above the floor.
+        let op = bsbm_q10_prefix(10);
+        assert_eq!(op.describe().op, "MembershipJoinOperator");
+    }
+
+    /// `VALUES ?a { 30 rows } . ?a :knows ?b . ?b :knows ?a`.
+    ///
+    /// A producer-seeded chain is the case where the operator estimate and the
+    /// planner disagree: `NestedLoopJoinOperator` reports `left × 10`, so the
+    /// second probe's left says 300 while the statistics say the same 30 rows
+    /// VALUES supplied. Reading the operator first admitted the lane on the
+    /// ×10 heuristic and drained the whole 100k `:knows` extension for 30
+    /// driving rows — under the floor, and not what EXPLAIN's `driving-est`
+    /// reported for the same step.
+    #[test]
+    fn membership_lane_prefers_planner_estimate_over_nested_loop_fanout() {
+        use crate::seed::EmptyOperator;
+        use crate::values::ValuesOperator;
+        use crate::Binding;
+
+        let stats = knows_stats(100_000);
+        let (a, b) = (VarId(0), VarId(1));
+        let rows: Vec<Vec<Binding>> = (0..30)
+            .map(|n| vec![Binding::sid(Sid::new(101, format!("p{n}").as_str()))])
+            .collect();
+        let seed: BoxedOperator = Box::new(ValuesOperator::new(
+            Box::new(EmptyOperator::new()),
+            vec![a],
+            rows,
+        ));
+        assert_eq!(seed.estimated_rows(), Some(30), "VALUES reports its rows");
+
+        let first = make_pattern(a, "knows", b);
+        let second = make_pattern(b, "knows", a);
+        let bounds = HashMap::new();
+        let planning = PlanningContext::current();
+        let mut planner = HashJoinPlanner::new(Some(&stats)).with_left_estimate(Some(30));
+        let mut bound: HashSet<VarId> = HashSet::new();
+        bound.extend(seed.schema().iter().copied());
+
+        let mut op = seed;
+        for tp in [&first, &second] {
+            planner.before_step(tp, &bound);
+            op = build_scan_or_join(
+                Some(op),
+                tp,
+                &bounds,
+                Vec::new(),
+                None,
+                EmitMask::ALL,
+                &[],
+                &planning,
+                &planner,
+            );
+            bound.extend(op.schema().iter().copied());
+        }
+
+        assert_eq!(
+            op.describe().op,
+            "NestedLoopJoinOperator",
+            "30 planner-estimated driving rows must not drain the :knows extension"
+        );
     }
 
     /// The build ceiling still applies independently of the driving side.

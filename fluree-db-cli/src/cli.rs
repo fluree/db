@@ -585,6 +585,69 @@ pub enum Commands {
         policy: PolicyArgs,
     },
 
+    /// Synchronize a named graph: make its contents exactly the supplied
+    /// data, committing only the delta.
+    ///
+    /// The target graph is the constant; the SOURCE of the desired contents
+    /// is pluggable. Today the source is RDF text (Turtle or JSON-LD) from a
+    /// file, inline expression, or stdin; the same command shape is where
+    /// mapped sources (R2RML over Iceberg / CSV / Excel) will plug in.
+    ///
+    /// Examples:
+    ///   fluree sync mydb --graph urn:example:ontology -f ontology.ttl
+    ///   fluree sync mydb --graph urn:example:ontology -f ontology.ttl --dry-run
+    ///   cat export.jsonld | fluree sync --graph urn:example:ontology --remote origin
+    Sync {
+        /// Optional ledger name and/or inline data (same resolution rules
+        /// as `upsert`: 0 args = active ledger + -e/-f/stdin; 1 arg = data,
+        /// file, or ledger; 2 args = ledger + inline data).
+        #[arg(num_args = 0..=2)]
+        args: Vec<String>,
+
+        /// Ledger name (defaults to active ledger).
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
+
+        /// Target named graph IRI — the sync scope. Required; the payload
+        /// never widens or narrows it.
+        #[arg(short = 'g', long)]
+        graph: String,
+
+        /// Inline data expression (Turtle or JSON-LD).
+        #[arg(short = 'e', long = "expr")]
+        expr: Option<String>,
+
+        /// Read data from a file
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
+
+        /// Data format (turtle or jsonld); auto-detected if omitted
+        #[arg(long)]
+        format: Option<String>,
+
+        /// Compute and report the delta (asserted / retracted counts)
+        /// without committing. The standard pre-flight for pipelines.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Allow an empty payload, which clears the graph. Off by default so
+        /// a truncated export cannot silently wipe the graph.
+        #[arg(long)]
+        allow_empty: bool,
+
+        /// Emit the report as JSON (machine-readable; same shape as the
+        /// server's dry-run response) instead of a sentence.
+        #[arg(long)]
+        json: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+
+        #[command(flatten)]
+        policy: PolicyArgs,
+    },
+
     /// Bulk-upsert CSV rows into a ledger via a per-row Cypher or JSON-LD
     /// template (the `LOAD CSV` analog).
     ///
@@ -968,6 +1031,21 @@ pub enum Commands {
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
         remote: Option<String>,
+    },
+
+    /// Verify a ledger's commit chain: every commit decodes, parents exist,
+    /// `t` is contiguous, and referenced txn blobs / index root are present
+    Verify {
+        /// Ledger name (defaults to active ledger)
+        ledger: Option<String>,
+
+        /// Stop after checking this many commits (newest first)
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show the contents of a commit (decoded flakes with resolved IRIs)

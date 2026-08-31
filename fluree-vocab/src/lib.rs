@@ -1032,6 +1032,28 @@ pub mod shacl {
     pub const LANGUAGE_IN: &str = "http://www.w3.org/ns/shacl#languageIn";
 
     // ========================================================================
+    // SPARQL-based Constraints (SHACL-SPARQL §5)
+    // ========================================================================
+
+    /// sh:sparql IRI
+    pub const SPARQL: &str = "http://www.w3.org/ns/shacl#sparql";
+
+    /// sh:select IRI
+    pub const SELECT: &str = "http://www.w3.org/ns/shacl#select";
+
+    /// sh:prefixes IRI
+    pub const PREFIXES: &str = "http://www.w3.org/ns/shacl#prefixes";
+
+    /// sh:declare IRI
+    pub const DECLARE: &str = "http://www.w3.org/ns/shacl#declare";
+
+    /// sh:prefix IRI
+    pub const PREFIX: &str = "http://www.w3.org/ns/shacl#prefix";
+
+    /// sh:namespace IRI
+    pub const NAMESPACE: &str = "http://www.w3.org/ns/shacl#namespace";
+
+    // ========================================================================
     // Node Kind Values
     // ========================================================================
 
@@ -1231,6 +1253,10 @@ pub mod shacl {
     /// sh:ClosedConstraintComponent IRI
     pub const CLOSED_CONSTRAINT_COMPONENT: &str =
         "http://www.w3.org/ns/shacl#ClosedConstraintComponent";
+
+    /// sh:SPARQLConstraintComponent IRI
+    pub const SPARQL_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#SPARQLConstraintComponent";
 }
 
 /// SHACL vocabulary local names (for SID construction)
@@ -1436,6 +1462,28 @@ pub mod shacl_names {
 
     /// sh:languageIn local name
     pub const LANGUAGE_IN: &str = "languageIn";
+
+    // ========================================================================
+    // SPARQL-based Constraints (SHACL-SPARQL §5)
+    // ========================================================================
+
+    /// sh:sparql local name
+    pub const SPARQL: &str = "sparql";
+
+    /// sh:select local name
+    pub const SELECT: &str = "select";
+
+    /// sh:prefixes local name
+    pub const PREFIXES: &str = "prefixes";
+
+    /// sh:declare local name
+    pub const DECLARE: &str = "declare";
+
+    /// sh:prefix local name
+    pub const PREFIX: &str = "prefix";
+
+    /// sh:namespace local name
+    pub const NAMESPACE: &str = "namespace";
 
     // ========================================================================
     // Node Kind Values

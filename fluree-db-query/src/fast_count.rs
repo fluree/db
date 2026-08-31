@@ -1985,6 +1985,8 @@ mod tests {
             ndv_values: 0,
             ndv_subjects: 0,
             last_modified_t: 1,
+            observed_datatypes: fluree_db_core::PropertyStatEntry::tags_of(&datatypes),
+            historical_datatypes: vec![],
             datatypes,
         }
     }
@@ -2003,6 +2005,7 @@ mod tests {
                 properties,
                 classes: None,
             }]),
+            historical_since_t: None,
         }
     }
 
@@ -2060,6 +2063,7 @@ mod tests {
             properties: None,
             classes: None,
             graphs: None,
+            historical_since_t: None,
         };
         assert_eq!(count_literal_rows_from_stats(&no_graphs, 0), None);
     }

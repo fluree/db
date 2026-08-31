@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Followers buffering a body the leader's routes would
         // refuse is wasted memory; cap the forward relay at the
         // same limit the public routes enforce.
-        bootstrap.network_config.forward_max_body_bytes = config.body_limit;
+        bootstrap.network_config.transport.forward_max_body_bytes = config.body_limit;
         let raft_listen = config.raft_listen_addr.expect("validated");
         tracing::info!(
             node_id = config.raft_node_id.unwrap(),

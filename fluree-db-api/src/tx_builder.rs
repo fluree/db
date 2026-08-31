@@ -130,6 +130,12 @@ pub(crate) enum TransactOperation<'a> {
     UpdateJson(&'a JsonValue),
     InsertTurtle(&'a str),
     UpsertTurtle(&'a str),
+    /// Graph sync: make `graph_iri`'s contents exactly `json`, committing
+    /// only the delta (see [`fluree_db_transact::Txn::sync_graph`]).
+    SyncGraph {
+        graph_iri: &'a str,
+        json: &'a JsonValue,
+    },
 }
 
 /// Result of parsing a transaction operation to JSON.
@@ -149,6 +155,9 @@ impl TransactOperation<'_> {
             TransactOperation::UpdateJson(_) => TxnType::Update,
             TransactOperation::InsertTurtle(_) => TxnType::Insert,
             TransactOperation::UpsertTurtle(_) => TxnType::Upsert,
+            // Sync parses as an insert whose staging adds the whole-graph
+            // retraction wave.
+            TransactOperation::SyncGraph { .. } => TxnType::Insert,
         }
     }
 
@@ -175,6 +184,11 @@ impl TransactOperation<'_> {
             }),
             TransactOperation::UpdateJson(j) => Ok(ParsedOperation {
                 json: (*j).clone(),
+                trig_meta: None,
+                named_graphs: Vec::new(),
+            }),
+            TransactOperation::SyncGraph { json, .. } => Ok(ParsedOperation {
+                json: (*json).clone(),
                 trig_meta: None,
                 named_graphs: Vec::new(),
             }),
@@ -450,6 +464,17 @@ impl<'a> OwnedTransactBuilder<'a> {
         self
     }
 
+    /// Set the operation to a graph sync: make `graph_iri`'s contents
+    /// exactly `data`, committing only the delta (see
+    /// [`fluree_db_transact::Txn::sync_graph`]).
+    pub fn sync_graph(mut self, graph_iri: &'a str, data: &'a JsonValue) -> Self {
+        self.core.set_operation(TransactOperation::SyncGraph {
+            graph_iri,
+            json: data,
+        });
+        self
+    }
+
     /// Set a pre-built transaction IR (bypasses JSON/Turtle parsing).
     ///
     /// This is used for SPARQL UPDATE where the transaction is already
@@ -531,6 +556,7 @@ impl<'a> OwnedTransactBuilder<'a> {
                 ns_registry,
                 txn_meta,
                 graph_delta,
+                sync_graph,
             } = if let Some(followup) = self.core.pre_built_txn_followup {
                 // Per-row relationship MERGE … ON MATCH SET: both branches stage
                 // into one commit, or an error returns with nothing committed.
@@ -578,7 +604,10 @@ impl<'a> OwnedTransactBuilder<'a> {
             // No-op updates: return success without committing.
             let (receipt, ledger) = if !view.has_staged()
                 && !registers_new_graph
-                && matches!(txn_type, TxnType::Update | TxnType::Upsert)
+                && (matches!(txn_type, TxnType::Update | TxnType::Upsert)
+                    // A sync that stages zero flakes is a no-change outcome,
+                    // not an empty insert.
+                    || sync_graph.is_some())
             {
                 let (base, flakes) = view.into_parts();
                 debug_assert!(
@@ -590,6 +619,8 @@ impl<'a> OwnedTransactBuilder<'a> {
                         commit_id: ContentId::new(ContentKind::Commit, &[]),
                         t: base.t(),
                         flake_count: 0,
+                        assert_count: 0,
+                        retract_count: 0,
                     },
                     base,
                 )
@@ -626,6 +657,72 @@ impl<'a> OwnedTransactBuilder<'a> {
                 .await;
         }
 
+        // Graph sync: dedicated staging (whole-graph retraction wave) with
+        // the no-change short-circuit — an identical payload commits nothing.
+        if let TransactOperation::SyncGraph { graph_iri, json } = op {
+            let tracker = self
+                .core
+                .tracking
+                .clone()
+                .map(Tracker::new)
+                .unwrap_or_default();
+            let stage_result = self
+                .fluree
+                .stage_sync_transaction_tracked(
+                    self.ledger,
+                    graph_iri,
+                    json,
+                    self.core.txn_opts,
+                    Some(&index_config),
+                    Some(&tracker),
+                    self.core.policy.as_ref(),
+                )
+                .await?;
+            let StageResult {
+                view,
+                ns_registry,
+                txn_meta,
+                graph_delta,
+                sync_graph: _,
+            } = stage_result;
+            let registers_new_graph = graph_delta.values().any(|iri| {
+                view.base()
+                    .snapshot
+                    .graph_registry
+                    .graph_id_for_iri(iri)
+                    .is_none()
+            });
+            let commit_opts = self
+                .core
+                .commit_opts
+                .with_txn_meta(txn_meta)
+                .with_graph_delta(graph_delta.into_iter().collect());
+            let (receipt, ledger) = if !view.has_staged() && !registers_new_graph {
+                let (base, flakes) = view.into_parts();
+                debug_assert!(
+                    flakes.is_empty(),
+                    "no-op sync path requires zero staged flakes"
+                );
+                (
+                    fluree_db_transact::CommitReceipt {
+                        commit_id: ContentId::new(ContentKind::Commit, &[]),
+                        t: base.t(),
+                        flake_count: 0,
+                        assert_count: 0,
+                        retract_count: 0,
+                    },
+                    base,
+                )
+            } else {
+                self.fluree
+                    .commit_staged(view, ns_registry, &index_config, commit_opts)
+                    .await?
+            };
+            return Ok(self
+                .fluree
+                .finalize_owned_commit(receipt, ledger, &index_config)
+                .await);
+        }
         let txn_type = op.txn_type();
         // Parse transaction, extracting TriG metadata and named graphs for Turtle inputs
         let parsed = op.to_json_with_trig_meta()?;
@@ -741,6 +838,33 @@ impl<'a> OwnedTransactBuilder<'a> {
             });
         }
 
+        // Graph sync: dedicated staging (whole-graph retraction wave).
+        if let TransactOperation::SyncGraph { graph_iri, json } = op {
+            let tracker = self
+                .core
+                .tracking
+                .clone()
+                .map(Tracker::new)
+                .unwrap_or_else(Tracker::disabled);
+            let tracker_ref = tracker.is_enabled().then_some(&tracker);
+            let stage_result = self
+                .fluree
+                .stage_sync_transaction_tracked(
+                    self.ledger,
+                    graph_iri,
+                    json,
+                    self.core.txn_opts,
+                    Some(&index_config),
+                    tracker_ref,
+                    self.core.policy.as_ref(),
+                )
+                .await?;
+            return Ok(Staged {
+                view: stage_result.view,
+                ns_registry: stage_result.ns_registry,
+                graph_delta: stage_result.graph_delta,
+            });
+        }
         let txn_type = op.txn_type();
         // Parse transaction, extracting TriG metadata and named graphs for Turtle inputs
         let parsed = op.to_json_with_trig_meta()?;
@@ -867,6 +991,17 @@ impl<'a> RefTransactBuilder<'a> {
         self
     }
 
+    /// Set the operation to a graph sync: make `graph_iri`'s contents
+    /// exactly `data`, committing only the delta (see
+    /// [`fluree_db_transact::Txn::sync_graph`]).
+    pub fn sync_graph(mut self, graph_iri: &'a str, data: &'a JsonValue) -> Self {
+        self.core.set_operation(TransactOperation::SyncGraph {
+            graph_iri,
+            json: data,
+        });
+        self
+    }
+
     /// Set a pre-built transaction IR (bypasses JSON/Turtle parsing).
     ///
     /// This is used for SPARQL UPDATE where the transaction is already
@@ -958,9 +1093,16 @@ impl<'a> RefTransactBuilder<'a> {
     /// what consensus-coordinated committers
     /// (e.g. `fluree-db-consensus::RaftCommitter`) use to produce a
     /// commit they then carry through Raft consensus themselves.
+    ///
+    /// Returns `Ok(None)` for a no-change transaction — a zero-flake
+    /// update/upsert, or a graph sync whose payload already matches the
+    /// graph — that registers nothing new. Nothing is written and the
+    /// write guard is released; the caller reports the unchanged head.
+    /// Without this, a no-change sync under consensus would surface as an
+    /// `EmptyTransaction` failure instead of `committed: false`.
     pub async fn build_commit(
         self,
-    ) -> Result<(LedgerWriteGuard, fluree_db_transact::StagedCommit)> {
+    ) -> Result<Option<(LedgerWriteGuard, fluree_db_transact::StagedCommit)>> {
         self.fluree
             .build_commit_with_handle(self.handle, self.core)
             .await
@@ -982,6 +1124,11 @@ enum OpPlan<'a> {
         trig_meta: Option<RawTrigMeta>,
         named_graphs: Vec<NamedGraphBlock>,
     },
+    /// Graph sync (see [`fluree_db_transact::Txn::sync_graph`]).
+    Sync {
+        graph_iri: String,
+        txn_json: JsonValue,
+    },
 }
 
 impl<'a> OpPlan<'a> {
@@ -990,6 +1137,10 @@ impl<'a> OpPlan<'a> {
     fn from_op(op: TransactOperation<'a>) -> Result<Self> {
         match op {
             TransactOperation::InsertTurtle(turtle) => Ok(OpPlan::InsertTurtle(turtle)),
+            TransactOperation::SyncGraph { graph_iri, json } => Ok(OpPlan::Sync {
+                graph_iri: graph_iri.to_string(),
+                txn_json: json.clone(),
+            }),
             _ => {
                 let txn_type = op.txn_type();
                 let parsed = op.to_json_with_trig_meta()?;
@@ -1224,6 +1375,30 @@ impl Fluree {
             return Ok((stage_result, TxnType::Insert, commit_opts, None));
         }
 
+        // Graph sync: dedicated staging (whole-graph retraction wave). Must
+        // be dispatched before the JSON-like fallthrough, which would
+        // otherwise stage the payload as a plain default-graph insert.
+        if let TransactOperation::SyncGraph { graph_iri, json } = op {
+            let stage_result = self
+                .stage_sync_transaction_tracked(
+                    ledger_state,
+                    graph_iri,
+                    json,
+                    core.txn_opts,
+                    Some(index_config),
+                    tracker_ref,
+                    core.policy.as_ref(),
+                )
+                .await?;
+            let commit_opts = self.maybe_spawn_txn_upload(
+                core.commit_opts,
+                &ledger_id,
+                json.clone(),
+                store_raw_txn,
+            );
+            return Ok((stage_result, TxnType::Insert, commit_opts, None));
+        }
+
         // JSON-like operation: parse, extracting TriG metadata + named graphs.
         let txn_type = op.txn_type();
         let parsed = op.to_json_with_trig_meta()?;
@@ -1313,6 +1488,29 @@ impl Fluree {
                     .await?;
                 Ok((stage_result, *txn_type, commit_opts))
             }
+            OpPlan::Sync {
+                graph_iri,
+                txn_json,
+            } => {
+                let commit_opts = self.maybe_spawn_txn_upload(
+                    commit_opts_base.clone(),
+                    &ledger_id,
+                    txn_json.clone(),
+                    store_raw_txn,
+                );
+                let stage_result = self
+                    .stage_sync_transaction_tracked(
+                        ledger_state,
+                        graph_iri,
+                        txn_json,
+                        txn_opts,
+                        Some(index_config),
+                        tracker_ref,
+                        None,
+                    )
+                    .await?;
+                Ok((stage_result, TxnType::Insert, commit_opts))
+            }
         }
     }
 
@@ -1337,6 +1535,7 @@ impl Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph,
         } = stage_result;
         // See the pre_built_txn path: a registration-only commit (new graph
         // IRI in the delta, zero flakes) must not take the no-op shortcut.
@@ -1353,7 +1552,10 @@ impl Fluree {
 
         if !view.has_staged()
             && !registers_new_graph
-            && matches!(txn_type, TxnType::Update | TxnType::Upsert)
+            && (matches!(txn_type, TxnType::Update | TxnType::Upsert)
+                // A sync that stages zero flakes is a no-change outcome,
+                // not an empty insert.
+                || sync_graph.is_some())
         {
             let (base, _) = view.into_parts();
             return Ok(TransactResultRef {
@@ -1361,6 +1563,8 @@ impl Fluree {
                     commit_id: ContentId::new(ContentKind::Commit, &[]),
                     t: base.t(),
                     flake_count: 0,
+                    assert_count: 0,
+                    retract_count: 0,
                 },
                 indexing: IndexingStatus {
                     enabled: self.indexing_mode.is_enabled(),
@@ -1412,7 +1616,7 @@ impl Fluree {
         &self,
         ledger: &LedgerHandle,
         mut core: TransactCore<'_>,
-    ) -> Result<(LedgerWriteGuard, fluree_db_transact::StagedCommit)> {
+    ) -> Result<Option<(LedgerWriteGuard, fluree_db_transact::StagedCommit)>> {
         core.validate().map_err(ApiError::Builder)?;
 
         let index_config = core
@@ -1430,7 +1634,7 @@ impl Fluree {
         // The dry-run/consensus path has no response channel for a trailing
         // Cypher RETURN — callers reject RETURN-carrying sequential
         // statements before submission.
-        let (stage_result, _txn_type, commit_opts, _cypher_return) = self
+        let (stage_result, txn_type, commit_opts, _cypher_return) = self
             .stage_under_lock(
                 write_guard.clone_state(),
                 core,
@@ -1445,7 +1649,24 @@ impl Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph,
         } = stage_result;
+        // Same no-op rule as `commit_and_finalize`: a registration-only
+        // transaction must still build a commit; a zero-flake
+        // update/upsert/sync that registers nothing is a no-change outcome.
+        let registers_new_graph = graph_delta.values().any(|iri| {
+            view.base()
+                .snapshot
+                .graph_registry
+                .graph_id_for_iri(iri)
+                .is_none()
+        });
+        if !view.has_staged()
+            && !registers_new_graph
+            && (matches!(txn_type, TxnType::Update | TxnType::Upsert) || sync_graph.is_some())
+        {
+            return Ok(None);
+        }
         let mut commit_opts = commit_opts
             .with_txn_meta(txn_meta)
             .with_graph_delta(graph_delta.into_iter().collect());
@@ -1464,6 +1685,7 @@ impl Fluree {
                 .ensure_head_temporal(store.as_ref())
                 .await
                 .map_err(fluree_db_transact::TransactError::from)?;
+            tracing::debug!(ledger = %ledger.id(), "head commit temporal resolved");
         }
 
         // Resolve the raw-txn CID before invoking the build phase
@@ -1479,7 +1701,9 @@ impl Fluree {
             commit_opts.raw_txn_upload.take();
             Some(cid)
         } else if let Some(pending) = commit_opts.raw_txn_upload.take() {
-            Some(pending.finish().await.map_err(ApiError::from)?)
+            let cid = pending.finish().await.map_err(ApiError::from)?;
+            tracing::debug!(ledger = %ledger.id(), raw_txn_cid = %cid, "raw txn upload finished");
+            Some(cid)
         } else {
             None
         };
@@ -1497,13 +1721,10 @@ impl Fluree {
                     t: view.base().t(),
                 });
 
-        // `build_commit` consumes `txn_id`; its early-return paths
-        // (EmptyTransaction / NoveltyAtMax / NoveltyWouldExceed /
-        // envelope-delta / serialize) return before installing
-        // `txn_id_for_release` on the staged commit, so release here
-        // to avoid orphaning the raw-txn blob.
-        let txn_id_for_cleanup = txn_id.clone();
-        let mut staged = match fluree_db_transact::build_commit(
+        // A failed build never deletes the raw-txn blob: it is
+        // content-addressed and may be shared with an already-published
+        // commit (see `fluree_db_transact::raw_txn_upload`).
+        let mut staged = fluree_db_transact::build_commit(
             view,
             ns_registry,
             expected_head_ref,
@@ -1512,24 +1733,20 @@ impl Fluree {
             commit_opts,
         )
         .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                let content_store = self.content_store(ledger.id());
-                fluree_db_transact::release_raw_txn_after_build_err(
-                    content_store.as_ref(),
-                    txn_id_for_cleanup.as_ref(),
-                )
-                .await;
-                return Err(ApiError::from(e));
-            }
-        };
+        .map_err(ApiError::from)?;
+        tracing::debug!(
+            ledger = %ledger.id(),
+            t = staged.commit.t,
+            commit_bytes = staged.commit_bytes.len(),
+            referenced_blobs = staged.referenced_bytes.len(),
+            "commit record built"
+        );
 
         if tracker.is_enabled() {
             staged.tally = tracker.tally();
         }
 
-        Ok((write_guard, staged))
+        Ok(Some((write_guard, staged)))
     }
 
     /// Stage and commit a transaction against a cached ledger handle.

@@ -147,11 +147,6 @@ async fn run_bm25_worker(fluree: Arc<Fluree>) {
 use tokio::net::TcpListener;
 use tracing::info;
 
-#[cfg(feature = "raft")]
-use fluree_db_consensus::raft::commit_worker::{
-    PublishingChannel, QueuePoisonPublisher, StagingContext, WorkerSupervisor,
-};
-
 /// Private listener config for the Raft inter-node RPC + admin
 /// routers. Only populated when the server is constructed with a
 /// Raft handle via [`FlureeServer::new_with_raft`].
@@ -176,40 +171,11 @@ pub struct FlureeServer {
     /// Optional private Raft listener (consensus + admin).
     #[cfg(feature = "raft")]
     raft_listener: Option<RaftListener>,
-    /// Leader-aware watcher driving every leader-only background
-    /// task (indexer, idempotency evictor). `Some` when raft mode is
-    /// on. Aborted on shutdown so the spawned tasks tear down with
-    /// the rest of the server.
+    /// The committer, worker supervisor, leader watcher, and release
+    /// task, owned together so they shut down in the order that keeps
+    /// the content store consistent. `Some` when raft mode is on.
     #[cfg(feature = "raft")]
-    raft_leader_watcher: Option<crate::raft::CancellableTaskHandle>,
-    /// Per-node worker supervisor. Runs on every node (independent
-    /// of leadership) and drives per-branch [`Worker`] tasks for
-    /// branches this node owns under rendezvous assignment. Shut
-    /// down gracefully so in-flight workers stop before the runtime
-    /// goes away.
-    ///
-    /// [`Worker`]: fluree_db_consensus::raft::commit_worker::Worker
-    #[cfg(feature = "raft")]
-    raft_worker_supervisor: Option<crate::raft::CancellableTaskHandle>,
-    /// Per-node release task that drains the state-machine adapter's
-    /// CAS release channel. Runs on every node (not just the leader)
-    /// so admin-cleared queue entries and idempotency-evicted
-    /// envelopes don't orphan their bodies in the content store.
-    ///
-    /// Holds the task's `JoinHandle` and a `CancellationToken`.
-    /// Shutdown cancels the token, the task drains any messages
-    /// already buffered in the channel, then exits; the
-    /// `JoinHandle` is awaited so leftover releases land in the
-    /// content store before the process goes away. A naked
-    /// `task.abort()` here would drop in-flight releases and leak
-    /// the envelopes — the channel is `mpsc::unbounded`, so
-    /// whatever the adapter pushed between the last `recv` and the
-    /// abort is gone.
-    #[cfg(feature = "raft")]
-    raft_release_task: Option<(
-        tokio::task::JoinHandle<()>,
-        tokio_util::sync::CancellationToken,
-    )>,
+    raft_node: Option<fluree_db_consensus::raft::embedded::EmbeddedRaftNode>,
 }
 
 /// How long in-flight requests get to complete after a shutdown
@@ -557,57 +523,11 @@ impl FlureeServer {
             task.abort();
         }
         #[cfg(feature = "raft")]
-        if let Some(handle) = self.raft_worker_supervisor {
-            // Drain workers before the leader-only background tasks
-            // (indexer, evictor) shut down — they touch the same
-            // shared state the workers' final publishes go through,
-            // and ordering matters when this node is itself the
-            // leader. The supervisor aborts each per-branch worker
-            // and returns only after they've stopped.
-            handle.shutdown().await;
-        }
-        #[cfg(feature = "raft")]
-        if let Some(handle) = self.raft_leader_watcher {
-            // Cooperative shutdown: cancel the watcher's token, then
-            // await its `JoinHandle`. The watcher exits its select
-            // loop, abort-and-awaits every in-flight leader task,
-            // and only then returns — so this `await` resolves with
-            // a guarantee that every leader-only task (indexer,
-            // eviction scheduler) has actually stopped, not just
-            // been signalled.
-            handle.shutdown().await;
-        }
-        #[cfg(feature = "raft")]
-        if let Some(integration) = self.state.raft.as_ref() {
-            // Stop the raft core before draining the release
-            // channel. A live core keeps committing and applying
-            // entries throughout this teardown (this node may be
-            // the leader), and any apply landing after the drain
-            // below pushes its release envelopes into a closed
-            // channel — a leak. Core shutdown stops replication,
-            // elections, and applies; surviving peers elect a new
-            // leader. Bounded so a wedged core can't hold the
-            // release drain (the thing this ordering protects)
-            // hostage.
-            match tokio::time::timeout(SHUTDOWN_GRACE, integration.raft.shutdown()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(error = %e, "raft core shutdown failed"),
-                Err(_) => tracing::warn!(
-                    grace_secs = SHUTDOWN_GRACE.as_secs(),
-                    "raft core shutdown timed out; proceeding with teardown"
-                ),
-            }
-        }
-        #[cfg(feature = "raft")]
-        if let Some((task, cancel)) = self.raft_release_task {
-            // Cooperative: cancel the recv loop, the task drains
-            // any messages still buffered in the unbounded channel,
-            // then exits. Awaiting the `JoinHandle` is what makes
-            // the drain actually happen before the process tears
-            // down — a bare `abort()` here would skip the drain
-            // and leak the envelopes.
-            cancel.cancel();
-            let _ = task.await;
+        if let Some(node) = self.raft_node {
+            // Workers, then leader tasks, then the raft core, then the
+            // release drain — the node owns that ordering and the
+            // reasons for it.
+            node.shutdown().await;
         }
 
         result
@@ -824,199 +744,89 @@ impl FlureeServerBuilder {
             AppState::with_fluree(self.config, telemetry_config, fluree, cache_stats_handle)
                 .await?;
 
-        // Hand the ledger cache to the raft adapter: consensus
-        // apply advances heads without the local writer pipeline,
-        // and its synchronous, lossless watermark report is what
-        // keeps cache hits from serving state the replicated head
-        // has moved past. (The event bus also carries these
-        // advances, but it is bounded and can drop under load — it
-        // drives reconciliation, not staleness.)
+        // Everything node-scoped that isn't the HTTP listener —
+        // committer, worker supervisor, leader watcher, release task —
+        // is assembled by `EmbeddedRaftNode`, the same entry point an
+        // embedding process uses. The server contributes only what
+        // `fluree-db-consensus` cannot: the background indexer (a
+        // dependency-direction constraint) and BM25 auto-sync.
         #[cfg(feature = "raft")]
-        if let Some(((integration, _), manager)) =
-            self.raft.as_ref().zip(state_inner.fluree.ledger_manager())
-        {
-            integration.attach_ledger_manager(Arc::clone(manager));
-        }
-
-        #[cfg(feature = "raft")]
-        let raft_listener_parts = self.raft.as_ref().map(|(integration, listen_addr)| {
-            // Consensus-side committer stack: `QueuedTransactor`
-            // routes all five `Committer` methods through
-            // `EnqueueCommand` plus the per-process `WaiterMap` and
-            // `StagedReceiptMap`; `CachingCommitter` sits on top so
-            // keyed retries dedupe before the queue propose.
-            let queued = fluree_db_consensus::raft::queued_transactor::QueuedTransactor::new(
-                Arc::clone(&integration.raft),
-                Arc::clone(&state_inner.fluree),
-                Arc::clone(&integration.waiter_map),
-                integration.shared_state.clone(),
-            );
-            state_inner.committer =
-                Arc::new(fluree_db_consensus::CachingCommitter::wrapping(queued));
-            state_inner.raft = Some(Arc::clone(integration));
-            // The actual `RaftListener` is assembled after `state` is
-            // Arc-wrapped below so the admin-auth middleware can be
-            // layered onto the `/cluster` subtree with `Arc<AppState>`.
-            (Arc::clone(integration), *listen_addr)
-        });
-
-        // Per-node CAS release task. The state-machine adapter pushes
-        // `(ledger_id, request_cid)` pairs through the integration's
-        // release channel whenever an apply surfaces evictable
-        // envelopes (idempotency eviction, admin clears). Followers
-        // see the same applies as the leader, so running this task on
-        // every node keeps the content store consistent across the
-        // cluster.
-        #[cfg(feature = "raft")]
-        let raft_release_task = match self.raft.as_ref() {
+        let raft_node = match self.raft.as_ref() {
             Some((integration, _)) => {
-                let rx = integration.take_release_receiver().await;
-                rx.map(|mut rx| {
-                    let fluree = Arc::clone(&state_inner.fluree);
-                    let cancel = tokio_util::sync::CancellationToken::new();
-                    let cancel_for_task = cancel.clone();
-                    let join = tokio::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                biased;
-                                () = cancel_for_task.cancelled() => break,
-                                msg = rx.recv() => {
-                                    match msg {
-                                        Some((ledger_id, cid)) => {
-                                            release_one(&fluree, &ledger_id, &cid).await;
-                                        }
-                                        // Sender side closed (Raft adapter
-                                        // gone): no more releases possible.
-                                        None => return,
-                                    }
-                                }
-                            }
-                        }
-                        // Shutdown drain: between the last `recv` and the
-                        // cancel signal the adapter may have buffered
-                        // releases for evictions / admin clears applied
-                        // moments before stop. Drop them and the
-                        // envelopes leak in the content store with no
-                        // path to GC; pull whatever's buffered and
-                        // release it before the task exits.
-                        while let Ok((ledger_id, cid)) = rx.try_recv() {
-                            release_one(&fluree, &ledger_id, &cid).await;
-                        }
-                    });
-                    (join, cancel)
-                })
-            }
-            None => None,
-        };
-
-        // Per-node worker supervisor. Runs on every node (leader and
-        // followers alike) because distributed workers can land
-        // anywhere under rendezvous assignment. Spawned here so its
-        // lifecycle is independent of the leader watcher's; followers'
-        // workers ferry their apply through the leader via
-        // `RaftNameService::apply_staged_commit`.
-        #[cfg(feature = "raft")]
-        let raft_worker_supervisor = self.raft.as_ref().map(|(integration, _)| {
-            let raft_ns = std::sync::Arc::clone(
-                raft_nameservice
-                    .as_ref()
-                    .expect("raft_nameservice present whenever self.raft is Some"),
-            );
-            let commits: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
-                std::sync::Arc::clone(&raft_ns) as _;
-            // Same `RaftNameService` Arc upcast a second time, this
-            // time to the queue-poison publisher trait so a follower-
-            // owned worker can ferry deterministic poisons to the
-            // leader instead of looping forever on `client_write`
-            // returning `ForwardToLeader`.
-            let poison: Arc<dyn QueuePoisonPublisher> = Arc::clone(&raft_ns) as _;
-            let supervisor = WorkerSupervisor::new(
-                integration.id,
-                Arc::clone(&integration.raft),
-                integration.shared_state.clone(),
-                PublishingChannel {
-                    commits,
-                    poison,
-                    staged_receipts: Arc::clone(&integration.staged_receipts),
-                },
-                StagingContext {
-                    fluree: Arc::clone(&state_inner.fluree),
+                let raft_ns = std::sync::Arc::clone(
+                    raft_nameservice
+                        .as_ref()
+                        .expect("raft_nameservice present whenever self.raft is Some"),
+                );
+                let backend = state_inner.fluree.backend().clone();
+                let bm25_auto_sync = state_inner.config.bm25_auto_sync;
+                let bm25_fluree = Arc::clone(&state_inner.fluree);
+                let indexer_config = fluree_db_indexer::IndexerConfig::default();
+                let event_bus = Arc::clone(&integration.event_bus);
+                let leader_tasks = move || {
+                    let nameservice: std::sync::Arc<
+                        dyn fluree_db_nameservice::IndexingNameService,
+                    > = raft_ns.clone();
+                    let (worker, handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
+                        backend.clone(),
+                        nameservice,
+                        indexer_config.clone(),
+                    );
+                    let worker = worker.with_event_bus(Arc::clone(&event_bus));
+                    // The handle owns the worker's ShutdownTrigger:
+                    // dropping it fires the shutdown oneshot and `run()`
+                    // exits on its FIRST select — silently, before its
+                    // first log line — leaving a raft cluster with no
+                    // indexer at all and every read walking the commit
+                    // chain unindexed. Move it into the worker's task so
+                    // they live and die together; the leader watcher's
+                    // abort on leadership loss releases both.
+                    let mut tasks = vec![tokio::spawn(async move {
+                        let _keepalive = handle;
+                        worker.run().await;
+                    })];
+                    // BM25 auto-sync is leader-only for the same reason
+                    // the indexer is: it publishes through the
+                    // nameservice, which under Raft proposes to the
+                    // state machine. Registration happens inside the
+                    // task because this closure re-runs on every
+                    // leadership acquisition, by which point the set of
+                    // indexes may have changed. Losing leadership
+                    // abort-and-awaits it — an ex-leader's publish no
+                    // longer carries, so finishing would only delay the
+                    // handover.
+                    if bm25_auto_sync {
+                        tasks.push(tokio::spawn(run_bm25_worker(Arc::clone(&bm25_fluree))));
+                    }
+                    tasks
+                };
+                let config = fluree_db_consensus::raft::embedded::EmbeddedRaftConfig {
                     index_config: state_inner
                         .index_config
                         .clone()
                         .expect("index_config set by AppState::new"),
-                },
-            );
-            crate::raft::spawn_worker_supervisor(supervisor)
-        });
-
-        // Wire the leader-aware launcher. Bundles the background
-        // indexer and the periodic idempotency evictor — both
-        // leader-only tasks. The worker supervisor lives at node
-        // scope (above) and is *not* in this set.
-        #[cfg(feature = "raft")]
-        let raft_leader_watcher = self.raft.as_ref().map(|(integration, _)| {
-            let raft_ns = std::sync::Arc::clone(
-                raft_nameservice
-                    .as_ref()
-                    .expect("raft_nameservice present whenever self.raft is Some"),
-            );
-            let backend = state_inner.fluree.backend().clone();
-            let bm25_auto_sync = state_inner.config.bm25_auto_sync;
-            let bm25_fluree = Arc::clone(&state_inner.fluree);
-            let indexer_config = fluree_db_indexer::IndexerConfig::default();
-            let event_bus = Arc::clone(&integration.event_bus);
-            let eviction_scheduler =
-                fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(Arc::clone(
-                    &integration.raft,
-                ));
-            let liveness_monitor =
-                fluree_db_consensus::raft::liveness_monitor::LivenessMonitor::new(
-                    Arc::clone(&integration.raft),
-                    integration.shared_state.clone(),
+                    liveness: self.liveness_config.clone(),
+                    extra_leader_tasks: Some(Box::new(leader_tasks)),
+                };
+                let node = fluree_db_consensus::raft::embedded::EmbeddedRaftNode::attach(
+                    Arc::clone(integration),
+                    Arc::clone(&state_inner.fluree),
+                    config,
                 )
-                .with_config(self.liveness_config.clone());
-            let spawn_leader_tasks = move || {
-                let nameservice: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
-                    raft_ns.clone();
-                let (worker, _handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
-                    backend.clone(),
-                    nameservice,
-                    indexer_config.clone(),
-                );
-                let worker = worker.with_event_bus(Arc::clone(&event_bus));
-                let mut tasks = vec![
-                    tokio::spawn(worker.run()),
-                    tokio::spawn(eviction_scheduler.clone().run()),
-                    tokio::spawn(liveness_monitor.clone().run()),
-                ];
-                // BM25 auto-sync is leader-only for the same reason the
-                // indexer is: it publishes through the nameservice, which
-                // under Raft proposes to the state machine. Registration
-                // happens inside the task because this closure is sync and
-                // re-runs on every leadership acquisition, by which point the
-                // set of indexes may have changed.
-                //
-                // Losing leadership abort-and-awaits this task rather than
-                // asking it to stop, so unlike the standalone shutdown path it
-                // does cut an in-flight sync. That is the wanted behavior for a
-                // demotion: an ex-leader's publish proposal no longer carries,
-                // so finishing the sync would only delay the handover.
-                if bm25_auto_sync {
-                    tasks.push(tokio::spawn(run_bm25_worker(Arc::clone(&bm25_fluree))));
-                }
-                tasks
-            };
-            crate::raft::spawn_leader_watcher(
-                Arc::clone(&integration.raft),
-                integration.id,
-                spawn_leader_tasks,
-            )
-        });
+                .await;
+                state_inner.committer = Arc::clone(&node.committer);
+                state_inner.raft = Some(Arc::clone(integration));
+                Some(node)
+            }
+            None => None,
+        };
+        #[cfg(feature = "raft")]
+        let raft_listener_parts = self
+            .raft
+            .as_ref()
+            .map(|(integration, listen_addr)| (Arc::clone(integration), *listen_addr));
 
-        // The raft tuple is no longer needed beyond this point —
-        // both raft_listener and raft_leader_watcher captured what
-        // they need. Drop the rest.
+        // The raft tuple is no longer needed beyond this point.
         #[cfg(feature = "raft")]
         drop(self.raft);
         #[cfg(feature = "raft")]
@@ -1087,11 +897,7 @@ impl FlureeServerBuilder {
             #[cfg(feature = "raft")]
             raft_listener,
             #[cfg(feature = "raft")]
-            raft_leader_watcher,
-            #[cfg(feature = "raft")]
-            raft_worker_supervisor,
-            #[cfg(feature = "raft")]
-            raft_release_task,
+            raft_node,
         })
     }
 }
@@ -1099,48 +905,6 @@ impl FlureeServerBuilder {
 impl Default for FlureeServerBuilder {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// One-shot release of a `(ledger_id, content_id)` pair from the
-/// content store. Pulled out so the steady-state release loop and
-/// the shutdown drain don't drift apart on error handling.
-#[cfg(feature = "raft")]
-async fn release_one(
-    fluree: &fluree_db_api::Fluree,
-    ledger_id: &str,
-    cid: &fluree_db_core::ContentId,
-) {
-    // `ContentStore::release` is idempotent, so retrying a transient
-    // backend failure is safe; without the retries a single blip
-    // leaks the blob permanently (nothing re-proposes a release).
-    const RELEASE_ATTEMPTS: u32 = 3;
-    const RELEASE_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
-
-    let store = fluree.content_store(ledger_id);
-    for attempt in 1..=RELEASE_ATTEMPTS {
-        match store.release(cid).await {
-            Ok(()) => return,
-            Err(err) if attempt < RELEASE_ATTEMPTS => {
-                tracing::debug!(
-                    %ledger_id,
-                    %cid,
-                    attempt,
-                    error = %err,
-                    "release failed; retrying"
-                );
-                tokio::time::sleep(RELEASE_BASE_BACKOFF * 2u32.pow(attempt - 1)).await;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    %ledger_id,
-                    %cid,
-                    attempts = RELEASE_ATTEMPTS,
-                    error = %err,
-                    "failed to release envelope from content store; blob will leak"
-                );
-            }
-        }
     }
 }
 

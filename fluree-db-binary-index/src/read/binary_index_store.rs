@@ -265,6 +265,18 @@ pub struct BinaryIndexStore {
     p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
 }
 
+/// Lowercase the root's language tags, preserving position.
+///
+/// `lang_id` indexes this vec, so the mapping must stay 1:1 — case-variant
+/// entries are kept as separate ids, not folded. Read-side compares
+/// (`binary_scan`) normalize the query's tag, so a root written before tag
+/// normalization would otherwise fail every tagged match against its own data.
+fn normalize_root_lang_tags(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .map(|t| fluree_db_core::normalize_lang_tag(t).into_owned())
+        .collect()
+}
+
 impl BinaryIndexStore {
     /// Decode FIR6 bytes and load the store.
     pub async fn load_from_root_bytes(
@@ -383,7 +395,7 @@ impl BinaryIndexStore {
             remote_leaf_open_counts: RwLock::new(HashMap::new()),
             max_t: root.index_t,
             base_t: root.base_t,
-            language_tags: root.language_tags.clone(),
+            language_tags: normalize_root_lang_tags(&root.language_tags),
             lex_sorted_string_ids: root.lex_sorted_string_ids,
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
@@ -1503,16 +1515,24 @@ impl BinaryIndexStore {
     pub fn resolve_lang_tag(&self, o_type: u16) -> Option<&str> {
         let ot = OType::from_u16(o_type);
         if ot.is_lang_string() {
-            let lang_id = ot.lang_id()? as usize;
-            if lang_id == 0 {
-                return None; // lang_id=0 means "no tag"
-            }
-            self.language_tags
-                .get(lang_id - 1)
-                .map(std::string::String::as_str)
+            self.lang_tag_for_id(ot.lang_id()?)
         } else {
             None
         }
+    }
+
+    /// Borrowed tag for a 1-based `lang_id` (`None` for the 0 sentinel).
+    ///
+    /// Same source as [`Self::resolve_lang_tag`], reachable without first
+    /// resolving an `OType` — callers holding the encoded triple would
+    /// otherwise build an `OTypeRegistry` per row just to get here.
+    pub fn lang_tag_for_id(&self, lang_id: u16) -> Option<&str> {
+        if lang_id == 0 {
+            return None;
+        }
+        self.language_tags
+            .get(lang_id as usize - 1)
+            .map(std::string::String::as_str)
     }
 
     /// Resolve o_type to a datatype Sid (for materializing datatype IRIs in output).
@@ -2124,6 +2144,20 @@ impl BinaryIndexStore {
     /// and delegates to [`decode_value_v3`](Self::decode_value_v3).
     ///
     /// Used by `Binding::EncodedLit` which stores `(o_kind, dt_id, lang_id)`.
+    /// The V3 `o_type` a late-materialized `(o_kind, dt_id, lang_id)` triple
+    /// resolves to — the same resolution `decode_value_from_kind` performs,
+    /// exposed so callers can recover the literal's datatype / language tag
+    /// (`resolve_datatype_sid`, `resolve_lang_tag`) without decoding.
+    pub fn o_type_from_kind(&self, o_kind: u8, dt_id: u16, lang_id: u16) -> u16 {
+        OTypeRegistry::builtin_only()
+            .resolve(
+                ObjKind::from_u8(o_kind),
+                DatatypeDictId::from_u16(dt_id),
+                lang_id,
+            )
+            .as_u16()
+    }
+
     pub fn decode_value_from_kind(
         &self,
         o_kind: u8,
@@ -3016,6 +3050,28 @@ pub(crate) mod tests {
             self.range_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.get_range(id, range).await
         }
+    }
+
+    /// A root written before tag normalization holds tags as authored. The
+    /// read-side compares in `binary_scan` normalize the query's tag, so the
+    /// store's copy has to be normalized too or every tagged match against
+    /// that ledger's own data fails. Positions are the `lang_id` mapping and
+    /// must survive untouched — case variants stay distinct ids.
+    #[test]
+    fn root_lang_tags_are_normalized_positionally() {
+        let tags = vec![
+            "en-US".to_string(),
+            "fr-CA".to_string(),
+            "de".to_string(),
+            "en-us".to_string(),
+        ];
+        let got = normalize_root_lang_tags(&tags);
+        assert_eq!(got, vec!["en-us", "fr-ca", "de", "en-us"]);
+        assert_eq!(
+            got.len(),
+            tags.len(),
+            "lang_id indexes this vec; no folding"
+        );
     }
 
     pub(crate) fn temp_cache_dir() -> PathBuf {

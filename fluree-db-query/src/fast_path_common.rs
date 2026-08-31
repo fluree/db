@@ -2074,7 +2074,11 @@ pub fn build_range_cursor(
 /// before any flake of a higher predicate. The bounds are a superset
 /// optimization for `for_each_overlay_flake` — callers must still filter the
 /// callback by predicate.
-fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, fluree_db_core::Flake) {
+///
+/// `pub(crate)` only so `binary_scan`'s
+/// `every_bound_builder_pins_the_sentinel_guard` can quantify over it; the
+/// sole production caller is [`collect_resolved_overlay_ops`] below.
+pub(crate) fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, fluree_db_core::Flake) {
     use fluree_db_core::flake::FlakeMeta;
     use fluree_db_core::Flake;
     let first = Flake::new(

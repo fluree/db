@@ -103,6 +103,11 @@ impl HttpOriginFetcher {
     ///
     /// Does NOT verify integrity — the caller (`MultiOriginFetcher::fetch`)
     /// is responsible for calling `verify_object_integrity`.
+    ///
+    /// A 404 returns [`SyncError::NotFound`] rather than
+    /// [`SyncError::Remote`], so the multi-origin caller can tell "this
+    /// origin does not have the object" from "this origin is unreachable
+    /// or refused us".
     pub async fn fetch_object(&self, id: &ContentId, ledger: &str) -> Result<Vec<u8>> {
         let cid_str = id.to_string();
         let url = format!(
@@ -120,6 +125,7 @@ impl HttpOriginFetcher {
                 let bytes = resp.bytes().await?;
                 Ok(bytes.to_vec())
             }
+            404 => Err(SyncError::NotFound(cid_str)),
             status => {
                 let body = resp.text().await.unwrap_or_default();
                 if body.trim().is_empty() {
@@ -295,8 +301,10 @@ impl MultiOriginFetcher {
     ///   data must not be silently skipped).
     /// - On **HTTP error** (404, network, auth): records the error and tries
     ///   the next origin.
-    /// - If all origins are exhausted, returns `FetchFailed` with per-origin
-    ///   diagnostics.
+    /// - If **every** origin answered 404, returns `NotFound` — the object is
+    ///   genuinely absent upstream.
+    /// - If any origin failed for another reason, returns `FetchFailed` with
+    ///   per-origin diagnostics.
     pub async fn fetch(&self, id: &ContentId, ledger: &str) -> Result<Vec<u8>> {
         let cid_str = id.to_string();
 
@@ -311,6 +319,7 @@ impl MultiOriginFetcher {
         }
 
         let mut errors = Vec::new();
+        let mut all_not_found = true;
 
         for fetcher in &self.fetchers {
             match fetcher.fetch_object(id, ledger).await {
@@ -322,6 +331,9 @@ impl MultiOriginFetcher {
                     return Ok(bytes);
                 }
                 Err(e) => {
+                    if !matches!(e, SyncError::NotFound(_)) {
+                        all_not_found = false;
+                    }
                     debug!(
                         origin = %fetcher.base_url,
                         error = %e,
@@ -330,6 +342,12 @@ impl MultiOriginFetcher {
                     errors.push(format!("{}: {}", fetcher.base_url, e));
                 }
             }
+        }
+
+        // Every origin answered 404: the object is absent, not unreachable.
+        // An origin skipped for unsatisfied auth is not evidence of absence.
+        if all_not_found && self.skipped_origins == 0 {
+            return Err(SyncError::NotFound(cid_str));
         }
 
         // All origins exhausted
@@ -794,6 +812,106 @@ mod tests {
         assert!(
             matches!(err, SyncError::IntegrityFailed(_)),
             "expected IntegrityFailed, got: {err}"
+        );
+    }
+
+    /// A CAS object every origin answers 404 for is absent, not unreachable.
+    /// Callers that tolerate an absent object (a dangling `commit.txn`
+    /// provenance ref during clone) key off this, so it must NOT collapse
+    /// into `FetchFailed` alongside auth/5xx/network failures.
+    #[tokio::test]
+    async fn test_fetch_all_404_is_not_found() {
+        let server1 = wiremock::MockServer::start().await;
+        let server2 = wiremock::MockServer::start().await;
+
+        let id = ContentId::new(ContentKind::Txn, b"absent everywhere");
+
+        for server in [&server1, &server2] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path_regex("/fluree/storage/objects/.*"))
+                .respond_with(wiremock::ResponseTemplate::new(404))
+                .mount(server)
+                .await;
+        }
+
+        let http = reqwest::Client::new();
+        let fetcher = MultiOriginFetcher {
+            fetchers: vec![
+                HttpOriginFetcher::new(server1.uri(), None, http.clone()),
+                HttpOriginFetcher::new(server2.uri(), None, http),
+            ],
+            skipped_origins: 0,
+        };
+
+        let err = fetcher.fetch(&id, "mydb:main").await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::NotFound(_)),
+            "expected NotFound, got: {err}"
+        );
+    }
+
+    /// One origin 404s and another is broken: that is NOT evidence of
+    /// absence — a tolerant caller must see a hard failure and stop.
+    #[tokio::test]
+    async fn test_fetch_404_plus_error_is_fetch_failed() {
+        let server1 = wiremock::MockServer::start().await;
+        let server2 = wiremock::MockServer::start().await;
+
+        let id = ContentId::new(ContentKind::Txn, b"maybe absent");
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex("/fluree/storage/objects/.*"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server1)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex("/fluree/storage/objects/.*"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string("token expired"))
+            .mount(&server2)
+            .await;
+
+        let http = reqwest::Client::new();
+        let fetcher = MultiOriginFetcher {
+            fetchers: vec![
+                HttpOriginFetcher::new(server1.uri(), None, http.clone()),
+                HttpOriginFetcher::new(server2.uri(), None, http),
+            ],
+            skipped_origins: 0,
+        };
+
+        let err = fetcher.fetch(&id, "mydb:main").await.unwrap_err();
+        match err {
+            SyncError::FetchFailed { details, .. } => assert!(details.contains("401")),
+            other => panic!("expected FetchFailed, got: {other}"),
+        }
+    }
+
+    /// An origin skipped for unsatisfied auth might have had the object, so
+    /// the remaining origins' 404s do not prove absence.
+    #[tokio::test]
+    async fn test_fetch_404_with_skipped_origin_is_fetch_failed() {
+        let server = wiremock::MockServer::start().await;
+        let id = ContentId::new(ContentKind::Txn, b"maybe behind auth");
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex("/fluree/storage/objects/.*"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let fetcher = MultiOriginFetcher {
+            fetchers: vec![HttpOriginFetcher::new(
+                server.uri(),
+                None,
+                reqwest::Client::new(),
+            )],
+            skipped_origins: 1,
+        };
+
+        let err = fetcher.fetch(&id, "mydb:main").await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::FetchFailed { .. }),
+            "expected FetchFailed, got: {err}"
         );
     }
 

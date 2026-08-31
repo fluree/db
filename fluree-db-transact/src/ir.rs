@@ -200,6 +200,24 @@ pub struct Txn {
     ///
     /// See [`GraphMgmtOp`] and `stage_graph_mgmt`.
     pub graph_mgmt: Option<GraphMgmtOp>,
+
+    /// Graph-synchronization directive: make the named graph's contents
+    /// exactly this transaction's insert templates, committing only the
+    /// delta.
+    ///
+    /// When `Some(iri)`, staging adds a second wave after assertion
+    /// generation (like the upsert wave): every currently-asserted flake in
+    /// the target graph is pushed as a retraction, and the mixed
+    /// [`FlakeAccumulator`](crate::generate::FlakeAccumulator) nets
+    /// retract+assert of the same fact to nothing — so the staged set is
+    /// exactly `A − B` retractions plus `B − A` assertions. An identical
+    /// payload stages zero flakes (no commit).
+    ///
+    /// The transaction's insert templates must all target this graph (the
+    /// parser re-homes them) and the graph must be a user graph — reserved
+    /// system graphs and (for now) the default graph are rejected at
+    /// staging. `None` for every ordinary transaction.
+    pub sync_graph: Option<String>,
 }
 
 /// A SPARQL graph-management operation, executed by whole-graph scan/re-home
@@ -282,6 +300,7 @@ impl Txn {
             graph_delta: FxHashMap::default(),
             namespace_delta: std::collections::HashMap::new(),
             graph_mgmt: None,
+            sync_graph: None,
         }
     }
 
@@ -389,6 +408,12 @@ impl Txn {
             txn_type: TxnType::Update,
             ..Self::insert()
         }
+    }
+
+    /// Set the graph-synchronization target (see [`Txn::sync_graph`]).
+    pub fn with_sync_graph(mut self, iri: impl Into<String>) -> Self {
+        self.sync_graph = Some(iri.into());
+        self
     }
 
     /// Add a WHERE pattern
@@ -673,6 +698,27 @@ pub struct TxnOpts {
     /// prefer `f:shapesSource`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shapes: Option<serde_json::Value>,
+
+    /// Requested SHACL validation mode for *this transaction only*.
+    ///
+    /// `Some(Warn)` asks to soften a `Reject` posture to warn-and-commit;
+    /// `Some(Reject)` asks to harden a `Warn` posture. Read from the
+    /// transaction JSON's `opts.validationMode` (`"warn"` / `"reject"`)
+    /// when unset here.
+    ///
+    /// This is a *request*, not a command: strengthening is always
+    /// honored, but softening is granted only when the ledger config's
+    /// SHACL `f:overrideControl` permits it for the request's verified
+    /// identity (`f:OverrideAll`, the default, permits everyone; an
+    /// `f:overrideControl` of `f:OverrideNone` or an identity-restricted
+    /// list gates it). A denied softening request keeps the configured
+    /// posture and logs a warning — it does not fail the transaction.
+    ///
+    /// Use case: a remediation agent whose corrective writes transiently
+    /// violate shapes gets per-write softening without flipping the
+    /// graph's standing validation posture for every other writer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_mode: Option<fluree_db_core::ledger_config::ValidationMode>,
 
     /// Inline `f:enforceUnique` declarations for *this transaction only*.
     ///

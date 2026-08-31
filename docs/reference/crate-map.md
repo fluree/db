@@ -56,6 +56,10 @@ fluree-db/
 │   ├── fluree-sse/                # Server-Sent Events parser
 │   └── fluree-db-peer/            # SSE protocol for peer mode
 │
+├── Consensus
+│   ├── fluree-raft-core/          # Generic Raft substrate (storage, node/group identity, ownership)
+│   └── fluree-db-consensus/       # Committer traits + the Raft-replicated nameservice
+│
 └── Top-Level
     ├── fluree-db-api/             # Public API and high-level operations
     ├── fluree-db-bolt/            # Bolt protocol codec + session machine
@@ -409,12 +413,13 @@ fluree-db/
 
 **Responsibilities:**
 - SHACL shapes parsing
-- Constraint validation
+- Constraint validation (core constraints + `sh:sparql` SPARQL-based constraints)
 - Validation reports
 
 **Dependencies:**
 - fluree-db-core
 - fluree-db-query
+- fluree-db-sparql (parsing `sh:select` constraint queries)
 - fluree-vocab
 
 ## Reasoning
@@ -537,6 +542,150 @@ fluree-db/
 
 **Dependencies:**
 - fluree-sse
+
+## Consensus Crates
+
+### fluree-raft-core
+
+**Purpose**: Application-agnostic Raft substrate — the generic half of what
+began inside `fluree-db-consensus::raft`.
+
+**Key modules**:
+
+- `storage` — durable log/vote/snapshot traits, with filesystem
+  (atomic write → fsync → rename) and in-memory backends
+- `node` — `NodeId` and `ClusterNode`, the raft/client address pair that
+  travels through membership changes
+- `group` — `GroupId`, the validated name of one group within a process
+  (a group's storage lives at `<root>/<group_id>/`)
+- `ownership` — rendezvous (HRW) hashing for assigning work to members
+  without a consensus round
+- `http` — hop-by-hop header classification for request forwarding
+
+Under the `raft` feature, which gates `openraft`:
+
+- `config` — `FlureeRaftConfig`, the constrained openraft profile every
+  group shares (pins `NodeId`, `Node`, `Entry`, `SnapshotData`,
+  `Responder`, `AsyncRuntime`, leaving only `D`/`R` open).
+  Blanket-implemented; applications still write their own
+  `declare_raft_types!`.
+- `state_machine` — the application seam: `AppStateMachine` for
+  deterministic reduction, `StateMachineObserver` for effects captured
+  under the state lock and published after it drops, a versioned
+  snapshot codec, and the adapter that drives openraft from the pair
+- `runtime` — `RaftGroup::bootstrap`, `RaftGroupConfig`, and the
+  leader-only task lifecycle (cancellation with bounded graceful
+  shutdown, then abort)
+- `log_adapter` — `LogAdapter<C, S>`, openraft's `RaftLogStorage` over
+  the storage traits
+- `network` — `RaftTransportConfig`, the HTTP+postcard RPC client, and a
+  **relative** router for `append-entries` / `vote` / `install-snapshot`
+- `admin` — `RaftAdmin<C>` and a relative router for `initialize`,
+  `add-learner`, `change-membership`, `status`
+- `forward` — follower→leader middleware, generic over a `LeaderView`
+  source rather than tied to `Raft` directly
+
+And under `kv` (independent of `raft` — pure state plus a pure
+reduction, so a consumer can hold the semantics without linking
+openraft):
+
+- `kv` — a replicated key/value *fragment* an application embeds in its
+  own state machine, not a service and not its own group. A lease fences
+  the work it guards only if both are ordered by the same log. An
+  entry's version is the **Raft log index** of the write that created
+  it, so a fencing token can never repeat; expiry is logical absence,
+  kept invisible across partial sweeps by a monotonic logical-time floor
+  that every reclamation raises; every CAS failure returns the current
+  record, which is also the recovery path for a lost response. TTLs are
+  rejected rather than clamped, and a fragment's expiry index and byte
+  total are rebuilt on snapshot decode rather than trusted. Tenancy is
+  the application's
+  composition — `BTreeMap<Tenant, KvFragment>` keyed by an
+  **append-only** enum, because postcard is positional: appending a
+  struct field breaks every existing snapshot, while appending an enum
+  variant does not.
+- `kv::sweep` (`kv` + `raft`) — the leader-only eviction driver.
+  `Evict` is bounded on purpose, so something has to notice
+  `more_expired` and come back. Two details live here rather than in
+  each consumer: re-propose **immediately with the same cutoff** (a
+  fresh clock read per round lets a steadily-expiring fragment outrun
+  the sweep), and **propose nothing when nothing has expired** (an idle
+  ticker that still writes grows the log on every node forever). Spawn
+  `run_sweep` from `spawn_leader_watcher`'s task factory.
+
+Full design rationale: `docs/design/raft-core.md`.
+
+And under `testing`:
+
+- `testing` — a conformance fixture any openraft state-machine adapter
+  can be run through (snapshot persist-before-swap, boot restore,
+  membership bookkeeping, one response per entry). Deliberately not
+  specific to this crate's adapter: any openraft `RaftStateMachine` can
+  be held to the same contract. Both consumers run it — the toy counter
+  in `fluree-raft-core/tests/state_machine_seam.rs` and the nameservice
+  in `fluree-db-consensus/tests/it_adapter_conformance.rs`.
+
+**Depends on**: nothing in the workspace. Without the `raft` feature
+there is no `openraft` dependency either: storage payloads are opaque
+bytes, and `ClusterNode` satisfies openraft's blanket `Node` bound
+through its derives alone. That keeps monolithic Fluree builds — which
+reach this crate through `fluree-db-consensus` for `http::is_hop_by_hop`
+— from compiling or linking openraft.
+
+**Note**: `ownership`'s hash is effectively a wire format — nodes compute
+ownership locally and independently, so two nodes that disagree can both
+claim the same key. See the module docs before touching it.
+
+**Routing**: the `network` and `admin` routers carry no prefix of their
+own. The host nests them — at `/raft` and `/cluster` for a single group,
+or under a `GroupId` when several share a process — which is what lets an
+existing group keep the paths already recorded in its replicated
+membership.
+
+### fluree-db-consensus
+
+**Purpose**: The `Committer` abstraction for submitting transactions, plus
+the Raft-replicated nameservice state machine.
+
+**Key types**: `Committer`, `LocalCommitter`, `CachingCommitter`,
+`Command`/`Response`, `NameServiceState`, `NameServiceApp`,
+`NameServiceObserver`, `RaftNameService`, `QueuedTransactor`,
+`commit_worker::Worker`.
+
+**Raft state machine**: `raft::app` holds both halves of the
+nameservice's contribution — `NameServiceApp` (the pure reduction) and
+`NameServiceObserver` (event bus, waiters, staged receipts, releases,
+ledger-cache watermark). The generic bookkeeping is
+`fluree_raft_core::state_machine::StateMachineAdapter`, and
+`raft::state_machine_adapter` is just their composition, kept at its
+historical path. `publish` runs in two phases: every commit-head
+watermark reaches the ledger cache before any event reaches the bus.
+
+**Embedding**: `raft::integration` (`RaftIntegration::bootstrap`) is the
+one-call consensus assembly — storage, adapters, `Raft`, the replicated
+nameservice, routers, channels — and `raft::embedded`
+(`EmbeddedRaftNode::attach`) wires a `Fluree` engine to it and starts the
+per-node tasks. Neither knows about `fluree-db-server`; the server binary
+is one consumer, and `tests/it_embedded_node.rs` proves a process with no
+server dependency gets the same node. The one thing an embedder must get
+right: route writes through `EmbeddedRaftNode::committer`, never the
+engine handle — `fluree-db-api` sits below this crate and cannot name
+`Committer`, so `Fluree::transact` on a Raft-mode engine still writes
+locally. The background indexer is the host's to supply (via
+`extra_leader_tasks`), because this crate does not depend on
+`fluree-db-indexer`.
+
+**Feature flags**: `raft` (non-default) gates `openraft` so monolithic
+users don't compile or link it. `testing` (implies `raft`) pulls in
+`fluree-raft-core`'s conformance fixture and runs the nameservice's
+state machine through it; test-only, so it is off outside
+`--all-features`.
+
+**Depends on**: fluree-raft-core, fluree-db-api, fluree-db-core,
+fluree-db-nameservice, fluree-db-transact, fluree-db-ledger
+
+**See also**: `docs/design/raft-command-queue.md`,
+`docs/operations/raft-clusters.md`
 
 ## Top-Level Crates
 

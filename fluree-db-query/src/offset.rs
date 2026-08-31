@@ -114,6 +114,15 @@ impl Operator for OffsetOperator {
             self.skipped = self.offset;
             let start_idx = remaining_to_skip;
 
+            // Zero-column input: a column-less `Batch` carries no row count
+            // through `Batch::new` (it reads the count off `columns.first()`),
+            // so the general rebuild below would drop the surviving rows.
+            // Same trap as `DistinctOperator` and `LimitOperator`;
+            // `Batch::empty_schema_with_len` preserves the count.
+            if self.schema.is_empty() {
+                return Ok(Some(Batch::empty_schema_with_len(batch.len() - start_idx)));
+            }
+
             let num_cols = self.schema.len();
             let mut columns: Vec<Vec<Binding>> = Vec::with_capacity(num_cols);
 
@@ -234,6 +243,35 @@ mod tests {
             })
             .collect();
         Batch::new(schema, columns).unwrap()
+    }
+
+    /// A partial skip over a zero-column batch must preserve the surviving row
+    /// count. Same `Batch::new`-loses-the-length trap as `DistinctOperator`
+    /// and `LimitOperator`: the column-by-column rebuild produced a zero-row
+    /// batch, so `OFFSET n` over a pruned-empty schema dropped every surviving
+    /// row (a constant-template `CONSTRUCT … OFFSET 2` built an empty graph).
+    #[tokio::test]
+    async fn test_offset_partial_skip_keeps_zero_column_row_count() {
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // 5 empty-tuple rows, OFFSET 2: 3 rows must survive.
+        let mock = MockOperator::new(vec![Batch::empty_schema_with_len(5)]);
+        let mut offset_op = OffsetOperator::new(Box::new(mock), 2);
+        offset_op.open(&ctx).await.unwrap();
+
+        let batch = offset_op
+            .next_batch(&ctx)
+            .await
+            .unwrap()
+            .expect("partial-skip batch must survive");
+        assert_eq!(
+            batch.len(),
+            3,
+            "zero-column partial skip lost the row count"
+        );
+        assert!(offset_op.next_batch(&ctx).await.unwrap().is_none());
     }
 
     #[tokio::test]

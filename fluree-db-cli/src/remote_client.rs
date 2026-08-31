@@ -1237,6 +1237,42 @@ impl RemoteLedgerClient {
     }
 
     // =========================================================================
+    // Sync (graph synchronization)
+    // =========================================================================
+
+    /// Synchronize a named graph: make its contents exactly `body`,
+    /// committing only the delta.
+    ///
+    /// `POST {base}/sync/{ledger}?graph=<iri>[&dryRun=true][&allowEmpty=true]`
+    /// with a JSON-LD body. A dry run answers with the delta report; a real
+    /// run with the standard transact response.
+    pub async fn sync_jsonld(
+        &self,
+        ledger: &str,
+        graph: &str,
+        body: &serde_json::Value,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("sync", ledger);
+        url.push_str("?graph=");
+        url.push_str(&urlencoding::encode(graph));
+        if dry_run {
+            url.push_str("&dryRun=true");
+        }
+        if allow_empty {
+            url.push_str("&allowEmpty=true");
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    // =========================================================================
     // Update (WHERE/DELETE/INSERT)
     // =========================================================================
 

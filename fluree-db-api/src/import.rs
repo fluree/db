@@ -3747,6 +3747,10 @@ struct IndexBuildInput<'a> {
     named_g_ids: Vec<u16>,
     /// Actual split mode the import used; written into the root and predicate sids.
     ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode,
+    /// Whether any imported record carried an RDF-list position (OR'd across
+    /// every parse chunk via `SpoolConfig::saw_list_meta`). Written into
+    /// `IndexRoot.has_list_meta`.
+    saw_list_meta: bool,
 }
 
 /// Run phases 2-6: import chunks, build indexes, upload to CAS, write V4 root, publish.
@@ -3810,6 +3814,7 @@ where
             prefix_map: &import_result.prefix_map,
             named_g_ids: import_result.named_g_ids,
             ns_split_mode: import_result.ns_split_mode,
+            saw_list_meta: import_result.saw_list_meta,
         };
         let index_result = build_and_upload(
             storage,
@@ -3923,6 +3928,9 @@ struct ChunkImportResult {
     /// `HostPlusN`). Recorded into the root, predicate sids, and genesis commit so
     /// reads split IRIs the same way the dictionary was keyed.
     ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode,
+    /// Whether any imported record carried an RDF-list position, OR'd across
+    /// every parse chunk. Recorded into `IndexRoot.has_list_meta`.
+    saw_list_meta: bool,
 }
 
 /// Import all TTL chunks: parallel parse + serial commit + streaming runs.
@@ -4322,6 +4330,10 @@ where
         numbig_pool: Arc::new(SharedNumBigPool::new()),
         vector_pool: Arc::new(SharedVectorArenaPool::new()),
         ns_alloc: Arc::clone(&shared_alloc),
+        // Parse workers OR their per-chunk observation in here at finish;
+        // read once at root assembly (after every worker has joined) to
+        // record `IndexRoot.has_list_meta` exactly.
+        saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     // Pre-insert rdf:type so we know the predicate ID before Phase A begins.
@@ -6025,6 +6037,11 @@ where
         named_g_ids: v3_named_g_ids,
         // Forwarder thread joined above, so this reflects any preflight coarsening.
         ns_split_mode: shared_alloc.split_mode(),
+        // Every parse worker has finished its `SpoolContext` by now, so this
+        // read sees every chunk's contribution.
+        saw_list_meta: spool_config
+            .saw_list_meta
+            .load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -6656,54 +6673,19 @@ where
             use fluree_db_core::index_stats as is;
 
             // Aggregate across graphs by p_id (deprecated SID-keyed view).
-            struct PropAgg {
-                count: u64,
-                ndv_values: u64,
-                ndv_subjects: u64,
-                last_modified_t: i64,
-                datatypes: Vec<(u8, u64)>,
-            }
-            let mut agg: std::collections::HashMap<u32, PropAgg> = std::collections::HashMap::new();
-            for g in &id_stats.graphs {
-                for p in &g.properties {
-                    let e = agg.entry(p.p_id).or_insert(PropAgg {
-                        count: 0,
-                        ndv_values: 0,
-                        ndv_subjects: 0,
-                        last_modified_t: 0,
-                        datatypes: Vec::new(),
-                    });
-                    e.count += p.count;
-                    e.ndv_values = e.ndv_values.max(p.ndv_values);
-                    e.ndv_subjects = e.ndv_subjects.max(p.ndv_subjects);
-                    e.last_modified_t = e.last_modified_t.max(p.last_modified_t);
-                    for &(dt, cnt) in &p.datatypes {
-                        if let Some(existing) = e.datatypes.iter_mut().find(|(d, _)| *d == dt) {
-                            existing.1 += cnt;
-                        } else {
-                            e.datatypes.push((dt, cnt));
-                        }
-                    }
-                }
-            }
-
-            let properties: Vec<is::PropertyStatEntry> = agg
-                .into_iter()
-                .map(|(p_id, pa)| {
-                    let (ns, name) = predicate_sids_v6
-                        .get(p_id as usize)
-                        .cloned()
-                        .unwrap_or((0u16, String::new()));
-                    is::PropertyStatEntry {
-                        sid: (ns, name),
-                        count: pa.count,
-                        ndv_values: pa.ndv_values,
-                        ndv_subjects: pa.ndv_subjects,
-                        last_modified_t: pa.last_modified_t,
-                        datatypes: pa.datatypes,
-                    }
-                })
-                .collect();
+            // Shared with the incremental and rebuild pipelines so
+            // `observed_datatypes` — which is fail-closed, and so goes wrong
+            // quietly — has one producer rather than one per pipeline.
+            let properties: Vec<is::PropertyStatEntry> =
+                fluree_db_indexer::stats::aggregate_property_entries_by_sid(
+                    &id_stats.graphs,
+                    |p_id| {
+                        predicate_sids_v6
+                            .get(p_id as usize)
+                            .cloned()
+                            .unwrap_or((0u16, String::new()))
+                    },
+                );
 
             let mut graphs = id_stats.graphs;
             if let Some(ref cs) = spot_class_stats {
@@ -6733,6 +6715,11 @@ where
                 properties: Some(properties),
                 classes: None,
                 graphs: Some(graphs),
+                // An import replays its entire input as the ledger's full
+                // history, so the stats hook has observed the tag of every
+                // record at every `t` — historical coverage is complete from
+                // genesis.
+                historical_since_t: Some(0),
             };
             // Wire `total_commit_size` into `stats.size` and per-graph sizes,
             // mirroring `root_assembly::compose_root_v6` for the normal indexing
@@ -6831,10 +6818,18 @@ where
             // later defensive drop carries the sticky bit forward
             // and stays out of the bootstrap path.
             had_annotation_arena: false,
-            // Bulk import does not observe list positions at root
-            // assembly; leave the flag untracked so the write path keeps
-            // hydrating until the first full rebuild records it exactly.
-            has_list_meta: None,
+            // Every record written through the spool pipeline reports
+            // whether it carried an RDF-list position, OR'd into one sticky
+            // bit on the shared `SpoolConfig` and read after the parse
+            // workers joined — so this is an exact observation, the same
+            // grade the full-rebuild resolver produces. `Some(false)` is
+            // what lets filtered-DELETE staging skip list-meta hydration on
+            // bulk-imported ledgers, which are the large ones.
+            //
+            // The txn-meta records assembled outside the spool (they hard-code
+            // `i: LIST_INDEX_NONE`) are the only other rows in the root, and
+            // they are never list rows.
+            has_list_meta: Some(input.saw_list_meta),
             ns_split_mode: input.ns_split_mode,
         };
 

@@ -690,6 +690,40 @@ pub async fn stage(
             }
         }
 
+        // Graph-sync target: resolve the g_id + graph Sid now, before the
+        // generator takes `ns_registry` mutably. An unregistered target is a
+        // first population — nothing to retract (`None` scan). Reserved
+        // system graphs are refused the same way CLEAR refuses them.
+        let sync_scan: Option<(GraphId, Sid)> = match &txn.sync_graph {
+            Some(iri) => {
+                // Guard the target by shape, independent of registration:
+                // every entry point (builder, consensus applier, HTTP) meets
+                // this check, so a malformed IRI can't be registered as a
+                // graph and the ledger's own system-graph IRIs are refused
+                // even on a ledger whose registry never seeded them.
+                fluree_db_core::graph_registry::validate_absolute_graph_iri(iri)
+                    .map_err(|msg| TransactError::Parse(format!("sync target: {msg}")))?;
+                let ledger_id = ledger.snapshot.ledger_id.as_ref();
+                if *iri == fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id)
+                    || *iri == fluree_db_core::graph_registry::config_graph_iri(ledger_id)
+                {
+                    return Err(TransactError::ReservedGraphTarget {
+                        graph_iri: iri.clone(),
+                    });
+                }
+                match ledger.snapshot.graph_registry.graph_id_for_iri(iri) {
+                    Some(g_id) if g_id < FIRST_USER_GRAPH_ID => {
+                        return Err(TransactError::ReservedGraphTarget {
+                            graph_iri: iri.clone(),
+                        });
+                    }
+                    Some(g_id) => Some((g_id, ns_registry.sid_for_iri(iri))),
+                    None => None,
+                }
+            }
+            None => None,
+        };
+
         let mut generator = FlakeGenerator::new(new_t, &mut ns_registry, txn_id)
             .with_graph_sids(graph_sids.clone());
 
@@ -752,6 +786,44 @@ pub async fn stage(
                 "upsert deletions generated"
             );
             acc.push_retractions(upsert_retractions);
+        }
+
+        // Graph-sync wave: push every currently-asserted flake of the target
+        // graph as a retraction (see [`Txn::sync_graph`]). The accumulator
+        // nets retract+assert of the same fact to nothing, so what survives
+        // `finalize()` is exactly `current − payload` retractions plus
+        // `payload − current` assertions — the delta. Scanned flakes carry
+        // correct `m` from storage, so (like the upsert wave) no hydration
+        // is needed.
+        //
+        // Policy model follows CLEAR (roadmap O4): the scan is not
+        // view-policy filtered — sync is an authoritative whole-graph
+        // replacement, and a view-filtered scan would leave rows the caller
+        // cannot see in place, breaking "the graph now equals the payload".
+        // Modify-policy is still enforced on the resulting flakes below.
+        //
+        // Scale note: like CLEAR/COPY/MOVE, this materializes the whole
+        // graph's flakes at staging time; backpressure is the pre-check
+        // above plus `NoveltyWouldExceed` sizing at commit (which sees only
+        // the surviving delta). Chunked staging for whole-graph ops is the
+        // same known follow-up flagged on `scan_graph_flakes`.
+        if let Some((sync_g_id, sync_graph_sid)) = &sync_scan {
+            // The scan attributes every flake to the graph Sid, matching the
+            // payload's assertions — both sides must agree on `flake.g` for
+            // the accumulator's unchanged-fact cancellation to fire.
+            let mut sync_retractions =
+                scan_graph_flakes(&ledger, *sync_g_id, Some(sync_graph_sid), options.tracker)
+                    .await?;
+            for f in &mut sync_retractions {
+                f.op = false;
+                f.t = new_t;
+            }
+            tracing::debug!(
+                graph_id = sync_g_id,
+                scanned = sync_retractions.len(),
+                "graph-sync retractions generated"
+            );
+            acc.push_retractions(sync_retractions);
         }
 
         let retraction_count = stream_stats.retraction_count;
@@ -1052,8 +1124,41 @@ fn flake_content(f: &Flake) -> FlakeContent {
     )
 }
 
+/// Default for [`whole_graph_scan_limit`]: ~2 GB peak at the accumulator's
+/// two-copies-per-fact profile. Any graph that worked before the limit
+/// existed still works — whole-graph verbs errored outright on
+/// index-resident graphs, and novelty-resident graphs are already bounded
+/// well below this by `reindex_max_bytes`.
+const DEFAULT_MAX_GRAPH_SCAN_FLAKES: usize = 10_000_000;
+
+/// Memory backstop for whole-graph scans (graph sync, CLEAR, DROP, COPY,
+/// MOVE): staging materializes the target graph's currently-asserted
+/// flakes, so peak memory scales with the graph, not the delta — an
+/// identical resync of a huge graph is the worst case, and no other guard
+/// sees it (`NoveltyWouldExceed` measures only the surviving delta, after
+/// materialization). `FLUREE_MAX_GRAPH_SCAN_FLAKES` overrides; `0`
+/// disables. Read per call — once per graph-management op, never per
+/// flake — so tests and embedders can change it at runtime.
+fn whole_graph_scan_limit() -> Option<usize> {
+    match std::env::var("FLUREE_MAX_GRAPH_SCAN_FLAKES") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT_MAX_GRAPH_SCAN_FLAKES),
+        },
+        Err(_) => Some(DEFAULT_MAX_GRAPH_SCAN_FLAKES),
+    }
+}
+
 /// Scan every currently-asserted flake in graph `g_id` (merged snapshot +
-/// novelty view as of the ledger's current `t`).
+/// novelty view as of the ledger's current `t`), attributed to `g_sid`.
+///
+/// Every flake comes back with `g = g_sid` (`None` for the default graph).
+/// The range provider materializes index-resident rows with `g: None`
+/// regardless of graph — only novelty-resident flakes carry it — and every
+/// caller here routes by `flake.g` (`resolve_flake_graph_id`, where `None`
+/// is the default graph). Without the stamp, retracting an indexed named
+/// graph silently retracted phantoms from the default graph instead.
 ///
 /// Scale note: a whole-graph operation (`CLEAR ALL`, a large COPY/MOVE)
 /// materializes every scanned flake into a `Vec` and re-stages it, and
@@ -1075,17 +1180,38 @@ fn flake_content(f: &Flake) -> FlakeContent {
 async fn scan_graph_flakes(
     ledger: &LedgerState,
     g_id: GraphId,
+    g_sid: Option<&Sid>,
     tracker: Option<&Tracker>,
 ) -> Result<Vec<Flake>> {
     let db_ref = match tracker {
         Some(t) => ledger.as_graph_db_ref(g_id).with_tracker(t),
         None => ledger.as_graph_db_ref(g_id),
     };
-    // Unbounded SPOT scan (empty match, `>= min`) returns the whole graph.
-    db_ref
-        .range(IndexType::Spot, RangeTest::Ge, RangeMatch::new())
+    // `Eq` with an empty match is the whole-graph scan on both range paths:
+    // the V3 provider treats "nothing bound" as a full-index cursor and
+    // rejects every other `RangeTest`, and the genesis (overlay-only) path
+    // matches an empty `Eq` against every flake. `Ge` only ever worked on
+    // the genesis path, where non-`Eq` tests pass through unfiltered.
+    // `flake_limit` stops the provider's drain loop mid-scan, so the
+    // backstop bounds what is materialized, not just what is returned.
+    let limit = whole_graph_scan_limit();
+    let opts = fluree_db_core::RangeOptions {
+        flake_limit: limit.map(|l| l.saturating_add(1)),
+        ..Default::default()
+    };
+    let mut flakes = db_ref
+        .range_with_opts(IndexType::Spot, RangeTest::Eq, RangeMatch::new(), opts)
         .await
-        .map_err(|e| TransactError::FlakeGeneration(format!("graph scan failed: {e}")))
+        .map_err(|e| TransactError::FlakeGeneration(format!("graph scan failed: {e}")))?;
+    if let Some(l) = limit {
+        if flakes.len() > l {
+            return Err(TransactError::WholeGraphScanTooLarge { limit: l });
+        }
+    }
+    for f in &mut flakes {
+        f.g = g_sid.cloned();
+    }
+    Ok(flakes)
 }
 
 /// Resolve the ledger `GraphId` and graph `Sid` for a named graph IRI, if it
@@ -1198,10 +1324,12 @@ async fn stage_graph_mgmt(
                 }
 
                 for (g_id, sid) in targets {
-                    if let Some(sid) = sid {
-                        graph_sids.insert(g_id, sid);
+                    if let Some(sid) = &sid {
+                        graph_sids.insert(g_id, sid.clone());
                     }
-                    for mut f in scan_graph_flakes(&ledger, g_id, options.tracker).await? {
+                    for mut f in
+                        scan_graph_flakes(&ledger, g_id, sid.as_ref(), options.tracker).await?
+                    {
                         f.op = false;
                         f.t = new_t;
                         flakes.push(f);
@@ -1238,7 +1366,7 @@ async fn stage_graph_mgmt(
                 // `from == to` is a spec no-op for ADD/COPY/MOVE.
                 if from != to {
                     // Resolve the source (existing only) and destination.
-                    let (src_g_id, _src_sid): (Option<GraphId>, Option<Sid>) = match from {
+                    let (src_g_id, src_sid): (Option<GraphId>, Option<Sid>) = match from {
                         GraphSel::Default => (Some(0), None),
                         GraphSel::Graph(iri) => {
                             match resolve_named_graph(&ledger, &mut ns_registry, iri) {
@@ -1310,12 +1438,15 @@ async fn stage_graph_mgmt(
                     }
 
                     let src_flakes = match src_g_id {
-                        Some(g) => scan_graph_flakes(&ledger, g, options.tracker).await?,
+                        Some(g) => {
+                            scan_graph_flakes(&ledger, g, src_sid.as_ref(), options.tracker).await?
+                        }
                         None => Vec::new(),
                     };
 
                     let dest_flakes =
-                        scan_graph_flakes(&ledger, dest_g_id, options.tracker).await?;
+                        scan_graph_flakes(&ledger, dest_g_id, dest_sid.as_ref(), options.tracker)
+                            .await?;
 
                     let dest_contents: HashSet<FlakeContent> =
                         dest_flakes.iter().map(flake_content).collect();
@@ -3135,7 +3266,7 @@ pub async fn stage_with_shacl(
     // `enabled_graphs` means "validate every graph with staged flakes" —
     // this legacy path doesn't consult per-graph config.
     let report =
-        validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None).await?;
+        validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None, None).await?;
 
     // Reject on violations only — spec-level `conforms` is also false for
     // warnings/infos, which must not block a commit.
@@ -3208,6 +3339,7 @@ pub async fn validate_view_with_shacl(
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
     membership_g_ids: &[GraphId],
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
+    sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ShaclValidationOutcome> {
     // Fast path: if there are no SHACL shapes, elide validation entirely.
     if shacl_cache.is_empty() {
@@ -3231,6 +3363,7 @@ pub async fn validate_view_with_shacl(
         tracker,
         enabled_graphs.as_ref(),
         cross_ledger,
+        sparql_iri_encoder,
     )
     .await?;
 
@@ -3281,6 +3414,7 @@ async fn validate_staged_nodes(
     tracker: Option<&fluree_db_core::Tracker>,
     enabled_graphs: Option<&HashSet<GraphId>>,
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
+    sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ValidationReport> {
     use fluree_vocab::namespaces::RDF;
     use fluree_vocab::rdf_names;
@@ -3389,7 +3523,7 @@ async fn validate_staged_nodes(
             // SubjectsOf/ObjectsOf handling there for why hints can't be
             // reliably built from staged flakes alone.
             let report = engine
-                .validate_node(db, subject, &node_types, cross_ledger)
+                .validate_node(db, subject, &node_types, cross_ledger, sparql_iri_encoder)
                 .await?;
             // Tag each result with the graph it was validated under so the
             // caller can route warn vs reject per-graph (see

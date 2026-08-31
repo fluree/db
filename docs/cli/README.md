@@ -58,6 +58,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`branch`](branch.md) | Branches: create, list, drop, rebase, merge, diff, revert |
 | [`insert`](insert.md) | Insert data into a ledger |
 | [`upsert`](upsert.md) | Upsert data (insert or update existing) |
+| [`sync`](sync.md) | Make a named graph's contents exactly the supplied data, committing only the delta |
 | [`update`](update.md) | Update with WHERE/DELETE/INSERT patterns |
 | [`load`](load.md) | Stream a CSV into a ledger as batched Cypher/JSON-LD upserts (`LOAD CSV`) |
 | [`query`](query.md) | Query a ledger |
@@ -67,6 +68,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`history`](history.md) | Show change history for an entity |
 | [`export`](export.md) | Export ledger data |
 | [`log`](log.md) | Show commit log |
+| [`verify`](verify.md) | Verify commit-chain integrity and referenced objects |
 | [`show`](show.md) | Show decoded commit contents (flakes with resolved IRIs) |
 | [`index`](index.md) | Build or update the binary index (incremental) |
 | [`reindex`](reindex.md) | Full reindex from commit history |
@@ -146,7 +148,7 @@ When you run `fluree init`, a `.fluree/` directory is created with:
 
 ## Input Resolution
 
-Commands that accept data input (`insert`, `upsert`, `update`, `query`) use flexible argument resolution:
+Commands that accept data input (`insert`, `upsert`, `sync`, `update`, `query`) use flexible argument resolution:
 
 | Arguments | Behavior |
 |-----------|----------|

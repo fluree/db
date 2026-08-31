@@ -2610,6 +2610,7 @@ dependencies = [
  "fluree-db-query",
  "fluree-db-r2rml",
  "fluree-db-server",
+ "fluree-graph-turtle",
  "fluree-vocab",
  "futures",
  "hex",
@@ -2662,6 +2663,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
  "testcontainers",
  "thiserror 1.0.69",
  "tokio",
@@ -2680,6 +2682,7 @@ dependencies = [
  "fluree-db-ledger",
  "fluree-db-nameservice",
  "fluree-db-transact",
+ "fluree-raft-core",
  "futures",
  "hex",
  "http-body-util",
@@ -2695,7 +2698,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -2722,6 +2724,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "postcard",
+ "rand 0.8.5",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -3176,6 +3179,7 @@ dependencies = [
  "async-trait",
  "fluree-db-core",
  "fluree-db-query",
+ "fluree-db-sparql",
  "fluree-vocab",
  "parking_lot",
  "regex",
@@ -3368,6 +3372,26 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "winnow 0.7.14",
+]
+
+[[package]]
+name = "fluree-raft-core"
+version = "4.1.6"
+dependencies = [
+ "async-trait",
+ "axum",
+ "http-body-util",
+ "openraft",
+ "postcard",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]
