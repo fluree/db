@@ -253,6 +253,11 @@ path = "tests/it_exists_semijoin_correlation.rs"
 name = "it_repeated_var_fast_path_guards"
 path = "tests/it_repeated_var_fast_path_guards.rs"
 
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_count_star_row_multiplicity"
+path = "tests/it_count_star_row_multiplicity.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
@@ -266,6 +271,10 @@ path = "tests/it_cyclic_bgp_novelty_pred.rs"
 [[test]]
 name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
+
+[[test]]
+name = "it_cyclic_bgp_string_dict"
+path = "tests/it_cyclic_bgp_string_dict.rs"
 
 # Own binary: asserts on a tracing event to pin that the BM25 incremental sync
 # really narrows its indexing query. Same convention and same two hazards as the
@@ -325,6 +334,11 @@ path = "tests/it_cypher_import.rs"
 [[test]]
 name = "it_query_explain"
 path = "tests/it_query_explain.rs"
+
+# Own binary: needs the background indexer to reach the indexed OPTIONAL lane.
+[[test]]
+name = "it_optional_after_union"
+path = "tests/it_optional_after_union.rs"
 
 [[test]]
 name = "it_query_sparql_indexed"
@@ -414,6 +428,14 @@ name = "transact_commit"
 harness = false
 
 [[bench]]
+name = "transact_filtered_delete"
+harness = false
+
+[[bench]]
+name = "query_overlay_only_range"
+harness = false
+
+[[bench]]
 name = "query_cold_reload"
 harness = false
 
@@ -433,6 +455,14 @@ harness = false
 name = "query_hot_bsbm"
 harness = false
 
+# Same-subject star with a fan-out predicate whose object var is unprojected —
+# the shape `PropertyJoinOperator`'s semijoin demotion serves. Its own fixture:
+# BSBM has no multi-valued same-subject predicate and adding one would move
+# `query_hot_bsbm`'s committed baseline for unrelated cases.
+[[bench]]
+name = "query_hot_fanout_star"
+harness = false
+
 [[bench]]
 name = "query_overlay_matrix"
 harness = false
@@ -443,6 +473,10 @@ harness = false
 
 [[bench]]
 name = "query_hot_property_path"
+harness = false
+
+[[bench]]
+name = "query_hot_optional"
 harness = false
 
 [[bench]]
@@ -467,6 +501,11 @@ name = "annotation_planner"
 harness = false
 
 [[test]]
+name = "it_batched_refs_overlay_lifecycle"
+path = "tests/it_batched_refs_overlay_lifecycle.rs"
+required-features = ["native"]
+
+[[test]]
 name = "it_filtered_delete_list_meta"
 path = "tests/it_filtered_delete_list_meta.rs"
 required-features = ["native"]
@@ -474,4 +513,11 @@ required-features = ["native"]
 [[test]]
 name = "it_literal_identity"
 path = "tests/it_literal_identity.rs"
+required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch AND asserts stats-merge routing via span capture.
+[[test]]
+name = "it_fast_stats_1391_regression"
+path = "tests/it_fast_stats_1391_regression.rs"
 required-features = ["native"]

@@ -47,6 +47,12 @@ impl From<RuleError> for QueryError {
 /// Local name for the f:rule predicate
 const RULE_LOCAL_NAME: &str = "rule";
 
+/// Prefix the parser puts on variables it invents for anonymous and nested
+/// nodes (`?__implicit_0`, `?__nested_1`, `?__anon_2`). A rule author never
+/// writes one, so diagnostics must not quote them back
+/// (see [`unsafe_insert_variables_message`]).
+const IMPLICIT_VAR_PREFIX: &str = "?__";
+
 /// Extract datalog rules from a database
 ///
 /// Queries for all `f:rule` triples and parses the rule definitions.
@@ -230,6 +236,39 @@ fn parse_rule_definition(
         .ok_or_else(|| QueryError::InvalidQuery("Rule missing 'insert' clause".to_string()))?;
     let insert_patterns = parse_insert_patterns(insert_json, &context, snapshot)?;
 
+    // Range restriction (#1560), enforced PER insert pattern to preserve the
+    // runtime semantic: `execute_rule_with_bindings` instantiates each insert
+    // pattern independently, so one head that can never instantiate must not
+    // silence the others. A head referencing a variable nothing can bind is
+    // skipped with a diagnostic naming the variable, and the remaining heads
+    // keep deriving; only a rule with NO instantiable head — which can never
+    // derive anything at all — is rejected outright. Left alone either case is
+    // invisible: every binding row is dropped inside `instantiate_pattern`, so
+    // the rule "runs" and derives nothing (or less than it was written to).
+    let bound = authored_bound_vars(&where_patterns);
+    let (insert_patterns, skipped): (Vec<RuleTriplePattern>, Vec<RuleTriplePattern>) =
+        insert_patterns
+            .into_iter()
+            .partition(|p| insert_pattern_is_instantiable(p, &bound));
+    if !skipped.is_empty() {
+        if insert_patterns.is_empty() {
+            let message = unsafe_insert_variables_message(&where_patterns, &skipped)
+                .expect("skipped insert patterns reference unbound variables");
+            return Err(QueryError::InvalidQuery(message));
+        }
+        let description = unbound_insert_description(&where_patterns, &skipped)
+            .expect("skipped insert patterns reference unbound variables");
+        tracing::warn!(
+            rule_id = %rule_id,
+            skipped = skipped.len(),
+            kept = insert_patterns.len(),
+            "datalog rule insert pattern skipped — {}. Every variable used in \
+             `insert` must also appear in `where`; the rule's remaining insert \
+             patterns still derive",
+            description
+        );
+    }
+
     let mut rule = DatalogRule::new(rule_id.clone(), where_patterns, insert_patterns);
 
     // Add filters if any were parsed
@@ -270,12 +309,32 @@ fn parse_where_clause(
                     }
                     JsonValue::Array(filter_arr) if is_filter_expression(filter_arr) => {
                         // Filter expression like ["filter", "(>= ?age 62)"]
-                        if let Some(filter) = parse_filter_expression(filter_arr)? {
-                            filters.push(filter);
-                        }
+                        filters.push(parse_filter_expression(filter_arr, context, snapshot)?);
                     }
+                    // A near-miss on the filter keyword — `["FILTER", ...]` —
+                    // is rejected outright. It is unambiguously a filter the
+                    // author meant to apply, and dropping it silently is the
+                    // #1556 failure mode by another route: the filter
+                    // disappears, `rule.filters` is empty, and the rule derives
+                    // everything it was written to restrict.
+                    _ if looks_like_misspelled_filter(item) => {
+                        return Err(QueryError::InvalidQuery(format!(
+                            "Unrecognized element in rule where clause: {item}. \
+                             The filter keyword is lowercase `filter` — this element \
+                             would otherwise be dropped, leaving the rule to derive \
+                             the facts the filter was written to exclude."
+                        )));
+                    }
+                    // Anything else stays tolerated, as it has been. Whether an
+                    // unknown where-clause element should be an outright error
+                    // is a language decision beyond this fix, but it should not
+                    // vanish without a trace.
                     _ => {
-                        // Skip unknown array elements
+                        tracing::warn!(
+                            element = %item,
+                            "unrecognized element in datalog rule where clause — ignored; \
+                             expected a node pattern object or [\"filter\", \"(op ?var value)\"]"
+                        );
                     }
                 }
             }
@@ -290,20 +349,169 @@ fn parse_where_clause(
     Ok((patterns, filters))
 }
 
+/// Variables an `insert` pattern references that no `where` pattern can bind.
+///
+/// This is datalog's range-restriction (safety) condition: every variable in
+/// the head must appear in the body. A rule that breaks it can never derive
+/// anything — `instantiate_pattern` returns `None` for each row — which is the
+/// silent dead end reported in #1560.
+///
+/// Parser-generated names on the where side are deliberately NOT treated as
+/// binding. They are numbered off each clause's own `patterns.len()`, so a
+/// where-side `?__implicit_0` and an unrelated insert-side `?__implicit_0`
+/// would otherwise collide and suppress the diagnostic for exactly the
+/// anonymous-node case it exists to report. An author cannot write one of
+/// these names, so an insert pattern can never legitimately be referring to
+/// the where clause's copy.
+fn unbound_insert_variables(
+    where_patterns: &[RuleTriplePattern],
+    insert_patterns: &[RuleTriplePattern],
+) -> Vec<Arc<str>> {
+    let bound = authored_bound_vars(where_patterns);
+
+    let mut unbound: Vec<Arc<str>> = Vec::new();
+    for pattern in insert_patterns {
+        for term in [&pattern.subject, &pattern.predicate, &pattern.object] {
+            if let RuleTerm::Var(v) = term {
+                if !bound.contains(v) && !unbound.contains(v) {
+                    unbound.push(v.clone());
+                }
+            }
+        }
+    }
+    unbound
+}
+
+/// The author-written variables a where clause binds. Parser-generated names
+/// are excluded — see [`unbound_insert_variables`] for why they must never be
+/// treated as binding.
+fn authored_bound_vars(where_patterns: &[RuleTriplePattern]) -> HashSet<Arc<str>> {
+    let mut bound: HashSet<Arc<str>> = HashSet::new();
+    for pattern in where_patterns {
+        bind_pattern_vars(pattern, &mut bound);
+    }
+    bound.retain(|v| !v.starts_with(IMPLICIT_VAR_PREFIX));
+    bound
+}
+
+/// Whether every variable `pattern` references is in `bound` — i.e. whether
+/// `instantiate_pattern` can ever produce a flake from it.
+fn insert_pattern_is_instantiable(pattern: &RuleTriplePattern, bound: &HashSet<Arc<str>>) -> bool {
+    [&pattern.subject, &pattern.predicate, &pattern.object]
+        .into_iter()
+        .all(|term| match term {
+            RuleTerm::Var(v) => bound.contains(v),
+            _ => true,
+        })
+}
+
+/// Human-readable description of why `insert_patterns` violate range
+/// restriction, or `None` when they are all safe.
+///
+/// Names the offending variables, because "this rule derives nothing" without
+/// them sends an author reading engine source (#1560). Auto-generated
+/// variables get their own wording: the author never wrote `?__implicit_0`, so
+/// naming it would be useless — what they need to know is that a node in the
+/// insert clause has no `@id`.
+fn unbound_insert_description(
+    where_patterns: &[RuleTriplePattern],
+    insert_patterns: &[RuleTriplePattern],
+) -> Option<String> {
+    let unbound = unbound_insert_variables(where_patterns, insert_patterns);
+    if unbound.is_empty() {
+        return None;
+    }
+
+    let (generated, authored): (Vec<&Arc<str>>, Vec<&Arc<str>>) = unbound
+        .iter()
+        .partition(|v| v.starts_with(IMPLICIT_VAR_PREFIX));
+
+    let mut parts: Vec<String> = Vec::new();
+    if !authored.is_empty() {
+        let names: Vec<&str> = authored.iter().map(|v| &***v).collect();
+        parts.push(format!(
+            "insert pattern references {} that the where clause never binds \
+             (check for a typo against the where clause's variable names)",
+            names.join(", ")
+        ));
+    }
+    if !generated.is_empty() {
+        parts.push(
+            "insert pattern contains a node with no `@id` (or a nested anonymous \
+             node), which has no subject to derive facts about"
+                .to_string(),
+        );
+    }
+
+    Some(parts.join("; "))
+}
+
+/// Actionable message for a rule that violates range restriction in EVERY
+/// insert pattern — such a rule can never derive anything — or `None` when at
+/// least the given patterns are safe.
+fn unsafe_insert_variables_message(
+    where_patterns: &[RuleTriplePattern],
+    insert_patterns: &[RuleTriplePattern],
+) -> Option<String> {
+    unbound_insert_description(where_patterns, insert_patterns).map(|description| {
+        format!(
+            "Rule cannot derive anything: {description}. Every variable used in \
+             `insert` must also appear in `where`."
+        )
+    })
+}
+
 /// Check if an array is a filter expression (starts with "filter")
 fn is_filter_expression(arr: &[JsonValue]) -> bool {
     matches!(arr.first(), Some(JsonValue::String(s)) if s == "filter")
 }
 
+/// Whether a where-clause element is an array whose head is some case variant
+/// of `filter` — i.e. the author meant a filter and the keyword did not match.
+/// Used only to sharpen the rejection message.
+fn looks_like_misspelled_filter(item: &JsonValue) -> bool {
+    matches!(
+        item.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()),
+        Some(s) if s.eq_ignore_ascii_case("filter")
+    )
+}
+
 /// Parse a filter expression like ["filter", "(>= ?age 62)"]
-fn parse_filter_expression(arr: &[JsonValue]) -> Result<Option<RuleFilter>> {
+///
+/// `context` and `snapshot` are threaded in so an IRI operand can be expanded
+/// and resolved the same way a node-pattern term is (#1556) — without them a
+/// colon-bearing operand was silently demoted to a string and could never
+/// equal the IRI it named.
+///
+/// Every rejection path is an error rather than a quiet `None`. A filter that
+/// fails to parse and disappears leaves `rule.filters` empty, and
+/// [`execute_rule_matching`] then skips filtering entirely — so a malformed
+/// exclusion filter derives exactly the facts it was written to withhold,
+/// which is the #1556 failure mode reached by a different route.
+fn parse_filter_expression(
+    arr: &[JsonValue],
+    context: &JsonValue,
+    snapshot: &LedgerSnapshot,
+) -> Result<RuleFilter> {
     if arr.len() != 2 {
-        return Ok(None);
+        return Err(QueryError::InvalidQuery(format!(
+            "A rule filter must have exactly two elements, \
+             [\"filter\", \"(op ?var value)\"], but got {} — refusing to drop the \
+             filter, since a rule that silently loses its filter derives the facts \
+             the filter was written to exclude.",
+            arr.len()
+        )));
     }
 
     let expr = match &arr[1] {
         JsonValue::String(s) => s.as_str(),
-        _ => return Ok(None),
+        other => {
+            return Err(QueryError::InvalidQuery(format!(
+                "A rule filter expression must be a string, but got {other} — \
+                 refusing to drop the filter, since a rule that silently loses its \
+                 filter derives the facts the filter was written to exclude."
+            )));
+        }
     };
 
     // Parse S-expression style filter: "(op arg1 arg2)"
@@ -315,7 +523,7 @@ fn parse_filter_expression(arr: &[JsonValue]) -> Result<Option<RuleFilter>> {
     }
 
     let inner = &expr[1..expr.len() - 1];
-    let parts: Vec<&str> = inner.split_whitespace().collect();
+    let parts = split_filter_tokens(inner)?;
 
     if parts.len() < 2 {
         return Err(QueryError::InvalidQuery(format!(
@@ -339,38 +547,208 @@ fn parse_filter_expression(arr: &[JsonValue]) -> Result<Option<RuleFilter>> {
     };
 
     // Parse left and right terms
-    let left = parse_filter_term(parts[1])?;
+    let left = parse_filter_term(parts[1], context, snapshot)?;
     let right = if parts.len() > 2 {
-        parse_filter_term(parts[2])?
+        parse_filter_term(parts[2], context, snapshot)?
     } else {
         return Err(QueryError::InvalidQuery(format!(
             "Comparison filter needs two arguments: {expr}"
         )));
     };
 
-    Ok(Some(RuleFilter::Compare { op, left, right }))
+    // An IRI has no ordering, so `<`/`<=`/`>`/`>=` against an IRI operand can
+    // never be answered. Reject it here rather than letting it evaluate to
+    // "no" per row — a silently-unsatisfiable ordering filter is the same
+    // class of invisible failure as the fail-open equality of #1556.
+    //
+    // This parse-time guard is JSON-LD-only: SPARQL rules never reach this
+    // function, and `sparql_lang.rs` lowers a constant IRI to
+    // `RuleTerm::Value(RuleValue::Ref(_))` rather than `RuleTerm::Sid(_)`.
+    // Both paths still fail closed — `compare_values` returns `Error` for IRI
+    // ordering at run time — so the difference is only in the diagnostic: a
+    // JSON-LD author gets a parse error naming the operator, a SPARQL author
+    // gets a per-rule warn from `execute_rule_matching`.
+    if !matches!(op, CompareOp::Equal | CompareOp::NotEqual)
+        && (matches!(left, RuleTerm::Sid(_)) || matches!(right, RuleTerm::Sid(_)))
+    {
+        return Err(QueryError::InvalidQuery(format!(
+            "Filter operator `{op_str}` cannot order IRIs: {expr}. \
+             Only `=` and `!=` are defined for IRI operands."
+        )));
+    }
+
+    Ok(RuleFilter::Compare { op, left, right })
 }
 
-/// Parse a single term in a filter expression (variable or literal)
-fn parse_filter_term(s: &str) -> Result<RuleTerm> {
-    if s.starts_with('?') {
-        // Variable
-        Ok(RuleTerm::var(s))
-    } else if let Ok(n) = s.parse::<i64>() {
-        // Integer literal
-        Ok(RuleTerm::Value(RuleValue::Long(n)))
-    } else if let Ok(f) = s.parse::<f64>() {
-        // Float literal
-        Ok(RuleTerm::Value(RuleValue::Double(f)))
-    } else if s == "true" {
-        Ok(RuleTerm::Value(RuleValue::Boolean(true)))
-    } else if s == "false" {
-        Ok(RuleTerm::Value(RuleValue::Boolean(false)))
-    } else {
-        // String literal (strip quotes if present)
-        let s = s.trim_matches('"').trim_matches('\'');
-        Ok(RuleTerm::Value(RuleValue::String(s.to_string())))
+/// Split a filter's inner S-expression into tokens, keeping a quoted operand
+/// whole.
+///
+/// Plain `split_whitespace` tore `"John Smith"` into `"John` and `Smith"`, so
+/// the quoting escape hatch that [`parse_filter_term`]'s own error message
+/// recommends did not survive a value containing a space — the operand became
+/// the literal string `"John`, leading quote included. Quotes are kept in the
+/// token so `quoted_literal` can still recognise and strip them.
+///
+/// An unterminated quote is an error rather than a silently truncated operand.
+fn split_filter_tokens(inner: &str) -> Result<Vec<&str>> {
+    let bytes = inner.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        let start = i;
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                return Err(QueryError::InvalidQuery(format!(
+                    "Unterminated quote in filter expression: {inner}. \
+                     A quoted operand must close its quote."
+                )));
+            }
+            i += 1; // consume the closing quote
+        } else {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+        tokens.push(&inner[start..i]);
     }
+
+    Ok(tokens)
+}
+
+/// The prefix of a token shaped like a compact IRI (`prefix:local`).
+///
+/// Deliberately narrow: the prefix must be a plausible NCName (leading letter
+/// or `_`), which keeps colon-bearing *literals* — `12:30:00`,
+/// `2026-08-25T09:30:00Z` — out of IRI classification, since no NCName starts
+/// with a digit. Returns `None` for anything that is not CURIE-shaped.
+/// (A non-CURIE unquoted token is then rejected by [`parse_filter_term`], with
+/// quoting as the escape hatch — so a colon-bearing literal is never misread
+/// as an IRI, and never silently read as a string either.)
+fn curie_prefix(s: &str) -> Option<&str> {
+    let colon = s.find(':')?;
+    let prefix = &s[..colon];
+    let mut chars = prefix.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if chars.any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')) {
+        return None;
+    }
+    Some(prefix)
+}
+
+/// Whether a filter token is wrapped in matching quotes — the explicit
+/// "compare this as a string" escape hatch for a literal that would otherwise
+/// read as a compact IRI.
+fn quoted_literal(s: &str) -> Option<&str> {
+    for q in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+            return Some(&s[1..s.len() - 1]);
+        }
+    }
+    None
+}
+
+/// Parse a single term in a filter expression (variable, literal, or IRI)
+///
+/// Classification order is load-bearing (#1556):
+///
+/// 1. A quoted token is always a string literal — the escape hatch for a
+///    literal that happens to look like a compact IRI.
+/// 2. `?x` is a variable.
+/// 3. Numbers and booleans are literals.
+/// 4. A [`curie_prefix`]-shaped token is an IRI (an absolute `http(s)` IRI is
+///    itself CURIE-shaped — `http`/`https` parse as the prefix — so one
+///    classification covers both forms, and [`expand_iri`] passes an absolute
+///    IRI through unchanged): it is expanded through the rule's `@context` and
+///    resolved to a Sid, exactly as [`parse_term`] resolves a node-pattern
+///    term.
+/// 5. Anything else — a bare unquoted token — is **rejected**.
+///
+/// Steps 4 and 5 both **fail closed**. When an IRI-shaped operand cannot be
+/// resolved to a namespace registered on this ledger, the rule is rejected
+/// instead of falling back to a string comparison. That fallback is precisely
+/// the #1556 defect: `(!= ?prop ex:ssn)` compared the string `"ex:ssn"`
+/// against the bare local name `"ssn"`, was therefore always true, and copied
+/// the property the author wrote the rule to withhold.
+///
+/// A bare token is rejected for the same reason: before #1556 was fixed, the
+/// bare form — `(!= ?prop ssn)` — was the only operand shape that ever matched
+/// a bound IRI, so it is exactly what a workaround rule looks like. Silently
+/// reading it as a string now would fail invisibly in BOTH directions: `=`
+/// derives nothing (a string never equals an IRI) and `!=` keeps every row and
+/// derives the very fact the filter was written to exclude — and no run-time
+/// gate can see the `!=` case, because every row surviving looks like success.
+/// Rejection covers both directions symmetrically, at zero per-row cost. A
+/// string comparison is still one keystroke away (quote the operand), and a
+/// rule that refuses to run is recoverable; a rule that silently derives an
+/// excluded fact is not.
+fn parse_filter_term(s: &str, context: &JsonValue, snapshot: &LedgerSnapshot) -> Result<RuleTerm> {
+    if let Some(inner) = quoted_literal(s) {
+        return Ok(RuleTerm::Value(RuleValue::String(inner.to_string())));
+    }
+    if s.starts_with('?') {
+        return Ok(RuleTerm::var(s));
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Ok(RuleTerm::Value(RuleValue::Long(n)));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Ok(RuleTerm::Value(RuleValue::Double(f)));
+    }
+    if s == "true" {
+        return Ok(RuleTerm::Value(RuleValue::Boolean(true)));
+    }
+    if s == "false" {
+        return Ok(RuleTerm::Value(RuleValue::Boolean(false)));
+    }
+
+    if curie_prefix(s).is_some() {
+        let expanded = expand_iri(s, context)?;
+        // `encode_iri_strict` (unlike `encode_iri`) refuses to mint a Sid in
+        // the EMPTY namespace for an unrecognized IRI, which is what makes the
+        // failure loud instead of producing a Sid that can never match. Same
+        // rule the SPARQL rule lowerer applies to an unresolved IRI.
+        return match snapshot.encode_iri_strict(&expanded) {
+            Some(sid) => Ok(RuleTerm::Sid(sid)),
+            None => Err(QueryError::InvalidQuery(format!(
+                "Filter operand `{s}` names an IRI that is not registered on this \
+                 ledger{}. Define the prefix in the rule's @context, use an absolute \
+                 IRI, or quote the operand (\"{s}\") to compare it as a string. \
+                 Refusing to compare it as a string: a filter whose IRI operand can \
+                 never match makes `!=` always true, so an exclusion rule derives the \
+                 fact it was written to exclude.",
+                if expanded == s {
+                    String::new()
+                } else {
+                    format!(" (expanded to `{expanded}`)")
+                }
+            ))),
+        };
+    }
+
+    Err(QueryError::InvalidQuery(format!(
+        "Filter operand `{s}` is a bare unquoted token. Quote it (\"{s}\") to \
+         compare it as a string, or write a prefixed or absolute IRI (ex:{s}) \
+         to compare it as an IRI. Refusing to guess: read as a string the bare \
+         form fails invisibly against an IRI-bound variable — `=` derives \
+         nothing, and `!=` keeps every row, so an exclusion rule derives the \
+         fact it was written to exclude."
+    )))
 }
 
 /// Parse a node-map pattern into triple patterns
@@ -386,7 +764,7 @@ fn parse_node_pattern(
     } else {
         // Generate unique implicit variable for anonymous node
         // Use patterns.len() to ensure uniqueness across multiple node patterns
-        let var_name = format!("?__implicit_{}", patterns.len());
+        let var_name = format!("{IMPLICIT_VAR_PREFIX}implicit_{}", patterns.len());
         RuleTerm::var(&var_name)
     };
 
@@ -427,7 +805,7 @@ fn parse_node_pattern(
                     parse_term(nested_id, context, snapshot)?
                 } else {
                     // Generate intermediate variable
-                    let var_name = format!("?__nested_{}", patterns.len());
+                    let var_name = format!("{IMPLICIT_VAR_PREFIX}nested_{}", patterns.len());
                     RuleTerm::var(&var_name)
                 };
 
@@ -492,7 +870,7 @@ fn parse_object_value(
         }
         JsonValue::Object(nested) => {
             // Nested anonymous node - generate variable and recurse
-            let var_name = format!("?__anon_{}", patterns.len());
+            let var_name = format!("{IMPLICIT_VAR_PREFIX}anon_{}", patterns.len());
             let nested_subject = RuleTerm::var(&var_name);
 
             // Create a map with @id for recursive parsing
@@ -704,37 +1082,169 @@ pub async fn execute_rule_matching(
         binding_rows = new_bindings;
     }
 
-    // Apply filters to eliminate non-matching bindings
+    // Apply filters to eliminate non-matching bindings.
+    //
+    // A row survives only on an outright `True`. `Error` — an unresolvable
+    // operand or a pair of literals with no defined comparison — drops the row,
+    // never keeps it, so filter *evaluation* cannot fail open (#1556).
     if !rule.filters.is_empty() {
+        let rows_before = binding_rows.len();
+        let mut diagnostics = FilterDiagnostics::default();
         binding_rows.retain(|bindings| {
-            rule.filters
-                .iter()
-                .all(|filter| evaluate_filter(filter, bindings))
+            let mut row_errored = false;
+            let keep = rule.filters.iter().all(|filter| {
+                match evaluate_filter(filter, bindings, &mut diagnostics) {
+                    FilterOutcome::True => true,
+                    FilterOutcome::False => false,
+                    FilterOutcome::Error => {
+                        row_errored = true;
+                        false
+                    }
+                }
+            });
+            diagnostics.errored_rows += row_errored as usize;
+            keep
         });
+
+        if diagnostics.errored_rows > 0 {
+            // Excluding the row is the safe answer, but silently excluding it
+            // is how a mis-typed filter looks exactly like a rule that
+            // legitimately matched nothing.
+            tracing::warn!(
+                rule = rule.name.as_deref().unwrap_or("<unnamed>"),
+                rule_id = %rule.id,
+                errored_rows = diagnostics.errored_rows,
+                "datalog rule filter could not compare its operands on some binding \
+                 rows; those rows were excluded — check the filter's operand types"
+            );
+        } else if rows_before > 0 && binding_rows.is_empty() && diagnostics.iri_vs_literal > 0 {
+            // Every row was eliminated, and at least one comparison put an IRI
+            // against a literal. The bare-local-name workaround form —
+            // `(= ?p knows)` — is rejected at parse time now, so what reaches
+            // here is a QUOTED operand spelling out an IRI — `(= ?p "ex:knows")`
+            // — or a variable that binds a string where its partner binds an
+            // IRI. Either way the rule correctly derives nothing, and without
+            // this it would do so in complete silence: RDFterm-equal makes
+            // IRI-vs-literal a clean `False`, not an `Error`, so the branch
+            // above cannot see it. (The `!=` twin of this mistake keeps every
+            // row instead of dropping them all, which no run-time gate can
+            // distinguish from success — that direction is exactly why the
+            // bare form is rejected at parse.)
+            tracing::warn!(
+                rule = rule.name.as_deref().unwrap_or("<unnamed>"),
+                rule_id = %rule.id,
+                rows_before,
+                "datalog rule filter compared an IRI against a literal and excluded \
+                 every binding row; a quoted operand is a string literal and never \
+                 equals an IRI — if the operand was meant to name an IRI, write it \
+                 unquoted as a prefixed or absolute IRI (`ex:knows`, not \
+                 `\"ex:knows\"`)"
+            );
+        }
     }
 
     Ok(binding_rows)
 }
 
+/// Per-rule tallies gathered while filtering, used only for diagnostics.
+#[derive(Default)]
+struct FilterDiagnostics {
+    /// Rows dropped because some filter could not be evaluated at all.
+    errored_rows: usize,
+    /// Comparisons that put an IRI against a literal. Well-defined (and false)
+    /// per RDFterm-equal, so it never drops a row on its own — but when it
+    /// coincides with "every row eliminated" it is the fingerprint of a filter
+    /// whose operand spells an IRI as a string (a quoted `"ex:knows"`, or a
+    /// string-bound variable compared against an IRI-bound one).
+    iri_vs_literal: usize,
+}
+
+/// Outcome of evaluating a rule filter against one binding row.
+///
+/// Three-valued on purpose, following SPARQL's treatment of a type error.
+/// Collapsing `Error` into `False` would be wrong under `Not`: `!(error)`
+/// would become `true` and re-admit a row the filter could not actually judge.
+/// Only [`FilterOutcome::True`] keeps a row, so an incomparable filter can
+/// exclude but never include.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterOutcome {
+    True,
+    False,
+    Error,
+}
+
 /// Evaluate a filter expression against a set of bindings
-fn evaluate_filter(filter: &RuleFilter, bindings: &Bindings) -> bool {
+///
+/// `diagnostics` accumulates the tallies that make a silently-empty filter
+/// explainable afterwards; evaluation itself does not consult them.
+fn evaluate_filter(
+    filter: &RuleFilter,
+    bindings: &Bindings,
+    diagnostics: &mut FilterDiagnostics,
+) -> FilterOutcome {
     match filter {
         RuleFilter::Compare { op, left, right } => {
             let left_val = resolve_filter_term(left, bindings);
             let right_val = resolve_filter_term(right, bindings);
 
             match (left_val, right_val) {
-                (Some(l), Some(r)) => compare_values(&l, &r, *op),
-                _ => false, // If either side can't be resolved, filter fails
+                (Some(l), Some(r)) => {
+                    if matches!(l, FlakeValue::Ref(_)) != matches!(r, FlakeValue::Ref(_)) {
+                        diagnostics.iri_vs_literal += 1;
+                    }
+                    compare_values(&l, &r, *op)
+                }
+                // An unbound operand cannot be judged either way.
+                _ => FilterOutcome::Error,
             }
         }
-        RuleFilter::And(filters) => filters.iter().all(|f| evaluate_filter(f, bindings)),
-        RuleFilter::Or(filters) => filters.iter().any(|f| evaluate_filter(f, bindings)),
-        RuleFilter::Not(inner) => !evaluate_filter(inner, bindings),
+        // `false && error` is `false`; `true && error` is `error`.
+        RuleFilter::And(filters) => {
+            let mut saw_error = false;
+            for f in filters {
+                match evaluate_filter(f, bindings, diagnostics) {
+                    FilterOutcome::False => return FilterOutcome::False,
+                    FilterOutcome::Error => saw_error = true,
+                    FilterOutcome::True => {}
+                }
+            }
+            if saw_error {
+                FilterOutcome::Error
+            } else {
+                FilterOutcome::True
+            }
+        }
+        // `true || error` is `true`; `false || error` is `error`.
+        RuleFilter::Or(filters) => {
+            let mut saw_error = false;
+            for f in filters {
+                match evaluate_filter(f, bindings, diagnostics) {
+                    FilterOutcome::True => return FilterOutcome::True,
+                    FilterOutcome::Error => saw_error = true,
+                    FilterOutcome::False => {}
+                }
+            }
+            if saw_error {
+                FilterOutcome::Error
+            } else {
+                FilterOutcome::False
+            }
+        }
+        RuleFilter::Not(inner) => match evaluate_filter(inner, bindings, diagnostics) {
+            FilterOutcome::True => FilterOutcome::False,
+            FilterOutcome::False => FilterOutcome::True,
+            // Never `True`: negating something uncomparable must not admit the row.
+            FilterOutcome::Error => FilterOutcome::Error,
+        },
     }
 }
 
 /// Resolve a filter term to a comparable value
+///
+/// An IRI stays an IRI. Rendering a bound Sid as its bare local name — what
+/// this did before #1556 — threw away the namespace, so `ex:knows` and
+/// `foaf:knows` both resolved to `"knows"` and neither could ever equal the
+/// operand `"ex:knows"` that the author actually wrote.
 fn resolve_filter_term(term: &RuleTerm, bindings: &Bindings) -> Option<FlakeValue> {
     match term {
         RuleTerm::Var(name) => bindings.get(name.as_ref()).map(|bv| match bv {
@@ -744,23 +1254,35 @@ fn resolve_filter_term(term: &RuleTerm, bindings: &Bindings) -> Option<FlakeValu
             BindingValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
             BindingValue::String(s) => FlakeValue::String(s.clone()),
             BindingValue::Boolean(b) => FlakeValue::Boolean(*b),
-            BindingValue::Sid(sid) => FlakeValue::String(sid.name.to_string()),
+            BindingValue::Sid(sid) => FlakeValue::Ref(sid.clone()),
         }),
         RuleTerm::Value(val) => Some(match val {
             RuleValue::Long(n) => FlakeValue::Long(*n),
             RuleValue::Double(d) => FlakeValue::Double(*d),
             RuleValue::String(s) => FlakeValue::String(s.clone()),
             RuleValue::Boolean(b) => FlakeValue::Boolean(*b),
-            RuleValue::Ref(sid) => FlakeValue::String(sid.name.to_string()),
+            RuleValue::Ref(sid) => FlakeValue::Ref(sid.clone()),
         }),
-        RuleTerm::Sid(sid) => Some(FlakeValue::String(sid.name.to_string())),
+        RuleTerm::Sid(sid) => Some(FlakeValue::Ref(sid.clone())),
     }
 }
 
-/// Compare two filter values using the given operator. Only the
-/// Long/Double/String/Boolean variants of FlakeValue are inspected; other
-/// variants fall through to "incompatible".
-fn compare_values(left: &FlakeValue, right: &FlakeValue, op: CompareOp) -> bool {
+/// Compare two filter values using the given operator.
+///
+/// Numeric, IRI (`Ref`), string and boolean pairs are comparable; every other
+/// pairing is [`FilterOutcome::Error`], which excludes the row. Note what is
+/// deliberately absent: a `Ref`-versus-`String` pairing does NOT stringify the
+/// IRI to make the comparison "work". That coercion is what made `!=` against
+/// an IRI always true (#1556).
+fn compare_values(left: &FlakeValue, right: &FlakeValue, op: CompareOp) -> FilterOutcome {
+    let outcome = |b: bool| {
+        if b {
+            FilterOutcome::True
+        } else {
+            FilterOutcome::False
+        }
+    };
+
     // Try numeric comparison first: exact across all numeric representations
     // (Long/Double/BigInt/Decimal), with BigDecimal promotion where an f64
     // cast would lose precision.
@@ -771,39 +1293,69 @@ fn compare_values(left: &FlakeValue, right: &FlakeValue, op: CompareOp) -> bool 
     };
 
     if let Some(cmp) = numeric_result {
-        return match op {
+        return outcome(match op {
             CompareOp::Equal => cmp == std::cmp::Ordering::Equal,
             CompareOp::NotEqual => cmp != std::cmp::Ordering::Equal,
             CompareOp::LessThan => cmp == std::cmp::Ordering::Less,
             CompareOp::LessThanOrEqual => cmp != std::cmp::Ordering::Greater,
             CompareOp::GreaterThan => cmp == std::cmp::Ordering::Greater,
             CompareOp::GreaterThanOrEqual => cmp != std::cmp::Ordering::Less,
-        };
+        });
     }
 
     // Fall back to string comparison
     let (left_str, right_str) = match (left, right) {
         (FlakeValue::String(l), FlakeValue::String(r)) => (l.as_str(), r.as_str()),
+        // IRI identity: Sid equality, namespace included. Ordering is
+        // undefined for IRIs — the parser rejects an ordering operator against
+        // a constant IRI, and a variable that turns out to be IRI-bound at run
+        // time lands here.
+        (FlakeValue::Ref(l), FlakeValue::Ref(r)) => {
+            return match op {
+                CompareOp::Equal => outcome(l == r),
+                CompareOp::NotEqual => outcome(l != r),
+                _ => FilterOutcome::Error,
+            };
+        }
+        // RDFterm-equal (SPARQL 1.1 §17.4.1.7) is a type error only "if the
+        // arguments are both literal but are not the same RDF term". An IRI
+        // against a literal is not both-literal, so the comparison is
+        // well-defined and simply false — they can never be the same RDF term.
+        // Routing this pair to `Error` instead would drop the row, which is
+        // safe but is silent under-derivation: a copy-properties rule filtering
+        // on a value, `(!= ?val "Bob")`, would discard every IRI-valued
+        // property. Must stay below the `(Ref, Ref)` arm so Sid identity wins
+        // when both sides really are IRIs.
+        (FlakeValue::Ref(_), _) | (_, FlakeValue::Ref(_)) => {
+            return match op {
+                CompareOp::Equal => outcome(false),
+                CompareOp::NotEqual => outcome(true),
+                // Ordering across an IRI and a literal remains undefined.
+                _ => FilterOutcome::Error,
+            };
+        }
         (FlakeValue::Boolean(l), FlakeValue::Boolean(r)) => {
             // Boolean comparison
             return match op {
-                CompareOp::Equal => l == r,
-                CompareOp::NotEqual => l != r,
-                _ => false, // Other comparisons don't make sense for booleans
+                CompareOp::Equal => outcome(l == r),
+                CompareOp::NotEqual => outcome(l != r),
+                _ => FilterOutcome::Error, // Other comparisons don't make sense for booleans
             };
         }
-        _ => return false, // Incompatible types
+        // Both literals, not the same RDF term: a genuine type error per
+        // §17.4.1.7 (e.g. a string against a number).
+        _ => return FilterOutcome::Error,
     };
 
     let cmp = left_str.cmp(right_str);
-    match op {
+    outcome(match op {
         CompareOp::Equal => cmp == std::cmp::Ordering::Equal,
         CompareOp::NotEqual => cmp != std::cmp::Ordering::Equal,
         CompareOp::LessThan => cmp == std::cmp::Ordering::Less,
         CompareOp::LessThanOrEqual => cmp != std::cmp::Ordering::Greater,
         CompareOp::GreaterThan => cmp == std::cmp::Ordering::Greater,
         CompareOp::GreaterThanOrEqual => cmp != std::cmp::Ordering::Less,
-    }
+    })
 }
 
 /// Match a single triple pattern against the database
@@ -1292,6 +1844,10 @@ pub async fn execute_datalog_rules_with_query_rules(
 
     let start = Instant::now();
     let mut capped: Option<&str> = None;
+    // Rules already flagged for "matched, but instantiated nothing" (#1560).
+    // The fixpoint re-runs every rule each round, so without this the same
+    // rule would warn once per iteration.
+    let mut warned_barren: HashSet<Sid> = HashSet::new();
 
     loop {
         // Budget check BEFORE another round — a round can scan the whole ledger
@@ -1328,12 +1884,32 @@ pub async fn execute_datalog_rules_with_query_rules(
             let binding_rows = execute_rule_matching(rule, iter_db).await?;
 
             if binding_rows.is_empty() {
+                // The where clause matched nothing. That is ordinary and says
+                // nothing about the rule's soundness — stay quiet (#1560).
                 continue;
             }
+            let matched_rows = binding_rows.len();
 
             // Generate flakes from bindings
             let flakes =
                 fluree_db_reasoner::execute_rule_with_bindings(rule, binding_rows, derived_t);
+
+            // "The where clause matched but the insert could not instantiate"
+            // is almost always an authoring bug, and it is invisible otherwise:
+            // the rule appears to run and the fixpoint completes normally
+            // (#1560). Catches what the parse-time safety check cannot see —
+            // SPARQL-lowered rules, and a subject/predicate variable that binds
+            // to a literal only at run time.
+            if flakes.is_empty() && warned_barren.insert(rule.id.clone()) {
+                tracing::warn!(
+                    rule = rule.name.as_deref().unwrap_or("<unnamed>"),
+                    rule_id = %rule.id,
+                    matched_rows,
+                    "datalog rule matched binding rows but derived no facts: every row \
+                     failed to instantiate its insert pattern — an insert variable is \
+                     unbound, or is bound to a literal in subject/predicate position"
+                );
+            }
 
             // Add new flakes (deduplicating by s, p, o, dt, m)
             for flake in flakes {
@@ -1545,5 +2121,417 @@ mod tests {
             &flake_value_to_binding(&dec("19.99")),
             &BindingValue::Double(19.99)
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // IRI comparison in filters (#1556)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn curie_prefix_rejects_colon_bearing_literals() {
+        // Real CURIEs.
+        assert_eq!(curie_prefix("ex:ssn"), Some("ex"));
+        assert_eq!(curie_prefix("foaf:knows"), Some("foaf"));
+        assert_eq!(curie_prefix("_x:y"), Some("_x"));
+        assert_eq!(curie_prefix("dc-terms:title"), Some("dc-terms"));
+
+        // Literals that merely contain a colon must NOT be read as IRIs — no
+        // NCName may start with a digit, which is what keeps times and
+        // timestamps out of IRI classification.
+        assert_eq!(curie_prefix("12:30:00"), None);
+        assert_eq!(curie_prefix("2026-08-25T09:30:00Z"), None);
+        assert_eq!(curie_prefix("no-colon-here"), None);
+        assert_eq!(curie_prefix("has space:x"), None);
+    }
+
+    #[test]
+    fn quoted_operand_is_the_string_escape_hatch() {
+        assert_eq!(quoted_literal("\"ex:ssn\""), Some("ex:ssn"));
+        assert_eq!(quoted_literal("'ex:ssn'"), Some("ex:ssn"));
+        assert_eq!(quoted_literal("ex:ssn"), None);
+        assert_eq!(quoted_literal("\"\""), Some(""));
+    }
+
+    fn sid(ns: u16, name: &str) -> Sid {
+        Sid::new(ns, name)
+    }
+
+    #[test]
+    fn iri_equality_compares_sids_not_local_names() {
+        // The #1556 defect in miniature: `ex:knows` and `foaf:knows` share a
+        // local name. Comparing local names conflated them; comparing Sids
+        // does not.
+        let ex_knows = FlakeValue::Ref(sid(100, "knows"));
+        let foaf_knows = FlakeValue::Ref(sid(200, "knows"));
+
+        assert_eq!(
+            compare_values(&ex_knows, &ex_knows.clone(), CompareOp::Equal),
+            FilterOutcome::True
+        );
+        assert_eq!(
+            compare_values(&ex_knows, &foaf_knows, CompareOp::Equal),
+            FilterOutcome::False,
+            "same local name in different namespaces must not compare equal"
+        );
+        assert_eq!(
+            compare_values(&ex_knows, &foaf_knows, CompareOp::NotEqual),
+            FilterOutcome::True
+        );
+    }
+
+    #[test]
+    fn iri_ordering_is_an_error_not_a_silent_false() {
+        let a = FlakeValue::Ref(sid(100, "a"));
+        let b = FlakeValue::Ref(sid(100, "b"));
+        for op in [
+            CompareOp::LessThan,
+            CompareOp::LessThanOrEqual,
+            CompareOp::GreaterThan,
+            CompareOp::GreaterThanOrEqual,
+        ] {
+            assert_eq!(compare_values(&a, &b, op), FilterOutcome::Error);
+        }
+    }
+
+    #[test]
+    fn iri_versus_literal_follows_rdfterm_equal() {
+        // SPARQL 1.1 §17.4.1.7: RDFterm-equal is a type error only when BOTH
+        // operands are literals. An IRI and a literal are simply never the same
+        // RDF term, so `=` is false and `!=` is true — routing this pair to
+        // Error would drop rows the spec says to keep.
+        let iri = FlakeValue::Ref(sid(100, "ssn"));
+        let text = FlakeValue::String("ex:ssn".to_string());
+
+        assert_eq!(
+            compare_values(&iri, &text, CompareOp::Equal),
+            FilterOutcome::False
+        );
+        assert_eq!(
+            compare_values(&iri, &text, CompareOp::NotEqual),
+            FilterOutcome::True,
+            "an IRI is genuinely not a literal; `!=` must keep the row"
+        );
+        // Direction must not matter.
+        assert_eq!(
+            compare_values(&text, &iri, CompareOp::NotEqual),
+            FilterOutcome::True
+        );
+        // An IRI against a number is the same story.
+        assert_eq!(
+            compare_values(&iri, &FlakeValue::Long(5), CompareOp::NotEqual),
+            FilterOutcome::True
+        );
+        // Ordering across an IRI and a literal stays undefined.
+        for op in [CompareOp::LessThan, CompareOp::GreaterThan] {
+            assert_eq!(compare_values(&iri, &text, op), FilterOutcome::Error);
+        }
+    }
+
+    #[test]
+    fn two_literals_of_different_types_are_a_type_error() {
+        // The other half of §17.4.1.7: both operands literal and not the same
+        // RDF term IS the type-error case.
+        let text = FlakeValue::String("5".to_string());
+        let number = FlakeValue::Long(5);
+        assert_eq!(
+            compare_values(&text, &number, CompareOp::Equal),
+            FilterOutcome::Error
+        );
+        assert_eq!(
+            compare_values(&text, &number, CompareOp::NotEqual),
+            FilterOutcome::Error
+        );
+    }
+
+    #[test]
+    fn incomparable_operands_never_fail_open() {
+        // #1556's invariant, stated over the pairing that is genuinely
+        // undecidable: a type error must never answer "true" and admit the row.
+        let text = FlakeValue::String("5".to_string());
+        let number = FlakeValue::Long(5);
+
+        for op in [
+            CompareOp::Equal,
+            CompareOp::NotEqual,
+            CompareOp::LessThan,
+            CompareOp::GreaterThan,
+        ] {
+            assert_ne!(
+                compare_values(&text, &number, op),
+                FilterOutcome::True,
+                "a type error must never evaluate true for {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn negating_an_uncomparable_filter_does_not_admit_the_row() {
+        // `Not` is reachable from SPARQL rules (`FILTER(!(...))`). If Error
+        // collapsed to False, `!Error` would become True and re-admit a row
+        // the engine could not judge — a fail-open path straight back in.
+        let bindings = Bindings::new();
+        let uncomparable = RuleFilter::Compare {
+            op: CompareOp::Equal,
+            left: RuleTerm::var("?never_bound"),
+            right: RuleTerm::Value(RuleValue::Long(1)),
+        };
+
+        assert_eq!(
+            evaluate_filter(&uncomparable, &bindings, &mut FilterDiagnostics::default()),
+            FilterOutcome::Error
+        );
+        assert_eq!(
+            evaluate_filter(
+                &RuleFilter::Not(Box::new(uncomparable)),
+                &bindings,
+                &mut FilterDiagnostics::default()
+            ),
+            FilterOutcome::Error,
+            "negating an error must stay an error, never become True"
+        );
+    }
+
+    #[test]
+    fn and_or_follow_sparql_error_propagation() {
+        let bindings = Bindings::new();
+        let error = || RuleFilter::Compare {
+            op: CompareOp::Equal,
+            left: RuleTerm::var("?never_bound"),
+            right: RuleTerm::Value(RuleValue::Long(1)),
+        };
+        let truth = || RuleFilter::Compare {
+            op: CompareOp::Equal,
+            left: RuleTerm::Value(RuleValue::Long(1)),
+            right: RuleTerm::Value(RuleValue::Long(1)),
+        };
+        let falsehood = || RuleFilter::Compare {
+            op: CompareOp::Equal,
+            left: RuleTerm::Value(RuleValue::Long(1)),
+            right: RuleTerm::Value(RuleValue::Long(2)),
+        };
+
+        // false && error => false; true && error => error
+        assert_eq!(
+            evaluate_filter(
+                &RuleFilter::And(vec![falsehood(), error()]),
+                &bindings,
+                &mut FilterDiagnostics::default()
+            ),
+            FilterOutcome::False
+        );
+        assert_eq!(
+            evaluate_filter(
+                &RuleFilter::And(vec![truth(), error()]),
+                &bindings,
+                &mut FilterDiagnostics::default()
+            ),
+            FilterOutcome::Error
+        );
+        // true || error => true; false || error => error
+        assert_eq!(
+            evaluate_filter(
+                &RuleFilter::Or(vec![truth(), error()]),
+                &bindings,
+                &mut FilterDiagnostics::default()
+            ),
+            FilterOutcome::True
+        );
+        assert_eq!(
+            evaluate_filter(
+                &RuleFilter::Or(vec![falsehood(), error()]),
+                &bindings,
+                &mut FilterDiagnostics::default()
+            ),
+            FilterOutcome::Error
+        );
+    }
+
+    #[test]
+    fn sid_bound_variable_resolves_as_an_iri() {
+        let mut bindings = Bindings::new();
+        bindings.insert(Arc::from("?p"), BindingValue::Sid(sid(100, "knows")));
+
+        let resolved = resolve_filter_term(&RuleTerm::var("?p"), &bindings);
+        assert_eq!(
+            resolved,
+            Some(FlakeValue::Ref(sid(100, "knows"))),
+            "a Sid binding must stay a Ref, not collapse to its local name"
+        );
+    }
+
+    #[test]
+    fn quoted_operand_survives_whitespace() {
+        // The escape hatch the parse error recommends has to work for a value
+        // with a space in it; `split_whitespace` used to tear it in half and
+        // leave the operand as the literal `"John`.
+        let tokens = split_filter_tokens(r#"= ?name "John Smith""#).expect("tokenize");
+        assert_eq!(tokens, vec!["=", "?name", "\"John Smith\""]);
+        assert_eq!(quoted_literal(tokens[2]), Some("John Smith"));
+    }
+
+    #[test]
+    fn unterminated_quote_is_rejected() {
+        let err = split_filter_tokens(r#"= ?name "John"#).expect_err("must reject");
+        assert!(
+            format!("{err:?}").contains("Unterminated quote"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn plain_tokens_still_split_on_whitespace() {
+        assert_eq!(
+            split_filter_tokens(">=  ?age   62").expect("tokenize"),
+            vec![">=", "?age", "62"]
+        );
+        assert!(split_filter_tokens("   ").expect("tokenize").is_empty());
+    }
+
+    #[test]
+    fn misspelled_filter_keyword_is_recognized_for_the_message() {
+        assert!(looks_like_misspelled_filter(&serde_json::json!([
+            "FILTER",
+            "(!= ?p ex:ssn)"
+        ])));
+        assert!(looks_like_misspelled_filter(&serde_json::json!([
+            "Filter",
+            "(!= ?p ex:ssn)"
+        ])));
+        assert!(!looks_like_misspelled_filter(&serde_json::json!([
+            "bind", "(?x 1)"
+        ])));
+        assert!(!looks_like_misspelled_filter(&serde_json::json!({
+            "@id": "?s"
+        })));
+    }
+
+    // ------------------------------------------------------------------
+    // Unbound insert variables (#1560)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn unbound_insert_variable_is_named() {
+        // The issue's own repro: where binds ?relation, insert says ?rel.
+        let where_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "relType")),
+            RuleTerm::var("?relation"),
+        )];
+        let insert_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::var("?rel"),
+            RuleTerm::var("?s"),
+        )];
+
+        let unbound = unbound_insert_variables(&where_patterns, &insert_patterns);
+        assert_eq!(unbound.len(), 1);
+        assert_eq!(unbound[0].as_ref(), "?rel");
+
+        let message = unsafe_insert_variables_message(&where_patterns, &insert_patterns)
+            .expect("unsafe rule must produce a message");
+        assert!(
+            message.contains("?rel"),
+            "the diagnostic must name the offending variable, got: {message}"
+        );
+    }
+
+    #[test]
+    fn where_side_generated_name_does_not_mask_an_insert_side_one() {
+        // Both clauses number their generated variables from their own
+        // `patterns.len()`, so the names collide at index 0. A where-side
+        // `?__implicit_0` must not be treated as binding the insert-side one,
+        // or the anonymous-node diagnostic is suppressed exactly where it is
+        // needed.
+        let where_patterns = vec![triple(
+            RuleTerm::var("?__implicit_0"),
+            RuleTerm::sid(sid(100, "parent")),
+            RuleTerm::var("?p"),
+        )];
+        let insert_patterns = vec![triple(
+            RuleTerm::var("?__implicit_0"),
+            RuleTerm::sid(sid(100, "ancestor")),
+            RuleTerm::var("?p"),
+        )];
+
+        let message = unsafe_insert_variables_message(&where_patterns, &insert_patterns)
+            .expect("collision must not suppress the diagnostic");
+        assert!(message.contains("@id"), "got: {message}");
+    }
+
+    #[test]
+    fn instantiability_is_judged_per_insert_pattern() {
+        // A two-head rule with one typo'd head: the good head must be
+        // recognized as instantiable on its own, so parsing can keep it while
+        // skipping the bad one — matching `execute_rule_with_bindings`, which
+        // instantiates each insert pattern independently.
+        let where_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "relType")),
+            RuleTerm::var("?relation"),
+        )];
+        let good = triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "hasRelation")),
+            RuleTerm::var("?relation"),
+        );
+        let bad = triple(
+            RuleTerm::var("?s"),
+            RuleTerm::var("?rel"),
+            RuleTerm::var("?s"),
+        );
+
+        let bound = authored_bound_vars(&where_patterns);
+        assert!(insert_pattern_is_instantiable(&good, &bound));
+        assert!(!insert_pattern_is_instantiable(&bad, &bound));
+
+        // The description for the skipped head names only its own variable.
+        let description = unbound_insert_description(&where_patterns, std::slice::from_ref(&bad))
+            .expect("the bad head must produce a description");
+        assert!(description.contains("?rel"), "got: {description}");
+        assert!(!description.contains("?relation"), "got: {description}");
+    }
+
+    #[test]
+    fn safe_rule_produces_no_message() {
+        let where_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "parent")),
+            RuleTerm::var("?p"),
+        )];
+        let insert_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "ancestor")),
+            RuleTerm::var("?p"),
+        )];
+
+        assert!(unbound_insert_variables(&where_patterns, &insert_patterns).is_empty());
+        assert!(unsafe_insert_variables_message(&where_patterns, &insert_patterns).is_none());
+    }
+
+    #[test]
+    fn generated_variables_get_their_own_wording() {
+        // An author never wrote `?__implicit_0`, so quoting it back is useless
+        // — the message has to say what they actually did wrong.
+        let where_patterns = vec![triple(
+            RuleTerm::var("?s"),
+            RuleTerm::sid(sid(100, "parent")),
+            RuleTerm::var("?p"),
+        )];
+        let insert_patterns = vec![triple(
+            RuleTerm::var("?__implicit_0"),
+            RuleTerm::sid(sid(100, "ancestor")),
+            RuleTerm::var("?p"),
+        )];
+
+        let message = unsafe_insert_variables_message(&where_patterns, &insert_patterns)
+            .expect("anonymous insert node must produce a message");
+        assert!(
+            message.contains("@id"),
+            "the diagnostic must point at the missing @id, got: {message}"
+        );
+        assert!(
+            !message.contains("?__implicit_0"),
+            "the diagnostic must not quote an engine-generated name, got: {message}"
+        );
     }
 }

@@ -65,6 +65,9 @@ pub async fn run(
                 graph: graph.map(String::from),
                 shapes,
                 include_attached,
+                // Operator-run and local: no request deadline to inherit and
+                // no untrusted caller to bound.
+                ..Default::default()
             };
             let report = fluree.validate_ledger(&alias, &options).await?;
             finish(&report, format, fail_on)
@@ -116,6 +119,7 @@ async fn validate_file(
         graph: graph.map(String::from),
         shapes,
         include_attached,
+        ..Default::default()
     };
     Ok(fluree.validate_ledger(alias, &options).await?)
 }

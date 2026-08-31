@@ -568,3 +568,31 @@ impl BatchSink for NdjsonRowSink<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_streamable;
+    use fluree_db_query::ir::{ConstructTemplate, QueryOutput};
+
+    /// The WHERE-dedup license for CONSTRUCT and ASK (#1700 follow-up;
+    /// `result_is_multiplicity_blind` in fluree-db-query's
+    /// `execute::operator_tree`) counts on this endpoint refusing both output
+    /// forms: a streaming serializer emits solutions as they arrive and cannot
+    /// canonicalize after the fact, so if either rejection is ever lifted the
+    /// new path must dedup its triples itself — or the license must be
+    /// revoked. See `every_output_format_collapses_or_rejects_construct` in
+    /// `it_query_construct.rs` for the non-streaming half of the same gate.
+    #[test]
+    fn streaming_endpoint_keeps_rejecting_construct_and_ask() {
+        assert!(
+            ensure_streamable(&QueryOutput::Construct(ConstructTemplate::new(Vec::new()))).is_err(),
+            "streaming CONSTRUCT would bypass Graph::canonicalize and observe \
+             WHERE-level dedup"
+        );
+        assert!(
+            ensure_streamable(&QueryOutput::Ask).is_err(),
+            "streaming ASK has no row stream to emit; its boolean is computed \
+             from solution-sequence emptiness on the buffered path"
+        );
+    }
+}

@@ -117,6 +117,20 @@ pub fn parse_transaction(
     }
     let lpg_mode = opts.lpg_edge_lifecycle.unwrap_or(false);
 
+    // Requested SHACL validation mode ("warn" / "reject"), same JSON-over-
+    // programmatic precedence as the opts above. Whether the request is
+    // honored is decided later against the ledger config's override control
+    // (see TxnOpts::validation_mode); an unrecognized string is ignored.
+    if opts.validation_mode.is_none() {
+        opts.validation_mode = json
+            .as_object()
+            .and_then(|m| m.get("opts"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("validationMode"))
+            .and_then(Value::as_str)
+            .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
+    }
+
     // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
     // `f:reifies*` system encoding before JSON-LD expansion, rejecting
     // user-authored `f:reifies*` IRIs and every deferred shape (literal-
