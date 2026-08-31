@@ -162,8 +162,9 @@ struct ConfigCacheEntry {
 /// All paths that touch both locks (snapshot, apply_index_v2, reload)
 /// follow this order to prevent deadlock and ensure coherence.
 ///
-/// `config_cache` is independent of `state` (guarded by its own lock, never
-/// held across the `state` lock), so it participates in no ordering constraint.
+/// `config_cache` has its own lock and is never held while acquiring `state`;
+/// `reload`'s swap takes it briefly *while holding* `state`, so the one
+/// permitted order is `state` → `config_cache`, never the reverse.
 struct LedgerHandleInner {
     /// Guards all access to the ledger state. A `RwLock` so concurrent reads
     /// (every query takes a brief shared `read()` to clone a cheap, Arc-backed
@@ -233,6 +234,24 @@ impl LedgerHandle {
         let mut entry = self.inner.config_cache.write().await;
         entry.key = Some(key);
         entry.config = config;
+    }
+
+    /// Drop the resolved-config entry so the next read re-resolves.
+    ///
+    /// Needed by out-of-band state swaps (`LedgerManager::reload`): the marker
+    /// only protects against staleness it can *see* advance. A reader that
+    /// raced the unwind gap of a detached commit (see `DetachedCacheSlot`)
+    /// can have resolved config against the empty placeholder and cached it
+    /// under `config_write_t = 0` — and a reloaded state whose config graph
+    /// was last written at or below `index_t` legitimately carries marker `0`
+    /// too, so that entry would *hit*, silently serving "no config" for a
+    /// configured ledger until the next config write. Clearing at the swap
+    /// point closes it (all but a resolve still in flight across the swap,
+    /// whose put can land after this clear — reaching even that needs a panic
+    /// plus two racing windows).
+    pub(crate) async fn config_cache_clear(&self) {
+        let mut entry = self.inner.config_cache.write().await;
+        *entry = ConfigCacheEntry::default();
     }
 
     /// Set the read-side tier width (`0`/`1` disables read-triggered compaction).
@@ -1561,6 +1580,15 @@ impl LedgerManager {
                             let mut bs_guard = handle.inner.binary_store.write().await;
                             write_guard.replace(new_state);
                             *bs_guard = new_binary_store;
+                            // Out-of-band swap: any resolved-config entry may
+                            // have been cached against a state this swap just
+                            // replaced — including a detached-commit
+                            // placeholder whose marker (0) a reloaded state
+                            // can legitimately share. See `config_cache_clear`.
+                            // Taking the config lock while holding `state` is
+                            // safe: no path acquires `state` while holding the
+                            // config lock.
+                            handle.config_cache_clear().await;
                         } else {
                             // A concurrent commit advanced the in-memory state
                             // past the reloaded storage HEAD (a txn took the
