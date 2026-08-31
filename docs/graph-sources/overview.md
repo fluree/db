@@ -218,21 +218,26 @@ SELECT ?s ?p ?o FROM <execution-log:main> WHERE { ?s ?p ?o } LIMIT 10
 ```json
 {
   "from": "mydb:main",
+  "from-named": ["warehouse-orders:main"],
   "select": ["?customer", "?orderId", "?total"],
   "where": [
     { "@id": "?customer", "schema:name": "?name" },
     { "@id": "?customer", "ex:customerId": "?custId" },
-    {
-      "graph": "warehouse-orders:main",
-      "where": [
-        { "@id": "?order", "ex:customerId": "?custId" },
-        { "@id": "?order", "ex:orderId": "?orderId" },
-        { "@id": "?order", "ex:total": "?total" }
-      ]
-    }
+    ["graph", "warehouse-orders:main", {
+      "@id": "?order",
+      "ex:customerId": "?custId",
+      "ex:orderId": "?orderId",
+      "ex:total": "?total"
+    }]
   ]
 }
 ```
+
+A graph pattern is the **array form** `["graph", <name>, <pattern>]` — an object
+with a `"graph"` key is parsed as an ordinary node pattern and fails. The graph
+source must also be part of the dataset (`"from-named"` here, `FROM NAMED` in
+SPARQL), or the block matches nothing. Address a graph source by its full id:
+dataset-local `fromNamed` aliases do not currently resolve to graph sources.
 
 Iceberg graph sources use R2RML mappings to define how table rows become RDF triples. See [Iceberg / Parquet](iceberg.md) and [R2RML](r2rml.md) for details.
 

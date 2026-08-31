@@ -536,4 +536,29 @@ async fn ledger_and_sql_source_join_in_one_dataset() {
         ("bob".into(), "blue".into()),
         "{rows:?}"
     );
+
+    // The same join in JSON-LD: the graph pattern is the ARRAY form
+    // `["graph", <alias>, pattern]` (an object with a "graph" key is not a
+    // graph pattern), and the source enters the dataset via `fromNamed`.
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "teams:main",
+        "from-named": ["people-sql:main"],
+        "select": ["?name", "?team"],
+        "where": [
+            {"@id": "?p", "ex:team": "?team"},
+            ["graph", "people-sql:main", {"@id": "?p", "ex:name": "?name"}]
+        ],
+        "orderBy": "?name"
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("jsonld join query");
+    let rows = rows.as_array().expect("array").clone();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0], json!(["alice", "red"]), "{rows:?}");
+    assert_eq!(rows[1], json!(["bob", "blue"]), "{rows:?}");
 }
