@@ -24,6 +24,16 @@
         "small": 5.0,
         "medium": 5.0
       },
+      "transact_filtered_delete": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
+      "query_overlay_only_range": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
       "query_cold_reload": {
         "tiny": 10.0,
         "small": 5.0,
@@ -64,12 +74,22 @@
         "small": 5.0,
         "medium": 3.0
       },
+      "query_hot_optional": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
       "query_hot_property_path": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 3.0
       },
       "query_hot_whole_graph_agg": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_fanout_star": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 3.0

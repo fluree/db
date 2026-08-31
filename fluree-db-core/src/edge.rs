@@ -54,6 +54,29 @@ pub fn xsd_string_datatype_sid() -> Sid {
 /// Fields mirror [`Flake`] one-for-one (minus `t`/`op`/`ann`-side bits) so
 /// the conversion from a base flake is mechanical and the round-trip
 /// encoding via `f:reifies*` system facts is lossless.
+///
+/// ## Field order is a persisted on-disk key order — do not reorder
+///
+/// `Ord` is derived, so declaration order *is* comparison priority, and the
+/// edge-annotation arenas persist that order: forward-leaf rows are stored
+/// sorted by `(EdgeKey, ann_sid, t, op)`, and branch entries carry
+/// `first_edge`/`last_edge` bounds that readers seek against in `EdgeKey`
+/// order (the sort contract and `AnnotationForwardBranchEntry` in
+/// `fluree-db-binary-index/src/annotation_arena/format.rs`; the branch
+/// cursor and the `partition_point` leaf seeks in `reader.rs`). Reordering
+/// these fields changes the derived comparator out from under every
+/// persisted arena — seeks against leaves sorted by the old order silently
+/// return wrong rows — so a reorder requires an arena format migration, at
+/// minimum an `ARENA_VERSION` bump plus a rebuild of existing arenas.
+///
+/// In particular, `lang` sorting before `list_i` here is the *opposite*
+/// nesting from [`FlakeMeta`]'s `Ord`, which compares the list index first
+/// and breaks ties on the language tag. That mismatch is deliberate, not an
+/// oversight to fix: nothing compares an `EdgeKey` with `FlakeMeta::cmp`,
+/// so the two relations never have to agree. `list_i` is always `None` in
+/// v1, which keeps the divergence invisible today — it becomes observable
+/// exactly when list-occurrence annotations land, and "harmonizing" the
+/// nesting then would invalidate every arena written before it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EdgeKey {
     /// Named graph the edge lives in. `None` = default graph.

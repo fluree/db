@@ -71,6 +71,8 @@ pub struct PropertyShape {
     pub name: Option<String>,
     /// Human-readable message for violations
     pub message: Option<String>,
+    /// `sh:sparql` constraints declared on this property shape
+    pub sparql_constraints: Vec<Arc<crate::sparql::SparqlConstraint>>,
 }
 
 /// A compiled node shape
@@ -94,6 +96,8 @@ pub struct CompiledShape {
     pub message: Option<String>,
     /// Whether this shape is deactivated (sh:deactivated true)
     pub deactivated: bool,
+    /// `sh:sparql` constraints declared on this node shape
+    pub sparql_constraints: Vec<Arc<crate::sparql::SparqlConstraint>>,
 }
 
 impl CompiledShape {
@@ -117,6 +121,28 @@ pub struct ShapeCompiler {
     shapes: HashMap<ShapeId, ShapeData>,
     /// Collected property shape data by property shape ID
     property_shapes: HashMap<ShapeId, PropertyShapeData>,
+    /// `sh:sparql` attachments: shape subject → constraint nodes
+    sparql_attach: HashMap<Sid, Vec<Sid>>,
+    /// `sh:select` texts by subject (constraint nodes)
+    sparql_selects: HashMap<Sid, Vec<String>>,
+    /// `sh:message` strings by subject — consulted for constraint nodes,
+    /// which live outside the shape / property-shape maps
+    messages_by_subject: HashMap<Sid, Vec<String>>,
+    /// `sh:deactivated true` subjects (for constraint nodes)
+    deactivated_subjects: HashSet<Sid>,
+    /// `sh:prefixes` references by subject (constraint node → ontology nodes)
+    prefixes_refs: HashMap<Sid, Vec<Sid>>,
+    /// `sh:declare` references (ontology node → declaration nodes)
+    declares: HashMap<Sid, Vec<Sid>>,
+    /// `sh:prefix` strings by declaration node
+    decl_prefix: HashMap<Sid, String>,
+    /// `sh:namespace` values by declaration node
+    decl_namespace: HashMap<Sid, String>,
+    /// `owl:imports` edges (followed for `sh:prefixes` resolution)
+    owl_imports: HashMap<Sid, Vec<Sid>>,
+    /// Built `sh:sparql` constraints by attachment subject (filled by
+    /// `build_sparql_constraints`, consumed by `finalize`)
+    built_sparql: HashMap<Sid, Vec<Arc<crate::sparql::SparqlConstraint>>>,
 }
 
 /// Intermediate representation during compilation
@@ -191,6 +217,16 @@ impl ShapeCompiler {
         Self {
             shapes: HashMap::new(),
             property_shapes: HashMap::new(),
+            sparql_attach: HashMap::new(),
+            sparql_selects: HashMap::new(),
+            messages_by_subject: HashMap::new(),
+            deactivated_subjects: HashSet::new(),
+            prefixes_refs: HashMap::new(),
+            declares: HashMap::new(),
+            decl_prefix: HashMap::new(),
+            decl_namespace: HashMap::new(),
+            owl_imports: HashMap::new(),
+            built_sparql: HashMap::new(),
         }
     }
 
@@ -276,6 +312,13 @@ impl ShapeCompiler {
             predicates::SEVERITY,
             predicates::MESSAGE,
             predicates::NAME,
+            // SPARQL-based constraints
+            predicates::SPARQL,
+            predicates::SELECT,
+            predicates::PREFIXES,
+            predicates::DECLARE,
+            predicates::PREFIX,
+            predicates::NAMESPACE,
         ];
 
         // Query each input graph for all SHACL predicates, accumulating into
@@ -290,6 +333,27 @@ impl ShapeCompiler {
 
                 for flake in flakes {
                     compiler.process_flake(&flake)?;
+                }
+            }
+
+            // owl:imports edges — followed when resolving `sh:prefixes`
+            // (per spec, prefix declarations are collected over the imports
+            // closure of the referenced ontology).
+            let owl_imports = Sid::new(fluree_vocab::namespaces::OWL, "imports");
+            let flakes = db
+                .range(
+                    IndexType::Psot,
+                    RangeTest::Eq,
+                    RangeMatch::predicate(owl_imports),
+                )
+                .await?;
+            for flake in &flakes {
+                if let FlakeValue::Ref(target) = &flake.o {
+                    compiler
+                        .owl_imports
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(target.clone());
                 }
             }
 
@@ -355,7 +419,102 @@ impl ShapeCompiler {
         }
 
         compiler.apply_implicit_class_targets(&class_typed);
+        compiler.build_sparql_constraints();
         compiler.finalize()
+    }
+
+    /// Assemble `sh:sparql` constraints from the raw predicate data collected
+    /// during the flake scan: resolve `sh:prefixes` (over the `owl:imports`
+    /// closure) into a PREFIX header and parse + pre-binding-check each
+    /// `sh:select`. Parse or structure problems compile into the constraint
+    /// and surface — as a validation failure — only when the owning shape
+    /// fires.
+    fn build_sparql_constraints(&mut self) {
+        if self.sparql_attach.is_empty() {
+            return;
+        }
+
+        let attach: Vec<(Sid, Vec<Sid>)> = self
+            .sparql_attach
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (subject, constraint_nodes) in attach {
+            for cnode in constraint_nodes {
+                let messages = self
+                    .messages_by_subject
+                    .get(&cnode)
+                    .cloned()
+                    .unwrap_or_default();
+                let deactivated = self.deactivated_subjects.contains(&cnode);
+                let selects = self.sparql_selects.get(&cnode);
+                let constraint = match selects.map(Vec::as_slice) {
+                    Some([select]) => crate::sparql::build_constraint(
+                        cnode.clone(),
+                        select,
+                        &self.prefix_header_for(&cnode),
+                        messages,
+                        deactivated,
+                    ),
+                    Some(_) => crate::sparql::invalid_constraint(
+                        cnode.clone(),
+                        messages,
+                        deactivated,
+                        "sh:sparql constraint node has multiple sh:select values".to_string(),
+                    ),
+                    None => crate::sparql::invalid_constraint(
+                        cnode.clone(),
+                        messages,
+                        deactivated,
+                        "sh:sparql constraint node has no sh:select query".to_string(),
+                    ),
+                };
+                self.built_sparql
+                    .entry(subject.clone())
+                    .or_default()
+                    .push(Arc::new(constraint));
+            }
+        }
+    }
+
+    /// PREFIX declarations for one constraint node: the union of `sh:declare`
+    /// entries on every `sh:prefixes` ontology, followed through `owl:imports`
+    /// (cycle-safe). First declaration of a prefix wins.
+    fn prefix_header_for(&self, cnode: &Sid) -> String {
+        use std::collections::VecDeque;
+        use std::fmt::Write as _;
+
+        let mut header = String::new();
+        let Some(roots) = self.prefixes_refs.get(cnode) else {
+            return header;
+        };
+
+        let mut queue: VecDeque<Sid> = roots.iter().cloned().collect();
+        let mut visited: HashSet<Sid> = roots.iter().cloned().collect();
+        let mut declared: HashSet<&str> = HashSet::new();
+
+        while let Some(node) = queue.pop_front() {
+            if let Some(decls) = self.declares.get(&node) {
+                for decl in decls {
+                    if let (Some(prefix), Some(ns)) =
+                        (self.decl_prefix.get(decl), self.decl_namespace.get(decl))
+                    {
+                        if declared.insert(prefix.as_str()) {
+                            let _ = writeln!(header, "PREFIX {prefix}: <{ns}>");
+                        }
+                    }
+                }
+            }
+            if let Some(imports) = self.owl_imports.get(&node) {
+                for imp in imports {
+                    if visited.insert(imp.clone()) {
+                        queue.push_back(imp.clone());
+                    }
+                }
+            }
+        }
+        header
     }
 
     /// Add an implicit-class target to every compiled shape that is also
@@ -854,6 +1013,13 @@ impl ShapeCompiler {
                         ps.deactivated = *v;
                     }
                     self.get_or_create_shape(&flake.s).deactivated = *v;
+                    // Also tracked by subject for sh:sparql constraint nodes,
+                    // which live outside the shape maps.
+                    if *v {
+                        self.deactivated_subjects.insert(flake.s.clone());
+                    } else {
+                        self.deactivated_subjects.remove(&flake.s);
+                    }
                 }
             }
             name if name == predicates::SEVERITY => {
@@ -874,6 +1040,12 @@ impl ShapeCompiler {
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.message = Some(msg.clone());
                     }
+                    // Also tracked by subject for sh:sparql constraint nodes,
+                    // which live outside the shape maps.
+                    self.messages_by_subject
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(msg.clone());
                 }
             }
             name if name == predicates::NAME => {
@@ -883,6 +1055,55 @@ impl ShapeCompiler {
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.name = Some(n.clone());
                     }
+                }
+            }
+
+            // SPARQL-based constraints (sh:sparql → sh:SPARQLConstraint node).
+            // Raw data is collected by subject here; whether a subject is a
+            // node shape, property shape, or constraint node is resolved in
+            // `build_sparql_constraints` once all flakes are seen.
+            name if name == predicates::SPARQL => {
+                if let FlakeValue::Ref(constraint_node) = &flake.o {
+                    self.sparql_attach
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(constraint_node.clone());
+                }
+            }
+            name if name == predicates::SELECT => {
+                if let FlakeValue::String(text) = &flake.o {
+                    self.sparql_selects
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(text.clone());
+                }
+            }
+            name if name == predicates::PREFIXES => {
+                if let FlakeValue::Ref(ontology) = &flake.o {
+                    self.prefixes_refs
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(ontology.clone());
+                }
+            }
+            name if name == predicates::DECLARE => {
+                if let FlakeValue::Ref(decl) = &flake.o {
+                    self.declares
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(decl.clone());
+                }
+            }
+            name if name == predicates::PREFIX => {
+                if let FlakeValue::String(p) = &flake.o {
+                    self.decl_prefix.insert(flake.s.clone(), p.clone());
+                }
+            }
+            name if name == predicates::NAMESPACE => {
+                // sh:namespace is an xsd:anyURI literal, which arrives as a
+                // string value.
+                if let FlakeValue::String(ns) = &flake.o {
+                    self.decl_namespace.insert(flake.s.clone(), ns.clone());
                 }
             }
 
@@ -912,6 +1133,8 @@ impl ShapeCompiler {
         let Self {
             shapes,
             property_shapes: ps_map,
+            built_sparql,
+            ..
         } = self;
 
         let mut compiled = Vec::new();
@@ -967,6 +1190,10 @@ impl ShapeCompiler {
                             severity: ps_data.severity,
                             name: ps_data.name.clone(),
                             message: ps_data.message.clone(),
+                            sparql_constraints: built_sparql
+                                .get(ps_id)
+                                .cloned()
+                                .unwrap_or_default(),
                         });
                     }
                 }
@@ -1049,6 +1276,15 @@ impl ShapeCompiler {
                 }
             }
 
+            // sh:sparql on this subject: node-level unless the subject is a
+            // path-bearing property shape (then it already rode along on the
+            // PropertyShape entry above — attaching both would double-fire).
+            let sparql_constraints = if ps_map.get(id).is_some_and(|own| own.path.is_some()) {
+                Vec::new()
+            } else {
+                built_sparql.get(id).cloned().unwrap_or_default()
+            };
+
             compiled.push(CompiledShape {
                 id: id.clone(),
                 targets: data.targets.clone(),
@@ -1059,6 +1295,7 @@ impl ShapeCompiler {
                 name,
                 message,
                 deactivated: data.deactivated,
+                sparql_constraints,
             });
         }
 
