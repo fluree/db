@@ -151,6 +151,10 @@ pub struct BuildResult {
     pub remap_elapsed: std::time::Duration,
     /// Time spent in the build phase.
     pub build_elapsed: std::time::Duration,
+    /// Cross-chunk duplicate statements collapsed by the import SPOT merge
+    /// (within-chunk duplicates are collapsed earlier, in the chunk sort, and
+    /// reported per chunk via `SortedCommitInfo::duplicates_removed`).
+    pub duplicates_removed: u64,
 }
 
 /// Dense 64-class subject→class-mask table: one `u64` bitmask per subject
@@ -1113,7 +1117,7 @@ pub fn build_indexes_from_commits(
             "class membership built for ref-target stats"
         );
     }
-    let (spot_result, spot_class_stats) = build_spot_index_from_commits(
+    let (spot_result, spot_class_stats, merge_duplicates) = build_spot_index_from_commits(
         commits,
         config,
         spot_rdf_type_p_id,
@@ -1239,6 +1243,13 @@ pub fn build_indexes_from_commits(
         for hook in worker_hooks {
             target_hook.merge_from(hook);
         }
+        // Worker hooks read the per-chunk (already chunk-deduped) sorted
+        // commits, so cross-chunk duplicates were counted once per copy;
+        // discount the copies the SPOT merge collapsed. HLL sketches are
+        // duplicate-insensitive and need no correction.
+        for (&(p_id, o_type), &n) in &merge_duplicates {
+            target_hook.discount_import_duplicates(config.g_id, p_id, o_type, n);
+        }
         tracing::info!(
             elapsed_ms = stats_merge_start.elapsed().as_millis(),
             "merged worker-local id stats hooks"
@@ -1279,7 +1290,7 @@ pub fn build_indexes_from_commits(
         leaflet_target_rows: config.leaflet_target_rows,
         leaf_target_rows: config.leaf_target_rows,
         zstd_level: config.zstd_level,
-        skip_dedup: true,   // Fresh import: unique asserts.
+        import_unique_asserts: true,
         skip_history: true, // Append-only: no time-travel data.
         g_id: config.g_id,
         progress: config.build_progress.clone(),
@@ -1326,18 +1337,24 @@ pub fn build_indexes_from_commits(
             total_remapped,
             remap_elapsed,
             build_elapsed,
+            duplicates_removed: merge_duplicates.values().sum(),
         },
         spot_class_stats,
     ))
 }
 
+#[allow(clippy::type_complexity)]
 fn build_spot_index_from_commits(
     commits: &[CommitInput],
     config: &BuildConfig,
     rdf_type_p_id: Option<u32>,
     class_membership: Option<ClassMembership>,
     fd_plan: &FdPlan,
-) -> io::Result<(IndexBuildResult, Option<SpotClassStats>)> {
+) -> io::Result<(
+    IndexBuildResult,
+    Option<SpotClassStats>,
+    FxHashMap<(u32, u16), u64>,
+)> {
     let g_id = config.g_id;
     let index_dir = &config.index_dir;
     let leaflet_target_rows = config.leaflet_target_rows;
@@ -1362,6 +1379,7 @@ fn build_spot_index_from_commits(
                 elapsed: t0.elapsed(),
             },
             None,
+            FxHashMap::default(),
         ));
     }
 
@@ -1382,6 +1400,7 @@ fn build_spot_index_from_commits(
 
     let mut class_stats_collector =
         rdf_type_p_id.map(|p_id| SpotClassStatsCollector::new(p_id, class_membership));
+    let mut merge_duplicates: FxHashMap<(u32, u16), u64> = FxHashMap::default();
 
     let total_rows = if commits.len() <= fd_plan.spot_fan_in {
         // Flat merge: one long-lived reader per chunk, all open at once.
@@ -1394,6 +1413,7 @@ fn build_spot_index_from_commits(
             g_id,
             class_stats_collector.as_mut(),
             progress.as_deref(),
+            &mut merge_duplicates,
         )?
     } else {
         // More chunks than the FD budget allows open at once: merge
@@ -1454,6 +1474,7 @@ fn build_spot_index_from_commits(
             g_id,
             class_stats_collector.as_mut(),
             progress.as_deref(),
+            &mut merge_duplicates,
         )?;
         drop(merge);
         // Reclaim the intermediate copy of the dataset before the
@@ -1463,9 +1484,11 @@ fn build_spot_index_from_commits(
     };
 
     let result = writer.finish()?;
+    let merge_duplicates_removed: u64 = merge_duplicates.values().sum();
     tracing::info!(
         g_id,
         total_rows,
+        merge_duplicates_removed,
         elapsed_ms = t0.elapsed().as_millis(),
         "direct SPOT build complete"
     );
@@ -1478,6 +1501,7 @@ fn build_spot_index_from_commits(
             elapsed: t0.elapsed(),
         },
         class_stats_collector.map(SpotClassStatsCollector::finish),
+        merge_duplicates,
     ))
 }
 
@@ -1533,6 +1557,7 @@ fn pump_spot_merge<T, F>(
     g_id: u16,
     mut class_stats_collector: Option<&mut SpotClassStatsCollector>,
     progress: Option<&AtomicU64>,
+    duplicates: &mut FxHashMap<(u32, u16), u64>,
 ) -> io::Result<u64>
 where
     T: MergeSource,
@@ -1540,7 +1565,18 @@ where
 {
     let mut total_rows = 0u64;
     let mut progress_batch = 0u64;
-    while let Some((mut record, op)) = merge.next_record()? {
+    let mut dropped = 0u64;
+    let mut dropped_seen = 0u64;
+    while let Some((mut record, op)) = merge.next_unique_assert(&mut dropped)? {
+        // Cross-chunk duplicate statements collapse in the merge (within-chunk
+        // copies already collapsed in the chunk sort). Chunks are per-graph
+        // streams, so the winner's (p_id, o_type) describes every collapsed
+        // copy; the tally later discounts the pre-merge stats hooks.
+        let pop_dropped = dropped - dropped_seen;
+        dropped_seen = dropped;
+        if pop_dropped > 0 {
+            *duplicates.entry((record.p_id, record.o_type)).or_insert(0) += pop_dropped;
+        }
         if op == 0 {
             continue;
         }
@@ -1550,7 +1586,8 @@ where
         }
         writer.push_record(record)?;
         total_rows += 1;
-        progress_batch += 1;
+        // Progress denominators count pre-dedup records; advance by consumed.
+        progress_batch += 1 + pop_dropped;
         if progress_batch >= PROGRESS_BATCH_SIZE {
             if let Some(ctr) = progress {
                 ctr.fetch_add(progress_batch, Ordering::Relaxed);
@@ -1577,7 +1614,7 @@ where
 /// Key differences from the import path:
 /// - Input: `&[SortedCommitInfo]` (not `&[CommitInput]`)
 /// - Remap: identity (global IDs already in place)
-/// - `skip_dedup: false` (rebuild may have retractions)
+/// - `import_unique_asserts: false` (rebuild may have retractions)
 /// - `skip_history: false` (produce history sidecars for time-travel)
 pub fn build_indexes_from_remapped_commits(
     commit_infos: &[crate::run_index::runs::spool::SortedCommitInfo],
@@ -1646,8 +1683,8 @@ pub fn build_indexes_from_remapped_commits(
         leaflet_target_rows: config.leaflet_target_rows,
         leaf_target_rows: config.leaf_target_rows,
         zstd_level: config.zstd_level,
-        skip_dedup: false,   // Rebuild: must deduplicate (max-t wins).
-        skip_history: false, // Produce history sidecars for time-travel.
+        import_unique_asserts: false, // Rebuild: full event-log resolution (max-t wins).
+        skip_history: false,          // Produce history sidecars for time-travel.
         g_id: config.g_id,
         progress: config.build_progress.clone(),
         // Rebuild path builds all 4 orders here (no separate SPOT thread), so
@@ -1680,6 +1717,7 @@ pub fn build_indexes_from_remapped_commits(
         total_remapped,
         remap_elapsed,
         build_elapsed,
+        duplicates_removed: 0,
     })
 }
 
@@ -1926,7 +1964,10 @@ mod tests {
         let flat = build("flat", &unlimited);
         let hier = build("hier", &constrained);
 
-        assert_eq!(flat.total_rows, 5 * 41);
+        // 200 disjoint records, plus the five identical-comparing seam
+        // records collapsing to one row (duplicate statements dedup in the
+        // import merge; the earliest t wins).
+        assert_eq!(flat.total_rows, 5 * 40 + 1);
         assert_eq!(flat.total_rows, hier.total_rows);
         let cids = |r: &IndexBuildResult| {
             r.graphs
@@ -2054,8 +2095,8 @@ mod tests {
             ..unlimited
         };
 
-        let (flat_result, flat_stats) = build("statflat", &unlimited);
-        let (hier_result, hier_stats) = build("stathier", &constrained);
+        let (flat_result, flat_stats, _) = build("statflat", &unlimited);
+        let (hier_result, hier_stats, _) = build("stathier", &constrained);
         let flat_stats = flat_stats.expect("flat stats");
         let hier_stats = hier_stats.expect("hier stats");
 
