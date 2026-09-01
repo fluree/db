@@ -54,9 +54,12 @@ use tracing::Instrument;
 /// implements it via `RefPublisher`, so the bulk importer works under
 /// all data planes without touching the transactor's queue contract.
 ///
-/// An equal-or-newer head is a no-op success, mirroring `publish_commit`:
-/// the final publish re-states the last checkpoint's `t`, and a re-run
-/// may find its own earlier head already in place.
+/// Import runs against a fresh ledger and publishes serially, so the one
+/// benign conflict is the final publish restating the last checkpoint's
+/// exact `(t, commit_id)`. Any other conflict is surfaced as an error:
+/// a head at a different `t`/id means a foreign writer got ahead of the
+/// import, and a head still behind `t` means the CAS retry budget ran
+/// out under contention.
 async fn publish_import_commit_head(
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
@@ -75,10 +78,33 @@ async fn publish_import_commit_head(
         .map_err(|e| ImportError::Storage(e.to_string()))?
     {
         CasResult::Updated => Ok(()),
-        CasResult::Conflict { actual } if actual.as_ref().is_some_and(|a| a.t >= t) => Ok(()),
-        CasResult::Conflict { actual } => Err(ImportError::Storage(format!(
-            "import commit-head publish for {alias} lost a race: head is {actual:?}, wanted t={t}"
-        ))),
+        CasResult::Conflict { actual }
+            if actual
+                .as_ref()
+                .is_some_and(|a| a.t == t && a.id.as_ref() == Some(commit_id)) =>
+        {
+            Ok(())
+        }
+        CasResult::Conflict { actual } => Err(ImportError::Storage(match actual.as_ref() {
+            // `fast_forward_commit` returns the same `Conflict` shape when
+            // its retry budget runs out while the fast-forward is still
+            // valid — the head never reached `t`, so this is contention,
+            // not divergence.
+            None => format!(
+                "import commit-head publish for {alias} gave up after contended CAS \
+                 attempts: head is still unborn, wanted t={t}"
+            ),
+            Some(a) if a.t < t => format!(
+                "import commit-head publish for {alias} gave up after contended CAS \
+                 attempts: head is at t={}, wanted t={t}",
+                a.t
+            ),
+            Some(a) => format!(
+                "import commit-head publish for {alias} found a diverged head: \
+                 head is t={} id={:?}, wanted t={t} id={commit_id}",
+                a.t, a.id
+            ),
+        })),
     }
 }
 
@@ -7655,13 +7681,14 @@ mod publish_import_commit_head_tests {
         ContentId::new(ContentKind::Commit, label.as_bytes())
     }
 
-    /// The four publish shapes the import pipeline produces: creation on
-    /// a freshly-initialized ledger, a checkpoint fast-forwarding past
-    /// the importer's own head, the final publish restating the last
-    /// checkpoint's `t`, and a stale republish — the last two are no-op
-    /// successes, mirroring `publish_commit`'s advance-if-newer contract.
+    /// The publish shapes the import pipeline produces — creation on a
+    /// freshly-initialized ledger, a checkpoint fast-forwarding past the
+    /// importer's own head, and the final publish restating the last
+    /// checkpoint's exact `(t, commit_id)` — plus the two conflicts it
+    /// never produces (equal `t` under a different id, lower `t`), which
+    /// must fail loudly instead of reporting success over a foreign head.
     #[tokio::test]
-    async fn creates_advances_and_tolerates_republishes() {
+    async fn creates_advances_tolerates_exact_republish_rejects_divergence() {
         let ns = MemoryNameService::new();
         let alias = "importdb:main";
 
@@ -7685,18 +7712,30 @@ mod publish_import_commit_head_tests {
 
         publish_import_commit_head(&ns, alias, 5, &cid("t5"))
             .await
-            .expect("equal-t republish is a no-op success");
+            .expect("republish of the exact head is a no-op success");
 
-        publish_import_commit_head(&ns, alias, 3, &cid("t3"))
+        let err = publish_import_commit_head(&ns, alias, 5, &cid("other"))
             .await
-            .expect("stale republish is a no-op success");
+            .expect_err("equal t under a different id is a divergence");
+        assert!(
+            err.to_string().contains("diverged"),
+            "unexpected error: {err}"
+        );
+
+        let err = publish_import_commit_head(&ns, alias, 3, &cid("t3"))
+            .await
+            .expect_err("a head past the published t is a divergence");
+        assert!(
+            err.to_string().contains("diverged"),
+            "unexpected error: {err}"
+        );
 
         let head = ns
             .get_ref(alias, RefKind::CommitHead)
             .await
             .expect("get_ref")
             .expect("head exists");
-        assert_eq!(head.t, 5, "no-op republishes leave the head alone");
+        assert_eq!(head.t, 5, "failed publishes leave the head alone");
         assert_eq!(head.id, Some(cid("t5")));
     }
 }
