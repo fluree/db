@@ -299,6 +299,17 @@ path = "tests/it_minmax_fast_path_fired.rs"
 name = "it_upsert_skip_fires"
 path = "tests/it_upsert_skip_fires.rs"
 
+# Standalone (NOT in grp_ledger): sets FLUREE_MAX_GRAPH_SCAN_FLAKES to exercise
+# the whole-graph-scan cap, then clears it. The limit is read from the process
+# env per scan and has no programmatic override, so a grouped binary — whose
+# tests are threads in one process under bare `cargo test` — leaks the cap into
+# every sibling running at the time. That surfaced as unrelated graph-sync tests
+# failing with WholeGraphScanTooLarge. nextest hides it by isolating per test.
+[[test]]
+name = "it_sync_graph_scan_backstop"
+path = "tests/it_sync_graph_scan_backstop.rs"
+required-features = ["native"]
+
 [[test]]
 name = "it_multi_graph_property_path"
 path = "tests/it_multi_graph_property_path.rs"
