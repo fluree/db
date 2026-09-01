@@ -106,10 +106,12 @@ harnesses named for its domains (`grp_http`, `grp_query`, `grp_proxy`,
 instrumentation-assertion rule above.
 
 Because `autotests = false` means an unwired file silently never compiles and
-never runs — with `cargo test` still reporting success —
-`fluree-db-server/tests/harness_coverage.rs` asserts that every `tests/*.rs` is
-either pulled into a harness or declared as its own `[[test]]`. Add the same
-guard to any other crate that adopts this layout.
+never runs — with `cargo test` still reporting success — both crates carry a
+`tests/harness_coverage.rs` that asserts every `tests/*.rs` is either declared
+as a `[[test]]` target or pulled into one via `#[path]`. It derives reachability
+from `Cargo.toml` outwards rather than from file names, so an undeclared
+`grp_*.rs` is flagged as an orphan itself instead of being assumed to be a
+target. Copy it into any other crate that adopts this layout.
 
 ### Example Tests
 
