@@ -392,6 +392,9 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     if let Some(ref v) = args.branch {
         obj.insert("branch".into(), v.clone().into());
     }
+    if let Some(ref v) = args.model {
+        obj.insert("model".into(), v.clone().into());
+    }
     if let Some(ref v) = args.auth_bearer {
         obj.insert("auth_bearer".into(), v.clone().into());
     }
@@ -674,6 +677,9 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
     if let Some(ref branch) = args.branch {
         config = config.with_branch(branch);
     }
+    if let Some(ref model) = args.model {
+        config = config.with_model(model);
+    }
     if let Some(ref token) = args.auth_bearer {
         config = config.with_auth_bearer(token);
     }
@@ -750,6 +756,7 @@ mod tests {
             r2rml: None,
             r2rml_type: None,
             branch: None,
+            model: None,
             auth_bearer: None,
             oauth2_token_url: None,
             oauth2_client_id: None,
@@ -762,6 +769,14 @@ mod tests {
             s3_endpoint: None,
             s3_path_style: false,
         }
+    }
+
+    #[test]
+    fn args_to_json_carries_model_ledger() {
+        let mut args = base_rest_args();
+        assert!(args_to_json(&args).unwrap().get("model").is_none());
+        args.model = Some("governance:main".to_string());
+        assert_eq!(args_to_json(&args).unwrap()["model"], "governance:main");
     }
 
     #[test]

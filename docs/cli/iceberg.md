@@ -80,6 +80,7 @@ fluree iceberg map <NAME> [OPTIONS]
 |--------|-------------|
 | `--remote <NAME>` | Execute against a remote server (by remote name) |
 | `--branch <NAME>` | Branch name (defaults to "main") |
+| `--model <LEDGER>` | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. See [Access policy](../graph-sources/iceberg.md#access-policy) |
 
 ### Description
 

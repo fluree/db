@@ -626,6 +626,24 @@ impl Fluree {
     /// the single source of truth for the genesis graph-source view; see
     /// [`db_or_graph_source`](Self::db_or_graph_source) and the dataset path's
     /// `resolve_as_graph_source`.
+    /// The config a model-governed virtual source presents to `wrap_policy`
+    /// (see `graph_source::r2rml::model_resolved_config`); `None` when the
+    /// record names no model ledger.
+    pub(crate) fn graph_source_model_config(
+        record: &fluree_db_nameservice::GraphSourceRecord,
+    ) -> Option<fluree_db_core::ledger_config::ResolvedConfig> {
+        #[cfg(feature = "iceberg")]
+        {
+            crate::graph_source::r2rml::model_ledger_of(record)
+                .map(|m| crate::graph_source::r2rml::model_resolved_config(&m))
+        }
+        #[cfg(not(feature = "iceberg"))]
+        {
+            let _ = record;
+            None
+        }
+    }
+
     pub async fn resolve_graph_source(&self, ledger_id: &str) -> Result<Option<GraphDb>> {
         // A graph-source alias may carry a graph fragment (`{ds}#txn-meta`) or an
         // explicit `:branch`. Split the fragment off BEFORE normalizing/looking up:
@@ -640,20 +658,20 @@ impl Fluree {
         let gs_id =
             fluree_db_core::normalize_ledger_id(base_id).unwrap_or_else(|_| base_id.to_string());
 
-        if self
+        let Some(record) = self
             .nameservice()
             .lookup_graph_source(&gs_id)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?
-            .is_none()
-        {
+        else {
             return Ok(None);
-        }
+        };
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis(&gs_id);
         let state =
             fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
         let mut db = GraphDb::from_ledger_state(&state);
+        db.resolved_config = Self::graph_source_model_config(&record);
 
         match graph_ref {
             GraphRef::Default => {
@@ -764,6 +782,7 @@ impl Fluree {
                 config_policy_class,
                 source,
                 &mut ctx,
+                view.graph_source_id.is_some(),
             )
             .await?;
 

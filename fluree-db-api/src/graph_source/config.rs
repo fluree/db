@@ -416,6 +416,10 @@ pub struct IcebergCreateConfig {
     /// Optional ordering column for latest-by-key materialization (e.g. an event
     /// timestamp or offset). `None` => last-in-scan-order wins.
     pub order_by: Option<String>,
+
+    /// Optional model ledger (`name:branch`) governing the source: its default
+    /// graph supplies view policies and the class/property hierarchy.
+    pub model: Option<String>,
 }
 
 /// The reusable Iceberg connection block — catalog access + IO, with **no**
@@ -729,6 +733,7 @@ impl IcebergCreateConfig {
             connection: IcebergConnectionConfig::rest(catalog_uri),
             table_identifier: table_identifier.into(),
             delete_convention: None,
+            model: None,
             order_by: None,
         }
     }
@@ -741,6 +746,7 @@ impl IcebergCreateConfig {
             connection: IcebergConnectionConfig::direct(table_location),
             table_identifier: String::new(),
             delete_convention: None,
+            model: None,
             order_by: None,
         }
     }
@@ -864,6 +870,13 @@ impl IcebergCreateConfig {
         self
     }
 
+    /// Reference a model ledger whose default graph holds this source's view
+    /// policies and `rdfs:subClassOf` / `rdfs:subPropertyOf` hierarchy.
+    pub fn with_model(mut self, ledger: impl Into<String>) -> Self {
+        self.model = Some(ledger.into());
+        self
+    }
+
     /// Get the effective branch name.
     pub fn effective_branch(&self) -> &str {
         self.branch.as_deref().unwrap_or(DEFAULT_BRANCH)
@@ -918,6 +931,7 @@ impl IcebergCreateConfig {
                 mapping: None,
                 delete: self.delete_convention.clone(),
                 order_by: self.order_by.clone(),
+                model: self.model.clone(),
             },
             CatalogMode::Direct { table_location } => {
                 // Direct never uses vended credentials, regardless of the io flag.
@@ -930,6 +944,7 @@ impl IcebergCreateConfig {
                     mapping: None,
                     delete: self.delete_convention.clone(),
                     order_by: self.order_by.clone(),
+                    model: self.model.clone(),
                 }
             }
         }
@@ -939,6 +954,9 @@ impl IcebergCreateConfig {
     pub fn validate(&self) -> crate::Result<()> {
         if self.name.trim().is_empty() {
             return Err(crate::ApiError::config("Graph source name cannot be empty"));
+        }
+        if self.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            return Err(crate::ApiError::config("model ledger id cannot be empty"));
         }
 
         if self.name.contains(':') {
@@ -1061,6 +1079,12 @@ pub struct R2rmlCreateConfig {
 
 #[cfg(feature = "iceberg")]
 impl R2rmlCreateConfig {
+    /// See [`IcebergCreateConfig::with_model`].
+    pub fn with_model(mut self, ledger: impl Into<String>) -> Self {
+        self.iceberg.model = Some(ledger.into());
+        self
+    }
+
     /// Create a new R2RML graph source config with REST catalog and inline mapping.
     pub fn new(
         name: impl Into<String>,

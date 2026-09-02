@@ -227,6 +227,11 @@ moment. Consequently
   the mapping author's, not a query author's.
 - Credentials can be indirected (`{"env_var": "TRINO_TOKEN"}` or
   `{"secret_ref": "…"}`) rather than stored in the record.
+- View policy is enforced in the R2RML scan exactly as for an Iceberg source
+  (static `f:onProperty` / `f:onClass` / `f:onSubject` targeting, subclass
+  expansion and stored policies through a `--model` ledger; `f:query` fails
+  closed). See [Access policy](iceberg.md#access-policy). Enforcement happens
+  after the rows come back from SQL; hidden columns are still selected.
 
 ## Running the bridge
 

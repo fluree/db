@@ -52,6 +52,13 @@ Verb semantics make the class grant exact: class targeting matches pre ∪ post 
 | `--space <id>` | Attach the policy class to this space's grant on the dataset (hosted stacks; requires `--remote`). Merges with existing grant classes, never clobbers |
 | `--dry-run` | Print the compiled JSON-LD without transacting |
 
+For a virtual graph source (Iceberg / SQL), `<DATASET>` is the source's **model
+ledger** — the ledger named by `--model` when the source was mapped — since the
+source has no ledger of its own to hold policies. The `read` profile's
+`--connected` gate compiles to an `f:query`, which a virtual source cannot
+evaluate; use a static profile there. See
+[Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
+
 Three class-shaped things are in play, with distinct roles: `--class` restricts *what data* is governed, `--property` optionally narrows it to columns, and the **policy class** selects *which policy set a request runs under* (via space grants / token `policy-class`).
 
 ### Semantics of re-running

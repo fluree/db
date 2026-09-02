@@ -89,6 +89,12 @@ pub struct SqlGsConfig {
     /// The R2RML mapping (CAS CID + media type). Absent only transiently.
     #[serde(default)]
     pub mapping: Option<MappingSource>,
+
+    /// Optional model ledger (`name:branch`) whose default graph supplies this
+    /// source's view policies and class/property hierarchy (see the Iceberg
+    /// config's field of the same name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl SqlGsConfig {
@@ -104,6 +110,7 @@ impl SqlGsConfig {
             session: BTreeMap::new(),
             request_timeout_secs: default_request_timeout(),
             mapping: None,
+            model: None,
         }
     }
 

@@ -23,6 +23,7 @@
 
 mod fused_aggregate;
 mod operator;
+pub(crate) mod policy;
 mod provider;
 mod rewrite;
 

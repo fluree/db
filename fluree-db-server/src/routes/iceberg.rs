@@ -77,6 +77,9 @@ pub struct IcebergMapRequest {
     pub delete_values: Vec<Option<String>>,
     /// Ordering column for latest-by-key materialization (e.g. `event_timestamp`).
     pub order_by: Option<String>,
+    /// Model ledger (`name:branch`) whose default graph supplies the source's
+    /// view policies and class/property hierarchy.
+    pub model: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -693,6 +696,9 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
     }
     if let Some(ref order_by) = req.order_by {
         config = config.with_order_by(order_by);
+    }
+    if let Some(ref model) = req.model {
+        config = config.with_model(model);
     }
 
     Ok(config)
@@ -1320,6 +1326,7 @@ mod tests {
             table_identifier: "ns.tbl".to_string(),
             delete_convention: None,
             order_by: None,
+            model: None,
         };
         assert!(create.is_rest());
         let gs = create.to_iceberg_gs_config();

@@ -175,6 +175,13 @@ name = "it_iceberg_local_fs"
 path = "tests/it_iceberg_local_fs.rs"
 required-features = ["iceberg", "native"]
 
+# View-policy enforcement on R2RML / Iceberg graph sources, checked against a
+# native twin of the same fixture as the oracle.
+[[test]]
+name = "it_iceberg_policy"
+path = "tests/it_iceberg_policy.rs"
+required-features = ["iceberg", "native"]
+
 # Standalone for the same reason: catalog-less WAREHOUSE-ROOT resolution through
 # every Direct entry point, against the committed fixture's parent directory.
 [[test]]

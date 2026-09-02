@@ -44,6 +44,9 @@ pub struct SqlCreateConfig {
     /// The R2RML mapping — inline content or a pre-existing address.
     pub mapping: R2rmlMappingInput,
     pub mapping_media_type: Option<String>,
+    /// Optional model ledger (`name:branch`) whose default graph supplies the
+    /// source's view policies and class/property hierarchy.
+    pub model: Option<String>,
 }
 
 impl SqlCreateConfig {
@@ -65,6 +68,7 @@ impl SqlCreateConfig {
             session: BTreeMap::new(),
             mapping: R2rmlMappingInput::Content(mapping_content.into()),
             mapping_media_type: None,
+            model: None,
         }
     }
 
@@ -97,6 +101,7 @@ impl SqlCreateConfig {
             source: mapping_address.to_string(),
             media_type: Some(media_type),
         });
+        cfg.model = self.model.clone();
         cfg
     }
 
@@ -449,6 +454,12 @@ pub(crate) fn mapping_source(record: &GraphSourceRecord) -> Option<MappingSource
     SqlGsConfig::from_json(&record.config)
         .ok()
         .and_then(|c| c.mapping)
+}
+
+pub(crate) fn model_ledger(record: &GraphSourceRecord) -> Option<String> {
+    SqlGsConfig::from_json(&record.config)
+        .ok()
+        .and_then(|c| c.model)
 }
 
 #[cfg(test)]

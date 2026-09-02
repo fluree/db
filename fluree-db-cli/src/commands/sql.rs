@@ -80,6 +80,7 @@ fn args_to_json(args: &SqlMapArgs) -> CliResult<serde_json::Value> {
         ("oauth2_client_secret", &args.oauth2_client_secret),
         ("oauth2_scope", &args.oauth2_scope),
         ("oauth2_audience", &args.oauth2_audience),
+        ("model", &args.model),
     ] {
         if let Some(v) = value {
             obj.insert(key.into(), v.clone().into());
@@ -152,6 +153,7 @@ async fn run_sql_map_local(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> 
     config.schema = args.schema.clone();
     config.user = args.user.clone();
     config.session = session_pairs(&args)?;
+    config.model = args.model.clone();
     if let Some(d) = &args.dialect {
         config.dialect = match d.to_lowercase().as_str() {
             "trino" => SqlDialect::Trino,

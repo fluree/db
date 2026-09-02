@@ -50,6 +50,9 @@ pub struct SqlMapRequest {
     /// Session properties (`X-Trino-Session`)
     #[serde(default)]
     pub session: BTreeMap<String, String>,
+    /// Model ledger (`name:branch`) whose default graph supplies the source's
+    /// view policies and class/property hierarchy.
+    pub model: Option<String>,
 }
 
 /// Response for `POST /v1/fluree/sql/map`
@@ -145,6 +148,7 @@ fn build_sql_config(req: &SqlMapRequest) -> Result<fluree_db_api::SqlCreateConfi
     config.schema = req.schema.clone();
     config.user = req.user.clone();
     config.session = req.session.clone();
+    config.model = req.model.clone();
 
     if let Some(d) = &req.dialect {
         config.dialect = match d.to_lowercase().as_str() {

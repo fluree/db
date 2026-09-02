@@ -3334,6 +3334,7 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
         };
 
         let stored = cfg.to_json().unwrap();
@@ -3455,6 +3456,7 @@ mod tests {
                 mapping: None,
                 delete: None,
                 order_by: None,
+                model: None,
             };
             let stored = cfg.to_json().unwrap();
             let redacted = redact_graph_source_config(&stored);

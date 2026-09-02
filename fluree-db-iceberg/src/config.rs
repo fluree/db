@@ -60,6 +60,13 @@ pub struct IcebergGsConfig {
     /// (legacy behavior; fields cleared in a later revision are NOT removed).
     #[serde(default)]
     pub order_by: Option<String>,
+    /// Optional model ledger (`name:branch`) governing this source: its
+    /// default graph supplies the view policies and the `rdfs:subClassOf` /
+    /// `rdfs:subPropertyOf` hierarchy used to expand policy targets, the way a
+    /// native ledger's `f:policySource` / `f:schemaSource` config references do.
+    /// A virtual source has no ledger of its own to hold either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Declares how a delete is encoded in the source table's append log so the
@@ -601,6 +608,7 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -616,6 +624,7 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
         };
         assert!(config.validate().is_err());
     }
@@ -634,6 +643,7 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -652,6 +662,7 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -680,6 +691,7 @@ mod tests {
                 mapping: None,
                 delete: None,
                 order_by: None,
+                model: None,
             };
             if crate::local_guard::local_roots().is_none() {
                 let err = config
@@ -713,6 +725,7 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
         };
         assert!(config.validate().is_err());
     }
@@ -729,6 +742,7 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -830,6 +844,7 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
         };
 
         let json = original.to_json().unwrap();
@@ -850,6 +865,7 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
         };
 
         let json = original.to_json().unwrap();

@@ -506,7 +506,8 @@ This is the way to give each partition its **own** ledger for per-partition
 access isolation: Fluree's read policy is graph-blind, so separate access regimes
 are separate ledgers (isolated by the per-ledger read gate) rather than named
 graphs. Within each per-partition ledger, `rr:graphMap` named-graph routing still
-applies independently.
+applies independently. Row- and column-level policy on the live source itself is
+covered under [Access policy](#access-policy).
 
 ### Multiple sources into one target (additive)
 
@@ -868,6 +869,59 @@ Before a twin is announced, a memory-bounded parity gate re-checks it against th
 - **`full`** — a whole-twin triple diff (the twin streamed in a single linear pass over the binary index), external-sorted and diffed under a bounded working set.
 
 A failed gate drops the twin so nothing unverified stays announced. See the [`fluree materialize`](../cli/materialize.md) reference for the full flow, the machine-safety posture, and `--tmp-dir`.
+
+## Access policy
+
+Fluree's view policy applies to an Iceberg source the same way it applies to a
+native ledger, with one difference in what a policy can express. A request that
+carries policy inputs (`identity`, `policy-class`, an inline `policy`, or
+`default-allow`) is enforced inside the R2RML scan: subject classes come from
+the mapping (`rr:class`, plus any column-derived `rdf:type`), targets are
+matched on the row's IRIs, and a triples map whose required predicates are all
+hidden is skipped before its table is read. In the common case a decision is
+made once per `(triples map, predicate)`, so enforcement is cheaper than the
+per-flake filter a native scan pays.
+
+Supported, with native parity (the test suite checks each shape against a
+native twin of the same data):
+
+- `f:onProperty`, `f:onClass`, `f:onSubject`, and untargeted policies with a
+  static `f:allow`, including `f:required` gates and `default-allow`.
+- `f:onClass` / `f:onProperty` expansion through `rdfs:subClassOf` /
+  `rdfs:subPropertyOf`, when the source references a model ledger (below).
+- Every pattern shape the scan produces: fixed predicates, same-subject stars,
+  constant objects, class scans, projected `rdf:type`, wildcards (`?s ?p ?o`),
+  aggregates, and `GRAPH` blocks in a dataset query.
+
+Not supported: **`f:query`** policies. A virtual source has no graph to run the
+policy query against, so a targeted `f:query` evaluates as "no rows" and
+denies its targets — it never falls open. Relationship gates that join the
+requesting identity to the row (`fluree model access … --connected`) fall in
+this category. Write verbs do not apply; the source is read-only.
+
+### Where policies live: the model ledger
+
+A virtual source has no ledger of its own, so its stored policies, the
+identities' `f:policyClass` assignments, and the class hierarchy are held in a
+**model ledger** the source references at registration:
+
+```bash
+fluree create governance
+fluree model class define governance --class https://example.org/Person --subclass-of https://example.org/Agent
+fluree model access enable governance --profile read --class https://example.org/Agent
+fluree iceberg map orders --mode direct --table-location s3://… --r2rml orders.ttl \
+  --model governance:main
+```
+
+The reference (`model` in the HTTP body and stored config, `--model` on the
+CLI) makes the model ledger's default graph the source's `f:policySource` and
+`f:schemaSource`, resolved through the same cross-ledger mechanism a native
+ledger's config uses. Rule selection follows the cross-ledger contract: an
+explicit `policy-class` on the request (or token) selects rules; a bare
+`identity` is looked up in the model ledger for its `f:policyClass`; an
+anonymous request carrying `default-allow` applies the baseline
+`f:AccessPolicy` rules. A request with no policy inputs is unrestricted, as
+for a native ledger. Inline `opts.policy` works with or without a model.
 
 ## Limitations
 

@@ -130,6 +130,48 @@ pub(crate) fn mapping_source_of(
     }
 }
 
+/// The model ledger a virtual source is governed by, if its record names one.
+pub(crate) fn model_ledger_of(record: &fluree_db_nameservice::GraphSourceRecord) -> Option<String> {
+    match record.source_type {
+        GraphSourceType::R2rml | GraphSourceType::Iceberg => {
+            IcebergGsConfig::from_json(&record.config)
+                .ok()
+                .and_then(|c| c.model)
+        }
+        #[cfg(feature = "sql")]
+        GraphSourceType::Sql => super::sql::model_ledger(record),
+        _ => None,
+    }
+}
+
+/// The resolved config a model-governed virtual source presents to the policy
+/// wrapper: the model ledger's default graph is both the `f:policySource` and
+/// the `f:schemaSource`, so `wrap_policy` takes the cross-ledger path unchanged
+/// and the R2RML policy gate sees hierarchy-expanded targets.
+pub(crate) fn model_resolved_config(model: &str) -> fluree_db_core::ledger_config::ResolvedConfig {
+    use fluree_db_core::ledger_config::{
+        GraphSourceRef, PolicyDefaults, ReasoningDefaults, ResolvedConfig,
+    };
+    let graph_ref = || GraphSourceRef {
+        ledger: Some(model.to_string()),
+        graph_selector: Some(fluree_vocab::config_iris::DEFAULT_GRAPH.to_string()),
+        at_t: None,
+        trust_policy: None,
+        rollback_guard: None,
+    };
+    ResolvedConfig {
+        policy: Some(PolicyDefaults {
+            policy_source: Some(graph_ref()),
+            ..PolicyDefaults::default()
+        }),
+        reasoning: Some(ReasoningDefaults {
+            schema_source: Some(graph_ref()),
+            ..ReasoningDefaults::default()
+        }),
+        ..ResolvedConfig::default()
+    }
+}
+
 /// An Iceberg-backed source scans tables, never queries: refuse a mapping with
 /// `rr:sqlQuery` at registration rather than at first query.
 fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> {
@@ -4499,6 +4541,7 @@ mod tests {
             // materialization options stay absent (their serde defaults).
             delete: None,
             order_by: None,
+            model: None,
         }
         .to_json()
         .unwrap()

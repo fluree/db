@@ -162,6 +162,17 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                         fluree_db_novelty::Novelty::new(0),
                     );
                     let mut db = crate::view::GraphDb::from_ledger_state(&state);
+                    // A model-governed source carries its model ledger as the
+                    // policy / schema source so `wrap_policy` resolves both.
+                    if let Ok(Some(record)) = self
+                        .graph
+                        .fluree
+                        .nameservice()
+                        .lookup_graph_source(&gs_id)
+                        .await
+                    {
+                        db.resolved_config = crate::Fluree::graph_source_model_config(&record);
+                    }
                     db.graph_source_id = Some(gs_id.into());
                     return Ok(db);
                 }

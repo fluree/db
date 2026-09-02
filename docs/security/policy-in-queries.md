@@ -204,6 +204,17 @@ Policies apply per-flake, regardless of which named graph the flake came from. A
 
 If different graphs need different policy regimes, use targeted policies (`f:onClass` for type-scoped restrictions, `f:onSubject` for explicit subject lists). For wholly separate access regimes, use separate ledgers.
 
+## Graph sources (Iceberg / SQL)
+
+A virtual graph source is enforced inside its R2RML scan rather than by the
+flake filter: static targeting (`f:onProperty`, `f:onClass`, `f:onSubject`,
+untargeted, `f:required`, `default-allow`) behaves as on a native ledger, and
+`f:onClass` / `f:onProperty` entail through a model ledger's hierarchy when the
+source was registered with `--model`. `f:query` policies cannot run against a
+virtual source and fail closed. Stored policies and identity `f:policyClass`
+assignments live in the model ledger. Details and the exact supported matrix:
+[Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
+
 ## Time-travel queries
 
 Policy evaluation honors the query's `t`. When you query `--at` a past `t`:
