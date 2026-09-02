@@ -144,6 +144,10 @@ impl Default for CacheConfig {
 /// matter, and still a real delay. Durations that large are absurd for
 /// every knob here, which is precisely why the failure would be so hard to
 /// believe if it ever happened.
+// Only the wasm driver modules call this in production; the clamp test below
+// exercises it on host-test builds. `cfg(any(wasm32, test))` so a plain host
+// lib build — where nothing calls it — does not see it as dead code.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn timer_millis(duration: Duration) -> u32 {
     const MAX_TIMER_MILLIS: u128 = i32::MAX as u128;
     duration.as_millis().min(MAX_TIMER_MILLIS) as u32
@@ -166,7 +170,7 @@ mod tests {
     /// `setTimeout`'s signed 32-bit delay and fires at once, so a bound
     /// meant to be unreachable becomes a bound that always trips.
     #[test]
-    fn timer_millis_clamps_below_the_setTimeout_overflow() {
+    fn timer_millis_clamps_below_the_set_timeout_overflow() {
         assert_eq!(timer_millis(Duration::from_millis(0)), 0);
         assert_eq!(timer_millis(Duration::from_secs(10)), 10_000);
         // The largest delay a browser still treats as a delay.

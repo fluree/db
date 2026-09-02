@@ -902,7 +902,9 @@ mod tests {
         let live = LiveQuerySet::new(fluree.clone(), None);
         let early = live.subscribe(LEDGER, names_query());
 
-        let seen: Arc<Mutex<Vec<(i64, Vec<SubId>)>>> = Arc::new(Mutex::new(Vec::new()));
+        // (watermark t, changed sub ids) captured per emitted outcome.
+        type SeenOutcomes = Vec<(i64, Vec<SubId>)>;
+        let seen: Arc<Mutex<SeenOutcomes>> = Arc::new(Mutex::new(Vec::new()));
         {
             let seen = Arc::clone(&seen);
             live.on_outcome(move |o| {
