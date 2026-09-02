@@ -111,7 +111,13 @@ never runs — with `cargo test` still reporting success — both crates carry a
 as a `[[test]]` target or pulled into one via `#[path]`. It derives reachability
 from `Cargo.toml` outwards rather than from file names, so an undeclared
 `grp_*.rs` is flagged as an orphan itself instead of being assumed to be a
-target. Copy it into any other crate that adopts this layout.
+target.
+
+The same file enforces the env rule above: any file compiled into a shared
+harness that calls `set_var`/`remove_var` fails the build, named. Standalone
+`[[test]]` targets are exempt — being alone in a process is exactly what makes
+the mutation safe. Copy both checks into any other crate that adopts this
+layout.
 
 ### Example Tests
 

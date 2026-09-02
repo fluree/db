@@ -69,19 +69,14 @@ fn declared_test_paths(manifest: &str) -> HashSet<String> {
     declared
 }
 
-#[test]
-fn every_test_file_is_reachable() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let tests_dir = root.join("tests");
-    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
-
-    let declared = declared_test_paths(&manifest);
-
-    // Files pulled in via `#[path = "..."]` by a *declared* target. Harvesting
-    // from every file on disk instead would let an undeclared harness launder
-    // its members into the covered set.
-    let mut referenced: HashSet<String> = HashSet::new();
-    for rel in &declared {
+/// Files pulled in via `#[path = "..."]` by a *declared* target, keyed by the
+/// harness that pulls them in. Harvesting from every file on disk instead would
+/// let an undeclared harness launder its members into the covered set.
+///
+/// Paths are as written in the attribute, i.e. relative to `tests/`.
+fn grouped_members(root: &Path, declared: &HashSet<String>) -> Vec<(String, String)> {
+    let mut members = Vec::new();
+    for rel in declared {
         let Ok(src) = fs::read_to_string(root.join(rel)) else {
             continue; // a declared path that does not exist is Cargo's error to report
         };
@@ -91,10 +86,24 @@ fn every_test_file_is_reachable() {
                 .strip_prefix("#[path = \"")
                 .and_then(|r| r.split('"').next())
             {
-                referenced.insert(file.to_string());
+                members.push((rel.clone(), file.to_string()));
             }
         }
     }
+    members
+}
+
+#[test]
+fn every_test_file_is_reachable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tests_dir = root.join("tests");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+
+    let declared = declared_test_paths(&manifest);
+    let referenced: HashSet<String> = grouped_members(root, &declared)
+        .into_iter()
+        .map(|(_harness, member)| member)
+        .collect();
 
     // Only top-level files become test binaries; tests/support and
     // tests/fixtures are pulled in by path and are not enumerated here.
@@ -122,6 +131,85 @@ fn every_test_file_is_reachable() {
         "unreachable under `autotests = false` — every tests/*.rs must be \
          declared as a [[test]] target or pulled into one via `#[path = \
          \"<file>\"] mod <name>;`. Orphaned: {orphans:?}"
+    );
+}
+
+/// Call shapes for process-global env mutation.
+///
+/// Assembled with `concat!` so this file does not contain the literals it
+/// searches for. It is pulled into a harness like any other case file, so a
+/// plain literal would make the guard flag itself.
+const ENV_MUTATION: [&str; 2] = [concat!("set", "_var("), concat!("remove", "_var(")];
+
+/// True when `body` calls one of the mutators. A match must begin at a word
+/// boundary, so an identifier that merely ends in one — `unset_var(`, say —
+/// does not count.
+fn mutates_process_env(body: &str) -> bool {
+    ENV_MUTATION.iter().any(|needle| {
+        let mut from = 0;
+        while let Some(i) = body[from..].find(needle) {
+            let at = from + i;
+            let preceded_by_ident = body[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if !preceded_by_ident {
+                return true;
+            }
+            from = at + needle.len();
+        }
+        false
+    })
+}
+
+#[test]
+fn grouped_tests_do_not_mutate_process_env() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tests_dir = root.join("tests");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+
+    let declared = declared_test_paths(&manifest);
+    let members = grouped_members(root, &declared);
+
+    // A target is a *harness* only if it pulls in a sibling top-level case file.
+    // Standalone targets use #[path] too, but only to reach shared helpers such
+    // as support/span_capture.rs; they are still alone in their process, which
+    // is precisely what makes mutating env legitimate for them.
+    let harnesses: HashSet<&String> = members
+        .iter()
+        .filter(|(_, member)| !member.contains('/'))
+        .map(|(target, _)| target)
+        .collect();
+
+    // Everything compiled into a shared binary: each harness and all it pulls in.
+    let mut to_scan: Vec<String> = Vec::new();
+    for (target, member) in &members {
+        if harnesses.contains(target) {
+            to_scan.push(member.clone());
+            to_scan.push(target.trim_start_matches("tests/").to_string());
+        }
+    }
+    to_scan.sort();
+    to_scan.dedup();
+
+    let mut offenders: Vec<String> = Vec::new();
+    for rel in to_scan {
+        let Ok(body) = fs::read_to_string(tests_dir.join(&rel)) else {
+            continue;
+        };
+        if mutates_process_env(&body) {
+            offenders.push(rel);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these files are compiled into a shared test binary but mutate \
+         process-global env. Under bare `cargo test` a binary runs its tests as \
+         threads in one process, so the mutation leaks into whichever siblings \
+         happen to be running — nextest hides this by isolating per test. Give \
+         each its own [[test]] target; see docs/contributing/tests.md, \"Kept \
+         standalone\": {offenders:?}"
     );
 }
 
