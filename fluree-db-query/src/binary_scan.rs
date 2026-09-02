@@ -4411,11 +4411,11 @@ mod tests {
     /// inclusive upper bound would exclude it — except that all four index
     /// comparators compare `t` and `op` *before* the metadata tiebreak, and
     /// no real flake carries `t == i64::MAX`. The guard therefore lives in
-    /// the builders, and this test quantifies over all six of them: the four
+    /// the builders, and this test quantifies over all seven of them: the four
     /// `Flake::max_*` in `fluree-db-core` (`max_psot` delegates to
     /// `max_spot`, asserted anyway so de-aliasing it can't drop the pin),
     /// plus `predicate_walk_bounds` in `fast_path_common` and
-    /// `overlay_walk_bounds` here.
+    /// `overlay_walk_bounds` / `bounded_overlay_walk` here.
     ///
     /// A new bound builder belongs in this list; one that deliberately does
     /// not pin `t` must instead show why reaching the narrowing is safe.
@@ -4469,8 +4469,19 @@ mod tests {
 
         operator.bound_o = Some(FlakeValue::Long(42));
         let (_, rhs) = operator
-            .overlay_walk_bounds(&Some(s), &Some(p))
+            .overlay_walk_bounds(&Some(s.clone()), &Some(p.clone()))
             .expect("bound-object arm must still produce walk bounds");
         assert_pinned("overlay_walk_bounds (bound object)", &rhs);
+
+        // `bounded_overlay_walk` is the translation-side bracket builder;
+        // both its arms (subject/SPOT and predicate/PSOT) construct `rhs`
+        // through the same closure, but assert each so de-fusing them can't
+        // drop the pin from one.
+        let walk = BinaryScanOperator::bounded_overlay_walk(&Some(s), &None)
+            .expect("bound subject must produce a bracketed walk");
+        assert_pinned("bounded_overlay_walk (subject bracket)", &walk.rhs);
+        let walk = BinaryScanOperator::bounded_overlay_walk(&None, &Some(p))
+            .expect("bound predicate must produce a bracketed walk");
+        assert_pinned("bounded_overlay_walk (predicate bracket)", &walk.rhs);
     }
 }
