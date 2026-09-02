@@ -180,6 +180,18 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
     let status = match &err {
         SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => 409,
         SubmissionError::Overloaded => 503,
+        // Keep the typed identity through the flattening: 503 +
+        // `err:db/NoveltyAtMax` + Retry-After for drainable backpressure,
+        // 413 + `err:db/NoveltyDeltaTooLarge` for a delta that can never
+        // fit — a status-only passthrough degrades the `@type` to the
+        // internal-error catch-all (and 413 is ambiguous with the HTTP
+        // body-size limit).
+        SubmissionError::NoveltyBackpressure { message } => {
+            return ServerError::NoveltyBackpressure(message.clone());
+        }
+        SubmissionError::NoveltyDeltaTooLarge { message } => {
+            return ServerError::NoveltyDeltaTooLarge(message.clone());
+        }
         SubmissionError::Execution { status, .. } => *status,
     };
     ServerError::Api(ApiError::http(status, err.to_string()))
@@ -2376,5 +2388,59 @@ mod tests {
         })));
         assert!(!is_misrouted_cypher_envelope(&json!({"cypher": 42})));
         assert!(!is_misrouted_cypher_envelope(&json!("MATCH (n) RETURN n")));
+    }
+
+    /// Exhaustive classification of every [`SubmissionError`] variant at the
+    /// consensus→HTTP flattening point. `Retry-After` attaches to every 503
+    /// unconditionally, so each variant's mapping is a retryability decision;
+    /// the `match` below has no wildcard arm, so adding a `SubmissionError`
+    /// variant refuses to compile until it is consciously classified here
+    /// (and, if it maps to 503, in `RETRYABLE_503_TYPES` in `error.rs`).
+    #[test]
+    fn submission_error_variants_are_exhaustively_classified() {
+        use fluree_vocab::errors;
+
+        let variants = [
+            SubmissionError::KeyCollision,
+            SubmissionError::AlreadyInFlight,
+            SubmissionError::Overloaded,
+            SubmissionError::Execution {
+                status: 422,
+                message: "invalid transaction".into(),
+            },
+            SubmissionError::NoveltyBackpressure {
+                message: "Novelty at maximum size, reindexing required".into(),
+            },
+            SubmissionError::NoveltyDeltaTooLarge {
+                message: "Transaction would exceed novelty limit".into(),
+            },
+        ];
+        for variant in variants {
+            // (status, @type) each variant must surface as. No wildcard:
+            // this match is the classification record.
+            let (expected_status, expected_type) = match &variant {
+                SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => {
+                    (409, errors::COMMIT_CONFLICT)
+                }
+                // Retryable capacity (in-flight cap) — one of the allowlisted
+                // 503 sources; its @type is the Http-passthrough catch-all.
+                SubmissionError::Overloaded => (503, errors::INTERNAL),
+                SubmissionError::Execution { .. } => (422, errors::INVALID_TRANSACTION),
+                SubmissionError::NoveltyBackpressure { .. } => (503, errors::NOVELTY_AT_MAX),
+                SubmissionError::NoveltyDeltaTooLarge { .. } => {
+                    (413, errors::NOVELTY_DELTA_TOO_LARGE)
+                }
+            };
+            let se = submission_error_to_server_error(variant);
+            assert_eq!(se.status_code().as_u16(), expected_status, "{se}");
+            assert_eq!(se.error_type(), expected_type, "{se}");
+            let is_503 = expected_status == 503;
+            let resp = axum::response::IntoResponse::into_response(se);
+            assert_eq!(
+                resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+                is_503,
+                "Retry-After must attach to every 503 and only to 503s"
+            );
+        }
     }
 }

@@ -41,9 +41,11 @@ pub const DEFAULT_REINDEX_MAX_BYTES_FALLBACK: usize = 256 * 1024 * 1024; // 256 
 ///
 /// Returns 20% of system RAM on native platforms, with a 256 MB fallback
 /// when detection is unavailable. Novelty is held in memory between index
-/// builds; once it exceeds this threshold, commits block until indexing
-/// catches up. 20% of RAM leaves plenty of headroom for the query cache,
-/// incoming requests, and the indexer itself.
+/// builds; once it reaches this threshold, new transactions are rejected
+/// (`TransactError::NoveltyAtMax` — HTTP 503 + `Retry-After` at the server)
+/// until indexing catches up; nothing waits or queues. 20% of RAM leaves
+/// plenty of headroom for the query cache, incoming requests, and the
+/// indexer itself.
 #[cfg(feature = "native")]
 pub fn default_reindex_max_bytes() -> usize {
     use sysinfo::{MemoryRefreshKind, System};
@@ -402,7 +404,7 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 # [server.indexing]
 # enabled = {indexing_enabled}                    # disable only when a separate peer/indexer owns indexing for this storage
 # reindex_min_bytes = {reindex_min_bytes}         # bytes of novelty before a background reindex (default ≈ every commit)
-# reindex_max_bytes = {reindex_max_bytes}      # {reindex_max_mb} MB (default: 20% of system RAM) — blocks commits until reindexed
+# reindex_max_bytes = {reindex_max_bytes}      # {reindex_max_mb} MB (default: 20% of system RAM) — transactions rejected (503, retryable) until reindexed
 
 # [server.auth.events]
 # mode = "{auth_mode}"                      # none, optional, required

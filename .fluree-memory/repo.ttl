@@ -2530,6 +2530,33 @@ mem:fact-01kta3264pg54aabvt97spk5qt a mem:Fact ;
     mem:createdAt "2026-06-04T19:51:46.070663+00:00"^^xsd:dateTime ;
     mem:rationale "A reviewer flagged \"use resolver fallback instead of sid_to_iri for novelty subjects\" as a major data-loss bug; it is a false positive due to the Sid-vs-integer-ID distinction." .
 
+mem:constraint-01m1035zyph3qqv6yc4bg25eva a mem:Constraint ;
+    mem:content "sh:sparql gotchas: (1) fluree-db-sparql lowering registers vars with the \"?\" prefix — VarRegistry lookups must use \"?this\"/\"?value\", bare \"this\" silently creates a second var and the VALUES injection stops constraining. (2) Sub-SELECT * must be REJECTED under pre-binding (W3C pre-binding-006 expects Failure; only explicit projection of $this is legal). (3) $PATH must be bound at validation time like $this, NOT text-substituted at compile time — compile-time decode_sid fails for inline-shapes namespaces staged in the same txn. (4) sh:value defaults to the focus node when ?value is unbound (spec §5.3.1; all pre-binding report tests depend on it)." ;
+    mem:tag "gotcha" ;
+    mem:tag "pre-binding" ;
+    mem:tag "sh-sparql" ;
+    mem:tag "shacl" ;
+    mem:tag "var-registry" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-shacl/src/sparql.rs" ;
+    mem:branch "fix/no-op-apply-head-completion" ;
+    mem:createdAt "2026-08-26T22:31:19.254258+00:00"^^xsd:dateTime .
+
+mem:fact-01m1035wc0tnshq7vzjmdpbypt a mem:Fact ;
+    mem:content "sh:sparql (SHACL-SPARQL §5) implemented in fluree-db-shacl/src/sparql.rs: sh:select parses at shape-compile time (snapshot-independent, stored as Arc<SparqlAst> in the constraint), lowers per validation against the DATA snapshot's ns registry (cross-ledger shapesSource safe), and pre-binds $this (+$PATH on property shapes) by injecting a one-row Pattern::Values into EVERY scope — top level, union branches, optionals, GRAPH bodies, subquery pattern lists (also pushing the var into sq.select). W3C sparql suite wired as shacl_sparql_w3c_testsuite: 17/22; remaining failures = constraint components (sh:validator) + $shapesGraph, both unimplemented by design." ;
+    mem:tag "pre-binding" ;
+    mem:tag "sh-sparql" ;
+    mem:tag "shacl" ;
+    mem:tag "validation" ;
+    mem:tag "w3c" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-shacl/src/compile.rs" ;
+    mem:artifactRef "fluree-db-shacl/src/sparql.rs" ;
+    mem:artifactRef "testsuite-shacl/tests/w3c_shacl.rs" ;
+    mem:branch "fix/no-op-apply-head-completion" ;
+    mem:createdAt "2026-08-26T22:31:15.584644+00:00"^^xsd:dateTime .
+
 mem:fact-01m0ghz0w7m3hhpnb8797vqjwj a mem:Fact ;
     mem:content "Planner bound-subject/bound-object fan-out (`estimate_triple_row_count`, planner.rs) is FRACTIONAL: `max(count/ndv, 1.0)` — no `ceil`. v4.1.6 regression (dblp `optional-join-3-star-2` 2.4x): `ceil` made `rdf:type` at 1.96/subject and `signatureDblpName` at 1.004/subject tie at 2 → seed ranking fell to source order. HLL256 (σ≈6.5%) puts a 1-per-subject predicate's ratio anywhere in ~[0.9,1.1], so `ceil` flipped plans on sketch noise (v4.1.2 had ndv_subjects > flake count for that reason; neither ndv was \"wrong\"). Estimate feeds rank_seed_candidates, HashJoinPlanner driving_est product, and the membership-join gate." ;
     mem:tag "cardinality" ;

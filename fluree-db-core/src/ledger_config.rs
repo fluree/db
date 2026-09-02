@@ -396,13 +396,28 @@ pub enum TrustMode {
 
 /// SHACL validation mode.
 ///
-/// Values are IRIs in the `f:` namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Values are IRIs in the `f:` namespace. Serialized lowercase
+/// (`"reject"` / `"warn"`) — the form `opts.validationMode` uses on
+/// transaction requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ValidationMode {
     /// `f:ValidationReject` — reject transactions that fail SHACL validation.
     Reject,
     /// `f:ValidationWarn` — warn but allow transactions that fail SHACL validation.
     Warn,
+}
+
+impl ValidationMode {
+    /// Parse the request-surface string form (case-insensitive
+    /// `"reject"` / `"warn"`). `None` for anything else.
+    pub fn parse_opt(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "reject" => Some(ValidationMode::Reject),
+            "warn" => Some(ValidationMode::Warn),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================

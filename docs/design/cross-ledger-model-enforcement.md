@@ -479,6 +479,25 @@ mode can be added without rewriting the failure taxonomy.
   `f:followOwlImports true` combined with a cross-ledger
   `f:schemaSource` fails closed (`ApiError::OntologyImport`)
   rather than silently reasoning over the starting graph alone.
+- `f:shapesSource` cross-ledger via the same shared resolver.
+  M's SHACL shapes graph is projected into a wire artifact (the
+  full ShapeCompiler predicate whitelist, including `sh:sparql`
+  constraints and their `sh:prefixes`/`owl:imports` closure,
+  plus rdf:list internals) and compiled against D's staged
+  namespace registry at validation time. Enforced on the
+  JSON-LD staging path, the direct-flake Turtle insert path,
+  and `Fluree::validate_ledger` (CLI/HTTP validate); `sh:class`
+  value-set membership is resolved by querying M live at the
+  resolved `t`. Commit replay (graph-sync push) intentionally
+  *skips* SHACL re-validation for cross-ledger sources — the
+  origin already validated against M, and re-resolving M at
+  replay time could see a different head than the origin did
+  (`StagedShaclContext::origin_validated_replay`). Compiled
+  shapes are reused across transactions while M's head `t` and
+  D's shape-affecting epochs are unchanged (see
+  `CachedShapeSource` in `fluree-db-api/src/tx.rs`), so the
+  steady-state per-transaction cost is one nameservice head
+  lookup.
 - Per-request memo + per-instance governance cache, both keyed
   on `(ArtifactKind, canonical_model_ledger_id, graph_iri,
   resolved_t)`.
@@ -512,7 +531,6 @@ materializers aren't implemented. Each lands as a new
   across ledgers) lands separately.
 - `f:ontologyImportMap` cross-ledger (mapping table entries
   whose `f:graphRef` targets another model ledger).
-- `f:shapesSource` cross-ledger (SHACL shapes).
 - `f:rulesSource` cross-ledger (datalog rules). The same-ledger
   routing for `f:rulesSource` is also still pending; the
   cross-ledger path will route through the shared resolver

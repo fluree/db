@@ -1240,6 +1240,54 @@ fn build_single_pattern(
     }
 }
 
+/// Variables whose bindings must survive a `PropertyJoinOperator` block.
+///
+/// `PropertyJoinOperator` demotes any predicate whose object variable is absent
+/// from this set to an **existence-only** (semijoin) constraint: it records that
+/// the subject has *some* object under that predicate and drops the per-subject
+/// object list entirely. That is a set operation, so it collapses a subject's N
+/// objects down to a single row.
+///
+/// `where_dedup_safe` carries exactly the same license as the sequential chain's
+/// early dedup (see [`build_where_operators_with_needed`]): it asserts that
+/// nothing downstream can observe WHERE-output row multiplicity. When it is
+/// false the demotion is **not** sound — the dropped rows are answer rows, and
+/// every multiplicity-sensitive consumer (a plain `COUNT`, a grouped
+/// `COUNT(*)`, or a non-DISTINCT projection read as a bag) silently gets the
+/// subject count where it asked for the row count. So when the license is
+/// absent, every variable object in the block is pinned as needed and the block
+/// produces its full cartesian product.
+///
+/// Bound objects are unaffected: `?s a ex:Gadget` matches at most one flake per
+/// subject, so existence-only carries its multiplicity exactly.
+fn property_join_needed_vars(
+    triples: &[TriplePattern],
+    optional_triples: &[TriplePattern],
+    required_where_vars: Option<&[VarId]>,
+    var_counts: &HashMap<VarId, usize>,
+    protected_vars: &HashSet<VarId>,
+    where_dedup_safe: bool,
+) -> HashSet<VarId> {
+    let mut needed: HashSet<VarId> = HashSet::new();
+    if let Some(rwv) = required_where_vars {
+        needed.extend(rwv.iter().copied());
+    }
+    for (v, c) in var_counts {
+        if *c > 1 || protected_vars.contains(v) {
+            needed.insert(*v);
+        }
+    }
+    if !where_dedup_safe {
+        needed.extend(
+            triples
+                .iter()
+                .chain(optional_triples)
+                .filter_map(|tp| tp.o.as_var()),
+        );
+    }
+    needed
+}
+
 /// Build an operator tree for a property-join-eligible block of triples.
 ///
 /// Constructs a `PropertyJoinOperator` for the triples, then layers deferred
@@ -1255,17 +1303,17 @@ fn build_property_join_block(
     required_where_vars: Option<&[VarId]>,
     var_counts: &HashMap<VarId, usize>,
     protected_vars: &HashSet<VarId>,
+    where_dedup_safe: bool,
     planning: &PlanningContext,
 ) -> Result<Option<BoxedOperator>> {
-    let mut needed: HashSet<VarId> = HashSet::new();
-    if let Some(rwv) = required_where_vars {
-        needed.extend(rwv.iter().copied());
-    }
-    for (v, c) in var_counts {
-        if *c > 1 || protected_vars.contains(v) {
-            needed.insert(*v);
-        }
-    }
+    let mut needed = property_join_needed_vars(
+        triples,
+        optional_triples,
+        required_where_vars,
+        var_counts,
+        protected_vars,
+        where_dedup_safe,
+    );
 
     let mut available_vars: HashSet<VarId> = triples
         .iter()
@@ -2332,6 +2380,7 @@ pub fn build_where_operators_seeded_with_needed(
                         augmented_ref,
                         &var_counts,
                         &protected_vars,
+                        where_dedup_safe,
                         planning,
                     )?;
                 } else {
@@ -3134,16 +3183,16 @@ pub fn build_triple_operators(
         //
         // If an object var is not needed downstream (not in required_where_vars and not
         // otherwise protected), treat that predicate as existence-only (semijoin) to avoid
-        // cartesian-product blowups.
-        let mut needed: HashSet<VarId> = HashSet::new();
-        if let Some(rwv) = ctx.required_where_vars {
-            needed.extend(rwv.iter().copied());
-        }
-        for (v, c) in ctx.var_counts {
-            if *c > 1 || ctx.protected_vars.contains(v) {
-                needed.insert(*v);
-            }
-        }
+        // cartesian-product blowups — but only while `where_dedup_safe` licenses it. See
+        // `property_join_needed_vars`.
+        let needed = property_join_needed_vars(
+            &triples_for_exec,
+            &[],
+            ctx.required_where_vars,
+            ctx.var_counts,
+            ctx.protected_vars,
+            ctx.where_dedup_safe,
+        );
 
         let pj = PropertyJoinOperator::new_with_needed_vars(
             &triples_for_exec,
@@ -3592,6 +3641,47 @@ mod tests {
         assert!(
             !ops.contains(&"PropertyJoinOperator"),
             "the seeded star must not drain the class extent: {ops:?}"
+        );
+    }
+
+    /// #1690: a VALUES over a variable a preceding OPTIONAL introduces must
+    /// build ABOVE that OPTIONAL.
+    ///
+    /// Seeded below it, the VALUES binds `?b` before the left join runs; the
+    /// left join then matches an already-bound `?b` and — dropping nothing —
+    /// lets every driving row out carrying the seeded value, so rows whose
+    /// OPTIONAL bound `?b` to something else are reported with a value the data
+    /// never had. `plan_ops` is root-first, so "above" is the smaller index.
+    #[test]
+    fn values_after_optional_builds_above_the_optional() {
+        use crate::binding::Binding;
+
+        // ?ev <ex:entity1> ?a . OPTIONAL { ?ev <ex:entity2> ?b } . VALUES ?b { <ex:B> }
+        let (ev, a, b) = (VarId(0), VarId(1), VarId(2));
+        let patterns = vec![
+            Pattern::Triple(make_pattern(ev, "entity1", a)),
+            Pattern::Optional(vec![Pattern::Triple(make_pattern(ev, "entity2", b))]),
+            Pattern::Values {
+                vars: vec![b],
+                rows: vec![vec![Binding::iri("ex:B")]],
+            },
+        ];
+
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        let ops = plan_ops(&plan);
+
+        let values_at = ops
+            .iter()
+            .position(|o| *o == "ValuesOperator")
+            .unwrap_or_else(|| panic!("the VALUES must be applied somewhere: {ops:?}"));
+        let optional_at = ops
+            .iter()
+            .position(|o| o.contains("Optional"))
+            .unwrap_or_else(|| panic!("the OPTIONAL must survive planning: {ops:?}"));
+        assert!(
+            values_at < optional_at,
+            "ValuesOperator must sit ABOVE the OPTIONAL, not be seeded below it: {ops:?}"
         );
     }
 
@@ -4241,6 +4331,72 @@ mod tests {
             op.schema(),
             &[VarId(0), VarId(1), VarId(2)],
             "PropertyJoinOperator should be used (schema = [subject, obj1, obj2])"
+        );
+    }
+
+    /// `?0 rdf:type <C> . ?0 <tag> ?1` — a bound-object-anchored star whose
+    /// object var nothing downstream reads. This is the shape from #1700.
+    fn anchored_star() -> Vec<Pattern> {
+        vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from("http://ex/C")),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from("http://ex/tag")),
+                Term::Var(VarId(1)),
+            )),
+        ]
+    }
+
+    fn plan_anchored_star(where_dedup_safe: bool) -> BoxedOperator {
+        // Only the subject survives the WHERE stage — exactly what
+        // `COUNT(*)` / `SELECT ?s` / `SELECT DISTINCT ?s` all request.
+        let needed: HashSet<VarId> = [VarId(0)].into_iter().collect();
+        super::build_where_operators_with_needed(
+            &anchored_star(),
+            None,
+            &needed,
+            &[],
+            where_dedup_safe,
+            Some(&[VarId(0)]),
+            &crate::temporal_mode::PlanningContext::current(),
+        )
+        .expect("plan anchored star")
+    }
+
+    /// Regression (#1700): demoting a variable-object predicate to an
+    /// existence-only semijoin drops a subject's extra objects, so the WHERE
+    /// stage emits one row per subject instead of one row per solution. That is
+    /// a set operation and it is licensed only by `where_dedup_safe`. Without
+    /// the license the object var must stay in the schema so the block produces
+    /// its full cartesian product.
+    #[test]
+    fn test_property_join_keeps_object_var_when_multiplicity_is_observable() {
+        let op = plan_anchored_star(false);
+        assert!(
+            op.schema().contains(&VarId(1)),
+            "object var must survive when downstream can observe row \
+             multiplicity — pruning it collapses N objects to one row and \
+             turns COUNT(*) into a distinct-subject count; schema was {:?}",
+            op.schema()
+        );
+    }
+
+    /// The other direction: the fix must narrow the pruning, not disable it. A
+    /// dedup-safe consumer (`SELECT DISTINCT ?s`, `COUNT(DISTINCT ?s)`) cannot
+    /// observe the multiplicity, so the existence-only demotion must still fire
+    /// and keep the object column out of the schema.
+    #[test]
+    fn test_property_join_still_prunes_object_var_when_dedup_safe() {
+        let op = plan_anchored_star(true);
+        assert_eq!(
+            op.schema(),
+            &[VarId(0)],
+            "a dedup-safe consumer must still get the pruned, existence-only \
+             plan — otherwise the fix is a blanket disable"
         );
     }
 

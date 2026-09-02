@@ -251,3 +251,50 @@ async fn a_task_that_ignores_cancellation_is_aborted_after_the_grace_period() {
         "an aborted straggler must actually be stopped once shutdown returns",
     );
 }
+
+/// Any node can accept a proposal: a FOLLOWER's `propose_via_leader`
+/// relays the command to the leader's `/propose` endpoint, the apply
+/// replicates, and the follower gets the application response back —
+/// the contract that lets a load balancer spread writes across a
+/// group's nodes instead of pinning them to whoever leads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_propose_relays_to_the_leader_and_applies() {
+    let group_id = GroupId::new("counter").expect("valid group id");
+    let nodes: Vec<CounterNode> = vec![
+        start_node(1, &group_id, |_| {}).await,
+        start_node(2, &group_id, |_| {}).await,
+        start_node(3, &group_id, |_| {}).await,
+    ];
+    form_cluster(&nodes).await;
+
+    let leader_id = leader(&nodes).await.id;
+    let follower = nodes
+        .iter()
+        .find(|n| n.id != leader_id)
+        .expect("two followers exist");
+
+    // Direct client_write on the follower refuses — the baseline the
+    // relay exists to fix.
+    let direct = follower
+        .group
+        .raft
+        .client_write(CounterCommand::Add(1))
+        .await;
+    assert!(
+        direct.is_err(),
+        "a follower's direct client_write must refuse"
+    );
+
+    // The relayed propose lands.
+    fluree_raft_core::forward::propose_via_leader(&follower.group.raft, CounterCommand::Add(41))
+        .await
+        .expect("relayed propose applies");
+
+    for node in &nodes {
+        let id = node.id;
+        eventually(&format!("node {id} to converge on 41"), || async {
+            node.group.state.read().await.value == 41
+        })
+        .await;
+    }
+}

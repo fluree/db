@@ -168,6 +168,50 @@ WHERE {
 }
 ```
 
+## Solution Multiplicity: Blank Nodes and LIMIT
+
+A CONSTRUCT template is instantiated once per **solution**, and a WHERE clause
+is a bag — a subject with three `ex:tag` values contributes three solutions,
+not one (SPARQL 1.1 §16.2). Because the result is an RDF graph, identical
+triples built from different solutions collapse into one, so this is usually
+invisible. It becomes visible in exactly two places:
+
+**Blank nodes in the template mint one blank node per solution.** A template
+blank node (`[ ... ]` or `_:b`) is fresh for every solution, so each solution
+produces distinct triples:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+CONSTRUCT { ?s ex:note [ ex:v "seen" ] }
+WHERE { ?s a ex:Gadget . ?s ex:tag ?o }
+```
+
+A gadget with three tags yields three matched solutions and therefore three
+distinct `ex:note` blank nodes — one per solution, not one per gadget. If you
+want one node per subject, make the WHERE clause produce one solution per
+subject (for example, drop the `?s ex:tag ?o` pattern, or move it into a
+subquery with `SELECT DISTINCT ?s`).
+
+**`LIMIT` counts solutions, not output triples.** The slice is applied to the
+solution sequence *before* the template is instantiated, and duplicate triples
+from the surviving solutions still collapse afterward. So
+`CONSTRUCT { ?s ex:flag "y" } WHERE { ?s a ex:Gadget . ?s ex:tag ?o } LIMIT 10`
+can return far fewer than 10 triples: the first 10 solutions may cover only a
+few distinct subjects (a single gadget with 10+ tags covers them all), and
+without an `ORDER BY` which solutions those are is not defined. If you are
+using `LIMIT` to preview *n* subjects, limit the subjects rather than the
+solutions:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+CONSTRUCT { ?s ex:flag "y" }
+WHERE {
+  { SELECT DISTINCT ?s WHERE { ?s a ex:Gadget . ?s ex:tag ?o } LIMIT 10 }
+}
+```
+
 ## Best Practices
 
 1. **Specific Patterns**: Construct specific patterns rather than wildcards
