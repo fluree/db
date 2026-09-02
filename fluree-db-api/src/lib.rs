@@ -3888,7 +3888,18 @@ impl Fluree {
             Err(ApiError::NotFound(_)) => None,
             Err(e) => return Err(e),
         };
-        let probe_view = probe_view.with_default_context(default_context);
+        // A write-decision probe reads asserted data only. Reasoning is a
+        // read-time view over the ledger, not something the ledger holds, so
+        // letting an entailed triple answer "does this already exist?" makes
+        // the branch depend on the reasoner. Worse than a mis-branch: staging
+        // does not reason, so an entailment-only match takes `ON MATCH` and
+        // then updates nothing, and the statement silently writes nothing at
+        // all. Explicit here rather than implicit in the view's origin,
+        // because config-graph defaults are completed at query preparation
+        // (`complete_config_defaults`) for every view that reaches it.
+        let probe_view = probe_view
+            .with_default_context(default_context)
+            .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::none());
 
         match cw {
             ConditionalCypherWrite::MergeSet { merge, trailing } => {

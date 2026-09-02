@@ -3453,3 +3453,314 @@ async fn anonymous_request_unenforced_despite_config_default_allow_false() {
         "anonymous requests remain unenforced regardless of config default-allow"
     );
 }
+
+// =============================================================================
+// Reasoning defaults: mode spelling, `f:schemaSource`, and the SPARQL path
+// =============================================================================
+//
+// `reasoning_defaults_apply` above covers one config shape on the JSON-LD
+// connection path, which resolves config while building its view. These
+// cover the path that does not: a view built by `GraphDb::from_ledger_state`
+// and queried with `Fluree::query`, which reaches query preparation carrying
+// no resolved config. That is the crate-level shape of fluree/db#1577 —
+// every test below fails without `complete_config_defaults`.
+//
+// They also widen the config surface along the three dimensions a real
+// config varies in: the mode written as an uppercase IRI (`f:RDFS`), an
+// `f:schemaSource` GraphRef naming the default graph, and the SPARQL
+// front-end.
+
+/// Seed the subProperty ontology + data, then write a reasoning config.
+///
+/// `extra_stmts` carries any additional statements on
+/// `<urn:config:reasoning>` the caller needs.
+async fn seed_reasoning_defaults_with(
+    ledger_id: &str,
+    modes_stmt: &str,
+    extra_stmts: &str,
+) -> fluree_db_api::Fluree {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                },
+                "@graph": [
+                    {"@id": "ex:childName", "rdfs:subPropertyOf": {"@id": "ex:name"}},
+                    {"@id": "ex:alice", "ex:childName": "Alice"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+            {modes_stmt}
+            {extra_stmts}
+        }}
+    "
+    );
+    fluree
+        .stage_owned(result.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+
+    fluree
+}
+
+/// An `f:schemaSource` block: a `f:GraphRef` whose nested `f:graphSource`
+/// selects the ledger's default graph.
+const SCHEMA_SOURCE_DEFAULT_GRAPH: &str = r"
+            <urn:config:reasoning> f:schemaSource <urn:config:reasoning:source> .
+            <urn:config:reasoning:source> rdf:type f:GraphRef .
+            <urn:config:reasoning:source> f:graphSource <urn:config:reasoning:source:graph> .
+            <urn:config:reasoning:source:graph> f:graphSelector f:defaultGraph .";
+
+/// Run the JSON-LD query that the RDFS subProperty expansion should answer.
+///
+/// Deliberately goes through `GraphDb::from_ledger_state` + `Fluree::query`
+/// rather than `query_connection`: that pair is the crate's documented
+/// quickstart path (see the `lib.rs` module docs), and it is the one that
+/// hands query preparation a view with no resolved config — the same shape
+/// the ledger-scoped server routes build, and the shape that made
+/// fluree/db#1577 reproduce. Routing these through `query_connection`
+/// instead would make every assertion below pass with or without the fix.
+async fn entailed_names_jsonld(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> serde_json::Value {
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:name": "?v"}
+    });
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+    let result = fluree.query(&db, &query).await.expect("query");
+    result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld")
+}
+
+/// Run the same query as SPARQL, over the same bare view.
+async fn entailed_names_sparql(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    prologue: &str,
+) -> Vec<serde_json::Value> {
+    let sparql = format!(
+        "{prologue}PREFIX ex: <http://example.org/>
+         SELECT ?v WHERE {{ ex:alice ex:name ?v }}"
+    );
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+    let result = fluree.query(&db, &sparql).await.expect("sparql query");
+    let json = result
+        .to_sparql_json(&ledger_state.snapshot)
+        .expect("to_sparql_json");
+    support::normalize_sparql_bindings(&json)
+}
+
+/// Mode names are matched case-insensitively once the namespace prefix is
+/// stripped, so the uppercase IRI `f:RDFS` names the same mode as `f:rdfs`.
+#[tokio::test]
+async fn reasoning_modes_uppercase_iri_engages() {
+    let ledger_id = "it/config-reasoning-uppercase-mode:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:RDFS .",
+        "",
+    )
+    .await;
+
+    assert_eq!(
+        entailed_names_jsonld(&fluree, ledger_id).await,
+        json!(["Alice"]),
+        "`f:reasoningModes f:RDFS` should engage RDFS reasoning"
+    );
+}
+
+/// Config defaults reach the SPARQL front-end, not only JSON-LD.
+#[tokio::test]
+async fn reasoning_defaults_apply_on_sparql_path() {
+    let ledger_id = "it/config-reasoning-sparql:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        "",
+    )
+    .await;
+
+    let bindings = entailed_names_sparql(&fluree, ledger_id, "").await;
+    assert_eq!(
+        bindings.len(),
+        1,
+        "config RDFS defaults should apply on the SPARQL path, got {bindings:?}"
+    );
+    assert_eq!(bindings[0]["v"]["value"], json!("Alice"));
+}
+
+/// An `f:schemaSource` naming the default graph resolves to the graph the
+/// ontology already lives in, so it neither adds nor removes entailments.
+#[tokio::test]
+async fn reasoning_defaults_with_default_graph_schema_source_engage() {
+    let ledger_id = "it/config-reasoning-schema-source:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        SCHEMA_SOURCE_DEFAULT_GRAPH,
+    )
+    .await;
+
+    assert_eq!(
+        entailed_names_jsonld(&fluree, ledger_id).await,
+        json!(["Alice"]),
+        "an `f:schemaSource` selecting the default graph should not suppress reasoning"
+    );
+}
+
+/// All three dimensions at once — uppercase mode IRI, `f:schemaSource`,
+/// SPARQL — with a pragma control that leaves the mode source as the only
+/// difference between the two queries.
+#[tokio::test]
+async fn config_reasoning_matches_pragma_reasoning() {
+    let ledger_id = "it/config-reasoning-combined:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:RDFS .",
+        SCHEMA_SOURCE_DEFAULT_GRAPH,
+    )
+    .await;
+
+    // Control: the same query with the modes supplied per-query instead.
+    let with_pragma = entailed_names_sparql(&fluree, ledger_id, "# PRAGMA reasoning: rdfs\n").await;
+    assert_eq!(
+        with_pragma.len(),
+        1,
+        "pragma control should entail, got {with_pragma:?}"
+    );
+
+    let without_pragma = entailed_names_sparql(&fluree, ledger_id, "").await;
+    assert_eq!(
+        without_pragma.len(),
+        1,
+        "config defaults should entail without the pragma, got {without_pragma:?}"
+    );
+    assert_eq!(without_pragma[0]["v"]["value"], json!("Alice"));
+}
+
+// =============================================================================
+// Config defaults vs. an explicit view-level reasoning wrapper
+// =============================================================================
+//
+// Config supplies *defaults*. A caller who attaches reasoning to the view has
+// made a decision, and `with_reasoning_precedence` overwrites `reasoning`
+// outright, so applying config defaults after the caller would discard that
+// decision with no way to recover it: `effective_reasoning` arbitrates only
+// between the wrapper and the query's own modes, never against a wrapper that
+// was already thrown away.
+//
+// Both directions are pinned, so a guard that simply stops applying config
+// cannot pass.
+
+/// Run the entailment query against a caller-built view.
+async fn entailed_names_for_view(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    view: &fluree_db_api::GraphDb,
+) -> serde_json::Value {
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:name": "?v"}
+    });
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let result = fluree.query(view, &query).await.expect("query");
+    result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld")
+}
+
+/// A caller who turns reasoning off keeps it off, even though the ledger
+/// configures `f:reasoningModes f:rdfs`.
+#[tokio::test]
+async fn explicit_view_reasoning_none_survives_config_defaults() {
+    let ledger_id = "it/config-reasoning-explicit-none:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        "",
+    )
+    .await;
+
+    // The documented quickstart shape: load a view, then attach reasoning.
+    let view = fluree
+        .db(ledger_id)
+        .await
+        .expect("db")
+        .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::none());
+
+    assert_eq!(
+        entailed_names_for_view(&fluree, ledger_id, &view).await,
+        json!([]),
+        "an explicit `with_reasoning(none())` must not be overwritten by config defaults"
+    );
+}
+
+/// The converse: a caller who turns reasoning on keeps it on, even though the
+/// ledger configures `f:reasoningModes f:none`. Without this, a guard that
+/// merely stopped applying config would look correct.
+#[tokio::test]
+async fn explicit_view_reasoning_on_survives_config_none() {
+    let ledger_id = "it/config-reasoning-explicit-on:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:none .",
+        "",
+    )
+    .await;
+
+    let view = fluree
+        .db(ledger_id)
+        .await
+        .expect("db")
+        .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::rdfs());
+
+    assert_eq!(
+        entailed_names_for_view(&fluree, ledger_id, &view).await,
+        json!(["Alice"]),
+        "an explicit `with_reasoning(rdfs())` must survive a config default of `f:none`"
+    );
+}
+
+/// Control: with no wrapper attached, the ledger's config still governs.
+/// This is the fluree/db#1577 behavior, and the guard above must not weaken it.
+#[tokio::test]
+async fn config_defaults_still_apply_without_an_explicit_wrapper() {
+    let ledger_id = "it/config-reasoning-no-wrapper:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        "",
+    )
+    .await;
+
+    let view = fluree.db(ledger_id).await.expect("db");
+
+    assert_eq!(
+        entailed_names_for_view(&fluree, ledger_id, &view).await,
+        json!(["Alice"]),
+        "config defaults must still apply to a view the caller left alone"
+    );
+}

@@ -110,8 +110,9 @@ impl Fluree {
     /// config graph is empty.
     ///
     /// Note: Reasoning defaults are NOT applied here — they are applied at
-    /// the request boundary via `config_resolver::merge_reasoning()` which
-    /// respects override control and server-verified identity.
+    /// query preparation by [`complete_config_defaults`](Self::complete_config_defaults),
+    /// via `config_resolver::merge_reasoning()`, which respects override
+    /// control and server-verified identity.
     pub(crate) async fn resolve_and_attach_config(&self, view: GraphDb) -> Result<GraphDb> {
         // Config reads are best-effort. If the config graph is unqueryable
         // (e.g., historical snapshot without a range_provider for g_id=2),
@@ -933,6 +934,14 @@ impl Fluree {
         let budget = config_resolver::config_reasoning_budget(resolved, server_identity);
 
         let view = match config_resolver::merge_reasoning(resolved, server_identity) {
+            // Config supplies *defaults*, so it must not overwrite reasoning
+            // the caller attached to the view. `with_reasoning_precedence`
+            // replaces `reasoning` outright, and `effective_reasoning`
+            // arbitrates only between the wrapper and the query's own modes,
+            // so a wrapper discarded here cannot be recovered downstream --
+            // not even one set with `Force`. The budget below still applies:
+            // a ledger's materialization cap governs whichever modes win.
+            Some(_) if view.reasoning().is_some() => view,
             Some((mode_strings, precedence)) => {
                 let modes = ReasoningModes::from_mode_strings(&mode_strings);
                 // Always wrap if modes has enabled flags or explicit_none=true
@@ -960,6 +969,29 @@ impl Fluree {
     pub fn apply_config_defaults(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
         let view = self.apply_config_reasoning(view, server_identity);
         self.apply_config_datalog(view, server_identity)
+    }
+
+    /// Return `view` with its ledger's config-graph defaults in force,
+    /// resolving the config graph first when the view doesn't carry it yet.
+    ///
+    /// Views reach query preparation in two states. One built through
+    /// [`db()`](Self::db) carries a resolved config; one built straight from a
+    /// `LedgerState` via `GraphDb::from_ledger_state` — the sync constructor
+    /// the ledger-scoped server routes use — carries none, because config
+    /// resolution is async. Neither carries the reasoning/datalog wrappers
+    /// derived from that config. Completing both here rather than at each
+    /// view-construction site is what keeps a configured `f:reasoningDefaults`
+    /// from being silently dropped by whichever route built the view
+    /// (fluree/db#1577).
+    ///
+    /// A ledger with an empty config graph re-resolves on every query, but
+    /// `resolve_ledger_config` short-circuits that case before it scans.
+    pub(crate) async fn complete_config_defaults(&self, view: &GraphDb) -> Result<GraphDb> {
+        let view = match view.resolved_config() {
+            Some(_) => view.clone(),
+            None => self.resolve_and_attach_config(view.clone()).await?,
+        };
+        Ok(self.apply_config_defaults(view, None))
     }
 
     /// Apply config-graph datalog defaults to a view.

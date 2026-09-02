@@ -473,6 +473,31 @@ impl Fluree {
         }
     }
 
+    /// A [`seq_probe_view`](Self::seq_probe_view) that reads asserted data
+    /// only, for the MERGE guard and its re-bind.
+    ///
+    /// Those two decide what gets written: the guard picks match-vs-create per
+    /// row, and the re-bind then binds the pattern's variables from the rows
+    /// it settled. Reasoning is a read-time view over the ledger rather than
+    /// something the ledger holds, so an entailed triple must not answer
+    /// "does this row already match?" -- staging does not reason, so a row
+    /// matched by entailment alone is neither created nor updatable.
+    ///
+    /// `seq_probe_view` itself stays reasoning-enabled: it also backs the
+    /// statement's own read clauses and its trailing RETURN, which are
+    /// ordinary reads and should see entailments like any other query.
+    async fn seq_decision_view(
+        &self,
+        state: &LedgerState,
+        governance: Option<&GovernanceOptions>,
+        default_context: Option<&serde_json::Value>,
+    ) -> Result<GraphDb> {
+        Ok(self
+            .seq_probe_view(state, governance, default_context)
+            .await?
+            .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::none()))
+    }
+
     /// Stage a CREATE clause seeded with the row table, then extend the table
     /// with the created entities' skolem Sids (row `i` ↔ WHERE solution `i`;
     /// the seeded WHERE is a single `VALUES` block, which preserves row
@@ -570,7 +595,7 @@ impl Fluree {
         // ---- Probe: which rows already match the pattern? ----------------
         let matched_rows: std::collections::HashSet<usize> = {
             let view = self
-                .seq_probe_view(stager.state(), governance, default_context)
+                .seq_decision_view(stager.state(), governance, default_context)
                 .await?;
             if table.is_seeded() {
                 let ast = seeded_pattern_query(
@@ -672,7 +697,7 @@ impl Fluree {
         let new_vars = merge_new_vars(table, part);
         if !new_vars.is_empty() || table.is_seeded() {
             let view = self
-                .seq_probe_view(stager.state(), governance, default_context)
+                .seq_decision_view(stager.state(), governance, default_context)
                 .await?;
             let mut projections = vec![row_idx_projection(span)];
             for c in &table.cols {
