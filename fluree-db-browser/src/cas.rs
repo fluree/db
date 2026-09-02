@@ -772,7 +772,7 @@ pub(crate) mod tests {
                     } => {
                         let script = {
                             let mut s = state.lock().unwrap();
-                            s.sse_log.push((url, headers));
+                            s.sse_log.push((url, headers.0));
                             s.sse_script.pop_front()
                         };
                         match script {

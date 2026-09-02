@@ -20,7 +20,7 @@
 //! v1 browser peer).
 
 use crate::bridge::{IoHandle, TokenCell};
-use crate::protocol::IoJob;
+use crate::protocol::{IoJob, SseHeaders};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_api::{Fluree, NotifyResult, NsNotify};
@@ -141,7 +141,7 @@ impl SseChunkSource for ChannelSseSource {
         self.io
             .send(IoJob::SseOpen {
                 url: self.url.clone(),
-                headers: self.headers(),
+                headers: SseHeaders(self.headers()),
                 ready,
                 chunks: chunk_tx,
             })
