@@ -48,16 +48,32 @@ async fn resolve_config(dirs: &FlureeDir) -> CliResult<DocConfig> {
     let Some(remote_name) = config.remote.clone() else {
         return Ok(config);
     };
-    let (client, remote_dirs) = match context::build_remote_client(&remote_name, dirs).await {
-        Ok(client) => (client, dirs.clone()),
-        Err(CliError::NotFound(_)) => {
-            let global = FlureeDir::global().ok_or_else(|| {
-                CliError::NotFound(format!("doc.remote '{remote_name}': no such remote"))
-            })?;
-            let client = context::build_remote_client(&remote_name, &global).await?;
-            (client, global)
+    // Project config first; then `~/.fluree`, which is where a `fluree
+    // remote add` run from the home directory lands; then the platform
+    // config directory.
+    let mut candidates = vec![dirs.clone()];
+    if let Some(home) = dirs::home_dir() {
+        let dot = home.join(fluree_db_api::server_defaults::FLUREE_DIR);
+        if dot.is_dir() {
+            candidates.push(FlureeDir::unified(dot));
         }
-        Err(e) => return Err(e),
+    }
+    candidates.extend(FlureeDir::global());
+    let mut found = None;
+    for candidate in candidates {
+        match context::build_remote_client(&remote_name, &candidate).await {
+            Ok(client) => {
+                found = Some((client, candidate));
+                break;
+            }
+            Err(CliError::NotFound(_)) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let Some((client, remote_dirs)) = found else {
+        return Err(CliError::NotFound(format!(
+            "doc.remote '{remote_name}': no such remote\n  hint: fluree remote add {remote_name} <url>"
+        )));
     };
     // A cheap authenticated call: on an expired login the client refreshes,
     // and the refreshed token is what the model slots must carry.
