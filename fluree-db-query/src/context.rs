@@ -190,8 +190,28 @@ pub type FulltextProviders = HashMap<(GraphId, u32, u16), Arc<FulltextArena>>;
 ///
 /// Scoping: contexts that swap the overlay (`with_graph_ref`) start a fresh
 /// memo, mirroring `const_sid_cache`; same-overlay derivations share it.
-pub type TranslatedOverlayCache =
-    Arc<Mutex<FxHashMap<(u64, GraphId, IndexType), Arc<crate::binary_scan::TranslatedOverlayOps>>>>;
+///
+/// The key's `OverlayWalkScope` distinguishes the whole-overlay product from
+/// the subject-/predicate-bounded ones a bound-term scan builds instead, so the
+/// two never alias. Only `Whole` products are actually inserted: a bounded
+/// walk is a sub-microsecond seek even uncached, and per-row join probes bind
+/// a distinct subject per left row — memoizing bounded products would grow
+/// this map by one entry per probed subject for the execution's lifetime with
+/// no eviction. The scope stays in the key as a type-level guard against a
+/// future bounded insert aliasing the whole product.
+pub type TranslatedOverlayCache = Arc<
+    Mutex<
+        FxHashMap<
+            (
+                u64,
+                GraphId,
+                IndexType,
+                crate::binary_scan::OverlayWalkScope,
+            ),
+            Arc<crate::binary_scan::TranslatedOverlayOps>,
+        >,
+    >,
+>;
 
 /// Execution context providing access to database and query state.
 ///

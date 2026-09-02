@@ -33,7 +33,7 @@
 use std::time::Instant;
 
 use fluree_bench_support::gen::people::{generate_txn_data, txn_data_to_jsonld};
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{FlureeBuilder, ReindexOptions};
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -128,6 +128,155 @@ async fn transact_growth_slope() {
         assert!(
             slope_per_1k <= max,
             "growth slope {slope_per_1k:.1} us/1k novelty flakes exceeds ceiling {max:.1}"
+        );
+    }
+}
+
+/// Per-DELETE cost vs accumulated novelty — the WHERE-execution slope.
+///
+/// [`transact_growth_slope`] drives pure inserts, which carry no WHERE clause
+/// and so never open a scan. This lane measures the other half: a bound-subject
+/// `DELETE { <s> ?p ?o } WHERE { <s> ?p ?o }` against a subject that is present
+/// in the PERSISTED index (the base is reindexed once up front), which is the
+/// shape whose `where_exec` p90 tracked novelty linearly in fluree/db#1722.
+///
+/// Each iteration commits one filler insert to grow novelty, then times one
+/// delete. Only the delete is timed, and its cost is fitted against novelty
+/// size. Before the bounded-overlay fix the scan translated the whole overlay
+/// on every open, so the slope was large with R² ≈ 1; after it the walk seeks a
+/// subject-bracketed window and the slope should collapse toward the intercept.
+///
+/// Manual run:
+///   cargo test -p fluree-db-api --test grp_transact delete_where_growth_slope \
+///     --features native --release -- --ignored --nocapture
+///
+/// Knobs: DELETE_GROWTH_SUBJECTS (default 4000), DELETE_GROWTH_DELETES
+/// (default 400), DELETE_GROWTH_FILLER (nodes per filler commit, default 10),
+/// DELETE_GROWTH_MAX_SLOPE_US_PER_1K (unset = report only; set = assert).
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "perf measurement; run manually with --release --ignored --nocapture"]
+async fn delete_where_growth_slope() {
+    use serde_json::json;
+
+    let subjects = env_usize("DELETE_GROWTH_SUBJECTS", 4000);
+    let deletes = env_usize("DELETE_GROWTH_DELETES", 400);
+    let filler = env_usize("DELETE_GROWTH_FILLER", 10);
+    assert!(deletes < subjects, "need a distinct subject per delete");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Thresholds far above anything this test produces: novelty grows
+    // monotonically after the one explicit reindex below.
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .with_indexing_thresholds(usize::MAX / 4, usize::MAX / 2)
+        .build()
+        .expect("build");
+
+    let mut ledger = fluree
+        .create_ledger("growth/delete:main")
+        .await
+        .expect("create_ledger");
+
+    // Base: offer-shaped subjects, ~6 triples each.
+    let chunk = 1000;
+    let mut lo = 0;
+    while lo < subjects {
+        let hi = (lo + chunk).min(subjects);
+        let graph: Vec<_> = (lo..hi)
+            .map(|i| {
+                json!({
+                    "@id": format!("http://example.org/offer{i}"),
+                    "http://example.org/name": format!("offer {i}"),
+                    "http://example.org/price": i as i64,
+                    "http://example.org/tag": "base"
+                })
+            })
+            .collect();
+        ledger = fluree
+            .insert(ledger, &json!({ "@graph": graph }))
+            .await
+            .expect("seed")
+            .ledger;
+        lo = hi;
+    }
+
+    // Put the base behind the persisted index. Subjects now resolve in the
+    // store dictionary, so a bound-subject scan takes the indexed path (a
+    // novelty-only subject would divert to the overlay-only fallback, which
+    // already seeks and would hide the regression this lane exists to catch).
+    fluree
+        .reindex("growth/delete:main", ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    // (novelty_flakes, delete_us) per iteration.
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(deletes);
+    let mut first_us = 0u128;
+    let mut last_us = 0u128;
+
+    for i in 0..deletes {
+        // Grow novelty with data unrelated to the subject being deleted.
+        let graph: Vec<_> = (0..filler)
+            .map(|k| {
+                json!({
+                    "@id": format!("http://example.org/filler{i}-{k}"),
+                    "http://example.org/name": format!("filler {i} {k}"),
+                    "http://example.org/price": k as i64,
+                    "http://example.org/tag": "filler"
+                })
+            })
+            .collect();
+        ledger = fluree
+            .insert(ledger, &json!({ "@graph": graph }))
+            .await
+            .expect("filler")
+            .ledger;
+
+        let subject = format!("http://example.org/offer{i}");
+        let update = json!({
+            "where":  {"@id": subject, "?p": "?o"},
+            "delete": {"@id": subject, "?p": "?o"}
+        });
+
+        let novelty_before = ledger.novelty().len() as f64;
+        let start = Instant::now();
+        let res = fluree.update(ledger, &update).await.expect("delete");
+        let elapsed_us = start.elapsed().as_micros();
+        ledger = res.ledger;
+
+        pts.push((novelty_before, elapsed_us as f64));
+        if i == 0 {
+            first_us = elapsed_us;
+        }
+        last_us = elapsed_us;
+    }
+
+    let (slope_per_flake, intercept, r2) = linreg(&pts);
+    let slope_per_1k = slope_per_flake * 1000.0;
+    let final_novelty = ledger.novelty().len();
+    let ratio = last_us as f64 / first_us.max(1) as f64;
+
+    eprintln!("\n================= delete-where growth slope =================");
+    eprintln!(
+        "base_subjects={subjects} deletes={deletes} filler_nodes/commit={filler} \
+         final_novelty={final_novelty} flakes"
+    );
+    eprintln!("DELETE_SLOPE_US_PER_1K_NOVELTY_FLAKES = {slope_per_1k:.3}");
+    eprintln!("DELETE_R2 = {r2:.4}");
+    eprintln!("fixed cost (intercept) = {intercept:.1} us/delete");
+    eprintln!("first_delete_us={first_us} last_delete_us={last_us} ratio={ratio:.1}x");
+    eprintln!("=============================================================");
+    eprintln!("(metric: SLOPE should collapse toward the intercept after #1722)");
+
+    assert_eq!(pts.len(), deletes, "recorded one point per delete");
+    assert!(final_novelty > 0, "novelty accumulated");
+
+    if let Ok(raw) = std::env::var("DELETE_GROWTH_MAX_SLOPE_US_PER_1K") {
+        let max: f64 = raw
+            .parse()
+            .expect("DELETE_GROWTH_MAX_SLOPE_US_PER_1K must be a number");
+        assert!(
+            slope_per_1k <= max,
+            "delete-where slope {slope_per_1k:.1} us/1k novelty flakes exceeds ceiling {max:.1}"
         );
     }
 }

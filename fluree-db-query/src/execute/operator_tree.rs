@@ -3260,6 +3260,17 @@ pub(crate) fn apply_solution_modifiers(
     variable_deps: Option<&VariableDeps>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // The partitioned hint promises the child stream arrives grouped by the
+    // GROUP BY key (comparator-adjacent), which only current-mode scans
+    // honor. A history plan's scan emits the *event stream* in collection
+    // order — persisted sidecar + base rows first, then novelty appended
+    // (`BinaryHistoryScanOperator::collect_history_flakes`) — so one key's
+    // rows are not adjacent once any part of the range is index-served, and
+    // the adjacency-based streaming lane would emit one group per key *run*
+    // (e.g. `GROUP BY ?s COUNT(*)` splitting every subject into per-source
+    // groups of 1). Demote here, next to the consumer, so no caller can
+    // reintroduce the unsound combination.
+    let partitioned = partitioned && !planning.is_history();
     // Flatten the grouping phase's data for consumption below. The variant
     // distinction has already done its structural work at the IR boundary; the
     // tail treats both variants uniformly. Cloning is cheap — both vectors are
