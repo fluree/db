@@ -21,6 +21,7 @@ pub const OWL: &str = "http://www.w3.org/2002/07/owl#";
 pub const SCHEMA: &str = "https://schema.org/";
 pub const SKOS: &str = "http://www.w3.org/2004/02/skos/core#";
 pub const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+pub const SHACL: &str = "http://www.w3.org/ns/shacl#";
 
 /// Prefixes the model text and the gate understand in both spellings, so
 /// `schema:Person` and `https://schema.org/Person` name one class.
@@ -31,6 +32,7 @@ pub const PREFIXES: &[(&str, &str)] = &[
     ("schema", SCHEMA),
     ("skos", SKOS),
     ("xsd", XSD),
+    ("sh", SHACL),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,9 +173,25 @@ impl Model {
 
     /// Queries whose rows [`ModelBuilder::add_property_rows`] takes, each
     /// with the kind its anchor implies: anything typed `rdf:Property` or an
-    /// OWL property class, and anything with a declared domain.
+    /// OWL property class, anything with a declared domain, and every
+    /// `sh:path` of a property shape on a node shape with a target class,
+    /// which is how a Fluree model usually declares its properties.
     pub fn property_queries() -> Vec<(Value, PropertyKind)> {
-        let mut queries = Vec::new();
+        let mut queries = vec![(
+            json!({
+                "@context": query_context(),
+                "where": [
+                    { "@id": "?shape", "sh:targetClass": "?domain", "sh:property": "?ps" },
+                    { "@id": "?ps", "sh:path": "?s" },
+                    ["optional", { "@id": "?ps", "sh:name": "?label" }],
+                    ["optional", { "@id": "?ps", "sh:description": "?comment" }],
+                    ["optional", { "@id": "?ps", "sh:class": "?range" }],
+                    ["optional", { "@id": "?ps", "sh:datatype": "?range" }]
+                ],
+                "select": ["?s", "?label", "?comment", "?domain", "?range"]
+            }),
+            PropertyKind::Unknown,
+        )];
         for (anchor, kind) in [
             (
                 json!({ "@id": "?s", "@type": "rdf:Property" }),
@@ -811,6 +829,43 @@ mod tests {
         );
         assert_eq!(m.class_iri("person").as_deref(), Some("schema:Person"));
         assert_eq!(m.class_iri("schema:Thing"), None);
+    }
+
+    #[test]
+    fn shacl_shapes_declare_properties() {
+        let q = Model::property_queries();
+        assert_eq!(q[0].0["where"][0]["sh:targetClass"], "?domain");
+        assert_eq!(q[0].0["where"][1]["sh:path"], "?s");
+        // Rows as that query returns them: the domain is the shape's target
+        // class, the range is sh:class or sh:datatype.
+        let mut b = ModelBuilder::default();
+        b.add_class_rows(&[
+            json!(["mg:Drawing", "Drawing", null, null]),
+            json!(["mg:Part", "Part", null, null]),
+        ]);
+        b.add_property_rows(
+            &[
+                json!(["mg:depicts", "depicts", null, "mg:Drawing", "mg:Part"]),
+                json!([
+                    "mg:drawingNumber",
+                    "Drawing number",
+                    "The title-block number",
+                    "mg:Drawing",
+                    "xsd:string"
+                ]),
+            ],
+            PropertyKind::Unknown,
+        );
+        let m = b.build();
+        assert_eq!(m.properties()[0].kind, PropertyKind::Object);
+        assert_eq!(m.properties()[1].kind, PropertyKind::Datatype);
+        assert_eq!(
+            m.judge("depicts", &[]),
+            Verdict::Repaired {
+                property: "mg:depicts".into(),
+                note: "compact-form"
+            }
+        );
     }
 
     #[test]

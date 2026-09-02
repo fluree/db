@@ -48,6 +48,10 @@ struct ParseMeta {
     escalation_skipped: Option<String>,
 }
 
+/// Bumped when the way an extraction is asked changes without the prompt
+/// text changing (v2: system prompt as a system message, not `instructions`).
+const EXTRACTION_CACHE_VERSION: &str = "v2";
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -134,8 +138,12 @@ impl DocCache {
     }
 
     /// Key for one chunk's extraction: who was asked, and exactly what.
+    /// The version covers how the ask is carried on the wire, so answers
+    /// given before a transport fix are not reused.
     pub fn extraction_key(model: &str, system: &str, user: &str) -> String {
         let mut h = Sha256::new();
+        h.update(EXTRACTION_CACHE_VERSION.as_bytes());
+        h.update([0]);
         h.update(model.as_bytes());
         h.update([0]);
         h.update(system.as_bytes());

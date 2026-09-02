@@ -158,14 +158,19 @@ impl LlmClient {
                 }),
             })
             .collect();
+        // The system prompt travels as a system-role message with string
+        // content, not as `instructions`: the Fluree AI gateway forwards the
+        // former and drops the latter, and OpenAI accepts both.
+        let mut input = Vec::new();
+        if let Some(system) = req.system {
+            input.push(serde_json::json!({ "role": "system", "content": system }));
+        }
+        input.push(serde_json::json!({ "role": "user", "content": content }));
         let mut body = serde_json::json!({
-            "input": [{ "role": "user", "content": content }],
+            "input": input,
             "stream": false,
             "fluree": { "intent": req.intent }
         });
-        if let Some(system) = req.system {
-            body["instructions"] = serde_json::json!(system);
-        }
         if !self.endpoint.model.eq_ignore_ascii_case("auto") {
             body["model"] = serde_json::json!(self.endpoint.model);
         }
@@ -286,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_body_uses_instructions_intent_and_auto_model() {
+    fn responses_body_uses_system_message_intent_and_auto_model() {
         let req = Request {
             system: Some("sys"),
             parts: vec![
@@ -301,14 +306,15 @@ mod tests {
             max_tokens: 10,
         };
         let body = client(WireApi::Responses).responses_body(&req);
-        assert_eq!(body["instructions"], "sys");
+        assert_eq!(body["input"][0]["role"], "system");
+        assert_eq!(body["input"][0]["content"], "sys");
         assert_eq!(body["fluree"]["intent"], "doc-parse");
         assert!(
             body.get("model").is_none(),
             "auto leaves the model to the gateway"
         );
-        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
-        assert!(body["input"][0]["content"][1]["image_url"]
+        assert_eq!(body["input"][1]["content"][1]["type"], "input_image");
+        assert!(body["input"][1]["content"][1]["image_url"]
             .as_str()
             .unwrap()
             .starts_with("data:image/png;base64,"));

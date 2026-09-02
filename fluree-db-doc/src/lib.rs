@@ -34,6 +34,7 @@ pub mod ingest;
 pub mod llm;
 pub mod model;
 pub mod parse;
+pub mod payload_fit;
 pub mod prompt;
 pub mod vocab;
 

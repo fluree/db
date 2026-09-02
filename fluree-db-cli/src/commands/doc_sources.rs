@@ -156,6 +156,30 @@ pub struct LoadedGazetteer {
 
 /// Every label from every source, plus the entities earlier runs minted
 /// into the target ledger, so a name already on a node keeps that node.
+/// A `#Class` scope must be something the label queries can name: a full
+/// IRI, or a compact form under a prefix they know.
+fn check_class_scope(source: &Source) -> CliResult<()> {
+    let Some(class) = &source.class else {
+        return Ok(());
+    };
+    if class.contains("://") || class.starts_with("urn:") {
+        return Ok(());
+    }
+    let known = fluree_db_doc::model::PREFIXES
+        .iter()
+        .map(|(p, _)| *p)
+        .chain(std::iter::once("doc"));
+    let prefix = class.split_once(':').map(|(p, _)| p).unwrap_or("");
+    if known.clone().any(|k| k == prefix) {
+        return Ok(());
+    }
+    Err(CliError::Usage(format!(
+        "--entities {}: class scope '{class}' uses a prefix the scan does not know; write the full IRI (known prefixes: {})",
+        source.label(),
+        known.collect::<Vec<_>>().join(", ")
+    )))
+}
+
 pub async fn load_gazetteer(
     sources: &[Source],
     target: Option<(&Fluree, &str)>,
@@ -165,6 +189,7 @@ pub async fn load_gazetteer(
     let mut builder = GazetteerBuilder::default();
     let mut counts = Vec::new();
     for source in sources {
+        check_class_scope(source)?;
         let opened = Opened::open(source, dirs).await?;
         let mut n = 0;
         for (query, predicate) in Gazetteer::queries(source.class.as_deref()) {

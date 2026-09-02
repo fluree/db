@@ -20,6 +20,7 @@ use std::collections::HashMap;
 pub const LABEL_PREDICATES: &[&str] = &[
     "skos:prefLabel",
     "schema:name",
+    "schema:legalName",
     "rdfs:label",
     "skos:altLabel",
     "schema:alternateName",

@@ -20,6 +20,7 @@
 use crate::cache::DocCache;
 use crate::config::ModelEndpoint;
 use crate::llm::{LlmClient, Part, Request};
+use crate::payload_fit::{fit_under_cap, MAX_CROP_BYTES};
 use crate::{DocError, Result};
 use fluree_doc_pdf::document::Analysis;
 use fluree_doc_pdf::escalate::{self, Crop, Readings};
@@ -125,9 +126,18 @@ impl VlmReader {
         if let Some(hit) = self.cache.as_ref().and_then(|c| c.load_reading(&key)) {
             return Ok(hit);
         }
+        // The cache is keyed on the pixels as rendered; what is sent may
+        // be a smaller re-encoding of them.
+        let fitted = fit_under_cap(image, mime, MAX_CROP_BYTES)?;
         let reading = self.client.complete(&Request {
             system: None,
-            parts: vec![Part::Text(prompt), Part::Image { mime, bytes: image }],
+            parts: vec![
+                Part::Text(prompt),
+                Part::Image {
+                    mime: fitted.mime,
+                    bytes: &fitted.bytes,
+                },
+            ],
             intent: "doc-parse",
             json: false,
             max_tokens: MAX_TOKENS,

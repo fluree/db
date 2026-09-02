@@ -27,7 +27,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--max-chars <N>` | Split a single element longer than this many characters (default `2000`). |
 | `--max-crops <N>` | Most crops one document may send to the vision model (default `70`). A document asking for more lands with the deterministic tier only and is flagged. |
 | `--model <LEDGER\|FILE>` | Ontology the language model extracts against: classes and properties from a ledger or a `.ttl` / `.jsonld` / `.nt` / `.json` file. Needs the `llm` slot or a Fluree AI account. |
-| `--entities <LEDGER\|FILE[#CLASS]>` | Known entities to find by label (`skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:alternateName`). Repeatable; `#Class` keeps only subjects of that type. A mention keeps the entity's own IRI. Works without `--model` and without any model. |
+| `--entities <LEDGER\|FILE[#CLASS]>` | Known entities to find by label (`skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:legalName`, `schema:alternateName`). Repeatable; `#Class` keeps only subjects of that type. A mention keeps the entity's own IRI. Works without `--model` and without any model. |
 | `--relations <MODE>` | `direct` (default) writes an edge for every predicate the ontology admits, plus the reified node; `reified` writes the nodes only; `off` extracts entities alone. |
 | `--guidance <FILE>` | Project priorities placed in the extraction prompt. Config: `doc.extraction.guidance`. |
 | `--system-prompt <FILE>` | Replaces the extraction system prompt; keep the `{model}` and `{guidance}` slots. Config: `doc.extraction.system_prompt`. |

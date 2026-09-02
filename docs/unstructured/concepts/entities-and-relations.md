@@ -35,7 +35,7 @@ The language model is shown the entities the scan found in each chunk and told t
 
 ## What the scan does
 
-Every label of every entity — `skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:alternateName` — goes into one automaton. Each chunk is scanned for the longest whole-word match, case-folded, and scanned again over Snowball stems (`--lang`, default `en`) so "cities" finds an entry labelled "city". A match is a `doc:Mention` on the chunk: `nif:beginIndex` and `nif:endIndex` into the chunk's text, `nif:anchorOf` with the text as written, `nif:entity` pointing at the entity, and `doc:sourceElement` naming the paragraph or cell it sits in, which for a PDF carries page and box.
+Every label of every entity — `skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:legalName`, `schema:alternateName` — goes into one automaton. Each chunk is scanned for the longest whole-word match, case-folded, and scanned again over Snowball stems (`--lang`, default `en`) so "cities" finds an entry labelled "city". A match is a `doc:Mention` on the chunk: `nif:beginIndex` and `nif:endIndex` into the chunk's text, `nif:anchorOf` with the text as written, `nif:entity` pointing at the entity, and `doc:sourceElement` naming the paragraph or cell it sits in, which for a PDF carries page and box.
 
 This is the deterministic half. It is exact, it is cheap, and with `--entities` alone it is the whole job.
 
