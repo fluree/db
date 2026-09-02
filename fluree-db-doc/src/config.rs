@@ -19,7 +19,7 @@
 //! ```
 //!
 //! Environment variables override the file, slot by slot:
-//! `FLUREE_DOC_{EMBEDDING,LLM,VLM}_{URL,MODEL,API_KEY,DIMENSIONS}`.
+//! `FLUREE_DOC_{EMBEDDING,LLM,VLM}_{URL,MODEL,API_KEY,DIMENSIONS,API}`.
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,19 @@ pub struct ModelEndpoint {
     /// `dimensions` parameter. Absent means the model's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<usize>,
+    /// Wire shape for generation calls: `chat` (`/chat/completions`, the
+    /// default) or `responses` (`/responses`, what the Fluree AI gateway
+    /// serves). Embeddings use `/embeddings` either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<WireApi>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WireApi {
+    #[default]
+    Chat,
+    Responses,
 }
 
 impl ModelEndpoint {
@@ -61,6 +74,10 @@ impl ModelEndpoint {
         Some(key.to_string())
     }
 
+    pub fn wire_api(&self) -> WireApi {
+        self.api.unwrap_or_default()
+    }
+
     fn apply_env(&mut self, slot: &str) {
         let var = |field: &str| std::env::var(format!("FLUREE_DOC_{slot}_{field}")).ok();
         if let Some(v) = var("URL") {
@@ -74,6 +91,15 @@ impl ModelEndpoint {
         }
         if let Some(v) = var("DIMENSIONS").and_then(|d| d.parse().ok()) {
             self.dimensions = Some(v);
+        }
+        match var("API")
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("chat") => self.api = Some(WireApi::Chat),
+            Some("responses") => self.api = Some(WireApi::Responses),
+            _ => {}
         }
     }
 
@@ -127,6 +153,7 @@ mod tests {
             model: "m".into(),
             api_key: None,
             dimensions: None,
+            api: None,
         };
         assert_eq!(
             ep.route("/embeddings"),
@@ -146,6 +173,7 @@ mod tests {
             model: "m".into(),
             api_key: Some("$FLUREE_DOC_TEST_KEY".into()),
             dimensions: None,
+            api: None,
         };
         assert_eq!(ep.resolved_api_key().as_deref(), Some("sk-test"));
     }
@@ -157,6 +185,7 @@ mod tests {
             model: "m".into(),
             api_key: None,
             dimensions: None,
+            api: None,
         };
         let cfg = DocConfig {
             embedding: None,

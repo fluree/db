@@ -2,9 +2,11 @@
 //!
 //! The engine decides *what* to read (`fluree_doc_pdf::escalate::crops_for`)
 //! and how to arbitrate what comes back; this module only carries pixels to
-//! an OpenAI-compatible chat endpoint and readings back. Any provider that
-//! accepts `image_url` content parts works: OpenAI, Ollama, vLLM, LM Studio,
-//! the Fluree AI gateway.
+//! an OpenAI-compatible endpoint and readings back. Two wire shapes: chat
+//! completions with `image_url` parts (OpenAI, Ollama, vLLM, LM Studio) and
+//! the Responses API with `input_image` parts (the Fluree AI gateway, which
+//! routes the `doc-parse` intent to whichever vision provider the account
+//! holds keys for).
 //!
 //! Escalation is all-or-nothing per document. A crop that fails is not
 //! skipped: the crops that did answer would be spliced around a hole, which
@@ -16,7 +18,7 @@
 //! change.
 
 use crate::cache::DocCache;
-use crate::config::ModelEndpoint;
+use crate::config::{ModelEndpoint, WireApi};
 use crate::{DocError, Result};
 use base64::Engine;
 use fluree_doc_pdf::document::Analysis;
@@ -145,21 +147,44 @@ impl VlmReader {
             "data:{mime};base64,{}",
             base64::engine::general_purpose::STANDARD.encode(image)
         );
-        let body = serde_json::json!({
-            "model": self.endpoint.model,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": prompt },
-                    { "type": "image_url", "image_url": { "url": data_url } }
-                ]
-            }],
-            // Transcription, not composition: the same pixels should give the
-            // same reading every time.
-            "temperature": 0,
-            "max_tokens": 8000
-        });
-        let url = self.endpoint.route("chat/completions");
+        let (url, body) = match self.endpoint.wire_api() {
+            WireApi::Chat => (
+                self.endpoint.route("chat/completions"),
+                serde_json::json!({
+                    "model": self.endpoint.model,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            { "type": "text", "text": prompt },
+                            { "type": "image_url", "image_url": { "url": data_url } }
+                        ]
+                    }],
+                    // Transcription, not composition: the same pixels should
+                    // give the same reading every time.
+                    "temperature": 0,
+                    "max_tokens": 8000
+                }),
+            ),
+            WireApi::Responses => {
+                let mut body = serde_json::json!({
+                    "input": [{
+                        "role": "user",
+                        "content": [
+                            { "type": "input_text", "text": prompt },
+                            { "type": "input_image", "image_url": data_url }
+                        ]
+                    }],
+                    "stream": false,
+                    // The gateway routes this intent to the account's vision
+                    // provider; a model named `auto` leaves the choice to it.
+                    "fluree": { "intent": "doc-parse" }
+                });
+                if !self.endpoint.model.eq_ignore_ascii_case("auto") {
+                    body["model"] = serde_json::json!(self.endpoint.model);
+                }
+                (self.endpoint.route("responses"), body)
+            }
+        };
 
         let mut last = String::new();
         for attempt in 0..ATTEMPTS {
@@ -177,7 +202,10 @@ impl VlmReader {
                     if status.is_success() {
                         let v: serde_json::Value = serde_json::from_str(&text)
                             .map_err(|e| DocError::Model(format!("malformed response: {e}")))?;
-                        return Ok(completion_text(&v));
+                        return match self.endpoint.wire_api() {
+                            WireApi::Chat => Ok(completion_text(&v)),
+                            WireApi::Responses => responses_text(&v),
+                        };
                     }
                     last = format!("{status}: {}", text.chars().take(300).collect::<String>());
                     if !(status.as_u16() == 429 || status.is_server_error()) {
@@ -208,9 +236,54 @@ fn completion_text(v: &serde_json::Value) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// The output text of a Responses-API envelope. A reading that did not
+/// `complete` is refused: a truncated transcription is otherwise
+/// indistinguishable from a complete reading of a shorter page.
+fn responses_text(v: &serde_json::Value) -> Result<Option<String>> {
+    let status = v.get("status").and_then(serde_json::Value::as_str);
+    if status != Some("completed") {
+        return Err(DocError::Model(format!(
+            "reading did not complete (status={})",
+            status.unwrap_or("<missing>")
+        )));
+    }
+    let message = v
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|out| {
+            out.iter()
+                .find(|o| o.get("type").and_then(serde_json::Value::as_str) == Some("message"))
+        })
+        .ok_or_else(|| DocError::Model("response carries no output message".into()))?;
+    let text: String = message
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("output_text"))
+        .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
+        .collect();
+    let text = text.trim();
+    Ok((!text.is_empty()).then(|| text.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_text_requires_completion_and_joins_parts() {
+        let ok = serde_json::json!({"status":"completed","output":[
+            {"type":"reasoning","content":[]},
+            {"type":"message","content":[
+                {"type":"output_text","text":"# T\n"},{"type":"output_text","text":"body"}]}]});
+        assert_eq!(responses_text(&ok).unwrap().as_deref(), Some("# T\nbody"));
+        let empty = serde_json::json!({"status":"completed","output":[
+            {"type":"message","content":[{"type":"output_text","text":"  "}]}]});
+        assert_eq!(responses_text(&empty).unwrap(), None);
+        let cut = serde_json::json!({"status":"incomplete","output":[]});
+        assert!(responses_text(&cut).is_err());
+    }
 
     #[test]
     fn completion_text_handles_string_and_parts() {

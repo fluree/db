@@ -145,6 +145,7 @@ model = "nomic-embed-text"
 url = "https://api.openai.com/v1"
 model = "gpt-5-mini"
 api_key = "$OPENAI_API_KEY"
+# api = "chat"                          # `chat` (default) or `responses`
 
 [doc.llm]                               # reserved for entity and relation extraction
 url = "https://api.openai.com/v1"
@@ -152,7 +153,26 @@ model = "gpt-5-mini"
 api_key = "$OPENAI_API_KEY"
 ```
 
-All three slots speak the OpenAI wire shape, so OpenAI, Ollama, vLLM, LM Studio and the Fluree AI gateway are configured the same way. Each slot can be overridden by environment variables `FLUREE_DOC_{EMBEDDING,LLM,VLM}_{URL,MODEL,API_KEY,DIMENSIONS}`.
+All three slots speak the OpenAI wire shape, so OpenAI, Ollama, vLLM and LM Studio are configured the same way. Each slot can be overridden by environment variables `FLUREE_DOC_{EMBEDDING,LLM,VLM}_{URL,MODEL,API_KEY,DIMENSIONS,API}`.
+
+### Using a Fluree AI account
+
+A Fluree AI stack serves the same routes and holds the model keys, so nothing else needs configuring locally. Its generation route is the Responses API, and a model of `auto` lets the gateway pick the account's vision provider:
+
+```toml
+[doc.vlm]
+url = "https://<your-stack>/v1"
+model = "auto"
+api = "responses"
+api_key = "$FLUREE_AI_API_KEY"          # an `flr_…` key from Settings → API keys
+
+[doc.embedding]
+url = "https://<your-stack>/v1"
+model = "text-embedding-3-small"
+api_key = "$FLUREE_AI_API_KEY"
+```
+
+The gateway's embeddings route forwards to the account's OpenAI-type provider, so vector search through the stack needs one configured there.
 
 With no slot configured the command never reaches the network: it parses deterministically, writes structure and chunks, and builds the full-text index. Raster images are the one input that cannot be read without a vision model.
 
