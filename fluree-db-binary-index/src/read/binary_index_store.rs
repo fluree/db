@@ -189,7 +189,12 @@ where
     T: Send + 'static,
     Fut: std::future::Future<Output = io::Result<T>> + Send + 'static,
 {
-    let _ = fut;
+    // Intentionally discard the future: there is no runtime to drive it on
+    // wasm32, and reaching this stub is itself the bug (a read path missing
+    // its residency arm). `drop` rather than `let _ =` so the discard is
+    // explicit and clippy's `let_underscore_future` does not read it as an
+    // accidental un-awaited future.
+    drop(fut);
     Err(io::Error::other(
         "sync CAS fetch bridge unavailable on wasm32; this read path is missing \
          a residency-tier arm (expected resolve_cached_bytes + NeedFetch)",
