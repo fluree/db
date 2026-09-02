@@ -210,6 +210,13 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 type RequestBody = DistributiveOmit<Request, "id">;
 
 /** Consecutive failed respawns tolerated before the channel goes terminal. */
+// Upper bound on a single init round-trip. Init awaits the wasm fetch +
+// instantiate and, in peer mode, a `tokenRequest` answered by the app's
+// getToken; a getToken that never settles (a hung fetch, a forgotten await)
+// would otherwise wedge `initing` — and every op behind it — forever with no
+// error. On expiry the init call rejects typed and the caller (connect/
+// playground) closes the channel.
+const INIT_TIMEOUT_MS = 30_000;
 const MAX_RESPAWN_ATTEMPTS = 3;
 /** Base backoff before a respawn; doubles per consecutive failure. */
 const RESPAWN_BACKOFF_MS = 250;
@@ -361,6 +368,16 @@ class Channel {
   /** Kill the poisoned worker, fail everything in flight, and — within the
    * respawn budget — start and re-initialize a fresh one. */
   private recycle(error: ErrorShape): void {
+    // Re-entrancy guard: a single fatal reply can reach recycle() twice —
+    // once from `onmessage` (line ~300) and once from the reinit `.then`
+    // below — and without this each would arm its own respawn timer, leaving
+    // the first to fire an orphan worker (a live wasm instance + SSE stream)
+    // after the second already recovered. A later recycle supersedes any
+    // pending respawn rather than stacking a second timer.
+    if (this.respawnTimer) {
+      clearTimeout(this.respawnTimer);
+      this.respawnTimer = null;
+    }
     const err = new FlureeError(error);
     for (const p of this.pending.values()) p.reject(err);
     this.pending.clear();
@@ -418,7 +435,13 @@ class Channel {
             // and only RuntimeError/RangeError are fatalized. Re-enter the
             // ladder so this either recovers or spends the budget and
             // becomes a terminal error the consumer is told about.
-            this.recycle(res.error);
+            //
+            // ONLY the non-fatal subset: a FATAL re-init reply is already
+            // recycled synchronously by `onmessage` (line ~300), so
+            // recycling it again here double-fires the ladder. (The
+            // re-entrancy guard in recycle() is the backstop; this is the
+            // correct predicate.)
+            if (!res.error.fatal) this.recycle(res.error);
           })
           .catch(() => {});
       }
@@ -447,7 +470,34 @@ class Channel {
     const id = this.nextId++;
     const worker = this.worker;
     return new Promise<Response>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      // Clear the init deadline (if any) on whichever way the call settles,
+      // so a normal reply never leaves a late timer to fire.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settle = {
+        resolve: (r: Response) => {
+          if (timer !== undefined) clearTimeout(timer);
+          resolve(r);
+        },
+        reject: (e: unknown) => {
+          if (timer !== undefined) clearTimeout(timer);
+          reject(e);
+        },
+      };
+      this.pending.set(id, settle);
+      if (req.op === "init") {
+        timer = setTimeout(() => {
+          // Only if still unsettled (onmessage may have resolved it already).
+          if (this.pending.delete(id)) {
+            settle.reject(
+              new FlureeError({
+                code: "timeout",
+                status: 504,
+                message: `engine init did not complete within ${INIT_TIMEOUT_MS}ms (a hung getToken or wasm fetch?)`,
+              }),
+            );
+          }
+        }, INIT_TIMEOUT_MS);
+      }
       worker.postMessage({ ...req, id });
     });
   }
@@ -861,14 +911,25 @@ export async function playground(options: PlaygroundOptions = {}): Promise<Playg
   const transport = options.resultTransport ?? "transfer";
   const maxMemoryBytes =
     options.maxMemoryBytes === null ? undefined : (options.maxMemoryBytes ?? defaultMaxMemoryBytes());
-  const init = unwrap<InitResult>(
-    await channel.call({
-      op: "init",
-      mode: "playground",
-      wasmUrl: options.wasmUrl === undefined ? undefined : String(options.wasmUrl),
-      maxMemoryBytes,
-    }),
-  );
+  // Close the spawned worker if init throws: a NON-fatal init failure (bad
+  // wasmUrl, unsupported mode) leaves the worker alive but `onmessage` does
+  // not recycle it, and the caller never receives the Channel, so nobody can
+  // call close() — it would leak (a wasm instance too, for peer mode) on
+  // every failed/retried connect. A fatal failure self-cleans via recycle.
+  let init: InitResult;
+  try {
+    init = unwrap<InitResult>(
+      await channel.call({
+        op: "init",
+        mode: "playground",
+        wasmUrl: options.wasmUrl === undefined ? undefined : String(options.wasmUrl),
+        maxMemoryBytes,
+      }),
+    );
+  } catch (e) {
+    channel.close();
+    throw e;
+  }
   channel.markInitialized();
   return new Playground(channel, init, transport);
 }
@@ -995,16 +1056,26 @@ export async function connect(url: string, options: ConnectOptions = {}): Promis
   const transport = options.resultTransport ?? "transfer";
   const maxMemoryBytes =
     options.maxMemoryBytes === null ? undefined : (options.maxMemoryBytes ?? defaultMaxMemoryBytes());
-  const init = unwrap<InitResult>(
-    await channel.call({
-      op: "init",
-      mode: "peer",
-      url,
-      subscribe: options.subscribe,
-      wasmUrl: options.wasmUrl === undefined ? undefined : String(options.wasmUrl),
-      maxMemoryBytes,
-    }),
-  );
+  // Close the spawned worker if init throws (see playground()): the common
+  // peer failures — bad url, a rejecting/empty getToken (401), unsupported
+  // mode — are all non-fatal, so the worker + its already-instantiated wasm
+  // stay alive and unreachable unless we close here.
+  let init: InitResult;
+  try {
+    init = unwrap<InitResult>(
+      await channel.call({
+        op: "init",
+        mode: "peer",
+        url,
+        subscribe: options.subscribe,
+        wasmUrl: options.wasmUrl === undefined ? undefined : String(options.wasmUrl),
+        maxMemoryBytes,
+      }),
+    );
+  } catch (e) {
+    channel.close();
+    throw e;
+  }
   channel.markInitialized();
   return new Peer(channel, init, transport);
 }
