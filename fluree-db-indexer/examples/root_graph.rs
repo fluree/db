@@ -96,6 +96,7 @@ fn main() {
     for (t, d) in genesis.iter().take(5) {
         println!("    index_t={t} {}", &d[..16.min(d.len())]);
     }
+    and_n_more(5, genesis.len());
 
     // Shape 2: a root pointed at by MORE THAN ONE successor is a fork point — two
     // builds based on the same parent. Only one can be the published head, so the
@@ -118,6 +119,7 @@ fn main() {
             kid_ts
         );
     }
+    and_n_more(8, forks.len());
 
     // Shape 1: dangling prev pointers — a root references a parent that is GONE.
     // Each dangling pointer is a place the chain walk stops. "Gone" has two causes
@@ -161,6 +163,7 @@ fn main() {
             &p[..16.min(p.len())]
         );
     }
+    and_n_more(8, dangling.len());
     if !dangling.is_empty() && !undecodable.is_empty() {
         // Shape 1 says something deletes out of order. A bad blob produces the same
         // hole without anything having deleted anything, so the verdict only stands
@@ -226,27 +229,41 @@ fn main() {
                 unreachable_ts[0],
                 unreachable_ts[unreachable_ts.len() - 1]
             );
-            // Contiguity: how many distinct index_t values, and are there gaps?
-            let distinct: BTreeMap<i64, usize> =
-                unreachable_ts.iter().fold(BTreeMap::new(), |mut m, t| {
-                    *m.entry(*t).or_insert(0) += 1;
-                    m
-                });
-            let dupes: Vec<_> = distinct.iter().filter(|(_, n)| **n > 1).take(6).collect();
+            // Contiguity: one root per t across the range is a truncated prefix;
+            // fewer distinct values than roots means some t was built more than once.
+            let mut distinct_ts = unreachable_ts.clone();
+            distinct_ts.dedup();
             println!(
-                "distinct unreachable index_t: {} (so {} share a t with another root)",
-                distinct.len(),
-                unreachable_ts.len() - distinct.len()
+                "unreachable roots: {}, at {} distinct index_t",
+                unreachable_ts.len(),
+                distinct_ts.len()
             );
-            if !dupes.is_empty() {
-                // TWO roots at the same index_t is the signature of a fork: the same
-                // logical version built twice.
-                println!("  index_t values with MULTIPLE roots (fork signature):");
-                for (t, n) in dupes {
-                    println!("    index_t={t}: {n} roots");
-                }
+        }
+
+        // Fork signature: an index_t carried by more than one root is one logical
+        // version built twice. Counted over EVERY root, not just the unreachable
+        // ones. In the ordinary fork the winner is published and therefore reachable
+        // and only the loser is orphaned, so a multiplicity map over the unreachable
+        // subset sees a count of 1 at that t, drops it, and prints nothing on
+        // exactly the case the line is named for.
+        let mut per_t: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
+        for (digest, (t, _)) in &nodes {
+            let entry = per_t.entry(*t).or_insert((0, 0));
+            entry.0 += 1;
+            if !seen.contains(digest) {
+                entry.1 += 1;
             }
         }
+        let shared: Vec<_> = per_t.iter().filter(|(_, (n, _))| *n > 1).collect();
+        let roots_sharing_t: usize = shared.iter().map(|(_, (n, _))| *n).sum();
+        println!(
+            "index_t built more than once (fork signature): {} such index_t, {roots_sharing_t} roots",
+            shared.len()
+        );
+        for (t, (n, unreachable)) in shared.iter().take(6) {
+            println!("    index_t={t}: {n} roots ({unreachable} unreachable)");
+        }
+        and_n_more(6, shared.len());
     }
 }
 
@@ -285,4 +302,15 @@ fn resolve_head(
          !! index_head_id. Refusing to report a zero-length walk as total orphaning."
     );
     std::process::exit(2);
+}
+
+/// Close a truncated preview by saying what it left out.
+///
+/// Every listing here is a `take(n)`, so without this a complete list of five and a
+/// cut-off list of two hundred look the same, and the count above the preview is the
+/// only thing that says otherwise.
+fn and_n_more(shown: usize, total: usize) {
+    if total > shown {
+        println!("    ... and {} more", total - shown);
+    }
 }
