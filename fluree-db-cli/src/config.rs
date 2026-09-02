@@ -363,6 +363,31 @@ pub fn read_indexing_thresholds(config_dir: &Path) -> IndexingThresholds {
     }
 }
 
+/// The `[doc]` table of the config file: model endpoints for `fluree doc`.
+///
+/// Absent, unreadable, or malformed sections read as unconfigured — the
+/// pipeline then runs deterministic and offline, which is the documented
+/// behavior for a machine with nothing set up.
+pub fn read_doc_config(config_dir: &Path) -> fluree_db_doc::DocConfig {
+    let Some((path, format)) = detect_config_file(config_dir) else {
+        return fluree_db_doc::DocConfig::default();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return fluree_db_doc::DocConfig::default();
+    };
+    let section = match format {
+        ConfigFileFormat::Toml => toml::from_str::<toml::Value>(&content)
+            .ok()
+            .and_then(|doc| doc.get("doc").cloned())
+            .and_then(|v| v.try_into::<fluree_db_doc::DocConfig>().ok()),
+        ConfigFileFormat::JsonLd => serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|doc| doc.get("doc").cloned())
+            .and_then(|v| serde_json::from_value(v).ok()),
+    };
+    section.unwrap_or_default()
+}
+
 /// Prefix map type: prefix -> IRI namespace
 pub type PrefixMap = std::collections::HashMap<String, String>;
 

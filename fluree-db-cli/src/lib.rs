@@ -837,6 +837,11 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         // Docs are embedded in the binary — no project directory needed.
         Commands::Docs { action } => commands::docs::run(action),
+
+        Commands::Doc { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::doc::run(action, &fluree_dir).await
+        }
     }
 }
 

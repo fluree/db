@@ -50,6 +50,7 @@
   - [docs](cli/docs.md)
   - [iceberg](cli/iceberg.md)
   - [bm25](cli/bm25.md)
+  - [doc](cli/doc.md)
   - [materialize](cli/materialize.md)
   - [completions](cli/completions.md)
 

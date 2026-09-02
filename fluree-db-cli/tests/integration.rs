@@ -3691,3 +3691,133 @@ fn table_output_renders_novelty_only_subject_after_index() {
         .stdout(predicate::str::contains("EncodedLit").not())
         .stdout(predicate::str::contains("(unresolved ").not());
 }
+
+// ============================================================================
+// fluree doc
+// ============================================================================
+
+#[test]
+fn doc_ingest_markdown_then_search_then_skip_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let docs = tmp.path().join("docs");
+    std::fs::create_dir_all(docs.join("hr")).unwrap();
+    std::fs::write(
+        docs.join("hr/onboarding.md"),
+        "# Onboarding Guide\n\nWelcome to the team.\n\n## Expense policy\n\nMeals under fifty dollars need no receipt. Travel must be booked through the portal.\n",
+    )
+    .unwrap();
+
+    // First run: creates the ledger, writes one document, builds the full-text index.
+    fluree_cmd(&tmp)
+        .args(["doc", "ingest", "docs", "-l", "handbook"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hr/onboarding.md"))
+        .stdout(predicate::str::contains(
+            "1 ingested, 0 unchanged, 0 failed",
+        ))
+        .stdout(predicate::str::contains(
+            "full-text index handbook-text:main",
+        ));
+
+    // Chunks are real nodes stamped with their document.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "handbook",
+            "-e",
+            r#"{"@context":{"doc":"https://ns.flur.ee/doc#","doc:sourceDocument":{"@type":"@id"}},
+                "where":[{"@id":"?c","@type":"doc:Chunk","doc:sourceDocument":"urn:fluree:doc:hr/onboarding.md","doc:headerPath":"?h"}],
+                "select":["?c","?h"]}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("urn:fluree:doc:hr/onboarding.md/chunk/0"))
+        .stdout(predicate::str::contains("Onboarding Guide"));
+
+    // Full-text search joins the hit back to its file and section path.
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "search",
+            "receipt travel portal",
+            "-l",
+            "handbook",
+            "--mode",
+            "text",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hr/onboarding.md"))
+        .stdout(predicate::str::contains("Onboarding Guide"))
+        .stdout(predicate::str::contains(
+            "urn:fluree:doc:hr/onboarding.md/chunk/0",
+        ));
+
+    // Same bytes, same parser, same (absent) embedding model: nothing to do.
+    fluree_cmd(&tmp)
+        .args(["doc", "ingest", "docs", "-l", "handbook"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unchanged"))
+        .stdout(predicate::str::contains(
+            "0 ingested, 1 unchanged, 0 failed",
+        ));
+
+    // A forced re-ingest retracts and replaces: still exactly one chunk.
+    fluree_cmd(&tmp)
+        .args(["doc", "ingest", "docs", "-l", "handbook", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "1 ingested, 0 unchanged, 0 failed",
+        ));
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "handbook",
+            "-e",
+            r#"{"@context":{"doc":"https://ns.flur.ee/doc#"},
+                "where":[{"@id":"?c","@type":"doc:Chunk"}],
+                "select":["(count ?c)"]}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1"))
+        .stdout(predicate::str::contains("2").not());
+}
+
+#[test]
+fn doc_ingest_dry_run_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    std::fs::write(tmp.path().join("note.md"), "# Note\n\nJust a note.\n").unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["doc", "ingest", "note.md", "-l", "scratch", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run, nothing written"));
+
+    fluree_cmd(&tmp)
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scratch").not());
+}
+
+#[test]
+fn doc_search_without_index_explains() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "empty"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args(["doc", "search", "anything", "-l", "empty", "--mode", "text"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no full-text index"));
+}
