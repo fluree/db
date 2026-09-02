@@ -72,9 +72,15 @@ pub fn connect_peer(api_base: String, token: String, max_memory_bytes: Option<f6
         make_exec_options(query_budget),
     );
     // SSE head change -> one advance per event. The engine callback must be
-    // Send + Sync, so it only forwards the ledger id; the drain task (worker
-    // event loop) awaits advance sequentially - the driver's coalescer folds
-    // bursts into one follow-up cycle at the latest head.
+    // Send + Sync, so it only forwards the ledger id; the drain task spawns
+    // each advance rather than awaiting it, so the driver's coalescer sees the
+    // concurrency it was built for: bursts on one ledger fold into a single
+    // follow-up cycle at the latest head (`begin` returns `None` for the
+    // second and later, folding them), and different ledgers advance in
+    // parallel rather than a slow cycle on one blocking the next. Awaiting
+    // each advance to completion here — as this once did — serialized
+    // everything and defeated the coalescer: a five-event burst ran five full
+    // cycles (five re-queries, five IndexedDB round trips) instead of one.
     //
     // Two things the drain does before advancing:
     //
@@ -100,7 +106,13 @@ pub fn connect_peer(api_base: String, token: String, max_memory_bytes: Option<f6
             while let Some(ledger) = advance_rx.next().await {
                 let ledger = crate::live::normalize(&ledger);
                 if set.has_ledger(&ledger) {
-                    set.advance(&ledger).await;
+                    // Spawn, don't await: overlapping advances are what let the
+                    // coalescer fold a same-ledger burst and run different
+                    // ledgers in parallel (see the note above).
+                    let set = set.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        set.advance(&ledger).await;
+                    });
                 }
             }
         });
