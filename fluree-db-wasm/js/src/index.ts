@@ -495,7 +495,18 @@ function queryKindOf(query: string | object): QueryKind {
  * normalized, so the per-sub fan-out below and `Peer.onCycle` can never
  * disagree about what a cycle meant.
  */
+// Memoize the decoded cycle by its source event. The channel dispatches the
+// SAME event object to every listener, and PeerTransport registers two that
+// both decode it — one for per-subscription fan-out (LiveRegistry), one for
+// delivery (Peer.onCycle). Without this, every changed payload is
+// UTF-8-decoded and JSON.parsed twice per commit on the main thread, in a
+// package whose whole point is paying only when the answer changes. The event
+// is unreferenced after dispatch, so entries are collected with it (no leak).
+const liveCycleCache = new WeakMap<CycleOutcomeEvent, LiveCycle>();
+
 function toLiveCycle(event: CycleOutcomeEvent, payloads?: ArrayBuffer[]): LiveCycle {
+  const cached = liveCycleCache.get(event);
+  if (cached !== undefined) return cached;
   const cycle: LiveCycle = {
     ledger: event.ledger,
     t: event.t === -1 ? undefined : event.t,
@@ -534,6 +545,7 @@ function toLiveCycle(event: CycleOutcomeEvent, payloads?: ArrayBuffer[]): LiveCy
       });
     }
   });
+  liveCycleCache.set(event, cycle);
   return cycle;
 }
 
