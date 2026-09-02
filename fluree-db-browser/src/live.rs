@@ -46,6 +46,25 @@
 //! many large subscriptions on one ledger sets the residency high-water
 //! mark, not the biggest one of them.
 //!
+//! **Hard requirement, not just a high-water mark.** `residency_budget_bytes`
+//! MUST exceed the combined resident working set of all subscriptions live on
+//! one ledger at once. Every subscription's fetched bytes are observed under
+//! the single cycle guard and so are un-evictable for the cycle's duration; if
+//! the combined set exceeds the budget, the fetch that tips it over cannot
+//! evict the earlier subscriptions' observed bytes and there is no other live
+//! guard to advance the epoch, so it takes [`ResidencyError::EvictionDeferred`],
+//! waits the full `budget_wait` ([`BrowserIoConfig`](crate::config::BrowserIoConfig),
+//! default 10s) for a release that cannot come, then fails typed. That
+//! subscription lands in `errored` and repeats the stall every cycle — it
+//! never delivers fresh data. Size the budget for the concurrent working set,
+//! or reduce the number of large concurrent subscriptions per ledger. (A
+//! browser reproduction is human-validation item H2; a fast-fail that skips
+//! the futile wait when the cycle guard is the only thing pinning the deficit
+//! is deferred to that reproduction — the production retry loop takes a nested
+//! per-query guard, so the "only the cycle's own guard is live" condition
+//! cannot be read reliably from the in-flight count without confirming the
+//! exact guard nesting in a real browser first.)
+//!
 //! Invalidation is v1 of the ladder: re-run everything, diff before
 //! notify. The v2 footprint filter plugs into the [`FootprintFilter`]
 //! seam — [`run_cycle_with_flakes`](LiveQuerySet::run_cycle_with_flakes)

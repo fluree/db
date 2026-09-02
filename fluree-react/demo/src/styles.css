@@ -59,7 +59,9 @@ h2 {
 .badge.err { color: var(--err); border-color: var(--err); }
 
 .dot { width: .55rem; height: .55rem; border-radius: 50%; background: var(--muted); display: inline-block; }
+.dot.connecting { background: var(--muted); }
 .dot.live { background: var(--accent); }
+.dot.idle { background: #6aa0c8; }
 .dot.reconnecting { background: #d09a3c; }
 .dot.closed { background: var(--err); }
 

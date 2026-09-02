@@ -78,6 +78,13 @@ export interface LiveUpdate {
  * and its results did not move" is information (it retires an error, and it
  * is the signal NOT to touch a cached snapshot), which per-sub callbacks
  * cannot express because they deliver nothing at all.
+ *
+ * TREAT THIS OBJECT AS READ-ONLY. One decoded cycle is memoized and handed —
+ * the same instance, arrays and `FlureeError`s included — to every internal
+ * listener (the per-sub fan-out and every `onCycle` callback) so a commit is
+ * decoded once, not once per listener. Mutating it (`cycle.changed.sort()`,
+ * reassigning a field) is therefore visible to the other listeners and is
+ * cached for anyone who reads the same cycle again; copy before you mutate.
  */
 export interface LiveCycle {
   ledger: string;

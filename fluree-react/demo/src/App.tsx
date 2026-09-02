@@ -9,6 +9,13 @@
  * note re-renders that note's row and nothing else — not the sibling rows,
  * not the header, not the other query on the page. That is the property the
  * package exists for, and it is invisible unless you count.
+ *
+ * One honest caveat: the board is `ORDER BY DESC(?votes)`, so a vote that
+ * moves a note PAST a neighbor genuinely re-renders every row in the band it
+ * jumped over — those rows really did change position, and positional
+ * structural sharing rebuilds them. That is correct, not a regression. To see
+ * the clean single-row result, vote on a note whose rank does not change (e.g.
+ * the one already on top).
  */
 
 import {
