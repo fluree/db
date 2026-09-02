@@ -48,6 +48,7 @@ pub mod value_convert;
 
 #[cfg(feature = "import")]
 pub mod import;
+#[cfg(feature = "import")]
 pub mod import_sink;
 /// Re-export from `fluree_graph_turtle::splitter` for backwards compatibility.
 #[cfg(feature = "import")]
