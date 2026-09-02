@@ -1,0 +1,29 @@
+# Tiers
+
+The pipeline is the same everywhere: parse, chunk, embed, write, index. What a tier changes is where the models come from and how much of the work runs on your machine.
+
+## Local only
+
+Nothing configured beyond a Fluree project. Parsing is deterministic and the command makes no network connection. You get the structure graph, chunks and full-text search.
+
+What you do not get: vector search, because nothing produced embeddings; and scanned pages or pixel-only regions, because nothing can read them. Such pages are reported as unread rather than silently dropped — the deterministic engine alone still places third of seventeen on a public benchmark, so most documents lose nothing.
+
+## Local, with models you run or pay for
+
+Three slots, each an OpenAI-compatible endpoint you point at anything: Ollama, vLLM, LM Studio, OpenAI, Voyage's compatible route.
+
+| Slot | Used for | Falls back to |
+|---|---|---|
+| `embedding` | one vector per chunk; enables vector search | — |
+| `vlm` | reading crops of pages and regions the parser could not | `llm` |
+| `llm` | entity and relation extraction (in progress) | — |
+
+This is the most setup and the fewest features, and it is fully yours: no account, and no data leaves the machine unless a slot points at a hosted API. See [Local models](../guides/local-models.md).
+
+## With a Fluree AI account
+
+One `fluree auth login`, then `doc.remote = "<remote>"` fills every slot you did not set yourself with the account's gateway. The pipeline still runs locally and the ledger is still local; only model calls go to the account, which routes each to the provider behind it. Explicit slots win, so you can mix a local embedding model with the account's vision model. See [Connect a Fluree AI account](../getting-started/fluree-ai.md).
+
+## Fluree AI hosted extraction
+
+Fluree AI runs a larger pipeline on its side: trained entity rankers with a feedback loop, relation extraction with review, entity resolution across documents, a parse cache shared across the account. It is used from the Fluree AI application today. Handing a local folder to it from `fluree doc` is planned; until then, a ledger built locally can be [published](../guides/publish-to-fluree-ai.md) to the account.

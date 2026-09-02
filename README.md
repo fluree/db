@@ -11,6 +11,11 @@ Billions of graph facts on commodity hardware. Over 2M facts/second bulk import.
 > Persistent, searchable memory for AI coding assistants. Give Claude Code, Cursor, and other AI tools long-term project memory: facts, decisions, and preferences persist across sessions in a Fluree ledger you control — scoped per-repo or per-user, shareable via git.
 > [Fluree Memory docs →](https://labs.flur.ee/docs)
 
+> [!NOTE]
+> **Fluree Unstructured** — is part of the Fluree DB CLI.
+> Unstructured documents in, a knowledge graph out. `fluree doc ingest ./folder` turns PDFs, Office files, Markdown and scans into a searchable, citable graph — structure, chunks and embeddings in a ledger you control — deterministic and offline by default, with your own models or a Fluree AI account when you want more.
+> [Fluree Unstructured docs →](docs/unstructured/README.md)
+
 ## Install
 
 **Cloud / Serverless** — Run in a dedicated serverless stack at no cost at [flur.ee](https://flur.ee/solo) (usage limited), spin up dedicated servers on demand as needed. Interact seamlessly with local fluree CLI (install instructions below).

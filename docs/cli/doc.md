@@ -13,7 +13,7 @@ It then creates or syncs a BM25 full-text index and, when embeddings were produc
 
 Everything runs in-process against local storage: the ledger written is always a local one, and Fluree AI, when connected, supplies models only. Parsing is deterministic and makes no network connection unless a model endpoint is configured.
 
-For the walkthrough — the three tiers, connecting a Fluree AI account, which model calls are made, and publishing the result to Fluree AI — see [Documents into a graph](../guides/documents.md).
+> This page is the CLI command reference. For the walkthrough — the tiers, connecting a Fluree AI account, what gets built, which model calls are made, and publishing the result — see the [Fluree Unstructured section](../unstructured/README.md) of the docs.
 
 ## Subcommands
 
