@@ -137,12 +137,11 @@ fn main() {
         println!("unlistable       : {unlistable}");
     }
 
-    // Which roots are pointed AT by some other root?
-    let mut referenced: HashSet<&String> = HashSet::new();
+    // Parent digest -> the roots that point at it. A parent with more than one child
+    // is the fork below.
     let mut prev_targets: HashMap<&String, Vec<&String>> = HashMap::new();
     for (digest, node) in &nodes {
         if let Some((p, _)) = &node.prev {
-            referenced.insert(p);
             prev_targets.entry(p).or_default().push(digest);
         }
     }
