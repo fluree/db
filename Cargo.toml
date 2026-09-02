@@ -169,12 +169,12 @@ urlencoding = "2"
 
 # Document parsing engine (fluree-doc-parse). Pin by rev; bump
 # `fluree_db_doc::parse::DOC_PARSE_REV` in step so the parse cache invalidates.
-fluree-doc-model = { git = "https://github.com/fluree/fluree-doc-parse", rev = "8765b4046debf08f3dbe810c90802c9e3534059e" }
-fluree-doc-pdf = { git = "https://github.com/fluree/fluree-doc-parse", rev = "8765b4046debf08f3dbe810c90802c9e3534059e" }
-fluree-doc-markdown = { git = "https://github.com/fluree/fluree-doc-parse", rev = "8765b4046debf08f3dbe810c90802c9e3534059e" }
-fluree-doc-docx = { git = "https://github.com/fluree/fluree-doc-parse", rev = "8765b4046debf08f3dbe810c90802c9e3534059e" }
-fluree-doc-html = { git = "https://github.com/fluree/fluree-doc-parse", rev = "8765b4046debf08f3dbe810c90802c9e3534059e" }
-fluree-doc-pptx = { git = "https://github.com/fluree/fluree-doc-parse", rev = "8765b4046debf08f3dbe810c90802c9e3534059e" }
+fluree-doc-model = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-pdf = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-markdown = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-docx = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-html = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-pptx = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
 hayro-syntax = "0.7"
 walkdir = "2"
 

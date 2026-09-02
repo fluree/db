@@ -2114,7 +2114,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.115",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3488,7 +3488,7 @@ dependencies = [
 [[package]]
 name = "fluree-doc-docx"
 version = "0.1.0"
-source = "git+https://github.com/fluree/fluree-doc-parse?rev=8765b4046debf08f3dbe810c90802c9e3534059e#8765b4046debf08f3dbe810c90802c9e3534059e"
+source = "git+https://github.com/fluree/fluree-doc-parse?rev=407daa034aeca0de1a70a53eac7899d94c52bb5d#407daa034aeca0de1a70a53eac7899d94c52bb5d"
 dependencies = [
  "fluree-doc-model",
  "quick-xml",
@@ -3498,7 +3498,7 @@ dependencies = [
 [[package]]
 name = "fluree-doc-html"
 version = "0.1.0"
-source = "git+https://github.com/fluree/fluree-doc-parse?rev=8765b4046debf08f3dbe810c90802c9e3534059e#8765b4046debf08f3dbe810c90802c9e3534059e"
+source = "git+https://github.com/fluree/fluree-doc-parse?rev=407daa034aeca0de1a70a53eac7899d94c52bb5d#407daa034aeca0de1a70a53eac7899d94c52bb5d"
 dependencies = [
  "fluree-doc-model",
  "html5ever",
@@ -3508,7 +3508,7 @@ dependencies = [
 [[package]]
 name = "fluree-doc-markdown"
 version = "0.1.0"
-source = "git+https://github.com/fluree/fluree-doc-parse?rev=8765b4046debf08f3dbe810c90802c9e3534059e#8765b4046debf08f3dbe810c90802c9e3534059e"
+source = "git+https://github.com/fluree/fluree-doc-parse?rev=407daa034aeca0de1a70a53eac7899d94c52bb5d#407daa034aeca0de1a70a53eac7899d94c52bb5d"
 dependencies = [
  "fluree-doc-model",
  "pulldown-cmark",
@@ -3517,7 +3517,7 @@ dependencies = [
 [[package]]
 name = "fluree-doc-model"
 version = "0.1.0"
-source = "git+https://github.com/fluree/fluree-doc-parse?rev=8765b4046debf08f3dbe810c90802c9e3534059e#8765b4046debf08f3dbe810c90802c9e3534059e"
+source = "git+https://github.com/fluree/fluree-doc-parse?rev=407daa034aeca0de1a70a53eac7899d94c52bb5d#407daa034aeca0de1a70a53eac7899d94c52bb5d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3526,7 +3526,7 @@ dependencies = [
 [[package]]
 name = "fluree-doc-pdf"
 version = "0.1.0"
-source = "git+https://github.com/fluree/fluree-doc-parse?rev=8765b4046debf08f3dbe810c90802c9e3534059e#8765b4046debf08f3dbe810c90802c9e3534059e"
+source = "git+https://github.com/fluree/fluree-doc-parse?rev=407daa034aeca0de1a70a53eac7899d94c52bb5d#407daa034aeca0de1a70a53eac7899d94c52bb5d"
 dependencies = [
  "fluree-doc-model",
  "hayro",
@@ -3542,7 +3542,7 @@ dependencies = [
 [[package]]
 name = "fluree-doc-pptx"
 version = "0.1.0"
-source = "git+https://github.com/fluree/fluree-doc-parse?rev=8765b4046debf08f3dbe810c90802c9e3534059e#8765b4046debf08f3dbe810c90802c9e3534059e"
+source = "git+https://github.com/fluree/fluree-doc-parse?rev=407daa034aeca0de1a70a53eac7899d94c52bb5d#407daa034aeca0de1a70a53eac7899d94c52bb5d"
 dependencies = [
  "fluree-doc-model",
  "quick-xml",

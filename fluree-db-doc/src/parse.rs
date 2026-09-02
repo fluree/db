@@ -18,7 +18,7 @@ use std::sync::Arc;
 /// The pinned `fluree-doc-parse` revision (see the workspace `Cargo.toml`).
 /// Part of every parse-cache fingerprint: bump it with the pin so cached
 /// output from an older engine is never served as current.
-pub const DOC_PARSE_REV: &str = "8765b4046debf08f3dbe810c90802c9e3534059e";
+pub const DOC_PARSE_REV: &str = "407daa034aeca0de1a70a53eac7899d94c52bb5d";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
