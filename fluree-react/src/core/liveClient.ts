@@ -63,7 +63,7 @@ export class LiveClient {
     opts?: QueryOptions,
   ): QueryStore {
     const spec: ResolvedSpec = resolveSpec(ledger, query, opts);
-    return this.cache.handleFor(spec, opts?.gcTime).store;
+    return this.cache.storeFor(spec, opts?.gcTime);
   }
 
   /** One-shot query outside the subscription system. */

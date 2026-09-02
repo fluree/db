@@ -79,6 +79,11 @@ export interface QueryOptions {
  * It is distinct from `connecting` (a stream is being established) so a
  * settled page does not show a perpetual spinner, and from `live` so a page
  * that has dropped its last subscription does not show a stale "connected".
+ *
+ * `idle` is a REMOTE-mode state: it describes having no SSE stream to open.
+ * Peer mode has no equivalent — its engine is local and always present, so it
+ * reports `live` once the worker is connected regardless of subscription
+ * count; it never emits `idle`.
  */
 export type ConnectionState =
   | "idle"

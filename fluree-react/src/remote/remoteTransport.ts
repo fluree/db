@@ -222,6 +222,13 @@ export class RemoteTransport implements LiveTransport {
       sseOpts.backoffMaxMs = this.sseOptions.backoffMaxMs;
     }
     this.sse = new SseSource(sseOpts);
+    // Settle the initial state. refresh() is debounced, so it coalesces with
+    // any subscribes that arrive synchronously after start() and evaluates
+    // the FINAL live set once: a page that subscribes to a live ledger goes
+    // connecting→live, but a page with no query — or only time-anchored
+    // (`opts.at`) queries, which never enter `byLedger` — settles to `idle`
+    // instead of sitting at the constructor default `connecting` forever.
+    this.sse.refresh();
   }
 
   subscribe(spec: SubscriptionSpec): void {

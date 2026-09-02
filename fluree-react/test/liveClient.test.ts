@@ -97,6 +97,21 @@ describe("watch", () => {
       at: 42,
     });
   });
+
+  it("gives a query first watched after close() a client-closed error, not a permanent loading", () => {
+    const { client } = setup();
+    client.close();
+    // A component mounting a NEW query key after teardown must not spin on
+    // `loading` forever — watch() returns a closed store, not a minted handle.
+    const store = client.watch("l", "q-after-close");
+    const snap = store.getSnapshot();
+    expect(snap.status).toBe("error");
+    expect(snap.error?.code).toBe("client-closed");
+    // Referentially stable across calls (or useSyncExternalStore would loop),
+    // and subscribe is a harmless no-op returning an unsubscribe.
+    expect(store.getSnapshot()).toBe(snap);
+    expect(typeof store.subscribe(() => {})).toBe("function");
+  });
 });
 
 describe("one-shot query", () => {

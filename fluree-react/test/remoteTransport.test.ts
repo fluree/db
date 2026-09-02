@@ -673,6 +673,26 @@ describe("time-anchored subscriptions", () => {
       "https://srv/v1/fluree/query/my/ledger",
     ]);
   });
+
+  it("settles to idle when nothing live is subscribed (no query at all)", async () => {
+    const { sink, transport } = setup();
+    // No subscription: start()'s refresh evaluates an empty live set and
+    // settles to idle rather than the constructor default `connecting`.
+    await settle();
+    expect(transport.connectionState()).toBe("idle");
+    expect(sink.states).toContain("idle");
+  });
+
+  it("settles to idle when every subscription is time-anchored", async () => {
+    const { server, sink, transport } = setup();
+    transport.subscribe(spec({ at: 12 }));
+    await settle();
+    // A t-anchored query never enters the live set, so there is nothing to
+    // stream — idle, not a perpetual `connecting` spinner.
+    expect(transport.connectionState()).toBe("idle");
+    expect(sink.states).toContain("idle");
+    expect(server.eventConnects).toHaveLength(0);
+  });
 });
 
 describe("errors", () => {

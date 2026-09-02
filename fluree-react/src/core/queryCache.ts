@@ -69,6 +69,20 @@ const CLOSED_STATE: QueryResult = Object.freeze({
   t: undefined,
 });
 
+/**
+ * The store handed to a query first observed AFTER `close()`. A frozen
+ * singleton with stable `subscribe`/`getSnapshot` identities — a real handle
+ * would be minted into `byKey` (even when closed) and its `INITIAL_STATE`
+ * would win in `snapshotFor` before the closed-check, so the component would
+ * spin on `loading` forever. `subscribe` is a no-op (nothing will ever fire)
+ * and `getSnapshot` always returns the same `CLOSED_STATE`, so
+ * `useSyncExternalStore` neither loops nor waits.
+ */
+const CLOSED_STORE: QueryStore = Object.freeze({
+  subscribe: () => () => {},
+  getSnapshot: () => CLOSED_STATE,
+});
+
 function sameError(a: QueryError | undefined, b: QueryError): boolean {
   return (
     a !== undefined &&
@@ -200,6 +214,14 @@ export class QueryCache {
     );
   }
 
+  /** The store `useQuery` binds to. On a closed cache, a shared closed store
+   * (typed `client-closed` error) rather than a freshly-minted `loading`
+   * handle that nothing can ever resolve. */
+  storeFor(spec: ResolvedSpec, gcTime?: number): QueryStore {
+    if (this.closed) return CLOSED_STORE;
+    return this.handleFor(spec, gcTime).store;
+  }
+
   /** Attach an observer to whichever handle owns `key` right now. */
   observe(
     key: string,
@@ -281,15 +303,16 @@ export class QueryCache {
       this.headListeners.set(ledger, set);
     }
     set.add(listener);
-    let removed = false;
     return () => {
-      if (removed) return; // React may call cleanup defensively
-      removed = true;
       set.delete(listener);
       // Only drop the ledger's entry if THIS set is still the registered one.
       // A later re-subscribe may have replaced it with a fresh set under the
       // same ledger; deleting then would evict that other component's
-      // listeners (they would silently stop updating).
+      // listeners (they would silently stop updating). This identity check
+      // also makes a defensive double-detach harmless — the second call finds
+      // the entry either gone or replaced — so unlike `addObserver` (which
+      // must guard an observer COUNT against double-decrement) this path needs
+      // no separate `removed` flag; the delete is idempotent by construction.
       if (set.size === 0 && this.headListeners.get(ledger) === set) {
         this.headListeners.delete(ledger);
       }
