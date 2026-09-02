@@ -61,6 +61,7 @@ fn timeout_millis(timeout: Duration) -> u32 {
 pub async fn execute(
     req: TransportRequest,
     timeout: Duration,
+    max_body_bytes: u64,
 ) -> Result<TransportResponse, TransportError> {
     let timeout_ms = timeout_millis(timeout);
     let controller = AbortController::new().map_err(request_err)?;
@@ -122,6 +123,22 @@ pub async fn execute(
         .map_err(|e| TransportError::Request(format!("invalid HTTP status: {e}")))?;
     let headers = collect_headers(&response.headers());
 
+    // Reject an oversized body BEFORE materializing it. `array_buffer()` pulls
+    // the whole response into JS memory and then copies it into wasm linear
+    // memory; with `max_concurrent_fetches` of these in flight, a hostile or
+    // broken server returning a multi-GiB object can exhaust the linear-memory
+    // ceiling and trap the instance. A declared length past the residency
+    // budget cannot be a legitimate block.
+    if let Some(len) = crate::config::declared_length_over_cap(
+        response.headers().get("content-length").ok().flatten(),
+        max_body_bytes,
+    ) {
+        controller.abort();
+        return Err(TransportError::Body(format!(
+            "response body Content-Length {len} exceeds the {max_body_bytes}-byte cap"
+        )));
+    }
+
     let body_promise = response
         .array_buffer()
         .map_err(|e| TransportError::Body(js_error_text(&e)))?;
@@ -169,3 +186,4 @@ fn collect_headers(headers: &Headers) -> HeaderMap {
     }
     map
 }
+

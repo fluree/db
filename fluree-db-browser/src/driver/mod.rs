@@ -182,7 +182,8 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                 reply,
             } => {
                 spawn_local(async move {
-                    let _ = reply.send(fetch::execute(req, timeout).await);
+                    let _ = reply
+                        .send(fetch::execute(req, timeout, config.residency_budget_bytes as u64).await);
                 });
             }
             // Rule 3: never wait. A miss while the open is in flight costs

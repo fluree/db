@@ -153,6 +153,18 @@ pub(crate) fn timer_millis(duration: Duration) -> u32 {
     duration.as_millis().min(MAX_TIMER_MILLIS) as u32
 }
 
+/// A declared `Content-Length` that exceeds `max` (returns the offending
+/// length). Used to reject an oversized response body before it is
+/// materialized into wasm linear memory. A missing or unparseable value
+/// returns `None` — the pre-check does not apply, and the residency budget
+/// still rejects the block after the fact. Pure, so it is unit-tested here
+/// off-wasm; the wasm-only `driver::fetch` calls it.
+pub(crate) fn declared_length_over_cap(content_length: Option<String>, max: u64) -> Option<u64> {
+    content_length
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&len| len > max)
+}
+
 impl CacheConfig {
     /// The eviction target in bytes (`budget_bytes * low_water_ratio`),
     /// clamped to a sane range.
@@ -187,6 +199,31 @@ mod tests {
             assert_eq!(got, max, "{absurd:?}");
             assert!(got <= max, "must never exceed a browser's signed delay");
         }
+    }
+
+    #[test]
+    fn declared_length_over_cap_gates_oversized_bodies() {
+        const CAP: u64 = 256 * 1024 * 1024;
+        // Over the cap → rejected, reporting the offending length.
+        assert_eq!(
+            declared_length_over_cap(Some((CAP + 1).to_string()), CAP),
+            Some(CAP + 1)
+        );
+        // At or under → allowed.
+        assert_eq!(declared_length_over_cap(Some(CAP.to_string()), CAP), None);
+        assert_eq!(declared_length_over_cap(Some("1024".to_string()), CAP), None);
+        // Whitespace tolerated.
+        assert_eq!(
+            declared_length_over_cap(Some(format!(" {} ", CAP + 5)), CAP),
+            Some(CAP + 5)
+        );
+        // Missing or unparseable → pre-check does not apply.
+        assert_eq!(declared_length_over_cap(None, CAP), None);
+        assert_eq!(
+            declared_length_over_cap(Some("not-a-number".to_string()), CAP),
+            None
+        );
+        assert_eq!(declared_length_over_cap(Some(String::new()), CAP), None);
     }
 
     #[test]
