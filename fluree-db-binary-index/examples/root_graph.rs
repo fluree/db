@@ -23,7 +23,7 @@
 //! Those have completely different fixes, which is why guessing was not good enough.
 //!
 //! Usage — copy a ledger's roots directory out of the pod, then:
-//!     cargo run -p fluree-db-indexer --example root_graph -- <roots-dir> [head-digest]
+//!     cargo run -p fluree-db-binary-index --example root_graph -- <roots-dir> [head-digest]
 //!
 //! `head-digest` is the published index head (the nameservice's `index_head_id`) if
 //! known; supplying it lets the tool report reachability from the real head rather
