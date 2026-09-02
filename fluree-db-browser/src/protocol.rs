@@ -82,7 +82,12 @@ pub enum IoJob {
         url: String,
         headers: SseHeaders,
         ready: oneshot::Sender<Result<(), SseConnectError>>,
-        chunks: mpsc::UnboundedSender<Result<Bytes, String>>,
+        /// BOUNDED: a full channel pauses the driver's stream read (and so
+        /// the TCP read), backpressuring a server that streams SSE faster
+        /// than the consumer drains it, instead of buffering it without
+        /// limit. The consumer awaits `LedgerManager::notify` per event, so
+        /// this bound is what keeps a flood from growing memory unboundedly.
+        chunks: mpsc::Sender<Result<Bytes, String>>,
     },
     /// Reply after `duration`. The engine side has no timer of its own —
     /// JS owns the clock — so bounded waits (deferred-insert deadlines)

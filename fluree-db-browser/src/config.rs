@@ -159,6 +159,9 @@ pub(crate) fn timer_millis(duration: Duration) -> u32 {
 /// returns `None` — the pre-check does not apply, and the residency budget
 /// still rejects the block after the fact. Pure, so it is unit-tested here
 /// off-wasm; the wasm-only `driver::fetch` calls it.
+// cfg(any(wasm32, test)): the only production caller is the wasm driver, so a
+// host lib build would see it as dead code (the native test still exercises it).
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn declared_length_over_cap(content_length: Option<String>, max: u64) -> Option<u64> {
     content_length
         .and_then(|v| v.trim().parse::<u64>().ok())

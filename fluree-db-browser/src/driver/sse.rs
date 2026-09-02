@@ -33,7 +33,7 @@ pub async fn run(
     headers: Vec<(&'static str, String)>,
     connect_timeout: Duration,
     ready: oneshot::Sender<Result<(), SseConnectError>>,
-    chunks: mpsc::UnboundedSender<Result<Bytes, String>>,
+    chunks: mpsc::Sender<Result<Bytes, String>>,
 ) {
     macro_rules! fail_ready {
         ($err:expr) => {{
@@ -156,7 +156,7 @@ pub async fn run(
         let chunk = match futures::future::select(read, closed).await {
             futures::future::Either::Left((Ok(chunk), _)) => chunk,
             futures::future::Either::Left((Err(e), _)) => {
-                let _ = chunks.send(Err(js_error_text(&e)));
+                let _ = chunks.send(Err(js_error_text(&e))).await;
                 return;
             }
             futures::future::Either::Right(_) => {
@@ -178,7 +178,9 @@ pub async fn run(
             continue;
         };
         let bytes = Bytes::from(Uint8Array::new(&value).to_vec());
-        if chunks.send(Ok(bytes)).is_err() {
+        // Awaits when the channel is full: backpressure to the stream read,
+        // not unbounded buffering. `Err` means the consumer dropped.
+        if chunks.send(Ok(bytes)).await.is_err() {
             // Consumer stopped between reads.
             let _ = reader.cancel();
             controller.abort();

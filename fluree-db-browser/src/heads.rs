@@ -137,7 +137,13 @@ impl ChannelSseSource {
 impl SseChunkSource for ChannelSseSource {
     async fn connect(&self) -> Result<BoxChunkStream, SseConnectError> {
         let (ready, ready_rx) = oneshot::channel();
-        let (chunk_tx, chunk_rx) = mpsc::unbounded_channel::<Result<Bytes, String>>();
+        // Bounded so a server flooding the SSE stream backpressures the
+        // driver's read rather than growing memory without limit; head-change
+        // events are small and infrequent, so this depth is never reached in
+        // normal operation.
+        const SSE_CHUNK_CHANNEL_DEPTH: usize = 256;
+        let (chunk_tx, chunk_rx) =
+            mpsc::channel::<Result<Bytes, String>>(SSE_CHUNK_CHANNEL_DEPTH);
         self.io
             .send(IoJob::SseOpen {
                 url: self.url.clone(),

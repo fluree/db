@@ -780,7 +780,7 @@ pub(crate) mod tests {
                                 let _ = ready.send(Ok(()));
                                 tokio::spawn(async move {
                                     for frame in frames {
-                                        if chunks.send(Ok(Bytes::from(frame))).is_err() {
+                                        if chunks.send(Ok(Bytes::from(frame))).await.is_err() {
                                             return;
                                         }
                                     }
