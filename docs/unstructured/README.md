@@ -16,9 +16,28 @@ That is the difference from a document-to-text converter with a vector database 
 
 A fourth, Fluree AI's hosted extraction pipeline — trained entity rankers, relation extraction with review, entity resolution across documents — is used from the Fluree AI application today, and will be reachable from `fluree doc` later.
 
+## How well does it read?
+
+The parsing engine is scored on [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench): 200 public PDFs with hand-checked ground truth, three metrics (NID for reading order and text, TEDS for table structure, MHS for heading structure), and a harness neither written nor tuned by Fluree. Measured 2026-08-01, the top 8 of the 17 engines scored:
+
+| # | engine | overall | NID | TEDS | MHS | s/doc |
+|---|---|---|---|---|---|---|
+| 1 | **fluree-doc-parse** (cascade) | **0.933** | 0.948 | 0.944 | 0.876 | ~1.5 |
+| 2 | opendataloader-hybrid | 0.907 | 0.934 | 0.928 | 0.821 | 0.463 |
+| 3 | **fluree-doc-parse** (deterministic) | **0.892** | 0.923 | 0.847 | 0.813 | **~0.009** |
+| 4 | nutrient | 0.885 | 0.925 | 0.708 | 0.819 | 0.008 |
+| 5 | docling | 0.882 | 0.898 | 0.887 | 0.824 | 0.762 |
+| 6 | opendataloader-hybrid-hydrogen | 0.877 | 0.926 | 0.796 | 0.769 | 5.068 |
+| 7 | pdf-inspector | 0.875 | 0.915 | 0.814 | 0.788 | 0.006 |
+| 8 | marker | 0.861 | 0.890 | 0.808 | 0.796 | 53.932 |
+
+Two rows matter for the tiers above. The **deterministic** engine — no model, no GPU, no API key, about 8 ms per document on a CPU — is what the local tier runs, and on its own it places third. The **cascade**, which adds a vision model for the pages and regions the deterministic pass could not read, is what a `vlm` slot or a Fluree AI account gives you, and it places first. Across that corpus 113 of the 200 documents never needed the model at all; of the 87 that did, the median cost 1.7 s and the worst 18.9 s.
+
+Every score reproduces from committed model-output caches without a GPU or a key, and the engine's own accounting of [where its output is better than the reference and scores lower for it](https://github.com/fluree/fluree-doc-parse/blob/main/docs/benchmarks/where-we-differ.md) is published alongside. Full detail: [the benchmarks page](https://github.com/fluree/fluree-doc-parse/blob/main/docs/benchmarks/README.md).
+
 ## Design philosophy
 
-- **Structure first, models second.** The parsing engine is deterministic and places third of seventeen engines on a public benchmark with no model at all. Models are asked only about what the deterministic pass could not read, per page and per region, and their answers are arbitrated against what the page says rather than trusted outright.
+- **Structure first, models second.** The parsing engine is deterministic and places third of seventeen engines on the public benchmark above with no model at all. Models are asked only about what the deterministic pass could not read, per page and per region, and their answers are arbitrated against what the page says rather than trusted outright.
 - **Provenance is the product.** Every chunk cites the elements it was built from; every element carries character offsets and, for PDFs, its page and box. A highlight on the page and the text a model reasons over come from one parse, so they agree by construction.
 - **Re-runs cost only what changed.** Parses are cached on content, model readings on the crop's pixels. A document whose bytes, parser and embedding model are unchanged is skipped; a changed one is retracted and replaced, never diffed, and the previous extraction remains queryable at its commit.
 - **Yours by default.** A local ledger, local caches, and no network connection until you point a slot at a model. Connecting an account changes where model calls go, not where your data lives.

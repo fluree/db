@@ -2,11 +2,18 @@
 
 The pipeline is the same everywhere: parse, chunk, embed, write, index. What a tier changes is where the models come from and how much of the work runs on your machine.
 
+What each tier reads, on the [public benchmark](../README.md#how-well-does-it-read) the parsing engine is scored on (200 PDFs, 2026-08-01):
+
+| Reading | Overall | Typical cost per document |
+|---|---|---|
+| Deterministic only — the local tier | 0.892 (third of seventeen engines) | ~8 ms, CPU |
+| With a vision model for pages and regions the deterministic pass could not read — a `vlm` slot or a Fluree AI account | 0.933 (first) | ~1.5 s averaged over the corpus; 113 of 200 documents never call the model |
+
 ## Local only
 
 Nothing configured beyond a Fluree project. Parsing is deterministic and the command makes no network connection. You get the structure graph, chunks and full-text search.
 
-What you do not get: vector search, because nothing produced embeddings; and scanned pages or pixel-only regions, because nothing can read them. Such pages are reported as unread rather than silently dropped — the deterministic engine alone still places third of seventeen on a public benchmark, so most documents lose nothing.
+What you do not get: vector search, because nothing produced embeddings; and scanned pages or pixel-only regions, because nothing can read them. Such pages are reported as unread rather than silently dropped. The deterministic engine alone still places third of seventeen on the public benchmark, and most documents in that corpus never needed more.
 
 ## Local, with models you run or pay for
 
