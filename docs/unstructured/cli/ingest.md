@@ -23,8 +23,8 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--no-index` | Skip building or syncing the vector and full-text indexes. |
 | `--no-cache` | Neither read nor write the parse and reading caches. |
 | `--force` | Re-ingest documents the ledger already holds with the same content, parser and embedding model. |
-| `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `800`). |
-| `--max-chars <N>` | Split a single element longer than this many characters (default `2000`). |
+| `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `1500`). |
+| `--max-chars <N>` | Split a single element longer than this many characters (default `4000`). |
 | `--max-crops <N>` | Most crops one document may send to the vision model (default `70`). A document asking for more lands with the deterministic tier only and is flagged. |
 | `--model <LEDGER\|FILE>` | Ontology the language model extracts against: classes and properties from a ledger or a `.ttl` / `.jsonld` / `.nt` / `.json` file. Needs the `llm` slot or a Fluree AI account. |
 | `--entities <LEDGER\|FILE[#CLASS]>` | Known entities to find by label (`skos:prefLabel`, `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`, `schema:legalName`, `schema:alternateName`). Repeatable; `#Class` keeps only subjects of that type. A mention keeps the entity's own IRI. Works without `--model` and without any model. |

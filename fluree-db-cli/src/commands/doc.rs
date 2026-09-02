@@ -521,6 +521,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
     let mut totals = Totals::default();
     let mut dimensions: Option<usize> = None;
     let parser_revision = fluree_db_doc::parse::DOC_PARSE_REV.to_string();
+    let chunking = format!("{}/{}", args.min_chars, args.max_chars);
 
     for (path, relative) in &inputs {
         let label = relative.as_str();
@@ -544,10 +545,14 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                     == embedder.as_ref().map(EmbeddingClient::model);
                 let same_extraction = prev.extraction_fingerprint.as_deref()
                     == extraction.as_ref().map(|x| x.fingerprint.as_str());
+                // A document written before chunking was recorded is
+                // treated as cut with these sizes.
+                let same_chunking = prev.chunking.as_deref().is_none_or(|c| c == chunking);
                 if prev.sha256 == sha
                     && prev.parser_revision == parser_revision
                     && same_model
                     && same_extraction
+                    && same_chunking
                 {
                     println!("  {} {label}  unchanged", "=".dimmed());
                     totals.skipped += 1;
@@ -608,6 +613,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             escalated_crops: doc.parsed.escalated_crops,
             parser_revision: parser_revision.clone(),
             ingested_at: now_rfc3339(),
+            chunking: chunking.clone(),
         };
         let embedding_stamp = embedder
             .as_ref()
@@ -897,6 +903,7 @@ struct PreviousIngest {
     parser_revision: String,
     embedding_model: Option<String>,
     extraction_fingerprint: Option<String>,
+    chunking: Option<String>,
 }
 
 async fn previous_ingest(
@@ -914,6 +921,7 @@ async fn previous_ingest(
         parser_revision: text(1).unwrap_or_default(),
         embedding_model: text(2),
         extraction_fingerprint: text(3),
+        chunking: text(4),
     }))
 }
 

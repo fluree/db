@@ -36,6 +36,7 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 | `doc:escalatedCrops` | integer | Crops a vision model read for this extraction. |
 | `doc:parserRevision` | string | The fluree-doc-parse revision that produced the structure graph. |
 | `doc:chunkCount` | integer | Chunks written. |
+| `doc:chunking` | string | `min/max` characters the chunks were cut with. |
 | `doc:embeddingModel` | string | The embedding model, when one ran. |
 | `doc:embeddingDimensions` | integer | Its vector width. |
 | `doc:ingestedAt` | `xsd:dateTime` | When this extraction was written. |

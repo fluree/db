@@ -21,6 +21,8 @@ pub struct DocumentMeta {
     pub parser_revision: String,
     /// RFC 3339 timestamp of this ingest.
     pub ingested_at: String,
+    /// `min/max` characters the chunker was run with.
+    pub chunking: String,
 }
 
 /// What extraction did to a document, for its node.
@@ -56,6 +58,7 @@ pub fn document_node(
         vocab::ESCALATED_CROPS: meta.escalated_crops,
         vocab::PARSER_REVISION: meta.parser_revision,
         vocab::CHUNK_COUNT: chunk_count,
+        vocab::CHUNKING: meta.chunking,
         vocab::INGESTED_AT: { "@value": meta.ingested_at, "@type": "xsd:dateTime" },
     });
     if let Some((model, dims)) = embedding {
@@ -143,18 +146,19 @@ pub fn retract_update(doc_iri: &str) -> String {
 }
 
 /// What an earlier ingest of this document recorded — content hash, parser
-/// revision, embedding model and extraction fingerprint — so an unchanged
-/// document can be skipped. Rows are `[sha256, parserRevision,
-/// embeddingModel | null, extractionFingerprint | null]`.
+/// revision, embedding model, extraction fingerprint and chunking — so an
+/// unchanged document can be skipped. Rows are `[sha256, parserRevision,
+/// embeddingModel | null, extractionFingerprint | null, chunking | null]`.
 pub fn exists_query(doc_iri: &str) -> Value {
     json!({
         "@context": { "doc": vocab::DOC_NS },
         "where": [
             { "@id": doc_iri, vocab::SHA256: "?sha", vocab::PARSER_REVISION: "?rev" },
             ["optional", { "@id": doc_iri, vocab::EMBEDDING_MODEL: "?model" }],
-            ["optional", { "@id": doc_iri, vocab::EXTRACTION_FINGERPRINT: "?extraction" }]
+            ["optional", { "@id": doc_iri, vocab::EXTRACTION_FINGERPRINT: "?extraction" }],
+            ["optional", { "@id": doc_iri, vocab::CHUNKING: "?chunking" }]
         ],
-        "select": ["?sha", "?rev", "?model", "?extraction"],
+        "select": ["?sha", "?rev", "?model", "?extraction", "?chunking"],
         "limit": 1
     })
 }

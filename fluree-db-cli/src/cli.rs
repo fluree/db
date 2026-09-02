@@ -3238,11 +3238,11 @@ pub struct DocIngestArgs {
     pub force: bool,
 
     /// Emit a chunk once its buffer reaches this many characters
-    #[arg(long, default_value_t = 800, value_name = "N")]
+    #[arg(long, default_value_t = 1500, value_name = "N")]
     pub min_chars: usize,
 
     /// Split a single element longer than this many characters
-    #[arg(long, default_value_t = 2000, value_name = "N")]
+    #[arg(long, default_value_t = 4000, value_name = "N")]
     pub max_chars: usize,
 
     /// Most crops one document may send to the vision model

@@ -4,7 +4,7 @@ Running `fluree doc ingest` over the same folder again is meant to be the normal
 
 ## Unchanged documents are skipped
 
-The document node records the file's SHA-256, the parser revision, the embedding model and, when extraction ran, a fingerprint of the ontology, the `--entities` sources, the language model, the guidance and the relation mode. When all of them match, the document is reported as `unchanged` and nothing is parsed, embedded, extracted or written. `--force` overrides this.
+The document node records the file's SHA-256, the parser revision, the chunk sizes, the embedding model and, when extraction ran, a fingerprint of the ontology, the `--entities` sources, the language model, the guidance and the relation mode. When all of them match, the document is reported as `unchanged` and nothing is parsed, embedded, extracted or written. `--force` overrides this.
 
 ## Changed documents are replaced, not diffed
 

@@ -30,6 +30,9 @@ pub const EMBEDDING: &str = "doc:embedding";
 pub const EMBEDDING_MODEL: &str = "doc:embeddingModel";
 pub const EMBEDDING_DIMENSIONS: &str = "doc:embeddingDimensions";
 pub const CHUNK_COUNT: &str = "doc:chunkCount";
+/// `min/max` characters the chunks were cut with, so a changed chunking
+/// re-ingests an otherwise unchanged document.
+pub const CHUNKING: &str = "doc:chunking";
 pub const FILE_NAME: &str = "doc:fileName";
 pub const RELATIVE_PATH: &str = "doc:relativePath";
 pub const SHA256: &str = "doc:sha256";

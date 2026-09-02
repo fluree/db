@@ -67,8 +67,8 @@ pub struct ChunkConfig {
 impl Default for ChunkConfig {
     fn default() -> Self {
         Self {
-            min_chars: 800,
-            max_chars: 2000,
+            min_chars: 1500,
+            max_chars: 4000,
         }
     }
 }

@@ -16,7 +16,7 @@ PDF is the geometric path: structure inferred from glyph and rule positions, esc
 
 ## Chunks
 
-A `doc:Chunk` is a retrieval unit cut along that structure. The chunker walks the graph and collects text from paragraphs, list items, captions and table cells until a chunk reaches `--min-chars` (default 800), closing early at a heading once it is at least half full so a chunk rarely straddles sections. A single element longer than `--max-chars` (default 2000) is split at sentence boundaries. Table cells are embedded with their headers: `Supply voltage / LM358B: 3 V`.
+A `doc:Chunk` is a retrieval unit cut along that structure. The chunker walks the graph and collects text from paragraphs, list items, captions and table cells until a chunk reaches `--min-chars` (default 1500), closing early at a heading once it is at least half full so a chunk rarely straddles sections. A single element longer than `--max-chars` (default 4000) is split at sentence boundaries. Table cells are embedded with their headers: `Supply voltage / LM358B: 3 V`.
 
 | Property | Meaning |
 |---|---|
