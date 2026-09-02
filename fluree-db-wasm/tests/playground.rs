@@ -84,6 +84,7 @@ async fn create_insert_sparql_select_roundtrip() {
              SELECT ?name ?age WHERE { ?p a ex:Person ; ex:name ?name ; ex:age ?age } \
              ORDER BY ?name"
                 .into(),
+            None,
         )
         .await
         .unwrap(),
@@ -121,7 +122,7 @@ async fn jsonld_query_update_and_snapshot_isolation() {
       "where": {"@id": "?p", "ex:knows": {"@id": "ex:bob"}}
     }"#;
     let before = snap(&pg, "jl").await;
-    let out = parse(pg.query_jsonld(before, q.into()).await.unwrap());
+    let out = parse(pg.query_jsonld(before, q.into(), None).await.unwrap());
     let rows = out.as_array().expect("JSON-LD select returns an array");
     assert_eq!(rows.len(), 1, "only alice knows bob: {out}");
     assert_eq!(rows[0]["ex:name"], "Alice");
@@ -139,6 +140,7 @@ async fn jsonld_query_update_and_snapshot_isolation() {
         pg.query_sparql(
             s,
             "PREFIX ex: <http://example.org/ns/> ASK { ex:bob ex:age 30 }".into(),
+            None,
         )
     };
 
@@ -173,7 +175,7 @@ async fn errors_carry_codes() {
 
     let s = snap(&pg, "errs").await;
     let bad = pg
-        .query_sparql(s, "SELECT WHERE {".into())
+        .query_sparql(s, "SELECT WHERE {".into(), None)
         .await
         .unwrap_err();
     assert_eq!(err_code(bad), "invalid_input");
@@ -188,7 +190,7 @@ async fn errors_carry_codes() {
     assert!(pg.release(s));
     assert!(!pg.release(s));
     let gone = pg
-        .query_sparql(s, "ASK { ?s ?p ?o }".into())
+        .query_sparql(s, "ASK { ?s ?p ?o }".into(), None)
         .await
         .unwrap_err();
     assert_eq!(err_code(gone), "not_found");
@@ -229,6 +231,7 @@ async fn memory_budget_rejects_oversized_query_typed() {
              WHERE { ?a a ex:Thing . ?b a ex:Thing } \
              GROUP BY ?a ?b"
                 .into(),
+            None,
         )
         .await;
     // A short panic on the wrong arm: dumping an Ok payload into the panic
@@ -242,7 +245,7 @@ async fn memory_budget_rejects_oversized_query_typed() {
 
     // The engine survived (typed error, not a trap): a small query still runs.
     let ok = parse(
-        pg.query_sparql(s, "ASK { ?s ?p ?o }".into())
+        pg.query_sparql(s, "ASK { ?s ?p ?o }".into(), None)
             .await
             .expect("engine alive after a budgeted rejection"),
     );
@@ -294,6 +297,7 @@ async fn upsert_and_sparql_update() {
         pg.query_sparql(
             s1,
             "PREFIX ex: <http://example.org/ns/> ASK { ex:bob ex:name \"Robert\" }".into(),
+            None,
         )
         .await
         .unwrap(),
@@ -318,6 +322,7 @@ async fn upsert_and_sparql_update() {
         pg.query_sparql(
             s2,
             "PREFIX ex: <http://example.org/ns/> ASK { ex:carol a ex:Person }".into(),
+            None,
         )
         .await
         .unwrap(),
