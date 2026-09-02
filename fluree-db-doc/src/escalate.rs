@@ -35,7 +35,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(180);
 const ATTEMPTS: u32 = 3;
 
 pub struct VlmReader {
-    client: reqwest::blocking::Client,
+    agent: ureq::Agent,
     endpoint: ModelEndpoint,
     api_key: Option<String>,
     cache: Option<DocCache>,
@@ -54,13 +54,15 @@ impl std::fmt::Debug for VlmReader {
 
 impl VlmReader {
     pub fn new(endpoint: ModelEndpoint, cache: Option<DocCache>, max_crops: usize) -> Result<Self> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(READ_TIMEOUT)
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(READ_TIMEOUT))
+            // Read error bodies ourselves: they say which crop and why.
+            .http_status_as_error(false)
             .build()
-            .map_err(|e| DocError::Model(format!("http client: {e}")))?;
+            .into();
         let api_key = endpoint.resolved_api_key();
         Ok(Self {
-            client,
+            agent,
             endpoint,
             api_key,
             cache,
@@ -191,15 +193,15 @@ impl VlmReader {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_secs(1 << attempt));
             }
-            let mut req = self.client.post(&url).json(&body);
+            let mut req = self.agent.post(&url);
             if let Some(key) = &self.api_key {
-                req = req.bearer_auth(key);
+                req = req.header("Authorization", &format!("Bearer {key}"));
             }
-            match req.send() {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let text = resp.text().unwrap_or_default();
-                    if status.is_success() {
+            match req.send_json(&body) {
+                Ok(mut resp) => {
+                    let status = resp.status().as_u16();
+                    let text = resp.body_mut().read_to_string().unwrap_or_default();
+                    if (200..300).contains(&status) {
                         let v: serde_json::Value = serde_json::from_str(&text)
                             .map_err(|e| DocError::Model(format!("malformed response: {e}")))?;
                         return match self.endpoint.wire_api() {
@@ -208,7 +210,7 @@ impl VlmReader {
                         };
                     }
                     last = format!("{status}: {}", text.chars().take(300).collect::<String>());
-                    if !(status.as_u16() == 429 || status.is_server_error()) {
+                    if !(status == 429 || status >= 500) {
                         break;
                     }
                 }

@@ -16,9 +16,12 @@ fluree-doc-html.workspace = true
 fluree-doc-pptx.workspace = true
 hayro-syntax.workspace = true
 
-# Model endpoints (OpenAI-compatible): embeddings async, VLM crops blocking
-# because they run inside the synchronous parse.
-reqwest = { workspace = true, features = ["blocking"] }
+# Model endpoints (OpenAI-compatible). Embeddings are async (reqwest); crop
+# reading runs inside the synchronous parse and uses ureq, a plain blocking
+# client with no runtime of its own — reqwest's blocking client owns one and
+# panics when dropped inside a tokio context.
+reqwest = { workspace = true }
+ureq = { version = "3", features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

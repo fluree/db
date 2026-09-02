@@ -157,20 +157,28 @@ All three slots speak the OpenAI wire shape, so OpenAI, Ollama, vLLM and LM Stud
 
 ### Using a Fluree AI account
 
-A Fluree AI stack serves the same routes and holds the model keys, so nothing else needs configuring locally. Its generation route is the Responses API, and a model of `auto` lets the gateway pick the account's vision provider:
+A Fluree AI stack serves the same routes and holds the model keys, so with an account nothing else needs configuring locally. Register the stack as a remote, log in once, and name it:
+
+```bash
+fluree remote add acct https://<your-stack>/v1/fluree     # OIDC is auto-discovered
+fluree auth login --remote acct                          # browser / device login
+fluree config set doc.remote acct
+```
+
+`doc.remote` fills every slot you have not set explicitly: embeddings through the gateway's `/v1/embeddings` (default model `text-embedding-3-small`), and crop reading and extraction through `/v1/responses` with `model = "auto"`, which lets the gateway route each intent to the account's vision or language provider. The remote is looked up in the project config first and the global config second, so one login from your home directory serves every project. An expired login is refreshed before the run.
+
+Any slot set explicitly wins, so a local embedding model can be combined with the account's vision model:
 
 ```toml
-[doc.vlm]
-url = "https://<your-stack>/v1"
-model = "auto"
-api = "responses"
-api_key = "$FLUREE_AI_API_KEY"          # an `flr_…` key from Settings → API keys
+[doc]
+remote = "acct"
 
 [doc.embedding]
-url = "https://<your-stack>/v1"
-model = "text-embedding-3-small"
-api_key = "$FLUREE_AI_API_KEY"
+url = "http://localhost:11434/v1"
+model = "nomic-embed-text"
 ```
+
+Without `doc.remote`, the same wiring can be spelled out by hand with an `flr_…` API key from Settings → API keys, using `api = "responses"` and `model = "auto"` on the `vlm` and `llm` slots.
 
 The gateway's embeddings route forwards to the account's OpenAI-type provider, so vector search through the stack needs one configured there.
 

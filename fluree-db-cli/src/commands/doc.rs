@@ -44,7 +44,7 @@ fn cache_root(dirs: &FlureeDir) -> PathBuf {
 /// first, then the global one, so a login done once from the home directory
 /// serves every project.
 async fn resolve_config(dirs: &FlureeDir) -> CliResult<DocConfig> {
-    let config = crate::config::read_doc_config(dirs.config_dir()).with_env();
+    let config = crate::config::read_doc_config(dirs.config_dir())?.with_env();
     let Some(remote_name) = config.remote.clone() else {
         return Ok(config);
     };
