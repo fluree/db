@@ -3076,7 +3076,8 @@ ex:alice a ex:User ; schema:name "Alice" .
         .args(["validate", "data.ttl", "--shacl", "shapes.ttl"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Conforms: true"));
+        .stdout(predicate::str::contains("Conforms: true"))
+        .stdout(predicate::str::contains("checked at t="));
 }
 
 #[test]
