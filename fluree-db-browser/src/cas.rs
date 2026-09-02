@@ -953,8 +953,14 @@ pub(crate) mod tests {
         let (storage, io, driver) = storage_with(&state, &config());
 
         // The read returns the GOOD bytes, not the poison.
-        let got = storage.read_bytes(&address).await.expect("heals via origin");
-        assert_eq!(got, good, "must serve verified origin bytes, not the poison");
+        let got = storage
+            .read_bytes(&address)
+            .await
+            .expect("heals via origin");
+        assert_eq!(
+            got, good,
+            "must serve verified origin bytes, not the poison"
+        );
 
         // The poison was rejected and the origin was hit (fall-through).
         assert_eq!(

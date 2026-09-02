@@ -142,8 +142,7 @@ impl SseChunkSource for ChannelSseSource {
         // events are small and infrequent, so this depth is never reached in
         // normal operation.
         const SSE_CHUNK_CHANNEL_DEPTH: usize = 256;
-        let (chunk_tx, chunk_rx) =
-            mpsc::channel::<Result<Bytes, String>>(SSE_CHUNK_CHANNEL_DEPTH);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Bytes, String>>(SSE_CHUNK_CHANNEL_DEPTH);
         self.io
             .send(IoJob::SseOpen {
                 url: self.url.clone(),

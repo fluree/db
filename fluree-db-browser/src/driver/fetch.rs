@@ -186,4 +186,3 @@ fn collect_headers(headers: &Headers) -> HeaderMap {
     }
     map
 }
-

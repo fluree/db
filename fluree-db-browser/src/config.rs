@@ -214,7 +214,10 @@ mod tests {
         );
         // At or under → allowed.
         assert_eq!(declared_length_over_cap(Some(CAP.to_string()), CAP), None);
-        assert_eq!(declared_length_over_cap(Some("1024".to_string()), CAP), None);
+        assert_eq!(
+            declared_length_over_cap(Some("1024".to_string()), CAP),
+            None
+        );
         // Whitespace tolerated.
         assert_eq!(
             declared_length_over_cap(Some(format!(" {} ", CAP + 5)), CAP),
