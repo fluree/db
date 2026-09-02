@@ -530,7 +530,10 @@ async fn unselective_bound_predicate_falls_back_to_whole_graph_path() {
 
     let (store, _guard) = span_capture::init_test_tracing();
 
-    let view = fluree.db(LEDGER).await.expect("view");
+    // Poll past the async post-commit index re-adoption: an unindexed view
+    // diverts to the range fallback, emits no overlay_translate span, and
+    // fails the span pins below spuriously under parallel-test load.
+    let view = indexed_view(&fluree).await;
     let q = json!({
         "@context": ctx(),
         "select": ["?s", "?o"],
@@ -597,7 +600,10 @@ async fn selective_brackets_stay_bounded() {
 
     // Bound PREDICATE, selective: stays bounded.
     let (store, _guard) = span_capture::init_test_tracing();
-    let view = fluree.db(LEDGER).await.expect("view");
+    // Poll past the async post-commit index re-adoption: an unindexed view
+    // diverts to the range fallback, emits no overlay_translate span, and
+    // fails the span pins below spuriously under parallel-test load.
+    let view = indexed_view(&fluree).await;
     let q = json!({
         "@context": ctx(),
         "select": ["?s", "?o"],
@@ -640,7 +646,8 @@ async fn selective_brackets_stay_bounded() {
 
     // Bound SUBJECT, selective: stays bounded.
     let (store2, _guard2) = span_capture::init_test_tracing();
-    let p = props(&fluree, LEDGER, "ex:item3").await;
+    let view2 = indexed_view(&fluree).await;
+    let p = props_on(&fluree, &view2, "ex:item3").await;
     assert!(
         p.iter().any(|s| s.contains("recolour3")),
         "novelty recolour missing from bound-subject read: {p:?}"
@@ -687,7 +694,10 @@ async fn tiny_unselective_bracket_stays_bounded_below_floor() {
 
     let (store, _guard) = span_capture::init_test_tracing();
 
-    let view = fluree.db(LEDGER).await.expect("view");
+    // Poll past the async post-commit index re-adoption: an unindexed view
+    // diverts to the range fallback, emits no overlay_translate span, and
+    // fails the span pins below spuriously under parallel-test load.
+    let view = indexed_view(&fluree).await;
     let q = json!({
         "@context": ctx(),
         "select": ["?s", "?o"],
