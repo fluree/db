@@ -150,14 +150,24 @@ impl Peer {
 
     /// SPARQL query against a snapshot handle → UTF-8 JSON bytes.
     #[wasm_bindgen(js_name = querySparql)]
-    pub async fn query_sparql(&self, snapshot: u32, sparql: String) -> Result<Vec<u8>, JsValue> {
-        self.core.query_sparql(snapshot, &sparql).await
+    pub async fn query_sparql(
+        &self,
+        snapshot: u32,
+        sparql: String,
+        timeout_ms: Option<f64>,
+    ) -> Result<Vec<u8>, JsValue> {
+        self.core.query_sparql(snapshot, &sparql, timeout_ms).await
     }
 
     /// JSON-LD query against a snapshot handle → UTF-8 JSON bytes.
     #[wasm_bindgen(js_name = queryJsonld)]
-    pub async fn query_jsonld(&self, snapshot: u32, query: String) -> Result<Vec<u8>, JsValue> {
-        self.core.query_jsonld(snapshot, &query).await
+    pub async fn query_jsonld(
+        &self,
+        snapshot: u32,
+        query: String,
+        timeout_ms: Option<f64>,
+    ) -> Result<Vec<u8>, JsValue> {
+        self.core.query_jsonld(snapshot, &query, timeout_ms).await
     }
 
     /// Register a JS callback for ledger head changes. Called with one JSON

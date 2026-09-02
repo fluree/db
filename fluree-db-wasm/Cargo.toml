@@ -33,6 +33,12 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# F3 per-query wall-clock timeout: a TimeoutFuture on the worker event loop,
+# raced against the query and dropped (clearing its setTimeout) when the query
+# wins. wasm-only — the timer is a browser setTimeout.
+gloo-timers = { version = "0.3", features = ["futures"] }
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 

@@ -240,16 +240,26 @@ impl Playground {
     /// bytes: W3C SPARQL Results JSON for SELECT/ASK, JSON-LD for
     /// CONSTRUCT/DESCRIBE — the same shapes the HTTP `/query` route returns.
     #[wasm_bindgen(js_name = querySparql)]
-    pub async fn query_sparql(&self, snapshot: u32, sparql: String) -> Result<Vec<u8>, JsValue> {
-        self.core.query_sparql(snapshot, &sparql).await
+    pub async fn query_sparql(
+        &self,
+        snapshot: u32,
+        sparql: String,
+        timeout_ms: Option<f64>,
+    ) -> Result<Vec<u8>, JsValue> {
+        self.core.query_sparql(snapshot, &sparql, timeout_ms).await
     }
 
     /// Run a JSON-LD query (`query` is the JSON text of the query object)
     /// against a snapshot handle. Resolves to UTF-8 JSON bytes in Fluree's
     /// JSON-LD result format.
     #[wasm_bindgen(js_name = queryJsonld)]
-    pub async fn query_jsonld(&self, snapshot: u32, query: String) -> Result<Vec<u8>, JsValue> {
-        self.core.query_jsonld(snapshot, &query).await
+    pub async fn query_jsonld(
+        &self,
+        snapshot: u32,
+        query: String,
+        timeout_ms: Option<f64>,
+    ) -> Result<Vec<u8>, JsValue> {
+        self.core.query_jsonld(snapshot, &query, timeout_ms).await
     }
 
     /// Test hook: deliberately panic — i.e. trap the wasm instance — so the

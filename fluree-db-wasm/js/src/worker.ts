@@ -337,8 +337,8 @@ async function handle(req: Request): Promise<void> {
         try {
           bytes =
             req.kind === "sparql"
-              ? await eng.querySparql(snap, req.text)
-              : await eng.queryJsonld(snap, req.text);
+              ? await eng.querySparql(snap, req.text, req.timeoutMs)
+              : await eng.queryJsonld(snap, req.text, req.timeoutMs);
         } finally {
           // Release only ephemeral (per-call) snapshots. This `finally` runs
           // BEFORE the outer catch sets `poisoned`, so a trap in the query

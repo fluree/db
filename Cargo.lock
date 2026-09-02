@@ -3569,6 +3569,7 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-query",
  "futures",
+ "gloo-timers",
  "js-sys",
  "serde_json",
  "wasm-bindgen",

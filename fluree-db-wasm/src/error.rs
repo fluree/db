@@ -6,6 +6,7 @@
 //! (`unauthorized`, `network`) without the playground ever producing them.
 
 use fluree_db_api::ApiError;
+use fluree_db_core::QueryCancellationReason;
 use fluree_db_query::QueryError;
 use wasm_bindgen::JsValue;
 
@@ -15,6 +16,10 @@ pub(crate) mod code {
     pub const CONFLICT: &str = "conflict";
     pub const INVALID_INPUT: &str = "invalid_input";
     pub const CANCELLED: &str = "cancelled";
+    /// A query passed its wall-clock timeout and was aborted *typed* (F3) —
+    /// the engine survives. `api::error` already maps a cancelled query to
+    /// HTTP 408, so only the code distinguishes a timeout from a caller cancel.
+    pub const TIMEOUT: &str = "timeout";
     /// A query crossed its memory budget and was aborted *typed* — the engine
     /// survives. The JS shell uses the same code (with `fatal: true`) when the
     /// allocator traps instead.
@@ -37,6 +42,9 @@ fn code_for(err: &ApiError) -> &'static str {
         | ApiError::CypherUpdateLower(_)
         | ApiError::Turtle(_)
         | ApiError::Builder(_) => code::INVALID_INPUT,
+        ApiError::Query(QueryError::Cancelled {
+            reason: QueryCancellationReason::Timeout,
+        }) => code::TIMEOUT,
         ApiError::Query(QueryError::Cancelled { .. }) => code::CANCELLED,
         ApiError::Query(QueryError::MemoryBudgetExceeded { .. }) => code::OUT_OF_MEMORY,
         _ => match err.status_code() {
@@ -73,4 +81,32 @@ pub(crate) fn invalid_json(what: &str, err: serde_json::Error) -> JsValue {
 /// input, mapped anyway rather than unwrapped.
 pub(crate) fn serialize_failed(err: serde_json::Error) -> JsValue {
     js_error(code::INTERNAL, 500, &format!("result serialization: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{code, code_for};
+    use fluree_db_api::ApiError;
+    use fluree_db_core::QueryCancellationReason;
+    use fluree_db_query::QueryError;
+
+    fn cancelled(reason: QueryCancellationReason) -> ApiError {
+        ApiError::Query(QueryError::Cancelled { reason })
+    }
+
+    #[test]
+    fn timeout_cancellation_maps_to_the_timeout_code_not_cancelled() {
+        // F3: a query aborted by its wall-clock timeout must surface a distinct
+        // `timeout` code so the JS surface can tell it apart from a caller
+        // cancel or a disconnect (all three are one QueryError::Cancelled).
+        assert_eq!(code_for(&cancelled(QueryCancellationReason::Timeout)), code::TIMEOUT);
+        assert_eq!(
+            code_for(&cancelled(QueryCancellationReason::Cancelled)),
+            code::CANCELLED,
+        );
+        assert_eq!(
+            code_for(&cancelled(QueryCancellationReason::ClientDisconnected)),
+            code::CANCELLED,
+        );
+    }
 }

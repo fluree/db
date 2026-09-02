@@ -114,6 +114,8 @@ export interface QueryRequest {
   /** SPARQL text, or the JSON text of a JSON-LD query object. */
   text: string;
   transport: ResultTransport;
+  /** Wall-clock budget in ms (F3). Undefined = no timeout. */
+  timeoutMs?: number;
 }
 
 /** Register a live subscription (A4). The engine auto-primes it: the first

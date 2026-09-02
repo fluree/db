@@ -177,6 +177,13 @@ export interface PlaygroundOptions {
 export interface QueryOptions {
   /** Per-call override of the result transport. */
   transport?: ResultTransport;
+  /** Wall-clock budget for this query in milliseconds (F3). When it elapses,
+   * the query is cancelled and the call rejects with a typed `timeout` error
+   * (HTTP 408) instead of pegging the worker indefinitely. Omit for no
+   * timeout. The engine cancels cooperatively at its checkpoints, so an
+   * I/O-bound query (the peer's residency fetches) aborts promptly; a purely
+   * compute-bound stretch is bounded by reaching the next checkpoint. */
+  timeoutMs?: number;
 }
 
 export interface ConnectOptions
@@ -727,6 +734,7 @@ export class Snapshot {
       kind: queryKindOf(query),
       text: asJsonText(query),
       transport: options.transport ?? this.transport,
+      timeoutMs: options.timeoutMs,
     });
     return decodeResult(res);
   }
@@ -809,6 +817,7 @@ export class Ledger {
       kind: queryKindOf(query),
       text: asJsonText(query),
       transport: options.transport ?? this.transport,
+      timeoutMs: options.timeoutMs,
     });
     return decodeResult(res);
   }
