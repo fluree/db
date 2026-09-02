@@ -84,11 +84,16 @@ fn main() {
     }
 
     // Shape 3: roots with no prev_index. Exactly one (genesis) is expected.
-    let genesis: Vec<_> = nodes
+    let mut genesis: Vec<_> = nodes
         .iter()
         .filter(|(_, (_, p))| p.is_none())
         .map(|(d, (t, _))| (*t, d.clone()))
         .collect();
+    // Every listing below is sorted by (index_t, digest). These are collected out of
+    // a HashMap, so without this the five roots a preview happens to show, and the
+    // order it shows them in, change from run to run over an unchanged directory.
+    // The tool's main use is diffing two measurements, which that makes impossible.
+    genesis.sort();
     println!(
         "roots with no prev_index (expect 1 = genesis): {}",
         genesis.len()
@@ -101,21 +106,26 @@ fn main() {
     // Shape 2: a root pointed at by MORE THAN ONE successor is a fork point — two
     // builds based on the same parent. Only one can be the published head, so the
     // other lineage is abandoned at creation.
-    let forks: Vec<_> = prev_targets
+    let mut forks: Vec<_> = prev_targets
         .iter()
         .filter(|(_, kids)| kids.len() > 1)
+        .map(|(parent, kids)| {
+            let parent_t = nodes.get(*parent).map(|(t, _)| *t).unwrap_or(-1);
+            let mut kid_ts: Vec<i64> = kids
+                .iter()
+                .map(|k| nodes.get(*k).map(|(t, _)| *t).unwrap_or(-1))
+                .collect();
+            kid_ts.sort_unstable();
+            (parent_t, (*parent).clone(), kid_ts)
+        })
         .collect();
+    forks.sort();
     println!("fork points (parent with >1 child): {}", forks.len());
-    for (parent, kids) in forks.iter().take(8) {
-        let pt = nodes.get(**parent).map(|(t, _)| *t).unwrap_or(-1);
-        let kid_ts: Vec<i64> = kids
-            .iter()
-            .map(|k| nodes.get(*k).map(|(t, _)| *t).unwrap_or(-1))
-            .collect();
+    for (parent_t, parent, kid_ts) in forks.iter().take(8) {
         println!(
-            "    parent index_t={pt} {} -> {} children at index_t {:?}",
+            "    parent index_t={parent_t} {} -> {} children at index_t {:?}",
             &parent[..16.min(parent.len())],
-            kids.len(),
+            kid_ts.len(),
             kid_ts
         );
     }
@@ -126,7 +136,7 @@ fn main() {
     // with different fixes: the parent was deleted, or it is still on disk and did
     // not decode. Truncating a root and deleting it leave the same hole, so the two
     // are counted and labelled apart rather than both reported as MISSING.
-    let dangling: Vec<_> = nodes
+    let mut dangling: Vec<_> = nodes
         .iter()
         .filter_map(|(d, (t, p))| {
             p.as_ref()
@@ -134,6 +144,7 @@ fn main() {
                 .map(|p| (*t, d.clone(), p.clone()))
         })
         .collect();
+    dangling.sort();
     let corrupt_parents = dangling
         .iter()
         .filter(|(_, _, p)| undecodable.contains(p))
@@ -178,10 +189,7 @@ fn main() {
     // Reachability from the head: what GC can actually see.
     let head = match &head_arg {
         Some(arg) => Some(resolve_head(arg, &nodes, &undecodable)),
-        None => nodes
-            .iter()
-            .max_by_key(|(_, (t, _))| *t)
-            .map(|(d, _)| d.clone()),
+        None => guess_head(&nodes),
     };
     if let Some(head) = head {
         // Count only digests that are actually PRESENT on disk. Walking into a
@@ -313,4 +321,26 @@ fn and_n_more(shown: usize, total: usize) {
     if total > shown {
         println!("    ... and {} more", total - shown);
     }
+}
+
+/// Pick the newest root by `index_t` when no head was supplied.
+///
+/// `max_by_key` over a HashMap picks arbitrarily among ties, so two runs over one
+/// directory could report different reachability. That is worst precisely where it
+/// matters: roots tied at the newest `index_t` are one version built twice, which is
+/// the fork this tool exists to find. Break the tie on digest so runs agree, and say
+/// the tie happened rather than silently guessing which side of the fork is the head.
+fn guess_head(nodes: &HashMap<String, (i64, Option<String>)>) -> Option<String> {
+    let (digest, (newest, _)) = nodes
+        .iter()
+        .max_by(|a, b| a.1 .0.cmp(&b.1 .0).then_with(|| a.0.cmp(b.0)))?;
+    let tied = nodes.values().filter(|(t, _)| t == newest).count();
+    if tied > 1 {
+        println!(
+            "!! no head supplied and {tied} roots share the newest index_t ({newest}): \
+             that tie is itself a fork signature. Guessing the largest digest; pass \
+             the published head to get a real reachability answer."
+        );
+    }
+    Some(digest.clone())
 }
