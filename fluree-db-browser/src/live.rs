@@ -386,7 +386,9 @@ impl LiveQuerySet {
         ledger: &str,
         commit_flakes: Option<&[Flake]>,
     ) -> CycleOutcome {
-        self.cycle_over(ledger, None, commit_flakes).await
+        // Pure path: the caller receives the outcome directly, so the
+        // result is "delivered" by definition — commit the hashes.
+        self.cycle_over(ledger, None, commit_flakes, true).await
     }
 
     /// Coalescing driver for head changes: runs a cycle now, or — when
@@ -435,7 +437,20 @@ impl LiveQuerySet {
         let mut only = solo;
         let mut first: Option<CycleOutcome> = None;
         loop {
-            let outcome = self.cycle_over(ledger, only.as_deref(), None).await;
+            // Deliverability gates the hash commit: with no callback
+            // registered (an auto-prime racing `on_outcome` registration),
+            // `emit` reaches nobody, so committing the change-gate hashes
+            // would wedge each subscription at "unchanged, no payload".
+            // Checked per iteration so a registration between cycles is seen.
+            let deliverable = !self
+                .inner
+                .callbacks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty();
+            let outcome = self
+                .cycle_over(ledger, only.as_deref(), None, deliverable)
+                .await;
             self.emit(&outcome);
             if want_outcome && first.is_none() {
                 first = Some(outcome);
@@ -468,11 +483,20 @@ impl LiveQuerySet {
 
     /// The advance-cycle core: one snapshot, one cycle guard, every
     /// selected subscription re-run against the one view, one outcome.
+    /// `commit_hashes`: whether to write each changed subscription's new
+    /// change-gate hash back into the registry. Committing a hash records
+    /// "the SDK has seen this result", so it MUST only happen when the
+    /// outcome is actually delivered — otherwise the next identical cycle is
+    /// reported `unchanged` with no payload and the subscription wedges on
+    /// data it never received. The emit path passes its deliverability here;
+    /// the pure `run_cycle` family passes `true` because it hands the outcome
+    /// straight back to its caller.
     async fn cycle_over(
         &self,
         ledger: &str,
         only: Option<&[SubId]>,
         commit_flakes: Option<&[Flake]>,
+        commit_hashes: bool,
     ) -> CycleOutcome {
         // Snapshot descriptors without holding the lock across awaits.
         let selected: Vec<SelectedSub> = {
@@ -581,9 +605,16 @@ impl LiveQuerySet {
         // unsubscribed mid-cycle is dropped from the outcome too.
         {
             let mut subs = self.subs_lock();
-            for (sub_id, hash) in &hash_updates {
-                if let Some(sub) = subs.get_mut(sub_id) {
-                    sub.last_hash = Some(*hash);
+            // Commit hashes only when this outcome is being delivered (see
+            // `commit_hashes`). An undelivered cycle — e.g. an auto-prime
+            // that raced callback registration and reached zero callbacks —
+            // must leave `last_hash` untouched so the next delivered cycle
+            // re-sends the payload instead of reporting it `unchanged`.
+            if commit_hashes {
+                for (sub_id, hash) in &hash_updates {
+                    if let Some(sub) = subs.get_mut(sub_id) {
+                        sub.last_hash = Some(*hash);
+                    }
                 }
             }
             outcome.changed.retain(|c| subs.contains_key(&c.sub_id));
@@ -857,6 +888,11 @@ mod tests {
     async fn prime_runs_a_new_subscription_solo_then_it_joins_the_barrier() {
         let fluree = seeded_fluree().await;
         let live = LiveQuerySet::new(fluree.clone(), None);
+        // A listener makes the emitted cycles deliverable, so their change-gate
+        // hashes commit — which is what lets the follow-up cycle see the primed
+        // subscription as `unchanged`. (Production always has this listener; a
+        // prime with none must NOT commit — see `a_prime_with_no_listener_...`.)
+        live.on_outcome(|_| {});
         let early = live.subscribe(LEDGER, names_query());
         let _ = live.run_cycle(LEDGER).await;
 
@@ -875,6 +911,50 @@ mod tests {
         assert!(cycle.unchanged.contains(&early) && cycle.unchanged.contains(&late));
 
         assert!(live.prime(9_999).await.is_none(), "unknown sub");
+    }
+
+    /// F3: an auto-prime that runs before any `on_outcome` listener is
+    /// registered reaches zero callbacks (the shell's auto-prime spawns
+    /// detached and ignores the return value; delivery is only via the
+    /// callback, installed later when JS calls `onCycleOutcome`). Its
+    /// change-gate hash must NOT be committed — otherwise the next delivered
+    /// cycle, computing the identical result, reports the subscription
+    /// `unchanged` with no payload and it wedges on data the SDK never got.
+    #[tokio::test]
+    async fn a_prime_with_no_listener_does_not_wedge_the_subscription() {
+        let fluree = seeded_fluree().await;
+        let live = LiveQuerySet::new(fluree.clone(), None);
+        let sub = live.subscribe(LEDGER, names_query());
+
+        // Prime BEFORE any listener: the outcome reaches nobody.
+        let primed = live.prime(sub).await.expect("known sub");
+        assert_eq!(primed.changed.len(), 1, "the solo prime computed a result");
+
+        // A listener attaches, then a head change drives a cycle.
+        let seen: Arc<Mutex<Vec<(Vec<SubId>, Vec<SubId>)>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            live.on_outcome(move |o| {
+                seen.lock().unwrap_or_else(PoisonError::into_inner).push((
+                    o.changed.iter().map(|c| c.sub_id).collect(),
+                    o.unchanged.clone(),
+                ));
+            });
+        }
+        live.advance(LEDGER).await;
+
+        // The subscription must be DELIVERED its payload (in `changed`), not
+        // reported `unchanged` with nothing — the undelivered prime left its
+        // hash uncommitted, so the first real delivery still carries the data.
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let delivered = seen.iter().any(|(changed, _)| changed.contains(&sub));
+        let wedged = seen
+            .iter()
+            .any(|(changed, unchanged)| unchanged.contains(&sub) && !changed.contains(&sub));
+        assert!(
+            delivered && !wedged,
+            "sub must receive its payload once a listener attaches, not be wedged unchanged: {seen:?}"
+        );
     }
 
     /// The ordering invariant everything above the driver rests on: a
