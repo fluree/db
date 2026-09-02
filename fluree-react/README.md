@@ -127,7 +127,7 @@ and then never updates, this section — not your code — is the reason.
 
 | Requirement | Why |
 | --- | --- |
-| **A server built with the `?ledger=` SSE fix** (PR **#1730**, `fix/events-per-ledger-subscription`). Not in any release. | Without it `GET /v1/fluree/events?ledger=…` fails deserialization outright — axum's `Query` extractor cannot build a `Vec` from repeated query keys — so **even a single ledger** 400s and the stream never opens. The symptom is a query stuck in `loading` with `useConnectionState()` flapping `reconnecting`. |
+| **A server built with the `?ledger=` SSE fix.** This branch carries it; a released build does not. (The same fix is up standalone as PR **#1730**, `fix/events-per-ledger-subscription`, for landing on main.) | Without it `GET /v1/fluree/events?ledger=…` fails deserialization outright — axum's `Query` extractor cannot build a `Vec` from repeated query keys — so **even a single ledger** 400s and the stream never opens. The symptom is a query stuck in `loading` with `useConnectionState()` flapping `reconnecting`. |
 | Nothing else. | Query + events is the whole surface. No flags, no tokens unless your server enforces them. |
 
 ### Peer mode
@@ -414,8 +414,9 @@ today** — that gap is why defects 1-4 survived a green suite.
 
 ### Known blockers
 
-1. **Remote mode needs PR #1730.** Not in any release. Until it lands, the
-   SSE subscription 400s and no query ever updates. See
+1. **Remote mode needs the `?ledger=` SSE fix on the server.** This branch
+   carries it (standalone as PR #1730 for main); no released build has it yet,
+   and until one does the SSE subscription 400s and no query ever updates. See
    [What you need on the server](#what-you-need-on-the-server).
 
 Not in this package's code.

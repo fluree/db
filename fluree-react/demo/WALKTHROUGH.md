@@ -16,9 +16,12 @@ someone will ask about.
 Three terminals. Remote mode is the one to demo: it is reliable, it starts in
 milliseconds, and the story does not depend on anything being warm.
 
-> **You need a server built from PR #1730** (`fix/events-per-ledger-subscription`).
-> No released build works — the SSE subscription 400s and nothing ever
-> updates. This is the single most likely way the demo fails on you.
+> **Build the server from this branch** — it carries the per-ledger `?ledger=`
+> SSE fix the demo needs (the same fix is up standalone as PR #1730 for main).
+> A released build does NOT have it: the SSE subscription 400s and nothing
+> ever updates. The `cargo build` below builds from your current checkout, so
+> as long as that is this branch you are set — this is the single most likely
+> way the demo fails on you.
 
 ```sh
 # 1. build the server (once; release, not debug — debug is far slower here)
@@ -154,7 +157,7 @@ per subscription per commit, capped at 6 concurrent. That is the honest
 current cost and the reason a multi-query endpoint is on the list. Peer mode
 re-runs locally and doesn't have this shape.
 
-**"Does it work today?"** Remote mode, against a server built from #1730 —
+**"Does it work today?"** Remote mode, against a server built from this branch —
 yes. Against a released server — no, and that PR is why. Peer mode — yes,
 including with the block cache unavailable entirely; its open question is
 cold-open *cost* (~3.4 s), not correctness.
