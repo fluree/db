@@ -8,6 +8,9 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 |---|---|
 | `doc:Chunk` | A retrieval unit cut from a document's structure. |
 | `doc:SourceDocument` | The file a graph was extracted from; the `doc:sourceDocument` target. |
+| `doc:Mention` | A span of a chunk naming an entity. Also typed `nif:RFC5147String`. |
+| `doc:Relation` | One relation the language model reported, reified with its evidence and verdict. |
+| `doc:Entity` | An entity extraction minted because no `--entities` source knew it. Known entities keep their own IRI and get no node here. |
 
 ## Chunk properties
 
@@ -36,6 +39,47 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 | `doc:embeddingModel` | string | The embedding model, when one ran. |
 | `doc:embeddingDimensions` | integer | Its vector width. |
 | `doc:ingestedAt` | `xsd:dateTime` | When this extraction was written. |
+| `doc:extractionModel` | string | The language model that extracted, when one ran. |
+| `doc:extractionFingerprint` | string | Hash of the ontology, entity sources, model, guidance and relation mode. |
+| `doc:mentionCount` | integer | Mentions written. |
+| `doc:entityCount` | integer | Distinct entities mentioned, known and new. |
+| `doc:relationCount` | integer | Relations written, every verdict included. |
+
+## Mention properties
+
+| Property | Range | Meaning |
+|---|---|---|
+| `nif:beginIndex`, `nif:endIndex` | integer | Character offsets into the chunk's `doc:text`. |
+| `nif:anchorOf` | string | The text as written. |
+| `nif:referenceContext` | IRI | The chunk. |
+| `nif:entity` | IRI | The entity, under the IRI its source gave it. |
+| `doc:sourceElement` | IRI | The structure element the span sits in. |
+| `doc:extractedBy` | string | `gazetteer` or `llm`. |
+| `doc:sourceDocument` | IRI | The document. |
+
+## Relation properties
+
+| Property | Range | Meaning |
+|---|---|---|
+| `rdf:subject`, `rdf:predicate` | IRI | The statement. |
+| `rdf:object` | IRI or literal | The statement's object: an entity, or the literal the model gave when the object was a value or named no entity in the chunk. |
+| `rdfs:label` | string | `subject | predicate label | object`. |
+| `doc:excerpt` | string | The text supporting it, as the model quoted it. |
+| `doc:verdict` | string | `valid`, `repaired` or `rejected`. |
+| `doc:asserted` | boolean | Whether a direct edge was written for it. |
+| `doc:originalPredicate`, `doc:repairNote` | string | On a repaired relation: what the model wrote, and how it was resolved. |
+| `doc:rejectionReason` | string | On a rejected relation. |
+| `doc:sourceChunk`, `doc:sourceDocument` | IRI | Where it was found. |
+
+## Minted entity properties
+
+| Property | Range | Meaning |
+|---|---|---|
+| `schema:name` | string | The canonical name. |
+| `skos:altLabel` | string, repeated | Other surface forms seen. |
+| `doc:nerLabel` | string | Coarse label: PERSON, ORG, GPE, LOC, FAC, EVENT, PRODUCT, WORK_OF_ART, LANGUAGE, MISC, CONCEPT. |
+| `doc:offModel` | boolean | Present and true when the model's class for the entity is not in the ontology; the node carries no class. |
+| *ontology datatype properties* | literal | Attributes the model stated and the ontology admits. |
 
 ## Structure terms used by the chunker
 

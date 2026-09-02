@@ -30,6 +30,10 @@ base64 = "0.22"
 thiserror.workspace = true
 tracing.workspace = true
 walkdir.workspace = true
+# Gazetteer scanning: longest whole-word match over every label, plus
+# Snowball stems so "cities" finds "City".
+aho-corasick = "1.1"
+rust-stemmers = "1.2"
 tokio = { workspace = true, features = ["time"] }
 
 [lints]

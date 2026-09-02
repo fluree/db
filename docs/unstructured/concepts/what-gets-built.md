@@ -1,6 +1,6 @@
 # What gets built
 
-One commit per document, holding four things.
+One commit per document, holding four things, and a fifth when extraction is on.
 
 ## The structure graph
 
@@ -29,11 +29,15 @@ A `doc:Chunk` is a retrieval unit cut along that structure. The chunker walks th
 
 ## The document node
 
-A `doc:SourceDocument` at the document's IRI records the file: `doc:fileName`, `doc:relativePath`, `doc:sha256`, `doc:mediaType`, `doc:byteSize`, `doc:pageCount`, `doc:escalatedCrops`, `doc:parserRevision`, `doc:chunkCount`, `doc:embeddingModel`, `doc:embeddingDimensions`, `doc:ingestedAt`. It is what a later run compares against to decide whether the document is unchanged.
+A `doc:SourceDocument` at the document's IRI records the file: `doc:fileName`, `doc:relativePath`, `doc:sha256`, `doc:mediaType`, `doc:byteSize`, `doc:pageCount`, `doc:escalatedCrops`, `doc:parserRevision`, `doc:chunkCount`, `doc:embeddingModel`, `doc:embeddingDimensions`, `doc:ingestedAt`, and, when extraction ran, `doc:extractionModel`, `doc:extractionFingerprint`, `doc:mentionCount`, `doc:entityCount`, `doc:relationCount`. It is what a later run compares against to decide whether the document is unchanged.
+
+## Entities, mentions and relations
+
+With `--model` and/or `--entities`, the same commit also holds what the document is about. A `doc:Mention` is a span of a chunk naming an entity: `nif:beginIndex` / `nif:endIndex` into the chunk's text, `nif:anchorOf`, `nif:referenceContext` (the chunk), `nif:entity` (the entity, under the IRI it already has in your `--entities` source), and `doc:sourceElement`. A `doc:Relation` is one statement the language model reported, reified with `rdf:subject`, `rdf:predicate`, `rdf:object`, its excerpt and the gate's verdict; admitted relations are also written as plain edges. An entity no source knew is minted as `doc:Entity` with `schema:name`, `skos:altLabel`, `doc:nerLabel` and any attributes the ontology admits. See [Entities and relations](entities-and-relations.md).
 
 ## IRIs
 
-Documents are minted as `<base-iri><relative path>`, default `urn:fluree:doc:` plus the path relative to the folder you ingested, percent-encoded but with `/` kept. Elements are `<document>/element/<n>` and `<document>/section/<n>` in emission order; chunks are `<document>/chunk/<n>`. Because the document IRI depends only on where the file sits, it survives re-runs, and `--base-iri` lets you put a corpus under your own namespace.
+Documents are minted as `<base-iri><relative path>`, default `urn:fluree:doc:` plus the path relative to the folder you ingested, percent-encoded but with `/` kept. Elements are `<document>/element/<n>` and `<document>/section/<n>` in emission order; chunks are `<document>/chunk/<n>`, mentions `<chunk>/mention/<n>`, relations `<document>/relation/<n>`, and minted entities `<base-iri>entity/<hash of the name>`. Because the document IRI depends only on where the file sits, it survives re-runs, and `--base-iri` lets you put a corpus under your own namespace.
 
 ## The indexes
 

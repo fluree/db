@@ -39,7 +39,7 @@ Every model interaction is a separate call. There are three kinds, and they are 
 |---|---|---|---|
 | Read a crop | `POST …/responses` (or `…/chat/completions`) with the crop image and a transcription prompt, intent `doc-parse` | `vlm`, else `llm` | Per crop, only for pages and regions the deterministic pass flagged. Answered from the reading cache when the pixels were seen before. |
 | Embed chunks | `POST …/embeddings` | `embedding` | Per document, in batches. |
-| Extract entities and relations | `POST …/responses`, intent `extraction` | `llm` | Per chunk, when extraction is enabled. In progress. |
+| Extract entities and relations | `POST …/responses` (or `…/chat/completions`) with the ontology as system prompt and the chunk with its known entities as the user turn, intent `extraction` | `llm` | Per chunk, when `--model` is given, several chunks at once. Answered from the extraction cache when the same ask was made before. |
 
 Against a Fluree AI gateway, the first and third go to the same route and the gateway routes each intent to the account's provider for it. Against your own endpoints, `vlm` and `llm` are simply two configurations, which may name the same model.
 
@@ -47,10 +47,10 @@ Against a Fluree AI gateway, the first and third go to the same route and the ga
 
 - For a crop read: a PNG of the page or region and a short prompt. Only pages the parser could not read are cropped; a document that reads deterministically sends nothing.
 - For embeddings: each chunk's text with its section path prefixed.
-- For extraction: each chunk's text plus the ontology and known entities you supplied.
+- For extraction: each chunk's text, the ontology rendered as text, and the names and types of the known entities found in that chunk.
 
 Never the file itself, never the ledger. The parse cache and reading cache are local files under `.fluree/cache/doc/`.
 
 ## Costs to expect
 
-The deterministic parse is milliseconds per page. A vision read is seconds per crop, so `--max-crops` (default 70) caps what one document may ask for; a document over the cap lands with the deterministic tier only and says so in the output. Embeddings are cheap per chunk, but a long report is hundreds of chunks.
+The deterministic parse is milliseconds per page. A vision read is seconds per crop, so `--max-crops` (default 70) caps what one document may ask for; a document over the cap lands with the deterministic tier only and says so in the output. Embeddings are cheap per chunk, but a long report is hundreds of chunks. Extraction is one generation call per chunk with the whole ontology in the prompt, so it is the most expensive step by far; the `--entities` scan alone costs nothing.

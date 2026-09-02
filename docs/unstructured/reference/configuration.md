@@ -38,6 +38,19 @@ Environment variables override the file per field: `FLUREE_DOC_{EMBEDDING,LLM,VL
 
 An absent `[doc]` table means unconfigured: the pipeline runs deterministic and offline. A present but malformed one is an error.
 
+## Extraction
+
+```toml
+[doc.extraction]
+guidance = "prompts/guidance.md"          # priorities placed in the extraction prompt
+# system_prompt = "prompts/system.txt"    # replaces the system prompt; keep {model} and {guidance}
+# user_prompt = "prompts/user.txt"        # replaces the user prompt; keep {existing} and {document}
+# concurrency = 4                         # chunks sent to the language model at once
+# drop_off_model = false                  # drop new entities typed outside the ontology
+```
+
+Paths are relative to the project. Each value has a flag of the same name on `fluree doc ingest` that overrides it for one run. See [Entities and relations](../concepts/entities-and-relations.md#guidance-and-custom-prompts).
+
 ## Defaults supplied by `remote`
 
 | Slot | Model | API |

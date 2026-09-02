@@ -37,6 +37,40 @@ SELECT ?chunk ?text WHERE {
 }
 ```
 
+## Across ledgers, on the entities you already have
+
+A mention points at the entity's own IRI from the `--entities` source, so a dataset query joins the source ledger and the documents ledger with no mapping. Everything a memo says about a person, next to what the people ledger knows about them:
+
+```sparql
+PREFIX doc: <https://ns.flur.ee/doc#>
+PREFIX nif: <http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#>
+PREFIX schema: <https://schema.org/>
+
+SELECT ?name ?email ?file ?said
+FROM <people:main>
+FROM <memos:main>
+WHERE {
+  ?person a schema:Person ; schema:name ?name ; schema:email ?email .
+  ?m nif:entity ?person ; nif:anchorOf ?said ; doc:sourceDocument ?d .
+  ?d doc:relativePath ?file .
+}
+```
+
+Relations are reified with their evidence, so a review of what the model claimed and how it was judged is one query:
+
+```sparql
+PREFIX doc: <https://ns.flur.ee/doc#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+SELECT ?verdict ?s ?p ?o ?excerpt ?reason WHERE {
+  ?r a doc:Relation ; doc:verdict ?verdict ;
+     rdf:subject ?s ; rdf:predicate ?p ; rdf:object ?o ; doc:excerpt ?excerpt .
+  OPTIONAL { ?r doc:rejectionReason ?reason }
+} ORDER BY ?verdict
+```
+
+Admitted relations are also plain edges, so `?person schema:worksFor ?org` works as it would over hand-written data.
+
 ## Vector and full-text search by hand
 
 The indexes are graph sources. A vector search takes a query vector — the same embedding endpoint the ingest used — and joins the hits to chunk data:

@@ -11,19 +11,22 @@
 //! back to the chunk's text, section path and source document, so a result
 //! is a citation and not just a score.
 
-use crate::cli::{DocAction, DocIngestArgs, DocSearchArgs, DocSearchMode};
+use crate::cli::{DocAction, DocIngestArgs, DocRelationMode, DocSearchArgs, DocSearchMode};
+use crate::commands::doc_sources::{self, Source};
 use crate::context::{self, build_fluree};
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::{Bm25CreateConfig, Fluree};
-use fluree_db_doc::graph::{self, DocumentMeta};
+use fluree_db_doc::extract::{self, ChunkExtraction, ChunkInput, ExtractionGraph};
+use fluree_db_doc::graph::{self, DocumentMeta, ExtractionStamp};
 use fluree_db_doc::{
     collect_inputs, prepare, vocab, Chunk, ChunkConfig, DocCache, DocConfig, EmbeddingClient,
-    IngestOptions, VlmReader,
+    ExtractOptions, Extractor, Gazetteer, IngestOptions, LlmClient, Model, RelationMode,
+    ResolvePolicy, VlmReader,
 };
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -147,6 +150,308 @@ struct Totals {
     /// Documents that asked for more crops than the cap and landed
     /// deterministic-only.
     unescalated: usize,
+    mentions: usize,
+    entities_new: usize,
+    relations: usize,
+    relations_rejected: usize,
+    hallucinated: usize,
+    off_model: usize,
+    off_model_dropped: usize,
+    extraction_cache_hits: usize,
+    chunks_failed: usize,
+}
+
+const DEFAULT_CONCURRENCY: usize = 4;
+
+/// What `--model` and `--entities` set up, shared across documents.
+struct Extraction {
+    model: Option<Arc<Model>>,
+    gazetteer: Option<Arc<Gazetteer>>,
+    extractor: Option<Arc<Extractor>>,
+    policy: ResolvePolicy,
+    concurrency: usize,
+    /// Changes when the ontology, the gazetteer, the model, the guidance,
+    /// the relation mode or the language does.
+    fingerprint: String,
+    gazetteer_counts: Vec<(String, usize)>,
+}
+
+async fn setup_extraction(
+    args: &DocIngestArgs,
+    config: &DocConfig,
+    cache: Option<DocCache>,
+    target: Option<&Fluree>,
+    alias: &str,
+    dirs: &FlureeDir,
+) -> CliResult<Option<Extraction>> {
+    if args.no_extract || (args.model.is_none() && args.entities.is_empty()) {
+        return Ok(None);
+    }
+    let mode = match args.relations {
+        DocRelationMode::Direct => RelationMode::Direct,
+        DocRelationMode::Reified => RelationMode::Reified,
+        DocRelationMode::Off => RelationMode::Off,
+    };
+    let project = config.extraction.clone().unwrap_or_default();
+    // A flag names a file where the command runs; a config value names one
+    // in the project, so every run of the project makes the same ask.
+    let project_root = dirs.config_dir().parent().map(Path::to_path_buf);
+    let prompt_file = |flag: &Option<PathBuf>, configured: &Option<String>, what: &str| {
+        let path = match (flag, configured) {
+            (Some(p), _) => p.clone(),
+            (None, Some(c)) => match &project_root {
+                Some(root) if Path::new(c).is_relative() => root.join(c),
+                _ => PathBuf::from(c),
+            },
+            (None, None) => return Ok(None),
+        };
+        std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|e| CliError::Input(format!("{what} {}: {e}", path.display())))
+    };
+    let guidance = prompt_file(&args.guidance, &project.guidance, "--guidance")?;
+    let system_template = prompt_file(
+        &args.system_prompt,
+        &project.system_prompt,
+        "--system-prompt",
+    )?;
+    let user_template = prompt_file(&args.user_prompt, &project.user_prompt, "--user-prompt")?;
+    let policy = ResolvePolicy {
+        relations: mode,
+        drop_off_model: args.drop_off_model || project.drop_off_model.unwrap_or(false),
+    };
+    let concurrency = args
+        .concurrency
+        .or(project.concurrency)
+        .unwrap_or(DEFAULT_CONCURRENCY)
+        .max(1);
+
+    let model = match &args.model {
+        Some(spec) => Some(Arc::new(
+            doc_sources::load_model(&Source::parse(spec), dirs).await?,
+        )),
+        None => None,
+    };
+    let extractor = match (&model, &config.llm) {
+        (Some(m), Some(endpoint)) => Some(Arc::new(Extractor::new(
+            LlmClient::new(endpoint.clone()),
+            m,
+            cache,
+            &ExtractOptions {
+                relations: mode,
+                guidance,
+                system_template,
+                user_template,
+                drop_off_model: policy.drop_off_model,
+            },
+        )?)),
+        (Some(_), None) => {
+            return Err(CliError::Config(
+                "--model needs a language model: set [doc.llm] (fluree config set doc.llm.url …) or doc.remote for a Fluree AI account".into(),
+            ))
+        }
+        (None, _) => None,
+    };
+
+    let sources: Vec<Source> = args.entities.iter().map(|s| Source::parse(s)).collect();
+    let loaded =
+        doc_sources::load_gazetteer(&sources, target.map(|f| (f, alias)), &args.lang, dirs).await?;
+    let gazetteer = (!loaded.gazetteer.is_empty()).then(|| Arc::new(loaded.gazetteer));
+    let gazetteer_counts = loaded.counts;
+
+    let fingerprint = fluree_db_doc::cache::sha256_hex(
+        format!(
+            "{}|{}|{:?}|{}|{}",
+            extractor
+                .as_ref()
+                .map(|x| x.fingerprint())
+                .unwrap_or_default(),
+            loaded.fingerprint,
+            mode,
+            policy.drop_off_model,
+            args.lang
+        )
+        .as_bytes(),
+    );
+    Ok(Some(Extraction {
+        model,
+        gazetteer,
+        extractor,
+        policy,
+        concurrency,
+        fingerprint,
+        gazetteer_counts,
+    }))
+}
+
+struct Extracted {
+    graph: ExtractionGraph,
+    cache_hits: usize,
+    /// Chunks whose model call failed; they contributed gazetteer mentions
+    /// only, and the document is not stamped as extracted.
+    chunks_failed: usize,
+    first_failure: Option<String>,
+}
+
+/// Scan every chunk for known entities, ask the language model about each,
+/// and resolve the answers into nodes. Blocking: the model calls are
+/// synchronous, like the crop reads, and `concurrency` of them run at once.
+/// A chunk whose call fails contributes its gazetteer mentions and nothing
+/// else; the run goes on and says so.
+async fn run_extraction(
+    setup: &Extraction,
+    doc_iri: &str,
+    entity_prefix: &str,
+    chunks: Vec<Chunk>,
+) -> CliResult<Extracted> {
+    let gazetteer = setup.gazetteer.clone();
+    let extractor = setup.extractor.clone();
+    let model = setup.model.clone();
+    let policy = setup.policy;
+    let concurrency = setup.concurrency;
+    let doc_iri = doc_iri.to_string();
+    let entity_prefix = entity_prefix.to_string();
+    tokio::task::spawn_blocking(move || -> CliResult<Extracted> {
+        // `concurrency` workers pull chunks off one counter; a chunk whose
+        // call fails contributes its gazetteer mentions and nothing else.
+        type ChunkWork = (Vec<fluree_db_doc::Mention>, Option<ChunkExtraction>);
+        type ChunkSlot = std::sync::Mutex<Option<(ChunkWork, Option<String>)>>;
+        let results: Vec<ChunkSlot> = chunks.iter().map(|_| ChunkSlot::default()).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..concurrency.min(chunks.len().max(1)) {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some(chunk) = chunks.get(i) else { break };
+                    let mentions = gazetteer
+                        .as_ref()
+                        .map(|g| g.scan(&chunk.text))
+                        .unwrap_or_default();
+                    let (extraction, failure) = match &extractor {
+                        Some(x) => {
+                            let existing = gazetteer
+                                .as_ref()
+                                .map(|g| g.existing_block(&mentions))
+                                .unwrap_or_else(|| {
+                                    "(none)
+"
+                                    .to_string()
+                                });
+                            match x.extract_chunk(&chunk.text, &existing) {
+                                Ok(e) => (Some(e), None),
+                                Err(e) => (None, Some(format!("chunk {i}: {e}"))),
+                            }
+                        }
+                        None => (None, None),
+                    };
+                    *results[i].lock().expect("chunk slot") =
+                        Some(((mentions, extraction), failure));
+                });
+            }
+        });
+        let mut cache_hits = 0;
+        let mut chunks_failed = 0;
+        let mut first_failure = None;
+        let mut per_chunk: Vec<ChunkWork> = Vec::with_capacity(chunks.len());
+        for slot in results {
+            let (work, failure) = slot
+                .into_inner()
+                .expect("chunk slot")
+                .expect("every chunk was visited");
+            if let Some(f) = failure {
+                chunks_failed += 1;
+                tracing::warn!("{f}");
+                first_failure.get_or_insert(f);
+            }
+            if work.1.as_ref().is_some_and(|e| e.from_cache) {
+                cache_hits += 1;
+            }
+            per_chunk.push(work);
+        }
+        let inputs: Vec<ChunkInput<'_>> = chunks
+            .iter()
+            .zip(per_chunk.iter())
+            .enumerate()
+            .map(|(i, (chunk, (mentions, extraction)))| ChunkInput {
+                chunk,
+                chunk_iri: graph::chunk_iri(&doc_iri, i),
+                mentions,
+                extraction: extraction.as_ref(),
+            })
+            .collect();
+        let graph = extract::resolve(
+            &doc_iri,
+            &entity_prefix,
+            &inputs,
+            gazetteer.as_deref(),
+            model.as_deref(),
+            policy,
+        );
+        Ok(Extracted {
+            graph,
+            cache_hits,
+            chunks_failed,
+            first_failure,
+        })
+    })
+    .await
+    .map_err(|e| CliError::Input(format!("extraction task failed: {e}")))?
+}
+
+/// A compact IRI from a query row, expanded with the prefixes the ingest
+/// context knows, so a retraction names the same term the insert did.
+fn expand_iri(iri: &str) -> String {
+    for (prefix, ns) in fluree_db_doc::model::PREFIXES {
+        if let Some(rest) = iri.strip_prefix(&format!("{prefix}:")) {
+            return format!("{ns}{rest}");
+        }
+    }
+    if let Some(rest) = iri.strip_prefix("doc:") {
+        return format!("{}{rest}", vocab::DOC_NS);
+    }
+    iri.to_string()
+}
+
+/// The edges a document's previous extraction asserted. Called before the
+/// retraction; after it, each is dropped unless another relation still
+/// states it.
+async fn asserted_edges(
+    fluree: &Fluree,
+    alias: &str,
+    doc_iri: &str,
+) -> CliResult<Vec<(String, String, String)>> {
+    let rows = query_rows(fluree, alias, &graph::asserted_triples_query(doc_iri)).await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let row = row.as_array()?;
+            let cell = |i: usize| row.get(i).and_then(Value::as_str).map(expand_iri);
+            Some((cell(0)?, cell(1)?, cell(2)?))
+        })
+        .collect())
+}
+
+async fn drop_unsupported_edges(
+    fluree: &Fluree,
+    alias: &str,
+    edges: &[(String, String, String)],
+) -> CliResult<usize> {
+    let mut orphaned = Vec::new();
+    for (s, p, o) in edges {
+        let support = query_rows(fluree, alias, &graph::relation_support_query(s, p, o)).await?;
+        if support.is_empty() {
+            orphaned.push((s.clone(), p.clone(), o.clone()));
+        }
+    }
+    if !orphaned.is_empty() {
+        fluree
+            .graph(alias)
+            .transact()
+            .sparql_update(&graph::delete_triples_update(&orphaned))
+            .commit()
+            .await?;
+    }
+    Ok(orphaned.len())
 }
 
 async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
@@ -175,12 +480,26 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         _ => None,
     };
 
+    let fluree = if args.dry_run {
+        None
+    } else {
+        let fluree = build_fluree(dirs)?;
+        if !fluree.ledger_exists(&ledger_id).await? {
+            fluree.create_ledger(&ledger_id).await?;
+            eprintln!("{} created ledger {alias}", "→".dimmed());
+        }
+        Some(fluree)
+    };
+    let extraction =
+        setup_extraction(&args, &config, cache.clone(), fluree.as_ref(), &alias, dirs).await?;
+
     announce(
         &alias,
         inputs.len(),
         &config,
         vlm.as_deref(),
         embedder.as_ref(),
+        extraction.as_ref(),
         &args,
     );
 
@@ -194,16 +513,6 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         vlm,
     };
 
-    let fluree = if args.dry_run {
-        None
-    } else {
-        let fluree = build_fluree(dirs)?;
-        if !fluree.ledger_exists(&ledger_id).await? {
-            fluree.create_ledger(&ledger_id).await?;
-            eprintln!("{} created ledger {alias}", "→".dimmed());
-        }
-        Some(fluree)
-    };
     if let Some(out) = &args.out_dir {
         std::fs::create_dir_all(out)?;
     }
@@ -233,7 +542,13 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             if let Some(prev) = &previous {
                 let same_model = prev.embedding_model.as_deref()
                     == embedder.as_ref().map(EmbeddingClient::model);
-                if prev.sha256 == sha && prev.parser_revision == parser_revision && same_model {
+                let same_extraction = prev.extraction_fingerprint.as_deref()
+                    == extraction.as_ref().map(|x| x.fingerprint.as_str());
+                if prev.sha256 == sha
+                    && prev.parser_revision == parser_revision
+                    && same_model
+                    && same_extraction
+                {
                     println!("  {} {label}  unchanged", "=".dimmed());
                     totals.skipped += 1;
                     continue;
@@ -267,6 +582,21 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             _ => None,
         };
 
+        let extracted = match &extraction {
+            Some(setup) => {
+                match run_extraction(setup, &doc.doc_iri, &args.base_iri, doc.chunks.clone()).await
+                {
+                    Ok(x) => Some(x),
+                    Err(e) => {
+                        println!("  {} {label}  extraction: {e}", "✗".red());
+                        totals.failed += 1;
+                        continue;
+                    }
+                }
+            }
+            None => None,
+        };
+
         let meta = DocumentMeta {
             doc_iri: doc.doc_iri.clone(),
             file_name: doc.meta.file_name.clone(),
@@ -283,9 +613,38 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             .as_ref()
             .zip(dimensions)
             .map(|(c, d)| (c.model(), d));
-        let document = graph::document_node(&meta, doc.chunks.len(), embedding_stamp);
+        // A document with a failed chunk is not stamped: the next run
+        // extracts it again, with the cache answering for the chunks that
+        // did succeed.
+        let fully_extracted = extracted.as_ref().is_none_or(|x| x.chunks_failed == 0);
+        let extraction_stamp = extraction
+            .as_ref()
+            .filter(|_| fully_extracted)
+            .map(|setup| {
+                let stats = extracted.as_ref().map(|x| &x.graph.stats);
+                ExtractionStamp {
+                    fingerprint: setup.fingerprint.clone(),
+                    model: setup.extractor.as_ref().map(|x| x.model_name().to_string()),
+                    mentions: stats.map_or(0, |s| s.gazetteer_mentions + s.llm_mentions),
+                    entities: stats.map_or(0, |s| s.entities_known + s.entities_new),
+                    relations: stats.map_or(0, |s| {
+                        s.relations_valid + s.relations_repaired + s.relations_rejected
+                    }),
+                }
+            });
+        let document = graph::document_node(
+            &meta,
+            doc.chunks.len(),
+            embedding_stamp,
+            extraction_stamp.as_ref(),
+        );
         let chunks = graph::chunk_nodes(&doc.doc_iri, &doc.chunks, embeddings.as_deref());
-        let tx = graph::transaction(&doc.parsed.doco, document, chunks)?;
+        let mut extra = Vec::new();
+        if let Some(x) = &extracted {
+            extra.extend(x.graph.nodes.iter().cloned());
+            extra.extend(x.graph.direct.iter().cloned());
+        }
+        let tx = graph::transaction(&doc.parsed.doco, document, chunks, extra)?;
 
         if let Some(out) = &args.out_dir {
             let target = out.join(format!("{}.jsonld", relative.replace('/', "__")));
@@ -296,10 +655,14 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         if let Some(f) = &fluree {
             let g = f.graph(&alias);
             if previous.is_some() {
+                // Edges the earlier extraction wrote outlive its nodes only
+                // while some other relation still supports them.
+                let edges = asserted_edges(f, &alias, &doc.doc_iri).await?;
                 g.transact()
                     .sparql_update(&graph::retract_update(&doc.doc_iri))
                     .commit()
                     .await?;
+                drop_unsupported_edges(f, &alias, &edges).await?;
             }
             let result = g.transact().insert(&tx).commit().await?;
             commit_note = format!("  t={}", result.receipt.t);
@@ -326,12 +689,60 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         } else {
             ""
         };
+        let extraction_note = match &extracted {
+            Some(x) => {
+                let s = &x.graph.stats;
+                let mentions = s.gazetteer_mentions + s.llm_mentions;
+                let mut note = format!(
+                    ", {mentions} mention(s) of {} entit{} ({} new{})",
+                    s.entities_known + s.entities_new,
+                    if s.entities_known + s.entities_new == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                    s.entities_new,
+                    if s.off_model > 0 {
+                        format!(", {} off-model", s.off_model)
+                    } else {
+                        String::new()
+                    }
+                );
+                let relations = s.relations_valid + s.relations_repaired + s.relations_rejected;
+                if relations > 0 {
+                    note.push_str(&format!(", {relations} relation(s)"));
+                    if s.relations_rejected > 0 {
+                        note.push_str(&format!(" ({} rejected)", s.relations_rejected));
+                    }
+                }
+                totals.mentions += mentions;
+                totals.entities_new += s.entities_new;
+                totals.relations += relations;
+                totals.relations_rejected += s.relations_rejected;
+                totals.hallucinated += s.hallucinated;
+                if x.chunks_failed > 0 {
+                    note.push_str(&format!(", {} chunk(s) not extracted", x.chunks_failed));
+                }
+                totals.off_model += s.off_model;
+                totals.off_model_dropped += s.off_model_dropped;
+                totals.extraction_cache_hits += x.cache_hits;
+                totals.chunks_failed += x.chunks_failed;
+                note
+            }
+            None => String::new(),
+        };
         println!(
-            "  {} {label}  {source}: {pages}{} elements, {} chunks{crops}{embedded}{commit_note}",
+            "  {} {label}  {source}: {pages}{} elements, {} chunks{crops}{embedded}{extraction_note}{commit_note}",
             "✓".green(),
             doc.parsed.elements,
             doc.chunks.len()
         );
+        if let Some(why) = extracted.as_ref().and_then(|x| x.first_failure.as_ref()) {
+            println!(
+                "    {} extraction incomplete, will be retried next run: {why}",
+                "!".yellow()
+            );
+        }
         if let Some(why) = &doc.parsed.escalation_skipped {
             println!(
                 "    {} deterministic tier only: {why}; raise --max-crops to read them",
@@ -368,6 +779,26 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         elapsed.as_secs_f64(),
         if args.dry_run { " (dry run, nothing written)" } else { "" }
     );
+    if extraction.is_some() && totals.ingested > 0 {
+        println!(
+            "  extraction: {} mention(s), {} new entit{} ({} off-model), {} relation(s) ({} rejected), {} dropped ({} hallucinated, {} off-model), {} chunk(s) from cache{}",
+            totals.mentions,
+            totals.entities_new,
+            if totals.entities_new == 1 { "y" } else { "ies" },
+            totals.off_model,
+            totals.relations,
+            totals.relations_rejected,
+            totals.hallucinated + totals.off_model_dropped,
+            totals.hallucinated,
+            totals.off_model_dropped,
+            totals.extraction_cache_hits,
+            if totals.chunks_failed > 0 {
+                format!(", {} chunk(s) failed", totals.chunks_failed)
+            } else {
+                String::new()
+            }
+        );
+    }
     if totals.unescalated > 0 {
         eprintln!(
             "note: {} document(s) exceeded the crop cap and were parsed without the vision model",
@@ -386,6 +817,7 @@ fn announce(
     config: &DocConfig,
     vlm: Option<&VlmReader>,
     embedder: Option<&EmbeddingClient>,
+    extraction: Option<&Extraction>,
     args: &DocIngestArgs,
 ) {
     eprintln!("ingest {count} document(s) → {alias}");
@@ -411,6 +843,50 @@ fn announce(
         }
         None => {}
     }
+    match extraction {
+        Some(x) => {
+            if let Some(m) = &x.model {
+                eprintln!(
+                    "  model      {} ({} classes, {} properties)",
+                    args.model.as_deref().unwrap_or(""),
+                    m.classes().len(),
+                    m.properties().len()
+                );
+            }
+            match &x.extractor {
+                Some(e) => eprintln!(
+                    "  extraction {} (relations: {}; off-model entities: {}; {} chunk(s) at once)",
+                    e.model_name(),
+                    match x.policy.relations {
+                        RelationMode::Direct => "reified + direct edges",
+                        RelationMode::Reified => "reified only",
+                        RelationMode::Off => "off",
+                    },
+                    if x.policy.drop_off_model {
+                        "dropped"
+                    } else {
+                        "kept, flagged"
+                    },
+                    x.concurrency
+                ),
+                None => eprintln!(
+                    "  extraction gazetteer scan only; add --model for the language model"
+                ),
+            }
+            for (label, n) in &x.gazetteer_counts {
+                eprintln!("  entities   {label}: {n} label(s)");
+            }
+            if let Some(g) = &x.gazetteer {
+                eprintln!(
+                    "  gazetteer  {} entit{}",
+                    g.entries().len(),
+                    if g.entries().len() == 1 { "y" } else { "ies" }
+                );
+            }
+        }
+        None if args.no_extract => eprintln!("  extraction off (--no-extract)"),
+        None => {}
+    }
     if args.no_cache {
         eprintln!("  cache      off");
     }
@@ -420,6 +896,7 @@ struct PreviousIngest {
     sha256: String,
     parser_revision: String,
     embedding_model: Option<String>,
+    extraction_fingerprint: Option<String>,
 }
 
 async fn previous_ingest(
@@ -436,6 +913,7 @@ async fn previous_ingest(
         sha256: text(0).unwrap_or_default(),
         parser_revision: text(1).unwrap_or_default(),
         embedding_model: text(2),
+        extraction_fingerprint: text(3),
     }))
 }
 

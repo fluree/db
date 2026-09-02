@@ -222,6 +222,7 @@
     - [Connect a Fluree AI account](unstructured/getting-started/fluree-ai.md)
   - [Concepts](unstructured/concepts/README.md)
     - [What gets built](unstructured/concepts/what-gets-built.md)
+    - [Entities and relations](unstructured/concepts/entities-and-relations.md)
     - [Tiers](unstructured/concepts/tiers.md)
     - [Models and calls](unstructured/concepts/models-and-calls.md)
     - [Re-runs and caching](unstructured/concepts/reruns-and-caching.md)

@@ -71,3 +71,13 @@ fluree query contracts -e '{
 ```
 
 From there the whole graph is open: the section containing the element, the document node with the file's hash and ingest time, or the same passage at an earlier commit. See [Querying the graph](../guides/querying-the-graph.md).
+
+## 5. Say what it is about
+
+Point the ingest at the entities you already have and, if you want relations, at an ontology:
+
+```bash
+fluree doc ingest ./contracts -l contracts --entities counterparties.ttl --model ./contracts-ontology.ttl
+```
+
+Every mention of a counterparty is written against the IRI it has in `counterparties.ttl`, so a query across that graph and the contracts joins on the same node. The ontology needs a language model in the `llm` slot or a Fluree AI account; the mentions alone need nothing. See [Entities and relations](../concepts/entities-and-relations.md).

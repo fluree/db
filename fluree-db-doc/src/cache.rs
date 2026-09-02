@@ -11,6 +11,10 @@
 //!   model, not on the document. An engine upgrade re-routes pages, but a
 //!   crop whose pixels did not change is answered from here without a
 //!   model call. This is where the money is.
+//! - **Extraction cache** — keyed on the whole ask: the model, the system
+//!   prompt (ontology and guidance) and the user prompt (known entities
+//!   and chunk text). A changed ontology invalidates exactly the language
+//!   model stage and nothing else.
 //!
 //! Layout under the root:
 //!
@@ -19,8 +23,10 @@
 //! parse/{sha256}-{fingerprint}/text.txt
 //! parse/{sha256}-{fingerprint}/meta.json
 //! readings/{key}.txt            (empty file = the model read nothing)
+//! extractions/{key}.json
 //! ```
 
+use crate::extract::ChunkExtraction;
 use crate::parse::ParsedDocument;
 use crate::Result;
 use serde::{Deserialize, Serialize};
@@ -126,6 +132,37 @@ impl DocCache {
         fs::write(path, reading.unwrap_or_default())?;
         Ok(())
     }
+
+    /// Key for one chunk's extraction: who was asked, and exactly what.
+    pub fn extraction_key(model: &str, system: &str, user: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(model.as_bytes());
+        h.update([0]);
+        h.update(system.as_bytes());
+        h.update([0]);
+        h.update(user.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    fn extraction_path(&self, key: &str) -> PathBuf {
+        self.root.join("extractions").join(format!("{key}.json"))
+    }
+
+    pub fn load_extraction(&self, key: &str) -> Option<ChunkExtraction> {
+        serde_json::from_slice(&fs::read(self.extraction_path(key)).ok()?).ok()
+    }
+
+    pub fn store_extraction(&self, key: &str, extraction: &ChunkExtraction) -> Result<()> {
+        let path = self.extraction_path(key);
+        fs::create_dir_all(path.parent().expect("extractions dir"))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(
+            &tmp,
+            serde_json::to_vec(extraction).expect("extraction serializes"),
+        )?;
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +202,27 @@ mod tests {
         assert_eq!(cache.load_reading(&key), Some(None));
         cache.store_reading(&key, Some("text")).unwrap();
         assert_eq!(cache.load_reading(&key), Some(Some("text".into())));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn extraction_round_trip() {
+        let dir = tempdir();
+        let cache = DocCache::new(&dir);
+        let key = DocCache::extraction_key("m", "sys", "user");
+        assert!(cache.load_extraction(&key).is_none());
+        let x = ChunkExtraction {
+            entities: vec![crate::extract::LlmEntity {
+                name: Some("A".into()),
+                ..Default::default()
+            }],
+            relations: vec![],
+            from_cache: false,
+        };
+        cache.store_extraction(&key, &x).unwrap();
+        let hit = cache.load_extraction(&key).unwrap();
+        assert_eq!(hit.entities, x.entities);
+        assert_ne!(key, DocCache::extraction_key("m", "sys", "other"));
         fs::remove_dir_all(dir).ok();
     }
 

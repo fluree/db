@@ -2927,6 +2927,7 @@ dependencies = [
 name = "fluree-db-doc"
 version = "4.1.6"
 dependencies = [
+ "aho-corasick",
  "base64 0.22.1",
  "fluree-doc-docx",
  "fluree-doc-html",
@@ -2937,6 +2938,7 @@ dependencies = [
  "hayro-syntax",
  "hex",
  "reqwest",
+ "rust-stemmers",
  "serde",
  "serde_json",
  "sha2",
