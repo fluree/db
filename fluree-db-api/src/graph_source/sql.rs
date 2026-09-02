@@ -7,17 +7,21 @@
 //! record's type is `Sql`. A SQL source has no snapshot to pin, so its build
 //! watermark records the endpoint, table and first-touch time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{ColumnBatchStream, ScanFilter, ScanValue, TableWatermark};
+use fluree_db_query::r2rml::plan::RelSource;
+use fluree_db_query::r2rml::{
+    ColumnBatchStream, PushdownCapabilities, RelPlan, ScanFilter, ScanValue, TableWatermark,
+};
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use fluree_db_sql::{
     AuthConfig, CmpOp, Literal, LogicalSource, MappingSource, Predicate, ScanRequest, SqlDialect,
     SqlError, SqlGsConfig, TrinoClient, WireProtocol,
 };
+use fluree_db_tabular::BatchSchema;
 use futures::StreamExt;
 use tracing::{debug, info, warn};
 
@@ -392,6 +396,67 @@ impl SqlSource {
             .execute(rendered.sql)
             .map(move |item| item.map_err(|e| sql_query_error(&gs, &table, e)));
         Ok(Box::pin(stream))
+    }
+
+    /// What the pushdown lane may send this source.
+    pub(crate) fn pushdown_capabilities(&self) -> PushdownCapabilities {
+        fluree_db_sql::pushdown_capabilities(self.client.dialect())
+    }
+
+    /// One statement for a whole block. Every table access is probed for its
+    /// schema (cached per client) so literals render typed; a statement over
+    /// the size budget is refused before it is sent.
+    pub(crate) async fn execute_plan(
+        &self,
+        session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
+        plan: &RelPlan,
+    ) -> QueryResult<(String, ColumnBatchStream)> {
+        let mut schemas: HashMap<String, Arc<BatchSchema>> = HashMap::new();
+        for (alias, source) in plan.root.accesses() {
+            let (logical, table_name) = match source {
+                RelSource::Table(t) => (LogicalSource::Table(t.clone()), t.clone()),
+                RelSource::Query(q) => {
+                    let alias_name = mapping
+                        .triples_maps
+                        .values()
+                        .find(|tm| tm.sql_query() == Some(q.as_str()))
+                        .and_then(|tm| tm.table_name())
+                        .unwrap_or("rr:sqlQuery")
+                        .to_string();
+                    (LogicalSource::Query(q.clone()), alias_name)
+                }
+            };
+            let schema = self
+                .client
+                .schema(&logical)
+                .await
+                .map_err(|e| sql_query_error(&self.graph_source_id, &table_name, e))?;
+            self.record_watermark(session, &table_name);
+            schemas.insert(alias.to_string(), schema);
+        }
+        let caps = self.pushdown_capabilities();
+        let sql = fluree_db_sql::render_plan(plan, &schemas, self.client.dialect())
+            .map_err(|e| sql_query_error(&self.graph_source_id, "<plan>", e))?;
+        if sql.len() > caps.statement_max_bytes {
+            return Err(QueryError::Internal(format!(
+                "SQL graph source '{}': pushed-down statement is {} bytes, over the {} byte budget",
+                self.graph_source_id,
+                sql.len(),
+                caps.statement_max_bytes
+            )));
+        }
+        info!(
+            graph_source_id = %self.graph_source_id,
+            sql = %sql,
+            "SQL block pushdown"
+        );
+        let gs = self.graph_source_id.clone();
+        let stream = self
+            .client
+            .execute(sql.clone())
+            .map(move |item| item.map_err(|e| sql_query_error(&gs, "<plan>", e)));
+        Ok((sql, Box::pin(stream)))
     }
 
     pub(crate) async fn row_count(

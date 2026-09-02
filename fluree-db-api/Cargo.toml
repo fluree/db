@@ -200,6 +200,13 @@ name = "it_sql_graph_source"
 path = "tests/it_sql_graph_source.rs"
 required-features = ["sql", "native"]
 
+# The SQL pushdown lane: golden statements, rows, routing stamps and the
+# per-scan lane as differential oracle, against the executing fake endpoint.
+[[test]]
+name = "it_sql_pushdown_lane"
+path = "tests/it_sql_pushdown_lane.rs"
+required-features = ["sql", "native"]
+
 [[test]]
 name = "grp_index"
 path = "tests/grp_index.rs"

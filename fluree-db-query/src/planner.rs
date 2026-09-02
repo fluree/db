@@ -980,6 +980,18 @@ pub fn estimate_pattern(
             row_count: s2p.limit.map_or(DEFAULT_SEARCH_LIMIT, |l| l as f64),
         },
 
+        // A named graph is estimated without the default graph's statistics:
+        // they describe another graph (often another ledger or a graph
+        // source entirely), and a predicate "known absent" there would rank
+        // the block as empty, placing it first and never letting bound
+        // outer values seed it. A variable graph name iterates this
+        // ledger's graphs and keeps its stats.
+        Pattern::Graph {
+            name: crate::ir::GraphName::Iri(_),
+            patterns,
+        } => PatternEstimate::Source {
+            row_count: estimate_branch_cardinality(patterns, None),
+        },
         Pattern::Graph { patterns, .. } => PatternEstimate::Source {
             row_count: estimate_branch_cardinality(patterns, stats),
         },

@@ -67,7 +67,7 @@ impl SqlDialect {
     }
 
     /// Whether typed literal prefixes (`DATE '…'`, `TIMESTAMP '…'`) are valid.
-    fn typed_literals(self) -> bool {
+    pub(crate) fn typed_literals(self) -> bool {
         !matches!(self, SqlDialect::Sqlite)
     }
 
@@ -108,54 +108,18 @@ impl LogicalSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CmpOp {
-    Eq,
-    NotEq,
-    Lt,
-    LtEq,
-    Gt,
-    GtEq,
-    In,
-}
+pub use fluree_db_tabular::plan::{CmpOp, Literal};
 
-impl CmpOp {
-    fn sql(self) -> &'static str {
-        match self {
-            CmpOp::Eq => "=",
-            CmpOp::NotEq => "<>",
-            CmpOp::Lt => "<",
-            CmpOp::LtEq => "<=",
-            CmpOp::Gt => ">",
-            CmpOp::GtEq => ">=",
-            CmpOp::In => "IN",
-        }
+pub(crate) fn cmp_sql(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Eq => "=",
+        CmpOp::NotEq => "<>",
+        CmpOp::Lt => "<",
+        CmpOp::LtEq => "<=",
+        CmpOp::Gt => ">",
+        CmpOp::GtEq => ">=",
+        CmpOp::In => "IN",
     }
-}
-
-/// A filter literal. Mirrors the engine's `ScanValue` without depending on the
-/// query crate.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Literal {
-    Bool(bool),
-    Int(i64),
-    Str(String),
-    /// Days since 1970-01-01.
-    Date(i32),
-    Double(f64),
-    Decimal {
-        unscaled: i128,
-        scale: i8,
-    },
-    /// Micros since the epoch; `tz` = the source literal carried an offset.
-    Timestamp {
-        micros: i64,
-        tz: bool,
-    },
-    /// A raw column value recovered by reversing a subject template. Its type
-    /// is whatever the column's type is; rendered only for int/string columns.
-    TemplateKey(String),
-    Set(Vec<Literal>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -274,7 +238,7 @@ fn describe(source: &LogicalSource) -> String {
 /// A `timestamp with time zone` column is re-rendered in UTC so the wire form
 /// is decodable without a zone database (Trino otherwise prints the value's
 /// own zone, which may be a named region).
-fn render_projected_column(name: &str, ty: FieldType, dialect: SqlDialect) -> String {
+pub(crate) fn render_projected_column(name: &str, ty: FieldType, dialect: SqlDialect) -> String {
     let q = dialect.quote_ident(name);
     match (ty, dialect) {
         (FieldType::TimestampTz, SqlDialect::Trino) => format!("{q} AT TIME ZONE 'UTC' AS {q}"),
@@ -296,7 +260,7 @@ fn render_predicate(pred: &Predicate, ty: FieldType, dialect: SqlDialect) -> Opt
             rendered.map(|r| format!("{col} IN ({})", r.join(", ")))
         }
         (Literal::Set(_), _) | (_, CmpOp::In) => None,
-        (lit, op) => render_literal(lit, ty, dialect).map(|l| format!("{col} {} {l}", op.sql())),
+        (lit, op) => render_literal(lit, ty, dialect).map(|l| format!("{col} {} {l}", cmp_sql(op))),
     }
 }
 
@@ -309,7 +273,7 @@ fn render_predicate(pred: &Predicate, ty: FieldType, dialect: SqlDialect) -> Opt
 /// *behind* an endpoint that need not be a bridge we configured. So a value
 /// carrying a backslash is declined, which costs a pushdown and nothing else —
 /// the in-engine FILTER enforces the predicate either way.
-fn sql_string(s: &str, dialect: SqlDialect) -> Option<String> {
+pub(crate) fn sql_string(s: &str, dialect: SqlDialect) -> Option<String> {
     if dialect.backslash_may_escape() && s.contains('\\') {
         return None;
     }
@@ -325,7 +289,7 @@ fn sql_string(s: &str, dialect: SqlDialect) -> Option<String> {
     Some(out)
 }
 
-fn is_numeric(ty: FieldType) -> bool {
+pub(crate) fn is_numeric(ty: FieldType) -> bool {
     matches!(
         ty,
         FieldType::Int32
@@ -338,7 +302,7 @@ fn is_numeric(ty: FieldType) -> bool {
 
 /// Render a literal for comparison against a column of type `ty`, or `None`
 /// when no rendering is safe for that pairing.
-fn render_literal(lit: &Literal, ty: FieldType, dialect: SqlDialect) -> Option<String> {
+pub(crate) fn render_literal(lit: &Literal, ty: FieldType, dialect: SqlDialect) -> Option<String> {
     match lit {
         Literal::Bool(b) => {
             matches!(ty, FieldType::Boolean).then(|| if *b { "TRUE" } else { "FALSE" }.to_string())

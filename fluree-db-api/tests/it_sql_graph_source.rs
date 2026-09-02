@@ -6,8 +6,7 @@
 
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, SqlCreateConfig, TxnOpts};
 use serde_json::{json, Value};
-use wiremock::matchers::{body_string_contains, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::MockServer;
 
 const PEOPLE_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
@@ -34,76 +33,29 @@ const PEOPLE_R2RML: &str = r#"
         ] .
 "#;
 
-fn columns() -> Value {
-    json!([
-        {"name": "id", "type": "bigint"},
-        {"name": "name", "type": "varchar"},
-        {"name": "score", "type": "double"},
-        {"name": "born", "type": "date"}
-    ])
-}
+#[path = "support/fake_sql.rs"]
+mod fake_sql;
+use fake_sql::{FakeSql, Table};
 
-fn finished(data: Value) -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_json(json!({
-        "id": "q",
-        "columns": columns(),
-        "data": data,
-        "stats": {"state": "FINISHED"}
-    }))
-}
-
-/// The fake endpoint. Mocks are tried in priority order (lower first).
+/// The fake endpoint: an in-memory `sales.people` the statements run against.
 async fn fake_trino() -> MockServer {
-    let server = MockServer::start().await;
-    // SELECT 1 — the registration-time connection test.
-    Mock::given(method("POST"))
-        .and(path("/v1/statement"))
-        .and(body_string_contains("SELECT 1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "t", "columns": [{"name": "_col0", "type": "integer"}], "data": [[1]], "stats": {"state": "FINISHED"}
-        })))
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    // Schema probe.
-    Mock::given(method("POST"))
-        .and(path("/v1/statement"))
-        .and(body_string_contains("LIMIT 0"))
-        .respond_with(finished(json!([])))
-        .with_priority(2)
-        .mount(&server)
-        .await;
-    // Exact count.
-    Mock::given(method("POST"))
-        .and(path("/v1/statement"))
-        .and(body_string_contains("COUNT(*)"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "c", "columns": [{"name": "_col0", "type": "bigint"}], "data": [[3]], "stats": {"state": "FINISHED"}
-        })))
-        .with_priority(3)
-        .mount(&server)
-        .await;
-    // A pushed equality on name.
-    Mock::given(method("POST"))
-        .and(path("/v1/statement"))
-        .and(body_string_contains(r#""name" = 'bob'"#))
-        .respond_with(finished(json!([[2, "bob", 7.5, "1990-05-04"]])))
-        .with_priority(4)
-        .mount(&server)
-        .await;
-    // Any other scan of the table: every row.
-    Mock::given(method("POST"))
-        .and(path("/v1/statement"))
-        .and(body_string_contains(r#"FROM "sales"."people""#))
-        .respond_with(finished(json!([
-            [1, "alice", 9.25, "1985-01-02"],
-            [2, "bob", 7.5, "1990-05-04"],
-            [3, null, null, null]
-        ])))
-        .with_priority(5)
-        .mount(&server)
-        .await;
-    server
+    FakeSql::new()
+        .table(Table::new(
+            "sales.people",
+            &[
+                ("id", "bigint"),
+                ("name", "varchar"),
+                ("score", "double"),
+                ("born", "date"),
+            ],
+            vec![
+                vec![json!(1), json!("alice"), json!(9.25), json!("1985-01-02")],
+                vec![json!(2), json!("bob"), json!(7.5), json!("1990-05-04")],
+                vec![json!(3), Value::Null, Value::Null, Value::Null],
+            ],
+        ))
+        .mount()
+        .await
 }
 
 /// SPARQL JSON results → the binding rows.
@@ -188,15 +140,12 @@ async fn sql_graph_source_end_to_end() {
     assert_eq!(probe, r#"SELECT * FROM "sales"."people" LIMIT 0"#);
     let scan = sent
         .iter()
-        .find(|s| s.starts_with("SELECT \"") && !s.contains("WHERE"))
-        .expect("scan statement");
-    assert!(
-        scan.contains(r#""id""#) && scan.contains(r#""name""#),
-        "{scan}"
-    );
-    assert!(
-        !scan.contains(r#""score""#),
-        "only mapped+needed columns are projected: {scan}"
+        .find(|s| s.starts_with(r#"SELECT "t0""#))
+        .unwrap_or_else(|| panic!("block statement; sent: {sent:#?}"));
+    assert_eq!(
+        scan,
+        r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "sales"."people" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#,
+        "one statement, only the mapped and needed columns"
     );
 
     // 3. A constant object is pushed as a typed WHERE.
@@ -216,7 +165,7 @@ async fn sql_graph_source_end_to_end() {
     assert!(rows[0].to_string().contains("person/2"), "{rows:?}");
     let sent = statements(&server).await;
     assert!(
-        sent.iter().any(|s| s.contains(r#"WHERE "name" = 'bob'"#)),
+        sent.iter().any(|s| s.contains(r#""t0"."name" = 'bob'"#)),
         "equality pushed to SQL: {sent:?}"
     );
 
@@ -276,35 +225,20 @@ const ORDERS_SQLQUERY_R2RML: &str = r#"
 /// projection and pushed filters applied on top of the mapping's query.
 #[tokio::test]
 async fn sql_query_logical_table_is_scanned_as_a_derived_table() {
-    let server = MockServer::start().await;
-    let orders_columns =
-        json!([{"name": "id", "type": "bigint"}, {"name": "total", "type": "decimal(10,2)"}]);
-    Mock::given(method("POST"))
-        .and(path("/v1/statement"))
-        .and(body_string_contains("SELECT 1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "t", "columns": [{"name": "_col0", "type": "integer"}], "data": [[1]], "stats": {"state": "FINISHED"}
-        })))
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/statement"))
-        .and(body_string_contains("LIMIT 0"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "p", "columns": orders_columns, "data": [], "stats": {"state": "FINISHED"}
-        })))
-        .with_priority(2)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/statement"))
-        .and(body_string_contains(r#"AS "__fluree_q""#))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "s", "columns": orders_columns, "data": [[10, "99.50"], [11, "5.00"]], "stats": {"state": "FINISHED"}
-        })))
-        .with_priority(3)
-        .mount(&server)
+    let server = FakeSql::new()
+        .table(Table::new(
+            "sales.orders_open",
+            &[("id", "bigint"), ("total", "decimal(10,2)")],
+            vec![
+                vec![json!(10), json!("99.50")],
+                vec![json!(11), json!("5.00")],
+            ],
+        ))
+        .query(
+            "SELECT id, total FROM sales.orders WHERE status = 'open'",
+            "sales.orders_open",
+        )
+        .mount()
         .await;
 
     let fluree = FlureeBuilder::memory().build_memory();
@@ -344,11 +278,11 @@ async fn sql_query_logical_table_is_scanned_as_a_derived_table() {
     let sent = statements(&server).await;
     let scan = sent
         .iter()
-        .find(|s| s.contains(r#"AS "__fluree_q""#) && !s.contains("LIMIT 0"))
-        .expect("derived-table scan");
+        .find(|s| s.starts_with(r#"SELECT "t0""#))
+        .expect("derived-table statement");
     assert_eq!(
         scan,
-        r#"SELECT "id", "total" FROM (SELECT id, total FROM sales.orders WHERE status = 'open') AS "__fluree_q""#
+        r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM (SELECT id, total FROM sales.orders WHERE status = 'open') AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#
     );
 }
 

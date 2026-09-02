@@ -1,0 +1,540 @@
+//! The SQL pushdown lane: one statement per GRAPH block over a SQL source.
+//!
+//! Every admitted shape is pinned three ways against a fake endpoint that
+//! executes the statement it receives: the exact SQL (the statement a SQL
+//! expert would write for the mapping), the rows, and the routing stamp
+//! (`MustFire` for admitted shapes, `MustNotFire` for declined ones). Every
+//! shape then runs again with fast paths disabled and must return the same
+//! rows — the per-scan lane is the oracle.
+
+#![cfg(all(feature = "sql", feature = "native"))]
+
+#[path = "support/fake_sql.rs"]
+mod fake_sql;
+#[path = "support/span_capture.rs"]
+mod span_capture;
+
+use fake_sql::{FakeSql, Table};
+use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, SqlCreateConfig};
+use serde_json::{json, Value};
+use tokio::sync::Mutex;
+use wiremock::MockServer;
+
+const SHOP_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Customer>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.customers" ] ;
+        rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:country ; rr:objectMap [ rr:column "country" ] ] .
+
+    <http://example.org/mapping#Order>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.orders" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:total ;
+            rr:objectMap [ rr:column "total" ; rr:datatype xsd:decimal ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:placed ;
+            rr:objectMap [ rr:column "placed" ; rr:datatype xsd:date ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:customer ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Customer> ;
+                rr:joinCondition [ rr:child "customer_id" ; rr:parent "id" ]
+            ]
+        ] .
+"#;
+
+const SITE: &str = "sql_block_pushdown";
+
+/// The global kill switch is process-wide; tests that flip it take this.
+static KILL_SWITCH: Mutex<()> = Mutex::const_new(());
+
+async fn shop() -> MockServer {
+    FakeSql::new()
+        .table(Table::new(
+            "shop.customers",
+            &[
+                ("id", "bigint"),
+                ("name", "varchar"),
+                ("country", "varchar"),
+            ],
+            vec![
+                vec![json!(1), json!("Ada"), json!("UK")],
+                vec![json!(2), json!("Bo"), Value::Null],
+                vec![json!(3), json!("Cy"), json!("US")],
+            ],
+        ))
+        .table(Table::new(
+            "shop.orders",
+            &[
+                ("id", "bigint"),
+                ("customer_id", "bigint"),
+                ("total", "decimal(10,2)"),
+                ("placed", "date"),
+            ],
+            vec![
+                vec![json!(10), json!(1), json!("99.50"), json!("2024-01-05")],
+                vec![json!(11), json!(1), json!("5.00"), json!("2024-02-01")],
+                vec![json!(12), json!(2), json!("42.00"), json!("2024-03-01")],
+                vec![json!(13), Value::Null, json!("7.00"), Value::Null],
+            ],
+        ))
+        .mount()
+        .await
+}
+
+async fn setup() -> (MockServer, Fluree) {
+    let server = shop().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_sql_graph_source(SqlCreateConfig::new("shop-sql", server.uri(), SHOP_R2RML))
+        .await
+        .expect("create sql source");
+    (server, fluree)
+}
+
+/// SPARQL JSON results as sorted rows of `var=value` pairs (variables in
+/// alphabetical order, which is also the order SPARQL JSON reports them).
+fn rows_of(v: &Value) -> Vec<String> {
+    let mut vars: Vec<String> = v["head"]["vars"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    vars.sort();
+    let mut out: Vec<String> = v["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("not SPARQL JSON: {v}"))
+        .iter()
+        .map(|b| {
+            vars.iter()
+                .map(|var| {
+                    let val = b[var]["value"].as_str().unwrap_or("").to_string();
+                    format!("{var}={val}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+async fn query(fluree: &Fluree, sparql: &str) -> Value {
+    fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {e}\n{sparql}"))
+}
+
+async fn block_statements(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.method == "POST")
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .filter(|s| s.starts_with(r#"SELECT "t0""#))
+        .collect()
+}
+
+fn proceeded_sites(store: &span_capture::SpanStore, from: usize) -> Vec<String> {
+    store.find_events("fast-path outcome")[from..]
+        .iter()
+        .filter(|e| e.fields.get("outcome").map(String::as_str) == Some("proceed"))
+        .filter_map(|e| e.fields.get("site").cloned())
+        .collect()
+}
+
+enum Routing {
+    MustFire,
+    MustNotFire,
+}
+
+struct Case {
+    name: &'static str,
+    sparql: &'static str,
+    /// The exact statement, when the lane fires.
+    sql: Option<&'static str>,
+    rows: &'static [&'static str],
+    routing: Routing,
+}
+
+const PREFIX: &str =
+    "PREFIX ex: <http://example.org/>\nPREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
+
+fn cases() -> Vec<Case> {
+    vec![
+        Case {
+            name: "star with an exact numeric filter",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t FILTER(?t > 40) }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" > 40"#),
+            rows: &[
+                "o=http://example.org/order/10 t=99.50",
+                "o=http://example.org/order/12 t=42.00",
+            ],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "foreign-key join between two entities",
+            sparql: "SELECT ?o ?n FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#),
+            rows: &[
+                "n=Ada o=http://example.org/order/10",
+                "n=Ada o=http://example.org/order/11",
+                "n=Bo o=http://example.org/order/12",
+            ],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "foreign-key object alone joins the parent for its IRI",
+            sparql: "SELECT ?o ?c FROM <shop-sql:main> WHERE { ?o ex:customer ?c }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL"#),
+            rows: &[
+                "c=http://example.org/customer/1 o=http://example.org/order/10",
+                "c=http://example.org/customer/1 o=http://example.org/order/11",
+                "c=http://example.org/customer/2 o=http://example.org/order/12",
+            ],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "constant subject reverses through the template",
+            sparql: "SELECT ?t FROM <shop-sql:main> WHERE { <http://example.org/order/10> ex:total ?t }",
+            sql: Some(r#"SELECT "t0"."total" AS "c0" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."id" = 10 AND "t0"."total" IS NOT NULL"#),
+            rows: &["t=99.50"],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "optional member of the same entity is a nullable column",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            rows: &["k= n=Bo", "k=UK n=Ada", "k=US n=Cy"],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "optional entity hanging off a foreign key is a left join",
+            sparql: "SELECT ?n ?o FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?o ex:customer ?c } }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."id" AS "c2" FROM "shop"."customers" AS "t0" LEFT JOIN "shop"."orders" AS "t1" ON "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t1"."customer_id" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            rows: &[
+                "n=Ada o=http://example.org/order/10",
+                "n=Ada o=http://example.org/order/11",
+                "n=Bo o=http://example.org/order/12",
+                "n=Cy o=",
+            ],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "unpushable filter stays in the engine as a residual",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 2) }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            rows: &["n=Ada"],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "typed date filter pushes as a DATE literal",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:placed ?p FILTER(?p >= \"2024-02-01\"^^xsd:date) }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL AND "t0"."placed" >= DATE '2024-02-01'"#),
+            rows: &["o=http://example.org/order/11", "o=http://example.org/order/12"],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "IN list pushes as a set",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(?n IN (\"Ada\", \"Cy\")) }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."name" IN ('Ada', 'Cy')"#),
+            rows: &["n=Ada", "n=Cy"],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "VALUES in the block is a static key set",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { VALUES ?c { <http://example.org/customer/2> } ?c ex:name ?n }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" JOIN (VALUES (2)) AS "v0" ("k0") ON "v0"."k0" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            rows: &["n=Bo"],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "LIMIT without ORDER BY pushes a LIMIT",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t } LIMIT 2",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL LIMIT 2"#),
+            rows: &["o=http://example.org/order/10", "o=http://example.org/order/11"],
+            routing: Routing::MustFire,
+        },
+        Case {
+            name: "variable predicate is not admitted",
+            sparql: "SELECT ?p ?v FROM <shop-sql:main> WHERE { <http://example.org/customer/1> ?p ?v }",
+            sql: None,
+            rows: &[
+                "p=http://example.org/country v=UK",
+                "p=http://example.org/name v=Ada",
+                "p=http://www.w3.org/1999/02/22-rdf-syntax-ns#type v=http://example.org/Customer",
+            ],
+            routing: Routing::MustNotFire,
+        },
+        Case {
+            name: "disconnected entities decline (no cartesian product)",
+            sparql: "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?c ex:name ?n . ?o ex:total ?t FILTER(?t > 90) }",
+            sql: None,
+            rows: &["n=Ada t=99.50", "n=Bo t=99.50", "n=Cy t=99.50"],
+            routing: Routing::MustNotFire,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
+    assert!(
+        std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
+        "unset FLUREE_DISABLE_QUERY_FAST_PATHS: the lane phase would pin nothing"
+    );
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    let cases = cases();
+
+    let (store, tracing_guard) = span_capture::init_test_tracing();
+    set_fast_paths_disabled(false);
+    let mut failures: Vec<String> = Vec::new();
+    let mut lane_rows: Vec<Vec<String>> = Vec::new();
+    for c in &cases {
+        let before_events = store.find_events("fast-path outcome").len();
+        let before_declines = store.find_events("sql pushdown declined").len();
+        let before_stmts = block_statements(&server).await.len();
+        let rows = rows_of(&query(&fluree, &format!("{PREFIX}{}", c.sparql)).await);
+        let proceeded = proceeded_sites(&store, before_events);
+        let declined: Vec<String> = store.find_events("sql pushdown declined")[before_declines..]
+            .iter()
+            .filter_map(|e| e.fields.get("why").cloned())
+            .collect();
+        let sent: Vec<String> = block_statements(&server).await[before_stmts..].to_vec();
+        let expected: Vec<String> = c.rows.iter().map(|s| (*s).to_string()).collect();
+        if rows != expected {
+            failures.push(format!(
+                "{}: lane rows {rows:?}, expected {expected:?}",
+                c.name
+            ));
+        }
+        match c.routing {
+            Routing::MustFire => {
+                if !proceeded.iter().any(|s| s == SITE) {
+                    failures.push(format!(
+                        "{}: expected `{SITE}` to proceed [proceeded: {proceeded:?}, declined: {declined:?}]",
+                        c.name
+                    ));
+                }
+            }
+            Routing::MustNotFire => {
+                if proceeded.iter().any(|s| s == SITE) {
+                    failures.push(format!(
+                        "{}: `{SITE}` proceeded on a declined shape",
+                        c.name
+                    ));
+                }
+            }
+        }
+        if let Some(sql) = c.sql {
+            if sent.as_slice() != [sql.to_string()] {
+                failures.push(format!(
+                    "{}: statements sent {sent:#?}\nexpected exactly:\n{sql}",
+                    c.name
+                ));
+            }
+        } else if !sent.is_empty() {
+            failures.push(format!("{}: unexpected block statements {sent:#?}", c.name));
+        }
+        lane_rows.push(rows);
+    }
+    drop(tracing_guard);
+
+    set_fast_paths_disabled(true);
+    for (i, c) in cases.iter().enumerate() {
+        let rows = rows_of(&query(&fluree, &format!("{PREFIX}{}", c.sparql)).await);
+        if rows != lane_rows[i] {
+            failures.push(format!(
+                "{}: scan lane rows {rows:?} differ from lane rows {:?}",
+                c.name, lane_rows[i]
+            ));
+        }
+    }
+    set_fast_paths_disabled(false);
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+}
+
+/// A static view policy prunes the mapping before the statement is built:
+/// a hidden required predicate empties the block without a round trip, a
+/// hidden column is never selected, and a subject-targeted policy (not
+/// static) declines to the per-scan lane, which enforces it row by row.
+#[tokio::test]
+async fn static_policy_prunes_the_statement() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    let context = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+    let deny_country = json!([{
+        "@id": "http://example.org/noCountry", "@type": "f:AccessPolicy", "f:action": "f:view",
+        "f:allow": false, "f:onProperty": [{"@id": "http://example.org/country"}]
+    }]);
+
+    let run = |policy: Value, r#where: Value, select: Value| {
+        let fluree = &fluree;
+        let context = context.clone();
+        async move {
+            let q = json!({
+                "@context": context,
+                "from": "shop-sql:main",
+                "opts": {"policy": policy, "default-allow": true},
+                "select": select,
+                "where": r#where,
+            });
+            fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("policy query failed: {e}"))
+        }
+    };
+
+    let (store, tracing_guard) = span_capture::init_test_tracing();
+    set_fast_paths_disabled(false);
+
+    // A required hidden predicate: nothing to send.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        deny_country.clone(),
+        json!({"@id": "?c", "ex:name": "?n", "ex:country": "?k"}),
+        json!(["?n", "?k"]),
+    )
+    .await;
+    assert_eq!(rows.as_array().map(Vec::len), Some(0), "{rows}");
+    assert_eq!(
+        block_statements(&server).await.len(),
+        before,
+        "no statement for an empty block"
+    );
+
+    // Only the visible column is selected.
+    let rows = run(
+        deny_country.clone(),
+        json!({"@id": "?c", "ex:name": "?n"}),
+        json!(["?n"]),
+    )
+    .await;
+    assert_eq!(rows, json!([["Ada"], ["Bo"], ["Cy"]]), "{rows}");
+    let sent = block_statements(&server).await;
+    assert_eq!(
+        sent.last().map(String::as_str),
+        Some(
+            r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#
+        )
+    );
+
+    // A hidden optional member: the variable stays unbound, no column.
+    let rows = run(
+        deny_country,
+        json!([{"@id": "?c", "ex:name": "?n"}, ["optional", {"@id": "?c", "ex:country": "?k"}]]),
+        json!(["?n", "?k"]),
+    )
+    .await;
+    assert_eq!(
+        rows,
+        json!([["Ada", null], ["Bo", null], ["Cy", null]]),
+        "{rows}"
+    );
+
+    // Subject targeting is not static: the lane declines, the scan lane hides
+    // the one subject.
+    let before = block_statements(&server).await.len();
+    let before_events = store.find_events("fast-path outcome").len();
+    let rows = run(
+        json!([{
+            "@id": "http://example.org/noAda", "@type": "f:AccessPolicy", "f:action": "f:view",
+            "f:allow": false, "f:onSubject": [{"@id": "http://example.org/customer/1"}]
+        }]),
+        json!({"@id": "?c", "ex:name": "?n"}),
+        json!(["?n"]),
+    )
+    .await;
+    assert_eq!(rows, json!([["Bo"], ["Cy"]]), "{rows}");
+    assert_eq!(
+        block_statements(&server).await.len(),
+        before,
+        "declined: no block statement"
+    );
+    let proceeded = proceeded_sites(&store, before_events);
+    assert!(!proceeded.iter().any(|s| s == SITE), "{proceeded:?}");
+    drop(tracing_guard);
+}
+
+/// Bindings the outer query already holds are sent into the statement as a
+/// key set, so the source does the semi-join instead of the engine rescanning
+/// it per outer row. A ledger pattern joins the same way; its placement
+/// relative to the block is the planner's, so the pinned statement uses an
+/// outer VALUES seed.
+#[tokio::test]
+async fn outer_bindings_become_a_key_set() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    let ledger = fluree.create_ledger("crm:main").await.expect("ledger");
+    fluree
+        .insert_turtle_with_opts(
+            ledger,
+            "@prefix ex: <http://example.org/> .\n\
+             <http://example.org/customer/1> ex:tier \"gold\" .\n\
+             <http://example.org/customer/3> ex:tier \"silver\" .\n\
+             <http://example.org/customer/9> ex:tier \"none\" .",
+            fluree_db_api::TxnOpts::default(),
+            fluree_db_api::CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 5_000_000_000,
+                reindex_max_bytes: 5_000_000_000,
+            },
+            None,
+        )
+        .await
+        .expect("insert");
+
+    let sparql = "
+        PREFIX ex: <http://example.org/>
+        SELECT ?c ?n FROM <crm:main> FROM NAMED <shop-sql:main>
+        WHERE {
+            VALUES ?c { <http://example.org/customer/1> <http://example.org/customer/3> <http://example.org/customer/9> }
+            GRAPH <shop-sql:main> { ?c ex:name ?n }
+        }
+    ";
+    let rows = rows_of(&query(&fluree, sparql).await);
+    assert_eq!(
+        rows,
+        vec![
+            "c=http://example.org/customer/1 n=Ada",
+            "c=http://example.org/customer/3 n=Cy"
+        ]
+    );
+    let sent = block_statements(&server).await;
+    assert_eq!(
+        sent,
+        vec![r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" JOIN (VALUES (1), (3), (9)) AS "k" ("k0") ON "k"."k0" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    // The ledger-driven join returns the same rows whichever side the planner
+    // drives from.
+    let sparql = "
+        PREFIX ex: <http://example.org/>
+        SELECT ?tier ?n FROM <crm:main> FROM NAMED <shop-sql:main>
+        WHERE { ?c ex:tier ?tier . GRAPH <shop-sql:main> { ?c ex:name ?n } }
+    ";
+    let rows = rows_of(&query(&fluree, sparql).await);
+    assert_eq!(rows, vec!["n=Ada tier=gold", "n=Cy tier=silver"]);
+}

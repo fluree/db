@@ -1796,6 +1796,34 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
     /// `record_count` sum only if [`sound_manifest_row_count`] proves it equals a
     /// full scan: no delete manifests, and every `non_null_col` provably zero-null.
     /// Otherwise `Ok(None)` and the caller falls back to the scan.
+    async fn pushdown_capabilities(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<Option<fluree_db_query::r2rml::PushdownCapabilities>> {
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            return Ok(Some(sql.pushdown_capabilities()));
+        }
+        let _ = graph_source_id;
+        Ok(None)
+    }
+
+    async fn execute_plan(
+        &self,
+        graph_source_id: &str,
+        plan: &fluree_db_query::r2rml::RelPlan,
+    ) -> QueryResult<(String, ColumnBatchStream)> {
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            let mapping = self.compiled_mapping(graph_source_id, None).await?;
+            return sql.execute_plan(&self.session, &mapping, plan).await;
+        }
+        let _ = plan;
+        Err(QueryError::Internal(format!(
+            "graph source '{graph_source_id}' cannot execute a pushed-down plan"
+        )))
+    }
+
     async fn table_row_count(
         &self,
         graph_source_id: &str,
