@@ -42,7 +42,10 @@ fn main() {
 
     // digest -> (index_t, prev_digest)
     let mut nodes: HashMap<String, (i64, Option<String>)> = HashMap::new();
-    let mut undecodable = 0usize;
+    // Digests of roots that are on disk but did not decode. Kept as a set, not a
+    // count: a root that fails to decode never enters `nodes`, so without this it is
+    // indistinguishable from a deleted one everywhere downstream.
+    let mut undecodable: HashSet<String> = HashSet::new();
 
     for entry in std::fs::read_dir(&dir).expect("read roots dir") {
         let path = entry.expect("dir entry").path();
@@ -61,14 +64,14 @@ fn main() {
                 nodes.insert(digest, (root.index_t, prev));
             }
             Err(e) => {
-                undecodable += 1;
                 eprintln!("  ! undecodable {digest}: {e}");
+                undecodable.insert(digest);
             }
         }
     }
 
     println!("roots on disk    : {}", nodes.len());
-    println!("undecodable      : {undecodable}");
+    println!("undecodable      : {}", undecodable.len());
 
     // Which roots are pointed AT by some other root?
     let mut referenced: HashSet<&String> = HashSet::new();
@@ -117,7 +120,10 @@ fn main() {
     }
 
     // Shape 1: dangling prev pointers — a root references a parent that is GONE.
-    // Each dangling pointer is a place the chain walk stops.
+    // Each dangling pointer is a place the chain walk stops. "Gone" has two causes
+    // with different fixes: the parent was deleted, or it is still on disk and did
+    // not decode. Truncating a root and deleting it leave the same hole, so the two
+    // are counted and labelled apart rather than both reported as MISSING.
     let dangling: Vec<_> = nodes
         .iter()
         .filter_map(|(d, (t, p))| {
@@ -126,21 +132,49 @@ fn main() {
                 .map(|p| (*t, d.clone(), p.clone()))
         })
         .collect();
-    println!(
+    let corrupt_parents = dangling
+        .iter()
+        .filter(|(_, _, p)| undecodable.contains(p))
+        .count();
+    print!(
         "dangling prev pointers (chain stops here): {}",
         dangling.len()
     );
-    for (t, d, p) in dangling.iter().take(8) {
+    if dangling.is_empty() {
+        println!();
+    } else {
         println!(
-            "    index_t={t} {} -> MISSING {}",
+            " ({} parent deleted, {} parent undecodable)",
+            dangling.len() - corrupt_parents,
+            corrupt_parents
+        );
+    }
+    for (t, d, p) in dangling.iter().take(8) {
+        let cause = if undecodable.contains(p) {
+            "UNDECODABLE"
+        } else {
+            "MISSING"
+        };
+        println!(
+            "    index_t={t} {} -> {cause} {}",
             &d[..16.min(d.len())],
             &p[..16.min(p.len())]
+        );
+    }
+    if !dangling.is_empty() && !undecodable.is_empty() {
+        // Shape 1 says something deletes out of order. A bad blob produces the same
+        // hole without anything having deleted anything, so the verdict only stands
+        // once nothing on disk is failing to decode.
+        println!(
+            "  ! shape 1 (something deletes out of order) is not the reading yet: \
+             {} root(s) on disk did not decode, and a bad blob leaves the same hole",
+            undecodable.len()
         );
     }
 
     // Reachability from the head: what GC can actually see.
     let head = match &head_arg {
-        Some(arg) => Some(resolve_head(arg, &nodes)),
+        Some(arg) => Some(resolve_head(arg, &nodes, &undecodable)),
         None => nodes
             .iter()
             .max_by_key(|(_, (t, _))| *t)
@@ -154,7 +188,15 @@ fn main() {
         let mut cur = Some(head.clone());
         while let Some(d) = cur {
             let Some((_, prev)) = nodes.get(&d) else {
-                break; // dangling: parent not on disk, chain ends here
+                // Chain ends here. If the blob is present but undecodable the walk
+                // stops for a reason that has nothing to do with GC, so say which.
+                if undecodable.contains(&d) {
+                    println!(
+                        "!! chain walk stopped at UNDECODABLE root {}",
+                        &d[..16.min(d.len())]
+                    );
+                }
+                break;
             };
             if !seen.insert(d.clone()) {
                 println!("!! CYCLE at {}", &d[..16.min(d.len())]);
@@ -215,7 +257,11 @@ fn main() {
 /// on hand can never match a key directly. Accept both, and refuse to guess when
 /// neither lands: an unmatched head walks zero roots, and a zero-length walk reads
 /// as a totally orphaned ledger, which is the most alarming output the tool has.
-fn resolve_head(arg: &str, nodes: &HashMap<String, (i64, Option<String>)>) -> String {
+fn resolve_head(
+    arg: &str,
+    nodes: &HashMap<String, (i64, Option<String>)>,
+    undecodable: &HashSet<String>,
+) -> String {
     if nodes.contains_key(arg) {
         return arg.to_string();
     }
@@ -224,6 +270,14 @@ fn resolve_head(arg: &str, nodes: &HashMap<String, (i64, Option<String>)>) -> St
             println!("head {arg} resolved to digest {digest}");
             return digest;
         }
+        if undecodable.contains(&digest) {
+            eprintln!("!! head {arg} is on disk as {digest} but did not decode");
+            std::process::exit(2);
+        }
+    }
+    if undecodable.contains(arg) {
+        eprintln!("!! head {arg} is on disk but did not decode");
+        std::process::exit(2);
     }
     eprintln!(
         "!! head {arg} is not a root in this directory.\n\
