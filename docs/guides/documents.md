@@ -85,7 +85,7 @@ fluree auth login --remote acct
 fluree auth status --remote acct
 ```
 
-Run those from the directory whose `.fluree/` should hold the remote. Adding it from your home directory puts it in `~/.fluree/config.toml`, and `doc.remote` finds remotes there as well as in the project, so one login serves every project. Logins expire after a few hours and are refreshed automatically when a command needs them; when the refresh token itself has lapsed, `fluree auth login` again.
+Run those inside the project: the remote and its login are stored in the nearest `.fluree/config.toml`, and the sync commands (`publish`, `push`, `query <remote>/<ledger>`) look only there. `doc.remote` is the one setting that also finds a remote registered from your home directory in `~/.fluree/config.toml`, so a single login can serve model access for every project even where publishing is set up per project. Logins expire after a few hours and are refreshed automatically when a command needs them; when the refresh token itself has lapsed, `fluree auth login` again.
 
 ## Where the data lives, and which calls are made
 
@@ -110,7 +110,10 @@ The ledger you built is a normal ledger, so the remote-sync commands move it:
 ```bash
 fluree publish acct contracts       # creates contracts on the stack and pushes every commit
 fluree push contracts               # later runs: push what is new
+fluree query acct/contracts -e '…'  # query the hosted copy
 ```
+
+The remote must be registered in this project's `.fluree/` for `publish` to find it (see the login section above).
 
 That carries the structure graph, the chunks, the embeddings and the document nodes. It does not carry the two indexes, which are separate graph sources on your machine:
 
