@@ -142,6 +142,13 @@ fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 
+# Its own target, not a harness member: as a member, deleting the one #[path]
+# line that wires it in would silently stop it compiling — an orphan of exactly
+# the kind it exists to catch.
+[[test]]
+name = "harness_coverage"
+path = "tests/harness_coverage.rs"
+
 [[test]]
 name = "grp_graphsource"
 path = "tests/grp_graphsource.rs"

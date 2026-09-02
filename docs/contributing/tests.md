@@ -113,16 +113,16 @@ from `Cargo.toml` outwards rather than from file names, so an undeclared
 `grp_*.rs` is flagged as an orphan itself instead of being assumed to be a
 target.
 
-The same file enforces the env rule above: any file compiled into a shared
-harness that calls `set_var`/`remove_var` fails the build, named. Standalone
-`[[test]]` targets are exempt — being alone in a process is exactly what makes
-the mutation safe.
+The other two standalone rules — env mutation and instrumentation assertions —
+are **not** mechanically enforced. Detecting them means scanning Rust source for
+call shapes, which costs more in false positives and blind spots than review
+does. They are conventions; honour them when adding a test.
 
-Both checks live in the `fluree-test-support` crate, so adopting them in a third
-crate is a dev-dependency plus a `tests/harness_coverage.rs` that calls
-`assert_every_test_file_is_reachable(env!("CARGO_MANIFEST_DIR"))` and
-`assert_grouped_tests_do_not_mutate_env(env!("CARGO_MANIFEST_DIR"))`. `env!`
-expands at the call site, so each crate is checked against its own manifest.
+The check lives in the `fluree-test-support` crate, so adopting it in a third
+crate is a dev-dependency plus a `tests/harness_coverage.rs` calling
+`assert_every_test_file_is_reachable(env!("CARGO_MANIFEST_DIR"))`, declared as
+its own `[[test]]` target. `env!` expands at the call site, so each crate is
+checked against its own manifest.
 
 ### Example Tests
 

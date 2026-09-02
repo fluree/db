@@ -1,8 +1,6 @@
 #[path = "support/mod.rs"]
 mod support;
 
-#[path = "harness_coverage.rs"]
-mod harness_coverage;
 #[path = "it_compile_breakdown.rs"]
 mod it_compile_breakdown;
 #[path = "it_count_distinct_objects.rs"]

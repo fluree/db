@@ -2,8 +2,6 @@
 mod admin_auth_layering;
 #[path = "cross_ledger_http_integration.rs"]
 mod cross_ledger_http_integration;
-#[path = "harness_coverage.rs"]
-mod harness_coverage;
 #[path = "iceberg_track_durability.rs"]
 mod iceberg_track_durability;
 #[path = "integration.rs"]

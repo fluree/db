@@ -37,7 +37,10 @@ fn payload_v1() -> JsonValue {
 }
 
 /// Seed a ledger with one default-graph triple and one triple in OTHER_IRI.
-async fn seed(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> i64 {
+///
+/// The original in it_sync_graph.rs returns the commit `t`; nothing here needs
+/// it, so this copy does not.
+async fn seed(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
     let ledger = genesis_ledger(fluree, ledger_id);
     let trig = format!(
         r#"
@@ -48,13 +51,12 @@ async fn seed(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> i64 {
         }}
         "#,
     );
-    let result = fluree
+    fluree
         .stage_owned(ledger)
         .upsert_turtle(&trig)
         .execute()
         .await
         .expect("seed insert");
-    result.receipt.t
 }
 
 /// The whole-graph memory backstop: staging materializes the target
