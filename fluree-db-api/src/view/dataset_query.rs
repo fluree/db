@@ -798,7 +798,11 @@ impl Fluree {
         // policy-enforced query. Do not "upgrade" this.
         let index_provider = crate::FlureeIndexProvider::new(self);
 
-        let config = ContextConfig {
+        #[allow(
+            unused_mut,
+            reason = "vector_provider is set inside cfg(feature = \"vector\")"
+        )]
+        let mut config = ContextConfig {
             tracker: if tracker.is_enabled() {
                 Some(tracker)
             } else {
@@ -825,6 +829,10 @@ impl Fluree {
             trust_fk_refs: options.trust_fk_refs,
             ..Default::default()
         };
+        #[cfg(feature = "vector")]
+        {
+            config.vector_provider = Some(&index_provider);
+        }
 
         let exec_db = db.with_t(to_t);
         fluree_db_query::execute::execute_prepared_streaming(exec_db, vars, prepared, config, sink)
@@ -961,7 +969,11 @@ impl Fluree {
         // policy-enforced query. Do not "upgrade" this.
         let index_provider = crate::FlureeIndexProvider::new(self);
 
-        let config = ContextConfig {
+        #[allow(
+            unused_mut,
+            reason = "vector_provider is set inside cfg(feature = \"vector\")"
+        )]
+        let mut config = ContextConfig {
             tracker: Some(tracker),
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
@@ -984,6 +996,10 @@ impl Fluree {
             trust_fk_refs: options.trust_fk_refs,
             ..Default::default()
         };
+        #[cfg(feature = "vector")]
+        {
+            config.vector_provider = Some(&index_provider);
+        }
 
         let exec_db = db.with_t(to_t);
         execute_prepared(exec_db, vars, prepared, config).await
