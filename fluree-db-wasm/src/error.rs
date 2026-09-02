@@ -99,7 +99,10 @@ mod tests {
         // F3: a query aborted by its wall-clock timeout must surface a distinct
         // `timeout` code so the JS surface can tell it apart from a caller
         // cancel or a disconnect (all three are one QueryError::Cancelled).
-        assert_eq!(code_for(&cancelled(QueryCancellationReason::Timeout)), code::TIMEOUT);
+        assert_eq!(
+            code_for(&cancelled(QueryCancellationReason::Timeout)),
+            code::TIMEOUT
+        );
         assert_eq!(
             code_for(&cancelled(QueryCancellationReason::Cancelled)),
             code::CANCELLED,

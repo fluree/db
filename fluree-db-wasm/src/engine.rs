@@ -120,7 +120,10 @@ impl EngineCore {
     fn exec_options_with_cancel(
         &self,
         want_timeout: bool,
-    ) -> (QueryExecutionOptions, Option<fluree_db_core::QueryCancellation>) {
+    ) -> (
+        QueryExecutionOptions,
+        Option<fluree_db_core::QueryCancellation>,
+    ) {
         if self.query_budget_bytes.is_none() && !want_timeout {
             return (QueryExecutionOptions::default(), None);
         }

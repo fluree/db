@@ -52,7 +52,7 @@
 //! the single cycle guard and so are un-evictable for the cycle's duration; if
 //! the combined set exceeds the budget, the fetch that tips it over cannot
 //! evict the earlier subscriptions' observed bytes and there is no other live
-//! guard to advance the epoch, so it takes [`ResidencyError::EvictionDeferred`],
+//! guard to advance the epoch, so it takes [`ResidencyError::EvictionDeferred`](crate::residency::ResidencyError::EvictionDeferred),
 //! waits the full `budget_wait` ([`BrowserIoConfig`](crate::config::BrowserIoConfig),
 //! default 10s) for a release that cannot come, then fails typed. That
 //! subscription lands in `errored` and repeats the stall every cycle — it
