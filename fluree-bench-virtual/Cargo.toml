@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Internal benchmark tooling — never a release artifact.
+[package.metadata.dist]
+dist = false
+
 # A single binary. The crate is a runner, not a library — its schema types live
 # in `src/schema.rs` and are exercised by the in-crate unit tests.
 [[bin]]

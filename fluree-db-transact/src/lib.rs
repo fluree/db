@@ -56,8 +56,7 @@ pub use fluree_graph_turtle::splitter as turtle_splitter;
 // Re-exports
 pub use address::parse_commit_id;
 pub use commit::{
-    build_commit, commit, release_raw_txn_after_build_err, CommitOpts, CommitOptsRequest,
-    CommitReceipt, StagedCommit,
+    build_commit, commit, CommitOpts, CommitOptsRequest, CommitReceipt, StagedCommit,
 };
 pub use commit_flakes::generate_commit_flakes;
 pub use error::{Result, TransactError};
@@ -75,8 +74,8 @@ pub use namespace::{
     SharedNamespaceAllocator, BLANK_NODE_ID_PREFIX, BLANK_NODE_PREFIX,
 };
 pub use parse::{
-    parse_transaction, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject, RawTerm,
-    RawTrigMeta, RawTriple, TrigPhase1Result,
+    parse_sync_transaction, parse_transaction, parse_trig_phase1, resolve_trig_meta,
+    NamedGraphBlock, RawObject, RawTerm, RawTrigMeta, RawTriple, TrigPhase1Result,
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
 pub use stage::{generate_txn_id, stage, stage_flakes, StageOptions};

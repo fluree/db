@@ -23,7 +23,7 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
+use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -620,26 +620,32 @@ impl NestedLoopJoinOperator {
 
         // Determine right pattern output vars (vars that are still unbound after substitution),
         // filtered by the emission mask. This allows plan-time pruning of unused vars.
+        //
+        // A variable repeated across positions (`?x <p> ?x`, `?x ?x ?o`) is one
+        // output column, not two: the right scan's own schema folds the repeat
+        // into a single slot (`schema_from_pattern_with_emit`) and enforces the
+        // implied equality per row (`within_row_var_equality_ok`), so emitting
+        // it twice here would only build a batch schema that names the same
+        // VarId in two columns — which `Batch::new` rejects outright.
         let mut right_output_vars: Vec<VarId> = Vec::new();
+        let push_right_var = |out: &mut Vec<VarId>, v: VarId| {
+            if !left_var_positions.contains_key(&v) && !out.contains(&v) {
+                out.push(v);
+            }
+        };
         if right_emit.s {
             if let Ref::Var(v) = &right_pattern.s {
-                if !left_var_positions.contains_key(v) {
-                    right_output_vars.push(*v);
-                }
+                push_right_var(&mut right_output_vars, *v);
             }
         }
         if right_emit.p {
             if let Ref::Var(v) = &right_pattern.p {
-                if !left_var_positions.contains_key(v) {
-                    right_output_vars.push(*v);
-                }
+                push_right_var(&mut right_output_vars, *v);
             }
         }
         if right_emit.o {
             if let Term::Var(v) = &right_pattern.o {
-                if !left_var_positions.contains_key(v) {
-                    right_output_vars.push(*v);
-                }
+                push_right_var(&mut right_output_vars, *v);
             }
         }
 
@@ -939,8 +945,17 @@ impl NestedLoopJoinOperator {
                             // Use Term::Iri so scan can encode for each target ledger
                             pattern.o = Term::Iri(iri.clone());
                         }
-                        Binding::Lit { val, .. } => {
+                        Binding::Lit { val, dtc, .. } => {
                             pattern.o = Term::Value(val.clone());
+                            // A string binding is one RDF term: `"bob"`,
+                            // `"bob"@en`, `"bob"^^xsd:anyURI` and
+                            // `"bob"^^ex:custom` share a dictionary key and
+                            // must not probe each other's rows. Numeric/other
+                            // constraints are left off so cross-subtype
+                            // matching stays as before.
+                            if crate::binding::is_string_dict_term(binding) {
+                                pattern.dtc = Some(dtc.clone());
+                            }
                         }
                         Binding::EncodedLit {
                             o_kind,
@@ -972,6 +987,49 @@ impl NestedLoopJoinOperator {
                                         ))
                                     })?;
                                 pattern.o = Term::Value(val);
+                                // Same term-identity rule as the `Lit` arm:
+                                // a string binding probes only rows with its
+                                // exact tag / datatype.
+                                //
+                                // Read straight off the encoded triple: the
+                                // datatype id already names the datatype, so
+                                // this needs no `OTypeRegistry` (a 15-element
+                                // `Vec`, and `decode_value_from_kind` above
+                                // builds one already). Only the three reserved
+                                // string-dictionary ids can appear here —
+                                // `late_materialized_object_binding` keeps
+                                // every other string datatype materialized, so
+                                // those reach the `Lit` arm above instead.
+                                let dt = DatatypeDictId::from_u16(*dt_id);
+                                let dtc = if !crate::binding::is_string_dict_term(binding) {
+                                    None
+                                } else if dt == DatatypeDictId::LANG_STRING {
+                                    gv.store().lang_tag_for_id(*lang_id).map(|tag| {
+                                        fluree_db_core::DatatypeConstraint::LangTag(Arc::from(tag))
+                                    })
+                                } else {
+                                    let sid = crate::eval::rdf::reserved_datatype_sid(dt);
+                                    // Unreachable fallback by the argument
+                                    // above: only the three reserved ids can
+                                    // appear on an encoded string-dict
+                                    // binding, and the two non-langString
+                                    // ones both have well-known Sids. Loud
+                                    // when a future widening of the encoded
+                                    // set forgets this probe site.
+                                    debug_assert!(
+                                        sid.is_some(),
+                                        "encoded string-dict binding carries non-reserved \
+                                         dt_id {dt_id}; late_materialized_object_binding \
+                                         keeps those datatypes materialized"
+                                    );
+                                    sid.or_else(|| {
+                                        gv.store().dt_sids().get(*dt_id as usize).cloned()
+                                    })
+                                    .map(fluree_db_core::DatatypeConstraint::Explicit)
+                                };
+                                if dtc.is_some() {
+                                    pattern.dtc = dtc;
+                                }
                             }
                             // Otherwise leave as variable
                         }
@@ -2019,6 +2077,13 @@ impl NestedLoopJoinOperator {
             "join batched binary scan complete"
         );
 
+        // The join reads leaflets itself here, so these rows cross no other
+        // charging surface: without this a subject-driven NLJ chain expanded
+        // its whole probe side for free. `matched_rows` is already tallied by
+        // the loop above for the debug line, so the charge costs one
+        // `fetch_add` at the scan boundary and nothing per row.
+        charge_probe_rows(ctx, matched_rows as usize)?;
+
         Ok(())
     }
 
@@ -2927,6 +2992,13 @@ impl NestedLoopJoinOperator {
             matched_rows,
             "join batched object flush complete"
         );
+
+        // The object-driven (POST) lane reads its own leaflets rather than
+        // going through `scan_matches`, so its rows need their own charge at
+        // this boundary — `matched_rows` is already tallied for the debug
+        // line above.
+        charge_probe_rows(ctx, matched_rows as usize)?;
+
         Ok(())
     }
 
@@ -3199,7 +3271,43 @@ pub(crate) struct SubjectProbeParams<'a> {
     pub dict_overlay: Option<&'a crate::dict_overlay::DictOverlay>,
 }
 
+/// Probe a batch of subjects for one predicate, charging the rows it
+/// returns.
+///
+/// The charge lives here rather than at the call sites because both
+/// `PropertyJoinOperator` and `NestedLoopJoinOperator` reach the index
+/// through this primitive. Pricing it per call site meant the same read
+/// was billed in one operator and free in the other, so a query's cost
+/// depended on which lane the planner picked. One charge per call, using
+/// the match count — never per row inside the leaflet loops (hot-loop
+/// purity, see [`charge_probe_rows`]).
 pub(crate) fn batched_subject_probe_binary(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    params: &SubjectProbeParams<'_>,
+    probe_ops: Option<&mut ProbeOps>,
+) -> Result<Vec<BatchedSubjectProbeMatch>> {
+    let matches = batched_subject_probe_binary_uncharged(ctx, store, params, probe_ops)?;
+    charge_probe_rows(ctx, matches.len())?;
+    Ok(matches)
+}
+
+/// Charge a batch of index-probe rows at [`PER_ROW_MICRO_FUEL`].
+///
+/// One `fetch_add` for the whole batch, at the boundary where the matches
+/// are handed back — never per iteration inside the leaflet merge loops.
+/// A never-taken branch in those loops measured +5-15% end-to-end (see
+/// CLAUDE.md's hot-loop purity rule), and `consume_fuel` short-circuits
+/// on an untracked query before touching the atomic at all.
+///
+/// [`PER_ROW_MICRO_FUEL`]: fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL
+fn charge_probe_rows(ctx: &ExecutionContext<'_>, rows: usize) -> Result<()> {
+    ctx.tracker
+        .consume_fuel(rows as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL)?;
+    Ok(())
+}
+
+fn batched_subject_probe_binary_uncharged(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     params: &SubjectProbeParams<'_>,
@@ -3508,7 +3616,30 @@ pub(crate) fn batched_subject_probe_binary(
     Ok(out)
 }
 
+/// Walk a batch of subjects across several predicates in SPOT order,
+/// charging the rows it returns. See [`batched_subject_probe_binary`] for
+/// why the charge lives in the primitive rather than at the call sites.
 pub(crate) fn batched_subject_star_spot(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    subject_ids: &[u64],
+    predicates: &[SpotStarPredicateParams<'_>],
+    dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
+    probe_ops: Option<&mut ProbeOps>,
+) -> Result<Vec<BatchedSpotStarMatch>> {
+    let matches = batched_subject_star_spot_uncharged(
+        ctx,
+        store,
+        subject_ids,
+        predicates,
+        dict_overlay,
+        probe_ops,
+    )?;
+    charge_probe_rows(ctx, matches.len())?;
+    Ok(matches)
+}
+
+fn batched_subject_star_spot_uncharged(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     subject_ids: &[u64],

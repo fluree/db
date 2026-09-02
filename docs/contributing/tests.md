@@ -50,7 +50,7 @@ fn test_query_workflow() {
 }
 ```
 
-#### Grouped integration binaries (`fluree-db-api`)
+#### Grouped integration binaries (`fluree-db-api`, `fluree-db-server`)
 
 Every top-level `tests/*.rs` file is a **separate test binary** that links the
 entire crate dependency graph. With ~160 integration files that meant ~160 full
@@ -92,10 +92,24 @@ binary. No new `[[test]]` entry is needed unless you are creating a new group.
   so this only matters for bare `cargo test`.)
 - Tests whose **assertions are about instrumentation** — presence/absence of
   tracing events captured via a thread-local `span_capture` subscriber (e.g.
-  `it_cyclic_bgp_probe`, `it_minmax_fast_path_fired`). Tracing's
+  `it_cyclic_bgp_probe`, `it_minmax_fast_path_fired`,
+  `it_upsert_skip_fires`). Tracing's
   callsite-interest cache is process-global and the capture is thread-local,
   so these assertions are only reliable when the test is alone in its
   process. (Same caveat as above: bites bare `cargo test` only.)
+
+`fluree-db-server` uses the same pattern and the same standalone rules, with
+harnesses named for its domains (`grp_http`, `grp_query`, `grp_proxy`,
+`grp_policy`, `grp_search`, `grp_raft`, `grp_bolt`). It has no shared
+`support/` module, so its case files are self-contained; `telemetry_test` and
+`multi_query_tracing_integration` are kept standalone under the
+instrumentation-assertion rule above.
+
+Because `autotests = false` means an unwired file silently never compiles and
+never runs — with `cargo test` still reporting success —
+`fluree-db-server/tests/harness_coverage.rs` asserts that every `tests/*.rs` is
+either pulled into a harness or declared as its own `[[test]]`. Add the same
+guard to any other crate that adopts this layout.
 
 ### Example Tests
 

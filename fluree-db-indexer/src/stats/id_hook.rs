@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::hll::HllSketch256;
 use fluree_db_core::value_id::ValueTypeTag;
-use fluree_db_core::{GraphId, GraphPropertyStatEntry, GraphStatsEntry};
+use fluree_db_core::{GraphId, GraphPropertyStatEntry, GraphStatsEntry, PropertyStatEntry};
 
 use super::hashing::subject_hash;
 
@@ -34,6 +34,14 @@ pub struct IdPropertyHll {
     pub last_modified_t: i64,
     /// Per-datatype flake count deltas: ValueTypeTag(u8) -> signed count
     pub datatypes: HashMap<u8, i64>,
+    /// 256-bit set of every datatype tag this entry has *seen* — every record
+    /// fed through the hook (asserts and retracts alike) plus any prior
+    /// historical tags seeded by the incremental path. Unlike `datatypes`,
+    /// bits are never cleared, which is what makes the finalized
+    /// `historical_datatypes` monotone across publishes. A retract's tag is
+    /// deliberately included: extra tags can only *decline* an optimization,
+    /// never license one.
+    historical_tag_bits: [u64; 4],
 }
 
 impl IdPropertyHll {
@@ -44,6 +52,7 @@ impl IdPropertyHll {
             subjects_hll: HllSketch256::new(),
             last_modified_t: 0,
             datatypes: HashMap::new(),
+            historical_tag_bits: [0; 4],
         }
     }
 
@@ -61,6 +70,7 @@ impl IdPropertyHll {
             subjects_hll,
             last_modified_t,
             datatypes,
+            historical_tag_bits: [0; 4],
         }
     }
 
@@ -74,6 +84,46 @@ impl IdPropertyHll {
         for (&dt, &delta) in &other.datatypes {
             *self.datatypes.entry(dt).or_insert(0) += delta;
         }
+        for (word, other_word) in self
+            .historical_tag_bits
+            .iter_mut()
+            .zip(other.historical_tag_bits.iter())
+        {
+            *word |= other_word;
+        }
+    }
+
+    #[inline]
+    fn note_historical_tag(&mut self, tag: u8) {
+        self.historical_tag_bits[(tag >> 6) as usize] |= 1u64 << (tag & 63);
+    }
+
+    /// Union prior historical tags into this entry (incremental seeding).
+    pub fn seed_historical_tags(&mut self, tags: impl IntoIterator<Item = u8>) {
+        for tag in tags {
+            self.note_historical_tag(tag);
+        }
+    }
+
+    /// The finalized historical tag set: every bit noted or seeded, unioned
+    /// with every key in the seeded `datatypes` count map (belt and braces —
+    /// a seeded count tag belongs to the covered range by construction, and
+    /// an extra tag is only ever conservative). Sorted.
+    pub fn historical_datatypes(&self) -> Vec<u8> {
+        let mut bits = self.historical_tag_bits;
+        for &dt in self.datatypes.keys() {
+            bits[(dt >> 6) as usize] |= 1u64 << (dt & 63);
+        }
+        let mut tags = Vec::new();
+        for (word_idx, word) in bits.iter().enumerate() {
+            let mut w = *word;
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                tags.push((word_idx as u32 * 64 + bit) as u8);
+                w &= w - 1;
+            }
+        }
+        tags
     }
 }
 
@@ -404,6 +454,8 @@ impl IdStatsHook {
 
         // Track datatype usage
         *hll.datatypes.entry(rec.dt.as_u8()).or_insert(0) += delta;
+        // Historical tag set: every record's tag, regardless of op or delta.
+        hll.note_historical_tag(rec.dt.as_u8());
 
         // Track class membership and class→property attribution (graph-scoped).
         if let Some(rdf_type_pid) = self.rdf_type_p_id {
@@ -659,6 +711,8 @@ impl IdStatsHook {
                     ndv_values: hll.values_hll.estimate(),
                     ndv_subjects: hll.subjects_hll.estimate(),
                     last_modified_t: hll.last_modified_t,
+                    observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
+                    historical_datatypes: hll.historical_datatypes(),
                     datatypes,
                 });
             }
@@ -777,6 +831,8 @@ impl IdStatsHook {
                     ndv_values: hll.values_hll.estimate(),
                     ndv_subjects: hll.subjects_hll.estimate(),
                     last_modified_t: hll.last_modified_t,
+                    observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
+                    historical_datatypes: hll.historical_datatypes(),
                     datatypes,
                 }
             })

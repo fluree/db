@@ -248,7 +248,9 @@ fn weigh_policy_map(map: &HashMap<String, PolicyStats>) -> usize {
 
 fn weigh_submission_error(err: &SubmissionError) -> usize {
     match err {
-        SubmissionError::Execution { message, .. } => message.capacity(),
+        SubmissionError::Execution { message, .. }
+        | SubmissionError::NoveltyBackpressure { message }
+        | SubmissionError::NoveltyDeltaTooLarge { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
         | SubmissionError::Overloaded => 0,
@@ -739,7 +741,13 @@ fn hash_governance(hasher: &mut Sha256, governance: &GovernanceOptions) {
         }
         None => hasher.update([0u8]),
     }
-    hasher.update([u8::from(governance.default_allow)]);
+    // Tri-state: unset and explicit-false must digest differently, since only
+    // the former lets the ledger's `f:defaultAllow` widen access.
+    hasher.update([match governance.default_allow {
+        None => 0u8,
+        Some(false) => 1u8,
+        Some(true) => 2u8,
+    }]);
 }
 
 fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
@@ -1142,6 +1150,7 @@ mod tests {
                     time: Some("12.34ms".into()),
                     fuel: Some(0.0),
                     policy: Some(policy),
+                    policy_enforcement: None,
                     reasoning: None,
                 }),
                 receipt: None,
@@ -1528,6 +1537,156 @@ mod tests {
         assert!(!SubmissionError::KeyCollision.is_settled());
         assert!(!SubmissionError::AlreadyInFlight.is_settled());
         assert!(!SubmissionError::Overloaded.is_settled());
+
+        // Novelty refusals are SETTLED even though the client is told to
+        // retry: they are decided before commit construction, and only a
+        // recorded `Failed` entry is re-attemptable (try_claim_slot's
+        // body-hash-matching replace). Unsettled would pin the InFlight
+        // slot — record_outcome skips it while guard.commit() disarms the
+        // cleanup — turning every keyed retry into a 409 for the TTL.
+        assert!(SubmissionError::NoveltyBackpressure {
+            message: "n".into()
+        }
+        .is_settled());
+        assert!(SubmissionError::NoveltyDeltaTooLarge {
+            message: "n".into()
+        }
+        .is_settled());
+    }
+
+    /// The `execution_failure` flattening must route novelty refusals by
+    /// drainability: at-max and a delta that fits after drain are retryable
+    /// backpressure (503 at the HTTP layer); a delta at or above the ceiling
+    /// can never fit and is a permanent 413 shape. Everything else keeps the
+    /// status-passthrough form.
+    #[test]
+    fn execution_failure_routes_novelty_by_drainability() {
+        use fluree_db_api::{ApiError, TransactError};
+        let f = crate::local::execution_failure;
+
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::NoveltyAtMax)),
+            SubmissionError::NoveltyBackpressure { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::NoveltyWouldExceed {
+                current_bytes: 90,
+                delta_bytes: 20,
+                max_bytes: 100
+            })),
+            SubmissionError::NoveltyBackpressure { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::NoveltyWouldExceed {
+                current_bytes: 0,
+                delta_bytes: 100,
+                max_bytes: 100
+            })),
+            SubmissionError::NoveltyDeltaTooLarge { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::EmptyTransaction)),
+            SubmissionError::Execution { status: 400, .. }
+        ));
+    }
+
+    /// Executor scripted for the keyed-retry pin: refuses the first
+    /// transact with novelty backpressure, commits the second — the
+    /// "indexer drained between attempts" shape.
+    #[derive(Clone)]
+    struct ScriptedNoveltyExecutor(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ScriptedNoveltyExecutor {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+        }
+
+        fn calls(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Committer for ScriptedNoveltyExecutor {
+        async fn transact(
+            &self,
+            request: TransactionRequest,
+        ) -> Result<TransactionReceipt, SubmissionError> {
+            let attempt = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(SubmissionError::NoveltyBackpressure {
+                    message: "Novelty at maximum size, reindexing required".into(),
+                });
+            }
+            Ok(TransactionReceipt {
+                idempotency_key: request.idempotency_key,
+                commit: fluree_db_transact::CommitReceipt {
+                    commit_id: CommitId::new(fluree_db_api::ContentKind::Commit, &[1u8]),
+                    t: 1,
+                    flake_count: 1,
+                    assert_count: 1,
+                    retract_count: 0,
+                },
+                tally: None,
+                cypher_return: None,
+            })
+        }
+        async fn revert(&self, _request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+            unreachable!("keyed-retry test never exercises revert")
+        }
+        async fn merge(&self, _request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+            unreachable!("keyed-retry test never exercises merge")
+        }
+        async fn rebase(&self, _request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+            unreachable!("keyed-retry test never exercises rebase")
+        }
+        async fn push(&self, _request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+            unreachable!("keyed-retry test never exercises push")
+        }
+    }
+
+    /// A keyed retry after a novelty refusal must RE-EXECUTE, not bounce
+    /// off a pinned `InFlight` slot (#1719 review CRITICAL-1).
+    ///
+    /// `record_outcome` skips unsettled errors while `guard.commit()`
+    /// unconditionally disarms the drop-time `InFlight` cleanup, so an
+    /// unsettled classification pins the slot for the full cache TTL and
+    /// every keyed retry returns `AlreadyInFlight` — the dropped-write
+    /// footgun (#1708), now behind one extra round-trip. Settled `Failed`
+    /// entries are re-attemptable by design (`try_claim_slot` replaces
+    /// them on a matching body hash). Mutation check: flipping the
+    /// novelty arm of `is_settled` back to `false` fails this test with
+    /// `AlreadyInFlight` on the retry.
+    #[tokio::test]
+    async fn keyed_retry_after_novelty_refusal_reexecutes() {
+        let scripted = ScriptedNoveltyExecutor::new();
+        let committer: CachingCommitter<ScriptedNoveltyExecutor> = CachingCommitter {
+            executor: scripted.clone(),
+            cache: Cache::builder()
+                .time_to_live(DEFAULT_IDEMPOTENCY_TTL)
+                .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+                .weigher(weigh_cached_submission)
+                .build(),
+            admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
+            per_ledger_admission: Arc::new(DashMap::new()),
+            per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
+        };
+
+        let req = || request("test/db:main", Some("ingest-1"), sample_insert("a"));
+
+        // First keyed attempt: refused by backpressure (503 at the HTTP layer).
+        let first = committer.transact(req()).await;
+        assert!(
+            matches!(first, Err(SubmissionError::NoveltyBackpressure { .. })),
+            "first attempt must surface the refusal, got {first:?}"
+        );
+
+        // Same key, same body, after the condition clears: must re-execute
+        // and commit — not 409 AlreadyInFlight, not a replayed refusal.
+        let second = committer.transact(req()).await;
+        let receipt = second.expect("keyed retry must re-execute and succeed");
+        assert_eq!(receipt.commit.t, 1);
+        assert_eq!(scripted.calls(), 2, "executor must run once per attempt");
     }
 
     #[tokio::test]
@@ -2044,7 +2203,7 @@ mod tests {
         // construction inside the consensus layer — and it permits the write.
         let mut req = request(&ledger_id, None, sample_insert("alice"));
         req.governance = GovernanceOptions {
-            default_allow: true,
+            default_allow: Some(true),
             ..Default::default()
         };
 
@@ -2074,7 +2233,7 @@ mod tests {
                 "f:action": [{"@id": "f:view"}],
                 "f:allow": true
             }])),
-            default_allow: false,
+            default_allow: Some(false),
             ..Default::default()
         };
 

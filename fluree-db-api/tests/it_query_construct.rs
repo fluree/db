@@ -770,3 +770,388 @@ async fn sparql_construct_duplicate_rows_mint_distinct_blanks() {
          template blanks — per-row, not per-distinct-binding: {out:#}"
     );
 }
+
+// =============================================================================
+// RDF set semantics for CONSTRUCT / DESCRIBE results
+// =============================================================================
+//
+// A CONSTRUCT result is an RDF graph, so triple identity is the full
+// `(s, p, o)` tuple and the result is a SET union of the instantiated
+// templates (SPARQL 1.1 §16.2). Both graph serializations are pinned here so
+// they cannot drift apart on that rule.
+
+/// Seed the two-predicate fixture. `same_value` selects the shape where one
+/// literal is shared by both predicates, or the distinct-value control.
+async fn seed_shared_object(
+    ledger_id: &str,
+    same_value: bool,
+) -> (fluree_db_api::Fluree, LedgerState) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let (v1, v2) = if same_value {
+        ("same", "same")
+    } else {
+        ("alpha", "beta")
+    };
+    let tx = json!({
+        "@graph": [{
+            "@id": "http://ex/s",
+            "http://ex/p1": v1,
+            "http://ex/p2": v2
+        }]
+    });
+    let committed = fluree.insert(ledger0, &tx).await.expect("insert fixture");
+    (fluree, committed.ledger)
+}
+
+/// Count object values across every `@graph` node, excluding `@id`/`@context`.
+fn count_graph_values(v: &JsonValue) -> usize {
+    let count_node = |o: &Map<String, JsonValue>| -> usize {
+        o.iter()
+            .filter(|(k, _)| k.as_str() != "@id" && k.as_str() != "@context")
+            .map(|(_, val)| match val {
+                JsonValue::Array(a) => a.len(),
+                _ => 1,
+            })
+            .sum()
+    };
+    match v.get("@graph").and_then(JsonValue::as_array) {
+        Some(graph) => graph
+            .iter()
+            .filter_map(JsonValue::as_object)
+            .map(count_node)
+            .sum(),
+        None => v.as_object().map_or(0, count_node),
+    }
+}
+
+const CONSTRUCT_ALL: &str = "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }";
+
+/// A constant template instantiated once per solution row yields the SAME
+/// triple N times; the result graph holds it once. Asserted in BOTH graph
+/// serializations — the JSON-LD formatter's value dedupe used to be the only
+/// thing collapsing it, which left RDF/XML emitting the duplicate.
+#[tokio::test]
+async fn sparql_construct_repeated_triple_collapses_in_both_serializations() {
+    // Two solution rows x one constant template triple.
+    let (fluree, ledger) = seed_shared_object("it/construct:repeat", false).await;
+    let db = support::graphdb_from_ledger(&ledger);
+    let sparql = "CONSTRUCT { <http://ex/s> <http://ex/pc> \"dup\" } WHERE { ?s ?p ?o }";
+
+    let jsonld = db
+        .query(&fluree)
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(
+        count_graph_values(&jsonld),
+        1,
+        "JSON-LD collapses the repeated triple: {jsonld:#}"
+    );
+
+    let rdfxml = db
+        .query(&fluree)
+        .sparql(sparql)
+        .format(fluree_db_api::FormatterConfig::rdf_xml())
+        .execute_formatted_string()
+        .await
+        .expect("RDF/XML must execute");
+    assert_eq!(
+        rdfxml.matches("<ns0:pc>").count(),
+        1,
+        "RDF/XML applies the same set semantics: {rdfxml}"
+    );
+}
+
+/// One subject, one literal, two predicates: two distinct RDF triples. The
+/// JSON-LD formatter's object dedupe once tracked seen values per SUBJECT and
+/// dropped the second. The SELECT row path is the oracle.
+#[tokio::test]
+async fn sparql_construct_shared_object_across_predicates_novelty() {
+    let (fluree, ledger) = seed_shared_object("it/construct:shared-obj", true).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let rows = support::query_sparql(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("select");
+    let row_count: usize = rows.batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(row_count, 2, "SELECT oracle sees both triples");
+
+    let out = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "same literal under p1 and p2 are distinct triples: {out:#}"
+    );
+}
+
+/// Same assertion on the indexed read path: the binary index feeds a different
+/// scan operator, and the reported reproduction reindexed before querying.
+#[tokio::test]
+async fn sparql_construct_shared_object_across_predicates_indexed() {
+    let ledger_id = "it/construct:shared-obj-idx";
+    let (fluree, _ledger) = seed_shared_object(ledger_id, true).await;
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let out = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "indexed lane must agree with novelty: {out:#}"
+    );
+}
+
+/// Control: distinct objects were never affected. Guards against a "fix" that
+/// simply disables deduplication.
+#[tokio::test]
+async fn sparql_construct_distinct_objects_across_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:distinct-obj", false).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let out = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT must execute");
+    assert_eq!(count_graph_values(&out), 2, "control: {out:#}");
+}
+
+/// DESCRIBE lowers to the same `QueryOutput::Construct`, so it shares the
+/// result-graph contract.
+#[tokio::test]
+async fn sparql_describe_shared_object_across_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:describe-obj", true).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let out = db
+        .query(&fluree)
+        .sparql("DESCRIBE <http://ex/s>")
+        .execute_formatted()
+        .await
+        .expect("DESCRIBE must execute");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "DESCRIBE must emit both triples: {out:#}"
+    );
+}
+
+/// Three-surface parity: the FQL `construct` form shares the same formatter and
+/// must agree with the SPARQL surface.
+#[tokio::test]
+async fn fql_construct_shared_object_across_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:fql-obj", true).await;
+
+    let query = json!({
+        "where": [{"@id": "?s", "?p": "?o"}],
+        "construct": [{"@id": "?s", "?p": "?o"}]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("FQL construct must execute");
+    let out = result
+        .to_jsonld_async(support::graphdb_from_ledger(&ledger).as_graph_db_ref())
+        .await
+        .expect("format");
+    assert_eq!(
+        count_graph_values(&out),
+        2,
+        "FQL construct must agree with SPARQL: {out:#}"
+    );
+}
+
+/// RDF/XML must carry both predicates for the shared-object shape. Pins the
+/// serializer that was already correct, so the dedupe-scope change cannot
+/// over-correct it into the JSON-LD failure mode.
+#[tokio::test]
+async fn sparql_construct_shared_object_rdfxml_keeps_both_predicates() {
+    let (fluree, ledger) = seed_shared_object("it/construct:shared-obj-xml", true).await;
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let rdfxml = db
+        .query(&fluree)
+        .sparql(CONSTRUCT_ALL)
+        .format(fluree_db_api::FormatterConfig::rdf_xml())
+        .execute_formatted_string()
+        .await
+        .expect("RDF/XML must execute");
+    assert!(
+        rdfxml.contains("p1") && rdfxml.contains("p2"),
+        "RDF/XML must carry both predicates: {rdfxml}"
+    );
+}
+
+/// A fully-constant template prunes the WHERE schema to zero columns
+/// (`compute_variable_deps` seeds an empty needed set from a template that
+/// references no variable), and a column-less `Batch` carries its row count
+/// out-of-band — so every operator that rebuilds a batch column-by-column is a
+/// place the count can silently vanish. `DistinctOperator` was the first
+/// (fixed here); `LimitOperator`'s truncation branch and `OffsetOperator`'s
+/// partial-skip branch were the second and third, both rebuilding via
+/// `Batch::new(schema, vec![])` and losing the length. Reachable from main:
+/// this exact query returned an **empty graph** whenever the WHERE matched
+/// more rows than the limit, because the truncated zero-column batch read as
+/// zero rows and ASK/CONSTRUCT formatting reads emptiness.
+#[tokio::test]
+async fn constant_template_construct_with_limit_keeps_its_triple() {
+    let (fluree, ledger) = seed_people().await;
+
+    // WHERE matches many rows; LIMIT slices the solution sequence. The
+    // template is constant, so any surviving solution instantiates the same
+    // single triple — the graph must never be empty.
+    for q in [
+        "CONSTRUCT { <http://ex/s> <http://ex/p> \"dup\" } WHERE { ?s ?p ?o } LIMIT 1",
+        "CONSTRUCT { <http://ex/s> <http://ex/p> \"dup\" } WHERE { ?s ?p ?o } LIMIT 5",
+        "CONSTRUCT { <http://ex/s> <http://ex/p> \"dup\" } WHERE { ?s ?p ?o } OFFSET 2",
+        "CONSTRUCT { <http://ex/s> <http://ex/p> \"dup\" } WHERE { ?s ?p ?o } LIMIT 3 OFFSET 2",
+    ] {
+        let result = support::query_sparql(&fluree, &ledger, q)
+            .await
+            .expect("construct query");
+        let graph = result
+            .to_construct(&ledger.snapshot)
+            .expect("construct format");
+        let n = graph["@graph"].as_array().map_or(0, Vec::len);
+        assert_eq!(
+            n, 1,
+            "{q}: a constant template over a non-empty sliced WHERE must \
+             yield exactly one triple, got {n} nodes: {graph}"
+        );
+    }
+}
+
+// ============================================================================
+// The WHERE-dedup license's output-path gate (#1700 follow-up, #1706)
+// ============================================================================
+
+/// Every output format must either canonicalize a CONSTRUCT graph or refuse
+/// CONSTRUCT outright — asserted behaviorally, per format, against a result
+/// that provably still carries duplicate solutions.
+///
+/// This is the gate that keeps `result_is_multiplicity_blind` (in
+/// `fluree-db-query`'s `execute::operator_tree`) honest. That license lets the
+/// WHERE planner collapse duplicate solutions for a blank-free, unsliced
+/// CONSTRUCT on the argument that *no* output path can observe them: every
+/// serializer either calls `Graph::canonicalize()` or rejects CONSTRUCT. The
+/// plan is built before the output format is chosen, so the license is sound
+/// only while that holds for EVERY format — one non-canonicalizing serializer
+/// anywhere and the license silently changes query results for it.
+///
+/// The enumeration is structural, not a comment: `classify` matches every
+/// `OutputFormat` variant with no wildcard arm, so adding a variant stops this
+/// file compiling until the new path is classified — and the classification is
+/// then executed, not taken on faith. If a future format legitimately needs to
+/// render CONSTRUCT without canonicalizing, the license itself has to change;
+/// this test failing is the reminder.
+mod construct_license_output_gate {
+    use crate::support;
+    use fluree_db_api::format::{format_results_string, FormatterConfig, OutputFormat};
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum ConstructPath {
+        /// Serializes the graph; duplicate solutions must collapse.
+        Canonicalizes,
+        /// Refuses CONSTRUCT results outright.
+        Rejects,
+    }
+
+    /// One list, used twice: the `match` (no wildcard) is the compile-time
+    /// exhaustiveness gate, and the same identifiers feed the runtime
+    /// iteration, so a variant cannot be classified without also being tested.
+    macro_rules! classified_formats {
+        ($($variant:ident => $path:ident),* $(,)?) => {
+            fn classify(format: OutputFormat) -> ConstructPath {
+                match format {
+                    $(OutputFormat::$variant => ConstructPath::$path,)*
+                }
+            }
+            fn all_formats() -> Vec<OutputFormat> {
+                vec![$(OutputFormat::$variant),*]
+            }
+        };
+    }
+
+    classified_formats! {
+        JsonLd     => Canonicalizes, // format_results → construct::format → Graph::canonicalize
+        SparqlJson => Canonicalizes, // coerced to the same construct::format path (#1274)
+        SparqlXml  => Rejects,       // sparql_xml::format: SELECT/ASK only
+        RdfXml     => Canonicalizes, // rdf_xml::format → Graph::canonicalize
+        TypedJson  => Canonicalizes, // coerced to construct::format
+        Tsv        => Rejects,       // delimited::reject_non_tabular
+        Csv        => Rejects,       // delimited::reject_non_tabular
+        AgentJson  => Canonicalizes, // coerced to construct::format
+        CypherJson => Canonicalizes, // coerced to construct::format
+    }
+
+    #[tokio::test]
+    async fn every_output_format_collapses_or_rejects_construct() {
+        let (fluree, ledger) = super::seed_people().await;
+
+        // `favNums` is multi-valued (jdoe 4, bbob 1, jbob 7 = 12 solutions over
+        // 3 subjects), and the LIMIT keeps the query outside the license, so
+        // the WHERE stage may not collapse anything: the duplicates must still
+        // be present when each serializer runs. The constant-object template
+        // then instantiates to one identical triple per solution.
+        let sparql = "CONSTRUCT { ?s <http://example.org/flagged> \"dup-collapse-marker\" } \
+                      WHERE { ?s <http://example.org/Person#favNums> ?n } LIMIT 100";
+        let result = support::query_sparql(&fluree, &ledger, sparql)
+            .await
+            .expect("construct query");
+
+        // Ran-marker: the gate is vacuous unless duplicate solutions actually
+        // reach the formatters. 12 rows over 3 distinct subjects, by fixture
+        // arithmetic — if WHERE-level dedup ever starts firing here (e.g. the
+        // license grows to cover sliced CONSTRUCT), this stops the test before
+        // the per-format loop can pass on an already-collapsed stream.
+        let rows: usize = result.batches.iter().map(fluree_db_api::Batch::len).sum();
+        assert_eq!(
+            rows, 12,
+            "precondition: the formatter input must still carry all 12 \
+             duplicate-bearing solutions (3 subjects x their favNums counts)"
+        );
+
+        for format in all_formats() {
+            let config = FormatterConfig {
+                format,
+                ..FormatterConfig::default()
+            };
+            let out = format_results_string(&result, &result.context, &ledger.snapshot, &config);
+            match classify(format) {
+                ConstructPath::Canonicalizes => {
+                    let s = out.unwrap_or_else(|e| {
+                        panic!("{format:?} is classified Canonicalizes but errored: {e}")
+                    });
+                    let occurrences = s.matches("dup-collapse-marker").count();
+                    assert_eq!(
+                        occurrences, 3,
+                        "{format:?} must collapse the 12 duplicate solutions to \
+                         one triple per subject (3); its output carried the \
+                         constructed object {occurrences} times:\n{s}"
+                    );
+                }
+                ConstructPath::Rejects => {
+                    assert!(
+                        out.is_err(),
+                        "{format:?} is classified Rejects but serialized a \
+                         CONSTRUCT result — if it now supports CONSTRUCT it \
+                         must canonicalize, and this gate must reclassify it: \
+                         {out:?}"
+                    );
+                }
+            }
+        }
+    }
+}

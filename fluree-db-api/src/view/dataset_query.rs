@@ -164,8 +164,14 @@ impl Fluree {
             }
         };
 
-        // 1b. Auto-wrap for graph source context
+        // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        super::query::guard_dataset_graph_source_patterns(
+            dataset,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )?;
 
         // 2. Build executable with optional reasoning override from primary view
         let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
@@ -263,8 +269,14 @@ impl Fluree {
             }
         };
 
-        // 1b. Auto-wrap for graph source context
+        // 1b. Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        super::query::guard_dataset_graph_source_patterns(
+            dataset,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )?;
 
         // 2. Build executable with optional reasoning override from primary view
         let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
@@ -384,10 +396,19 @@ impl Fluree {
             }
         };
 
-        // Auto-wrap for graph source context
+        // Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         if let Some(primary) = dataset.primary() {
             super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
         }
+        super::query::guard_dataset_graph_source_patterns(
+            dataset,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )
+        .map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+        })?;
 
         // Build executable
         let executable = self
@@ -496,10 +517,19 @@ impl Fluree {
             }
         };
 
-        // Auto-wrap for graph source context
+        // Auto-wrap for graph source context, then refuse whatever the wrap
+        // could not put on the provider's path.
         if let Some(primary) = dataset.primary() {
             super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
         }
+        super::query::guard_dataset_graph_source_patterns(
+            dataset,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )
+        .map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+        })?;
 
         let executable = self
             .build_executable_for_dataset(dataset, &parsed)
@@ -665,6 +695,11 @@ impl Fluree {
         options: &QueryExecutionOptions,
         sink: &mut S,
     ) -> Result<()> {
+        // As in `execute_dataset_tracked_with_r2rml`: recorded before execution
+        // and aggregated across every graph. This is also the streaming dataset
+        // producer's path, so the NDJSON `end` record carries the same state.
+        tracker.record_policy_enforcement(dataset.policy_enforcement());
+
         let primary = dataset
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no default graphs"))?;
@@ -832,6 +867,10 @@ impl Fluree {
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
+        // See `execute_view_tracked_with_r2rml`: recorded before execution, and
+        // aggregated across every graph the dataset can read.
+        tracker.record_policy_enforcement(dataset.policy_enforcement());
+
         let primary = dataset.primary().ok_or_else(|| {
             fluree_db_query::QueryError::InvalidQuery("Dataset has no default graphs".into())
         })?;

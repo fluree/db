@@ -2,7 +2,14 @@
 //!
 //! Bypasses JSON DOM construction and JSON serialization entirely.
 //! Resolves bindings directly to bytes in a pre-allocated buffer.
-//! IRIs are compacted via `IriCompactor` using the query's `@context`.
+//!
+//! W3C SPARQL 1.1 Query Results CSV and TSV are spec'd formats with no prefix
+//! map, so IRIs come out **absolute** (issue #45) — that is what the plain
+//! `format_csv` / `format_tsv` entry points and [`FormatterConfig::csv`] /
+//! [`FormatterConfig::tsv`] do. A caller rendering for human display can pass a
+//! [`FormatterConfig::with_compact_iris`] config to [`format_bytes`] /
+//! [`format_limited`] to compact against the query's `@context` instead; the CLI
+//! is the only such caller (#1466).
 //!
 //! # Performance
 //!
@@ -18,6 +25,7 @@
 //! - **CSV**: Comma-separated. RFC 4180 quoting (values containing `,`, `"`, or
 //!   newlines are wrapped in double-quotes; internal `"` doubled).
 
+use super::config::{FormatterConfig, OutputFormat};
 use super::iri::IriCompactor;
 use super::{FormatError, Result};
 use crate::QueryResult;
@@ -55,7 +63,20 @@ impl Delimiter {
             Delimiter::Comma => "CSV",
         }
     }
+
+    /// The delimiter a `FormatterConfig` selects, or `None` for a non-delimited
+    /// output format.
+    pub fn from_format(format: OutputFormat) -> Option<Self> {
+        match format {
+            OutputFormat::Tsv => Some(Delimiter::Tab),
+            OutputFormat::Csv => Some(Delimiter::Comma),
+            _ => None,
+        }
+    }
 }
+
+/// The W3C profile these entry points serialize under: absolute IRIs.
+const ABSOLUTE: bool = true;
 
 // ---------------------------------------------------------------------------
 // Public API — TSV
@@ -63,12 +84,12 @@ impl Delimiter {
 
 /// Format query results as TSV bytes.
 pub fn format_tsv_bytes(result: &QueryResult, snapshot: &LedgerSnapshot) -> Result<Vec<u8>> {
-    format_delimited_bytes(result, snapshot, Delimiter::Tab)
+    format_delimited_bytes(result, snapshot, Delimiter::Tab, ABSOLUTE)
 }
 
 /// Format query results as a TSV string.
 pub fn format_tsv(result: &QueryResult, snapshot: &LedgerSnapshot) -> Result<String> {
-    format_delimited(result, snapshot, Delimiter::Tab)
+    format_delimited(result, snapshot, Delimiter::Tab, ABSOLUTE)
 }
 
 /// Format TSV with a row limit. Returns `(tsv_bytes, total_row_count)`.
@@ -77,7 +98,7 @@ pub fn format_tsv_bytes_limited(
     snapshot: &LedgerSnapshot,
     limit: usize,
 ) -> Result<(Vec<u8>, usize)> {
-    format_delimited_bytes_limited(result, snapshot, Delimiter::Tab, limit)
+    format_delimited_bytes_limited(result, snapshot, Delimiter::Tab, limit, ABSOLUTE)
 }
 
 /// Format TSV string with a row limit. Returns `(tsv_string, total_row_count)`.
@@ -86,7 +107,7 @@ pub fn format_tsv_limited(
     snapshot: &LedgerSnapshot,
     limit: usize,
 ) -> Result<(String, usize)> {
-    format_delimited_limited(result, snapshot, Delimiter::Tab, limit)
+    format_delimited_limited(result, snapshot, Delimiter::Tab, limit, ABSOLUTE)
 }
 
 // ---------------------------------------------------------------------------
@@ -95,12 +116,12 @@ pub fn format_tsv_limited(
 
 /// Format query results as CSV bytes.
 pub fn format_csv_bytes(result: &QueryResult, snapshot: &LedgerSnapshot) -> Result<Vec<u8>> {
-    format_delimited_bytes(result, snapshot, Delimiter::Comma)
+    format_delimited_bytes(result, snapshot, Delimiter::Comma, ABSOLUTE)
 }
 
 /// Format query results as a CSV string.
 pub fn format_csv(result: &QueryResult, snapshot: &LedgerSnapshot) -> Result<String> {
-    format_delimited(result, snapshot, Delimiter::Comma)
+    format_delimited(result, snapshot, Delimiter::Comma, ABSOLUTE)
 }
 
 /// Format CSV with a row limit. Returns `(csv_bytes, total_row_count)`.
@@ -109,7 +130,7 @@ pub fn format_csv_bytes_limited(
     snapshot: &LedgerSnapshot,
     limit: usize,
 ) -> Result<(Vec<u8>, usize)> {
-    format_delimited_bytes_limited(result, snapshot, Delimiter::Comma, limit)
+    format_delimited_bytes_limited(result, snapshot, Delimiter::Comma, limit, ABSOLUTE)
 }
 
 /// Format CSV string with a row limit. Returns `(csv_string, total_row_count)`.
@@ -118,7 +139,50 @@ pub fn format_csv_limited(
     snapshot: &LedgerSnapshot,
     limit: usize,
 ) -> Result<(String, usize)> {
-    format_delimited_limited(result, snapshot, Delimiter::Comma, limit)
+    format_delimited_limited(result, snapshot, Delimiter::Comma, limit, ABSOLUTE)
+}
+
+// ---------------------------------------------------------------------------
+// Public API — config-driven (lets a caller opt out of the W3C profile)
+// ---------------------------------------------------------------------------
+
+/// Format query results as delimited bytes under an explicit config.
+///
+/// The only reason to reach for this over [`format_csv_bytes`] /
+/// [`format_tsv_bytes`] is to render for human display, where
+/// [`FormatterConfig::with_compact_iris`] restores `@context` compaction.
+pub fn format_bytes(
+    result: &QueryResult,
+    snapshot: &LedgerSnapshot,
+    delimiter: Delimiter,
+    config: &FormatterConfig,
+) -> Result<Vec<u8>> {
+    format_delimited_bytes(result, snapshot, delimiter, config.absolute_iris)
+}
+
+/// Format query results as a delimited string, taking both the delimiter and
+/// the IRI profile from `config`. The dispatch entry used by
+/// [`super::format_results_string`]; errors for a non-delimited `config.format`.
+pub fn format_string_for(
+    result: &QueryResult,
+    snapshot: &LedgerSnapshot,
+    config: &FormatterConfig,
+) -> Result<String> {
+    let delimiter = Delimiter::from_format(config.format).ok_or_else(|| {
+        FormatError::InvalidBinding(format!("{:?} is not a delimited format", config.format))
+    })?;
+    format_delimited(result, snapshot, delimiter, config.absolute_iris)
+}
+
+/// Row-limited [`format_bytes`], as a string. Returns `(text, total_row_count)`.
+pub fn format_limited(
+    result: &QueryResult,
+    snapshot: &LedgerSnapshot,
+    delimiter: Delimiter,
+    limit: usize,
+    config: &FormatterConfig,
+) -> Result<(String, usize)> {
+    format_delimited_limited(result, snapshot, delimiter, limit, config.absolute_iris)
 }
 
 // ---------------------------------------------------------------------------
@@ -129,10 +193,12 @@ fn format_delimited_bytes(
     result: &QueryResult,
     snapshot: &LedgerSnapshot,
     delimiter: Delimiter,
+    absolute_iris: bool,
 ) -> Result<Vec<u8>> {
     reject_non_tabular(result, delimiter)?;
 
-    let compactor = IriCompactor::new(snapshot.shared_namespaces(), &result.context);
+    let compactor = IriCompactor::new(snapshot.shared_namespaces(), &result.context)
+        .with_absolute_iris(absolute_iris);
     let gv = result.binary_graph.as_ref();
     let select_vars = resolve_select_vars(result);
 
@@ -161,8 +227,9 @@ fn format_delimited(
     result: &QueryResult,
     snapshot: &LedgerSnapshot,
     delimiter: Delimiter,
+    absolute_iris: bool,
 ) -> Result<String> {
-    let bytes = format_delimited_bytes(result, snapshot, delimiter)?;
+    let bytes = format_delimited_bytes(result, snapshot, delimiter, absolute_iris)?;
     #[cfg(debug_assertions)]
     {
         Ok(String::from_utf8(bytes).expect("delimited output should always be valid UTF-8"))
@@ -182,10 +249,12 @@ fn format_delimited_bytes_limited(
     snapshot: &LedgerSnapshot,
     delimiter: Delimiter,
     limit: usize,
+    absolute_iris: bool,
 ) -> Result<(Vec<u8>, usize)> {
     reject_non_tabular(result, delimiter)?;
 
-    let compactor = IriCompactor::new(snapshot.shared_namespaces(), &result.context);
+    let compactor = IriCompactor::new(snapshot.shared_namespaces(), &result.context)
+        .with_absolute_iris(absolute_iris);
     let gv = result.binary_graph.as_ref();
     let select_vars = resolve_select_vars(result);
     let total = result.row_count();
@@ -216,8 +285,10 @@ fn format_delimited_limited(
     snapshot: &LedgerSnapshot,
     delimiter: Delimiter,
     limit: usize,
+    absolute_iris: bool,
 ) -> Result<(String, usize)> {
-    let (bytes, total) = format_delimited_bytes_limited(result, snapshot, delimiter, limit)?;
+    let (bytes, total) =
+        format_delimited_bytes_limited(result, snapshot, delimiter, limit, absolute_iris)?;
     #[cfg(debug_assertions)]
     let s = String::from_utf8(bytes).expect("delimited output should always be valid UTF-8");
     #[cfg(not(debug_assertions))]
@@ -376,12 +447,12 @@ fn write_binding_cell(
             write_compacted_sid(cell, compactor, sid)?;
         }
         Binding::IriMatch { iri, .. } => {
-            let compacted = compactor.compact_vocab_iri(iri);
-            cell.extend_from_slice(compacted.as_bytes());
+            let rendered = compactor.render_vocab_iri(iri);
+            cell.extend_from_slice(rendered.as_bytes());
         }
         Binding::Iri(iri) => {
-            let compacted = compactor.compact_vocab_iri(iri);
-            cell.extend_from_slice(compacted.as_bytes());
+            let rendered = compactor.render_vocab_iri(iri);
+            cell.extend_from_slice(rendered.as_bytes());
         }
         Binding::Lit { val, .. } => {
             write_flake_value(cell, val, compactor);
@@ -393,8 +464,8 @@ fn write_binding_cell(
                     "Failed to resolve subject IRI for s_id {s_id}: {e}"
                 ))
             })?;
-            let compacted = compactor.compact_vocab_iri(&iri);
-            cell.extend_from_slice(compacted.as_bytes());
+            let rendered = compactor.render_vocab_iri(&iri);
+            cell.extend_from_slice(rendered.as_bytes());
         }
         Binding::EncodedPid { p_id } => {
             let gv = require_graph_view(gv)?;
@@ -404,8 +475,8 @@ fn write_binding_cell(
                     "Failed to resolve predicate IRI for p_id {p_id}"
                 ))
             })?;
-            let compacted = compactor.compact_vocab_iri(iri);
-            cell.extend_from_slice(compacted.as_bytes());
+            let rendered = compactor.render_vocab_iri(iri);
+            cell.extend_from_slice(rendered.as_bytes());
         }
         Binding::EncodedLit {
             o_kind,
@@ -437,8 +508,8 @@ fn write_binding_cell(
                         "Failed to resolve ref IRI for s_id {o_key}: {e}"
                     ))
                 })?;
-                let compacted = compactor.compact_vocab_iri(&iri);
-                cell.extend_from_slice(compacted.as_bytes());
+                let rendered = compactor.render_vocab_iri(&iri);
+                cell.extend_from_slice(rendered.as_bytes());
             } else {
                 let val = gv
                     .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
@@ -511,8 +582,8 @@ fn require_graph_view(gv: Option<&BinaryGraphView>) -> Result<&BinaryGraphView> 
 
 /// Write a compacted Sid IRI to the cell buffer.
 fn write_compacted_sid(cell: &mut Vec<u8>, compactor: &IriCompactor, sid: &Sid) -> Result<()> {
-    let compacted = compactor.compact_sid(sid)?;
-    cell.extend_from_slice(compacted.as_bytes());
+    let rendered = compactor.render_vocab_sid(sid)?;
+    cell.extend_from_slice(rendered.as_bytes());
     Ok(())
 }
 
@@ -521,9 +592,9 @@ fn write_flake_value(cell: &mut Vec<u8>, val: &FlakeValue, compactor: &IriCompac
     match val {
         FlakeValue::String(s) => cell.extend_from_slice(s.as_bytes()),
         FlakeValue::Ref(sid) => {
-            // Best-effort: if compaction fails (unknown namespace), write raw
-            match compactor.compact_sid(sid) {
-                Ok(compacted) => cell.extend_from_slice(compacted.as_bytes()),
+            // Best-effort: if the namespace is unknown, write raw
+            match compactor.render_vocab_sid(sid) {
+                Ok(rendered) => cell.extend_from_slice(rendered.as_bytes()),
                 Err(_) => {
                     // Fallback: code:name
                     let mut buf = itoa::Buffer::new();
@@ -709,9 +780,11 @@ mod tests {
         assert_eq!(tsv, "s\nhttp://example.org/alice\n");
     }
 
+    /// W3C `text/tab-separated-values` has no prefix map, so a declared `ex:`
+    /// prefix must NOT shorten the IRI (issue #45) — even though the same result
+    /// under the display profile does compact (next test).
     #[test]
     fn test_tsv_sid_binding_with_context() {
-        // With @context that maps "ex" -> "http://example.org/", IRIs should be compacted
         let snapshot = make_test_snapshot();
         let result = make_result_with_context(
             &["?s"],
@@ -719,6 +792,25 @@ mod tests {
             make_test_context(),
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
+        assert_eq!(tsv, "s\nhttp://example.org/alice\n");
+    }
+
+    /// The CLI display profile (#1466): `with_compact_iris` restores compaction
+    /// against the query's `@context`.
+    #[test]
+    fn test_tsv_sid_binding_with_context_compacting_profile() {
+        let snapshot = make_test_snapshot();
+        let result = make_result_with_context(
+            &["?s"],
+            vec![vec![Binding::sid(Sid::new(100, "alice"))]],
+            make_test_context(),
+        );
+        let tsv = format_string_for(
+            &result,
+            &snapshot,
+            &FormatterConfig::tsv().with_compact_iris(),
+        )
+        .unwrap();
         assert_eq!(tsv, "s\nex:alice\n");
     }
 
@@ -855,6 +947,7 @@ mod tests {
         assert_eq!(tsv, "g\nhttp://example.org/graph1\n");
     }
 
+    /// A raw `Binding::Iri` obeys the same W3C rule as `Binding::Sid`.
     #[test]
     fn test_tsv_iri_binding_with_context() {
         let snapshot = make_test_snapshot();
@@ -864,7 +957,14 @@ mod tests {
             make_test_context(),
         );
         let tsv = format_tsv(&result, &snapshot).unwrap();
-        assert_eq!(tsv, "g\nex:graph1\n");
+        assert_eq!(tsv, "g\nhttp://example.org/graph1\n");
+        let display = format_string_for(
+            &result,
+            &snapshot,
+            &FormatterConfig::tsv().with_compact_iris(),
+        )
+        .unwrap();
+        assert_eq!(display, "g\nex:graph1\n");
     }
 
     #[test]
@@ -951,6 +1051,8 @@ mod tests {
         assert_eq!(csv, "val\n\"line1\nline2\"\n");
     }
 
+    /// W3C `text/csv`, same rule as TSV (issue #45), with the display profile
+    /// pinned alongside it.
     #[test]
     fn test_csv_sid_with_context() {
         let snapshot = make_test_snapshot();
@@ -960,7 +1062,14 @@ mod tests {
             make_test_context(),
         );
         let csv = format_csv(&result, &snapshot).unwrap();
-        assert_eq!(csv, "s\nex:alice\n");
+        assert_eq!(csv, "s\nhttp://example.org/alice\n");
+        let display = format_string_for(
+            &result,
+            &snapshot,
+            &FormatterConfig::csv().with_compact_iris(),
+        )
+        .unwrap();
+        assert_eq!(display, "s\nex:alice\n");
     }
 
     #[test]

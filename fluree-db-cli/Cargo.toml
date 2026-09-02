@@ -47,6 +47,7 @@ csv = "1.4"
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-core = { path = "../fluree-db-core" }
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
 fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-vocab = { path = "../fluree-vocab" }
 fluree-db-query = { path = "../fluree-db-query" }
@@ -127,6 +128,13 @@ parking_lot = "0.12"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# Drive the server's router in-process (behind the `server` feature) so the
+# tracking headers this CLI emits are tested against the parser that consumes
+# them, rather than each side being asserted in isolation.
+axum = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 # Used by `create --from` integration tests to produce .gz / .zst fixtures inline.
 flate2 = { workspace = true }
 zstd = { workspace = true }

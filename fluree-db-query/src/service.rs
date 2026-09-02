@@ -284,18 +284,15 @@ impl ServiceOperator {
             ))
         })?;
 
-        let source_body = self.service.source_body.as_deref().ok_or_else(|| {
+        // Build the complete SPARQL query from the captured body, prefixed by the
+        // parent query's prologue so prefixed names and relative IRIs in the body
+        // mean the same thing remotely as they do locally.
+        let sparql = self.service.remote_query_text().ok_or_else(|| {
             QueryError::InvalidQuery(
                 "Remote SERVICE requires SPARQL source text (not available for JSON-LD queries)"
                     .into(),
             )
         })?;
-
-        // Build a complete SPARQL query from the captured body.
-        // The source_body may or may not include braces depending on whether
-        // parse_group_graph_pattern unwrapped a single-pattern group. Always
-        // wrap in braces to ensure valid SPARQL (double-braces are legal).
-        let sparql = format!("SELECT * WHERE {{ {source_body} }}");
 
         let result = match executor
             .execute_remote_sparql(connection_name, ledger, &sparql)

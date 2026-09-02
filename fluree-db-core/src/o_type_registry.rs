@@ -156,7 +156,7 @@ impl OTypeRegistry {
 /// at slot 11 to signal "special-case via `OType::lang_string(lang_id)`
 /// at query time." Runtime callers that can't compute it should filter
 /// the marker back to `None`.
-fn known_datatype_to_otype(dt: fluree_vocab::datatype::KnownDatatype) -> OType {
+pub fn known_datatype_to_otype(dt: fluree_vocab::datatype::KnownDatatype) -> OType {
     use fluree_vocab::datatype::KnownDatatype::*;
     match dt {
         // XSD string + subtypes

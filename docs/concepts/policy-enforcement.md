@@ -115,6 +115,8 @@ The same policy model governs both, distinguished by `f:action`:
 
 A single policy can govern both (`"f:action": [{"@id": "f:view"}, {"@id": "f:modify"}]`). Most realistic policy sets mix view-only restrictions, modify-only restrictions, and a small number of `[f:view, f:modify]` defaults.
 
+The two are also loud in different ways. A rejected transaction is an error the caller cannot miss. A filtered query is not: it returns HTTP 200 and a result set with the disallowed flakes simply absent, indistinguishable from a query that had nothing to return. That asymmetry is the design — a per-query "rows were hidden" signal would let a caller probe for the existence of data they cannot read. A caller who needs to know whether policy governed a request can ask for it: see [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied), which reports enforcement state without reporting anything about the data.
+
 ## Policies are data
 
 Because policies are flakes:

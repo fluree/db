@@ -304,6 +304,38 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             .await
         }
 
+        Commands::Sync {
+            args,
+            ledger,
+            graph,
+            expr,
+            file,
+            format,
+            dry_run,
+            allow_empty,
+            json,
+            remote,
+            policy,
+        } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::graph_sync::run(commands::graph_sync::SyncArgs {
+                args: &args,
+                ledger: ledger.as_deref(),
+                graph: &graph,
+                expr: expr.as_deref(),
+                file: file.as_deref(),
+                format: format.as_deref(),
+                dry_run,
+                allow_empty,
+                json,
+                remote: remote.as_deref(),
+                direct,
+                policy: &policy,
+                dirs: &fluree_dir,
+            })
+            .await
+        }
+
         Commands::Query {
             args,
             ledger,
@@ -508,6 +540,15 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 direct,
             )
             .await
+        }
+
+        Commands::Verify {
+            ledger,
+            limit,
+            json,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::verify::run(ledger.as_deref(), limit, json, &fluree_dir).await
         }
 
         Commands::Show {

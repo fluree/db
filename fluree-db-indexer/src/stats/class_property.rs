@@ -79,6 +79,16 @@ impl ClassPropertyExtractor {
     /// Create an extractor initialized with prior class stats
     ///
     /// Used during refresh to incrementally update class-property stats.
+    ///
+    /// NOTE (#1391): this is a **base-seeded** accumulator driven by a blind
+    /// `±1` per flake ([`Self::process_flake`]) — the same shape as the
+    /// runtime fast-stats over-count, and unlike [`super::id_hook::StatsIdHook`]
+    /// it has no base-presence variant. Re-asserting an already-counted fact
+    /// would inflate `count_delta`. What makes that harmless today is that the
+    /// only consumer, [`super::compute_class_property_stats_parallel`], has no
+    /// caller in the workspace. Anything that wires it up needs to derive the
+    /// delta from a materialized state transition first — see
+    /// `StatsIdHook::on_record_with_base_presence` for the pattern.
     pub fn from_prior(prior_stats: Option<&fluree_db_core::IndexStats>) -> Self {
         if let Some(stats) = prior_stats {
             if let Some(ref classes) = stats.classes {

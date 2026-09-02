@@ -40,8 +40,14 @@ pub fn format(result: &QueryResult, compactor: &IriCompactor) -> Result<JsonValu
     // 1. Build Graph from template instantiation
     let mut graph = instantiate_construct_graph(result, compactor)?;
 
-    // Sort for deterministic output
-    graph.sort();
+    // Sort for deterministic output, and apply RDF set semantics: a CONSTRUCT
+    // result is a graph, so a template instantiated to the same (s, p, o) by
+    // several solution rows contributes one triple (SPARQL 1.1 §16.2).
+    // `Term`'s equality compares value, datatype AND language, so this is real
+    // RDF term identity — `"1"^^xsd:integer` and `"1"^^xsd:string` stay
+    // distinct. Caveat: a NaN `xsd:double` object never compares equal to
+    // itself, so repeated NaN triples are not collapsed.
+    graph.canonicalize();
 
     // 2. Format to JSON-LD using CONSTRUCT parity settings.
     //    Use the precomputed ContextCompactor so we don't rebuild the

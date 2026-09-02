@@ -133,7 +133,9 @@ impl LanguageTagDict {
     /// Returns 0 if `tag` is None.
     pub fn get_or_insert(&mut self, tag: Option<&str>) -> u16 {
         match tag {
-            Some(t) => self.inner.assign_or_lookup(t),
+            Some(t) => self
+                .inner
+                .assign_or_lookup(&fluree_db_core::normalize_lang_tag(t)),
             None => 0,
         }
     }
@@ -149,7 +151,7 @@ impl LanguageTagDict {
     /// Reverse lookup: find the u16 ID for a given language tag string.
     /// Returns None if the tag is not in the dictionary.
     pub fn find(&self, tag: &str) -> Option<u16> {
-        self.inner.find(tag)
+        self.find_normalized(tag)
     }
 
     /// Number of distinct language tags (excluding the "none" sentinel).
@@ -165,7 +167,20 @@ impl LanguageTagDict {
     ///
     /// Returns `None` if the tag is not in the dictionary.
     pub fn find_id(&self, tag: &str) -> Option<u16> {
-        self.inner.find(tag)
+        self.find_normalized(tag)
+    }
+
+    /// Case-insensitive reverse lookup: the dictionary stores normalized
+    /// (lowercase) tags, but a dictionary persisted before normalization may
+    /// still hold the tag as written, so an exact miss falls back to a scan.
+    fn find_normalized(&self, tag: &str) -> Option<u16> {
+        let norm = fluree_db_core::normalize_lang_tag(tag);
+        self.inner.find(&norm).or_else(|| {
+            self.inner
+                .iter()
+                .find(|(_, t)| t.eq_ignore_ascii_case(&norm))
+                .map(|(id, _)| id)
+        })
     }
 
     /// Iterator over (id, tag) pairs.
@@ -191,5 +206,25 @@ impl LanguageTagDict {
 impl Default for LanguageTagDict {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod lang_tag_case_tests {
+    use super::LanguageTagDict;
+
+    #[test]
+    fn language_tags_intern_and_resolve_case_insensitively() {
+        let mut d = LanguageTagDict::new();
+        let en = d.get_or_insert(Some("EN"));
+        assert_eq!(d.get_or_insert(Some("en")), en, "one id per tag");
+        assert_eq!(d.resolve(en), Some("en"), "stored lowercase");
+        assert_eq!(d.find("En"), Some(en));
+        assert_eq!(d.find_id("EN"), Some(en));
+        assert_eq!(d.get_or_insert(None), 0);
+        // A pre-normalization dictionary still answers case-insensitively.
+        let legacy = LanguageTagDict::from_ordered_tags(vec!["FR".into(), "de-AT".into()]);
+        assert_eq!(legacy.find("fr"), Some(1));
+        assert_eq!(legacy.find("DE-at"), Some(2));
     }
 }

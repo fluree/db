@@ -104,6 +104,11 @@ impl Fluree {
         };
 
         super::query::maybe_wrap_for_graph_source(db, &mut parsed);
+        super::query::guard_graph_source_patterns(
+            db,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )?;
 
         ensure_streamable(&parsed.output)?;
 
@@ -195,12 +200,16 @@ impl Fluree {
             .await;
 
         let terminal = match exec {
-            Ok(()) => ndjson_stream::end_record(
-                sink.rows,
-                meta.t,
-                tracker.current_fuel(),
-                tracker.tally().and_then(|t| t.time).as_deref(),
-            ),
+            Ok(()) => {
+                let tally = tracker.tally();
+                ndjson_stream::end_record(
+                    sink.rows,
+                    meta.t,
+                    tracker.current_fuel(),
+                    tally.as_ref().and_then(|t| t.time.as_deref()),
+                    tally.as_ref().and_then(|t| t.policy_enforcement.as_ref()),
+                )
+            }
             Err(err) => {
                 ndjson_stream::error_record(query_error_code(&err), &err.to_string(), sink.rows)
             }
@@ -221,6 +230,12 @@ impl Fluree {
         options: &QueryExecutionOptions,
         sink: &mut S,
     ) -> std::result::Result<(), fluree_db_query::QueryError> {
+        // Sibling of the buffered `execute_view_tracked_with_r2rml`: record
+        // whether policy governs this request before executing, so the terminal
+        // `end` record answers "was this enforced?" the same way the buffered
+        // response does.
+        tracker.record_policy_enforcement(db.policy_enforcement());
+
         let db_ref = db.as_graph_db_ref();
         let prepare_config = PrepareConfig::current(db.binary_store.as_ref());
         let prepared = fluree_db_query::execute::prepare_execution_with_config(
@@ -321,6 +336,11 @@ impl Fluree {
         };
 
         super::query::maybe_wrap_for_graph_source(primary, &mut parsed);
+        super::query::guard_dataset_graph_source_patterns(
+            dataset,
+            &parsed,
+            super::query::QuerySyntax::of(&input),
+        )?;
         ensure_streamable(&parsed.output)?;
 
         let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
@@ -419,12 +439,16 @@ impl Fluree {
             .await;
 
         let terminal = match exec {
-            Ok(()) => ndjson_stream::end_record(
-                sink.rows,
-                meta.t,
-                tracker.current_fuel(),
-                tracker.tally().and_then(|t| t.time).as_deref(),
-            ),
+            Ok(()) => {
+                let tally = tracker.tally();
+                ndjson_stream::end_record(
+                    sink.rows,
+                    meta.t,
+                    tracker.current_fuel(),
+                    tally.as_ref().and_then(|t| t.time.as_deref()),
+                    tally.as_ref().and_then(|t| t.policy_enforcement.as_ref()),
+                )
+            }
             Err(err) => {
                 ndjson_stream::error_record(api_error_code(&err), &err.to_string(), sink.rows)
             }
@@ -542,5 +566,33 @@ impl BatchSink for NdjsonRowSink<'_> {
             }
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_streamable;
+    use fluree_db_query::ir::{ConstructTemplate, QueryOutput};
+
+    /// The WHERE-dedup license for CONSTRUCT and ASK (#1700 follow-up;
+    /// `result_is_multiplicity_blind` in fluree-db-query's
+    /// `execute::operator_tree`) counts on this endpoint refusing both output
+    /// forms: a streaming serializer emits solutions as they arrive and cannot
+    /// canonicalize after the fact, so if either rejection is ever lifted the
+    /// new path must dedup its triples itself — or the license must be
+    /// revoked. See `every_output_format_collapses_or_rejects_construct` in
+    /// `it_query_construct.rs` for the non-streaming half of the same gate.
+    #[test]
+    fn streaming_endpoint_keeps_rejecting_construct_and_ask() {
+        assert!(
+            ensure_streamable(&QueryOutput::Construct(ConstructTemplate::new(Vec::new()))).is_err(),
+            "streaming CONSTRUCT would bypass Graph::canonicalize and observe \
+             WHERE-level dedup"
+        );
+        assert!(
+            ensure_streamable(&QueryOutput::Ask).is_err(),
+            "streaming ASK has no row stream to emit; its boolean is computed \
+             from solution-sequence emptiness on the buffered path"
+        );
     }
 }

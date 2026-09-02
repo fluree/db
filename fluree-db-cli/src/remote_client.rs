@@ -98,8 +98,11 @@ pub(crate) fn policy_headers(policy: &PolicyArgs) -> Vec<(&'static str, String)>
             headers.push(("fluree-policy-values", s));
         }
     }
-    if policy.default_allow {
-        headers.push(("fluree-default-allow", "true".to_string()));
+    // Explicit `false` must travel too: the header is tri-state server-side, so
+    // omitting it would let the ledger's `f:defaultAllow` apply instead of the
+    // fail-closed posture `--no-default-allow` asked for.
+    if let Some(default_allow) = policy.default_allow_opt() {
+        headers.push(("fluree-default-allow", default_allow.to_string()));
     }
     headers
 }
@@ -144,8 +147,11 @@ pub(crate) fn inject_policy_into_json_opts(body: &mut serde_json::Value, policy:
         let obj: serde_json::Map<String, serde_json::Value> = values.into_iter().collect();
         opts_obj.insert("policy-values".to_string(), serde_json::Value::Object(obj));
     }
-    if policy.default_allow {
-        opts_obj.insert("default-allow".to_string(), serde_json::Value::Bool(true));
+    if let Some(default_allow) = policy.default_allow_opt() {
+        opts_obj.insert(
+            "default-allow".to_string(),
+            serde_json::Value::Bool(default_allow),
+        );
     }
 }
 
@@ -1226,6 +1232,42 @@ impl RemoteLedgerClient {
             &url,
             "text/turtle",
             Some(RequestBody::Text(turtle)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // Sync (graph synchronization)
+    // =========================================================================
+
+    /// Synchronize a named graph: make its contents exactly `body`,
+    /// committing only the delta.
+    ///
+    /// `POST {base}/sync/{ledger}?graph=<iri>[&dryRun=true][&allowEmpty=true]`
+    /// with a JSON-LD body. A dry run answers with the delta report; a real
+    /// run with the standard transact response.
+    pub async fn sync_jsonld(
+        &self,
+        ledger: &str,
+        graph: &str,
+        body: &serde_json::Value,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("sync", ledger);
+        url.push_str("?graph=");
+        url.push_str(&urlencoding::encode(graph));
+        if dry_run {
+            url.push_str("&dryRun=true");
+        }
+        if allow_empty {
+            url.push_str("&allowEmpty=true");
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
         )
         .await
     }
@@ -2823,6 +2865,70 @@ mod tests {
     fn test_client_strips_trailing_slash() {
         let client = RemoteLedgerClient::new("http://localhost:8090/fluree/", None);
         assert_eq!(client.base_url, "http://localhost:8090/fluree");
+    }
+
+    fn default_allow_header(policy: &PolicyArgs) -> Option<String> {
+        policy_headers(policy)
+            .into_iter()
+            .find(|(name, _)| *name == "fluree-default-allow")
+            .map(|(_, value)| value)
+    }
+
+    /// The producer/consumer seam: `--no-default-allow` is only meaningful
+    /// remotely if the header actually travels. Sending it solely for `true`
+    /// would silently drop the fail-closed posture over HTTP while it kept
+    /// working embedded.
+    #[test]
+    fn default_allow_header_travels_in_both_directions() {
+        assert_eq!(
+            default_allow_header(&PolicyArgs {
+                default_allow: true,
+                ..Default::default()
+            }),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            default_allow_header(&PolicyArgs {
+                no_default_allow: true,
+                ..Default::default()
+            }),
+            Some("false".to_string())
+        );
+        // Unset sends no header, leaving the ledger's f:defaultAllow in force.
+        assert_eq!(
+            default_allow_header(&PolicyArgs {
+                identity: Some("did:key:alice".into()),
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
+    /// Same tri-state on the JSON-LD body-opts path.
+    #[test]
+    fn default_allow_body_opts_travel_in_both_directions() {
+        let mut body = serde_json::json!({});
+        inject_policy_into_json_opts(
+            &mut body,
+            &PolicyArgs {
+                no_default_allow: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            body["opts"]["default-allow"],
+            serde_json::Value::Bool(false)
+        );
+
+        let mut body = serde_json::json!({});
+        inject_policy_into_json_opts(
+            &mut body,
+            &PolicyArgs {
+                identity: Some("did:key:alice".into()),
+                ..Default::default()
+            },
+        );
+        assert!(body["opts"].get("default-allow").is_none());
     }
 
     /// `put_upload_file` must send a fixed `Content-Length` and NOT

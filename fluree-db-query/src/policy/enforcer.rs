@@ -4,7 +4,7 @@
 
 use super::QueryPolicyExecutor;
 use crate::error::Result;
-use fluree_db_core::{Flake, LedgerSnapshot, OverlayProvider, Sid, Tracker};
+use fluree_db_core::{Flake, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use std::sync::Arc;
 
@@ -91,6 +91,8 @@ impl QueryPolicyEnforcer {
     /// # Arguments
     ///
     /// * `snapshot` - The database for this graph
+    /// * `g_id` - The graph these flakes belong to, used to look up class
+    ///   membership in the graph that actually asserted it
     /// * `overlay` - The overlay provider for this graph
     /// * `to_t` - Target transaction time for this graph
     /// * `tracker` - Fuel tracker for limits
@@ -102,6 +104,7 @@ impl QueryPolicyEnforcer {
     pub async fn filter_flakes_for_graph(
         &self,
         snapshot: &LedgerSnapshot,
+        g_id: GraphId,
         overlay: &dyn OverlayProvider,
         to_t: i64,
         tracker: &Tracker,
@@ -127,7 +130,7 @@ impl QueryPolicyEnforcer {
             // Get subject classes from cache
             let subject_classes = self
                 .policy
-                .get_cached_subject_classes(&flake.s)
+                .get_cached_subject_classes(g_id, &flake.s)
                 .unwrap_or_default();
 
             // Async policy check with f:query support
@@ -163,6 +166,7 @@ impl QueryPolicyEnforcer {
     pub async fn allow_flake_for_graph(
         &self,
         snapshot: &LedgerSnapshot,
+        g_id: GraphId,
         overlay: &dyn OverlayProvider,
         to_t: i64,
         tracker: &Tracker,
@@ -184,7 +188,7 @@ impl QueryPolicyEnforcer {
         // Get subject classes from cache
         let subject_classes = self
             .policy
-            .get_cached_subject_classes(&flake.s)
+            .get_cached_subject_classes(g_id, &flake.s)
             .unwrap_or_default();
 
         // Async policy check

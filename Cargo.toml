@@ -45,11 +45,12 @@ members = [
     "fluree-bench-alloc",
     "fluree-bench-virtual",
     "fluree-db-consensus",
+    "fluree-raft-core",
 ]
 exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load"]
 
 [workspace.package]
-version = "4.1.5"
+version = "4.1.6"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/fluree/db"
@@ -235,6 +236,9 @@ lto = false
 strip = false
 codegen-units = 16
 opt-level = 2
+
+[profile.dev]
+split-debuginfo = "unpacked"
 
 # The profile that 'dist' will build with
 [profile.dist]

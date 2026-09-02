@@ -30,7 +30,8 @@ use fluree_db_query::parse::encode::IriEncoder;
 
 use std::collections::HashMap;
 
-use super::{LowerError, LoweringContext, Result};
+use super::path::PathObject;
+use super::{LoweringContext, Result};
 
 /// Prefix used for registry names of synthetic variables that must
 /// stay invisible to `SELECT *` and unmatchable by user input. `#`
@@ -144,7 +145,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 Ok((r.into(), None))
             }
             other if with_constraint => self.lower_object_with_constraint(other),
-            other => Ok((self.lower_object(other)?, None)),
+            other => self.lower_object_with_term_constraint(other),
         }
     }
 
@@ -219,17 +220,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     }));
                 }
                 AnnotationVerb::Path(path) => {
-                    // Same contract as the main property-path surface:
-                    // path objects must be Refs (vars/IRIs/bnodes), not
-                    // literal values.
-                    let (o_term, _dtc) =
+                    // Same contract as the main property-path surface: a
+                    // literal object is legal (`{| :r/:q "x" |}`) and is
+                    // narrowed per-arm by the dispatcher. The datatype
+                    // constraint rides along so a literal endpoint on the
+                    // final hop stays as precise as the `Simple` verb above.
+                    let (o_term, dtc) =
                         self.lower_object_desugared(&entry.object, &mut cache, &mut out, true)?;
-                    let o = Ref::try_from(o_term).map_err(|_| {
-                        LowerError::invalid_property_path(
-                            "Property path object cannot be a literal value",
-                            entry.span,
-                        )
-                    })?;
+                    let o = PathObject::new(o_term, dtc);
                     let pats = self.lower_path_dispatch(annotation, path, &o, entry.span)?;
                     out.extend(pats);
                 }

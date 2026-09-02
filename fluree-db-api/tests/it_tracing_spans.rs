@@ -1085,3 +1085,156 @@ async fn ac9_cyclic_bgp_operator_spans() {
         })
         .await;
 }
+
+// =============================================================================
+// AC-10: Index install spans — index_install / index_install_wait / index_install_lock
+// =============================================================================
+
+/// Installing a freshly built index root into a cached ledger handle must
+/// emit `index_install` with two children that aggregate independently:
+/// `index_install_wait` (state-lock acquisition) and `index_install_lock`
+/// (the guarded novelty-trim + dict-reseed + store swap). No event may fire
+/// inside the exclusive section — with a `fmt` layer attached an event
+/// dispatch is a formatted write to a shared writer, an observer effect on
+/// exactly the section the spans exist to measure.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "current_thread")]
+async fn ac10_index_install_spans() {
+    use fluree_db_api::{IndexConfig, LedgerManagerConfig};
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "ac10/install-spans:main";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+            let insert = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "ex:name": "Alice"
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert");
+            let ledger = result.ledger;
+            let commit_t = ledger.t();
+
+            // Cache the handle at its unindexed state so the notify path
+            // below has something to install into.
+            let _cached = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cache ledger handle");
+
+            // Phase 1: capture at DEBUG across build + install.
+            let (store, guard) = span_capture::init_test_tracing();
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, commit_t).await;
+            support::wait_for_index_application(&fluree, ledger_id, commit_t).await;
+
+            for name in ["index_install", "index_install_wait", "index_install_lock"] {
+                assert!(
+                    store.has_span(name),
+                    "{name} span should exist after an index install. Captured: {:?}",
+                    store.span_names()
+                );
+                let span = store.find_span(name).unwrap();
+                assert_eq!(span.level, tracing::Level::DEBUG, "{name} should be DEBUG");
+                assert!(span.closed, "{name} must close (no span leak)");
+            }
+
+            let install = store.find_span("index_install").unwrap();
+            assert!(
+                install.fields.contains_key("ledger_id"),
+                "index_install must carry ledger_id: fields = {:?}",
+                install.fields
+            );
+            assert_eq!(
+                install.fields.get("index_t").map(String::as_str),
+                Some(commit_t.to_string().as_str()),
+                "index_install must record the installed index_t"
+            );
+
+            // Wait vs hold must aggregate independently: both are children of
+            // index_install, so each name's durations answer its own question
+            // (contention vs guarded work) without per-trace arithmetic.
+            for name in ["index_install_wait", "index_install_lock"] {
+                let span = store.find_span(name).unwrap();
+                assert_eq!(
+                    span.parent_name.as_deref(),
+                    Some("index_install"),
+                    "{name} must nest under index_install"
+                );
+            }
+
+            // The pre-split shapes must not resurface: the version-embedding
+            // span name, the aggregate wait+hold span, and the in-lock event.
+            assert!(
+                !store.has_span("apply_index_v2"),
+                "span renamed to index_install (a v3 would rename the operation)"
+            );
+            assert!(
+                !store.has_span("apply_index_install_lock"),
+                "aggregate wait+hold span replaced by the wait/lock split"
+            );
+            assert!(
+                !store.has_event("install lock acquired"),
+                "no event may fire inside the exclusive install section"
+            );
+            drop(guard);
+
+            // Phase 2: a second commit + install cycle at INFO-only must be
+            // silent — the install spans are DEBUG-tier, zero noise at the
+            // production default.
+            let (store, _guard) = span_capture::init_info_only_tracing();
+            let insert2 = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:bob",
+                "ex:name": "Bob"
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &insert2,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("second insert");
+            let commit_t2 = result.ledger.t();
+            support::trigger_index_and_wait_outcome(&handle, ledger_id, commit_t2).await;
+            support::wait_for_index_application(&fluree, ledger_id, commit_t2).await;
+
+            for name in ["index_install", "index_install_wait", "index_install_lock"] {
+                assert!(
+                    !store.has_span(name),
+                    "{name} must be invisible at INFO level. Captured: {:?}",
+                    store.span_names()
+                );
+            }
+        })
+        .await;
+}

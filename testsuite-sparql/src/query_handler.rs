@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use fluree_db_api::{
-    format, Fluree, FlureeBuilder, FormatterConfig, GraphDb, LedgerState, ParsedContext,
-    QueryOutput,
+    format, Fluree, FlureeBuilder, FormatterConfig, GraphDb, LedgerState, QueryOutput,
 };
 
 use crate::files::read_file_to_string;
@@ -278,10 +277,14 @@ async fn read_graph_triples(
         .await
         .with_context(|| format!("Reading back graph {graph:?}"))?;
 
-    let empty_context = ParsedContext::new();
     let config = FormatterConfig::sparql_json();
-    let json = format::format_results(&query_result, &empty_context, &ledger.snapshot, &config)
-        .map_err(|e| anyhow::anyhow!("Formatting readback results: {e}"))?;
+    let json = format::format_results(
+        &query_result,
+        &query_result.context,
+        &ledger.snapshot,
+        &config,
+    )
+    .map_err(|e| anyhow::anyhow!("Formatting readback results: {e}"))?;
     let results = fluree_json_to_sparql_results(&json)
         .context("Converting readback results to SparqlResults")?;
 
@@ -330,10 +333,14 @@ async fn list_named_graphs(fluree: &Fluree, ledger: &LedgerState) -> Result<Vec<
         .await
         .context("Enumerating named graphs")?;
 
-    let empty_context = ParsedContext::new();
     let config = FormatterConfig::sparql_json();
-    let json = format::format_results(&query_result, &empty_context, &ledger.snapshot, &config)
-        .map_err(|e| anyhow::anyhow!("Formatting graph enumeration: {e}"))?;
+    let json = format::format_results(
+        &query_result,
+        &query_result.context,
+        &ledger.snapshot,
+        &config,
+    )
+    .map_err(|e| anyhow::anyhow!("Formatting graph enumeration: {e}"))?;
     let results = fluree_json_to_sparql_results(&json)?;
 
     let SparqlResults::Solutions { solutions, .. } = results else {
@@ -471,12 +478,21 @@ pub async fn run_eval_test(
         fluree_construct_to_sparql_results(&construct_json)
             .context("Converting CONSTRUCT output to graph")?
     } else {
-        // SELECT/ASK path: format as SPARQL JSON
-        let empty_context = ParsedContext::new();
+        // SELECT/ASK path: format as SPARQL JSON, through the SAME context the
+        // HTTP surface passes. Substituting an empty context here made IRI
+        // compaction structurally invisible to this suite: every test rendered
+        // as if it had no prologue, so a `PREFIX`-declaring test could never
+        // surface a CURIE and the harness's prepended `BASE` could never surface
+        // a relative reference (issue #45). The writers emit absolute IRIs for
+        // the W3C formats now, so this is a live gate on that.
         let config = FormatterConfig::sparql_json();
-        let actual_json =
-            format::format_results(&query_result, &empty_context, &ledger.snapshot, &config)
-                .map_err(|e| anyhow::anyhow!("Formatting SPARQL JSON: {e}"))?;
+        let actual_json = format::format_results(
+            &query_result,
+            &query_result.context,
+            &ledger.snapshot,
+            &config,
+        )
+        .map_err(|e| anyhow::anyhow!("Formatting SPARQL JSON: {e}"))?;
         fluree_json_to_sparql_results(&actual_json)
             .context("Converting Fluree results to SparqlResults")?
     };

@@ -154,9 +154,12 @@ impl RemoteServiceExecutor for HttpRemoteService {
     }
 }
 
-/// Mock remote executor for testing — returns pre-programmed SPARQL Results JSON responses.
+/// Mock remote executor for testing — returns pre-programmed SPARQL Results JSON
+/// responses, and records the SPARQL text it was asked to execute so a test can
+/// assert on the query the engine actually ships.
 pub struct MockRemoteService {
     responses: std::sync::Mutex<HashMap<String, serde_json::Value>>,
+    last_sparql: std::sync::Mutex<Option<String>>,
 }
 
 impl fmt::Debug for MockRemoteService {
@@ -175,7 +178,16 @@ impl MockRemoteService {
     pub fn new() -> Self {
         Self {
             responses: std::sync::Mutex::new(HashMap::new()),
+            last_sparql: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The SPARQL text of the most recent `execute_remote_sparql` call, if any.
+    ///
+    /// Recorded before the canned-response lookup, so it is available even when
+    /// the call goes on to fail.
+    pub fn last_sparql(&self) -> Option<String> {
+        self.last_sparql.lock().unwrap().clone()
     }
 
     /// Register a canned SPARQL Results JSON response for a given connection+ledger.
@@ -191,9 +203,11 @@ impl RemoteServiceExecutor for MockRemoteService {
         &self,
         connection_name: &str,
         ledger: &str,
-        _sparql: &str,
+        sparql: &str,
     ) -> fluree_db_query::error::Result<RemoteQueryResult> {
         use fluree_db_query::error::QueryError;
+
+        *self.last_sparql.lock().unwrap() = Some(sparql.to_string());
 
         let key = format!("{connection_name}/{ledger}");
         let guard = self.responses.lock().unwrap();

@@ -248,6 +248,7 @@ fn body_kind_tag(kind: BodyKind) -> &'static str {
         BodyKind::JsonLdInsert
         | BodyKind::JsonLdUpsert
         | BodyKind::JsonLdUpdate
+        | BodyKind::JsonLdGraphSync
         | BodyKind::TurtleInsert
         | BodyKind::TurtleUpsert
         | BodyKind::TrigUpsert
@@ -369,6 +370,8 @@ mod tests {
                         commit_id,
                         t: 42,
                         flake_count: 3,
+                        assert_count: 3,
+                        retract_count: 0,
                     },
                     tally: None,
                     cypher_return: None,

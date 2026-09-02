@@ -26,7 +26,7 @@
 //! log entries must be durable before AppendEntries is acknowledged.
 //! Buffered/async impls that violate this break Raft's safety.
 
-use crate::raft::NodeId;
+use crate::node::NodeId;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;

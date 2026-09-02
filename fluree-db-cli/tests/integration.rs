@@ -262,6 +262,58 @@ fn query_and_insert_accept_ledger_flag() {
         .stdout(predicate::str::contains("Carol"));
 }
 
+/// #1466 end to end: `--format json` on a SPARQL query prints the abbreviated
+/// IRI the query's own PREFIX declares. The W3C result writers emit absolute
+/// IRIs (#45); the CLI is a display surface and deliberately does not, so this
+/// pins the deviation against the real rendered bytes rather than the config.
+#[test]
+fn query_sparql_json_output_keeps_compact_iris() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "curiedb");
+
+    let assertion = fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "curiedb",
+            "--sparql",
+            "--format",
+            "json",
+            "-e",
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"Alice\" }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ex:alice"));
+    let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains("http://example.org/alice"),
+        "CLI json output should stay compacted, got: {stdout}"
+    );
+}
+
+/// Same contract for the delimited display formats.
+#[test]
+fn query_csv_output_keeps_compact_iris() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "curiecsv");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "curiecsv",
+            "--sparql",
+            "--format",
+            "csv",
+            "-e",
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"Alice\" }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ex:alice"));
+}
+
 #[test]
 fn query_ledger_flag_rejects_extra_positional() {
     let tmp = TempDir::new().unwrap();
@@ -1322,6 +1374,89 @@ fn upsert_turtle() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Committed t=1"));
+}
+
+#[test]
+fn sync_graph_commits_only_the_delta() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "syncdb"])
+        .assert()
+        .success();
+    let graph = "urn:example:ontology";
+
+    let v1 = r#"{"@context": {"ex": "http://example.org/"}, "@graph": [
+        {"@id": "ex:alice", "ex:name": "Alice", "ex:role": "engineer"},
+        {"@id": "ex:bob", "ex:name": "Bob"}]}"#;
+    // First sync populates the graph: 3 asserts, nothing to retract.
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdb", "--graph", graph, "-e", v1])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+3 asserted, -0 retracted (t=1)"));
+
+    // Identical payload is a no-op: no commit, t unchanged.
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdb", "--graph", graph, "-e", v1])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already matches the payload"));
+
+    // Dry run of a delta reports the counts without committing (still t=1).
+    let v2 = "@prefix ex: <http://example.org/> .\nex:alice ex:name \"Alice\" ; ex:role \"manager\" .\nex:carol ex:name \"Carol\" .";
+    fluree_cmd(&tmp)
+        .args([
+            "sync",
+            "syncdb",
+            "--graph",
+            graph,
+            "--dry-run",
+            "--json",
+            "-e",
+            v2,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"asserted\": 2"))
+        .stdout(predicate::str::contains("\"retracted\": 2"))
+        .stdout(predicate::str::contains("\"committed\": false"))
+        .stdout(predicate::str::contains("\"t\": 1"));
+
+    // Real run from Turtle (converted client-side): one commit for the delta.
+    fluree_cmd(&tmp)
+        .args(["sync", "syncdb", "--graph", graph, "-e", v2])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+2 asserted, -2 retracted (t=2)"));
+
+    // Empty payload is refused without --allow-empty ...
+    fluree_cmd(&tmp)
+        .args([
+            "sync",
+            "syncdb",
+            "--graph",
+            graph,
+            "-e",
+            r#"{"@graph": []}"#,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--allow-empty"));
+    // ... and clears the graph with it.
+    fluree_cmd(&tmp)
+        .args([
+            "sync",
+            "syncdb",
+            "--graph",
+            graph,
+            "--allow-empty",
+            "-e",
+            r#"{"@graph": []}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+0 asserted, -3 retracted (t=3)"));
 }
 
 // ============================================================================
@@ -3478,4 +3613,81 @@ fn skolem_namespace_flag_controls_cross_ledger_blank_node_identity() {
         shared_a, shared_b,
         "--skolem-namespace must reach the import builder on both sides"
     );
+}
+
+// ============================================================================
+// #1466 — table output must never Debug-print an internal binding
+// ============================================================================
+
+/// The fix, end to end through the real binary: an indexed ledger, a subject
+/// whose triples arrived after the index snapshot, and a `--format table`
+/// render that has to resolve that subject from novelty.
+///
+/// The bug printed `EncodedSid { s_id: .., t: None, op: None }` into a cell.
+///
+/// The query shape matters. Joining the novelty subject in through a *literal*
+/// — the reported repro's shape — never reaches the arm this fixes: subjects
+/// arrive at the formatter already materialized as `Binding::Sid`, so that
+/// version of this test passed with the whole `EncodedSid` arm deleted. Joining
+/// through a *reference* edge against a typed object keeps `?s`
+/// late-materialized, which is what puts a novelty-only `EncodedSid` in front
+/// of the renderer. `output.rs`'s
+/// `novelty_only_encoded_sid_from_a_real_query_renders_its_iri` asserts that
+/// property directly on the batch; this pins the same shape through the whole
+/// pipeline (insert, index, insert, query), so a regression anywhere along it —
+/// not just in the resolver — is caught.
+#[test]
+fn table_output_renders_novelty_only_subject_after_index() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "noveltytable"])
+        .assert()
+        .success();
+
+    // Base data, then persist an index over it.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            "<urn:x1> a <urn:Target> ; <urn:indexed-prop> \"val1\" . \
+             <urn:s1> <urn:ref> \"val1\" ; <urn:content> \"c1\" ; \
+             <urn:knows> <urn:x1> ; a <urn:Probe> .",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index"]).assert().success();
+
+    // Commit again *without* indexing: urn:m9 exists only in novelty.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            "<urn:x2> <urn:indexed-prop> \"val2\" . \
+             <urn:m9> <urn:ref> \"val2\" ; <urn:content> \"probe content\" ; \
+             <urn:knows> <urn:x1> ; a <urn:Probe> .",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--format",
+            "table",
+            "--sparql",
+            "SELECT ?s ?o WHERE { \
+               ?s <urn:knows> ?o . \
+               ?o a <urn:Target> . }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("urn:m9"))
+        .stdout(predicate::str::contains("urn:s1"))
+        // The reported symptom, and the placeholder that replaced it: neither
+        // belongs in a correct render.
+        .stdout(predicate::str::contains("EncodedSid").not())
+        .stdout(predicate::str::contains("EncodedPid").not())
+        .stdout(predicate::str::contains("EncodedLit").not())
+        .stdout(predicate::str::contains("(unresolved ").not());
 }

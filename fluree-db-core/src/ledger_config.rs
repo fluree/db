@@ -73,7 +73,15 @@ pub struct ResolvedConfig {
 /// Policy defaults from the config graph (`f:policyDefaults`).
 #[derive(Debug, Clone, Default)]
 pub struct PolicyDefaults {
-    /// `f:defaultAllow` — `None` means use system default (true).
+    /// `f:defaultAllow` — whether to permit access when no policy rule
+    /// matches. `None` means unconfigured, in which case the request's own
+    /// (also tri-state) `default-allow` governs; unset on both sides resolves
+    /// fail-closed to **false**.
+    ///
+    /// Note this is only ever consulted for a request that carries policy
+    /// inputs (an identity, a policy class, or an inline policy). A request
+    /// with none of those builds no policy context at all and reads
+    /// everything, whatever this is set to.
     pub default_allow: Option<bool>,
     /// `f:policySource` — reference to graph containing policy rules.
     pub policy_source: Option<GraphSourceRef>,
@@ -388,13 +396,28 @@ pub enum TrustMode {
 
 /// SHACL validation mode.
 ///
-/// Values are IRIs in the `f:` namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Values are IRIs in the `f:` namespace. Serialized lowercase
+/// (`"reject"` / `"warn"`) — the form `opts.validationMode` uses on
+/// transaction requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ValidationMode {
     /// `f:ValidationReject` — reject transactions that fail SHACL validation.
     Reject,
     /// `f:ValidationWarn` — warn but allow transactions that fail SHACL validation.
     Warn,
+}
+
+impl ValidationMode {
+    /// Parse the request-surface string form (case-insensitive
+    /// `"reject"` / `"warn"`). `None` for anything else.
+    pub fn parse_opt(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "reject" => Some(ValidationMode::Reject),
+            "warn" => Some(ValidationMode::Warn),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================

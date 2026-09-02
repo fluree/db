@@ -298,8 +298,9 @@ async fn policy_defaults_apply() {
     let resolved = view.resolved_config().expect("resolved config");
     let empty_opts = GovernanceOptions::default();
     let merged = config_resolver::merge_policy_opts(resolved, &empty_opts, None);
-    assert!(
-        !merged.default_allow,
+    assert_eq!(
+        merged.default_allow,
+        Some(false),
         "config's defaultAllow=false should apply when no query opts"
     );
     assert!(
@@ -613,12 +614,13 @@ async fn override_control_none_blocks() {
     // 4. Check that merge_policy_opts respects OverrideNone:
     //    Even with opts specifying default_allow=true, the config should win
     let opts_with_override = GovernanceOptions {
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
     let merged = config_resolver::merge_policy_opts(resolved, &opts_with_override, None);
-    assert!(
-        !merged.default_allow,
+    assert_eq!(
+        merged.default_allow,
+        Some(false),
         "OverrideNone should block query-time default_allow override"
     );
 }
@@ -674,28 +676,31 @@ async fn override_control_identity_restricted() {
 
     // Test actual gating behavior via merge_policy_opts
     let opts = GovernanceOptions {
-        default_allow: true,
+        default_allow: Some(true),
         ..Default::default()
     };
 
     // Admin identity → override permitted (opts.default_allow=true passes through)
     let merged_admin = config_resolver::merge_policy_opts(resolved, &opts, Some("did:key:admin"));
-    assert!(
+    assert_eq!(
         merged_admin.default_allow,
+        Some(true),
         "admin identity should be permitted to override"
     );
 
     // Unknown identity → override denied (config.default_allow=false applied)
     let merged_user = config_resolver::merge_policy_opts(resolved, &opts, Some("did:key:user"));
-    assert!(
-        !merged_user.default_allow,
+    assert_eq!(
+        merged_user.default_allow,
+        Some(false),
         "non-admin identity should be denied override"
     );
 
     // No identity → override denied (config.default_allow=false applied)
     let merged_none = config_resolver::merge_policy_opts(resolved, &opts, None);
-    assert!(
-        !merged_none.default_allow,
+    assert_eq!(
+        merged_none.default_allow,
+        Some(false),
         "no identity should be denied override"
     );
 }
@@ -2021,8 +2026,8 @@ async fn merge_shacl_opts_unit_test() {
 
     let view = fluree.db(ledger_id).await.unwrap();
     let resolved = view.resolved_config().expect("resolved config");
-    let shacl =
-        config_resolver::merge_shacl_opts(resolved, None).expect("shacl config should be present");
+    let shacl = config_resolver::merge_shacl_opts(resolved, None, None)
+        .expect("shacl config should be present");
 
     assert!(shacl.enabled, "SHACL should be enabled");
     assert_eq!(
@@ -3254,4 +3259,462 @@ async fn reasoning_modes_collection_of_iris_engages() {
                                     rdf:rest  rdf:nil .",
     )
     .await;
+}
+
+// =============================================================================
+// Test 20: ledger-configured f:defaultAllow reaches identity-carrying requests
+// =============================================================================
+
+/// Seed two named subjects and (optionally) a policy config declaring
+/// `f:defaultAllow <value>`. Returns the ledger id.
+async fn seed_default_allow_ledger(
+    fluree: &support::MemoryFluree,
+    ledger_id: &str,
+    configured_default_allow: Option<bool>,
+) {
+    let ledger = genesis_ledger(fluree, ledger_id);
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice"},
+                    {"@id": "ex:bob", "@type": "ex:User", "ex:name": "Bob"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+
+    let Some(default_allow) = configured_default_allow else {
+        return;
+    };
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:policyDefaults <urn:config:policy> .
+            <urn:config:policy> f:defaultAllow {default_allow} .
+        }}
+    "
+    );
+
+    fluree
+        .stage_owned(result.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+}
+
+/// Run `SELECT ?name WHERE { ?s ex:name ?name }` with the given `opts` and
+/// return the names visible to that request.
+async fn visible_names(
+    fluree: &support::MemoryFluree,
+    ledger_id: &str,
+    opts: serde_json::Value,
+) -> Vec<String> {
+    let mut query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "from": ledger_id,
+        "select": "?name",
+        "where": {"@id": "?s", "ex:name": "?name"}
+    });
+    if !opts.is_null() {
+        query["opts"] = opts;
+    }
+
+    let result = fluree.query_connection(&query).await.expect("query");
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let jsonld = result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld");
+
+    let mut names: Vec<String> = jsonld
+        .as_array()
+        .expect("array result")
+        .iter()
+        .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The operator scenario: a ledger configured `f:defaultAllow true` must apply
+/// to a request that carries nothing but an identity.
+///
+/// Before `GovernanceOptions::default_allow` became tri-state this returned
+/// nothing: `merge_policy_opts` treats any request with policy inputs as an
+/// override, and a bare `bool` made the derive-default `false` indistinguishable
+/// from "the caller never said," so config's `true` was silently discarded and
+/// the identity fell through to default-deny.
+#[tokio::test]
+async fn config_default_allow_true_applies_to_identity_only_request() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-default-allow-identity:main";
+    seed_default_allow_ledger(&fluree, ledger_id, Some(true)).await;
+
+    let names = visible_names(
+        &fluree,
+        ledger_id,
+        json!({"identity": "did:key:z6MkUnknownIdentity"}),
+    )
+    .await;
+
+    assert_eq!(
+        names,
+        vec!["Alice".to_string(), "Bob".to_string()],
+        "config's f:defaultAllow true must govern an identity-only request"
+    );
+}
+
+/// A request that names `default-allow` explicitly still wins over config —
+/// in both directions.
+#[tokio::test]
+async fn request_default_allow_overrides_config_both_ways() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Config says allow; request explicitly says deny → deny wins.
+    let open_ledger = "it/config-default-allow-request-false:main";
+    seed_default_allow_ledger(&fluree, open_ledger, Some(true)).await;
+    let names = visible_names(
+        &fluree,
+        open_ledger,
+        json!({"identity": "did:key:z6MkUnknownIdentity", "default-allow": false}),
+    )
+    .await;
+    assert!(
+        names.is_empty(),
+        "explicit request default-allow:false must override config true; got: {names:?}"
+    );
+
+    // Config says deny; request explicitly says allow → allow wins (the config
+    // here uses the default OverrideControl::AllowAll).
+    let closed_ledger = "it/config-default-allow-request-true:main";
+    seed_default_allow_ledger(&fluree, closed_ledger, Some(false)).await;
+    let names = visible_names(
+        &fluree,
+        closed_ledger,
+        json!({"identity": "did:key:z6MkUnknownIdentity", "default-allow": true}),
+    )
+    .await;
+    assert_eq!(
+        names,
+        vec!["Alice".to_string(), "Bob".to_string()],
+        "explicit request default-allow:true must override config false"
+    );
+}
+
+/// Unchanged posture: with no ledger config at all, an identity-only request is
+/// still fail-closed. This is the same pin as the server-side
+/// `identity_without_policy_class_default_allow_false_denies_all`, asserted at
+/// the API layer so the tri-state change can't quietly widen the default.
+#[tokio::test]
+async fn identity_only_without_config_still_denies_all() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-default-allow-no-config:main";
+    seed_default_allow_ledger(&fluree, ledger_id, None).await;
+
+    let names = visible_names(
+        &fluree,
+        ledger_id,
+        json!({"identity": "did:key:z6MkUnknownIdentity"}),
+    )
+    .await;
+
+    assert!(
+        names.is_empty(),
+        "no config + identity only must stay fail-closed; got: {names:?}"
+    );
+}
+
+/// Unchanged posture: an anonymous request is wholly unenforced, so a ledger's
+/// configured `f:defaultAllow false` does not close it.
+///
+/// `has_any_policy_inputs()` is false for an anonymous request, so
+/// `apply_source_or_global_policy` never calls `wrap_policy` and no
+/// `PolicyContext` — and therefore no config default — is ever built. Pinned
+/// here as current behavior, not endorsed: see the note in the branch report.
+#[tokio::test]
+async fn anonymous_request_unenforced_despite_config_default_allow_false() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-default-allow-anonymous:main";
+    seed_default_allow_ledger(&fluree, ledger_id, Some(false)).await;
+
+    let names = visible_names(&fluree, ledger_id, serde_json::Value::Null).await;
+
+    assert_eq!(
+        names,
+        vec!["Alice".to_string(), "Bob".to_string()],
+        "anonymous requests remain unenforced regardless of config default-allow"
+    );
+}
+
+// =============================================================================
+// Transaction-requested SHACL validation mode (opts.validationMode)
+// =============================================================================
+
+/// Shared setup for the validation-mode override tests: a ledger with a
+/// minCount shape on ex:Person and a config graph carrying the given SHACL
+/// group body (caller supplies the `<urn:config:shacl>` triples).
+#[cfg(feature = "shacl")]
+async fn seed_shacl_mode_ledger(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    shacl_group_trig: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger = genesis_ledger(fluree, ledger_id);
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "sh": "http://www.w3.org/ns/shacl#",
+                    "ex": "http://example.org/",
+                    "xsd": "http://www.w3.org/2001/XMLSchema#"
+                },
+                "@id": "ex:PersonShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"},
+                "sh:property": [{
+                    "sh:path": {"@id": "ex:name"},
+                    "sh:minCount": 1
+                }]
+            }),
+        )
+        .await
+        .expect("shape insert");
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:shaclDefaults <urn:config:shacl> .
+            {shacl_group_trig}
+        }}
+    "
+    );
+    fluree
+        .stage_owned(result.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write")
+        .ledger
+}
+
+/// A violating transaction document (ex:Person without ex:name).
+#[cfg(feature = "shacl")]
+fn violating_person() -> serde_json::Value {
+    json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:nameless",
+        "@type": "ex:Person"
+    })
+}
+
+/// Under the default override control (`f:OverrideAll`), a transaction may
+/// soften a configured `Reject` posture to warn-and-commit for itself only —
+/// the standing posture still rejects other writers.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_txn_validation_mode_softens_reject_under_default_override() {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_shacl_mode_ledger(
+        &fluree,
+        "it/shacl-mode-soften:main",
+        "<urn:config:shacl> f:shaclEnabled true .",
+    )
+    .await;
+
+    // Without the opt: configured Reject applies.
+    let err = fluree
+        .insert(ledger.clone(), &violating_person())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "configured reject posture must reject: {err:?}"
+    );
+
+    // With opts.validationMode = warn: commits (findings logged, not fatal).
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Warn),
+        ..Default::default()
+    };
+    fluree
+        .stage_owned(ledger)
+        .txn_opts(opts)
+        .insert(&violating_person())
+        .execute()
+        .await
+        .expect("warn-mode request under default override control must commit");
+}
+
+/// `f:overrideControl f:OverrideNone` pins the configured posture: a
+/// transaction-requested warn is denied and the write still rejects.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_txn_validation_mode_denied_by_override_none() {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_shacl_mode_ledger(
+        &fluree,
+        "it/shacl-mode-pinned:main",
+        r"<urn:config:shacl> f:shaclEnabled true .
+          <urn:config:shacl> f:overrideControl f:OverrideNone .",
+    )
+    .await;
+
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Warn),
+        ..Default::default()
+    };
+    let err = fluree
+        .stage_owned(ledger)
+        .txn_opts(opts)
+        .insert(&violating_person())
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "OverrideNone must pin the configured reject posture: {err:?}"
+    );
+}
+
+/// The shapes-exist heuristic (shapes present, NO config graph) fails closed:
+/// a transaction-requested warn does NOT soften it.
+///
+/// This path never reaches `merge_shacl_opts`, so it consults no
+/// `f:overrideControl` and no identity. Honoring the request here would let
+/// anyone who can write downgrade enforcement on every ledger that has shapes
+/// but no `#config` graph — the back-compat default — with the violations
+/// reduced to a log line.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_heuristic_without_config_ignores_requested_warn_mode() {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "it/shacl-heuristic-no-config:main");
+    // Shapes, deliberately with no config graph written afterwards.
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "sh": "http://www.w3.org/ns/shacl#",
+                    "ex": "http://example.org/"
+                },
+                "@id": "ex:PersonShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"},
+                "sh:property": [{
+                    "sh:path": {"@id": "ex:name"},
+                    "sh:minCount": 1
+                }]
+            }),
+        )
+        .await
+        .expect("shape insert");
+
+    // Baseline: the heuristic enforces without any opt.
+    let err = fluree
+        .insert(result.ledger.clone(), &violating_person())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "shapes-exist heuristic must reject: {err:?}"
+    );
+
+    // The same write asking for warn is still rejected — no config group
+    // exists to permit the override, so the request is not honored.
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Warn),
+        ..Default::default()
+    };
+    let err = fluree
+        .stage_owned(result.ledger)
+        .txn_opts(opts)
+        .insert(&violating_person())
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "requested warn must NOT soften the ungated no-config heuristic: {err:?}"
+    );
+}
+
+/// Strengthening needs no permission: on a warn-mode ledger, a transaction
+/// may request reject for itself even under `f:OverrideNone`.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_txn_validation_mode_reject_strengthens_warn() {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_shacl_mode_ledger(
+        &fluree,
+        "it/shacl-mode-strengthen:main",
+        r"<urn:config:shacl> f:shaclEnabled true .
+          <urn:config:shacl> f:validationMode f:ValidationWarn .
+          <urn:config:shacl> f:overrideControl f:OverrideNone .",
+    )
+    .await;
+
+    // Configured warn: the violation commits.
+    let result = fluree
+        .insert(ledger.clone(), &violating_person())
+        .await
+        .expect("warn posture commits violations");
+
+    // Requested reject: strengthening is always honored.
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Reject),
+        ..Default::default()
+    };
+    let err = fluree
+        .stage_owned(result.ledger)
+        .txn_opts(opts)
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:nameless2",
+            "@type": "ex:Person"
+        }))
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "requested reject must strengthen a warn posture: {err:?}"
+    );
 }

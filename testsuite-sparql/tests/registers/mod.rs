@@ -88,13 +88,9 @@ pub const SPARQL11_AGGREGATES: &[&str] = &[
     //     memory-backed, so the fast path never fires under it).
     //   * agg-err-01 (SUM/AVG must poison to unbound on a bound non-numeric
     //     group member, §18.5) was greened on main by the same 45d6009bf.
-    // COUNT(DISTINCT *): DEFERRED — the parser accepts it but the lowerer
-    // rejects it (lower/aggregate.rs); greening needs a new CountDistinctAll IR
-    // variant + whole-row group-operator plumbing (the operators feed each
-    // aggregate one input-var column, not the whole solution). Perf-neutral
-    // (per-group, off the per-row hot path); a standalone post-wave-3 follow-up,
-    // NOT X3 — PR-X2 (decision-owner).
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-count-rows-distinct",
+    //   * agg-count-rows-distinct (COUNT(DISTINCT *)) was greened by the
+    //     CountDistinctAll IR variant plus whole-row plumbing through both
+    //     group operators.
 ];
 
 pub const SPARQL11_BINDINGS: &[&str] = &[
@@ -143,6 +139,15 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // (PR-W1-OPT). filter-nested-2 (nested-group FILTER scope) and join-scope-1
     // (sub-SELECT merge of an OPTIONAL-produced correlation var) are fixed
     // (PR-W1 Families A/B).
+    //
+    // nested-opt-1/2 are about WHERE the right operand is evaluated, not how it
+    // merges: §18.2.4 evaluates it independently and unifies afterwards, while
+    // every OptionalBuilder here seeds it from the required row. nested-opt-1
+    // wants `{ :x3 :q ?w . OPTIONAL { :x2 :p ?v } }` to bind ?v=2 on its own and
+    // so match nothing against ?v=1 (1 solution); correlating substitutes ?v=1,
+    // the inner OPTIONAL finds nothing and passes ?w=3/4 through, and we answer
+    // 2. #1713's unbound-merge fix does not move either one — verified, output
+    // byte-identical before and after.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-2",
@@ -157,20 +162,11 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-4",
-    // quotes-3/4: D5b scan-path — pattern-object datatype drop (ninth-audit
-    // reclassified these here from serialization); deferred with the scan-path
-    // carve-out (open-eq-02 / eq-graph / dawg-lang-3) — PR-X2.
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-4",
     // dawg-bev-1..6: greened by the datatype-aware, fallible bare-variable EBV
     // (numeric-zero/empty-string falsy; ill-typed/lang/IRI/unbound → type error
     // excluding the row) — D-EBV, PR-X2
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-9",
-    // dawg-lang-3: pattern-object language tag dropped on the scan path
-    // (`?x :p "string"@EN` matches every lexical "string" regardless of @lang)
-    // — D5b scan-path family, PR-X2 (owned with open-eq-02 / quotes-3/4)
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-3",
     // dawg-langMatches-4: `!langMatches(lang(?v),"*")` where ?v is an IRI —
     // LANG of a non-literal must raise a type error that excludes the row (the
     // negation of an error is an error), not evaluate to "" — PR-X2 follow-up
@@ -191,14 +187,13 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // instant handling; needs temporal value semantics beyond the filter lattice
     // — PR-X2 (temporal, deferred).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-dateTime",
-    // eq-graph-1/2/4: NOT filter equality — each is a bare BGP `{ ?x :p <const> }`
-    // (no GRAPH keyword, no FILTER), so the constant OBJECT is matched on the scan
-    // path, which ignores the exact term (`:p 1` also matches "01"/1.0e0). Same
-    // D5b scan-path class as open-eq-02; the earlier "GRAPH-var / pr-g1" note was
-    // a misnomer — PR-X2 (scan-path carve-out, deferred).
+    // eq-graph-1/2: bare BGP `{ ?x :p <const> }` with a NUMERIC constant — the
+    // scan path deliberately matches `:p 1` against "01"/1.0e0 (bare numerics
+    // stay lenient across numeric subtypes). String constants (quotes-3/4,
+    // open-eq-02, eq-graph-4) carry their exact term since string literals
+    // lower with a datatype/language constraint.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-4",
     // expr-ops {add,subtract,multiply,divide}-numbers-cast + unplus-2/unminus-2:
     // greened by D4 numeric promotion (xsd:float first-class, double∘decimal→
     // double) — PR-X2
@@ -207,23 +202,16 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // (temporal, deferred).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-01",
-    // open-eq-02: D5b scan-path — the BGP object `"a"^^t:type1` matches
-    // `"a"^^t:type2`; a deliberately-disabled per-flake scan datatype constraint,
-    // deferred to protect the bench budget (spec-sanctioned carve-out) — PR-X2.
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-02",
     // open-eq-04 greened (D5 datatype-aware `=`/`!=`). open-eq-05/06 need BOTH the
     // scan-path EncodedLit datatype-carry (bench-sensitive, D5b class) AND typed-
-    // literal *constants* to carry their datatype (lower_typed_literal drops it);
-    // open-eq-07/08/10/11/12 now select the correct 12/42/52/52/10-row set but
-    // stay non-isomorphic on blank-node OUTPUT identity (the same object bnode is
-    // re-minted per binding) — orthogonal to the equality lattice.
+    // literal *constants* to carry their datatype (lower_typed_literal drops it).
+    // open-eq-07/08/10/11/12 greened by issue #45 (b): they already selected the
+    // correct 12/42/52/52/10-row set, and the residual mismatch was the SPARQL-JSON
+    // writer dropping the `datatype` off string-backed literals with an "inferable"
+    // type — so a typed object compared as a plain string and no bnode mapping was
+    // consistent. With the datatype emitted, the isomorphism resolves.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-05",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-06",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-07",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-08",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-10",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-11",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-12",
     // optional cluster (3): all three optional-complex-* use GRAPH ?x/?g and
     // are gated on PR-G1 (GRAPH-variable semantics). dawg-optional-filter-005's
     // doubly-nested `OPTIONAL { { ... FILTER } }` scope leak is fixed (PR-W1
@@ -267,7 +255,6 @@ pub const SPARQL11_CSV_TSV: &[&str] = &[];
 pub const SPARQL11_ENTAILMENT: &[&str] = &[
     // result mismatch (45)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#bind07",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#lang",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#paper-sparqldl-Q1",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#paper-sparqldl-Q1-rdfs",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#paper-sparqldl-Q2",
@@ -281,7 +268,6 @@ pub const SPARQL11_ENTAILMENT: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#parent7",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#parent8",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#parent9",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#plainLit",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#rdf01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#rdfs01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#rdfs02",

@@ -312,7 +312,7 @@ impl GraphOperator {
             // empty native index and silently return no rows — fail loudly.
             if !rewrite_result.unsupported.is_empty() {
                 return Err(unsupported_subscope_error(
-                    &graph_iri,
+                    &[&graph_iri],
                     &rewrite_result.unsupported,
                 ));
             }
@@ -528,7 +528,7 @@ impl GraphOperator {
         // index — fail loudly rather than return a wrong empty result.
         if !rewrite_result.unsupported.is_empty() {
             return Err(unsupported_subscope_error(
-                &graph_iri,
+                &[&graph_iri],
                 &rewrite_result.unsupported,
             ));
         }

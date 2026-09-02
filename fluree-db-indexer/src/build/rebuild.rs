@@ -980,6 +980,12 @@ where
                     properties: Some(properties),
                     classes: root_classes,
                     graphs: Some(final_graphs),
+                    // A full rebuild walks the entire commit chain from
+                    // genesis, feeding every record — asserts and retracts,
+                    // including facts later retracted — through the stats
+                    // hook, so the historical tag sets cover every `t` the
+                    // ledger has ever had.
+                    historical_since_t: Some(0),
                 }
             };
 
@@ -1127,6 +1133,7 @@ where
                 total_commit_size,
                 total_asserts,
                 total_retracts,
+                saw_list_meta: shared.saw_list_meta,
                 db_stats: Some(db_stats),
                 db_schema,
                 sketch_ref,

@@ -336,10 +336,16 @@ pub fn configured_fulltext_properties_for_indexer(
 ///
 /// Algorithm:
 /// 1. No config policy → return opts unchanged
-/// 2. Query specifies policy → check override control:
-///    - Permitted → keep query opts
-///    - Denied → log warning, apply config defaults
-/// 3. No query policy → apply config defaults
+/// 2. Override control denies a policy-carrying request → log warning and let
+///    config *force* its values over the request's (the documented truth table)
+/// 3. Otherwise → config fills only what the request left genuinely unset;
+///    `policy_class` additionally applies only when the request carried no
+///    policy inputs at all, preserving the pre-tri-state behavior
+///
+/// The distinction that matters for `default_allow`: `None` means the caller
+/// never spoke, so config governs; `Some(v)` is an explicit request value and
+/// survives, because the only thing entitled to overrule an explicit caller
+/// value is override control saying so.
 pub fn merge_policy_opts(
     resolved: &ResolvedConfig,
     opts: &GovernanceOptions,
@@ -352,29 +358,44 @@ pub fn merge_policy_opts(
 
     // Does the query specify any policy inputs?
     let query_has_policy = opts.has_any_policy_inputs();
+    let override_denied =
+        query_has_policy && !policy.override_control.permits_override(server_identity);
 
-    if query_has_policy {
-        // Check if override is permitted
-        if policy.override_control.permits_override(server_identity) {
-            return opts.clone();
-        }
+    let mut merged = opts.clone();
+
+    if override_denied {
         tracing::warn!(
             server_identity,
             "Query-time policy override denied by config override control — applying config defaults"
         );
+
+        // Config wins outright, including over an explicit request value.
+        if let Some(default_allow) = policy.default_allow {
+            merged.default_allow = Some(default_allow);
+        }
+        if let Some(ref classes) = policy.policy_class {
+            merged.policy_class = Some(classes.clone());
+        }
+        return merged;
     }
 
-    // Apply config defaults
-    let mut merged = opts.clone();
-
-    // Apply default_allow from config (config says deny-by-default)
-    if let Some(default_allow) = policy.default_allow {
-        merged.default_allow = default_allow;
+    // Config fills only a genuine unset. An explicit `Some(false)` reaches here
+    // via a request that carries no *other* policy input (a per-source
+    // `SourcePolicyOverride` naming only `default_allow: false` is exactly that
+    // shape, since `has_any_policy_inputs` counts only `Some(true)`), and it
+    // must not be clobbered by config's `f:defaultAllow true`.
+    if merged.default_allow.is_none() {
+        merged.default_allow = policy.default_allow;
     }
 
-    // Apply policy_class from config
-    if let Some(ref classes) = policy.policy_class {
-        merged.policy_class = Some(classes.clone());
+    // policy_class stays request-first: config supplies it only when the request
+    // carried no policy inputs at all. Widening this to "fill when unset" would
+    // start applying config's f:policyClass to identity-carrying requests on the
+    // local path, which it never has — see the note in fluree_ext.rs::wrap_policy.
+    if !query_has_policy {
+        if let Some(ref classes) = policy.policy_class {
+            merged.policy_class = Some(classes.clone());
+        }
     }
 
     // policy_source (GraphSourceRef) is resolved to graph IDs by the caller
@@ -451,26 +472,59 @@ pub struct EffectiveShaclConfig {
     pub validation_mode: ValidationMode,
 }
 
-/// Compute effective SHACL settings from resolved config.
+/// Compute effective SHACL settings from resolved config, honoring a
+/// transaction-requested validation mode under override control.
 ///
 /// Returns `None` if no SHACL config section is present. When `None`,
 /// callers fall back to the shapes-exist heuristic (see `stage_with_config_shacl`).
 ///
-/// Override control is recognized but not actively gated — there's no
-/// transaction-time SHACL override mechanism yet. When one is added
-/// (e.g., `TxnOpts.skip_shacl`), the gate goes here.
+/// `requested_mode` is the transaction's `opts.validationMode`
+/// (`TxnOpts::validation_mode`); `server_identity` is the auth-layer-verified
+/// identity (NOT the user-settable `opts.identity`). Gating is asymmetric:
+///
+/// - **Strengthening** (config `Warn`, request `Reject`) is always honored —
+///   asking for stricter validation needs no permission.
+/// - **Softening** (config `Reject`, request `Warn`) is honored only when the
+///   SHACL group's `f:overrideControl` permits it for `server_identity`
+///   (`f:OverrideAll` — the default — permits everyone; `f:OverrideNone`
+///   denies all; an identity-restricted list checks membership). A denied
+///   request keeps the configured posture and logs a warning; it does not
+///   fail the transaction.
+///
+/// The request can never toggle `enabled` — only the failure handling of
+/// validation that config already turned on.
 pub fn merge_shacl_opts(
     resolved: &ResolvedConfig,
-    _server_identity: Option<&str>,
+    requested_mode: Option<ValidationMode>,
+    server_identity: Option<&str>,
 ) -> Option<EffectiveShaclConfig> {
     let shacl = resolved.shacl.as_ref()?;
+    let config_mode = shacl.validation_mode.unwrap_or(ValidationMode::Reject);
+    let validation_mode = match requested_mode {
+        None => config_mode,
+        Some(ValidationMode::Reject) => ValidationMode::Reject,
+        Some(ValidationMode::Warn) => {
+            if config_mode == ValidationMode::Warn
+                || shacl.override_control.permits_override(server_identity)
+            {
+                ValidationMode::Warn
+            } else {
+                tracing::warn!(
+                    server_identity,
+                    "Transaction-requested SHACL warn mode denied by config override control \
+                     — keeping configured reject posture"
+                );
+                config_mode
+            }
+        }
+    };
     Some(EffectiveShaclConfig {
         // Default `false` per docs/ledger-config/setting-groups.md — opt-in is
         // the safer posture. Prior code defaulted to `true`, silently enabling
         // SHACL for any config that declared an `f:shaclDefaults` section
         // without setting `f:shaclEnabled`, diverging from documented behavior.
         enabled: shacl.enabled.unwrap_or(false),
-        validation_mode: shacl.validation_mode.unwrap_or(ValidationMode::Reject),
+        validation_mode,
     })
 }
 
@@ -2100,6 +2154,80 @@ mod tests {
         assert_eq!(r.modes.as_deref(), Some(&["rdfs".into()][..])); // ledger-wide wins
     }
 
+    /// Asymmetric transaction-mode gating: strengthening is free, softening
+    /// obeys the SHACL group's override control against the verified identity.
+    #[test]
+    fn merge_shacl_opts_gates_requested_mode() {
+        use fluree_db_core::ledger_config::ShaclDefaults;
+
+        let resolved_with = |control: OverrideControl| ResolvedConfig {
+            shacl: Some(ShaclDefaults {
+                enabled: Some(true),
+                shapes_source: None,
+                validation_mode: Some(ValidationMode::Reject),
+                override_control: control,
+            }),
+            ..Default::default()
+        };
+
+        // AllowAll (default): softening honored for anyone, identity or not.
+        let cfg = resolved_with(OverrideControl::AllowAll);
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Warn
+        );
+
+        // OverrideNone: softening denied, configured posture kept.
+        let cfg = resolved_with(OverrideControl::None);
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:alice"))
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
+        // ...but strengthening a Warn posture never needs permission.
+        let warn_cfg = ResolvedConfig {
+            shacl: Some(ShaclDefaults {
+                enabled: Some(true),
+                shapes_source: None,
+                validation_mode: Some(ValidationMode::Warn),
+                override_control: OverrideControl::None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_shacl_opts(&warn_cfg, Some(ValidationMode::Reject), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
+
+        // IdentityRestricted: only the listed verified identity may soften.
+        let cfg = resolved_with(OverrideControl::IdentityRestricted {
+            allowed_identities: HashSet::from([std::sync::Arc::from("did:key:remediator")]),
+        });
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:remediator"))
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Warn
+        );
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:intruder"))
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
+        assert_eq!(
+            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), None)
+                .unwrap()
+                .validation_mode,
+            ValidationMode::Reject
+        );
+    }
+
     #[test]
     fn ledger_wide_override_none_blocks_per_graph_shacl() {
         // Truth table: `shaclEnabled: false`, OverrideNone | `shaclEnabled: true` | → **disabled**
@@ -2243,7 +2371,7 @@ mod tests {
         };
         let opts = GovernanceOptions::default();
         let merged = merge_policy_opts(&resolved, &opts, None);
-        assert!(!merged.default_allow);
+        assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
             Some(&["ex:DefaultPolicy".into()][..])
@@ -2286,7 +2414,7 @@ mod tests {
         };
         let merged = merge_policy_opts(&resolved, &opts, Some("did:key:alice"));
         // Config defaults applied despite query specifying identity
-        assert!(!merged.default_allow);
+        assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
             Some(&["ex:Locked".into()][..])
@@ -2333,10 +2461,223 @@ mod tests {
         };
         let merged = merge_policy_opts(&resolved, &opts, Some("did:key:non-admin"));
         // Server identity is not admin → override denied
-        assert!(!merged.default_allow);
+        assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
             Some(&["ex:Restricted".into()][..])
+        );
+    }
+
+    // --- merge_policy_opts: the tri-state default_allow ---
+    //
+    // Every test above supplies an explicit `default_allow`, so none of them can
+    // see the case the tri-state exists for: a request that carries policy
+    // inputs but says nothing about default-allow.
+
+    /// The headline case. An identity-only request used to short-circuit the
+    /// merge entirely, so config's `f:defaultAllow true` never applied.
+    #[test]
+    fn config_default_allow_fills_unset_request() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts, None);
+        assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
+        assert_eq!(
+            merged.default_allow,
+            Some(true),
+            "config default-allow must fill a request that never named it"
+        );
+    }
+
+    /// An explicit request value wins over config in both directions, even
+    /// though override control is `AllowAll`.
+    #[test]
+    fn explicit_request_default_allow_wins_over_config() {
+        let open_config = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let deny = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&open_config, &deny, None).default_allow,
+            Some(false)
+        );
+
+        let closed_config = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::AllowAll,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let allow = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&closed_config, &allow, None).default_allow,
+            Some(true)
+        );
+    }
+
+    /// Unset on both sides stays unset, and resolves fail-closed.
+    #[test]
+    fn unset_on_both_sides_resolves_fail_closed() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: None,
+                policy_class: Some(vec!["ex:SomePolicy".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts, None);
+        assert_eq!(merged.default_allow, None);
+        assert!(
+            !merged.effective_default_allow(),
+            "nobody configured a default → deny"
+        );
+    }
+
+    /// A config that configures no policy at all leaves the request untouched.
+    #[test]
+    fn no_config_policy_leaves_default_allow_unset() {
+        let resolved = ResolvedConfig::default();
+        let opts = GovernanceOptions {
+            identity: Some("did:key:alice".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts, None).default_allow,
+            None
+        );
+    }
+
+    /// `Some(false)` is the fail-closed value, not a request to switch
+    /// enforcement on: it must not make an otherwise-anonymous request count as
+    /// carrying policy inputs. Only `Some(true)` does, matching the bare-bool
+    /// behavior this replaced.
+    #[test]
+    fn only_explicit_true_counts_as_a_policy_input() {
+        let unset = GovernanceOptions::default();
+        assert!(!unset.has_any_policy_inputs());
+
+        let explicit_false = GovernanceOptions {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert!(!explicit_false.has_any_policy_inputs());
+
+        let explicit_true = GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert!(explicit_true.has_any_policy_inputs());
+    }
+
+    /// An explicit `Some(false)` survives even though it carries no *other*
+    /// policy input and so lands on the config-defaults path.
+    ///
+    /// This is the shape a per-source `SourcePolicyOverride` takes when it names
+    /// only `default_allow: false`: `SourcePolicyOverride::has_policy()` counts
+    /// `is_some()` so the override is applied, but `has_any_policy_inputs()`
+    /// counts only `Some(true)` so the merge sees "no policy inputs". Config
+    /// must fill genuine unset, not overwrite an explicit caller value.
+    #[test]
+    fn explicit_false_survives_the_no_policy_input_path() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts, None).default_allow,
+            Some(false),
+            "config f:defaultAllow true must not clobber an explicit request false"
+        );
+    }
+
+    /// The same shape as it actually arrives: through
+    /// `SourcePolicyOverride::to_query_connection_options()`.
+    #[test]
+    fn per_source_override_of_only_default_allow_false_survives_config() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let override_opts = crate::dataset::SourcePolicyOverride {
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            override_opts.has_policy(),
+            "an override naming only default_allow is still an override"
+        );
+
+        let opts = override_opts.to_query_connection_options();
+        assert!(
+            !opts.has_any_policy_inputs(),
+            "precondition: Some(false) is not a policy input, so this lands on \
+             the config-defaults path"
+        );
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts, None).default_allow,
+            Some(false)
+        );
+    }
+
+    /// Override control still overrules an explicit request value — that is the
+    /// one thing entitled to, and the documented truth table.
+    #[test]
+    fn override_control_none_still_forces_config_over_explicit_request() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                default_allow: Some(false),
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_policy_opts(&resolved, &opts, None).default_allow,
+            Some(false)
         );
     }
 

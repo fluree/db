@@ -353,6 +353,17 @@ An R2RML graph source is *virtual* — every query re-reads the underlying table
 1. **Read-Only:** R2RML graph sources are read-only (no writes via Fluree)
 2. **Performance:** Complex joins across Fluree + Iceberg may be slow
 3. **Schema Changes:** Requires mapping updates when referenced columns change
+4. **No index-walking query patterns (fail-closed):** Property-path quantifiers
+   (`p+`, `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
+   `shortestPath`, and subqueries cannot be evaluated over a mapped source — it
+   has no native index for them to walk. A query using one is **refused** with
+   HTTP 400 `err:db/InvalidQuery` naming the pattern, rather than returning the
+   empty result it would otherwise produce as a success. Fixed-length patterns
+   (`p`, `p/p`, …) and unquantified `a|b` / `^p` lower to table scans and run
+   normally. See [Graph Sources Overview → Query Patterns a Graph Source Cannot
+   Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate) for the
+   bounded workaround, or materialize a native twin (below) for unbounded
+   traversal.
 
 ## Troubleshooting
 

@@ -51,8 +51,21 @@ pub fn heartbeat_record(elapsed_ms: u64, fuel: Option<f64>) -> String {
 }
 
 /// `end` record: success terminator carrying the final row count and, when
-/// tracked, the same `t`/`fuel`/`time` metadata the buffered endpoint reports.
-pub fn end_record(rows: u64, t: Option<i64>, fuel: Option<f64>, time: Option<&str>) -> String {
+/// tracked, the same `t`/`fuel`/`time`/`policy_enforcement` metadata the
+/// buffered endpoint reports.
+///
+/// `policy_enforcement` is present only when policy tracking was requested and
+/// a non-root policy context governed the query — the same presence rule the
+/// buffered response uses, so a client can read absence the same way on both
+/// surfaces. It is known before the first row is pulled but reported here,
+/// with the rest of the per-request metadata.
+pub fn end_record(
+    rows: u64,
+    t: Option<i64>,
+    fuel: Option<f64>,
+    time: Option<&str>,
+    policy_enforcement: Option<&fluree_db_core::PolicyEnforcement>,
+) -> String {
     let mut value = json!({ "type": "end", "rows": rows });
     if let Some(t) = t {
         value["t"] = json!(t);
@@ -62,6 +75,9 @@ pub fn end_record(rows: u64, t: Option<i64>, fuel: Option<f64>, time: Option<&st
     }
     if let Some(time) = time {
         value["time"] = json!(time);
+    }
+    if let Some(enforcement) = policy_enforcement {
+        value["policy_enforcement"] = json!(enforcement);
     }
     let mut line = value.to_string();
     line.push('\n');
@@ -117,16 +133,33 @@ mod tests {
 
     #[test]
     fn end_includes_only_tracked_fields() {
-        let v = parse(&end_record(50213, None, None, None));
+        let v = parse(&end_record(50213, None, None, None, None));
         assert_eq!(v["type"], "end");
         assert_eq!(v["rows"], 50213);
         assert!(v.get("t").is_none());
         assert!(v.get("fuel").is_none());
+        assert!(v.get("policy_enforcement").is_none());
 
-        let v = parse(&end_record(3, Some(42), Some(1.01), Some("12.34ms")));
+        let v = parse(&end_record(3, Some(42), Some(1.01), Some("12.34ms"), None));
         assert_eq!(v["t"], 42);
         assert_eq!(v["fuel"], 1.01);
         assert_eq!(v["time"], "12.34ms");
+    }
+
+    /// The streaming surface reports enforcement the same way the buffered one
+    /// does: present only when policy governed the request, so absence carries
+    /// the same "unenforced" meaning on both.
+    #[test]
+    fn end_carries_policy_enforcement_when_enforced() {
+        let enforcement = fluree_db_core::PolicyEnforcement {
+            enforced: true,
+            denies_all_data: true,
+        };
+        let v = parse(&end_record(0, Some(7), None, None, Some(&enforcement)));
+        assert_eq!(
+            v["policy_enforcement"],
+            json!({"enforced": true, "denies_all_data": true})
+        );
     }
 
     #[test]
