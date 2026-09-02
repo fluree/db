@@ -71,8 +71,21 @@ export interface QueryOptions {
   gcTime?: number;
 }
 
-/** Client connection lifecycle, as exposed by `useConnectionState`. */
-export type ConnectionState = "connecting" | "live" | "reconnecting" | "closed";
+/**
+ * Client connection lifecycle, as exposed by `useConnectionState`.
+ *
+ * `idle` means there is nothing to connect: no query is subscribed, or every
+ * subscribed query is time-anchored (`opts.at`) and so needs no live stream.
+ * It is distinct from `connecting` (a stream is being established) so a
+ * settled page does not show a perpetual spinner, and from `live` so a page
+ * that has dropped its last subscription does not show a stale "connected".
+ */
+export type ConnectionState =
+  | "idle"
+  | "connecting"
+  | "live"
+  | "reconnecting"
+  | "closed";
 
 /** Fully-resolved subscription parameters (post inference + defaults). */
 export interface ResolvedSpec {

@@ -445,6 +445,36 @@ describe("applying an advance-cycle", () => {
     expect(seen).toEqual([5, 8]);
   });
 
+  it("a stale head detach does not evict a re-subscribed watcher", () => {
+    // Component A watches a ledger, then unmounts — emptying and removing the
+    // ledger's listener set. Component B then mounts and watches the SAME
+    // ledger, getting a fresh set under that key. If A's cleanup runs again
+    // (React calls cleanup defensively, and a late unmount is ordinary), the
+    // stale closure must not delete the ledger entry and evict B — B would
+    // silently stop updating. This is the demo's own HeadBadge.
+    const { cache, transport } = setup();
+    const h = cache.handleFor(spec("q"));
+    observe(h);
+
+    const detachA = cache.onLedgerHead("my/ledger", () => {});
+    detachA(); // A unmounts: set empties, ledger entry removed.
+
+    const seenB: (number | undefined)[] = [];
+    cache.onLedgerHead("my/ledger", () =>
+      seenB.push(cache.ledgerHead("my/ledger")),
+    );
+    detachA(); // A's cleanup fires again — must be a no-op for B.
+
+    transport.emit({
+      ledger: "my/ledger",
+      t: 7,
+      changed: [],
+      unchanged: [h.subId],
+      errored: [],
+    });
+    expect(seenB).toEqual([7]);
+  });
+
   it("has every query already at the new head when it announces one", () => {
     const { cache, transport } = setup();
     const h = cache.handleFor(spec("q"));

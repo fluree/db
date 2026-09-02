@@ -67,11 +67,14 @@ describe("connecting", () => {
     expect(states).toEqual(["live"]);
   });
 
-  it("does not connect when there is nothing to watch", async () => {
+  it("does not connect when there is nothing to watch, and reports idle", async () => {
     const { server, states, connect } = setup(null);
     await connect();
     expect(server.eventConnects).toHaveLength(0);
-    expect(states).toEqual([]);
+    // No stream is opened, but the state is announced idle rather than left
+    // silent — otherwise a settled/time-travel-only page shows a perpetual
+    // "connecting" (or, after dropping its last watch, a stale "live").
+    expect(states).toEqual(["idle"]);
   });
 
   it("coalesces a burst of refreshes into one connection", async () => {

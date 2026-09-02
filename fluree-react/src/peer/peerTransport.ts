@@ -331,43 +331,65 @@ export class PeerTransport implements LiveTransport {
     errored: { subId: number; error: PeerError }[];
   }): void {
     if (this.closed) return;
-    const changed: CycleChange[] = [];
-    const unchanged: number[] = [];
-    const errored: CycleErrored[] = [];
-    // The engine names ledgers canonically (`demo/board:main`); the app
-    // subscribed with whatever it passed to `useQuery` (usually the bare
-    // name). Report cycles under the APP's spelling, or everything keyed by
-    // ledger downstream — `client.ledgerHead(ledger)` most visibly — is
-    // filed under a name the app never uses and silently reads as unknown.
-    let ledger: string | undefined;
-    const claim = (engineId: number): number | undefined => {
+    // Group by the SUBSCRIBING spec's ledger spelling, not a single spelling
+    // claimed from the first entry. The engine names ledgers canonically
+    // (`demo/board:main`), but one page can hold useQuery("demo/board") and
+    // useQuery("demo/board:main") at once; each must be delivered — and keyed
+    // downstream (`client.ledgerHead`) — under the spelling ITS subscription
+    // used, or the other spelling reads as unknown and its head never fires.
+    type Bucket = {
+      changed: CycleChange[];
+      unchanged: number[];
+      errored: CycleErrored[];
+    };
+    const byLedger = new Map<string, Bucket>();
+    const bucketFor = (ledger: string): Bucket => {
+      let b = byLedger.get(ledger);
+      if (!b) {
+        b = { changed: [], unchanged: [], errored: [] };
+        byLedger.set(ledger, b);
+      }
+      return b;
+    };
+    const resolve = (
+      engineId: number,
+    ): { subId: number; ledger: string } | undefined => {
       const subId = this.byEngineId.get(engineId);
       if (subId === undefined) return undefined;
-      ledger ??= this.subs.get(subId)?.spec.ledger;
-      return subId;
+      const ledger = this.subs.get(subId)?.spec.ledger;
+      if (ledger === undefined) return undefined;
+      return { subId, ledger };
     };
 
     for (const entry of cycle.changed) {
-      const subId = claim(entry.subId);
-      if (subId !== undefined) changed.push({ subId, payload: entry.data });
+      const r = resolve(entry.subId);
+      if (r) bucketFor(r.ledger).changed.push({ subId: r.subId, payload: entry.data });
     }
     for (const engineId of cycle.unchanged) {
-      const subId = claim(engineId);
-      if (subId !== undefined) unchanged.push(subId);
+      const r = resolve(engineId);
+      if (r) bucketFor(r.ledger).unchanged.push(r.subId);
     }
     for (const entry of cycle.errored) {
-      const subId = claim(entry.subId);
-      if (subId !== undefined) {
-        errored.push({ subId, error: toQueryError(entry.error) });
+      const r = resolve(entry.subId);
+      if (r) {
+        bucketFor(r.ledger).errored.push({
+          subId: r.subId,
+          error: toQueryError(entry.error),
+        });
       }
     }
-    if (ledger === undefined) {
-      return; // nothing in this cycle belongs to us
-    }
 
-    const update: CycleUpdate = { ledger, changed, unchanged, errored };
-    if (cycle.t !== undefined) update.t = cycle.t;
-    this.sink?.onCycle(update);
+    // One coherent CycleUpdate per distinct ledger spelling (as failAll does).
+    for (const [ledger, b] of byLedger) {
+      const update: CycleUpdate = {
+        ledger,
+        changed: b.changed,
+        unchanged: b.unchanged,
+        errored: b.errored,
+      };
+      if (cycle.t !== undefined) update.t = cycle.t;
+      this.sink?.onCycle(update);
+    }
   }
 
   async fetchOnce(spec: ResolvedSpec): Promise<unknown> {

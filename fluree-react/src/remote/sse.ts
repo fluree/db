@@ -20,7 +20,12 @@ export interface SseMessage {
   id?: string;
 }
 
-export type SseState = "connecting" | "live" | "reconnecting" | "closed";
+export type SseState =
+  | "idle"
+  | "connecting"
+  | "live"
+  | "reconnecting"
+  | "closed";
 
 export interface SseSourceOptions {
   /** Resolve the current stream URL; `null` means nothing to watch. */
@@ -70,7 +75,14 @@ export class SseSource {
       this.generation++;
       this.ctrl?.abort();
       const url = this.opts.url();
-      if (url === null) return; // idle: nothing subscribed
+      if (url === null) {
+        // Nothing (live) to subscribe to: no watched ledger, or every watch
+        // is time-anchored. Announce idle so the indicator does not keep
+        // showing the aborted stream's last state ("live") or a perpetual
+        // "connecting" on a page that never opens a stream.
+        this.opts.onState("idle");
+        return;
+      }
       void this.runLoop(this.generation, url);
     }, this.refreshDebounceMs);
   }

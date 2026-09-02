@@ -51,6 +51,24 @@ const INITIAL_STATE: QueryResult = Object.freeze({
   t: undefined,
 });
 
+/**
+ * Snapshot for a query first observed AFTER the client was closed. A frozen
+ * singleton so `getSnapshot` stays referentially stable (a fresh object each
+ * call would loop `useSyncExternalStore`). Distinct from `INITIAL_STATE`: a
+ * closed cache never observes or fetches, so a new query would otherwise sit
+ * in `loading` forever with nothing to move it — the same silent-freeze shape
+ * the transport-contract guard elsewhere goes out of its way to make loud.
+ */
+const CLOSED_STATE: QueryResult = Object.freeze({
+  data: undefined,
+  status: "error" as const,
+  error: Object.freeze({
+    code: "client-closed",
+    message: "the Fluree client was closed before this query was observed",
+  }),
+  t: undefined,
+});
+
 function sameError(a: QueryError | undefined, b: QueryError): boolean {
   return (
     a !== undefined &&
@@ -198,8 +216,11 @@ export class QueryCache {
     const existing = this.byKey.get(key);
     if (existing) return existing.state;
     // A closed cache mints nothing: handles survive `close()` precisely so
-    // a still-mounted component keeps rendering what it last had.
-    if (this.closed) return INITIAL_STATE;
+    // a still-mounted component keeps rendering what it last had (the
+    // `existing` branch above). A query first observed AFTER close has no
+    // handle and never will — surface a typed error rather than a permanent
+    // `loading` that nothing can ever resolve.
+    if (this.closed) return CLOSED_STATE;
     return this.liveHandleFor(key, spec, gcTime).state;
   }
 
@@ -260,9 +281,18 @@ export class QueryCache {
       this.headListeners.set(ledger, set);
     }
     set.add(listener);
+    let removed = false;
     return () => {
+      if (removed) return; // React may call cleanup defensively
+      removed = true;
       set.delete(listener);
-      if (set.size === 0) this.headListeners.delete(ledger);
+      // Only drop the ledger's entry if THIS set is still the registered one.
+      // A later re-subscribe may have replaced it with a fresh set under the
+      // same ledger; deleting then would evict that other component's
+      // listeners (they would silently stop updating).
+      if (set.size === 0 && this.headListeners.get(ledger) === set) {
+        this.headListeners.delete(ledger);
+      }
     };
   }
 

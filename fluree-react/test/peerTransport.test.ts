@@ -250,6 +250,41 @@ describe("cycle translation", () => {
     expect(sink.cycles[0]!.ledger).toBe("demo/board");
   });
 
+  it("splits a cycle spanning two spellings of one ledger, one update per spelling", async () => {
+    // A page can hold useQuery("demo/board") and useQuery("demo/board:main")
+    // at once. The engine names both canonically and reports them in one
+    // cycle; each must be delivered — and keyed for client.ledgerHead — under
+    // its OWN subscription's spelling. Filing the whole cycle under one
+    // spelling leaves the other reading as unknown, its head never firing.
+    const { engine, sink, transport } = setup();
+    await flush();
+    const bare = spec({ ledger: "demo/board", text: "qa" });
+    const full = spec({ ledger: "demo/board:main", text: "qb" });
+    transport.subscribe(bare);
+    transport.subscribe(full);
+    await flush();
+
+    engine.emitCycle(
+      cycle({
+        ledger: "demo/board:main",
+        t: 4,
+        changed: [
+          { subId: engine.subId(0), data: { rows: ["a"] } },
+          { subId: engine.subId(1), data: { rows: ["b"] } },
+        ],
+      }),
+    );
+
+    expect(sink.cycles).toHaveLength(2);
+    const byLedger = new Map(sink.cycles.map((c) => [c.ledger, c]));
+    expect(byLedger.get("demo/board")?.changed).toEqual([
+      { subId: bare.subId, payload: { rows: ["a"] } },
+    ]);
+    expect(byLedger.get("demo/board:main")?.changed).toEqual([
+      { subId: full.subId, payload: { rows: ["b"] } },
+    ]);
+  });
+
   it("carries an absent watermark through rather than inventing one", async () => {
     const { engine, sink, transport } = setup();
     await flush();
