@@ -67,6 +67,40 @@ async fn props(fluree: &Fluree, ledger_id: &str, subject: &str) -> Vec<String> {
     rows_to_pairs(&out.to_jsonld(&view.snapshot).expect("jsonld"))
 }
 
+/// A view whose snapshot is INDEXED (`snapshot.t > 0`). After a commit, the
+/// cached handle re-adopts the persisted index asynchronously and `db()` can
+/// briefly return an unindexed view (snapshot.t == 0) that bypasses the
+/// binary-scan path entirely — which would let a span-pinned test pass
+/// vacuously. Poll until the index is back.
+async fn indexed_view(fluree: &Fluree) -> fluree_db_api::GraphDb {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let v = fluree.db(LEDGER).await.expect("db view");
+        if v.snapshot.t > 0 {
+            return v;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "indexed view never came back after commit"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// `props` against a caller-supplied view (so tests can pin the view state).
+async fn props_on(fluree: &Fluree, view: &fluree_db_api::GraphDb, subject: &str) -> Vec<String> {
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?p", "?o"],
+        "where": {"@id": subject, "?p": "?o"}
+    });
+    let out = fluree
+        .query(view, QueryInput::JsonLd(&q))
+        .await
+        .expect("query");
+    rows_to_pairs(&out.to_jsonld(&view.snapshot).expect("jsonld"))
+}
+
 fn rows_to_pairs(jsonld: &Value) -> Vec<String> {
     let mut v: Vec<String> = jsonld
         .as_array()
@@ -464,12 +498,16 @@ use crate::support::span_capture;
 /// novelty window must abandon the bounded product and take the whole-graph
 /// cached path — observable as `overlay_translate{bounded=true fallback=true}`
 /// — with results identical to what the bounded product would have produced.
+///
+/// `N` is sized so the matched set clears `BOUNDED_WALK_GUARD_MIN_MATCHED`
+/// (the retag commit produces 2N matched ops); below that floor the guard is
+/// skipped entirely — see `tiny_unselective_bracket_stays_bounded_below_floor`.
 #[tokio::test(flavor = "current_thread")]
 async fn unselective_bound_predicate_falls_back_to_whole_graph_path() {
     let (fluree, _dir) = new_fluree().await;
     let mut ledger = fluree.create_ledger(LEDGER).await.expect("create");
 
-    const N: usize = 20;
+    const N: usize = 200;
     ledger = fluree
         .insert(ledger, &seed_graph(N))
         .await
@@ -615,5 +653,231 @@ async fn selective_brackets_stay_bounded() {
         }),
         "bound-subject scan did not stay bounded: {:?}",
         spans2.iter().map(|s| &s.fields).collect::<Vec<_>>()
+    );
+}
+
+/// An unselective bracket BELOW the guard's absolute floor
+/// (`BOUNDED_WALK_GUARD_MIN_MATCHED`) must stay bounded: a matched set this
+/// small is trivially cheap to rebuild per execution, so even at ~100% of a
+/// tiny novelty window there is nothing to amortize — and the guard's
+/// O(segments) denominator must not run at all. Results still pinned first.
+#[tokio::test(flavor = "current_thread")]
+async fn tiny_unselective_bracket_stays_bounded_below_floor() {
+    let (fluree, _dir) = new_fluree().await;
+    let mut ledger = fluree.create_ledger(LEDGER).await.expect("create");
+
+    const N: usize = 20; // retag produces 2N = 40 matched ops, far below the floor
+    ledger = fluree
+        .insert(ledger, &seed_graph(N))
+        .await
+        .expect("seed")
+        .ledger;
+    fluree
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let update = json!({
+        "@context": ctx(),
+        "where":  {"@id": "?s", "ex:tag": "?t"},
+        "delete": {"@id": "?s", "ex:tag": "?t"},
+        "insert": {"@id": "?s", "ex:tag": "retagged"}
+    });
+    fluree.update(ledger, &update).await.expect("retag all");
+
+    let (store, _guard) = span_capture::init_test_tracing();
+
+    let view = fluree.db(LEDGER).await.expect("view");
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?s", "?o"],
+        "where": {"@id": "?s", "ex:tag": "?o"}
+    });
+    let out = fluree
+        .query(&view, QueryInput::JsonLd(&q))
+        .await
+        .expect("query");
+    let rows = rows_to_pairs(&out.to_jsonld(&view.snapshot).expect("jsonld"));
+
+    assert_eq!(rows.len(), N, "one row per subject expected: {rows:?}");
+    assert!(
+        rows.iter().all(|r| r.contains("retagged")),
+        "stale or missing tag values below the guard floor: {rows:?}"
+    );
+
+    let spans = store.find_spans("overlay_translate");
+    assert!(
+        spans.iter().any(|s| {
+            s.fields.get("bounded").map(String::as_str) == Some("true")
+                && !s.fields.contains_key("fallback")
+        }),
+        "tiny unselective bracket did not stay bounded: {:?}",
+        spans.iter().map(|s| &s.fields).collect::<Vec<_>>()
+    );
+    assert!(
+        !spans
+            .iter()
+            .any(|s| s.fields.get("fallback").map(String::as_str) == Some("true")),
+        "guard tripped below its absolute floor: {:?}",
+        spans.iter().map(|s| &s.fields).collect::<Vec<_>>()
+    );
+}
+
+// =============================================================================
+// Warm-cache-first (whole-graph product short-circuits the bounded seek)
+// =============================================================================
+
+/// The warm-first probe, end to end, with the differential identity at its
+/// centre:
+///
+/// 1. a bound-subject query COLD at this epoch takes the bounded seek;
+/// 2. an unbracketed scan then builds + caches the whole-graph product;
+/// 3. the same bound-subject query now short-circuits to the warm product
+///    (`bounded=true cache_hit=true`, no seek) and MUST return byte-identical
+///    rows to the cold seek — the two paths are interchangeable or the
+///    warm-first optimization is unsound;
+/// 4. a further commit moves the overlay epoch, and the warm product from the
+///    old epoch must NOT be served: the query must see the newest value.
+#[tokio::test(flavor = "current_thread")]
+async fn warm_whole_product_short_circuits_and_respects_epoch() {
+    let (fluree, _dir) = new_fluree().await;
+    let mut ledger = fluree.create_ledger(LEDGER).await.expect("create");
+
+    const N: usize = 12;
+    ledger = fluree
+        .insert(ledger, &seed_graph(N))
+        .await
+        .expect("seed")
+        .ledger;
+    fluree
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    // Novelty commit: recolour item0..item3 (epoch E).
+    let deletes: Vec<Value> = (0..4)
+        .map(|i| json!({"@id": format!("ex:item{i}"), "ex:colour": format!("colour{i}")}))
+        .collect();
+    let inserts: Vec<Value> = (0..4)
+        .map(|i| json!({"@id": format!("ex:item{i}"), "ex:colour": format!("recolour{i}")}))
+        .collect();
+    let update = json!({"@context": ctx(), "delete": deletes, "insert": inserts});
+    let ledger = fluree
+        .update(ledger, &update)
+        .await
+        .expect("recolour")
+        .ledger;
+
+    // (1) Cold bounded seek: reference rows for the differential check.
+    // (`indexed_view` polls past the post-commit index re-adoption window, so
+    // every step here provably exercises the binary-scan path — asserted by
+    // the positive span markers.)
+    let (store_cold, guard_cold) = span_capture::init_test_tracing();
+    let view1 = indexed_view(&fluree).await;
+    let cold_rows = props_on(&fluree, &view1, "ex:item1").await;
+    assert!(
+        cold_rows.iter().any(|r| r.contains("recolour1")),
+        "novelty recolour missing from the cold bounded read: {cold_rows:?}"
+    );
+    let cold_spans = store_cold.find_spans("overlay_translate");
+    assert!(
+        cold_spans.iter().any(|s| {
+            s.fields.get("bounded").map(String::as_str) == Some("true")
+                && s.fields.get("cache_hit").map(String::as_str) == Some("false")
+        }),
+        "cold bound-subject read did not take the bounded seek: {:?}",
+        cold_spans.iter().map(|s| &s.fields).collect::<Vec<_>>()
+    );
+    drop(guard_cold);
+
+    // (2) + (3): warm the whole-graph product, then re-read the same subject.
+    // The cross-query cache is a small process-wide LRU, so a concurrently
+    // running test binary's own inserts can evict the freshly-built product
+    // between the two queries; retry the warm+probe pair once before treating
+    // a missed short-circuit as a failure. The differential identity assert
+    // stays unconditional either way.
+    let mut warm_hit_seen = false;
+    for _attempt in 0..2 {
+        let (store_warm, _guard_warm) = span_capture::init_test_tracing();
+        let view = indexed_view(&fluree).await;
+        let scan = json!({
+            "@context": ctx(),
+            "select": ["?s", "?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"}
+        });
+        let out = fluree
+            .query(&view, QueryInput::JsonLd(&scan))
+            .await
+            .expect("unbracketed scan");
+        let _ = out.to_jsonld(&view.snapshot).expect("jsonld");
+
+        let warm_rows = props_on(&fluree, &view, "ex:item1").await;
+        assert_eq!(
+            cold_rows, warm_rows,
+            "warm-served rows differ from the cold bounded seek"
+        );
+
+        let spans = store_warm.find_spans("overlay_translate");
+        assert!(
+            spans
+                .iter()
+                .any(|s| { s.fields.get("bounded").map(String::as_str) == Some("false") }),
+            "unbracketed scan did not take the whole-graph path: {:?}",
+            spans.iter().map(|s| &s.fields).collect::<Vec<_>>()
+        );
+        warm_hit_seen = spans.iter().any(|s| {
+            s.fields.get("bounded").map(String::as_str) == Some("true")
+                && s.fields.get("cache_hit").map(String::as_str) == Some("true")
+                && !s.fields.contains_key("fallback")
+        });
+        if warm_hit_seen {
+            break;
+        }
+    }
+    assert!(
+        warm_hit_seen,
+        "bound-subject read never short-circuited to the warm whole-graph product"
+    );
+
+    // (4) Epoch moves: the warm product from epoch E is stale and must miss.
+    let update2 = json!({
+        "@context": ctx(),
+        "delete": {"@id": "ex:item1", "ex:colour": "recolour1"},
+        "insert": {"@id": "ex:item1", "ex:colour": "recolour1-again"}
+    });
+    fluree
+        .update(ledger, &update2)
+        .await
+        .expect("recolour again");
+
+    let (store_after, _guard_after) = span_capture::init_test_tracing();
+    let view4 = indexed_view(&fluree).await;
+    let after_rows = props_on(&fluree, &view4, "ex:item1").await;
+    assert!(
+        after_rows.iter().any(|r| r.contains("recolour1-again")),
+        "stale warm product served across an epoch change: {after_rows:?}"
+    );
+    assert!(
+        !after_rows.iter().any(|r| r.contains("\"recolour1\"")),
+        "retracted value resurfaced after the epoch change: {after_rows:?}"
+    );
+    let after_spans = store_after.find_spans("overlay_translate");
+    // Positive ran-marker first: the fresh-epoch read must have taken the
+    // bounded binary path at all, or the staleness assertions below are
+    // vacuous (an unindexed view diverts to the range fallback and would
+    // "pass" without exercising the warm probe).
+    assert!(
+        after_spans
+            .iter()
+            .any(|s| s.fields.get("bounded").map(String::as_str) == Some("true")),
+        "fresh-epoch read never took the bounded binary path: {:?}",
+        after_spans.iter().map(|s| &s.fields).collect::<Vec<_>>()
+    );
+    assert!(
+        !after_spans
+            .iter()
+            .any(|s| { s.fields.get("cache_hit").map(String::as_str) == Some("true") }),
+        "a cache hit was recorded at a fresh epoch — warm key must include the overlay epoch: {:?}",
+        after_spans.iter().map(|s| &s.fields).collect::<Vec<_>>()
     );
 }

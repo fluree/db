@@ -2407,18 +2407,54 @@ impl Operator for BinaryScanOperator {
             );
             let _translate_guard = translate_span.enter();
 
-            // The whole-graph product: per-execution memo, then the cross-query
-            // layer, then a fresh build. Taken when nothing brackets the walk,
-            // and as the selectivity-guard fallback below.
-            let whole_graph_product = || {
+            // Warm probe for the whole-graph product at (epoch, g_id, index):
+            // the per-execution memo, then the cross-query
+            // `global_translation_cache`. Returns only what is already warm —
+            // it NEVER builds — so the bounded branch below can consult it
+            // without ever paying an O(novelty) translate for a product it
+            // didn't need. A global hit is promoted into the per-execution
+            // memo so nested-loop reopens against the same execution hit the
+            // cheaper layer.
+            // Single source of truth for the cross-query key, shared by the
+            // warm probe and the build path below so the two can never
+            // disagree on a key dimension.
+            let make_global_key = || GlobalTranslationKey {
+                ledger_id: ctx.active_snapshot.ledger_id.as_str().into(),
+                snapshot_t: ctx.active_snapshot.t,
+                overlay_epoch: epoch,
+                store_id: store_arc.store_id(),
+                to_t: ctx.to_t,
+                g_id: self.g_id,
+                index: self.index,
+            };
+
+            let warm_whole_product = || -> Option<Arc<TranslatedOverlayOps>> {
                 let cache_key = (epoch, self.g_id, self.index, OverlayWalkScope::Whole);
-                let mut cache = ctx
-                    .translated_overlay_cache
+                {
+                    let cache = ctx
+                        .translated_overlay_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(hit) = cache.get(&cache_key) {
+                        translate_span.record("cache_hit", true);
+                        return Some(Arc::clone(hit));
+                    }
+                }
+                let hit = global_translation_cache().get(&make_global_key())?;
+                translate_span.record("cache_hit", true);
+                ctx.translated_overlay_cache
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(hit) = cache.get(&cache_key) {
-                    translate_span.record("cache_hit", true);
-                    return Arc::clone(hit);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(cache_key, Arc::clone(&hit));
+                Some(hit)
+            };
+
+            // The whole-graph product: the warm layers above, then a fresh
+            // build (inserted into both cache layers). Taken when nothing
+            // brackets the walk, and as the selectivity-guard fallback below.
+            let whole_graph_product = || {
+                if let Some(hit) = warm_whole_product() {
+                    return hit;
                 }
                 translate_span.record("cache_hit", false);
                 // `overlay_segments` allocates, so only pay for it when a
@@ -2433,61 +2469,70 @@ impl Operator for BinaryScanOperator {
                 // materializations) cost O(overlay × dict lookups) to
                 // translate, which would otherwise put a flat multi-second
                 // floor under every query at scale.
-                let global_key = GlobalTranslationKey {
-                    ledger_id: ctx.active_snapshot.ledger_id.as_str().into(),
-                    snapshot_t: ctx.active_snapshot.t,
-                    overlay_epoch: epoch,
-                    store_id: store_arc.store_id(),
-                    to_t: ctx.to_t,
-                    g_id: self.g_id,
-                    index: self.index,
-                };
-                let entry = if let Some(hit) = global_translation_cache().get(&global_key) {
-                    hit
-                } else {
-                    // Segment-aware path (raw Novelty): assemble from
-                    // per-segment caches so a write burst re-translates only
-                    // new segments. Falls back to the whole-graph translate
-                    // for non-segment-native overlays or an uncacheable
-                    // segment. Both paths return ops sorted by `order`; the
-                    // merged product is then resolved + cached per epoch.
-                    let (mut ops, mut untranslated, ephemeral_preds) =
-                        match collect_segment_merged_ops(
-                            ctx, &store_arc, self.g_id, self.index, ctx.to_t,
-                        ) {
-                            Some(triple) => triple,
-                            None => {
-                                let (mut ops, untrans, eph) =
-                                    translate_overlay_flakes_with_untranslated(
-                                        ctx.overlay(),
-                                        &store_arc,
-                                        ctx.dict_novelty.as_ref(),
-                                        ctx.runtime_small_dicts,
-                                        ctx.to_t,
-                                        self.g_id,
-                                    );
-                                sort_overlay_ops(&mut ops, order);
-                                (ops, untrans, eph)
-                            }
-                        };
-                    resolve_overlay_ops(&mut ops);
-                    if !untranslated.is_empty() {
-                        untranslated.sort_by(self.index.comparator());
-                        untranslated = resolve_overlay_retractions(untranslated);
+                let global_key = make_global_key();
+                // Segment-aware path (raw Novelty): assemble from
+                // per-segment caches so a write burst re-translates only
+                // new segments. Falls back to the whole-graph translate
+                // for non-segment-native overlays or an uncacheable
+                // segment. Both paths return ops sorted by `order`; the
+                // merged product is then resolved + cached per epoch.
+                let (mut ops, mut untranslated, ephemeral_preds) = match collect_segment_merged_ops(
+                    ctx, &store_arc, self.g_id, self.index, ctx.to_t,
+                ) {
+                    Some(triple) => triple,
+                    None => {
+                        let (mut ops, untrans, eph) = translate_overlay_flakes_with_untranslated(
+                            ctx.overlay(),
+                            &store_arc,
+                            ctx.dict_novelty.as_ref(),
+                            ctx.runtime_small_dicts,
+                            ctx.to_t,
+                            self.g_id,
+                        );
+                        sort_overlay_ops(&mut ops, order);
+                        (ops, untrans, eph)
                     }
-                    let entry = Arc::new(TranslatedOverlayOps {
-                        ops: ops.into(),
-                        untranslated,
-                        ephemeral_preds,
-                    });
-                    global_translation_cache().insert(global_key, Arc::clone(&entry));
-                    entry
                 };
-                cache.insert(cache_key, Arc::clone(&entry));
+                resolve_overlay_ops(&mut ops);
+                if !untranslated.is_empty() {
+                    untranslated.sort_by(self.index.comparator());
+                    untranslated = resolve_overlay_retractions(untranslated);
+                }
+                let entry = Arc::new(TranslatedOverlayOps {
+                    ops: ops.into(),
+                    untranslated,
+                    ephemeral_preds,
+                });
+                global_translation_cache().insert(global_key, Arc::clone(&entry));
+                ctx.translated_overlay_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        (epoch, self.g_id, self.index, OverlayWalkScope::Whole),
+                        Arc::clone(&entry),
+                    );
                 entry
             };
 
-            let translated = if let Some(walk) = bounded.as_ref() {
+            // Warm-first: when a whole-graph product for this (epoch, g_id,
+            // index) is already warm, a cache hit is cheaper than even a
+            // bounded seek, and the cursor windows the whole product down to
+            // the bound term via `overlay_window_for_range` exactly as the
+            // pre-bounded path always did — so a warm cache is by definition
+            // the case where bounding has nothing left to win. The probe never
+            // builds: a cold or churning epoch misses in two lookups and keeps
+            // the seek. This is what restores `global_translation_cache`
+            // amortization on read-heavy windows at a stable epoch (where the
+            // product gets built once by some unbracketed or guard-tripped
+            // scan) without giving up the seek under sustained writes.
+            let warm_hit = if bounded.is_some() {
+                warm_whole_product()
+            } else {
+                None
+            };
+            let translated = if let Some(warm) = warm_hit {
+                warm
+            } else if let Some(walk) = bounded.as_ref() {
                 // Bounded path — uncached end to end. The per-execution memo
                 // is skipped (see the note atop this block), the cross-query
                 // `global_translation_cache` is skipped (its key has no scope
@@ -2524,11 +2569,21 @@ impl Operator for BinaryScanOperator {
                 // lost.) The walk already cost O(matched) either way; the
                 // guard only converts a repeated per-execution cost into a
                 // cached one.
+                //
+                // The absolute floor comes first: below it the bounded product
+                // is trivially cheap no matter what share of the window it is,
+                // so the guard doesn't run at all — which also means the
+                // O(segments) `overlay_flake_count` denominator is only ever
+                // computed when the walk has already done at least
+                // floor-matched work to amortize it against.
                 let matched = ops.len() + untranslated.len();
-                let unselective = ctx
-                    .overlay()
-                    .overlay_flake_count(self.g_id)
-                    .is_some_and(|total| matched * 100 > total * BOUNDED_WALK_MAX_MATCH_PERCENT);
+                let unselective = matched >= BOUNDED_WALK_GUARD_MIN_MATCHED
+                    && ctx
+                        .overlay()
+                        .overlay_flake_count(self.g_id)
+                        .is_some_and(|total| {
+                            matched * 100 > total * BOUNDED_WALK_MAX_MATCH_PERCENT
+                        });
                 if unselective {
                     translate_span.record("fallback", true);
                     whole_graph_product()
@@ -2899,6 +2954,16 @@ struct BoundedOverlayWalk {
 /// both scopes uniformly — a subject matching a quarter of novelty is
 /// pathological, but the guard is nearly free.
 const BOUNDED_WALK_MAX_MATCH_PERCENT: usize = 25;
+
+/// Absolute floor under which the selectivity guard is skipped entirely: a
+/// bounded product this small is trivially cheap to rebuild per execution
+/// (O(matched) translate + sort), so even at 100% of a tiny novelty window it
+/// is never worth discarding for the whole-graph cached path. The floor is
+/// checked BEFORE the guard's `overlay_flake_count` denominator, so the
+/// O(segments) count is only computed on walks that already matched at least
+/// this many ops — the denominator's cost stays amortized against matched
+/// work instead of being a fixed per-open tax on every selective seek.
+const BOUNDED_WALK_GUARD_MIN_MATCHED: usize = 256;
 
 /// Translate overlay flakes to V3 overlay ops, also returning flakes that cannot be translated
 /// and the mapping of novelty-only predicate IRIs to ephemeral p_ids.
