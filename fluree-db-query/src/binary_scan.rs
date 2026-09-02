@@ -3664,20 +3664,27 @@ fn infer_exact_datatype_sid_from_stats(
     value: &FlakeValue,
 ) -> Option<Sid> {
     let stats = stats_view?.get_graph_property(g_id, p_id)?;
-    let present: Vec<fluree_db_core::ValueTypeTag> = stats
-        .datatypes
-        .iter()
-        .filter_map(|(tag, count)| (*count > 0).then_some(*tag))
-        .collect();
+    // Read the observed-tag *set*, never the `datatypes` counts: the counts
+    // are novelty-merged as a blind ±1 delta log, so a no-op delete naming a
+    // tag the base carries can zero that tag out while its data is still
+    // there — and a scan narrowed to the surviving tag then returns rows that
+    // don't match the query (#1738). The observed set is monotone under
+    // retraction (asserts add, no retraction removes), and for a read below
+    // the published index `t` the stats builder substitutes the historical
+    // set (or clears it below the accumulation boundary), so "only one
+    // string-compatible tag" is a conclusive statement about the whole
+    // logical DB at the queried `t`. Empty means "unknown": no narrowing.
+    if stats.observed_datatypes.is_empty() {
+        return None;
+    }
+    let present: &[fluree_db_core::ValueTypeTag] = &stats.observed_datatypes;
 
     // Untyped string values can only match string-compatible datatypes, so
     // non-string tags on the predicate (int/date/ref/…) are irrelevant. Narrow
     // when exactly one string-compatible tag is present and it is non-lang
     // (langString needs a language id → multi-slice path). UNKNOWN is unsafe —
     // it may stand in for a string-valued datatype, so its presence declines
-    // narrowing. These stats are novelty-aware (the datatype set reflects base +
-    // novelty), so "only one string-compatible tag" is a conclusive statement
-    // about the whole logical DB, not just the base index.
+    // narrowing.
     if matches!(value, FlakeValue::String(_)) {
         if present.contains(&fluree_db_core::ValueTypeTag::UNKNOWN) {
             return None;
@@ -3698,7 +3705,7 @@ fn infer_exact_datatype_sid_from_stats(
     }
 
     // Non-string values: exact single-datatype inference.
-    let mut tags = present;
+    let mut tags = present.to_vec();
     tags.sort();
     tags.dedup();
     if tags.len() != 1 {
@@ -4242,8 +4249,10 @@ mod tests {
     use super::*;
     use fluree_db_core::{stats_view::GraphPropertyStatData, StatsView, ValueTypeTag};
 
-    #[test]
-    fn infer_exact_datatype_for_integer_family() {
+    fn stats_with(
+        datatypes: Vec<(ValueTypeTag, u64)>,
+        observed_datatypes: Vec<ValueTypeTag>,
+    ) -> StatsView {
         let mut stats = StatsView::default();
         stats.graph_properties.insert(
             0,
@@ -4253,10 +4262,17 @@ mod tests {
                     count: 10,
                     ndv_values: 0,
                     ndv_subjects: 0,
-                    datatypes: vec![(ValueTypeTag::INT, 10)],
+                    datatypes,
+                    observed_datatypes,
                 },
             )]),
         );
+        stats
+    }
+
+    #[test]
+    fn infer_exact_datatype_for_integer_family() {
+        let stats = stats_with(vec![(ValueTypeTag::INT, 10)], vec![ValueTypeTag::INT]);
 
         let inferred = infer_exact_datatype_sid_from_stats(
             Some(&stats),
@@ -4271,18 +4287,9 @@ mod tests {
 
     #[test]
     fn does_not_infer_when_multiple_datatypes_present() {
-        let mut stats = StatsView::default();
-        stats.graph_properties.insert(
-            0,
-            HashMap::from([(
-                RuntimePredicateId::from_u32(7),
-                GraphPropertyStatData {
-                    count: 10,
-                    ndv_values: 0,
-                    ndv_subjects: 0,
-                    datatypes: vec![(ValueTypeTag::INT, 5), (ValueTypeTag::LONG, 5)],
-                },
-            )]),
+        let stats = stats_with(
+            vec![(ValueTypeTag::INT, 5), (ValueTypeTag::LONG, 5)],
+            vec![ValueTypeTag::INT, ValueTypeTag::LONG],
         );
 
         assert!(infer_exact_datatype_sid_from_stats(
@@ -4292,5 +4299,113 @@ mod tests {
             &FlakeValue::Long(42),
         )
         .is_none());
+    }
+
+    /// #1738's mechanism, pinned at the consumer: a spurious retraction can
+    /// zero a tag out of the count breakdown while its data still exists, so
+    /// the counts saying "one tag" while the observed set remembers two must
+    /// NOT narrow — the set wins.
+    #[test]
+    fn observed_set_vetoes_narrowing_when_counts_dropped_a_tag() {
+        let stats = stats_with(
+            vec![(ValueTypeTag::LONG, 5)],
+            vec![ValueTypeTag::INT, ValueTypeTag::LONG],
+        );
+
+        assert!(infer_exact_datatype_sid_from_stats(
+            Some(&stats),
+            0,
+            RuntimePredicateId::from_u32(7),
+            &FlakeValue::Long(42),
+        )
+        .is_none());
+    }
+
+    /// An empty observed set means "unknown" (a read below the historical
+    /// accumulation boundary, or a producer that could not fill it) and must
+    /// fail closed, even when the counts look conclusive.
+    #[test]
+    fn empty_observed_set_declines_narrowing() {
+        let stats = stats_with(vec![(ValueTypeTag::INT, 10)], vec![]);
+
+        assert!(infer_exact_datatype_sid_from_stats(
+            Some(&stats),
+            0,
+            RuntimePredicateId::from_u32(7),
+            &FlakeValue::Long(42),
+        )
+        .is_none());
+    }
+
+    /// Every upper-bound builder in the tree must pin `t` to `i64::MAX` and
+    /// `op` to `true`.
+    ///
+    /// That pin is what makes the `FlakeMeta::max()` narrowing unreachable
+    /// (see its doc in `fluree-db-core/src/flake.rs`): `{lang: Some(_),
+    /// i: Some(i32::MAX)}` sorts strictly above `FlakeMeta::max()`, so an
+    /// inclusive upper bound would exclude it — except that all four index
+    /// comparators compare `t` and `op` *before* the metadata tiebreak, and
+    /// no real flake carries `t == i64::MAX`. The guard therefore lives in
+    /// the builders, and this test quantifies over all six of them: the four
+    /// `Flake::max_*` in `fluree-db-core` (`max_psot` delegates to
+    /// `max_spot`, asserted anyway so de-aliasing it can't drop the pin),
+    /// plus `predicate_walk_bounds` in `fast_path_common` and
+    /// `overlay_walk_bounds` here.
+    ///
+    /// A new bound builder belongs in this list; one that deliberately does
+    /// not pin `t` must instead show why reaching the narrowing is safe.
+    #[test]
+    fn every_bound_builder_pins_the_sentinel_guard() {
+        let s = Sid::new(3, "s");
+        let p = Sid::new(5, "p");
+
+        let assert_pinned = |name: &str, upper: &Flake| {
+            assert_eq!(
+                upper.t,
+                i64::MAX,
+                "{name} must pin t to i64::MAX — it is the guard that keeps \
+                 FlakeMeta::max()'s narrowing unreachable"
+            );
+            assert!(upper.op, "{name} must pin op to true");
+        };
+
+        // The four core builders (plus the max_spot alias).
+        assert_pinned("Flake::max_spot", &Flake::max_spot());
+        assert_pinned("Flake::max_psot", &Flake::max_psot());
+        assert_pinned("Flake::max_for_subject", &Flake::max_for_subject(s.clone()));
+        assert_pinned(
+            "Flake::max_for_subject_predicate",
+            &Flake::max_for_subject_predicate(s.clone(), p.clone()),
+        );
+        assert_pinned(
+            "Flake::max_for_predicate",
+            &Flake::max_for_predicate(p.clone()),
+        );
+
+        // The two query-side builders.
+        let (_, rhs) = crate::fast_path_common::predicate_walk_bounds(&p);
+        assert_pinned("predicate_walk_bounds", &rhs);
+
+        // `overlay_walk_bounds` needs an operator instance; a bound-s/bound-p
+        // pattern routes to Spot, whose leading component is pinned, so the
+        // builder returns bounds. Exercise both `o_bounds` arms — the
+        // unbound-object full range and the bound-object pin — since each
+        // constructs its own `rhs`.
+        let pattern = TriplePattern::new(
+            Ref::Sid(s.clone()),
+            Ref::Sid(p.clone()),
+            Term::Var(VarId(0)),
+        );
+        let mut operator = BinaryScanOperator::new(pattern, None, vec![]);
+        let (_, rhs) = operator
+            .overlay_walk_bounds(&Some(s.clone()), &Some(p.clone()))
+            .expect("Spot with a bound subject must produce walk bounds");
+        assert_pinned("overlay_walk_bounds (unbound object)", &rhs);
+
+        operator.bound_o = Some(FlakeValue::Long(42));
+        let (_, rhs) = operator
+            .overlay_walk_bounds(&Some(s), &Some(p))
+            .expect("bound-object arm must still produce walk bounds");
+        assert_pinned("overlay_walk_bounds (bound object)", &rhs);
     }
 }

@@ -386,6 +386,24 @@ index_gc (debug, separate trace)
 └── gc_delete_entries (debug)
 ```
 
+Once a build completes, installing the new index root into a live cached
+ledger handle emits its own spans (nested under whatever task performs the
+install — a nameservice notify, or a background-index publish event):
+
+```
+index_install (debug, ledger_id, index_t)
+├── index_install_wait (debug)
+└── index_install_lock (debug)
+```
+
+`index_install_wait` covers acquisition of the exclusive ledger-state lock —
+its duration is contention (committers hold the same lock). `index_install_lock`
+covers the section that holds the lock: novelty trim, runtime-dict reseed, and
+the store/range-provider swap, which scale with accumulated novelty. The two
+are separate spans precisely so each aggregates independently: a commit-latency
+spike attributes to lock contention or to install hold time without per-trace
+arithmetic.
+
 #### Span Tree (Bulk Import / fluree-ingest)
 
 Bulk import runs as a **standalone top-level trace** under the `fluree-cli` service (no HTTP server involved). The import pipeline instruments all major phases:

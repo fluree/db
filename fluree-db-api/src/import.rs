@@ -43,6 +43,71 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
 
+/// Publish the import's commit head by fast-forwarding the ref directly.
+///
+/// Bulk import is a one-shot admin flow: nothing is staged on the
+/// per-branch transaction queue, so `publish_commit` — whose contract on
+/// queue-backed nameservices (the raft data plane) is "apply the staged
+/// queue front" — fails there with "per-branch queue is empty". A
+/// ref-level fast-forward carries the exact strictly-newer semantics the
+/// file/S3 nameservices give `publish_commit`, and every nameservice
+/// implements it via `RefPublisher`, so the bulk importer works under
+/// all data planes without touching the transactor's queue contract.
+///
+/// Import runs against a fresh ledger and publishes serially, so the one
+/// benign conflict is the final publish restating the last checkpoint's
+/// exact `(t, commit_id)`. Any other conflict is surfaced as an error:
+/// a head at a different `t`/id means a foreign writer got ahead of the
+/// import, and a head still behind `t` means the CAS retry budget ran
+/// out under contention.
+async fn publish_import_commit_head(
+    nameservice: &dyn crate::NameServicePublisher,
+    alias: &str,
+    t: i64,
+    commit_id: &ContentId,
+) -> std::result::Result<(), ImportError> {
+    use fluree_db_nameservice::{CasResult, RefValue};
+
+    let new_ref = RefValue {
+        id: Some(commit_id.clone()),
+        t,
+    };
+    match nameservice
+        .fast_forward_commit(alias, &new_ref, 5)
+        .await
+        .map_err(|e| ImportError::Storage(e.to_string()))?
+    {
+        CasResult::Updated => Ok(()),
+        CasResult::Conflict { actual }
+            if actual
+                .as_ref()
+                .is_some_and(|a| a.t == t && a.id.as_ref() == Some(commit_id)) =>
+        {
+            Ok(())
+        }
+        CasResult::Conflict { actual } => Err(ImportError::Storage(match actual.as_ref() {
+            // `fast_forward_commit` returns the same `Conflict` shape when
+            // its retry budget runs out while the fast-forward is still
+            // valid — the head never reached `t`, so this is contention,
+            // not divergence.
+            None => format!(
+                "import commit-head publish for {alias} gave up after contended CAS \
+                 attempts: head is still unborn, wanted t={t}"
+            ),
+            Some(a) if a.t < t => format!(
+                "import commit-head publish for {alias} gave up after contended CAS \
+                 attempts: head is at t={}, wanted t={t}",
+                a.t
+            ),
+            Some(a) => format!(
+                "import commit-head publish for {alias} found a diverged head: \
+                 head is t={} id={:?}, wanted t={t} id={commit_id}",
+                a.t, a.id
+            ),
+        })),
+    }
+}
+
 const IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS: u128 = 50;
 const LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY: usize = 2;
 
@@ -4180,10 +4245,13 @@ where
                 if env.config.publish_every > 0
                     && (next_expected + 1).is_multiple_of(env.config.publish_every)
                 {
-                    env.nameservice
-                        .publish_commit(env.alias, result.t, &result.commit_id)
-                        .await
-                        .map_err(|e| ImportError::Storage(e.to_string()))?;
+                    publish_import_commit_head(
+                        env.nameservice,
+                        env.alias,
+                        result.t,
+                        &result.commit_id,
+                    )
+                    .await?;
                     tracing::info!(
                         t = result.t,
                         chunk = next_expected + 1,
@@ -5050,10 +5118,7 @@ where
                 elapsed_secs: run_start.elapsed().as_secs_f64(),
             });
             if config.publish_every > 0 && (idx + 1).is_multiple_of(config.publish_every) {
-                nameservice
-                    .publish_commit(alias, result.t, &result.commit_id)
-                    .await
-                    .map_err(|e| ImportError::Storage(e.to_string()))?;
+                publish_import_commit_head(nameservice, alias, result.t, &result.commit_id).await?;
             }
         }
 
@@ -5312,10 +5377,8 @@ where
                     elapsed_secs: run_start.elapsed().as_secs_f64(),
                 });
                 if config.publish_every > 0 && (i + 1).is_multiple_of(config.publish_every) {
-                    nameservice
-                        .publish_commit(alias, result.t, &result.commit_id)
-                        .await
-                        .map_err(|e| ImportError::Storage(e.to_string()))?;
+                    publish_import_commit_head(nameservice, alias, result.t, &result.commit_id)
+                        .await?;
                 }
             }
         }
@@ -5327,10 +5390,7 @@ where
         .clone()
         .ok_or_else(|| ImportError::Storage("no commit head after import".to_string()))?;
 
-    nameservice
-        .publish_commit(alias, state.t, &commit_head_id)
-        .await
-        .map_err(|e| ImportError::Storage(e.to_string()))?;
+    publish_import_commit_head(nameservice, alias, state.t, &commit_head_id).await?;
     tracing::info!(t = state.t, "published final commit head");
 
     // ---- Spawn txn-meta "meta chunk" build in background ----
@@ -6673,54 +6733,19 @@ where
             use fluree_db_core::index_stats as is;
 
             // Aggregate across graphs by p_id (deprecated SID-keyed view).
-            struct PropAgg {
-                count: u64,
-                ndv_values: u64,
-                ndv_subjects: u64,
-                last_modified_t: i64,
-                datatypes: Vec<(u8, u64)>,
-            }
-            let mut agg: std::collections::HashMap<u32, PropAgg> = std::collections::HashMap::new();
-            for g in &id_stats.graphs {
-                for p in &g.properties {
-                    let e = agg.entry(p.p_id).or_insert(PropAgg {
-                        count: 0,
-                        ndv_values: 0,
-                        ndv_subjects: 0,
-                        last_modified_t: 0,
-                        datatypes: Vec::new(),
-                    });
-                    e.count += p.count;
-                    e.ndv_values = e.ndv_values.max(p.ndv_values);
-                    e.ndv_subjects = e.ndv_subjects.max(p.ndv_subjects);
-                    e.last_modified_t = e.last_modified_t.max(p.last_modified_t);
-                    for &(dt, cnt) in &p.datatypes {
-                        if let Some(existing) = e.datatypes.iter_mut().find(|(d, _)| *d == dt) {
-                            existing.1 += cnt;
-                        } else {
-                            e.datatypes.push((dt, cnt));
-                        }
-                    }
-                }
-            }
-
-            let properties: Vec<is::PropertyStatEntry> = agg
-                .into_iter()
-                .map(|(p_id, pa)| {
-                    let (ns, name) = predicate_sids_v6
-                        .get(p_id as usize)
-                        .cloned()
-                        .unwrap_or((0u16, String::new()));
-                    is::PropertyStatEntry {
-                        sid: (ns, name),
-                        count: pa.count,
-                        ndv_values: pa.ndv_values,
-                        ndv_subjects: pa.ndv_subjects,
-                        last_modified_t: pa.last_modified_t,
-                        datatypes: pa.datatypes,
-                    }
-                })
-                .collect();
+            // Shared with the incremental and rebuild pipelines so
+            // `observed_datatypes` — which is fail-closed, and so goes wrong
+            // quietly — has one producer rather than one per pipeline.
+            let properties: Vec<is::PropertyStatEntry> =
+                fluree_db_indexer::stats::aggregate_property_entries_by_sid(
+                    &id_stats.graphs,
+                    |p_id| {
+                        predicate_sids_v6
+                            .get(p_id as usize)
+                            .cloned()
+                            .unwrap_or((0u16, String::new()))
+                    },
+                );
 
             let mut graphs = id_stats.graphs;
             if let Some(ref cs) = spot_class_stats {
@@ -6750,6 +6775,11 @@ where
                 properties: Some(properties),
                 classes: None,
                 graphs: Some(graphs),
+                // An import replays its entire input as the ledger's full
+                // history, so the stats hook has observed the tag of every
+                // record at every `t` — historical coverage is complete from
+                // genesis.
+                historical_since_t: Some(0),
             };
             // Wire `total_commit_size` into `stats.size` and per-graph sizes,
             // mirroring `root_assembly::compose_root_v6` for the normal indexing
@@ -7638,5 +7668,74 @@ mod resource_model_tests {
         assert_eq!(parallel[0].0, 0);
         assert_eq!(parallel[1].0, 1);
         assert_eq!(parallel[2].0, 2);
+    }
+}
+
+#[cfg(test)]
+mod publish_import_commit_head_tests {
+    use super::*;
+    use fluree_db_nameservice::memory::MemoryNameService;
+    use fluree_db_nameservice::{LedgerLifecycle, RefKind, RefLookup};
+
+    fn cid(label: &str) -> ContentId {
+        ContentId::new(ContentKind::Commit, label.as_bytes())
+    }
+
+    /// The publish shapes the import pipeline produces — creation on a
+    /// freshly-initialized ledger, a checkpoint fast-forwarding past the
+    /// importer's own head, and the final publish restating the last
+    /// checkpoint's exact `(t, commit_id)` — plus the two conflicts it
+    /// never produces (equal `t` under a different id, lower `t`), which
+    /// must fail loudly instead of reporting success over a foreign head.
+    #[tokio::test]
+    async fn creates_advances_tolerates_exact_republish_rejects_divergence() {
+        let ns = MemoryNameService::new();
+        let alias = "importdb:main";
+
+        // The importer initializes the ledger before its first publish.
+        ns.init(alias).await.expect("init");
+
+        publish_import_commit_head(&ns, alias, 1, &cid("t1"))
+            .await
+            .expect("initial publish creates the head");
+        let head = ns
+            .get_ref(alias, RefKind::CommitHead)
+            .await
+            .expect("get_ref")
+            .expect("head exists");
+        assert_eq!(head.t, 1);
+        assert_eq!(head.id, Some(cid("t1")));
+
+        publish_import_commit_head(&ns, alias, 5, &cid("t5"))
+            .await
+            .expect("checkpoint fast-forwards");
+
+        publish_import_commit_head(&ns, alias, 5, &cid("t5"))
+            .await
+            .expect("republish of the exact head is a no-op success");
+
+        let err = publish_import_commit_head(&ns, alias, 5, &cid("other"))
+            .await
+            .expect_err("equal t under a different id is a divergence");
+        assert!(
+            err.to_string().contains("diverged"),
+            "unexpected error: {err}"
+        );
+
+        let err = publish_import_commit_head(&ns, alias, 3, &cid("t3"))
+            .await
+            .expect_err("a head past the published t is a divergence");
+        assert!(
+            err.to_string().contains("diverged"),
+            "unexpected error: {err}"
+        );
+
+        let head = ns
+            .get_ref(alias, RefKind::CommitHead)
+            .await
+            .expect("get_ref")
+            .expect("head exists");
+        assert_eq!(head.t, 5, "failed publishes leave the head alone");
+        assert_eq!(head.id, Some(cid("t5")));
     }
 }

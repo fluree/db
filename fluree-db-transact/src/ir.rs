@@ -699,6 +699,27 @@ pub struct TxnOpts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shapes: Option<serde_json::Value>,
 
+    /// Requested SHACL validation mode for *this transaction only*.
+    ///
+    /// `Some(Warn)` asks to soften a `Reject` posture to warn-and-commit;
+    /// `Some(Reject)` asks to harden a `Warn` posture. Read from the
+    /// transaction JSON's `opts.validationMode` (`"warn"` / `"reject"`)
+    /// when unset here.
+    ///
+    /// This is a *request*, not a command: strengthening is always
+    /// honored, but softening is granted only when the ledger config's
+    /// SHACL `f:overrideControl` permits it for the request's verified
+    /// identity (`f:OverrideAll`, the default, permits everyone; an
+    /// `f:overrideControl` of `f:OverrideNone` or an identity-restricted
+    /// list gates it). A denied softening request keeps the configured
+    /// posture and logs a warning — it does not fail the transaction.
+    ///
+    /// Use case: a remediation agent whose corrective writes transiently
+    /// violate shapes gets per-write softening without flipping the
+    /// graph's standing validation posture for every other writer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_mode: Option<fluree_db_core::ledger_config::ValidationMode>,
+
     /// Inline `f:enforceUnique` declarations for *this transaction only*.
     ///
     /// Each entry is a property IRI (full IRI; not compact prefix
