@@ -197,17 +197,33 @@ impl RetryBudget {
             )));
         }
 
+        // The first-recorded want is the object the caller is actually
+        // blocked on — the cursor records the leaf it failed to open first,
+        // and `MissRegister` preserves insertion order. Termination is gated
+        // on THIS object becoming resident, not on the weaker "some want was
+        // fetched": under a resident tier too small to hold a retry round,
+        // re-fetching an evicted tail satisfies `newly_resident > 0` every
+        // round while the caller's blocking object is evicted again before it
+        // can be re-read, and the cursor never advances. Gating on the
+        // blocking object makes each `Ok(true)` guarantee forward progress
+        // over a finite, monotonically-advancing routed set.
+        let blocking = wants[0].cid.clone();
         let outcome = fetch_wants(cs, wants, width).await;
         self.fetched_total += outcome.newly_resident;
-        if outcome.newly_resident == 0 {
+        if cs.resolve_cached_bytes(&blocking).is_none() {
             let detail = outcome
                 .failures
                 .first()
                 .map(|(w, e)| format!("{} {}: {}", w.kind, w.cid, e))
-                .unwrap_or_else(|| "no wants fetched".to_string());
+                .unwrap_or_else(|| {
+                    "the blocking object was evicted before re-read — resident \
+                     tier smaller than one retry round?"
+                        .to_string()
+                });
             return Err(io::Error::other(format!(
-                "residency retry stalled: 0 of {} wants became resident (round {}; first failure: {})",
-                outcome.wanted, self.rounds, detail,
+                "residency retry cannot make progress: blocking object {} not resident after \
+                 fetching {} want(s) (round {}; {})",
+                blocking, outcome.wanted, self.rounds, detail,
             )));
         }
         tracing::debug!(
@@ -387,8 +403,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// A store that violates the fetch-pins contract stalls the loop with an
-    /// error instead of spinning.
+    /// A store that fetches but never pins is the worst case of a
+    /// byte-budgeted resident tier: the blocking object is evicted the instant
+    /// after it is fetched. The retry loop must fail fast on the first round
+    /// rather than spin re-fetching it to the sanity cap.
     #[derive(Debug)]
     struct NonPinningStore {
         inner: MemoryContentStore,
@@ -423,6 +441,7 @@ pub(crate) mod tests {
             inner: MemoryContentStore::new(),
             register: MissRegister::new(),
         });
+        let mut budget = RetryBudget::default();
         let cid = run_sync_on_runtime({
             let inner = store.inner.clone();
             async move {
@@ -438,16 +457,24 @@ pub(crate) mod tests {
         let err = run_sync_on_runtime({
             let store = Arc::clone(&store);
             async move {
-                RetryBudget::default()
+                budget
                     .after_error(store.as_ref(), 2)
                     .await
-                    .map(|_| ())
+                    .map(|outcome| (outcome, budget.rounds()))
             }
         })
         .expect_err("no progress must surface as an error");
+        // Fast-fail on round 1: the message is the progress-gate error, not
+        // "round cap exceeded" — proof the loop did not spin re-fetching the
+        // evicted object hundreds of times before giving up.
         assert!(
-            err.to_string().contains("stalled"),
-            "error names the stall: {err}"
+            err.to_string().contains("cannot make progress")
+                && err.to_string().contains("not resident"),
+            "error names the blocking object that never became resident: {err}"
+        );
+        assert!(
+            !err.to_string().contains("round cap"),
+            "must fail on the blocking-object gate, not by spinning to the cap: {err}"
         );
     }
 }

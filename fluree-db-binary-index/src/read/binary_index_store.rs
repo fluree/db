@@ -3651,6 +3651,91 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(cache_dir);
     }
 
+    /// One leaf-open miss on a large routed scan registers a BOUNDED
+    /// read-ahead window, not the whole remaining routed set. This is both the
+    /// LIMIT-overfetch fix (a scan that stops early never pulls the whole
+    /// predicate run) and the eviction-livelock fix (a retry round never
+    /// fetches more than a bounded window). PREFETCH_WINDOW in
+    /// binary_cursor.rs is 32; a 40-leaf scan must register exactly 32,
+    /// contiguous from the leaf that missed.
+    #[cfg(feature = "residency")]
+    #[test]
+    fn residency_miss_registers_a_bounded_window_not_the_whole_run() {
+        use crate::read::binary_cursor::BinaryCursor;
+        use crate::read::column_types::{BinaryFilter, ColumnProjection};
+        use crate::read::need_fetch::tests::MissInjectingStore;
+
+        const LEAVES: u64 = 40;
+        const EXPECTED_WINDOW: usize = 32;
+
+        let store = Arc::new(MissInjectingStore::new());
+        let mut entries = Vec::new();
+        for i in 0..LEAVES {
+            let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+            writer.set_skip_history(true);
+            let s_id = i + 1;
+            writer
+                .push_record(make_rec(s_id, 1, OType::XSD_INTEGER.as_u16(), s_id * 10, 1))
+                .unwrap();
+            let info = writer.finish().unwrap().remove(0);
+            let cid = run_sync_on_runtime({
+                let store = Arc::clone(&store);
+                let bytes = info.leaf_bytes.clone();
+                async move {
+                    store
+                        .inner
+                        .put(ContentKind::IndexLeaf, &bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("seed leaf");
+            entries.push(crate::format::branch::LeafEntry {
+                first_key: info.first_key,
+                last_key: info.last_key,
+                row_count: info.total_rows,
+                leaf_cid: cid,
+                sidecar_cid: None,
+            });
+        }
+        let leaf_cids: Vec<ContentId> = entries.iter().map(|e| e.leaf_cid.clone()).collect();
+
+        let cache_dir = temp_cache_dir();
+        let cs: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
+        let binary_store = Arc::new(empty_store(cs, cache_dir.clone()));
+        let branch = Arc::new(crate::format::branch::BranchManifest { leaves: entries });
+        let mut cursor = BinaryCursor::scan_all(
+            Arc::clone(&binary_store),
+            RunSortOrder::Post,
+            branch,
+            BinaryFilter::default(),
+            ColumnProjection::all(),
+        );
+
+        // Cold scan: leaf 0 misses.
+        cursor.next_batch().expect_err("cold scan must miss");
+        let wants = binary_store
+            .content_store()
+            .and_then(|cs| cs.miss_register())
+            .expect("residency store exposes a register")
+            .drain();
+        assert_eq!(
+            wants.len(),
+            EXPECTED_WINDOW,
+            "one miss registers a bounded window, not all {LEAVES} routed leaves"
+        );
+        // Contiguous from the leaf that missed (leaf 0).
+        let want_cids: Vec<&ContentId> = wants.iter().map(|w| &w.cid).collect();
+        for (i, cid) in leaf_cids.iter().take(EXPECTED_WINDOW).enumerate() {
+            assert_eq!(want_cids[i], cid, "window leaf {i} out of order");
+        }
+        assert!(
+            !want_cids.contains(&&leaf_cids[EXPECTED_WINDOW]),
+            "leaf {EXPECTED_WINDOW} is past the window and must not be registered"
+        );
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
     #[test]
     fn open_leaf_handle_caches_remote_metadata() {
         let store = CountingContentStore::new();

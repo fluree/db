@@ -301,21 +301,41 @@ impl BinaryCursor {
         self.leaf_overlay_end = self.overlay_pos + (end_offset - start_offset);
     }
 
-    /// After a leaf-open failure in residency mode, record every remaining
-    /// routed leaf (and sidecar, when replaying) that is not yet resident
-    /// into the store's miss register — the scan's whole want set, so the
-    /// retry frame fetches it in one concurrent round (see
+    /// After a leaf-open failure in residency mode, record a bounded
+    /// read-ahead window of routed leaves (and sidecars, when replaying) that
+    /// are not yet resident into the store's miss register, so the retry
+    /// frame fetches them in one concurrent round (see
     /// [`crate::read::need_fetch::RetryBudget`]).
+    ///
+    /// The window is bounded rather than "the whole remaining routed set" for
+    /// two reasons. Correctness: a resident tier with a byte budget evicts,
+    /// and registering every remaining leaf made each retry round re-fetch a
+    /// tail the tier had just evicted — `newly_resident > 0` every round while
+    /// the cursor never advanced, a livelock the round cap alone stopped
+    /// (thousands of wasted fetches first). Cost: a `LIMIT`-shaped scan that
+    /// reads one leaf and stops should not pull the whole predicate run over
+    /// the network first — the consumer stops calling `next_batch`, so only
+    /// the first window is ever fetched. `RetryBudget::after_error` closes the
+    /// residual pathological case (a tier smaller than one window) by gating
+    /// progress on the blocking object, so this bound is a read-ahead/latency
+    /// knob, not the termination guarantee.
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     fn register_remaining_wants(&self, from_leaf_idx: usize) {
         use crate::read::need_fetch::FetchKind;
+        // Read-ahead width: enough to amortize round latency at the fetch
+        // concurrency (`DEFAULT_FETCH_WIDTH` = 8), bounded so one miss never
+        // fetches an unbounded routed run.
+        const PREFETCH_WINDOW: usize = 32;
         let Some(cs) = self.store.content_store() else {
             return;
         };
         let Some(register) = cs.miss_register() else {
             return;
         };
-        for entry in &self.branch.leaves[from_leaf_idx..self.leaf_range.end] {
+        let window_end = from_leaf_idx
+            .saturating_add(PREFETCH_WINDOW)
+            .min(self.leaf_range.end);
+        for entry in &self.branch.leaves[from_leaf_idx..window_end] {
             if cs.resolve_cached_bytes(&entry.leaf_cid).is_none() {
                 register.record(&entry.leaf_cid, FetchKind::IndexLeaf);
             }
@@ -558,10 +578,11 @@ impl BinaryCursor {
             ) {
                 Ok(handle) => handle,
                 Err(err) => {
-                    // A residency miss on this leaf means the rest of the
-                    // scan's routed leaves are likely missing too: record
-                    // the whole remaining want set so one retry round
-                    // fetches N objects instead of one per round.
+                    // A residency miss on this leaf means the next routed
+                    // leaves are likely missing too: record a bounded
+                    // read-ahead window so one retry round fetches several
+                    // objects instead of one per round (bound explained on
+                    // `register_remaining_wants`).
                     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
                     self.register_remaining_wants(leaf_idx);
                     return Err(err);
