@@ -390,6 +390,11 @@ jobs:
           tool: wasm-pack@0.13.1
 
       - name: Install wasm-bindgen CLI (Cargo.lock version) and binaryen
+        # Native host build: clear the job-level wasm `getrandom_backend` cfg
+        # (getrandom 0.3.4+ hard-errors when that cfg is set for a non-wasm
+        # target), exactly as the fluree-server native build step below does.
+        env:
+          RUSTFLAGS: ""
         run: |
           VER=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | tail -1 | cut -d'"' -f2)
           if [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" != "$VER" ]; then
