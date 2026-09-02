@@ -677,7 +677,7 @@ async fn dispatch_subqueries(
     let envelope_opts = envelope.opts.clone();
 
     let mut outcomes = Vec::with_capacity(envelope.queries.len());
-    for (alias, sub) in envelope.queries.into_iter() {
+    for (alias, sub) in envelope.queries {
         tracing::debug!(alias = %alias, "mq.sub.sequential");
         let kind = match execute_subquery(
             fluree.as_ref(),

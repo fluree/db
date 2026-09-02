@@ -262,6 +262,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -272,11 +273,24 @@ jobs:
         with:
           tool: wasm-pack
 
-      - name: Check engine stack (wasm32)
-        run: cargo check --target wasm32-unknown-unknown -p fluree-db-api --no-default-features
+      # clippy, not check: `cargo check` cannot see clippy-only lints, and
+      # nothing else runs clippy against the wasm32 target. Two of those lints
+      # (a dropped un-awaited future in the CAS bridge stub, a needless return
+      # in a wasm-cfg storage arm) sat red under this exact command while the
+      # check-only gate reported green. clippy lints every workspace member in
+      # the -p closure, so this covers the engine crates behind fluree-db-api,
+      # not just the umbrella.
+      # No --all-targets: it drags in fluree-db-api's dev-dependencies, whose
+      # tokio `net`/mio does not build for wasm32 (unrelated to our code). The
+      # lib-level pass is what matters here anyway — clippy lints every
+      # workspace member in the -p closure at lib level, which is how the two
+      # latent lints this gate exists for (in fluree-db-binary-index and
+      # fluree-db-connection) surfaced.
+      - name: Lint engine stack (wasm32 clippy)
+        run: cargo clippy --target wasm32-unknown-unknown -p fluree-db-api --no-default-features
 
-      - name: Check parse layer, no default features (wasm32)
-        run: cargo check --target wasm32-unknown-unknown --no-default-features -p fluree-vocab -p fluree-graph-ir -p fluree-graph-turtle -p fluree-graph-json-ld -p fluree-db-sparql
+      - name: Lint parse layer, no default features (wasm32 clippy)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features -p fluree-vocab -p fluree-graph-ir -p fluree-graph-turtle -p fluree-graph-json-ld -p fluree-db-sparql
 
       # Compiling is not running: wasm32-unknown-unknown panics at RUNTIME on
       # Instant::now / SystemTime::now, thread spawns, and moka construction,
