@@ -37,6 +37,11 @@ use fluree_db_core::ContentId;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
+/// Why a root that is on disk did not make it into `nodes`. Printed as the cause on
+/// a dangling pointer, where the other possibility is MISSING: nothing there at all.
+const UNDECODABLE: &str = "UNDECODABLE";
+const UNREADABLE: &str = "UNREADABLE";
+
 /// What we keep from each decoded root.
 ///
 /// `prev_index` carries the parent's `t` alongside its CID, so keep both: the `t`
@@ -60,13 +65,36 @@ fn main() {
 
     // digest -> decoded root
     let mut nodes: HashMap<String, Node> = HashMap::new();
-    // Digests of roots that are on disk but did not decode. Kept as a set, not a
-    // count: a root that fails to decode never enters `nodes`, so without this it is
-    // indistinguishable from a deleted one everywhere downstream.
-    let mut undecodable: HashSet<String> = HashSet::new();
+    // Roots that are on disk but yielded no header, and why. Kept as a map, not a
+    // count: such a root never enters `nodes`, so without this it is indistinguishable
+    // from a deleted one everywhere downstream.
+    //
+    // Failing to read one is not fatal. This is pointed at a directory copied out of
+    // a pod, possibly mid-GC, possibly a partial rsync, so one unreadable file killing
+    // a 226-root survey is the wrong trade: count it and carry on, and the count is
+    // itself diagnostic.
+    let mut unusable: HashMap<String, &'static str> = HashMap::new();
+    let mut unlistable = 0usize;
 
-    for entry in std::fs::read_dir(&dir).expect("read roots dir") {
-        let path = entry.expect("dir entry").path();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // Nothing to survey, so this one really is fatal. Say so plainly.
+            eprintln!("!! cannot read roots dir {dir}: {e}");
+            std::process::exit(2);
+        }
+    };
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                // No name to file it under, so it cannot go in `unusable`. Count it,
+                // so the survey admits it did not see everything.
+                eprintln!("  ! unlistable directory entry: {e}");
+                unlistable += 1;
+                continue;
+            }
+        };
         if path.extension().and_then(|s| s.to_str()) != Some("fir6") {
             continue;
         }
@@ -75,7 +103,14 @@ fn main() {
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
-        let bytes = std::fs::read(&path).expect("read root");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("  ! unreadable {digest}: {e}");
+                unusable.insert(digest, UNREADABLE);
+                continue;
+            }
+        };
         match IndexRoot::decode(&bytes) {
             Ok(root) => {
                 let prev = root.prev_index.as_ref().map(|p| (p.id.digest_hex(), p.t));
@@ -89,13 +124,18 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("  ! undecodable {digest}: {e}");
-                undecodable.insert(digest);
+                unusable.insert(digest, UNDECODABLE);
             }
         }
     }
 
+    let undecodable = unusable.values().filter(|r| **r == UNDECODABLE).count();
     println!("roots on disk    : {}", nodes.len());
-    println!("undecodable      : {}", undecodable.len());
+    println!("undecodable      : {undecodable}");
+    println!("unreadable       : {}", unusable.len() - undecodable);
+    if unlistable > 0 {
+        println!("unlistable       : {unlistable}");
+    }
 
     // Which roots are pointed AT by some other root?
     let mut referenced: HashSet<&String> = HashSet::new();
@@ -172,7 +212,7 @@ fn main() {
     dangling.sort();
     let corrupt_parents = dangling
         .iter()
-        .filter(|(_, _, p, _)| undecodable.contains(p))
+        .filter(|(_, _, p, _)| unusable.contains_key(p))
         .count();
     print!(
         "dangling prev pointers (chain stops here): {}",
@@ -182,17 +222,13 @@ fn main() {
         println!();
     } else {
         println!(
-            " ({} parent deleted, {} parent undecodable)",
+            " ({} parent deleted, {} parent on disk but unusable)",
             dangling.len() - corrupt_parents,
             corrupt_parents
         );
     }
     for (t, d, p, prev_t) in dangling.iter().take(8) {
-        let cause = if undecodable.contains(p) {
-            "UNDECODABLE"
-        } else {
-            "MISSING"
-        };
+        let cause = unusable.get(p).copied().unwrap_or("MISSING");
         // The parent's own `index_t`, from the child's pointer: it says where in
         // version space the hole is without needing the blob that is gone.
         println!(
@@ -202,14 +238,14 @@ fn main() {
         );
     }
     and_n_more(8, dangling.len());
-    if !dangling.is_empty() && !undecodable.is_empty() {
-        // Shape 1 says something deletes out of order. A bad blob produces the same
-        // hole without anything having deleted anything, so the verdict only stands
-        // once nothing on disk is failing to decode.
+    if !dangling.is_empty() && !unusable.is_empty() {
+        // Shape 1 says something deletes out of order. A blob that is there but
+        // unusable produces the same hole without anything having deleted anything,
+        // so the verdict only stands once every root on disk yielded a header.
         println!(
             "  ! shape 1 (something deletes out of order) is not the reading yet: \
-             {} root(s) on disk did not decode, and a bad blob leaves the same hole",
-            undecodable.len()
+             {} root(s) on disk did not read or decode, and either leaves the same hole",
+            unusable.len()
         );
     }
 
@@ -240,7 +276,7 @@ fn main() {
 
     // Reachability from the head: what GC can actually see.
     let head = match &head_arg {
-        Some(arg) => Some(resolve_head(arg, &nodes, &undecodable)),
+        Some(arg) => Some(resolve_head(arg, &nodes, &unusable)),
         None => guess_head(&nodes),
     };
     if let Some(head) = head {
@@ -251,11 +287,11 @@ fn main() {
         let mut cur = Some(head.clone());
         while let Some(d) = cur {
             let Some(node) = nodes.get(&d) else {
-                // Chain ends here. If the blob is present but undecodable the walk
+                // Chain ends here. If the blob is present but unusable the walk
                 // stops for a reason that has nothing to do with GC, so say which.
-                if undecodable.contains(&d) {
+                if let Some(reason) = unusable.get(&d) {
                     println!(
-                        "!! chain walk stopped at UNDECODABLE root {}",
+                        "!! chain walk stopped at {reason} root {}",
                         &d[..16.min(d.len())]
                     );
                 }
@@ -334,7 +370,11 @@ fn main() {
 /// on hand can never match a key directly. Accept both, and refuse to guess when
 /// neither lands: an unmatched head walks zero roots, and a zero-length walk reads
 /// as a totally orphaned ledger, which is the most alarming output the tool has.
-fn resolve_head(arg: &str, nodes: &HashMap<String, Node>, undecodable: &HashSet<String>) -> String {
+fn resolve_head(
+    arg: &str,
+    nodes: &HashMap<String, Node>,
+    unusable: &HashMap<String, &'static str>,
+) -> String {
     if nodes.contains_key(arg) {
         return arg.to_string();
     }
@@ -343,13 +383,13 @@ fn resolve_head(arg: &str, nodes: &HashMap<String, Node>, undecodable: &HashSet<
             println!("head {arg} resolved to digest {digest}");
             return digest;
         }
-        if undecodable.contains(&digest) {
-            eprintln!("!! head {arg} is on disk as {digest} but did not decode");
+        if let Some(reason) = unusable.get(&digest) {
+            eprintln!("!! head {arg} is on disk as {digest}, marked {reason}");
             std::process::exit(2);
         }
     }
-    if undecodable.contains(arg) {
-        eprintln!("!! head {arg} is on disk but did not decode");
+    if let Some(reason) = unusable.get(arg) {
+        eprintln!("!! head {arg} is on disk, marked {reason}");
         std::process::exit(2);
     }
     eprintln!(
