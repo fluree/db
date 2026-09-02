@@ -84,6 +84,11 @@ async fn main() {
     let rounds = env_usize("PROBE_ROUNDS", 8);
     let filler = env_usize("PROBE_FILLER", 400);
     let queries = env_usize("PROBE_QUERIES", 200);
+    // Churn mode: commit one write every `PROBE_WRITE_EVERY` queries INSIDE a
+    // round, so the overlay epoch (and `to_t`) move under the read stream and
+    // every translation-cache layer misses — the sustained-write shape
+    // fluree/db#1722 is about. 0 (default) keeps rounds read-only.
+    let write_every = env_usize("PROBE_WRITE_EVERY", 0);
 
     let dir = tempfile::tempdir().expect("tempdir");
     let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
@@ -123,7 +128,36 @@ async fn main() {
         .await
         .expect("reindex");
 
-    println!("subjects={subjects} rounds={rounds} filler/round={filler} queries/round={queries}");
+    // Churn mode reads through views built directly off the transacting
+    // ledger lineage. The cached handle re-adopts a persisted index
+    // ASYNCHRONOUSLY after each commit, so under per-few-queries commits
+    // `fluree.db()` would return unindexed (snapshot.t == 0) views almost
+    // always, divert every scan to the range fallback, and measure nothing.
+    // Re-seed the lineage from the cached handle once it has adopted the
+    // reindexed store; every churn commit then carries the index forward.
+    if write_every > 0 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let handle = fluree
+                .ledger_cached("probe/overlay:main")
+                .await
+                .expect("cached handle");
+            let state = handle.lock_for_write().await.clone_state();
+            if state.snapshot.t > 0 {
+                ledger = state;
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reindexed store never adopted by the cached handle"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    println!(
+        "subjects={subjects} rounds={rounds} filler/round={filler} queries/round={queries} write_every={write_every}"
+    );
     println!(
         "{:>12}  {:>10}  {:>10}  {:>10}",
         "novelty", "mean_us", "p50_us", "p90_us"
@@ -155,12 +189,33 @@ async fn main() {
         // context, exactly as a separate request would.
         let mut times: Vec<u128> = Vec::with_capacity(queries);
         for q in 0..queries {
+            if write_every > 0 && q % write_every == 0 {
+                // Untimed epoch churn: the write itself is not measured, but
+                // every query after it faces a fresh overlay epoch.
+                let node = json!({
+                    "@id": format!("http://example.org/churn{round}-{q}"),
+                    "http://example.org/name": format!("churn {round} {q}"),
+                    "http://example.org/tag": "churn"
+                });
+                ledger = fluree
+                    .insert(ledger, &node)
+                    .await
+                    .expect("churn write")
+                    .ledger;
+            }
             let subject = format!("http://example.org/offer{}", q % subjects);
             let query = json!({
                 "select": ["?p", "?o"],
                 "where": {"@id": subject, "?p": "?o"}
             });
-            let view = fluree.db("probe/overlay:main").await.expect("view");
+            // Read-only mode keeps the historical `fluree.db()` acquisition
+            // byte-for-byte (comparability with prior runs); churn mode views
+            // the lineage directly so the index survives per-query commits.
+            let view = if write_every > 0 {
+                fluree_db_api::GraphDb::from_ledger_state(&ledger)
+            } else {
+                fluree.db("probe/overlay:main").await.expect("view")
+            };
             let start = Instant::now();
             let out = fluree
                 .query(&view, QueryInput::JsonLd(&query))
