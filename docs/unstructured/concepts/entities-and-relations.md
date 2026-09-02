@@ -31,7 +31,7 @@ WHERE {
 }
 ```
 
-The language model is shown the entities the scan found in each chunk and told to use exactly those names, so its output reconciles to the same IRIs. An entity it names that no source knows is minted once, under an IRI derived from the name, so the same new name in two documents is one node. Those minted entities are typed `doc:Entity` and, on the next run, are themselves part of the gazetteer, so a corpus converges on one node per name.
+The language model is shown the entities the scan found in each chunk and told to use exactly those names, so its output reconciles to the same IRIs. An entity it names that no source knows is minted once, under an IRI derived from the name, so the same new name in two documents is one node. Those minted entities are typed `doc:Entity` and, on the next run, are themselves part of the gazetteer, so a corpus converges on one node per name. Entities flagged off-model are left out of that: a name the ontology has no class for is kept for review, not scanned for.
 
 ## What the scan does
 

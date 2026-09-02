@@ -98,6 +98,21 @@ impl GazetteerBuilder {
         }
     }
 
+    /// Drop entries by IRI: what a run learned it should not be scanning for.
+    pub fn remove(&mut self, iris: &std::collections::HashSet<String>) {
+        if iris.is_empty() {
+            return;
+        }
+        self.entries.retain(|e| !iris.contains(&e.iri));
+        self.at = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.iri.clone(), i))
+            .collect();
+        self.name_rank.retain(|iri, _| !iris.contains(iri));
+    }
+
     /// Fingerprint of the entries added so far; see [`Gazetteer::fingerprint`].
     pub fn fingerprint(&self) -> String {
         fingerprint_entries(&self.entries)
@@ -474,6 +489,25 @@ mod tests {
         assert_eq!(acme.labels.len(), 4);
         assert_eq!(acme.types, vec!["schema:Organization"]);
         assert_eq!(g.lookup("nowhere"), None);
+    }
+
+    #[test]
+    fn removed_entries_are_not_scanned_for() {
+        let mut b = GazetteerBuilder::default();
+        b.add_rows(
+            &[
+                json!(["ex:a", "Acme", null]),
+                json!(["ex:n", "notes", null]),
+            ],
+            "schema:name",
+        );
+        b.remove(&["ex:n".to_string()].into_iter().collect());
+        let g = b.build("en");
+        assert_eq!(g.entries().len(), 1);
+        assert!(g
+            .scan("notes on Acme")
+            .iter()
+            .all(|m| g.entries()[m.entry].iri == "ex:a"));
     }
 
     #[test]

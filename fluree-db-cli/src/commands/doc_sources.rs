@@ -208,6 +208,19 @@ pub async fn load_gazetteer(
         for (query, predicate) in Gazetteer::queries(Some(fluree_db_doc::vocab::ENTITY)) {
             builder.add_rows(&opened.rows(&query).await?, predicate);
         }
+        // An entity minted outside the ontology is kept for review, not
+        // trusted: "notes" scanned for by name would tag every page.
+        let off_model = opened
+            .rows(&serde_json::json!({
+                "@context": { "doc": fluree_db_doc::vocab::DOC_NS },
+                "where": [{ "@id": "?s", "@type": fluree_db_doc::vocab::ENTITY, fluree_db_doc::vocab::OFF_MODEL: true }],
+                "select": ["?s"]
+            }))
+            .await?
+            .iter()
+            .filter_map(|row| row.as_array()?.first()?.as_str().map(str::to_string))
+            .collect();
+        builder.remove(&off_model);
     }
     Ok(LoadedGazetteer {
         gazetteer: builder.build(lang),
