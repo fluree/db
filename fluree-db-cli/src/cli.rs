@@ -3059,6 +3059,13 @@ pub enum SqlAction {
         remote: Option<String>,
     },
 
+    /// Re-run the subject key uniqueness probe against the live tables and
+    /// store the result on the source
+    Check {
+        /// Graph source name (branch defaults to main)
+        name: String,
+    },
+
     /// Show details for a mapped graph source
     Info {
         /// Graph source name
@@ -3169,6 +3176,11 @@ pub struct SqlMapArgs {
     /// source readable under authentication without a model (unset: deny).
     #[arg(long, value_name = "BOOL")]
     pub default_allow: Option<bool>,
+
+    /// Accept subject keys the registration probe finds non-unique (the
+    /// probe still warns; the pushdown lane then runs over them)
+    #[arg(long)]
+    pub allow_duplicate_subjects: bool,
 }
 
 /// Arguments for mapping an Iceberg table as a graph source.

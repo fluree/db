@@ -235,7 +235,7 @@ pub use fluree_db_sql::{
     SqlGsConfig, WireProtocol,
 };
 #[cfg(feature = "sql")]
-pub use graph_source::{SqlCreateConfig, SqlCreateResult};
+pub use graph_source::{SqlCheckResult, SqlCreateConfig, SqlCreateResult};
 
 /// Secret-resolution injection point for `ConfigValue::SecretRef` in Iceberg
 /// graph-source auth. The host constructs a [`SecretResolver`] with the tenant

@@ -93,6 +93,9 @@ fn args_to_json(args: &SqlMapArgs) -> CliResult<serde_json::Value> {
     if let Some(v) = args.default_allow {
         obj.insert("default_allow".into(), v.into());
     }
+    if args.allow_duplicate_subjects {
+        obj.insert("allow_duplicate_subjects".into(), true.into());
+    }
     Ok(body)
 }
 
@@ -141,7 +144,64 @@ async fn run_sql_map_remote(
         flag("mapping_validated"),
     );
     super::iceberg::print_model_warnings(&super::iceberg::model_warnings_of(&result));
+    print_mapping_warnings(&string_list_of(&result, "mapping_warnings"));
     Ok(())
+}
+
+fn string_list_of(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|w| w.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn print_mapping_warnings(warnings: &[String]) {
+    for w in warnings {
+        println!("  Warning:     {w}");
+    }
+}
+
+/// `fluree sql check NAME`: re-probe subject key uniqueness (local only).
+pub async fn run_sql_check(name: &str, dirs: &FlureeDir) -> CliResult<()> {
+    run_sql_check_local(name, dirs).await
+}
+
+#[cfg(feature = "sql")]
+async fn run_sql_check_local(name: &str, dirs: &FlureeDir) -> CliResult<()> {
+    let fluree = crate::context::build_fluree(dirs)?;
+    let id = if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("{name}:main")
+    };
+    let result = fluree.check_sql_graph_source(&id).await?;
+    println!("Checked SQL graph source '{}'", result.graph_source_id);
+    if result.duplicate_subject_tables.is_empty() {
+        println!("  Subject keys: unique in every probed table");
+    } else {
+        println!(
+            "  Subject keys: NOT unique in {} ({})",
+            result.duplicate_subject_tables.join(", "),
+            if result.allow_duplicate_subjects {
+                "accepted: registered with --allow-duplicate-subjects"
+            } else {
+                "the pushdown lane refuses statements over these tables"
+            }
+        );
+    }
+    print_mapping_warnings(&result.mapping_warnings);
+    Ok(())
+}
+
+#[cfg(not(feature = "sql"))]
+async fn run_sql_check_local(_name: &str, _dirs: &FlureeDir) -> CliResult<()> {
+    Err(CliError::Usage(
+        "this build has no SQL graph source support (feature `sql`)".to_string(),
+    ))
 }
 
 #[cfg(feature = "sql")]
@@ -197,6 +257,7 @@ async fn run_sql_map_local(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> 
         };
     }
 
+    config.allow_duplicate_subjects = args.allow_duplicate_subjects;
     let result = fluree.create_sql_graph_source(config).await?;
     print_created(
         &result.graph_source_id,
@@ -209,6 +270,7 @@ async fn run_sql_map_local(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> 
         result.mapping_validated,
     );
     super::iceberg::print_model_warnings(&result.model_warnings);
+    print_mapping_warnings(&result.mapping_warnings);
     Ok(())
 }
 

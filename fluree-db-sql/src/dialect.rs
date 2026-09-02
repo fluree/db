@@ -167,6 +167,24 @@ pub fn render_count(
     sql
 }
 
+/// `SELECT 1 FROM <source> WHERE k IS NOT NULL … GROUP BY k… HAVING COUNT(*) > 1 LIMIT 1`
+/// — one row iff some subject key repeats. Every dialect stops at the first
+/// duplicate.
+pub fn render_duplicate_probe(
+    source: &LogicalSource,
+    keys: &[String],
+    dialect: SqlDialect,
+) -> String {
+    let cols: Vec<String> = keys.iter().map(|k| dialect.quote_ident(k)).collect();
+    let not_null: Vec<String> = cols.iter().map(|c| format!("{c} IS NOT NULL")).collect();
+    format!(
+        "SELECT 1 FROM {} WHERE {} GROUP BY {} HAVING COUNT(*) > 1 LIMIT 1",
+        source.render(dialect),
+        not_null.join(" AND "),
+        cols.join(", ")
+    )
+}
+
 /// Render the scan against the probed schema. Unknown projected columns are
 /// an error (the mapping names a column the table does not have); predicates
 /// on unknown columns or with unrenderable literals are declined, not errors.
@@ -426,6 +444,27 @@ mod tests {
         assert_eq!(
             sql_string("O'Brien", SqlDialect::Trino).unwrap(),
             "'O''Brien'"
+        );
+    }
+
+    #[test]
+    fn duplicate_probe_renders_per_dialect() {
+        let keys = vec!["order_id".to_string(), "line".to_string()];
+        assert_eq!(
+            render_duplicate_probe(
+                &LogicalSource::Table("sales.lines".into()),
+                &keys,
+                SqlDialect::Trino
+            ),
+            r#"SELECT 1 FROM "sales"."lines" WHERE "order_id" IS NOT NULL AND "line" IS NOT NULL GROUP BY "order_id", "line" HAVING COUNT(*) > 1 LIMIT 1"#
+        );
+        assert_eq!(
+            render_duplicate_probe(
+                &LogicalSource::Query("SELECT id FROM t".into()),
+                &["id".to_string()],
+                SqlDialect::Mysql
+            ),
+            "SELECT 1 FROM (SELECT id FROM t) AS `__fluree_q` WHERE `id` IS NOT NULL GROUP BY `id` HAVING COUNT(*) > 1 LIMIT 1"
         );
     }
 

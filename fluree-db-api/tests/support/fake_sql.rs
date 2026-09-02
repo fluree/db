@@ -6,8 +6,9 @@
 //! a `FROM` table (or an `rr:sqlQuery` derived table mapped to a fixture
 //! table) followed by any number of `JOIN` / `LEFT JOIN` items — tables or
 //! `VALUES` key sets — with `ON` predicates; `WHERE` conjunctions of
-//! `IS [NOT] NULL`, comparisons, `IN`, `NOT (…)` and `OR`; `ORDER BY` on one
-//! column; `LIMIT`. Anything else answers with a Trino error naming the
+//! `IS [NOT] NULL`, comparisons, `IN`, `NOT (…)` and `OR`; `GROUP BY` with
+//! `HAVING COUNT(*) > n` (the uniqueness probe); `ORDER BY` on one column;
+//! `LIMIT`. Anything else answers with a Trino error naming the
 //! statement, so a test fails loudly with the SQL it sent.
 
 #![allow(dead_code)]
@@ -215,11 +216,23 @@ impl FakeSql {
         }
 
         let mut where_text = None;
+        let mut group_by: Option<Vec<Col>> = None;
+        let mut having_min_count: Option<usize> = None;
         let mut order = None;
         let mut limit = None;
         if let Some(r) = rest.strip_prefix("WHERE ") {
             let (w, tail) = cut_clause(r);
             where_text = Some(w);
+            rest = tail;
+        }
+        if let Some(r) = rest.strip_prefix("GROUP BY ") {
+            let (g, tail) = cut_clause(r);
+            group_by = Some(split_top(g, ", ").into_iter().map(colref).collect());
+            rest = tail;
+        }
+        if let Some(r) = rest.strip_prefix("HAVING COUNT(*) > ") {
+            let (h, tail) = cut_clause(r);
+            having_min_count = Some(h.trim().parse::<usize>().map_err(|e| e.to_string())? + 1);
             rest = tail;
         }
         if let Some(r) = rest.strip_prefix("ORDER BY ") {
@@ -241,6 +254,31 @@ impl FakeSql {
             let pred = parse_pred(w)?;
             tuples.retain(|t| pred.eval(t, &resolver));
         }
+        if let Some(cols) = &group_by {
+            // One representative tuple per group, kept only when the group
+            // is large enough for HAVING.
+            let idx: Vec<(usize, usize)> = cols
+                .iter()
+                .map(|c| resolver.resolve(c))
+                .collect::<Result<_, _>>()?;
+            let mut groups: Vec<(Vec<Value>, Tuple, usize)> = Vec::new();
+            for t in &tuples {
+                let key: Vec<Value> = idx.iter().map(|(ri, ci)| cell(t, *ri, *ci)).collect();
+                match groups
+                    .iter_mut()
+                    .find(|(k, _, _)| k.iter().zip(&key).all(|(a, b)| values_eq(a, b)))
+                {
+                    Some((_, _, n)) => *n += 1,
+                    None => groups.push((key, t.clone(), 1)),
+                }
+            }
+            let min = having_min_count.unwrap_or(0);
+            tuples = groups
+                .into_iter()
+                .filter(|(_, _, n)| *n >= min)
+                .map(|(_, t, _)| t)
+                .collect();
+        }
         if let Some((col, asc)) = order {
             let (ri, ci) = resolver.resolve(&col)?;
             tuples.sort_by(|a, b| {
@@ -256,6 +294,12 @@ impl FakeSql {
             tuples.truncate(n);
         }
 
+        if select_list.trim() == "1" {
+            return Ok((
+                vec![("_col0".into(), "integer".into())],
+                tuples.iter().map(|_| vec![json!(1)]).collect(),
+            ));
+        }
         if select_list.trim() == "COUNT(*)" {
             return Ok((
                 vec![("_col0".into(), "bigint".into())],
@@ -575,7 +619,15 @@ fn strip_parens(s: &str) -> &str {
 /// Cut a clause body at the next top-level keyword.
 fn cut_clause(s: &str) -> (&str, &str) {
     let mut best: Option<usize> = None;
-    for kw in [" WHERE ", " ORDER BY ", " LIMIT ", " JOIN ", " LEFT JOIN "] {
+    for kw in [
+        " WHERE ",
+        " GROUP BY ",
+        " HAVING ",
+        " ORDER BY ",
+        " LIMIT ",
+        " JOIN ",
+        " LEFT JOIN ",
+    ] {
         if let Some((head, _)) = split_once_top(s, kw) {
             let pos = head.len();
             if best.is_none_or(|b| pos < b) {

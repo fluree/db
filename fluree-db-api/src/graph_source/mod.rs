@@ -145,7 +145,7 @@ mod r2rml_materialize;
 mod sql;
 
 #[cfg(feature = "sql")]
-pub use sql::{SqlCreateConfig, SqlCreateResult};
+pub use sql::{SqlCheckResult, SqlCreateConfig, SqlCreateResult};
 
 // Re-export configuration types
 pub use config::Bm25CreateConfig;

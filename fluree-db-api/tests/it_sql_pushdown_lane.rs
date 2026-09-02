@@ -538,3 +538,106 @@ async fn outer_bindings_become_a_key_set() {
     let rows = rows_of(&query(&fluree, sparql).await);
     assert_eq!(rows, vec!["n=Ada tier=gold", "n=Cy tier=silver"]);
 }
+
+const DUP_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Tag>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.item_tags" ] ;
+        rr:subjectMap [ rr:template "http://example.org/item/{item_id}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:tag ; rr:objectMap [ rr:column "tag" ] ] .
+"#;
+
+/// A subject minted from a non-unique column: registration reports it, the
+/// lane refuses a statement over the table, and `--allow-duplicate-subjects`
+/// lets the query run with the duplicates it implies.
+#[tokio::test]
+async fn duplicate_subject_keys_are_detected_and_refused() {
+    let _lock = KILL_SWITCH.lock().await;
+    let server = FakeSql::new()
+        .table(Table::new(
+            "shop.item_tags",
+            &[("item_id", "bigint"), ("tag", "varchar")],
+            vec![
+                vec![json!(1), json!("red")],
+                vec![json!(1), json!("sale")],
+                vec![json!(2), json!("blue")],
+            ],
+        ))
+        .mount()
+        .await;
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let created = fluree
+        .create_sql_graph_source(SqlCreateConfig::new("tags-sql", server.uri(), DUP_R2RML))
+        .await
+        .expect("create");
+    assert!(
+        created
+            .mapping_warnings
+            .iter()
+            .any(|w| w.contains("shop.item_tags") && w.contains("not unique")),
+        "{:?}",
+        created.mapping_warnings
+    );
+    let probes: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .filter(|s| s.contains("HAVING"))
+        .collect();
+    assert_eq!(
+        probes,
+        vec![r#"SELECT 1 FROM "shop"."item_tags" WHERE "item_id" IS NOT NULL GROUP BY "item_id" HAVING COUNT(*) > 1 LIMIT 1"#.to_string()]
+    );
+
+    let sparql = "PREFIX ex: <http://example.org/>\nSELECT ?i ?t FROM <tags-sql:main> WHERE { ?i ex:tag ?t }";
+    let err = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect_err("the lane refuses a flagged table");
+    assert!(
+        err.to_string().contains("shop.item_tags") && err.to_string().contains("non-unique"),
+        "{err}"
+    );
+
+    // Re-check reports the same finding and keeps the flag.
+    let checked = fluree
+        .check_sql_graph_source("tags-sql:main")
+        .await
+        .expect("check");
+    assert_eq!(
+        checked.duplicate_subject_tables,
+        vec!["shop.item_tags".to_string()]
+    );
+    assert!(!checked.allow_duplicate_subjects);
+
+    // Accepting duplicates: the same query runs, with one row per table row.
+    let mut config = SqlCreateConfig::new("tags-ok", server.uri(), DUP_R2RML);
+    config.allow_duplicate_subjects = true;
+    fluree
+        .create_sql_graph_source(config)
+        .await
+        .expect("create with duplicates accepted");
+    let rows = rows_of(
+        &query(
+            &fluree,
+            "PREFIX ex: <http://example.org/>\nSELECT ?i ?t FROM <tags-ok:main> WHERE { ?i ex:tag ?t }",
+        )
+        .await,
+    );
+    assert_eq!(
+        rows,
+        vec![
+            "i=http://example.org/item/1 t=red",
+            "i=http://example.org/item/1 t=sale",
+            "i=http://example.org/item/2 t=blue",
+        ]
+    );
+}

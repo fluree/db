@@ -22,7 +22,8 @@ pub mod types;
 
 pub use config::{SqlGsConfig, WireProtocol};
 pub use dialect::{
-    CmpOp, Literal, LogicalSource, Predicate, RenderedScan, ScanRequest, SqlDialect,
+    render_duplicate_probe, CmpOp, Literal, LogicalSource, Predicate, RenderedScan, ScanRequest,
+    SqlDialect,
 };
 pub use error::{Result, SqlError};
 pub use net::validate_endpoint as validate_sql_endpoint;

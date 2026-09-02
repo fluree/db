@@ -176,11 +176,57 @@ against the endpoint, so cardinality on a large table costs an aggregate scan,
 where an Iceberg source answers from metadata. Most engines optimize
 `COUNT(*)`, but plan for it if a query shape asks for cardinality repeatedly.
 
-**Not pushed:** `ORDER BY … LIMIT`. A NULL in a key or required column would
-consume `LIMIT` slots for rows the mapping drops, so the engine's own sort
-runs over the full scan. Joins between triples maps on the same source are
-also performed in the engine (a whole-query SQL rewrite in the Ontop style is
-a possible later optimization, not a v1 requirement).
+### The pushdown lane: one statement per block
+
+A `GRAPH <source> { … }` block (and the whole `WHERE` clause of a query run
+against the source) is compiled to **one SQL statement** when its shape
+allows: triple patterns grouped by subject are one table access each, joins
+between them are on the mapping's `rr:joinCondition` columns or on the
+columns of an identical IRI template — never on a rendered IRI string — and
+every required column is `IS NOT NULL`, which is also what makes `LIMIT`
+pushable. In that statement:
+
+- an `OPTIONAL` member of the same entity is a nullable column of the same
+  access (no join); an optional entity hanging off a foreign key is a
+  `LEFT JOIN`;
+- a `FILTER` is pushed only when it is exact — the column's RDF datatype
+  (from `rr:datatype`; `xsd:string` when un-annotated), the literal's type
+  and the SQL type agree, and for strings the dialect compares bytes.
+  Anything else stays in the engine as a residual filter over the returned
+  rows;
+- a `VALUES` block, and bindings the outer query already holds (a ledger
+  pattern joined to the block), are sent as a `VALUES` key set so the
+  source does the semi-join;
+- `LIMIT` and a single-column `ORDER BY` on a typed, required column are
+  pushed when no residual filter could drop rows afterwards.
+
+Terms are always built in the engine from the returned columns, so
+datatypes come from the mapping, not from the SQL types. Shapes the lane
+cannot express exactly — variable predicates, several triples maps for one
+entity, disconnected entities (a Cartesian product), a filter inside an
+optional that is not exact, subject-targeted view policies — decline to the
+per-scan lane below, which is also the differential oracle in the test
+suite. `FLUREE_SQL_PUSHDOWN_LANE=0` disables the lane. The statement sent
+is logged at `info` as `SQL block pushdown`.
+
+### Subject keys must be unique
+
+Both lanes assume the columns of a subject template identify one row: a
+star over a subject reads its columns from one row. R2RML itself does not
+require that — the output graph is a set — so a subject minted from a
+non-key column, a joined `rr:sqlQuery` view or a denormalized fact table
+would return duplicate rows. Registration therefore probes every table
+(`SELECT 1 … GROUP BY <subject key columns> HAVING COUNT(*) > 1 LIMIT 1`,
+also over the parent columns of every foreign key pointing at the map) and
+reports repeats as `mapping_warnings`; the finding is stored on the source.
+The pushdown lane **refuses** a statement over a flagged table with an
+error naming it. Register with `allow_duplicate_subjects` to accept the
+duplicate rows instead, and run `fluree sql check <source>` to re-probe
+live tables. An unreachable endpoint skips the probe with a warning.
+
+**Not pushed** in the per-scan lane: `ORDER BY … LIMIT` (a NULL in a key or
+required column would consume `LIMIT` slots for rows the mapping drops) and
+joins between triples maps, which run in the engine.
 
 ### Types
 
@@ -250,8 +296,9 @@ moment. Consequently
 - View policy is enforced in the R2RML scan exactly as for an Iceberg source
   (static `f:onProperty` / `f:onClass` / `f:onSubject` targeting, subclass
   expansion and stored policies through a `--model` ledger; `f:query` fails
-  closed). See [Access policy](iceberg.md#access-policy). Enforcement happens
-  after the rows come back from SQL; hidden columns are still selected.
+  closed). See [Access policy](iceberg.md#access-policy). The pushdown lane
+  prunes the mapping before it builds its statement, so a hidden column is
+  never selected; the per-scan lane enforces after the rows come back.
 
 ## Running the bridge
 
@@ -288,8 +335,9 @@ next to `99.50` as a real; typing by declaration keeps both as `5.0` and
 |-|----------------|------------|
 | Reads | Parquet files directly (S3/GCS/local) | SQL through an endpoint |
 | Filters | file/row-group pruning by min/max stats | exact `WHERE` |
+| Joins, OPTIONAL, VALUES, outer bindings | in the engine | one statement per block (pushdown lane) |
 | `COUNT` | manifest stats, when provably exact | exact `COUNT(*)` |
-| `ORDER BY … LIMIT` | top-k file ordering | not pushed |
+| `ORDER BY … LIMIT` | top-k file ordering | pushed by the pushdown lane on typed required columns |
 | Snapshots / time travel | pinned per query, incremental twins | none; full rebuilds |
 | `rr:sqlQuery` | refused | supported |
 | View policy | static targeting in the scan, `--model` ledger | same |

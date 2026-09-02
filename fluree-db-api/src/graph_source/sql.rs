@@ -48,6 +48,9 @@ pub struct SqlCreateConfig {
     /// The R2RML mapping — inline content or a pre-existing address.
     pub mapping: R2rmlMappingInput,
     pub mapping_media_type: Option<String>,
+    /// Accept subject keys the registration probe finds non-unique (the
+    /// pushdown lane otherwise refuses statements over those tables).
+    pub allow_duplicate_subjects: bool,
     /// Optional model ledger (`name:branch`) whose default graph supplies the
     /// source's view policies and class/property hierarchy.
     pub model: Option<String>,
@@ -74,6 +77,7 @@ impl SqlCreateConfig {
             session: BTreeMap::new(),
             mapping: R2rmlMappingInput::Content(mapping_content.into()),
             mapping_media_type: None,
+            allow_duplicate_subjects: false,
             model: None,
             default_allow: None,
         }
@@ -108,6 +112,7 @@ impl SqlCreateConfig {
             source: mapping_address.to_string(),
             media_type: Some(media_type),
         });
+        cfg.allow_duplicate_subjects = self.allow_duplicate_subjects;
         cfg.model = self.model.clone();
         cfg.default_allow = self.default_allow;
         cfg
@@ -148,6 +153,96 @@ pub struct SqlCreateResult {
     /// evaluate). Empty when no model is set or nothing is amiss.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_warnings: Vec<String>,
+    /// Findings of the registration probe: tables whose subject keys repeat,
+    /// or a probe that could not run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mapping_warnings: Vec<String>,
+}
+
+/// Result of `fluree sql check`: the re-run uniqueness probe.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SqlCheckResult {
+    pub graph_source_id: String,
+    pub duplicate_subject_tables: Vec<String>,
+    pub allow_duplicate_subjects: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mapping_warnings: Vec<String>,
+}
+
+/// The key columns per table whose uniqueness the mapping assumes: every
+/// subject template column, plus the parent columns of every foreign key
+/// pointing at the map (a repeated parent key multiplies a join).
+fn duplicate_probe_keys(mapping: &CompiledR2rmlMapping) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut maps: Vec<&fluree_db_r2rml::mapping::TriplesMap> =
+        mapping.triples_maps.values().collect();
+    maps.sort_by(|a, b| a.iri.cmp(&b.iri));
+    for tm in &maps {
+        let Some(table) = tm.table_name() else {
+            continue;
+        };
+        let mut keys: Vec<String> = tm.subject_columns().into_iter().map(String::from).collect();
+        for child in mapping.find_maps_referencing(&tm.iri) {
+            for pom in &child.predicate_object_maps {
+                if let fluree_db_r2rml::mapping::ObjectMap::RefObjectMap(rom) = &pom.object_map {
+                    if rom.parent_triples_map == tm.iri {
+                        for c in rom.parent_columns() {
+                            if !keys.iter().any(|k| k == c) {
+                                keys.push(c.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if keys.is_empty() {
+            continue;
+        }
+        match out.iter_mut().find(|(t, _)| t == table) {
+            Some((_, existing)) => {
+                for k in keys {
+                    if !existing.contains(&k) {
+                        existing.push(k);
+                    }
+                }
+            }
+            None => out.push((table.to_string(), keys)),
+        }
+    }
+    out
+}
+
+/// Probe every table's subject keys for duplicates. Returns the flagged
+/// tables and human-readable warnings (a duplicate, or a probe that could not
+/// run — the latter never blocks registration).
+async fn probe_duplicate_subjects(
+    client: &TrinoClient,
+    mapping: &CompiledR2rmlMapping,
+) -> (Vec<String>, Vec<String>) {
+    let mut flagged = Vec::new();
+    let mut warnings = Vec::new();
+    for (table, keys) in duplicate_probe_keys(mapping) {
+        let source = match mapping.sql_query_for_table(&table) {
+            Some(sql) => LogicalSource::Query(sql.to_string()),
+            None => LogicalSource::Table(table.clone()),
+        };
+        let sql = fluree_db_sql::render_duplicate_probe(&source, &keys, client.dialect());
+        match client.execute_collect(&sql).await {
+            Ok((_, batches)) => {
+                if batches.iter().any(|b| b.num_rows > 0) {
+                    warnings.push(format!(
+                        "table '{table}': subject key ({}) is not unique; a star over a repeated                          subject returns duplicate rows and the pushdown lane refuses statements                          over it (register with allow_duplicate_subjects to proceed anyway)",
+                        keys.join(", ")
+                    ));
+                    flagged.push(table);
+                }
+            }
+            Err(e) => warnings.push(format!(
+                "table '{table}': could not probe subject key uniqueness: {e}"
+            )),
+        }
+    }
+    (flagged, warnings)
 }
 
 impl crate::Fluree {
@@ -162,6 +257,7 @@ impl crate::Fluree {
         config.validate()?;
         let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
 
+        let mut compiled_for_probe: Option<CompiledR2rmlMapping> = None;
         let (mapping_address, triples_map_count, table_names, mapping_validated) = match &config
             .mapping
         {
@@ -170,6 +266,7 @@ impl crate::Fluree {
                     Self::compile_r2rml_content(content, config.mapping_media_type.as_deref(), "")?;
                 let count = compiled.len();
                 let tables = Self::sorted_table_names(&compiled);
+                compiled_for_probe = Some(compiled);
                 let cid = self
                     .content_store(&graph_source_id)
                     .put(
@@ -198,7 +295,12 @@ impl crate::Fluree {
                                 address,
                             )
                         }) {
-                        Ok(compiled) => (compiled.len(), Self::sorted_table_names(&compiled), true),
+                        Ok(compiled) => {
+                            let summary =
+                                (compiled.len(), Self::sorted_table_names(&compiled), true);
+                            compiled_for_probe = Some(compiled);
+                            summary
+                        }
                         Err(e) => {
                             warn!(graph_source_id = %graph_source_id, error = %e, "Could not validate R2RML mapping from address");
                             (0, Vec::new(), false)
@@ -213,14 +315,34 @@ impl crate::Fluree {
             }
         };
 
-        let gs_config = config.to_gs_config(&mapping_address);
-        let connection_tested = match self.test_sql_connection(&gs_config).await {
-            Ok(()) => true,
+        let mut gs_config = config.to_gs_config(&mapping_address);
+        let mut mapping_warnings = Vec::new();
+        let connection_tested = match build_sql_client(&gs_config, self.secret_resolver()).await {
+            Ok(client) => match client.execute_collect("SELECT 1").await {
+                Ok(_) => {
+                    if let Some(mapping) = &compiled_for_probe {
+                        let (flagged, warnings) = probe_duplicate_subjects(&client, mapping).await;
+                        gs_config.duplicate_subject_tables = flagged;
+                        mapping_warnings = warnings;
+                    }
+                    true
+                }
+                Err(e) => {
+                    warn!(graph_source_id = %graph_source_id, error = %e, "SQL endpoint connection test failed; registering anyway");
+                    false
+                }
+            },
             Err(e) => {
                 warn!(graph_source_id = %graph_source_id, error = %e, "SQL endpoint connection test failed; registering anyway");
                 false
             }
         };
+        if !connection_tested {
+            mapping_warnings.push(
+                "subject key uniqueness was not probed (endpoint unreachable); run `fluree sql check`                  once it is"
+                    .to_string(),
+            );
+        }
 
         let config_json = gs_config
             .to_json()
@@ -238,6 +360,7 @@ impl crate::Fluree {
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, "Created SQL graph source");
         Ok(SqlCreateResult {
             model_warnings,
+            mapping_warnings,
             graph_source_id,
             endpoint: gs_config.endpoint,
             mapping_source: mapping_address,
@@ -246,6 +369,80 @@ impl crate::Fluree {
             table_names,
             connection_tested,
             mapping_validated,
+        })
+    }
+
+    /// Re-run the subject key uniqueness probe for a registered SQL source
+    /// (tables are live) and store the result on its record.
+    pub async fn check_sql_graph_source(
+        &self,
+        graph_source_id: &str,
+    ) -> crate::Result<SqlCheckResult> {
+        let record = self
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| crate::ApiError::Config(format!("nameservice: {e}")))?
+            .ok_or_else(|| {
+                crate::ApiError::Config(format!("graph source '{graph_source_id}' not found"))
+            })?;
+        if record.source_type != GraphSourceType::Sql {
+            return Err(crate::ApiError::Config(format!(
+                "graph source '{graph_source_id}' is not a SQL source"
+            )));
+        }
+        let mut config = SqlGsConfig::from_json(&record.config)
+            .map_err(|e| crate::ApiError::Config(e.to_string()))?;
+        let mapping_ref = config.mapping.clone().ok_or_else(|| {
+            crate::ApiError::Config(format!("graph source '{graph_source_id}' has no mapping"))
+        })?;
+        let bytes = if let Ok(cid) = mapping_ref.source.parse::<fluree_db_core::ContentId>() {
+            self.content_store(graph_source_id)
+                .get(&cid)
+                .await
+                .map_err(|e| crate::ApiError::Config(format!("read mapping: {e}")))?
+        } else {
+            let storage = self.admin_storage().ok_or_else(|| {
+                crate::ApiError::Config(
+                    "address-based mappings are not supported on this backend".to_string(),
+                )
+            })?;
+            storage
+                .read_bytes(&mapping_ref.source)
+                .await
+                .map_err(|e| crate::ApiError::Config(format!("read mapping: {e}")))?
+        };
+        let content =
+            String::from_utf8(bytes).map_err(|e| crate::ApiError::Config(e.to_string()))?;
+        let compiled = Self::compile_r2rml_content(
+            &content,
+            mapping_ref.media_type.as_deref(),
+            &mapping_ref.source,
+        )?;
+        let client = build_sql_client(&config, self.secret_resolver())
+            .await
+            .map_err(|e| crate::ApiError::Config(e.to_string()))?;
+        let (flagged, mapping_warnings) = probe_duplicate_subjects(&client, &compiled).await;
+        config.duplicate_subject_tables = flagged.clone();
+        let (name, branch) = graph_source_id
+            .rsplit_once(':')
+            .unwrap_or((graph_source_id, "main"));
+        self.publisher()?
+            .publish_graph_source(
+                name,
+                branch,
+                GraphSourceType::Sql,
+                &config
+                    .to_json()
+                    .map_err(|e| crate::ApiError::Config(e.to_string()))?,
+                &[],
+            )
+            .await?;
+        Ok(SqlCheckResult {
+            graph_source_id: graph_source_id.to_string(),
+            duplicate_subject_tables: flagged,
+            allow_duplicate_subjects: config.allow_duplicate_subjects,
+            mapping_warnings,
         })
     }
 
@@ -412,6 +609,29 @@ impl SqlSource {
         mapping: &CompiledR2rmlMapping,
         plan: &RelPlan,
     ) -> QueryResult<(String, ColumnBatchStream)> {
+        if !self.config.allow_duplicate_subjects {
+            let touched: Vec<&str> = plan
+                .root
+                .accesses()
+                .iter()
+                .filter_map(|(_, src)| match src {
+                    RelSource::Table(t) => self
+                        .config
+                        .duplicate_subject_tables
+                        .iter()
+                        .any(|d| d == t)
+                        .then_some(t.as_str()),
+                    RelSource::Query(_) => None,
+                })
+                .collect();
+            if !touched.is_empty() {
+                return Err(QueryError::InvalidQuery(format!(
+                    "SQL graph source '{}': table(s) {} have non-unique subject keys, so a                      statement over them would return wrong row multiplicities; fix the mapping                      (map from a view with distinct keys), or re-register with                      allow_duplicate_subjects to accept duplicate rows",
+                    self.graph_source_id,
+                    touched.join(", ")
+                )));
+            }
+        }
         let mut schemas: HashMap<String, Arc<BatchSchema>> = HashMap::new();
         for (alias, source) in plan.root.accesses() {
             let (logical, table_name) = match source {
