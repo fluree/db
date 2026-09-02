@@ -38,6 +38,8 @@ struct ParseMeta {
     pages: usize,
     elements: usize,
     escalated_crops: usize,
+    #[serde(default)]
+    escalation_skipped: Option<String>,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -71,6 +73,7 @@ impl DocCache {
             pages: meta.pages,
             elements: meta.elements,
             escalated_crops: meta.escalated_crops,
+            escalation_skipped: meta.escalation_skipped,
             from_cache: true,
         })
     }
@@ -82,6 +85,7 @@ impl DocCache {
             pages: doc.pages,
             elements: doc.elements,
             escalated_crops: doc.escalated_crops,
+            escalation_skipped: doc.escalation_skipped.clone(),
         };
         // Write into place last so a torn write never reads as a hit.
         fs::write(dir.join("text.txt"), &doc.text)?;
@@ -138,6 +142,7 @@ mod tests {
             pages: 2,
             elements: 3,
             escalated_crops: 1,
+            escalation_skipped: None,
             from_cache: false,
         };
         assert!(cache.load_parse("abc", "fp").is_none());

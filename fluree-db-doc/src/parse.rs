@@ -11,7 +11,9 @@ use crate::escalate::VlmReader;
 use crate::{DocError, Result};
 use fluree_doc_model::{to_doco, to_text, DocoOptions, Notes, PageSize};
 use fluree_doc_pdf::document::AnalyzeOptions;
+use fluree_doc_pdf::escalate::Readings;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -95,6 +97,10 @@ impl ParseOptions {
         h.update(self.doc_iri.as_bytes());
         h.update([0]);
         h.update(self.vlm.as_ref().map_or("none", |v| v.model()).as_bytes());
+        h.update([0]);
+        // A parse that skipped escalation over the cap must not be served
+        // to a later run that raised it.
+        h.update(self.vlm.as_ref().map_or(0, |v| v.max_crops()).to_le_bytes());
         hex::encode(h.finalize())[..16].to_string()
     }
 }
@@ -109,6 +115,9 @@ pub struct ParsedDocument {
     pub elements: usize,
     /// Crops the vision model read for this parse (zero when none asked).
     pub escalated_crops: usize,
+    /// Why escalation did not happen although the document asked for it:
+    /// the deterministic tier stands in, and the caller should say so.
+    pub escalation_skipped: Option<String>,
     pub from_cache: bool,
 }
 
@@ -170,6 +179,7 @@ fn emit(
         pages: page_count,
         elements: elements.len(),
         escalated_crops,
+        escalation_skipped: None,
         from_cache: false,
     }
 }
@@ -188,8 +198,19 @@ fn parse_pdf(data: Vec<u8>, stem: &str, opts: &ParseOptions) -> Result<ParsedDoc
     let mut analysis = fluree_doc_pdf::document::analyze_with(&mut doc, &outline, &analyze_opts);
 
     let mut escalated_crops = 0;
+    let mut escalation_skipped = None;
     if let Some(vlm) = &opts.vlm {
-        let readings = vlm.read_pdf(&raw, &doc, &analysis)?;
+        // Over the cap, the deterministic tier stands: nothing has been
+        // spent, the document still lands, and the caller is told so it
+        // can raise `--max-crops` on purpose.
+        let readings = match vlm.read_pdf(&raw, &doc, &analysis) {
+            Ok(readings) => readings,
+            Err(e @ DocError::CropCap { .. }) => {
+                escalation_skipped = Some(e.to_string());
+                Readings::from_map(HashMap::new())
+            }
+            Err(e) => return Err(e),
+        };
         escalated_crops = readings.len();
         if !readings.is_empty() {
             // The page's own text, so the arbiter can ask whether a reading
@@ -241,14 +262,16 @@ fn parse_pdf(data: Vec<u8>, stem: &str, opts: &ParseOptions) -> Result<ParsedDoc
             .collect(),
     };
     let page_count = doc.pages.len();
-    Ok(emit(
+    let mut parsed = emit(
         &analysis.elements,
         sizes,
         notes,
         page_count,
         escalated_crops,
         opts,
-    ))
+    );
+    parsed.escalation_skipped = escalation_skipped;
+    Ok(parsed)
 }
 
 /// A bare image is one page of pixels with no deterministic reading to fall

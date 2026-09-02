@@ -48,6 +48,10 @@ pub enum DocError {
     Config(String),
     #[error("model endpoint: {0}")]
     Model(String),
+    /// The document asks the vision model for more crops than the caller
+    /// allowed. Raised before any call is made, so nothing has been spent.
+    #[error("{crops} crop(s) routed to the vision model, past the cap of {cap}")]
+    CropCap { crops: usize, cap: usize },
 }
 
 impl From<std::io::Error> for DocError {

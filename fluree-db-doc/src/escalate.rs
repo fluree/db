@@ -74,6 +74,10 @@ impl VlmReader {
         &self.endpoint.model
     }
 
+    pub fn max_crops(&self) -> usize {
+        self.max_crops
+    }
+
     /// Read every crop `analysis` asks for. Empty when the document asks for
     /// nothing, which is the common case and must stay silent.
     pub fn read_pdf(&self, pdf: &Pdf, doc: &Document, analysis: &Analysis) -> Result<Readings> {
@@ -86,13 +90,10 @@ impl VlmReader {
             return Ok(Readings::from_map(HashMap::new()));
         }
         if crops.len() > self.max_crops {
-            return Err(DocError::Model(format!(
-                "document routes {} crop(s) to the vision model, past the cap of {} \
-                 (`--max-crops`); raise it deliberately, or pass `--no-escalate` \
-                 to keep the deterministic tier only",
-                crops.len(),
-                self.max_crops
-            )));
+            return Err(DocError::CropCap {
+                crops: crops.len(),
+                cap: self.max_crops,
+            });
         }
         tracing::info!(crops = crops.len(), model = %self.endpoint.model, "escalating to the vision model");
 

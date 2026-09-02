@@ -144,6 +144,9 @@ struct Totals {
     pages: usize,
     escalated_crops: usize,
     cache_hits: usize,
+    /// Documents that asked for more crops than the cap and landed
+    /// deterministic-only.
+    unescalated: usize,
 }
 
 async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
@@ -329,6 +332,13 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             doc.parsed.elements,
             doc.chunks.len()
         );
+        if let Some(why) = &doc.parsed.escalation_skipped {
+            println!(
+                "    {} deterministic tier only: {why}; raise --max-crops to read them",
+                "!".yellow()
+            );
+            totals.unescalated += 1;
+        }
         totals.ingested += 1;
         totals.chunks += doc.chunks.len();
         totals.pages += doc.parsed.pages;
@@ -358,6 +368,12 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
         elapsed.as_secs_f64(),
         if args.dry_run { " (dry run, nothing written)" } else { "" }
     );
+    if totals.unescalated > 0 {
+        eprintln!(
+            "note: {} document(s) exceeded the crop cap and were parsed without the vision model",
+            totals.unescalated
+        );
+    }
     if totals.failed > 0 {
         return Err(CliError::ExitCode(1));
     }
@@ -460,7 +476,22 @@ async fn ensure_indexes(fluree: &Fluree, alias: &str, dimensions: Option<usize>)
     }
 
     let (vec_id, vec_name) = vector_index_id(alias);
-    if graph_source_present(fluree, &vec_id).await? {
+    let mut present = graph_source_present(fluree, &vec_id).await?;
+    // An index built for another embedding model has the wrong width:
+    // vectors of a new size cannot be synced into it, so it is rebuilt.
+    if let (true, Some(dims)) = (present, dimensions) {
+        if let Some(existing) = index_dimensions(fluree, &vec_id).await? {
+            if existing != dims {
+                fluree.drop_vector_index(&vec_id).await?;
+                println!(
+                    "  {} vector index {vec_id}: rebuilt, embeddings changed from {existing} to {dims} dims",
+                    "×".yellow()
+                );
+                present = false;
+            }
+        }
+    }
+    if present {
         let r = fluree.sync_vector_index(&vec_id).await?;
         println!(
             "  {} vector index {vec_id}: +{} −{} vector(s)",
@@ -507,6 +538,18 @@ async fn sync_indexes_if_present(fluree: &Fluree, alias: &str) -> CliResult<()> 
         fluree.sync_vector_index(&vec_id).await?;
     }
     Ok(())
+}
+
+/// The width a vector index was built for, from its published config.
+async fn index_dimensions(fluree: &Fluree, id: &str) -> CliResult<Option<usize>> {
+    let Some(record) = fluree.nameservice().lookup_graph_source(id).await? else {
+        return Ok(None);
+    };
+    let config: Value = serde_json::from_str(&record.config).unwrap_or(Value::Null);
+    Ok(config
+        .get("dimensions")
+        .and_then(Value::as_u64)
+        .map(|d| d as usize))
 }
 
 async fn graph_source_present(fluree: &Fluree, id: &str) -> CliResult<bool> {

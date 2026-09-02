@@ -47,7 +47,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--force` | Re-ingest documents the ledger already holds with the same content, parser and embedding model. |
 | `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `800`). |
 | `--max-chars <N>` | Split a single element longer than this many characters (default `2000`). |
-| `--max-crops <N>` | Most crops one document may send to the vision model (default `70`). |
+| `--max-crops <N>` | Most crops one document may send to the vision model (default `70`). A document asking for more is parsed with the deterministic tier only and flagged in the output; nothing is sent. |
 | `--dry-run` | Parse, chunk and embed, then report what would be written. Nothing is written. |
 | `--out-dir <DIR>` | Also write each document's transaction as JSON-LD into this directory. |
 
@@ -61,7 +61,7 @@ For each document, in path order:
 4. **Embed** each chunk's text, prefixed with its section path, against `[doc.embedding]`.
 5. **Retract the previous extraction** of the same document IRI, if any, then insert the structure graph, the chunks and the document node as one commit. The earlier extraction remains queryable at its commit.
 
-After the documents, the full-text index `<ledger>-text` is created or synced, and the vector index `<ledger>-vectors` likewise when embeddings were produced.
+After the documents, the full-text index `<ledger>-text` is created or synced, and the vector index `<ledger>-vectors` likewise when embeddings were produced. A vector index built for a different embedding width, because the embedding model changed, is dropped and rebuilt rather than synced.
 
 ### Examples
 
