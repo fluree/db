@@ -239,7 +239,13 @@ async fn run(mut rx: IoReceiver, config: BrowserIoConfig) {
                 ready,
                 chunks,
             } => {
-                spawn_local(sse::run(url, headers.0, ready, chunks));
+                spawn_local(sse::run(
+                    url,
+                    headers.0,
+                    config.nameservice_timeout,
+                    ready,
+                    chunks,
+                ));
             }
             IoJob::Sleep { duration, reply } => {
                 let millis = crate::config::timer_millis(duration);

@@ -8,7 +8,10 @@
 use crate::driver::fetch::js_error_text;
 use bytes::Bytes;
 use fluree_db_nameservice_sync::SseConnectError;
+use futures::future::{select, Either};
+use gloo_timers::future::TimeoutFuture;
 use js_sys::{Function, Promise, Reflect, Uint8Array};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -28,6 +31,7 @@ fn classify_connect(value: &JsValue) -> SseConnectError {
 pub async fn run(
     url: String,
     headers: Vec<(&'static str, String)>,
+    connect_timeout: Duration,
     ready: oneshot::Sender<Result<(), SseConnectError>>,
     chunks: mpsc::UnboundedSender<Result<Bytes, String>>,
 ) {
@@ -82,14 +86,32 @@ pub async fn run(
         Ok(p) => p,
         Err(e) => fail_ready!(e),
     };
-    let response: Response = match JsFuture::from(promise).await {
-        Ok(r) => match r.dyn_into() {
+    // Bound the CONNECT (time to first response headers), not the stream.
+    // The module keeps no timeout on the long-lived stream deliberately, but
+    // a server that accepts the TCP connection and never sends headers is not
+    // long-lived — it is hung, and without this the head-tracking future
+    // parks forever inside `until_stopped`, the reconnect backoff never runs,
+    // no `Disconnected` is emitted, and the peer silently stops seeing
+    // commits. On expiry, abort the fetch and surface a Retryable error so
+    // the existing backoff path reconnects.
+    let millis = crate::config::timer_millis(connect_timeout);
+    let fetch_fut = JsFuture::from(promise);
+    let timeout_fut = TimeoutFuture::new(millis);
+    futures::pin_mut!(fetch_fut, timeout_fut);
+    let response: Response = match select(fetch_fut, timeout_fut).await {
+        Either::Left((Ok(r), _)) => match r.dyn_into() {
             Ok(r) => r,
             Err(_) => fail_ready!(SseConnectError::Retryable(
                 "fetch resolved to a non-Response value".to_string()
             )),
         },
-        Err(e) => fail_ready!(classify_connect(&e)),
+        Either::Left((Err(e), _)) => fail_ready!(classify_connect(&e)),
+        Either::Right(((), _)) => {
+            controller.abort();
+            fail_ready!(SseConnectError::Retryable(format!(
+                "SSE connect exceeded {millis}ms before response headers"
+            )));
+        }
     };
 
     let status = response.status();
