@@ -212,6 +212,20 @@ path = "tests/grp_reasoning.rs"
 name = "grp_transact"
 path = "tests/grp_transact.rs"
 
+# Own binary: installs a process-global tracing subscriber and asserts on every
+# `fluree::cow_probe` event the process emits, so it must not share a process
+# with other tests that commit.
+[[test]]
+name = "it_cached_handle_cow"
+path = "tests/it_cached_handle_cow.rs"
+required-features = ["native"]
+
+# Own binary for the same reason (process-global `fluree::cow_probe` capture),
+# covering the branch-op (merge / revert) commit flows.
+[[test]]
+name = "it_branch_op_cow"
+path = "tests/it_branch_op_cow.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
