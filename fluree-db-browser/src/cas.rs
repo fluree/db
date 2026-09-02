@@ -68,6 +68,7 @@ fn residency_error(e: ResidencyError) -> CoreError {
 struct Counters {
     residency_hits: AtomicU64,
     cache_hits: AtomicU64,
+    cache_rejections: AtomicU64,
     fetches: AtomicU64,
     bytes_fetched: AtomicU64,
     coalesced_waits: AtomicU64,
@@ -80,6 +81,10 @@ pub struct CasStats {
     pub residency_hits: u64,
     /// Reads served from the persistent (IndexedDB) cache.
     pub cache_hits: u64,
+    /// Cached rows rejected because their bytes did not hash to the CID key
+    /// they were stored under (tampered/corrupt); refetched from origin.
+    /// A nonzero value is a security signal, not just a performance one.
+    pub cache_rejections: u64,
     /// Network fetches performed.
     pub fetches: u64,
     /// Bytes received over the network.
@@ -173,6 +178,7 @@ impl BrowserCasStorage {
         CasStats {
             residency_hits: c.residency_hits.load(Ordering::Relaxed),
             cache_hits: c.cache_hits.load(Ordering::Relaxed),
+            cache_rejections: c.cache_rejections.load(Ordering::Relaxed),
             fetches: c.fetches.load(Ordering::Relaxed),
             bytes_fetched: c.bytes_fetched.load(Ordering::Relaxed),
             coalesced_waits: c.coalesced_waits.load(Ordering::Relaxed),
@@ -366,13 +372,37 @@ impl BrowserCasStorage {
     async fn fetch_into_residency(&self, cid: &ContentId, address: &str) -> Result<Arc<[u8]>> {
         if self.inner.cache_enabled {
             if let Some(bytes) = self.cache_get(cid).await {
+                // Re-verify a cache hit against its CID before trusting it.
+                // The network path is verified inside the proxy client, but
+                // IndexedDB is not: a same-origin writer (a second app on the
+                // origin, an XSS, a compromised third-party bundle) can plant
+                // arbitrary bytes under a well-formed CID key, and because CAS
+                // blocks are immutable and never revalidated, an unverified
+                // hit would be trusted for the life of the database. This is
+                // the one admission path into the engine that the proxy does
+                // not already cover.
+                if fluree_db_nameservice_sync::verify_object_integrity(cid, &bytes) {
+                    self.inner
+                        .counters
+                        .cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    let resident: Arc<[u8]> = Arc::from(&bytes[..]);
+                    drop(bytes);
+                    return self.make_resident(cid, resident, None).await;
+                }
+                // Tampered or corrupt row: do not serve it. Fall through to
+                // the origin fetch, which verifies and (via make_resident's
+                // write-behind CachePut) overwrites the poison under the same
+                // key, healing the cache. Surfaced as a counter because a
+                // nonzero value is a security signal.
                 self.inner
                     .counters
-                    .cache_hits
+                    .cache_rejections
                     .fetch_add(1, Ordering::Relaxed);
-                let resident: Arc<[u8]> = Arc::from(&bytes[..]);
-                drop(bytes);
-                return self.make_resident(cid, resident, None).await;
+                tracing::warn!(
+                    cid = %cid,
+                    "cached object failed CID verification; discarding and refetching from origin"
+                );
             }
         }
 
@@ -900,6 +930,54 @@ pub(crate) mod tests {
         io.shutdown();
         driver.await.unwrap();
         assert!(state.lock().unwrap().puts.is_empty(), "nothing persisted");
+    }
+
+    /// A poisoned IndexedDB row — attacker bytes stored under a VALID CID key
+    /// — must not be served. The persistent cache is the one admission path
+    /// the proxy client does not verify, and CAS blocks are immutable and
+    /// never revalidated, so an unverified hit would be trusted forever. The
+    /// read must reject the poison, refetch from origin (which verifies), and
+    /// heal the cache by overwriting the bad row.
+    #[tokio::test]
+    async fn poisoned_cache_row_is_reverified_refetched_and_healed() {
+        let (id, address, good) = object(3, 16);
+        let state = Arc::new(Mutex::new(MockState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            // Cache holds attacker bytes under the valid CID key...
+            s.cache
+                .insert(id.to_string(), b"poisoned attacker bytes!!".to_vec());
+            // ...while the origin holds the real, CID-matching bytes.
+            s.objects.insert(id.to_string(), (200, good.clone()));
+        }
+        let (storage, io, driver) = storage_with(&state, &config());
+
+        // The read returns the GOOD bytes, not the poison.
+        let got = storage.read_bytes(&address).await.expect("heals via origin");
+        assert_eq!(got, good, "must serve verified origin bytes, not the poison");
+
+        // The poison was rejected and the origin was hit (fall-through).
+        assert_eq!(
+            state.lock().unwrap().fetch_log,
+            vec![id.to_string()],
+            "a rejected cache hit must fall through to a network fetch"
+        );
+        let stats = storage.stats();
+        assert_eq!(stats.cache_rejections, 1, "the poison was counted");
+        assert_eq!(stats.cache_hits, 0, "a rejected row is not a hit");
+        assert_eq!(stats.fetches, 1);
+
+        // Write-behind overwrote the poison under the same key with the
+        // verified bytes: the cache is healed.
+        io.shutdown();
+        driver.await.unwrap();
+        let s = state.lock().unwrap();
+        assert_eq!(s.puts, vec![id.to_string()]);
+        assert_eq!(
+            s.cache.get(&id.to_string()).unwrap(),
+            &good,
+            "the poisoned row was overwritten with verified bytes"
+        );
     }
 
     #[tokio::test]
