@@ -230,7 +230,7 @@ When more than one policy targets the same flake, the engine combines them as fo
 
 1. If any **required** policy (`f:required: true`) targets the flake and does not allow it (either `f:allow: false`, missing `f:allow`, or `f:query` returning no rows), access is **denied** for that flake. Required policies are *gates*: they cannot be overridden by other allows or by `default-allow`.
 2. If at least one targeted (but not required) policy allows the flake, access is **granted**. Non-required allows combine with allow-overrides semantics.
-3. If a targeted policy's `f:query` returns false (no rows), that policy *applied but did not permit* — the flake is denied even if `default-allow` is `true`. Default-allow only applies when **no** policy targets the flake.
+3. If a targeted policy's `f:query` returns false (no rows) and no other targeted policy allows, that policy *applied but did not permit* — the flake is denied even if `default-allow` is `true`. Every targeted policy is evaluated before this decision, so the result never depends on the order policies were loaded in. Default-allow only applies when **no** policy targets the flake.
 4. If no policies target the flake, `default-allow` decides. `false` denies; `true` permits.
 
 `f:allow` always takes precedence over `f:query`: if both are set on the same policy, `f:allow` wins.

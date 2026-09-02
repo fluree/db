@@ -504,10 +504,20 @@ impl PolicyContext {
             return Ok(true);
         }
 
-        // No required policies: allow-overrides — the first allow (or passing
-        // f:query) grants; a targeted f:query that fails denies for its target.
-        for entry in filtered_entries {
+        // No required policies: allow-overrides — any allow (or passing
+        // f:query) grants. Every targeted entry is tried before the decision
+        // so the outcome cannot depend on restriction order; a targeted
+        // f:query that fails still blocks fall-through to Default policies.
+        let (targeted, defaults): (Vec<_>, Vec<_>) = filtered_entries
+            .into_iter()
+            .partition(|e| policy_set.restrictions[e.idx].target_mode != TargetMode::Default);
+        let mut targeted_query_failed = false;
+        for entry in targeted.iter().chain(&defaults) {
             let restriction = &policy_set.restrictions[entry.idx];
+            let is_targeted = restriction.target_mode != TargetMode::Default;
+            if !is_targeted && targeted_query_failed {
+                break;
+            }
             tracker.policy_executed(&restriction.id);
             match &restriction.value {
                 PolicyValue::Allow => {
@@ -529,17 +539,7 @@ impl PolicyContext {
                         tracker.policy_allowed(&restriction.id);
                         return Ok(true);
                     }
-                    // Query returned false.
-                    // For targeted policies (OnProperty, OnSubject, OnClass), a failing
-                    // query means access is denied for that target. For Default policies,
-                    // continue to the next policy.
-                    if matches!(
-                        restriction.target_mode,
-                        TargetMode::OnProperty | TargetMode::OnSubject | TargetMode::OnClass
-                    ) {
-                        return Ok(false);
-                    }
-                    continue;
+                    targeted_query_failed |= is_targeted;
                 }
             }
         }
@@ -758,10 +758,21 @@ impl PolicyContext {
             });
         }
 
-        // No required policies: allow-overrides — first allow (or passing
-        // f:query) grants; a targeted f:query that fails denies for its target.
-        for entry in &filtered_entries {
+        // No required policies: allow-overrides — any allow (or passing
+        // f:query) grants. Every targeted entry is tried before the decision
+        // so the outcome cannot depend on restriction order; a targeted
+        // f:query that fails still blocks fall-through to Default policies.
+        let (targeted, defaults): (Vec<&FlakePolicyEntry>, Vec<&FlakePolicyEntry>) =
+            filtered_entries
+                .iter()
+                .partition(|e| policy_set.restrictions[e.idx].target_mode != TargetMode::Default);
+        let mut failed_targeted: Vec<&'a PolicyRestriction> = Vec::new();
+        for entry in targeted.into_iter().chain(defaults) {
             let restriction = &policy_set.restrictions[entry.idx];
+            let is_targeted = restriction.target_mode != TargetMode::Default;
+            if !is_targeted && !failed_targeted.is_empty() {
+                break;
+            }
             tracker.policy_executed(&restriction.id);
             match &restriction.value {
                 PolicyValue::Allow => {
@@ -787,24 +798,20 @@ impl PolicyContext {
                             restriction: Some(restriction),
                         });
                     }
-                    // Query returned false.
-                    // For targeted policies, a failing query means access denied.
-                    if matches!(
-                        restriction.target_mode,
-                        TargetMode::OnProperty | TargetMode::OnSubject | TargetMode::OnClass
-                    ) {
-                        return Ok(PolicyDecision::Denied {
-                            candidates: vec![restriction],
-                        });
+                    if is_targeted {
+                        failed_targeted.push(restriction);
                     }
-                    continue;
                 }
             }
         }
 
         // Policies applied, but none allowed -> deny with candidates
         Ok(PolicyDecision::Denied {
-            candidates: candidate_restrictions,
+            candidates: if failed_targeted.is_empty() {
+                candidate_restrictions
+            } else {
+                failed_targeted
+            },
         })
     }
 
@@ -1077,6 +1084,140 @@ mod tests {
         let mut r = make_allow_restriction(id, property);
         r.value = PolicyValue::Deny;
         r
+    }
+
+    fn make_query_restriction(id: &str, property: Sid, source: &str) -> PolicyRestriction {
+        let mut r = make_allow_restriction(id, property);
+        r.value = PolicyValue::Query(crate::types::PolicyQuery {
+            source: source.to_string(),
+            language: Default::default(),
+            state: Default::default(),
+        });
+        r
+    }
+
+    /// Answers a policy query from its source text: "pass" grants, anything
+    /// else returns no rows.
+    struct SourceExecutor;
+
+    impl crate::query_eval::PolicyQueryExecutor for SourceExecutor {
+        fn evaluate_policy_query<'a>(
+            &'a self,
+            query: &'a crate::types::PolicyQuery,
+            _bindings: &'a std::collections::HashMap<String, FlakeValue>,
+        ) -> crate::query_eval::PolicyQueryFut<'a> {
+            Box::pin(async move { Ok(query.source == "pass") })
+        }
+    }
+
+    fn view_ctx(restrictions: Vec<PolicyRestriction>, property: Sid) -> PolicyContext {
+        let mut set = PolicySet::new();
+        for (idx, r) in restrictions.into_iter().enumerate() {
+            let default = r.target_mode == TargetMode::Default;
+            set.restrictions.push(r);
+            if default {
+                set.defaults.push(idx);
+            } else {
+                set.by_property
+                    .entry(property.clone())
+                    .or_default()
+                    .push(PropertyPolicyEntry {
+                        idx,
+                        class_check_needed: false,
+                    });
+            }
+        }
+        let wrapper = PolicyWrapper::new(
+            set,
+            PolicySet::new(),
+            false,
+            false,
+            std::collections::HashMap::new(),
+        );
+        PolicyContext::new(wrapper, None)
+    }
+
+    /// Two targeted f:query policies on the same target: the outcome must be
+    /// the same whichever is loaded first (allow-overrides across the whole
+    /// targeted set, not first-match-wins).
+    #[tokio::test]
+    async fn targeted_query_policies_are_order_independent() {
+        let prop = make_sid(100, "name");
+        let failing = || make_query_restriction("fail", prop.clone(), "fail");
+        let passing = || make_query_restriction("pass", prop.clone(), "pass");
+        for restrictions in [vec![failing(), passing()], vec![passing(), failing()]] {
+            let ctx = view_ctx(restrictions, prop.clone());
+            let tracker = Tracker::disabled();
+            let allowed = ctx
+                .allow_view_flake_async(
+                    &make_sid(100, "alice"),
+                    &prop,
+                    &FlakeValue::String("Alice".into()),
+                    &[],
+                    &SourceExecutor,
+                    &tracker,
+                )
+                .await
+                .unwrap();
+            assert!(
+                allowed,
+                "a passing targeted f:query must grant regardless of order"
+            );
+            let detailed = ctx
+                .allow_view_flake_async_detailed(
+                    &make_sid(100, "alice"),
+                    &prop,
+                    &FlakeValue::String("Alice".into()),
+                    &[],
+                    &SourceExecutor,
+                    &tracker,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                detailed,
+                PolicyDecision::Allowed {
+                    restriction: Some(r)
+                } if r.id == "pass"
+            ));
+        }
+    }
+
+    /// A failing targeted f:query still blocks fall-through to a Default
+    /// allow, and the denial reports the targeted policies that did not
+    /// permit.
+    #[tokio::test]
+    async fn failing_targeted_query_blocks_default_fallthrough() {
+        let prop = make_sid(100, "name");
+        let mut default_allow = make_allow_restriction("default", prop.clone());
+        default_allow.target_mode = TargetMode::Default;
+        default_allow.targets = HashSet::new();
+        let ctx = view_ctx(
+            vec![
+                make_query_restriction("fail", prop.clone(), "fail"),
+                default_allow,
+            ],
+            prop.clone(),
+        );
+        let tracker = Tracker::disabled();
+        let detailed = ctx
+            .allow_view_flake_async_detailed(
+                &make_sid(100, "alice"),
+                &prop,
+                &FlakeValue::String("Alice".into()),
+                &[],
+                &SourceExecutor,
+                &tracker,
+            )
+            .await
+            .unwrap();
+        match detailed {
+            PolicyDecision::Denied { candidates } => {
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].id, "fail");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
     }
 
     #[test]

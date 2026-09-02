@@ -783,7 +783,9 @@ async fn load_policies_of_classes(
         }
     }
 
-    // Load each policy's restrictions
+    // Load each policy's restrictions in a deterministic order.
+    let mut policy_sids: Vec<Sid> = policy_sids.into_iter().collect();
+    policy_sids.sort();
     let mut restrictions = Vec::new();
     for policy_sid in policy_sids {
         if let Some(restriction) =
