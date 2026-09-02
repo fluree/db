@@ -81,6 +81,7 @@
   - [Connecting with Neo4j drivers (Bolt)](guides/bolt.md)
   - [SPARQL](guides/cookbook-sparql.md)
   - [Full-text and vector search](guides/cookbook-search.md)
+  - [Documents into a graph](guides/documents.md)
   - [Time travel patterns](guides/cookbook-time-travel.md)
   - [Branching and merging](guides/cookbook-branching.md)
   - [Access control policies](guides/cookbook-policies.md)

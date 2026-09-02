@@ -11,7 +11,9 @@ Turn a folder of documents into a searchable graph, and search it.
 
 It then creates or syncs a BM25 full-text index and, when embeddings were produced, an HNSW vector index over the chunks. `fluree doc search` queries those indexes and joins each hit back to its chunk text, section path and source file.
 
-Everything runs in-process against local storage. Parsing is deterministic and makes no network connection unless a model endpoint is configured.
+Everything runs in-process against local storage: the ledger written is always a local one, and Fluree AI, when connected, supplies models only. Parsing is deterministic and makes no network connection unless a model endpoint is configured.
+
+For the walkthrough — the three tiers, connecting a Fluree AI account, which model calls are made, and publishing the result to Fluree AI — see [Documents into a graph](../guides/documents.md).
 
 ## Subcommands
 
