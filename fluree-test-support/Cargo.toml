@@ -1,0 +1,16 @@
+[package]
+name = "fluree-test-support"
+description = "Shared guards for crates that group their integration tests: asserts every tests/*.rs is reachable under `autotests = false`, and that nothing mutating process-global env is compiled into a shared harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Internal test tooling — never a release artifact.
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+
+[lints]
+workspace = true

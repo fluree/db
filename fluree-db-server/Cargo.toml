@@ -180,6 +180,7 @@ wiremock = { workspace = true }
 indexmap = { workspace = true }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-test-support = { path = "../fluree-test-support" }
 
 [lints]
 workspace = true

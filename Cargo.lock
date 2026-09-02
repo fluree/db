@@ -2507,6 +2507,7 @@ dependencies = [
  "fluree-graph-json-ld",
  "fluree-graph-turtle",
  "fluree-search-protocol",
+ "fluree-test-support",
  "fluree-vocab",
  "fs2",
  "futures",
@@ -3135,6 +3136,7 @@ dependencies = [
  "fluree-db-query",
  "fluree-db-sparql",
  "fluree-sse",
+ "fluree-test-support",
  "fluree-vocab",
  "futures",
  "hex",
@@ -3454,6 +3456,10 @@ version = "4.1.6"
 dependencies = [
  "tracing",
 ]
+
+[[package]]
+name = "fluree-test-support"
+version = "4.1.6"
 
 [[package]]
 name = "fluree-vocab"

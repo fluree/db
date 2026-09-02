@@ -116,8 +116,13 @@ target.
 The same file enforces the env rule above: any file compiled into a shared
 harness that calls `set_var`/`remove_var` fails the build, named. Standalone
 `[[test]]` targets are exempt — being alone in a process is exactly what makes
-the mutation safe. Copy both checks into any other crate that adopts this
-layout.
+the mutation safe.
+
+Both checks live in the `fluree-test-support` crate, so adopting them in a third
+crate is a dev-dependency plus a `tests/harness_coverage.rs` that calls
+`assert_every_test_file_is_reachable(env!("CARGO_MANIFEST_DIR"))` and
+`assert_grouped_tests_do_not_mutate_env(env!("CARGO_MANIFEST_DIR"))`. `env!`
+expands at the call site, so each crate is checked against its own manifest.
 
 ### Example Tests
 

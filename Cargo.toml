@@ -44,6 +44,7 @@ members = [
     "fluree-bench-support",
     "fluree-bench-alloc",
     "fluree-bench-virtual",
+    "fluree-test-support",
     "fluree-db-consensus",
     "fluree-raft-core",
 ]
