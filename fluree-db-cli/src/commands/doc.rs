@@ -38,6 +38,55 @@ fn cache_root(dirs: &FlureeDir) -> PathBuf {
     dirs.config_dir().join("cache").join("doc")
 }
 
+/// The `[doc]` config with `remote = "<name>"` resolved: the remote's URL
+/// becomes the gateway base and its stored login the bearer token for every
+/// slot not set explicitly. The remote is looked up in the project config
+/// first, then the global one, so a login done once from the home directory
+/// serves every project.
+async fn resolve_config(dirs: &FlureeDir) -> CliResult<DocConfig> {
+    let config = crate::config::read_doc_config(dirs.config_dir()).with_env();
+    let Some(remote_name) = config.remote.clone() else {
+        return Ok(config);
+    };
+    let (client, remote_dirs) = match context::build_remote_client(&remote_name, dirs).await {
+        Ok(client) => (client, dirs.clone()),
+        Err(CliError::NotFound(_)) => {
+            let global = FlureeDir::global().ok_or_else(|| {
+                CliError::NotFound(format!("doc.remote '{remote_name}': no such remote"))
+            })?;
+            let client = context::build_remote_client(&remote_name, &global).await?;
+            (client, global)
+        }
+        Err(e) => return Err(e),
+    };
+    // A cheap authenticated call: on an expired login the client refreshes,
+    // and the refreshed token is what the model slots must carry.
+    client.list_ledgers().await.map_err(|e| {
+        CliError::Remote(format!(
+            "doc.remote '{remote_name}': {e}\n  hint: fluree auth login --remote {remote_name}"
+        ))
+    })?;
+    context::persist_refreshed_tokens(&client, &remote_name, &remote_dirs).await;
+    let token = client.current_token().ok_or_else(|| {
+        CliError::Config(format!(
+            "doc.remote '{remote_name}' has no stored login\n  hint: fluree auth login --remote {remote_name}"
+        ))
+    })?;
+    Ok(config.fill_from_gateway(&gateway_base(client.base_url()), &token))
+}
+
+/// `https://stack/v1/fluree` (the CLI-compat base a remote is registered
+/// with) → `https://stack/v1`, where the gateway's model routes live.
+fn gateway_base(remote_url: &str) -> String {
+    let trimmed = remote_url.trim_end_matches('/');
+    let origin_v1 = trimmed.strip_suffix("/fluree").unwrap_or(trimmed);
+    if origin_v1.ends_with("/v1") {
+        origin_v1.to_string()
+    } else {
+        format!("{origin_v1}/v1")
+    }
+}
+
 /// `name:branch` → (`name`, `branch`), defaulting the branch to `main`.
 fn split_alias(alias: &str) -> (String, String) {
     match alias.split_once(':') {
@@ -84,7 +133,7 @@ struct Totals {
 async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
     let alias = context::resolve_ledger(args.ledger.as_deref(), dirs)?;
     let ledger_id = context::to_ledger_id(&alias);
-    let config = crate::config::read_doc_config(dirs.config_dir()).with_env();
+    let config = resolve_config(dirs).await?;
 
     let inputs = collect_inputs(&args.paths)?;
     if inputs.is_empty() {
@@ -308,6 +357,9 @@ fn announce(
     args: &DocIngestArgs,
 ) {
     eprintln!("ingest {count} document(s) → {alias}");
+    if let Some(remote) = &config.remote {
+        eprintln!("  account    {remote} (Fluree AI gateway supplies unset model slots)");
+    }
     eprintln!(
         "  parser     fluree-doc-parse {}",
         short_rev(fluree_db_doc::parse::DOC_PARSE_REV)
@@ -455,7 +507,7 @@ async fn graph_source_present(fluree: &Fluree, id: &str) -> CliResult<bool> {
 
 async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
     let alias = context::resolve_ledger(args.ledger.as_deref(), dirs)?;
-    let config = crate::config::read_doc_config(dirs.config_dir()).with_env();
+    let config = resolve_config(dirs).await?;
     let fluree = build_fluree(dirs)?;
 
     let mode = match args.mode {

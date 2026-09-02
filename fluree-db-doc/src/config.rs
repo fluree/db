@@ -110,6 +110,11 @@ impl ModelEndpoint {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DocConfig {
+    /// A configured CLI remote (a Fluree AI stack) whose URL and stored
+    /// login supply every slot not set explicitly below. The CLI resolves
+    /// it; this crate only sees the filled slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<ModelEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,7 +145,37 @@ impl DocConfig {
     pub fn crop_reader(&self) -> Option<&ModelEndpoint> {
         self.vlm.as_ref().or(self.llm.as_ref())
     }
+
+    /// Fill every slot from a Fluree AI gateway at `base_url` (up to and
+    /// including `/v1`) authenticated by `token`. Explicit per-slot values
+    /// win; only what is missing is supplied.
+    pub fn fill_from_gateway(mut self, base_url: &str, token: &str) -> Self {
+        let fill = |slot: &mut Option<ModelEndpoint>, model: &str, api: WireApi| {
+            let ep = slot.get_or_insert_with(ModelEndpoint::default);
+            if ep.url.trim().is_empty() {
+                ep.url = base_url.to_string();
+            }
+            if ep.model.trim().is_empty() {
+                ep.model = model.to_string();
+            }
+            if ep.resolved_api_key().is_none() {
+                ep.api_key = Some(token.to_string());
+            }
+            if ep.api.is_none() {
+                ep.api = Some(api);
+            }
+        };
+        fill(&mut self.embedding, GATEWAY_EMBEDDING_MODEL, WireApi::Chat);
+        fill(&mut self.vlm, "auto", WireApi::Responses);
+        fill(&mut self.llm, "auto", WireApi::Responses);
+        self
+    }
 }
+
+/// What the Fluree AI gateway forwards embeddings to when no model is named
+/// locally: its embeddings route passes through to the account's OpenAI-type
+/// provider.
+pub const GATEWAY_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 #[cfg(test)]
 mod tests {
@@ -188,10 +223,36 @@ mod tests {
             api: None,
         };
         let cfg = DocConfig {
+            remote: None,
             embedding: None,
             llm: Some(llm.clone()),
             vlm: None,
         };
         assert_eq!(cfg.crop_reader(), Some(&llm));
+    }
+
+    #[test]
+    fn gateway_fills_only_missing_values() {
+        let cfg = DocConfig {
+            remote: Some("acct".into()),
+            embedding: Some(ModelEndpoint {
+                url: String::new(),
+                model: "nomic-embed-text".into(),
+                api_key: None,
+                dimensions: None,
+                api: None,
+            }),
+            llm: None,
+            vlm: None,
+        }
+        .fill_from_gateway("https://stack/v1", "tok");
+        let emb = cfg.embedding.unwrap();
+        assert_eq!(emb.url, "https://stack/v1");
+        assert_eq!(emb.model, "nomic-embed-text");
+        assert_eq!(emb.api_key.as_deref(), Some("tok"));
+        let vlm = cfg.vlm.unwrap();
+        assert_eq!(vlm.model, "auto");
+        assert_eq!(vlm.api, Some(WireApi::Responses));
+        assert_eq!(vlm.route("responses"), "https://stack/v1/responses");
     }
 }

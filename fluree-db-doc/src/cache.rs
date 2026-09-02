@@ -163,14 +163,14 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    /// Tests run in parallel inside one process, so a name has to come from
+    /// a counter: pid + wall clock collided on macOS's clock granularity.
     fn tempdir() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
             "fluree-db-doc-cache-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir_all(&d).unwrap();
         d
