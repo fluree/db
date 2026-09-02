@@ -4,7 +4,7 @@
 //! disagreed wildly on a live deployment — GC reported a 21-version chain while the
 //! ledger held 211 root files — and no amount of reasoning about the truncation
 //! loop explained it. Every root carries `index_t` and `prev_index`, so the actual
-//! structure is recoverable; this decodes it and says which of three shapes it is:
+//! structure is recoverable; this decodes it and says which of four shapes it is:
 //!
 //!   1. ONE BROKEN CHAIN — a middle root is missing, so everything older than the
 //!      hole is unreachable in a single stroke. GC deletes oldest-first precisely to
@@ -14,6 +14,11 @@
 //!      upstream of GC entirely.
 //!   3. UNCHAINED ROOTS — roots with no `prev_index` that are not genesis, i.e.
 //!      never linked in at all.
+//!   4. INCONSISTENT CHAIN METADATA — a root's `prev_index.t` disagrees with the
+//!      `index_t` the parent itself carries. The pointer still resolves, so the walk
+//!      succeeds and none of the three shapes above show it, but one of the two
+//!      values was written wrong and anything reasoning from `prev_index.t` without
+//!      fetching the parent is being lied to.
 //!
 //! Those have completely different fixes, which is why guessing was not good enough.
 //!
@@ -32,6 +37,19 @@ use fluree_db_core::ContentId;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
+/// What we keep from each decoded root.
+///
+/// `prev_index` carries the parent's `t` alongside its CID, so keep both: the `t`
+/// names where a missing parent sat in version space, which is the answer shape 1 is
+/// asking for, and when the parent IS present the two `t` values are a free
+/// consistency check on the chain metadata (shape 4).
+struct Node {
+    index_t: i64,
+    /// `(parent digest, the parent `index_t` this root claims)`, or `None` for a
+    /// root with no `prev_index`.
+    prev: Option<(String, i64)>,
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let dir = args.next().unwrap_or_else(|| {
@@ -40,8 +58,8 @@ fn main() {
     });
     let head_arg = args.next();
 
-    // digest -> (index_t, prev_digest)
-    let mut nodes: HashMap<String, (i64, Option<String>)> = HashMap::new();
+    // digest -> decoded root
+    let mut nodes: HashMap<String, Node> = HashMap::new();
     // Digests of roots that are on disk but did not decode. Kept as a set, not a
     // count: a root that fails to decode never enters `nodes`, so without this it is
     // indistinguishable from a deleted one everywhere downstream.
@@ -60,8 +78,14 @@ fn main() {
         let bytes = std::fs::read(&path).expect("read root");
         match IndexRoot::decode(&bytes) {
             Ok(root) => {
-                let prev = root.prev_index.as_ref().map(|p| p.id.digest_hex());
-                nodes.insert(digest, (root.index_t, prev));
+                let prev = root.prev_index.as_ref().map(|p| (p.id.digest_hex(), p.t));
+                nodes.insert(
+                    digest,
+                    Node {
+                        index_t: root.index_t,
+                        prev,
+                    },
+                );
             }
             Err(e) => {
                 eprintln!("  ! undecodable {digest}: {e}");
@@ -76,8 +100,8 @@ fn main() {
     // Which roots are pointed AT by some other root?
     let mut referenced: HashSet<&String> = HashSet::new();
     let mut prev_targets: HashMap<&String, Vec<&String>> = HashMap::new();
-    for (digest, (_, prev)) in &nodes {
-        if let Some(p) = prev {
+    for (digest, node) in &nodes {
+        if let Some((p, _)) = &node.prev {
             referenced.insert(p);
             prev_targets.entry(p).or_default().push(digest);
         }
@@ -86,8 +110,8 @@ fn main() {
     // Shape 3: roots with no prev_index. Exactly one (genesis) is expected.
     let mut genesis: Vec<_> = nodes
         .iter()
-        .filter(|(_, (_, p))| p.is_none())
-        .map(|(d, (t, _))| (*t, d.clone()))
+        .filter(|(_, node)| node.prev.is_none())
+        .map(|(d, node)| (node.index_t, d.clone()))
         .collect();
     // Every listing below is sorted by (index_t, digest). These are collected out of
     // a HashMap, so without this the five roots a preview happens to show, and the
@@ -110,10 +134,10 @@ fn main() {
         .iter()
         .filter(|(_, kids)| kids.len() > 1)
         .map(|(parent, kids)| {
-            let parent_t = nodes.get(*parent).map(|(t, _)| *t).unwrap_or(-1);
+            let parent_t = nodes.get(*parent).map(|n| n.index_t).unwrap_or(-1);
             let mut kid_ts: Vec<i64> = kids
                 .iter()
-                .map(|k| nodes.get(*k).map(|(t, _)| *t).unwrap_or(-1))
+                .map(|k| nodes.get(*k).map(|n| n.index_t).unwrap_or(-1))
                 .collect();
             kid_ts.sort_unstable();
             (parent_t, (*parent).clone(), kid_ts)
@@ -138,16 +162,17 @@ fn main() {
     // are counted and labelled apart rather than both reported as MISSING.
     let mut dangling: Vec<_> = nodes
         .iter()
-        .filter_map(|(d, (t, p))| {
-            p.as_ref()
-                .filter(|p| !nodes.contains_key(*p))
-                .map(|p| (*t, d.clone(), p.clone()))
+        .filter_map(|(d, node)| {
+            node.prev
+                .as_ref()
+                .filter(|(p, _)| !nodes.contains_key(p))
+                .map(|(p, prev_t)| (node.index_t, d.clone(), p.clone(), *prev_t))
         })
         .collect();
     dangling.sort();
     let corrupt_parents = dangling
         .iter()
-        .filter(|(_, _, p)| undecodable.contains(p))
+        .filter(|(_, _, p, _)| undecodable.contains(p))
         .count();
     print!(
         "dangling prev pointers (chain stops here): {}",
@@ -162,14 +187,16 @@ fn main() {
             corrupt_parents
         );
     }
-    for (t, d, p) in dangling.iter().take(8) {
+    for (t, d, p, prev_t) in dangling.iter().take(8) {
         let cause = if undecodable.contains(p) {
             "UNDECODABLE"
         } else {
             "MISSING"
         };
+        // The parent's own `index_t`, from the child's pointer: it says where in
+        // version space the hole is without needing the blob that is gone.
         println!(
-            "    index_t={t} {} -> {cause} {}",
+            "    index_t={t} {} -> {cause} index_t={prev_t} {}",
             &d[..16.min(d.len())],
             &p[..16.min(p.len())]
         );
@@ -186,6 +213,31 @@ fn main() {
         );
     }
 
+    // Shape 4: the pointer resolves, but the child and the parent disagree about the
+    // parent's index_t. Nothing above sees this — the walk follows the digest and
+    // succeeds — yet one of the two values was written wrong.
+    let mut inconsistent: Vec<_> = nodes
+        .iter()
+        .filter_map(|(d, node)| {
+            let (p, claimed) = node.prev.as_ref()?;
+            let actual = nodes.get(p)?.index_t;
+            (actual != *claimed).then(|| (node.index_t, d.clone(), p.clone(), *claimed, actual))
+        })
+        .collect();
+    inconsistent.sort();
+    println!(
+        "prev_index.t disagreeing with the parent's own index_t: {}",
+        inconsistent.len()
+    );
+    for (t, d, p, claimed, actual) in inconsistent.iter().take(8) {
+        println!(
+            "    index_t={t} {} -> parent {} claimed index_t={claimed}, carries {actual}",
+            &d[..16.min(d.len())],
+            &p[..16.min(p.len())]
+        );
+    }
+    and_n_more(8, inconsistent.len());
+
     // Reachability from the head: what GC can actually see.
     let head = match &head_arg {
         Some(arg) => Some(resolve_head(arg, &nodes, &undecodable)),
@@ -198,7 +250,7 @@ fn main() {
         let mut seen = HashSet::new();
         let mut cur = Some(head.clone());
         while let Some(d) = cur {
-            let Some((_, prev)) = nodes.get(&d) else {
+            let Some(node) = nodes.get(&d) else {
                 // Chain ends here. If the blob is present but undecodable the walk
                 // stops for a reason that has nothing to do with GC, so say which.
                 if undecodable.contains(&d) {
@@ -213,7 +265,7 @@ fn main() {
                 println!("!! CYCLE at {}", &d[..16.min(d.len())]);
                 break;
             }
-            cur = prev.clone();
+            cur = node.prev.as_ref().map(|(p, _)| p.clone());
         }
         println!(
             "\nreachable from head {} : {} of {} roots  ({} UNREACHABLE)",
@@ -228,7 +280,7 @@ fn main() {
         let mut unreachable_ts: Vec<i64> = nodes
             .iter()
             .filter(|(d, _)| !seen.contains(*d))
-            .map(|(_, (t, _))| *t)
+            .map(|(_, node)| node.index_t)
             .collect();
         unreachable_ts.sort_unstable();
         if !unreachable_ts.is_empty() {
@@ -255,8 +307,8 @@ fn main() {
         // subset sees a count of 1 at that t, drops it, and prints nothing on
         // exactly the case the line is named for.
         let mut per_t: BTreeMap<i64, (usize, usize)> = BTreeMap::new();
-        for (digest, (t, _)) in &nodes {
-            let entry = per_t.entry(*t).or_insert((0, 0));
+        for (digest, node) in &nodes {
+            let entry = per_t.entry(node.index_t).or_insert((0, 0));
             entry.0 += 1;
             if !seen.contains(digest) {
                 entry.1 += 1;
@@ -282,11 +334,7 @@ fn main() {
 /// on hand can never match a key directly. Accept both, and refuse to guess when
 /// neither lands: an unmatched head walks zero roots, and a zero-length walk reads
 /// as a totally orphaned ledger, which is the most alarming output the tool has.
-fn resolve_head(
-    arg: &str,
-    nodes: &HashMap<String, (i64, Option<String>)>,
-    undecodable: &HashSet<String>,
-) -> String {
+fn resolve_head(arg: &str, nodes: &HashMap<String, Node>, undecodable: &HashSet<String>) -> String {
     if nodes.contains_key(arg) {
         return arg.to_string();
     }
@@ -330,11 +378,12 @@ fn and_n_more(shown: usize, total: usize) {
 /// matters: roots tied at the newest `index_t` are one version built twice, which is
 /// the fork this tool exists to find. Break the tie on digest so runs agree, and say
 /// the tie happened rather than silently guessing which side of the fork is the head.
-fn guess_head(nodes: &HashMap<String, (i64, Option<String>)>) -> Option<String> {
-    let (digest, (newest, _)) = nodes
+fn guess_head(nodes: &HashMap<String, Node>) -> Option<String> {
+    let (digest, newest) = nodes
         .iter()
-        .max_by(|a, b| a.1 .0.cmp(&b.1 .0).then_with(|| a.0.cmp(b.0)))?;
-    let tied = nodes.values().filter(|(t, _)| t == newest).count();
+        .max_by(|a, b| a.1.index_t.cmp(&b.1.index_t).then_with(|| a.0.cmp(b.0)))
+        .map(|(d, n)| (d, n.index_t))?;
+    let tied = nodes.values().filter(|n| n.index_t == newest).count();
     if tied > 1 {
         println!(
             "!! no head supplied and {tied} roots share the newest index_t ({newest}): \
