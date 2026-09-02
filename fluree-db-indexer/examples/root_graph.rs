@@ -147,7 +147,9 @@ fn main() {
         }
     }
 
-    // Shape 3: roots with no prev_index. Exactly one (genesis) is expected.
+    // Shape 3: roots with no prev_index. Zero or one is healthy: genesis has none by
+    // construction, and once GC has legitimately truncated past genesis the correct
+    // answer is zero. Two or more means roots were written without being linked in.
     let mut genesis: Vec<_> = nodes
         .iter()
         .filter(|(_, node)| node.prev.is_none())
@@ -159,7 +161,7 @@ fn main() {
     // The tool's main use is diffing two measurements, which that makes impossible.
     genesis.sort();
     println!(
-        "roots with no prev_index (expect 1 = genesis): {}",
+        "roots with no prev_index (expect 0 or 1; 0 once GC truncated past genesis): {}",
         genesis.len()
     );
     for (t, d) in genesis.iter().take(5) {
