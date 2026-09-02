@@ -2901,7 +2901,8 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `order_by` | string | Latest-by-key ordering column for materialization (int/date/timestamp) |
 | `delete_column` | string | Column that marks a row as a delete (tombstone) during materialization |
 | `delete_values` | (string\|null)[] | Values of `delete_column` that mean "deleted"; a `null` entry matches a NULL column (null-payload delete). Required when `delete_column` is set. |
-| `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
+| `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
+| `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
 
 **Response:**
 
@@ -3085,7 +3086,8 @@ POST {api_base_url}/sql/map
 | `auth_bearer` | string | Static bearer token |
 | `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client-credentials flow (refreshes); `oauth2_token_url` is guarded against internal hosts |
 | `session` | object | Session properties sent as `X-Trino-Session` |
-| `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
+| `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
+| `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
 
 **Response:**
 

@@ -53,6 +53,8 @@ pub struct SqlMapRequest {
     /// Model ledger (`name:branch`) whose default graph supplies the source's
     /// view policies and class/property hierarchy.
     pub model: Option<String>,
+    /// `default-allow` for governed requests that match no policy.
+    pub default_allow: Option<bool>,
 }
 
 /// Response for `POST /v1/fluree/sql/map`
@@ -66,6 +68,10 @@ pub struct SqlMapResponse {
     pub table_count: usize,
     pub table_names: Vec<String>,
     pub mapping_validated: bool,
+    /// Warnings about the `model` reference (policies a virtual source cannot
+    /// evaluate).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_warnings: Vec<String>,
 }
 
 /// Map a SQL endpoint as a graph source
@@ -123,6 +129,7 @@ async fn sql_map_local(state: Arc<AppState>, request: Request) -> Result<impl In
         Ok((
             StatusCode::CREATED,
             Json(SqlMapResponse {
+                model_warnings: result.model_warnings,
                 graph_source_id: result.graph_source_id,
                 endpoint: result.endpoint,
                 connection_tested: result.connection_tested,
@@ -149,6 +156,7 @@ fn build_sql_config(req: &SqlMapRequest) -> Result<fluree_db_api::SqlCreateConfi
     config.user = req.user.clone();
     config.session = req.session.clone();
     config.model = req.model.clone();
+    config.default_allow = req.default_allow;
 
     if let Some(d) = &req.dialect {
         config.dialect = match d.to_lowercase().as_str() {

@@ -95,6 +95,11 @@ pub struct SqlGsConfig {
     /// config's field of the same name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+
+    /// Optional `default-allow` for governed requests that match no policy
+    /// (see the Iceberg config's field of the same name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_allow: Option<bool>,
 }
 
 impl SqlGsConfig {
@@ -111,6 +116,7 @@ impl SqlGsConfig {
             request_timeout_secs: default_request_timeout(),
             mapping: None,
             model: None,
+            default_allow: None,
         }
     }
 

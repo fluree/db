@@ -792,3 +792,127 @@ async fn model_ledger_supplies_policies_and_hierarchy() {
         .unwrap();
     assert_eq!(rows(r.clone()), 0, "{r}");
 }
+
+/// `--model` is validated when the source is registered, and policies the
+/// source will never be able to evaluate are reported up front.
+#[tokio::test]
+async fn registration_validates_model_and_warns_on_query_policies() {
+    let fluree = setup().await;
+    let cfg = |name: &str, model: &str| {
+        R2rmlCreateConfig::new_direct(name, table_location(), PEOPLE_R2RML)
+            .with_mapping_media_type("text/turtle")
+            .with_model(model)
+    };
+
+    let err = fluree
+        .create_r2rml_graph_source(cfg("bad-model", "nope:main"))
+        .await
+        .expect_err("unknown model ledger must be refused");
+    assert!(err.to_string().contains("not found"), "{err}");
+
+    let err = fluree
+        .create_r2rml_graph_source(cfg("gs-model", GS))
+        .await
+        .expect_err("a graph source is not a model");
+    assert!(err.to_string().contains("graph source"), "{err}");
+
+    let ledger = fluree.create_ledger("gated:main").await.expect("model");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+                "@graph": [
+                    { "@id": "ex:owners", "@type": "f:AccessPolicy", "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }],
+                      "f:query": { "@type": "@json", "@value": { "where": [{ "@id": "?$this", "ex:owner": "?$identity" }] } } },
+                    { "@id": "ex:plain", "@type": "f:AccessPolicy", "f:action": { "@id": "f:view" },
+                      "f:onProperty": [{ "@id": "ex:name" }], "f:allow": true }
+                ]
+            }),
+        )
+        .await
+        .expect("seed gated model");
+    let created = fluree
+        .create_r2rml_graph_source(cfg("gated-people", "gated:main"))
+        .await
+        .expect("registers with warnings");
+    assert_eq!(
+        created.model_warnings.len(),
+        1,
+        "{:?}",
+        created.model_warnings
+    );
+    assert!(created.model_warnings[0].contains("http://example.org/owners"));
+    assert!(created.model_warnings[0].contains("f:query"));
+}
+
+/// The tracked response names the policies the virtual source could not
+/// evaluate, so a caller can tell a fail-closed `f:query` from an empty table.
+#[tokio::test]
+async fn tracked_response_lists_unevaluable_policies() {
+    let fluree = setup().await;
+    let (sel, wh) = name_query();
+    let gate = json!({
+        "@id": "ex:q", "@type": "f:AccessPolicy", "f:action": "f:view",
+        "f:onProperty": [{ "@id": "http://example.org/name" }],
+        "f:query": { "@type": "@json", "@value": { "where": [{ "@id": "?$this", "ex:name": "alice" }] } }
+    });
+    let q = json!({
+        "@context": context(),
+        "from": GS,
+        "opts": { "policy": [gate], "default-allow": true, "meta": { "policy": true } },
+        "select": sel,
+        "where": wh,
+    });
+    let response = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_tracked()
+        .await
+        .expect("tracked query");
+    assert_eq!(response.result.as_array().map_or(0, Vec::len), 0);
+    let enforcement = response.policy_enforcement.expect("enforced");
+    assert!(enforcement.enforced);
+    // Ids are reported as the policy wrote them (here the compact form).
+    assert_eq!(enforcement.unevaluable_policies, vec!["ex:q".to_string()]);
+}
+
+/// A source's own `default-allow` keeps it readable to authenticated callers
+/// that match no policy, without attaching a model.
+#[tokio::test]
+async fn source_default_allow_keeps_model_less_source_readable() {
+    let fluree = setup().await;
+    let cfg = R2rmlCreateConfig::new_direct("local-open", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle")
+        .with_default_allow(true);
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("open source");
+
+    let (sel, wh) = name_query();
+    let q = |from: &str| {
+        json!({
+            "@context": context(),
+            "from": from,
+            "opts": { "identity": "http://example.org/users/anyone" },
+            "select": sel,
+            "where": wh,
+        })
+    };
+    let open = fluree
+        .query_from()
+        .jsonld(&q("local-open:main"))
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(open.as_array().map_or(0, Vec::len), 5, "{open}");
+    let closed = fluree
+        .query_from()
+        .jsonld(&q(GS))
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(closed.as_array().map_or(0, Vec::len), 0, "{closed}");
+}

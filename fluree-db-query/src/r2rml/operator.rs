@@ -965,6 +965,12 @@ impl R2rmlScanOperator {
                 for tm in triples_maps {
                     if gate.tm_can_yield(ctx, &self.pattern, tm).await? {
                         kept.push(tm);
+                    } else {
+                        tracing::debug!(
+                            graph_source = %self.pattern.graph_source_id,
+                            triples_map = %tm.iri,
+                            "R2RML scan: TriplesMap skipped, its required predicates are hidden by view policy"
+                        );
                     }
                 }
                 kept
@@ -2852,7 +2858,7 @@ impl Operator for R2rmlScanOperator {
             .compiled_mapping(&self.pattern.graph_source_id, as_of_t)
             .await?;
 
-        self.policy_gate = R2rmlPolicyGate::build(ctx, &mapping);
+        self.policy_gate = R2rmlPolicyGate::build(ctx, &mapping, &self.pattern.graph_source_id);
         self.mapping = Some(mapping);
         self.state = OperatorState::Open;
 

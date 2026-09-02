@@ -3164,6 +3164,11 @@ pub struct SqlMapArgs {
     /// and the class/property hierarchy they entail over.
     #[arg(long, value_name = "LEDGER")]
     pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
 }
 
 /// Arguments for mapping an Iceberg table as a graph source.
@@ -3225,6 +3230,11 @@ pub struct IcebergMapArgs {
     /// and the class/property hierarchy they entail over.
     #[arg(long, value_name = "LEDGER")]
     pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
 
     /// Bearer token for REST catalog authentication
     #[arg(long)]

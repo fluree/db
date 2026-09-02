@@ -81,7 +81,8 @@ be fixed later; the first query surfaces the real error.
 | `auth` | none | `bearer` (static token) or `oauth2_client_credentials`; values accept the same `env_var` / `secret_ref` indirection as Iceberg catalog auth |
 | `session` | `{}` | Session properties, e.g. `{"query_max_run_time": "5m"}` |
 | `request_timeout_secs` | `120` | Per page fetch |
-| `model` | — | Model ledger (`name:branch`) whose default graph supplies view policies and the class/property hierarchy; see [Access policy](iceberg.md#access-policy) |
+| `model` | — | Model ledger (`name:branch`) whose default graph supplies view policies and the class/property hierarchy; must exist. See [Access policy](iceberg.md#access-policy) |
+| `default_allow` | — | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model |
 
 Table names in the mapping are dotted and quoted part by part:
 `rr:tableName "sales.orders"` becomes `"sales"."orders"`; with `catalog`

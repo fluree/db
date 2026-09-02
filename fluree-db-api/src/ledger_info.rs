@@ -330,6 +330,18 @@ pub struct Source {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub mor_approximate_tables: Vec<String>,
+    /// Model ledger governing this source's view policies and class hierarchy
+    /// (registered with `--model`). Omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The source's `default-allow` for governed requests that match no policy.
+    /// Omitted when unset (fail-closed).
+    #[serde(
+        rename = "default-allow",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_allow: Option<bool>,
 }
 
 /// Source catalog descriptor. `type`/`warehouse` emit explicit `null` (not
@@ -1213,6 +1225,10 @@ pub struct VirtualSourceMeta {
     /// Tables whose snapshot carries merge-on-read delete files, so their row count
     /// is an upper bound (see [`Source::mor_approximate_tables`]).
     pub mor_approximate_tables: Vec<String>,
+    /// Model ledger governing the source (`--model`), if any.
+    pub model: Option<String>,
+    /// The source's `default-allow` for governed requests, if set.
+    pub default_allow: Option<bool>,
 }
 
 /// Sum two optional row counts, treating `None` as "unknown" rather than zero:
@@ -1482,6 +1498,8 @@ pub fn build_virtual_ledger_info(
             .map(|(t, c)| (t.clone(), *c))
             .collect(),
         mor_approximate_tables: meta.mor_approximate_tables.clone(),
+        model: meta.model.clone(),
+        default_allow: meta.default_allow,
     };
 
     LedgerInfo {
@@ -1817,6 +1835,8 @@ async fn build_iceberg_virtual_info(
         .map(|m| m.table_names().into_iter().map(str::to_string).collect())
         .unwrap_or_default();
     if let Some(cfg) = cfg.as_ref() {
+        meta.model = cfg.model.clone();
+        meta.default_allow = cfg.default_allow;
         match &cfg.catalog {
             CatalogConfig::Rest {
                 catalog_type,
@@ -3005,6 +3025,8 @@ mod tests {
             ],
             snapshot_id: Some(42),
             mor_approximate_tables: Vec::new(),
+            model: None,
+            default_allow: None,
         }
     }
 
@@ -3335,6 +3357,7 @@ mod tests {
             delete: None,
             order_by: None,
             model: None,
+            default_allow: None,
         };
 
         let stored = cfg.to_json().unwrap();
@@ -3457,6 +3480,7 @@ mod tests {
                 delete: None,
                 order_by: None,
                 model: None,
+                default_allow: None,
             };
             let stored = cfg.to_json().unwrap();
             let redacted = redact_graph_source_config(&stored);

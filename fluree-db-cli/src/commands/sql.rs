@@ -90,6 +90,9 @@ fn args_to_json(args: &SqlMapArgs) -> CliResult<serde_json::Value> {
     if !session.is_empty() {
         obj.insert("session".into(), serde_json::to_value(session).unwrap());
     }
+    if let Some(v) = args.default_allow {
+        obj.insert("default_allow".into(), v.into());
+    }
     Ok(body)
 }
 
@@ -137,6 +140,7 @@ async fn run_sql_map_remote(
         flag("connection_tested"),
         flag("mapping_validated"),
     );
+    super::iceberg::print_model_warnings(&super::iceberg::model_warnings_of(&result));
     Ok(())
 }
 
@@ -154,6 +158,7 @@ async fn run_sql_map_local(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> 
     config.user = args.user.clone();
     config.session = session_pairs(&args)?;
     config.model = args.model.clone();
+    config.default_allow = args.default_allow;
     if let Some(d) = &args.dialect {
         config.dialect = match d.to_lowercase().as_str() {
             "trino" => SqlDialect::Trino,
@@ -203,6 +208,7 @@ async fn run_sql_map_local(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> 
         result.connection_tested,
         result.mapping_validated,
     );
+    super::iceberg::print_model_warnings(&result.model_warnings);
     Ok(())
 }
 

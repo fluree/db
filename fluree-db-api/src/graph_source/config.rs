@@ -420,6 +420,9 @@ pub struct IcebergCreateConfig {
     /// Optional model ledger (`name:branch`) governing the source: its default
     /// graph supplies view policies and the class/property hierarchy.
     pub model: Option<String>,
+
+    /// Optional `default-allow` for governed requests that match no policy.
+    pub default_allow: Option<bool>,
 }
 
 /// The reusable Iceberg connection block — catalog access + IO, with **no**
@@ -734,6 +737,7 @@ impl IcebergCreateConfig {
             table_identifier: table_identifier.into(),
             delete_convention: None,
             model: None,
+            default_allow: None,
             order_by: None,
         }
     }
@@ -747,6 +751,7 @@ impl IcebergCreateConfig {
             table_identifier: String::new(),
             delete_convention: None,
             model: None,
+            default_allow: None,
             order_by: None,
         }
     }
@@ -877,6 +882,13 @@ impl IcebergCreateConfig {
         self
     }
 
+    /// Declare the fallback for governed requests that match no policy: `true`
+    /// keeps the source readable under authentication without a model.
+    pub fn with_default_allow(mut self, allow: bool) -> Self {
+        self.default_allow = Some(allow);
+        self
+    }
+
     /// Get the effective branch name.
     pub fn effective_branch(&self) -> &str {
         self.branch.as_deref().unwrap_or(DEFAULT_BRANCH)
@@ -932,6 +944,7 @@ impl IcebergCreateConfig {
                 delete: self.delete_convention.clone(),
                 order_by: self.order_by.clone(),
                 model: self.model.clone(),
+                default_allow: self.default_allow,
             },
             CatalogMode::Direct { table_location } => {
                 // Direct never uses vended credentials, regardless of the io flag.
@@ -945,6 +958,7 @@ impl IcebergCreateConfig {
                     delete: self.delete_convention.clone(),
                     order_by: self.order_by.clone(),
                     model: self.model.clone(),
+                    default_allow: self.default_allow,
                 }
             }
         }
@@ -1082,6 +1096,12 @@ impl R2rmlCreateConfig {
     /// See [`IcebergCreateConfig::with_model`].
     pub fn with_model(mut self, ledger: impl Into<String>) -> Self {
         self.iceberg.model = Some(ledger.into());
+        self
+    }
+
+    /// See [`IcebergCreateConfig::with_default_allow`].
+    pub fn with_default_allow(mut self, allow: bool) -> Self {
+        self.iceberg.default_allow = Some(allow);
         self
     }
 

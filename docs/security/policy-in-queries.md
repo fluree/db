@@ -268,6 +268,7 @@ to carry it) — and the response gains two siblings:
 | `policy` | Per-policy counters, `{policy-id: {executed, allowed}}`. A policy appears only once it actually runs, so this map is **empty whenever no policy ran** — which happens both when nothing is enforced and when enforcement grants nothing. |
 | `policy_enforcement.enforced` | The request executed under a non-root policy context. The field is **absent entirely** when it did not, so its presence alone answers "was this request enforced?" |
 | `policy_enforcement.denies_all_data` | The effective view-policy set is empty and `default-allow` is false: under this request's policy configuration, **no data flake could have been returned**. |
+| `policy_enforcement.unevaluable_policies` | Ids of `f:query` policies a virtual graph source (Iceberg / SQL) could not evaluate and therefore denied. Omitted when empty; never set on a native ledger. |
 
 The same values ride the `x-fdb-policy` (base64 JSON) and
 `x-fdb-policy-enforcement` (plain JSON) response headers, which is how you read

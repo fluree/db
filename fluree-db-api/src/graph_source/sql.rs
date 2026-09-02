@@ -47,6 +47,8 @@ pub struct SqlCreateConfig {
     /// Optional model ledger (`name:branch`) whose default graph supplies the
     /// source's view policies and class/property hierarchy.
     pub model: Option<String>,
+    /// Optional `default-allow` for governed requests that match no policy.
+    pub default_allow: Option<bool>,
 }
 
 impl SqlCreateConfig {
@@ -69,6 +71,7 @@ impl SqlCreateConfig {
             mapping: R2rmlMappingInput::Content(mapping_content.into()),
             mapping_media_type: None,
             model: None,
+            default_allow: None,
         }
     }
 
@@ -102,6 +105,7 @@ impl SqlCreateConfig {
             media_type: Some(media_type),
         });
         cfg.model = self.model.clone();
+        cfg.default_allow = self.default_allow;
         cfg
     }
 
@@ -136,6 +140,10 @@ pub struct SqlCreateResult {
     /// not fatal: the record is still created (credentials may arrive later).
     pub connection_tested: bool,
     pub mapping_validated: bool,
+    /// Warnings about the `model` reference (policies a virtual source cannot
+    /// evaluate). Empty when no model is set or nothing is amiss.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_warnings: Vec<String>,
 }
 
 impl crate::Fluree {
@@ -148,6 +156,7 @@ impl crate::Fluree {
         let graph_source_id = config.graph_source_id();
         info!(graph_source_id = %graph_source_id, "Creating SQL graph source");
         config.validate()?;
+        let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
 
         let (mapping_address, triples_map_count, table_names, mapping_validated) = match &config
             .mapping
@@ -224,6 +233,7 @@ impl crate::Fluree {
 
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, "Created SQL graph source");
         Ok(SqlCreateResult {
+            model_warnings,
             graph_source_id,
             endpoint: gs_config.endpoint,
             mapping_source: mapping_address,
@@ -456,10 +466,10 @@ pub(crate) fn mapping_source(record: &GraphSourceRecord) -> Option<MappingSource
         .and_then(|c| c.mapping)
 }
 
-pub(crate) fn model_ledger(record: &GraphSourceRecord) -> Option<String> {
+pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Option<bool>) {
     SqlGsConfig::from_json(&record.config)
         .ok()
-        .and_then(|c| c.model)
+        .map_or((None, None), |c| (c.model, c.default_allow))
 }
 
 #[cfg(test)]

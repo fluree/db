@@ -62,6 +62,7 @@ impl R2rmlPolicyGate {
     pub(crate) fn build(
         ctx: &ExecutionContext<'_>,
         mapping: &CompiledR2rmlMapping,
+        graph_source_id: &str,
     ) -> Option<Self> {
         if ctx.allow_unfiltered() {
             return None;
@@ -94,6 +95,7 @@ impl R2rmlPolicyGate {
         }
         let per_subject = !view.by_subject.is_empty();
         let has_class_policies = view.restrictions.iter().any(|r| r.class_policy);
+        report_unevaluable_policies(ctx, graph_source_id, &view);
         let wrapper = PolicyWrapper::new(
             view,
             PolicySet::default(),
@@ -268,6 +270,44 @@ impl R2rmlPolicyGate {
             self.static_cache.insert(key, allowed);
         }
         Ok(allowed)
+    }
+}
+
+/// Surface every `f:query` policy in the view set: it cannot run against a
+/// virtual source and denies its targets, which a caller would otherwise only
+/// see as missing rows. Recorded on the tracker (the tracked response's
+/// `policy_enforcement.unevaluable_policies`) and logged once per policy per
+/// process — a warning per scan would flood a busy server.
+fn report_unevaluable_policies(
+    ctx: &ExecutionContext<'_>,
+    graph_source_id: &str,
+    view: &PolicySet,
+) {
+    use fluree_db_policy::PolicyValue;
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+    for r in &view.restrictions {
+        if !matches!(r.value, PolicyValue::Query(_)) {
+            continue;
+        }
+        ctx.tracker.record_unevaluable_policy(&r.id);
+        let first = WARNED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .map(|mut set| set.insert(r.id.clone()))
+            .unwrap_or(true);
+        if first {
+            tracing::warn!(
+                policy = %r.id,
+                graph_source = %graph_source_id,
+                "policy uses f:query, which cannot be evaluated against a virtual \
+                 (Iceberg / SQL) graph source; its targets are denied. Use static \
+                 targeting (f:onClass / f:onProperty / f:onSubject with f:allow) for \
+                 policies that govern virtual sources."
+            );
+        }
     }
 }
 

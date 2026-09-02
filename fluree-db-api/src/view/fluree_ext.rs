@@ -626,22 +626,80 @@ impl Fluree {
     /// the single source of truth for the genesis graph-source view; see
     /// [`db_or_graph_source`](Self::db_or_graph_source) and the dataset path's
     /// `resolve_as_graph_source`.
-    /// The config a model-governed virtual source presents to `wrap_policy`
-    /// (see `graph_source::r2rml::model_resolved_config`); `None` when the
-    /// record names no model ledger.
+    /// The config a governed virtual source presents to `wrap_policy` (see
+    /// `graph_source::r2rml::source_resolved_config`); `None` when the record
+    /// sets neither a model ledger nor a `default-allow`.
     pub(crate) fn graph_source_model_config(
         record: &fluree_db_nameservice::GraphSourceRecord,
     ) -> Option<fluree_db_core::ledger_config::ResolvedConfig> {
         #[cfg(feature = "iceberg")]
         {
-            crate::graph_source::r2rml::model_ledger_of(record)
-                .map(|m| crate::graph_source::r2rml::model_resolved_config(&m))
+            let (model, default_allow) = crate::graph_source::r2rml::policy_config_of(record);
+            crate::graph_source::r2rml::source_resolved_config(model.as_deref(), default_allow)
         }
         #[cfg(not(feature = "iceberg"))]
         {
             let _ = record;
             None
         }
+    }
+
+    /// Validate a graph source's `--model` reference at registration and
+    /// return user-facing warnings about it.
+    ///
+    /// The model must be an existing native ledger (a typo would otherwise
+    /// surface only as a 502 on every governed query). Policies in it that use
+    /// `f:query` are reported: a virtual source cannot evaluate them, so they
+    /// deny their targets.
+    pub(crate) async fn validate_source_model(&self, model: Option<&str>) -> Result<Vec<String>> {
+        let Some(model) = model else {
+            return Ok(Vec::new());
+        };
+        let id = fluree_db_core::normalize_ledger_id(model).unwrap_or_else(|_| model.to_string());
+        let ns = self.nameservice();
+        if ns
+            .lookup_graph_source(&id)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .is_some()
+        {
+            return Err(ApiError::config(format!(
+                "model '{model}' is a graph source; a model must be a native ledger \
+                 holding the policies and class hierarchy"
+            )));
+        }
+        match ns.lookup(&id).await {
+            Ok(Some(record)) if !record.retracted => {}
+            Ok(_) => {
+                return Err(ApiError::config(format!(
+                    "model ledger '{model}' not found; create it first (`fluree create`) \
+                     or check the name"
+                )));
+            }
+            Err(e) => return Err(ApiError::internal(e.to_string())),
+        }
+
+        let probe = serde_json::json!({
+            "from": id,
+            "select": ["?policy"],
+            "where": { "@id": "?policy", "https://ns.flur.ee/db#query": "?q" },
+        });
+        let rows = self.query_from().jsonld(&probe).execute_formatted().await?;
+        let mut warnings: Vec<String> = rows
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row.get(0).and_then(|v| v.as_str()))
+            .map(|policy| {
+                format!(
+                    "policy {policy} in model '{model}' uses f:query, which a virtual source \
+                     cannot evaluate; its targets will be denied"
+                )
+            })
+            .collect();
+        warnings.sort();
+        warnings.dedup();
+        Ok(warnings)
     }
 
     pub async fn resolve_graph_source(&self, ledger_id: &str) -> Result<Option<GraphDb>> {

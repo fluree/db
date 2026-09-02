@@ -931,6 +931,32 @@ anonymous request carrying `default-allow` applies the baseline
 `f:AccessPolicy` rules. A request with no policy inputs is unrestricted, as
 for a native ledger. Inline `opts.policy` works with or without a model.
 
+The model is validated when the source is registered: it must be an existing
+native ledger (not a graph source), so a mistyped name fails at `map` time
+rather than as a 502 on every governed query. Registration also reports every
+policy in the model that uses `f:query` — in the CLI output, and as
+`model_warnings` in the HTTP response — since the source will deny their
+targets.
+
+### Sources without a model under authentication
+
+On a server with data auth enabled every request carries an identity, which is
+a policy input, so a source with **no** model and no matching policy resolves
+to nothing: `default-allow` is fail-closed when unset. To keep such a source
+readable without attaching a model, register it with `--default-allow true`
+(`default_allow` in the HTTP body and stored config). It plays the same role as
+a native ledger's `f:defaultAllow` config: it fills a request that left
+`default-allow` unset, and an explicit request value still wins.
+
+### Seeing what policy did
+
+With `"meta": {"policy": true}` (or the `fluree-meta` header) the tracked
+response's `policy_enforcement` carries `unevaluable_policies`: the ids of
+`f:query` policies the source could not evaluate and therefore denied. That is
+how to tell a fail-closed policy from an empty table. The server also logs a
+warning the first time each such policy is met, and a debug line for every
+triples map a scan skipped because its predicates were hidden.
+
 ## Limitations
 
 1. **Read-Only:** Iceberg graph sources are read-only (no writes via Fluree)
