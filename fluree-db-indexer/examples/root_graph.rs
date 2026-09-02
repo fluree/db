@@ -22,10 +22,15 @@
 //!
 //! `head-digest` is the published index head (the nameservice's `index_head_id`) if
 //! known; supplying it lets the tool report reachability from the real head rather
-//! than guessing the newest by `index_t`.
+//! than guessing the newest by `index_t`. Either spelling works: the hex digest that
+//! names the `.fir6` file, or the base32 CID that `index_head_id` stringifies to.
+//! A head that is not a root in this directory is an error, not a walk of length
+//! zero reported as total orphaning.
 
 use fluree_db_binary_index::IndexRoot;
+use fluree_db_core::ContentId;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::str::FromStr;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -134,12 +139,13 @@ fn main() {
     }
 
     // Reachability from the head: what GC can actually see.
-    let head = head_arg.or_else(|| {
-        nodes
+    let head = match &head_arg {
+        Some(arg) => Some(resolve_head(arg, &nodes)),
+        None => nodes
             .iter()
             .max_by_key(|(_, (t, _))| *t)
-            .map(|(d, _)| d.clone())
-    });
+            .map(|(d, _)| d.clone()),
+    };
     if let Some(head) = head {
         // Count only digests that are actually PRESENT on disk. Walking into a
         // missing parent (the tail of a GC truncation) and counting it would make
@@ -200,4 +206,29 @@ fn main() {
             }
         }
     }
+}
+
+/// Turn the operator's `head-digest` argument into a key of `nodes`, or exit.
+///
+/// Roots are keyed by the hex digest that names the file, but `index_head_id`
+/// stringifies as a base32 CIDv1, so the value the operator is most likely to have
+/// on hand can never match a key directly. Accept both, and refuse to guess when
+/// neither lands: an unmatched head walks zero roots, and a zero-length walk reads
+/// as a totally orphaned ledger, which is the most alarming output the tool has.
+fn resolve_head(arg: &str, nodes: &HashMap<String, (i64, Option<String>)>) -> String {
+    if nodes.contains_key(arg) {
+        return arg.to_string();
+    }
+    if let Ok(digest) = ContentId::from_str(arg).map(|cid| cid.digest_hex()) {
+        if nodes.contains_key(&digest) {
+            println!("head {arg} resolved to digest {digest}");
+            return digest;
+        }
+    }
+    eprintln!(
+        "!! head {arg} is not a root in this directory.\n\
+         !! Pass either the hex digest naming the .fir6 file, or the CID form of\n\
+         !! index_head_id. Refusing to report a zero-length walk as total orphaning."
+    );
+    std::process::exit(2);
 }
