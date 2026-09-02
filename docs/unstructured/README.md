@@ -31,7 +31,12 @@ The parsing engine is scored on [opendataloader-bench](https://github.com/openda
 | 7 | pdf-inspector | 0.875 | 0.915 | 0.814 | 0.788 | 0.006 |
 | 8 | marker | 0.861 | 0.890 | 0.808 | 0.796 | 53.932 |
 
-Two rows matter for the tiers above. The **deterministic** engine — no model, no GPU, no API key, about 8 ms per document on a CPU — is what the local tier runs, and on its own it places third. The **cascade**, which adds a vision model for the pages and regions the deterministic pass could not read, is what a `vlm` slot or a Fluree AI account gives you, and it places first. Across that corpus 113 of the 200 documents never needed the model at all; of the 87 that did, the median cost 1.7 s and the worst 18.9 s.
+Two rows matter for the tiers above.
+
+- The **deterministic** engine — no model, no GPU, no API key, about 8 ms per document on a CPU — is what the local tier runs. It is the best model-free engine on the board: ahead of every other engine that runs without a model (nutrient and pdf-inspector, the other two under 10 ms per document), and ahead of most of the model-assisted ones too, including docling and marker. Only one model-assisted engine scores above it.
+- The **cascade**, which adds a vision model for just the pages and regions the deterministic pass could not read, is what a `vlm` slot or a Fluree AI account gives you. It places first, ahead of every engine scored, model-assisted or not, on every one of the three metrics.
+
+Across that corpus 113 of the 200 documents never needed the model at all; of the 87 that did, the median cost 1.7 s and the worst 18.9 s.
 
 Every score reproduces from committed model-output caches without a GPU or a key, and the engine's own accounting of [where its output is better than the reference and scores lower for it](https://github.com/fluree/fluree-doc-parse/blob/main/docs/benchmarks/where-we-differ.md) is published alongside. Full detail: [the benchmarks page](https://github.com/fluree/fluree-doc-parse/blob/main/docs/benchmarks/README.md).
 

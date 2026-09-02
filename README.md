@@ -13,7 +13,7 @@ Billions of graph facts on commodity hardware. Over 2M facts/second bulk import.
 
 > [!NOTE]
 > **Fluree Unstructured** — is part of the Fluree DB CLI.
-> Unstructured documents in, a knowledge graph out. `fluree doc ingest ./folder` turns PDFs, Office files, Markdown and scans into a searchable, citable graph — structure, chunks and embeddings in a ledger you control — deterministic and offline by default, with your own models or a Fluree AI account when you want more.
+> Unstructured documents in, a knowledge graph out. `fluree doc ingest ./folder` turns PDFs, Office files, Markdown and scans into a searchable, citable graph — structure, chunks and embeddings in a ledger you control. Deterministic and offline by default, with the best model-free parsing engine on a public 200-document benchmark; add your own vision model or a Fluree AI account and it outscores every engine measured.
 > [Fluree Unstructured docs →](docs/unstructured/README.md)
 
 ## Install
