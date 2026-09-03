@@ -376,6 +376,19 @@ struct Lowerer<'a> {
 struct UnionInfo {
     branches: Vec<RelPlan>,
     tag: String,
+    /// Per parent triples map a foreign key may target, the parent's join
+    /// columns as `(column, slot)` — present only when every branch reads
+    /// the parent's row.
+    parent_cols: HashMap<String, Vec<(String, String)>>,
+}
+
+/// A foreign key another entity may point at an entity: the parent map and
+/// its join columns; `certain` when every map that could provide the
+/// pointing member uses it (so the join is placed whichever map is chosen).
+struct Incoming {
+    parent: String,
+    cols: Vec<String>,
+    certain: bool,
 }
 
 /// A required entity that resolves to no triples map: the block is empty.
@@ -413,8 +426,45 @@ impl<'a> Lowerer<'a> {
         // source, joined on the subject's key columns; maps over the same
         // table and subject share one access.
         let mut entity_accesses: HashMap<usize, Vec<(String, &'a TriplesMap)>> = HashMap::new();
-        let mut union_entities: HashSet<usize> = HashSet::new();
+        let mut union_entities: HashMap<usize, String> = HashMap::new();
         let mut pending_refs: Vec<RefEdge> = Vec::new();
+        // Foreign keys the other entities may point at each entity, known
+        // before it is lowered so a union can expose the parent's columns.
+        let mut incoming: HashMap<VarId, Vec<Incoming>> = HashMap::new();
+        for (subject, members) in &entities {
+            for (pred, obj) in members {
+                let Obj::Var(v) = obj else { continue };
+                if !required_subjects.contains(v) || matches!(subject, SubjRef::Var(s) if s == v) {
+                    continue;
+                }
+                let mut refs: Vec<(String, Vec<String>)> = Vec::new();
+                let mut providers = 0usize;
+                for tm in self.mapping.triples_maps.values() {
+                    let Some(i) = pom_for(tm, pred) else { continue };
+                    providers += 1;
+                    if let ObjectMap::RefObjectMap(rom) = &tm.predicate_object_maps[i].object_map {
+                        let cols = rom
+                            .join_conditions
+                            .iter()
+                            .map(|jc| jc.parent_column.clone())
+                            .collect();
+                        refs.push((rom.parent_triples_map.clone(), cols));
+                    }
+                }
+                let certain =
+                    providers > 0 && refs.len() == providers && refs.iter().all(|r| r == &refs[0]);
+                for (parent, cols) in refs {
+                    let entry = incoming.entry(*v).or_default();
+                    if !entry.iter().any(|i| i.parent == parent && i.cols == cols) {
+                        entry.push(Incoming {
+                            parent,
+                            cols,
+                            certain,
+                        });
+                    }
+                }
+            }
+        }
         for (idx, (subject, members)) in entities.iter().enumerate() {
             let mut alternatives = match self.resolve_alternatives(members, None) {
                 Ok(a) => a,
@@ -425,12 +475,17 @@ impl<'a> Lowerer<'a> {
                 1 => alternatives.pop().expect("one resolution"),
                 // Several resolutions: their union, as one derived table.
                 _ => {
-                    match self.lower_union_entity(subject, members, alternatives)? {
-                        Ok(Ok(())) => {}
+                    let refs: &[Incoming] = match subject {
+                        SubjRef::Var(v) => incoming.get(v).map_or(&[], Vec::as_slice),
+                        SubjRef::Iri(_) => &[],
+                    };
+                    match self.lower_union_entity(subject, members, alternatives, refs)? {
+                        Ok(Ok(alias)) => {
+                            union_entities.insert(idx, alias);
+                        }
                         Ok(Err(Empty)) => return Ok(Ok(None)),
                         Err(d) => return Ok(Err(d)),
                     }
-                    union_entities.insert(idx);
                     entity_accesses.insert(idx, Vec::new());
                     continue;
                 }
@@ -498,8 +553,34 @@ impl<'a> Lowerer<'a> {
             let target = entities
                 .iter()
                 .position(|(s, _)| matches!(s, SubjRef::Var(v) if *v == var));
-            if target.is_some_and(|i| union_entities.contains(&i)) {
-                return Ok(Err(Decline("ref object map into a union entity")));
+            // A union exposes the parent's columns when every branch reads
+            // the parent's row.
+            if let Some(u) = target.and_then(|i| union_entities.get(&i)) {
+                let Some(cols) = self
+                    .unions
+                    .get(u)
+                    .and_then(|info| info.parent_cols.get(&parent_tm_iri))
+                else {
+                    return Ok(Err(Decline(
+                        "ref object map into a union entity without the parent's row",
+                    )));
+                };
+                for (child_col, parent_col) in conds {
+                    let Some((_, slot)) = cols.iter().find(|(c, _)| c == &parent_col) else {
+                        return Ok(Err(Decline(
+                            "ref object map parent column not in the union",
+                        )));
+                    };
+                    self.edges.push((
+                        child_alias.clone(),
+                        u.clone(),
+                        Pred::ColEq {
+                            left: ColRef::new(&child_alias, child_col),
+                            right: ColRef::new(u, slot),
+                        },
+                    ));
+                }
+                continue;
             }
             let Some(accesses) = target.and_then(|i| entity_accesses.get(&i)) else {
                 return Ok(Err(Decline("ref target entity missing")));
@@ -780,7 +861,8 @@ impl<'a> Lowerer<'a> {
         subject: &SubjRef,
         members: &[(String, Obj)],
         alternatives: Vec<Vec<Part<'a>>>,
-    ) -> Result<Lowering<std::result::Result<(), Empty>>> {
+        incoming: &[Incoming],
+    ) -> Result<Lowering<std::result::Result<String, Empty>>> {
         let triples: Vec<Tp> = members
             .iter()
             .map(|(p, o)| Tp {
@@ -789,6 +871,27 @@ impl<'a> Lowerer<'a> {
                 o: o.clone(),
             })
             .collect();
+        // A foreign key certain to point at this entity joins its parent's
+        // row: a resolution minting another subject can never meet it and
+        // is dropped; one on the parent's subject over other tables takes
+        // the parent's row as a part of its own, joined on the subject key.
+        let mapping = self.mapping;
+        let mut alternatives = alternatives;
+        for inc in incoming.iter().filter(|i| i.certain) {
+            let Some(parent) = mapping.get(&inc.parent) else {
+                return Ok(Err(Decline("ref object map parent missing")));
+            };
+            alternatives.retain_mut(|parts| {
+                if parts.iter().any(|(tm, _)| same_row(tm, parent)) {
+                    return true;
+                }
+                if parts.iter().any(|(tm, _)| same_subject(tm, parent)) {
+                    parts.push((parent, Vec::new()));
+                    return true;
+                }
+                false
+            });
+        }
         let mut branches: Vec<(Lowered, HashSet<(String, String)>)> = Vec::new();
         for alt in alternatives {
             let mut inner = self.nested();
@@ -811,6 +914,16 @@ impl<'a> Lowerer<'a> {
                 Err(d) => return Ok(Err(d)),
             }
         }
+        let row_of = |l: &Lowered, parent: &TriplesMap| -> Option<String> {
+            l.accesses
+                .iter()
+                .find(|a| {
+                    self.mapping
+                        .get(&a.tm_iri)
+                        .is_some_and(|tm| same_row(tm, parent))
+                })
+                .map(|a| a.alias.clone())
+        };
         let Some((first, _)) = branches.first() else {
             return Ok(Ok(Err(Empty)));
         };
@@ -844,6 +957,33 @@ impl<'a> Lowerer<'a> {
                     None => slots.push(per_branch),
                 }
             }
+        }
+        // The parents' join columns, as slots, where every branch reads
+        // the parent's row.
+        let mut parent_slots: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+        for inc in incoming {
+            let Some(parent) = self.mapping.get(&inc.parent) else {
+                continue;
+            };
+            let rows: Option<Vec<String>> =
+                branches.iter().map(|(l, _)| row_of(l, parent)).collect();
+            let Some(rows) = rows else { continue };
+            let mut cols_of = Vec::with_capacity(inc.cols.len());
+            for col in &inc.cols {
+                let per_branch: Vec<ColRef> = rows.iter().map(|a| ColRef::new(a, col)).collect();
+                // A branch whose subject key is the parent's column shares
+                // the key's slot; one that reads the parent's row through a
+                // join gets a slot of its own.
+                let k = match slots.iter().position(|s| *s == per_branch) {
+                    Some(k) => k,
+                    None => {
+                        slots.push(per_branch);
+                        slots.len() - 1
+                    }
+                };
+                cols_of.push((col.clone(), k));
+            }
+            parent_slots.insert(inc.parent.clone(), cols_of);
         }
         let mut types: Vec<FieldType> = Vec::with_capacity(slots.len());
         for slot in &slots {
@@ -1015,14 +1155,24 @@ impl<'a> Lowerer<'a> {
                 return Ok(Err(d));
             }
         }
+        let parent_cols = parent_slots
+            .into_iter()
+            .map(|(p, cols)| {
+                (
+                    p,
+                    cols.into_iter().map(|(c, k)| (c, slot_name(k))).collect(),
+                )
+            })
+            .collect();
         self.unions.insert(
-            alias,
+            alias.clone(),
             UnionInfo {
                 branches: plans,
                 tag,
+                parent_cols,
             },
         );
-        Ok(Ok(Ok(())))
+        Ok(Ok(Ok(alias)))
     }
 
     /// A sub-select as a derived table: its block is lowered on its own
@@ -1732,15 +1882,34 @@ impl<'a> Lowerer<'a> {
                         }
                     }
                 }
-                providers.push(found);
+                // Two maps declaring the class on the same rows mint the
+                // same type triples.
+                let mut kept: Vec<&'a TriplesMap> = Vec::with_capacity(found.len());
+                for tm in found {
+                    let alike = kept.iter().any(|k| {
+                        k.same_source_row(tm)
+                            && static_classes(k).iter().any(|c| c == class)
+                            && static_classes(tm).iter().any(|c| c == class)
+                    });
+                    if !alike {
+                        kept.push(tm);
+                    }
+                }
+                providers.push(kept);
             } else {
-                providers.push(
-                    candidates
-                        .iter()
-                        .copied()
-                        .filter(|tm| pom_for(tm, pred).is_some())
-                        .collect(),
-                );
+                // Maps minting the predicate alike mint the same triples,
+                // which the graph holds once.
+                let mut kept: Vec<&'a TriplesMap> = Vec::new();
+                for tm in candidates
+                    .iter()
+                    .copied()
+                    .filter(|tm| pom_for(tm, pred).is_some())
+                {
+                    if !kept.iter().any(|k| k.mints_alike(tm, pred)) {
+                        kept.push(tm);
+                    }
+                }
+                providers.push(kept);
             }
         }
         if providers.iter().any(Vec::is_empty) {

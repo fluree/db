@@ -31,7 +31,7 @@ use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
 use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
-use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap};
+use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
 use fluree_vocab::namespaces::XSD;
 use std::collections::HashSet;
 
@@ -437,13 +437,35 @@ pub fn rewrite_patterns_for_r2rml(
                 .chain(&const_members)
                 .filter_map(|p| p.predicate_filter.as_deref())
                 .collect();
-            let covered = m.triples_maps.values().any(|tm| {
-                preds.iter().all(|pred| {
-                    tm.predicate_object_maps
-                        .iter()
-                        .any(|pom| pom.predicate_map.as_constant() == Some(pred))
-                })
-            });
+            // A fused scan reads the star from maps carrying every member.
+            // A map providing only some of them loses its rows unless its
+            // subjects provably never meet a covering map's (disjoint
+            // templates): a vertical partition's second provider of one
+            // member keeps the star unfused, another entity's does not.
+            let provides = |tm: &TriplesMap, pred: &str| {
+                tm.predicate_object_maps
+                    .iter()
+                    .any(|pom| pom.predicate_map.as_constant() == Some(pred))
+            };
+            let covering: Vec<&TriplesMap> = m
+                .triples_maps
+                .values()
+                .filter(|tm| preds.iter().all(|pred| provides(tm, pred)))
+                .collect();
+            let covered = !covering.is_empty()
+                && m.triples_maps.values().all(|tm| {
+                    !preds.iter().any(|pred| provides(tm, pred))
+                        || preds.iter().all(|pred| provides(tm, pred))
+                        || covering.iter().all(|c| {
+                            match (
+                                tm.subject_map.template.as_deref(),
+                                c.subject_map.template.as_deref(),
+                            ) {
+                                (Some(a), Some(b)) => templates_provably_disjoint(a, b),
+                                _ => false,
+                            }
+                        })
+                });
             if !covered {
                 for m in var_members.into_iter().chain(const_members) {
                     result_patterns.push(Pattern::R2rml(m));

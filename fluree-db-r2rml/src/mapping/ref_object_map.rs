@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 /// This says: "For each route, generate a triple with predicate ex:airline
 /// whose object is the subject IRI of the AirlineMapping where the route's
 /// airline_id matches the airline's id."
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RefObjectMap {
     /// IRI of the parent TriplesMap
     pub parent_triples_map: String,
@@ -99,7 +99,7 @@ impl RefObjectMap {
 ///
 /// Specifies that the child column in the current table must equal
 /// the parent column in the parent TriplesMap's table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JoinCondition {
     /// Column in the current (child) TriplesMap's logical table
     pub child_column: String,

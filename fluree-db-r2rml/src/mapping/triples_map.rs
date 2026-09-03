@@ -178,6 +178,39 @@ impl TriplesMap {
     /// reading any POM or parent column for it is wasted I/O. Use this instead of
     /// `columns_for_predicate(None)` (which projects every POM column) when the
     /// pattern has no object variable.
+    /// Whether `other` reads the same rows and mints the same subject from
+    /// them: the same logical table and the same subject template, column
+    /// or constant (its classes aside).
+    pub fn same_source_row(&self, other: &TriplesMap) -> bool {
+        let (a, b) = (&self.subject_map, &other.subject_map);
+        self.logical_table == other.logical_table
+            && a.template == b.template
+            && a.template_columns == b.template_columns
+            && a.column == b.column
+            && a.constant == b.constant
+            && a.term_type == b.term_type
+    }
+
+    /// The object map of the first predicate-object map naming `predicate`
+    /// as a constant.
+    pub fn object_map_for(&self, predicate: &str) -> Option<&super::term_map::ObjectMap> {
+        self.predicate_object_maps
+            .iter()
+            .find(|pom| pom.predicate_map.as_constant() == Some(predicate))
+            .map(|pom| &pom.object_map)
+    }
+
+    /// Whether the two maps mint `predicate` alike — from the same rows,
+    /// the same subject and the same object map — and so the same triples,
+    /// which an RDF graph holds once.
+    pub fn mints_alike(&self, other: &TriplesMap, predicate: &str) -> bool {
+        self.same_source_row(other)
+            && matches!(
+                (self.object_map_for(predicate), other.object_map_for(predicate)),
+                (Some(a), Some(b)) if a == b
+            )
+    }
+
     pub fn subject_columns(&self) -> Vec<&str> {
         let mut columns: Vec<&str> = self
             .subject_map
@@ -268,7 +301,7 @@ impl TriplesMap {
 /// Defines where the tabular data comes from.
 /// Iceberg graph sources accept only table names; SQL graph sources also
 /// accept `rr:sqlQuery`, which is scanned as a derived table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LogicalTable {
     /// `rr:tableName` - direct table reference
     ///

@@ -237,13 +237,18 @@ pushable. In that statement:
   subject) is lowered on its own and the branches are `UNION ALL`ed under
   shared columns, each row tagged with its branch so its terms decode
   through that branch's maps. The rest of the block joins the union once.
-  Like the per-scan lane, a triple two maps mint comes back once per map.
-  Filters and a top-k on a union variable push on the union's columns; a
-  variable keeps its key shape (so it can be seeded or joined) only where
-  every branch agrees on it. The branches must bind their columns with the
-  same database types, an entity with more than eight resolutions, a
-  foreign key into a union entity, an aggregate over one, and a union
-  inside a sub-select decline;
+  Two maps minting a triple alike (the same table, subject template and
+  object map) count as one provider, since the graph holds the triple
+  once; maps deriving the same value differently still come back once
+  each. Filters and a top-k on a union variable push on the union's
+  columns; a variable keeps its key shape (so it can be seeded or joined)
+  only where every branch agrees on it. A foreign key into a union entity
+  joins the parent's columns, which every branch exposes: a branch on the
+  parent's subject over another table takes the parent's row as a part of
+  its own, and a branch minting another subject can never meet the key and
+  is dropped. The branches must bind their columns with the same database
+  types, an entity with more than eight resolutions, an aggregate over a
+  union entity, and a union inside a sub-select decline;
 - the statement has limits the lane respects: outer bindings above the
   provider's key-set cap (2000 rows, or half the statement budget) go out
   as several statements, one per chunk; a `VALUES` block or an `IN` list

@@ -133,6 +133,14 @@ const VP_R2RML: &str = r#"
         rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
         rr:predicateObjectMap [ rr:predicate ex:email ; rr:objectMap [ rr:column "email" ] ] .
 
+    # The same subject minting `ex:label` from another table's column: a
+    # second provider proper, unlike CustomerCountry's copy of Customer's.
+    <http://example.org/mapping#CustomerAlias>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.profiles" ] ;
+        rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "email" ] ] .
+
     <http://example.org/mapping#Order>
         a rr:TriplesMap ;
         rr:logicalTable [ rr:tableName "shop.orders" ] ;
@@ -870,17 +878,18 @@ fn cases() -> Vec<Case> {
         // An entity several resolutions provide (a predicate two maps
         // mint, on the same subject or on different ones) is one derived
         // table: the resolutions `UNION ALL`ed, each row tagged with its
-        // branch so its terms decode through that branch's maps. Like the
-        // per-scan lane, a triple two maps mint comes back once per map.
+        // branch so its terms decode through that branch's maps. Two maps
+        // minting a triple alike (CustomerCountry's copy of Customer's
+        // label) count as one provider: the graph holds the triple once.
         Case {
             name: "a predicate two maps provide unions the resolutions at the node",
             sparql: "SELECT ?l ?e FROM <shop-vp:main> WHERE { ?c ex:label ?l ; ex:email ?e }",
-            sql: &[r#"SELECT "u0"."c3" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2", "u0"."c2" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."email" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t0" JOIN "shop"."profiles" AS "t1" ON "t0"."id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", "t3"."email" AS "c2", 1 AS "c3" FROM "shop"."customers" AS "t2" JOIN "shop"."profiles" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL AND "t3"."id" IS NOT NULL AND "t3"."email" IS NOT NULL) AS "u0""#],
+            sql: &[r#"SELECT "u0"."c3" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2", "u0"."c2" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."email" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t0" JOIN "shop"."profiles" AS "t1" ON "t0"."id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t2"."email" AS "c2", 1 AS "c3" FROM "shop"."profiles" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL) AS "u0""#],
             rows: &[
                 "e=ada@example.org l=Ada",
-                "e=ada@example.org l=Ada",
+                "e=ada@example.org l=ada@example.org",
                 "e=cy@example.org l=Cy",
-                "e=cy@example.org l=Cy",
+                "e=cy@example.org l=cy@example.org",
             ],
             routing: Routing::MustFire,
             declined: None,
@@ -888,20 +897,19 @@ fn cases() -> Vec<Case> {
         Case {
             name: "maps with different subjects providing a predicate union their accesses",
             sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l }",
-            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", 1 AS "c2" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0""#],
+            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0""#],
             // The subject has no key over the union (two templates), so it
             // decodes per branch; the object is one string column.
             rows: &[
                 "l=Ada s=http://example.org/customer/1",
-                "l=Ada s=http://example.org/customer/1",
                 "l=Ada s=http://example.org/person/1",
-                "l=Bo s=http://example.org/customer/2",
                 "l=Bo s=http://example.org/customer/2",
                 "l=Bo s=http://example.org/person/2",
                 "l=Cy s=http://example.org/customer/3",
-                "l=Cy s=http://example.org/customer/3",
                 "l=Cy s=http://example.org/person/3",
                 "l=Di s=http://example.org/person/4",
+                "l=ada@example.org s=http://example.org/customer/1",
+                "l=cy@example.org s=http://example.org/customer/3",
             ],
             routing: Routing::MustFire,
             declined: None,
@@ -909,9 +917,8 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a filter on a union variable pushes on the union's column",
             sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l FILTER(?l = \"Ada\") }",
-            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", 1 AS "c2" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" WHERE "u0"."c1" = 'Ada'"#],
+            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" WHERE "u0"."c1" = 'Ada'"#],
             rows: &[
-                "l=Ada s=http://example.org/customer/1",
                 "l=Ada s=http://example.org/customer/1",
                 "l=Ada s=http://example.org/person/1",
             ],
@@ -923,25 +930,43 @@ fn cases() -> Vec<Case> {
             sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l } ORDER BY DESC(?l) LIMIT 1",
             // Every branch requires the column, so the union's is required
             // and orders exactly.
-            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", 1 AS "c2" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" ORDER BY "u0"."c1" DESC LIMIT 1"#],
-            rows: &["l=Di s=http://example.org/person/4"],
+            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" ORDER BY "u0"."c1" DESC LIMIT 1"#],
+            rows: &["l=cy@example.org s=http://example.org/customer/3"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        // A foreign key into a union entity joins the parent's columns the
+        // union exposes: a branch on the parent's row carries them as its
+        // own, one on the parent's subject over another table (the alias
+        // on profiles) takes the parent's row as a part joined on the
+        // subject key, and one minting another subject (people) can never
+        // meet a key that is certain to be placed, so it is dropped.
+        Case {
+            name: "a foreign key into a union entity joins the parent's columns",
+            sparql: "SELECT ?o ?l FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:label ?l }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "u0"."c3" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."id" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."id" AS "c2", 1 AS "c3" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c2" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
+            rows: &[
+                "l=Ada o=http://example.org/order/10",
+                "l=Ada o=http://example.org/order/11",
+                "l=Bo o=http://example.org/order/12",
+                "l=ada@example.org o=http://example.org/order/10",
+                "l=ada@example.org o=http://example.org/order/11",
+            ],
             routing: Routing::MustFire,
             declined: None,
         },
         Case {
-            name: "a foreign key into a union entity declines",
-            sparql: "SELECT ?o ?l FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:label ?l }",
-            sql: &[],
+            name: "a foreign key into a partitioned union entity keeps its other parts",
+            sparql: "SELECT ?o ?l ?k FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:label ?l ; ex:country ?k }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "u0"."c4" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4", "u0"."c3" AS "c5" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."country" AS "c2", "t1"."id" AS "c3", 0 AS "c4" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."country" AS "c2", "t3"."id" AS "c3", 1 AS "c4" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL AND "t3"."country" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c3" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
             rows: &[
-                "l=Ada o=http://example.org/order/10",
-                "l=Ada o=http://example.org/order/10",
-                "l=Ada o=http://example.org/order/11",
-                "l=Ada o=http://example.org/order/11",
-                "l=Bo o=http://example.org/order/12",
-                "l=Bo o=http://example.org/order/12",
+                "k=UK l=Ada o=http://example.org/order/10",
+                "k=UK l=Ada o=http://example.org/order/11",
+                "k=UK l=ada@example.org o=http://example.org/order/10",
+                "k=UK l=ada@example.org o=http://example.org/order/11",
             ],
-            routing: Routing::MustNotFire,
-            declined: Some("ref object map into a union entity"),
+            routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "union branches whose column types differ decline",

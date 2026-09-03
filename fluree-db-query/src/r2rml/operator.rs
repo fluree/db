@@ -984,6 +984,35 @@ impl R2rmlScanOperator {
             None => triples_maps,
         };
 
+        // Two maps minting this pattern's triples alike — the same rows,
+        // subject and object maps — yield the same triples, which the graph
+        // holds once: keep one of them. A variable predicate reads every
+        // map's own predicates, so it never dedups.
+        let triples_maps: Vec<&TriplesMap> = if self.pattern.predicate_var.is_some() {
+            triples_maps
+        } else {
+            let preds = self.pattern_predicates();
+            let class = self.pattern.class_filter.as_deref();
+            if preds.is_empty() && class.is_none() {
+                triples_maps
+            } else {
+                let mut kept: Vec<&TriplesMap> = Vec::with_capacity(triples_maps.len());
+                for tm in triples_maps {
+                    let alike = kept.iter().any(|k| {
+                        k.same_source_row(tm)
+                            && preds.iter().all(|p| k.mints_alike(tm, p))
+                            && class.is_none_or(|c| {
+                                k.classes().iter().any(|x| x == c)
+                                    && tm.classes().iter().any(|x| x == c)
+                            })
+                    });
+                    if !alike {
+                        kept.push(tm);
+                    }
+                }
+                kept
+            }
+        };
         if triples_maps.is_empty() {
             return Ok(None);
         }
