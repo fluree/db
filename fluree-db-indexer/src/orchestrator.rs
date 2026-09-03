@@ -3437,9 +3437,10 @@ mod tests {
     /// by the api layer, and the leader runs a second, bus-wired one. Two
     /// sweeping workers hold independent `states` maps, so `trigger_if_idle`
     /// cannot see the other's claim and the same ledger is queued and built
-    /// twice; on followers, sweeping means initiating builds that publish
-    /// through a nameservice which under raft proposes to the state machine,
-    /// where indexing is leader-only by design.
+    /// twice; on followers, sweeping means initiating builds whose publish
+    /// cannot land — `RaftNameService::publish_index` swallows the
+    /// `ForwardToLeader` a non-leader gets back as `Ok(())`, so the build pays
+    /// its full cost, reports success, and advances no index head.
     ///
     /// The handle must still work: this turns off automatic catch-up, not the
     /// indexer. Admin reindex, post-commit triggers and the max-novelty nudge
