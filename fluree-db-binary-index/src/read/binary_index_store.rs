@@ -941,40 +941,30 @@ impl BinaryIndexStore {
             DecodeKind::Bool => Ok(FlakeValue::Boolean(o_key != 0)),
             DecodeKind::I64 => Ok(FlakeValue::Long(key.decode_i64())),
             DecodeKind::F64 => Ok(FlakeValue::Double(key.decode_f64())),
+            // The temporal types own their canonical form; building them from
+            // the key directly is what makes an indexed value identical to the
+            // same value parsed from a commit (see fluree_db_core::temporal).
             DecodeKind::Date => {
                 let days = key.decode_date();
-                let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap_or(
-                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch date is valid"),
-                );
-                let iso = date.format("%Y-%m-%d").to_string();
-                match fluree_db_core::temporal::Date::parse(&iso) {
-                    Ok(d) => Ok(FlakeValue::Date(Box::new(d))),
-                    Err(_) => Ok(FlakeValue::String(iso)),
-                }
+                Ok(fluree_db_core::temporal::Date::from_days_since_epoch(days)
+                    .map(|d| FlakeValue::Date(Box::new(d)))
+                    .unwrap_or_else(|| FlakeValue::String(format!("<date {days}>"))))
             }
             DecodeKind::Time => {
                 let micros = key.decode_time();
-                let secs = (micros / 1_000_000) as u32;
-                let frac_micros = (micros % 1_000_000) as u32;
-                let time =
-                    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, frac_micros * 1000)
-                        .unwrap_or(
-                            chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is valid"),
-                        );
-                let iso = time.format("%H:%M:%S%.6f").to_string();
-                match fluree_db_core::temporal::Time::parse(&iso) {
-                    Ok(t) => Ok(FlakeValue::Time(Box::new(t))),
-                    Err(_) => Ok(FlakeValue::String(iso)),
-                }
+                Ok(
+                    fluree_db_core::temporal::Time::from_micros_since_midnight(micros)
+                        .map(|t| FlakeValue::Time(Box::new(t)))
+                        .unwrap_or_else(|| FlakeValue::String(format!("<time {micros}>"))),
+                )
             }
             DecodeKind::DateTime => {
-                let epoch_micros = key.decode_datetime();
-                let dt = chrono::DateTime::from_timestamp_micros(epoch_micros).unwrap_or_default();
-                let iso = dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-                match fluree_db_core::temporal::DateTime::parse(&iso) {
-                    Ok(d) => Ok(FlakeValue::DateTime(Box::new(d))),
-                    Err(_) => Ok(FlakeValue::String(iso)),
-                }
+                let micros = key.decode_datetime();
+                Ok(
+                    fluree_db_core::temporal::DateTime::from_epoch_micros(micros)
+                        .map(|d| FlakeValue::DateTime(Box::new(d)))
+                        .unwrap_or_else(|| FlakeValue::String(format!("<dateTime {micros}>"))),
+                )
             }
             DecodeKind::GYear => Ok(FlakeValue::GYear(Box::new(
                 fluree_db_core::temporal::GYear::from_year(key.decode_g_year()),

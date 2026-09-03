@@ -1,17 +1,15 @@
 //! `TZ()` and `TIMEZONE()` answer the same thing before and after a reindex.
 //!
-//! Fluree normalizes temporal values to UTC and does not persist the source
-//! offset: `ObjKey::encode_datetime` stores epoch micros and nothing else, and
-//! the decoder re-renders the instant with a `Z`. The offset survives only in
-//! novelty, where the parsed value still carries `tz_offset`.
+//! Fluree does not support timezone offsets: a `dateTime` is a UTC instant and
+//! a `date`/`time` carries no designator at all, from the moment the lexical is
+//! parsed (see `fluree_db_core::temporal`). So there is no offset for these
+//! accessors to report, on either lane.
 //!
-//! Both accessors used to read that offset, so they reported whichever
-//! representation the row happened to be sitting in. The same query over
-//! unchanged data returned `"-08:00"` and then `"Z"` once a background reindex
-//! moved the value — a result that changes with no write behind it, which a
-//! caller can neither predict nor control. Answering UTC unconditionally is
-//! what makes the two lanes agree, and it is also what the stored data says
-//! once indexed, since the offset is gone by then.
+//! They used to read one. The parsed value kept its source offset while it sat
+//! in novelty and lost it once indexed, so the same query over unchanged data
+//! returned `"-08:00"` and then `"Z"` once a background reindex moved the value
+//! — a result that changes with no write behind it, which a caller can neither
+//! predict nor control. This file is the pin against that ever coming back.
 //!
 //! So `TZ` is `"Z"` and `TIMEZONE` is `"PT0S"` for every temporal value, and
 //! both are unbound for a non-temporal argument (a type error — SPARQL 1.1

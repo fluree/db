@@ -671,17 +671,27 @@ Shifting is calendar-aware, with three behaviours worth knowing:
 
 The two duration families never mix — `?dayTimeDuration + ?yearMonthDuration` is
 a type error, because months have no fixed length. So is `?time ± ?yearMonthDuration`,
-since a time carries no months. Computed values render in UTC.
+since a time carries no months. Computed values render in the canonical form of
+their kind: a `dateTime` in UTC with a `Z`, a `date` or `time` with no timezone
+designator.
 
 
 **Semantics:**
 
 - **Signed.** `?end - ?start` is negative when the end precedes the start, e.g.
   `-P1D`. It is an elapsed difference, not an absolute magnitude.
-- **Timezone-normalized.** Both operands are compared against a shared origin, so
-  `"2026-01-01T13:00:00+03:00" - "2026-01-01T10:00:00Z"` is `PT0S` — the same
-  instant written two ways — not the three hours the wall-clock readings differ
-  by. A value whose lexical form carries no timezone is read as UTC.
+- **`xsd:dateTime` is an instant.** A dateTime is UTC from the moment it is
+  parsed, so `"2026-01-01T13:00:00+03:00" - "2026-01-01T10:00:00Z"` is `PT0S` —
+  the same instant written two ways — not the three hours the wall-clock
+  readings differ by. A lexical form with no timezone is read as UTC.
+- **`xsd:date` and `xsd:time` carry no offset** (deviation, see below). Fluree
+  does not support timezone offsets: on a `date` or `time` the designator is
+  validated and discarded, not applied, so `"2026-01-01+05:00"` *is*
+  `"2026-01-01"` and `"17:00:00-06:00"` *is* `"17:00:00"`. Arithmetic therefore
+  subtracts calendar dates and wall clocks: `"2026-01-01+05:00" - "2026-01-01Z"`
+  is `PT0S` rather than the `-PT5H` XPath gives. Full statement under
+  [Timezone offsets are not supported](../reference/compatibility.md). Store an
+  offset you need to keep as its own property.
 - **Subtraction only.** `+`, `*`, `/` and `%` are not defined over temporal
   operands, and neither are mixed pairs such as `?dateTime - ?date`. These are
   type errors, which inside `BIND` means the variable is left **unbound** rather
@@ -691,10 +701,14 @@ since a time carries no months. Computed values render in UTC.
 > the SPARQL 1.2 draft does not extend it either — a conformant processor is
 > free to answer a type error here. Fluree follows
 > [SEP-0002](https://github.com/w3c/sparql-dev/blob/main/SEP/SEP-0002/sep-0002.md),
-> the community proposal that specifies these operators, so the behaviour agrees
-> with the other engines that implement them (Stardog, GraphDB, RDFox, Jena).
-> Queries relying on this are not portable to processors that implement only the
-> published spec.
+> the community proposal that specifies these operators, and matches its XPath
+> semantics wherever an offset is not in play — that is, for every
+> `xsd:dateTime` operand, and for `xsd:date`/`xsd:time` operands written without
+> one. Where an `xsd:date` or `xsd:time` is written with an offset, the bullet
+> above applies and the answers differ; XPath's own `op:subtract-times` example
+> (`"17:00:00-06:00" - "08:00:00+09:00"` = `P1D`) is one such case, and Fluree
+> answers `PT9H`. Queries relying on any of this are not portable to processors
+> that implement only the published spec.
 
 Also supported from SEP-0002: ordering and equality over `xsd:date`,
 `xsd:time`, `xsd:dayTimeDuration` and `xsd:yearMonthDuration` (`<`, `>`, `=`),

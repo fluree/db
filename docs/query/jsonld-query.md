@@ -1123,8 +1123,8 @@ as an `xsd:dayTimeDuration`:
 ["bind", "?elapsed", "(- ?end ?start)"]
 ```
 
-The result is signed and timezone-normalized, and subtraction is the only
-operator defined over temporal operands. This is an extension beyond the SPARQL
+The result is signed, and subtraction is the only operator defined over two
+temporal operands (shifting by a duration is the other form). This is an extension beyond the SPARQL
 standard; see [Date/Time Arithmetic](sparql.md#datetime-arithmetic) for the full
 semantics and portability caveat, which apply identically here — both query
 surfaces lower to the same expression IR.

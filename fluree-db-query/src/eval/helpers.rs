@@ -555,14 +555,14 @@ fn hash_flake_value(value: &FlakeValue, state: &mut impl Hasher) {
         FlakeValue::Double(v) => v.to_bits().hash(state),
         FlakeValue::BigInt(v) => v.to_string().hash(state),
         FlakeValue::Decimal(v) => v.to_string().hash(state),
-        FlakeValue::DateTime(v) => v.original().hash(state),
-        FlakeValue::Date(v) => v.original().hash(state),
-        FlakeValue::Time(v) => v.original().hash(state),
-        FlakeValue::GYear(v) => v.original().hash(state),
-        FlakeValue::GYearMonth(v) => v.original().hash(state),
-        FlakeValue::GMonth(v) => v.original().hash(state),
-        FlakeValue::GDay(v) => v.original().hash(state),
-        FlakeValue::GMonthDay(v) => v.original().hash(state),
+        FlakeValue::DateTime(v) => v.hash(state),
+        FlakeValue::Date(v) => v.hash(state),
+        FlakeValue::Time(v) => v.hash(state),
+        FlakeValue::GYear(v) => v.hash(state),
+        FlakeValue::GYearMonth(v) => v.hash(state),
+        FlakeValue::GMonth(v) => v.hash(state),
+        FlakeValue::GDay(v) => v.hash(state),
+        FlakeValue::GMonthDay(v) => v.hash(state),
         FlakeValue::YearMonthDuration(v) => v.original().hash(state),
         FlakeValue::DayTimeDuration(v) => v.original().hash(state),
         FlakeValue::Duration(v) => v.original().hash(state),
@@ -747,46 +747,23 @@ fn flake_value_to_datetime(
     let utc = FixedOffset::east_opt(0).unwrap();
 
     match val {
-        FlakeValue::DateTime(dt) => {
-            let offset = dt.tz_offset().unwrap_or(utc);
-            Some(dt.instant().with_timezone(&offset))
-        }
-        FlakeValue::Date(d) => {
-            let offset = d.tz_offset().unwrap_or(utc);
-            let naive = d.date().and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
-        }
+        // Temporal values carry no offset (see fluree_db_core::temporal), so
+        // every component is read in UTC on both storage lanes.
+        FlakeValue::DateTime(dt) => Some(dt.instant().with_timezone(&utc)),
+        FlakeValue::Date(d) => Some(utc.from_utc_datetime(&d.date().and_hms_opt(0, 0, 0)?)),
         FlakeValue::Time(t) => {
-            let offset = t.tz_offset().unwrap_or(utc);
             // A time carries no date; fill it from the shared defaults.
             let date = promotion_default_date()?;
-            let naive = NaiveDateTime::new(date, t.time());
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
+            Some(utc.from_utc_datetime(&NaiveDateTime::new(date, t.time())))
         }
-        FlakeValue::GYear(gy) => {
-            promote_calendar_fragment(gy.tz_offset(), Some(gy.year()), None, None)
-        }
+        FlakeValue::GYear(gy) => promote_calendar_fragment(None, Some(gy.year()), None, None),
         FlakeValue::GYearMonth(gym) => {
-            promote_calendar_fragment(gym.tz_offset(), Some(gym.year()), Some(gym.month()), None)
+            promote_calendar_fragment(None, Some(gym.year()), Some(gym.month()), None)
         }
-        FlakeValue::GMonth(gm) => {
-            promote_calendar_fragment(gm.tz_offset(), None, Some(gm.month()), None)
-        }
-        FlakeValue::GDay(gd) => {
-            promote_calendar_fragment(gd.tz_offset(), None, None, Some(gd.day()))
-        }
+        FlakeValue::GMonth(gm) => promote_calendar_fragment(None, None, Some(gm.month()), None),
+        FlakeValue::GDay(gd) => promote_calendar_fragment(None, None, None, Some(gd.day())),
         FlakeValue::GMonthDay(gmd) => {
-            promote_calendar_fragment(gmd.tz_offset(), None, Some(gmd.month()), Some(gmd.day()))
+            promote_calendar_fragment(None, None, Some(gmd.month()), Some(gmd.day()))
         }
         FlakeValue::String(s) => DateTime::parse_from_rfc3339(s).ok().or_else(|| {
             let with_time = format!("{s}T00:00:00+00:00");

@@ -234,6 +234,11 @@ path = "tests/it_timezone_accessors.rs"
 required-features = ["native"]
 
 [[test]]
+name = "it_temporal_lane_stability"
+path = "tests/it_temporal_lane_stability.rs"
+required-features = ["native"]
+
+[[test]]
 name = "it_temporal_arithmetic"
 path = "tests/it_temporal_arithmetic.rs"
 required-features = ["native"]

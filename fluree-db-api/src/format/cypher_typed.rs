@@ -337,7 +337,7 @@ async fn binding_cell_owned(
 fn date_cell(d: &fluree_db_core::temporal::Date) -> CypherTemporal {
     CypherTemporal::Date {
         days: d.days_since_epoch() as i64,
-        iso: d.original().to_string(),
+        iso: d.canonical(),
     }
 }
 
@@ -346,8 +346,9 @@ fn datetime_cell(dt: &fluree_db_core::temporal::DateTime) -> CypherTemporal {
     CypherTemporal::DateTime {
         epoch_seconds: micros.div_euclid(1_000_000),
         nanos: (micros.rem_euclid(1_000_000) * 1_000) as u32,
-        tz_offset_seconds: dt.tz_offset().map(|o| o.local_minus_utc()),
-        iso: dt.original().to_string(),
+        // Every dateTime is a UTC instant (see fluree_db_core::temporal).
+        tz_offset_seconds: Some(0),
+        iso: dt.canonical(),
     }
 }
 
@@ -356,8 +357,9 @@ fn time_cell(t: &fluree_db_core::temporal::Time) -> CypherTemporal {
     let nanos = (whole_minutes_secs + t.seconds()) * 1_000_000_000.0;
     CypherTemporal::Time {
         nanos_since_midnight: nanos.round() as i64,
-        tz_offset_seconds: t.tz_offset().map(|o| o.local_minus_utc()),
-        iso: t.original().to_string(),
+        // A time carries no offset (see fluree_db_core::temporal).
+        tz_offset_seconds: None,
+        iso: t.canonical(),
     }
 }
 

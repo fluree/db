@@ -303,6 +303,13 @@ impl ArithmeticOp {
             // which every engine that implements it agrees on — the result is an
             // xsd:dayTimeDuration.
             //
+            // dateTime matches XPath exactly: the value is a UTC instant. date
+            // and time carry no offset at all (it is discarded at parse — see
+            // fluree_db_core::temporal), so where XPath would anchor an operand
+            // in its own timezone these subtract calendar dates / wall clocks.
+            // Deviation documented in docs/reference/compatibility.md and
+            // pinned by it_temporal_lane_stability.
+            //
             // The guard matters: only `-` is defined here. `+`, `*`, `/` and `%`
             // on temporal operands fall through to the type error below, as they
             // must — adding two dateTimes is meaningless.
@@ -315,10 +322,7 @@ impl ArithmeticOp {
                 day_time_duration_between(a.epoch_micros(), b.epoch_micros())
             }
             (ComparableValue::Time(a), ComparableValue::Time(b)) if self == ArithmeticOp::Sub => {
-                day_time_duration_between(
-                    a.utc_micros_since_midnight(),
-                    b.utc_micros_since_midnight(),
-                )
+                day_time_duration_between(a.micros_since_midnight(), b.micros_since_midnight())
             }
             // Temporal ± duration, per XPath / SEP-0002. `xsd:time` has no
             // months to carry, so `time ± yearMonthDuration` is not defined and
@@ -1076,26 +1080,39 @@ mod tests {
     }
 
     #[test]
-    fn subtract_dates_accounts_for_timezone_offset() {
-        // Midnight at +05:00 is 19:00Z the previous day, five hours earlier
-        // than midnight UTC — the offset must survive into the difference.
+    fn subtract_dates_reads_the_stored_calendar_date() {
+        // Previously `subtract_dates_accounts_for_timezone_offset`, asserting
+        // PT5H here: midnight at +05:00 is 19:00Z the previous day, so folding
+        // the offset in made the difference five hours. That is what XPath's
+        // op:subtract-dates says, but the offset is not persisted — only
+        // days_since_epoch reaches the index — so PT5H was reachable in novelty
+        // and PT0S once reindexed. Now the calendar date is read on both lanes,
+        // pinned end-to-end by it_temporal_lane_stability.
         assert_eq!(
             duration_of(ArithmeticOp::Sub.apply(date("2026-01-01Z"), date("2026-01-01+05:00"))),
-            "PT5H"
+            "PT0S"
+        );
+        // Offsets ignored, so a real difference in calendar dates is unaffected.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(date("2026-01-03Z"), date("2026-01-01Z"))),
+            "P2D"
         );
     }
 
     #[test]
     fn subtract_times_yields_day_time_duration() {
-        // XPath op:subtract-times examples.
+        // XPath op:subtract-times example, offset-free so it is unaffected.
         assert_eq!(
             duration_of(ArithmeticOp::Sub.apply(time("11:12:00Z"), time("04:00:00Z"))),
             "PT7H12M"
         );
-        // 11:00-05:00 and 21:30+05:30 are both 16:00Z.
+        // This pair used to assert PT0S, on the grounds that 11:00-05:00 and
+        // 21:30+05:30 are both 16:00Z. Only micros_since_midnight is stored, so
+        // that answer held in novelty and became -PT10H30M after a reindex.
+        // Wall clocks are now what is subtracted on both lanes: 11:00 − 21:30.
         assert_eq!(
             duration_of(ArithmeticOp::Sub.apply(time("11:00:00-05:00"), time("21:30:00+05:30"))),
-            "PT0S"
+            "-PT10H30M"
         );
     }
 
@@ -1120,9 +1137,9 @@ mod tests {
     /// Lexical form of a temporal-valued arithmetic result.
     fn lexical_of(v: Result<ComparableValue, ArithmeticError>) -> String {
         match v.expect("temporal arithmetic should succeed") {
-            ComparableValue::DateTime(d) => d.original().to_string(),
-            ComparableValue::Date(d) => d.original().to_string(),
-            ComparableValue::Time(t) => t.original().to_string(),
+            ComparableValue::DateTime(d) => d.canonical(),
+            ComparableValue::Date(d) => d.canonical(),
+            ComparableValue::Time(t) => t.canonical(),
             ComparableValue::TypedLiteral {
                 val: FlakeValue::DayTimeDuration(d),
                 ..
@@ -1193,16 +1210,16 @@ mod tests {
     fn time_plus_day_time_duration_wraps_within_the_day() {
         assert_eq!(
             lexical_of(ArithmeticOp::Add.apply(time("09:30:00Z"), dtd("PT2H"))),
-            "11:30:00Z"
+            "11:30:00"
         );
         // A time has no date to carry into, so it wraps.
         assert_eq!(
             lexical_of(ArithmeticOp::Add.apply(time("23:00:00Z"), dtd("PT2H"))),
-            "01:00:00Z"
+            "01:00:00"
         );
         assert_eq!(
             lexical_of(ArithmeticOp::Sub.apply(time("01:00:00Z"), dtd("PT2H"))),
-            "23:00:00Z"
+            "23:00:00"
         );
     }
 

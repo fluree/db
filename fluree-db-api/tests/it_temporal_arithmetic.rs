@@ -15,13 +15,12 @@
 //! enumerate every relevant operator.
 //!
 //! Neither SPARQL 1.1 nor the 1.2 editor's draft maps these over temporal
-//! operands, so answering a type error was conformant — but every engine that
-//! implements this at all (Stardog, GraphDB, RDFox, Jena, Comunica, Oxigraph
-//! behind its `sep-0002` feature) agrees on the XPath semantics that SEP-0002
-//! writes down. Differences are signed and timezone-normalized; shifts are
-//! calendar-aware, so a `yearMonthDuration` clamps to the end of the month
-//! rather than overflowing it, and a `time` wraps within its day because it has
-//! no date to carry into. That is what is pinned here.
+//! operands, so answering a type error was conformant — but SEP-0002 writes
+//! down the XPath F&O semantics for them, and that is what Fluree follows.
+//! Differences are signed; shifts are calendar-aware, so a `yearMonthDuration`
+//! clamps to the end of the month rather than overflowing it, and a `time`
+//! wraps within its day because it has no date to carry into. That is what is
+//! pinned here.
 //!
 //! Two things beyond the arithmetic are load-bearing:
 //!
@@ -206,7 +205,7 @@ fn cases() -> Vec<Case> {
                 {"@id": "ex:p1", "ex:tod": "?a", "ex:dur": "?u"},
                 ["bind", "?d", "(+ ?a ?u)"]
             ]),
-            expected: Some("01:30:00Z"),
+            expected: Some("01:30:00"),
         },
         Case {
             name: "duration + duration",
