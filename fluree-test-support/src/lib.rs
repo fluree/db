@@ -38,8 +38,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-/// `path` of every `[[test]]` target, relative to the crate root. A target may
-/// omit `path`, in which case Cargo infers `tests/<name>.rs`.
+/// `path` of every `[[test]]` target, relative to the crate root and
+/// normalised so `./tests/x.rs` and `tests/x.rs` are the same target. A target
+/// may omit `path`, in which case Cargo infers `tests/<name>.rs`.
 fn declared_test_paths(manifest: &str) -> HashSet<String> {
     let parsed: toml::Value = manifest.parse().expect("parse Cargo.toml");
     let Some(targets) = parsed.get("test").and_then(toml::Value::as_array) else {
@@ -59,6 +60,7 @@ fn declared_test_paths(manifest: &str) -> HashSet<String> {
                         .map(|name| format!("tests/{name}.rs"))
                 })
         })
+        .map(|path| normalize(Path::new(&path)))
         .collect()
 }
 
@@ -188,8 +190,9 @@ fn normalize(path: &Path) -> String {
 ///
 /// # Panics
 ///
-/// Panics listing every unreachable file, or if the crate's `Cargo.toml` or
-/// `tests/` directory cannot be read.
+/// Panics listing every unreachable file, or if the crate's `Cargo.toml`
+/// cannot be read. A crate with no `tests/` directory yet has nothing to
+/// reach and passes.
 pub fn assert_every_test_file_is_reachable(manifest_dir: &str) {
     let root = Path::new(manifest_dir);
     let tests_dir = root.join("tests");
@@ -200,8 +203,13 @@ pub fn assert_every_test_file_is_reachable(manifest_dir: &str) {
 
     // Only top-level files become test binaries; subdirectories such as
     // tests/support are pulled in by path and are not enumerated here.
+    let entries = match fs::read_dir(&tests_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => panic!("read {}: {e}", tests_dir.display()),
+    };
     let mut orphans: Vec<String> = Vec::new();
-    for entry in fs::read_dir(&tests_dir).expect("read tests/") {
+    for entry in entries {
         let path = entry.expect("tests/ entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
@@ -309,6 +317,24 @@ path = "benches/not_a_test.rs"
     #[test]
     fn a_manifest_with_no_test_targets_declares_nothing() {
         assert!(declared_test_paths("[package]\nname = \"x\"\n").is_empty());
+    }
+
+    #[test]
+    fn a_declared_path_is_normalised() {
+        let declared = declared_test_paths(
+            "[[test]]\nname = \"a\"\npath = \"./tests/a.rs\"\n\
+             [[test]]\nname = \"b\"\npath = \"tests/sub/../b.rs\"\n",
+        );
+        assert_eq!(
+            declared,
+            HashSet::from(["tests/a.rs".to_string(), "tests/b.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_crate_without_a_tests_directory_has_no_orphans() {
+        let krate = Crate::new(&[("Cargo.toml", "[package]\nname = \"x\"\n")]);
+        assert_eq!(krate.failure(), None);
     }
 
     #[test]
