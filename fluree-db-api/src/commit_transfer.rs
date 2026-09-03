@@ -450,7 +450,7 @@ impl Fluree {
 
             // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
             let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
-            let staged_view = stage_commit_flakes(
+            let staged_view = match stage_commit_flakes(
                 evolving_state,
                 &c.commit.flakes,
                 index_config,
@@ -458,7 +458,23 @@ impl Fluree {
                 &routing.graph_sids,
             )
             .await
-            .map_err(PushError::into_api_error)?;
+            {
+                Ok(view) => view,
+                Err(e) => {
+                    // Replication is a write family like any other, and it hits
+                    // the same accumulated-novelty gate. Without this, a
+                    // follower whose novelty is past `reindex_max_bytes`
+                    // rejects every incoming commit and never asks for the
+                    // build that would drain it.
+                    self.request_index_after_novelty_rejection(
+                        base_state.ledger_id(),
+                        current_t,
+                        &e,
+                    )
+                    .await;
+                    return Err(push_error_for_stage(e).into_api_error());
+                }
+            };
 
             // 4.4 SHACL (optional feature).
             //
@@ -971,27 +987,35 @@ async fn build_policy_ctx_for_push(
     .await
 }
 
+/// Map a staging failure onto the push surface.
+///
+/// Split out from `stage_commit_flakes` so the caller sees the typed
+/// `TransactError` first: novelty backpressure has to be recognised by variant
+/// to ask the indexer for a build, and it is indistinguishable once flattened
+/// into `PushError::Invalid(String)`.
+fn push_error_for_stage(e: fluree_db_transact::TransactError) -> PushError {
+    match e {
+        fluree_db_transact::TransactError::PolicyViolation(p) => {
+            PushError::Forbidden(p.to_string())
+        }
+        other => PushError::Invalid(other.to_string()),
+    }
+}
+
 async fn stage_commit_flakes(
     ledger: LedgerState,
     flakes: &[Flake],
     index_config: &IndexConfig,
     policy_ctx: Option<&PolicyContext>,
     graph_sids: &HashMap<GraphId, Sid>,
-) -> std::result::Result<fluree_db_ledger::StagedLedger, PushError> {
+) -> std::result::Result<fluree_db_ledger::StagedLedger, fluree_db_transact::TransactError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
         .with_graph_sids(graph_sids);
     if let Some(policy_ctx) = policy_ctx.filter(|p| !p.wrapper().is_root()) {
         options = options.with_policy(policy_ctx);
     }
-    fluree_db_transact::stage_flakes(ledger, flakes.to_vec(), options)
-        .await
-        .map_err(|e| match e {
-            fluree_db_transact::TransactError::PolicyViolation(p) => {
-                PushError::Forbidden(p.to_string())
-            }
-            other => PushError::Invalid(other.to_string()),
-        })
+    fluree_db_transact::stage_flakes(ledger, flakes.to_vec(), options).await
 }
 
 async fn assert_retractions_exist(

@@ -2313,7 +2313,18 @@ impl crate::Fluree {
     ///
     /// Deliberately not fired for `NoveltyWouldExceed`: that rejection is
     /// already self-healing, because callers halve the batch and retry.
-    async fn request_index_after_novelty_rejection(
+    ///
+    /// Call this from every seam that can surface `NoveltyAtMax` to a client.
+    /// `at_max_novelty` is checked in four places in `fluree-db-transact`
+    /// (`stage`, `stage_graph_mgmt`, `stage_flakes`, and commit entry), which
+    /// reach the api layer through five write families: owned-state
+    /// insert/upsert/transact, the guarded view path (HTTP transact and SPARQL
+    /// UPDATE), credential transact, `stage_turtle_insert` (Turtle/TriG, via
+    /// `TxBuilder`), and commit replication (`commit_transfer`). Missing one
+    /// does not break correctness — the catch-up sweeps still recover the
+    /// ledger — but it costs that family the O(1) recovery and leaves it wedged
+    /// for up to two sweep intervals.
+    pub(crate) async fn request_index_after_novelty_rejection(
         &self,
         ledger_id: &str,
         base_t: i64,
@@ -3479,6 +3490,10 @@ impl crate::Fluree {
 
         let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         let new_t = ledger.t() + 1;
+        // Captured before `ledger` moves into `stage_flakes`, so a max-novelty
+        // rejection can name the ledger and the t the indexer should build to.
+        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        let base_t = ledger.t();
         let txn_id = generate_txn_id();
 
         // Parse Turtle directly to flakes
@@ -3534,7 +3549,14 @@ impl crate::Fluree {
         if let Some(policy) = policy {
             options = options.with_policy(policy);
         }
-        let view = stage_flakes(ledger, flakes, options).await?;
+        let view = match stage_flakes(ledger, flakes, options).await {
+            Ok(view) => view,
+            Err(e) => {
+                self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
+                    .await;
+                return Err(e.into());
+            }
+        };
 
         // Apply SHACL policy to the staged view. Plain Turtle has no named-graph
         // metadata (that's TriG), so we pass `None` for graph_delta/graph_sids —
@@ -4028,6 +4050,76 @@ mod tests {
             pending("wedged:main").await,
             "a max-novelty rejection must ask the indexer for a build; without it \
              the write that is blocked never asks for the thing that unblocks it"
+        );
+    }
+
+    /// The Turtle/TriG write family must ask for a build too.
+    ///
+    /// `stage_turtle_insert` reaches `at_max_novelty` through `stage_flakes`
+    /// rather than through `stage`, so it sits outside the three seams the
+    /// JSON-LD paths use. A deployment ingesting Turtle wedges exactly the same
+    /// way and, without this, gets only the sweeps — recovery in up to two
+    /// sweep intervals instead of immediately.
+    ///
+    /// `reindex_max_bytes: 0` makes the gate fire on any ledger (`novelty.size
+    /// >= 0`), which pins the seam without having to accumulate real novelty.
+    #[tokio::test]
+    async fn a_turtle_insert_rejected_at_max_novelty_asks_for_a_build() {
+        let mut fluree = crate::FlureeBuilder::memory()
+            .build_client()
+            .await
+            .expect("memory client");
+        let ledger = fluree
+            .create_ledger("turtle:main")
+            .await
+            .expect("create ledger");
+
+        // The worker is built for its handle and deliberately never spawned, so
+        // nothing drains the queue underneath the assertion below. Which
+        // nameservice it holds is therefore immaterial.
+        let ns: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
+            std::sync::Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
+        let (_worker, handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
+            fluree.backend().clone(),
+            ns,
+            fluree_db_indexer::IndexerConfig::default(),
+        );
+        fluree.set_indexing_mode(IndexingMode::Background(handle.clone()));
+
+        assert!(
+            !handle.is_pending("turtle:main").await,
+            "nothing has asked for a build yet"
+        );
+
+        let wedged = IndexConfig {
+            reindex_min_bytes: 0,
+            reindex_max_bytes: 0,
+        };
+        // `StageResult` is not `Debug`, so match rather than `expect_err`.
+        let Err(err) = fluree
+            .stage_turtle_insert(
+                ledger,
+                "@prefix ex: <http://example.org/> . ex:a ex:b \"c\" .",
+                Some(&wedged),
+                None,
+                None,
+            )
+            .await
+        else {
+            panic!("a ledger at max novelty must reject the write");
+        };
+        assert!(
+            matches!(
+                err,
+                ApiError::Transact(fluree_db_transact::TransactError::NoveltyAtMax)
+            ),
+            "expected NoveltyAtMax, got {err:?}"
+        );
+
+        assert!(
+            handle.is_pending("turtle:main").await,
+            "a Turtle write rejected at max novelty must ask the indexer for a build; \
+             without it this write family never asks for the thing that unblocks it"
         );
     }
 
