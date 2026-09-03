@@ -452,17 +452,33 @@ async fn drop_unsupported_edges(
     edges: &[(String, String, String)],
 ) -> CliResult<usize> {
     let mut orphaned = Vec::new();
+    let mut unsafe_iris = 0usize;
     for (s, p, o) in edges {
         let support = query_rows(fluree, alias, &graph::relation_support_query(s, p, o)).await?;
-        if support.is_empty() {
+        if !support.is_empty() {
+            continue;
+        }
+        // Gazetteer and model IRIs are operator-supplied, and the update
+        // interpolates them into `<…>`. One that could break out is left in
+        // place and reported, not escaped: it is stored under that exact
+        // IRI, so a rewritten one would retract nothing silently.
+        if [s, p, o].iter().all(|i| graph::sparql_iri_safe(i)) {
             orphaned.push((s.clone(), p.clone(), o.clone()));
+        } else {
+            unsafe_iris += 1;
         }
     }
-    if !orphaned.is_empty() {
+    if unsafe_iris > 0 {
+        eprintln!(
+            "  {} {unsafe_iris} unsupported edge(s) left in place: an IRI is not safe to name in a SPARQL update",
+            "warning:".yellow().bold()
+        );
+    }
+    if let Some(update) = graph::delete_triples_update(&orphaned) {
         fluree
             .graph(alias)
             .transact()
-            .sparql_update(&graph::delete_triples_update(&orphaned))
+            .sparql_update(&update)
             .commit()
             .await?;
     }

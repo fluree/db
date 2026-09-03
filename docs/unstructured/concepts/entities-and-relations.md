@@ -59,6 +59,12 @@ Everything it says is checked before it is written:
 
 Reified means a `doc:Relation` node with `rdf:subject`, `rdf:predicate`, `rdf:object`, the excerpt, the verdict, the chunk and the document. Every relation gets one, so a rejected predicate is evidence you can review and a repaired one shows what was repaired. `--relations reified` stops there and writes no edges at all; `--relations off` skips relations.
 
+### Direct edges are claims, with evidence
+
+Read a `doc:` ledger's direct edges as *what a document stated*, not as what is true. The gate above decides which predicates may be written, never which statements are correct, so any document you ingest can attach an admitted-predicate edge to any gazetteer entity it names by label — that is the feature, and it is why a memo naming a person joins to that person's node.
+
+Every edge has a `doc:Relation` beside it carrying the excerpt, the verdict, the chunk and the source document, so the provenance of any claim is one hop away. A consumer that needs assertions rather than claims should read the reified nodes and apply its own trust rule — by source document, by verdict, or by corroboration across documents. `--relations reified` writes the evidence without the edges, which is the right mode when the corpus is not trusted.
+
 ## Re-runs
 
 The document node records a fingerprint of the ontology, the gazetteer sources, the language model, the guidance and the relation mode. A document is unchanged only when that fingerprint is too, so editing the ontology re-extracts and editing nothing skips.

@@ -206,13 +206,34 @@ pub fn relation_support_query(subject: &str, predicate: &str, object: &str) -> V
     })
 }
 
+/// Whether an IRI can be written inside `<…>` in a SPARQL update without
+/// escaping — the RFC 3987 IRIREF exclusions.
+///
+/// Minted IRIs are hex and document IRIs are percent-encoded, but gazetteer
+/// and model IRIs come from operator-supplied files (`--entities`,
+/// `--model`). One carrying `>` would close the brackets and splice extra
+/// triples into a `DELETE DATA` on the target ledger.
+pub fn sparql_iri_safe(iri: &str) -> bool {
+    !iri.is_empty()
+        && !iri.chars().any(|c| {
+            c <= '\u{20}' || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+        })
+}
+
 /// One update retracting every edge given, all full IRIs.
-pub fn delete_triples_update(triples: &[(String, String, String)]) -> String {
+///
+/// A triple naming an unsafe IRI is skipped rather than escaped: the IRI is
+/// already stored that way, so rewriting it would delete nothing and hide
+/// that it happened. `None` when nothing is left to retract. Callers should
+/// filter with [`sparql_iri_safe`] first so they can report what they
+/// skipped; this is the backstop.
+pub fn delete_triples_update(triples: &[(String, String, String)]) -> Option<String> {
     let body: Vec<String> = triples
         .iter()
+        .filter(|(s, p, o)| sparql_iri_safe(s) && sparql_iri_safe(p) && sparql_iri_safe(o))
         .map(|(s, p, o)| format!("<{s}> <{p}> <{o}> ."))
         .collect();
-    format!("DELETE DATA {{ {} }}", body.join(" "))
+    (!body.is_empty()).then(|| format!("DELETE DATA {{ {} }}", body.join(" ")))
 }
 
 #[cfg(test)]
@@ -253,5 +274,46 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["e0", "d", "c0", "m0"]);
         assert_eq!(tx["@context"]["doc"], vocab::DOC_NS);
+    }
+
+    #[test]
+    fn delete_triples_update_refuses_an_iri_that_escapes_its_brackets() {
+        let safe = (
+            "urn:fluree:doc:a".to_string(),
+            "https://ex.org/knows".to_string(),
+            "urn:fluree:doc:b".to_string(),
+        );
+        let update = delete_triples_update(std::slice::from_ref(&safe)).expect("one safe triple");
+        assert!(update.contains("<urn:fluree:doc:a> <https://ex.org/knows> <urn:fluree:doc:b> ."));
+
+        // An operator-supplied gazetteer IRI closing the bracket would
+        // otherwise splice a second triple into the DELETE DATA.
+        let injected = (
+            "https://ex.org/x> <https://ex.org/p> <https://ex.org/o> . <urn:victim".to_string(),
+            "https://ex.org/knows".to_string(),
+            "urn:fluree:doc:b".to_string(),
+        );
+        assert!(!sparql_iri_safe(&injected.0));
+        assert_eq!(delete_triples_update(std::slice::from_ref(&injected)), None);
+
+        // A safe triple alongside an unsafe one still retracts.
+        let update = delete_triples_update(&[injected, safe]).expect("the safe triple survives");
+        assert!(!update.contains("urn:victim"));
+        assert_eq!(
+            update.matches(" .").count(),
+            1,
+            "exactly one triple: {update}"
+        );
+    }
+
+    #[test]
+    fn sparql_iri_safe_rejects_the_iriref_exclusions() {
+        assert!(sparql_iri_safe("https://ex.org/a_b-c~1"));
+        assert!(sparql_iri_safe("urn:fluree:doc:folder/file.pdf/chunk/0"));
+        for bad in [
+            "", "a b", "a>b", "a<b", "a\"b", "a{b", "a}b", "a|b", "a^b", "a`b", "a\\b", "a\nb",
+        ] {
+            assert!(!sparql_iri_safe(bad), "should reject {bad:?}");
+        }
     }
 }
