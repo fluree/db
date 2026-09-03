@@ -14,7 +14,7 @@ use crate::types::{
     TargetMode, WriteFlakeInfo,
 };
 use crate::Result;
-use fluree_db_core::{FlakeValue, Sid, Tracker};
+use fluree_db_core::{FlakeValue, GraphId, Sid, Tracker};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -56,6 +56,10 @@ impl<'a> FlakeEvalParams<'a> {
     }
 }
 
+/// Shared (graph, subject) -> classes cache for runtime class-membership
+/// checks. See the `class_cache` field docs for why the graph is in the key.
+type ClassCache = Arc<RwLock<std::collections::HashMap<(GraphId, Sid), Vec<Sid>>>>;
+
 /// Policy context for evaluation
 ///
 /// Holds the policy wrapper, grounded identity, and class cache.
@@ -66,8 +70,13 @@ pub struct PolicyContext {
     pub wrapper: PolicyWrapper,
     /// The grounded identity (always has a value, even if random)
     pub identity: Sid,
-    /// Cache of subject -> classes for runtime class membership checks
-    class_cache: Arc<RwLock<std::collections::HashMap<Sid, Vec<Sid>>>>,
+    /// Cache of (graph, subject) -> classes for runtime class membership checks.
+    ///
+    /// Keyed on the graph as well as the subject: the same subject IRI can carry
+    /// different `rdf:type` values in different named graphs, and an `f:onClass`
+    /// decision made against another graph's classes is simply wrong. Keying on
+    /// `Sid` alone made the result depend on which graph populated the entry first.
+    class_cache: ClassCache,
 }
 
 impl PolicyContext {
@@ -908,19 +917,19 @@ impl PolicyContext {
         Ok((false, evaluated))
     }
 
-    /// Cache subject classes for repeated lookups
-    pub fn cache_subject_classes(&self, subject: Sid, classes: Vec<Sid>) {
+    /// Cache subject classes for repeated lookups, within one graph.
+    pub fn cache_subject_classes(&self, g_id: GraphId, subject: Sid, classes: Vec<Sid>) {
         if let Ok(mut cache) = self.class_cache.write() {
-            cache.insert(subject, classes);
+            cache.insert((g_id, subject), classes);
         }
     }
 
-    /// Get cached subject classes
-    pub fn get_cached_subject_classes(&self, subject: &Sid) -> Option<Vec<Sid>> {
+    /// Get cached subject classes for a subject in a specific graph.
+    pub fn get_cached_subject_classes(&self, g_id: GraphId, subject: &Sid) -> Option<Vec<Sid>> {
         self.class_cache
             .read()
             .ok()
-            .and_then(|cache| cache.get(subject).cloned())
+            .and_then(|cache| cache.get(&(g_id, subject.clone())).cloned())
     }
 }
 
@@ -1188,6 +1197,46 @@ mod tests {
             values.get("?$identity"),
             Some(&FlakeValue::Ref(identity.clone()))
         );
+    }
+
+    #[test]
+    fn class_cache_keeps_graphs_apart() {
+        // The same subject IRI can be typed differently in two named graphs —
+        // exactly what `rr:graphMap` routing produces. Before the cache was keyed
+        // on the graph, the second population overwrote the first and every
+        // subsequent `f:onClass` decision for that subject used whichever graph
+        // happened to be cached last.
+        let ctx = PolicyContext::new(PolicyWrapper::root(), None);
+        let subject = make_sid(100, "alice");
+        let employee = make_sid(100, "Employee");
+        let patient = make_sid(100, "Patient");
+
+        ctx.cache_subject_classes(3, subject.clone(), vec![employee.clone()]);
+        ctx.cache_subject_classes(4, subject.clone(), vec![patient.clone()]);
+
+        assert_eq!(
+            ctx.get_cached_subject_classes(3, &subject),
+            Some(vec![employee]),
+            "graph 3's classes were clobbered by the graph 4 population"
+        );
+        assert_eq!(
+            ctx.get_cached_subject_classes(4, &subject),
+            Some(vec![patient]),
+            "graph 4 did not get its own entry"
+        );
+    }
+
+    #[test]
+    fn class_cache_miss_does_not_borrow_another_graphs_classes() {
+        // A graph with no cached entry must miss, not silently inherit another
+        // graph's classes. A miss degrades to "no classes", which is the
+        // conservative direction; borrowing is what produces a wrong decision.
+        let ctx = PolicyContext::new(PolicyWrapper::root(), None);
+        let subject = make_sid(100, "alice");
+
+        ctx.cache_subject_classes(3, subject.clone(), vec![make_sid(100, "Employee")]);
+
+        assert_eq!(ctx.get_cached_subject_classes(7, &subject), None);
     }
 
     #[test]

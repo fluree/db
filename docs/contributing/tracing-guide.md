@@ -367,4 +367,3 @@ See the [OTEL dev harness](../../otel/README.md) for running a local Jaeger inst
 
 - [Performance Investigation](../troubleshooting/performance-tracing.md) -- How operators use deep tracing
 - [Telemetry and Logging](../operations/telemetry.md) -- Configuration reference
-- [Deep Tracing Playbook](../../dev-docs/deep-tracing-replay-playbook.md) -- Comprehensive implementation reference

@@ -110,26 +110,43 @@ impl Fluree {
     /// config graph is empty.
     ///
     /// Note: Reasoning defaults are NOT applied here — they are applied at
-    /// the request boundary via `config_resolver::merge_reasoning()` which
-    /// respects override control and server-verified identity.
+    /// query preparation by [`complete_config_defaults`](Self::complete_config_defaults),
+    /// via `config_resolver::merge_reasoning()`, which applies override
+    /// control against whatever server-verified identity the caller supplies.
     pub(crate) async fn resolve_and_attach_config(&self, view: GraphDb) -> Result<GraphDb> {
         // Config reads are best-effort. If the config graph is unqueryable
         // (e.g., historical snapshot without a range_provider for g_id=2),
         // treat it as "no config" and apply system defaults.
-        let config =
-            match config_resolver::resolve_ledger_config(&view.snapshot, &*view.overlay, view.t)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(error = %e, "Config graph read failed — using system defaults");
-                    return Ok(view);
-                }
-            };
+        //
+        // Resolved through the same marker-keyed cache the write path uses:
+        // query preparation completes config defaults on every view that
+        // arrives without them, which for the ledger-scoped server routes is
+        // every request, and a configured ledger would otherwise pay the full
+        // config-graph read each time. The cache serves a value only on an
+        // exact `config_write_t` match at head, so a stale read is not
+        // possible; a miss costs the resolve this used to do unconditionally.
+        // `view.novelty()` is passed explicitly because a read view's overlay
+        // may be a composed reasoning overlay rather than a bare `Novelty`, in
+        // which case the resolver's own downcast would find no marker and
+        // silently stop caching.
+        let config = match crate::policy_view::resolve_ledger_config_cached(
+            self,
+            &view.snapshot,
+            &*view.overlay,
+            view.novelty().map(|n| &**n),
+            view.t,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "Config graph read failed — using system defaults");
+                return Ok(view);
+            }
+        };
 
-        let config = match config {
-            Some(c) => Arc::new(c),
-            None => return Ok(view),
+        let Some(config) = config else {
+            return Ok(view);
         };
 
         // Resolve effective config for this view's graph
@@ -225,7 +242,7 @@ impl Fluree {
                     .get(&index_cid)
                     .await
                     .map_err(|e| ApiError::internal(format!("read index root: {e}")))?;
-                let cache_dir = std::env::temp_dir().join("fluree-cache");
+                let cache_dir = crate::ledger_manager::temp_cache_dir("fluree-cache");
                 let mut store = BinaryIndexStore::load_from_root_bytes(
                     cs,
                     &bytes,
@@ -360,7 +377,7 @@ impl Fluree {
                     let bytes = cs.get(index_cid).await.map_err(|e| {
                         ApiError::internal(format!("failed to read index root {index_cid}: {e}"))
                     })?;
-                    let cache_dir = std::env::temp_dir().join("fluree-cache");
+                    let cache_dir = crate::ledger_manager::temp_cache_dir("fluree-cache");
                     let mut store = BinaryIndexStore::load_from_root_bytes(
                         cs,
                         &bytes,
@@ -933,6 +950,14 @@ impl Fluree {
         let budget = config_resolver::config_reasoning_budget(resolved, server_identity);
 
         let view = match config_resolver::merge_reasoning(resolved, server_identity) {
+            // Config supplies *defaults*, so it must not overwrite reasoning
+            // the caller attached to the view. `with_reasoning_precedence`
+            // replaces `reasoning` outright, and `effective_reasoning`
+            // arbitrates only between the wrapper and the query's own modes,
+            // so a wrapper discarded here cannot be recovered downstream --
+            // not even one set with `Force`. The budget below still applies:
+            // a ledger's materialization cap governs whichever modes win.
+            Some(_) if view.reasoning().is_some() => view,
             Some((mode_strings, precedence)) => {
                 let modes = ReasoningModes::from_mode_strings(&mode_strings);
                 // Always wrap if modes has enabled flags or explicit_none=true
@@ -960,6 +985,42 @@ impl Fluree {
     pub fn apply_config_defaults(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
         let view = self.apply_config_reasoning(view, server_identity);
         self.apply_config_datalog(view, server_identity)
+    }
+
+    /// Return `view` with its ledger's config-graph defaults in force,
+    /// resolving the config graph first when the view doesn't carry it yet.
+    ///
+    /// Views reach query preparation in two states. One built through
+    /// [`db()`](Self::db) carries a resolved config; one built straight from a
+    /// `LedgerState` via `GraphDb::from_ledger_state` — the sync constructor
+    /// the ledger-scoped server routes use — carries none, because config
+    /// resolution is async. Neither carries the reasoning/datalog wrappers
+    /// derived from that config. Completing both here rather than at each
+    /// view-construction site is what keeps a configured `f:reasoningDefaults`
+    /// from being silently dropped by whichever route built the view
+    /// (fluree/db#1577).
+    ///
+    /// A ledger with an empty config graph re-resolves on every query, but
+    /// `resolve_ledger_config` short-circuits that case before it scans.
+    ///
+    /// `server_identity` is the auth-layer-verified identity that
+    /// `f:overrideControl` gates on. It is not `opts.identity`, which is the
+    /// caller-settable policy evaluation context. This is the one place the
+    /// identity reaches the config merges, so threading it from the request
+    /// boundary is a change to the two callers of
+    /// `apply_reasoning_to_executable`, not to this function. Until that is
+    /// done both pass `None`, under which `f:IdentityRestricted` denies every
+    /// override, the same as `f:OverrideNone`.
+    pub(crate) async fn complete_config_defaults(
+        &self,
+        view: &GraphDb,
+        server_identity: Option<&str>,
+    ) -> Result<GraphDb> {
+        let view = match view.resolved_config() {
+            Some(_) => view.clone(),
+            None => self.resolve_and_attach_config(view.clone()).await?,
+        };
+        Ok(self.apply_config_defaults(view, server_identity))
     }
 
     /// Apply config-graph datalog defaults to a view.
@@ -1019,17 +1080,17 @@ fn resolve_local_rules_source_g_id(
         return Ok(None);
     }
     if src.at_t.is_some() {
-        return Err(ApiError::config(
+        return Err(ApiError::ledger_config(
             "f:rulesSource with f:atT (temporal pinning) is not yet supported",
         ));
     }
     if src.trust_policy.is_some() {
-        return Err(ApiError::config(
+        return Err(ApiError::ledger_config(
             "f:rulesSource with f:trustPolicy is not yet supported",
         ));
     }
     if src.rollback_guard.is_some() {
-        return Err(ApiError::config(
+        return Err(ApiError::ledger_config(
             "f:rulesSource with f:rollbackGuard is not yet supported",
         ));
     }
@@ -1040,7 +1101,7 @@ fn resolve_local_rules_source_g_id(
     };
     match g_id {
         Some(id) => Ok(Some(id)),
-        None => Err(ApiError::config(format!(
+        None => Err(ApiError::ledger_config(format!(
             "f:rulesSource graph '{}' not found in this ledger's graph registry",
             src.graph_selector.as_deref().unwrap_or("<none>"),
         ))),
@@ -1071,6 +1132,90 @@ fn populate_dict_novelty_from_view(
 mod tests {
     use super::*;
     use crate::FlureeBuilder;
+
+    /// A query over a view that arrives without a resolved config resolves it
+    /// through the shared marker-keyed cache, so the next such query on the
+    /// same ledger state hits instead of re-reading the config graph. Lives
+    /// here rather than in `tests/` because `config_cache_get` is crate-private.
+    ///
+    /// Both memo shapes are covered: a resolved config on a configured ledger,
+    /// and the "no config" result on an unconfigured one, which is what lets
+    /// unconfigured ledgers skip the scan after the first miss.
+    #[tokio::test]
+    async fn read_path_populates_the_config_cache() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        assert!(
+            fluree.ledger_manager().is_some(),
+            "harness: the cache lives on the ledger manager, which this builder must attach"
+        );
+
+        // --- configured ledger: memoizes Some(config) ---
+        let configured = "cfgcache/configured:main";
+        let ledger = fluree.create_ledger(configured).await.expect("create");
+        let trig = format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <urn:fluree:{configured}#config> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+                <urn:config:reasoning> f:reasoningModes f:rdfs .
+            }}
+            "
+        );
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&trig)
+            .execute()
+            .await
+            .expect("write config");
+
+        let handle = fluree
+            .ledger_cached(configured)
+            .await
+            .expect("cached handle");
+        let state = fluree.ledger(configured).await.expect("ledger state");
+        let key = state.novelty.config_write_t;
+        assert!(
+            handle.config_cache_get(key).await.is_none(),
+            "nothing has resolved config yet, so the marker must miss"
+        );
+
+        let db = GraphDb::from_ledger_state(&state);
+        let q = serde_json::json!({"select": "?s", "where": {"@id": "?s"}});
+        fluree.query(&db, &q).await.expect("query");
+
+        assert!(
+            matches!(handle.config_cache_get(key).await, Some(Some(_))),
+            "a read over a config-less view must resolve through the cache and memoize the config"
+        );
+
+        // --- unconfigured ledger: memoizes None ---
+        let bare = "cfgcache/bare:main";
+        let ledger = fluree.create_ledger(bare).await.expect("create");
+        fluree
+            .insert(
+                ledger,
+                &serde_json::json!({"@id": "http://example.org/a", "http://example.org/p": "v"}),
+            )
+            .await
+            .expect("insert");
+        let handle = fluree.ledger_cached(bare).await.expect("cached handle");
+        let state = fluree.ledger(bare).await.expect("ledger state");
+        let key = state.novelty.config_write_t;
+        assert!(
+            handle.config_cache_get(key).await.is_none(),
+            "unconfigured: cold"
+        );
+
+        let db = GraphDb::from_ledger_state(&state);
+        fluree.query(&db, &q).await.expect("query");
+
+        assert!(
+            matches!(handle.config_cache_get(key).await, Some(None)),
+            "a read over an unconfigured ledger must memoize the no-config result"
+        );
+    }
 
     #[tokio::test]
     async fn test_view_not_found() {

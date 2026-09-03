@@ -1208,6 +1208,7 @@ mod tests {
             total_commit_size: 0,
             total_asserts: 0,
             total_retracts: 0,
+            saw_list_meta: false,
             db_stats: None,
             db_schema: None,
             sketch_ref: None,

@@ -30,7 +30,7 @@ For SPARQL SELECT, ASK, CONSTRUCT queries.
 ```http
 Content-Type: application/sparql-update
 ```
-For SPARQL UPDATE operations. See [SPARQL Transactions](../transactions/sparql.md) for supported operations.
+For SPARQL UPDATE operations. See [SPARQL UPDATE](../query/sparql.md#sparql-update) for supported operations.
 
 **RDF Formats:**
 ```http
@@ -438,9 +438,9 @@ If a request exceeds size limits:
 **Response:**
 ```json
 {
-  "error": "Request body exceeds maximum size of 10485760 bytes",
+  "error": "request body exceeds the configured limit",
   "status": 413,
-  "@type": "err:http/PayloadTooLarge"
+  "@type": "err:db/PayloadTooLarge"
 }
 ```
 

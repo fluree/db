@@ -59,8 +59,9 @@ pub use fluree_db_core::commit::codec::format::{CommitSignature, ALGO_ED25519};
 pub use fluree_db_core::commit::codec::verify_commit_blob;
 pub use fluree_db_credential::SigningKey;
 pub use runtime_stats::{
-    assemble_fast_stats, assemble_full_stats, resolve_runtime_predicate_id, StatsAssemblyError,
-    StatsLookup,
+    assemble_fast_stats, assemble_fast_stats_with, assemble_full_stats, assemble_full_stats_with,
+    resolve_runtime_predicate_id, stats_merge_site, NoveltyDeltaResolver, NoveltyMerge,
+    StatsAssemblyError, StatsLookup, STATS_MERGE_TARGET,
 };
 pub use stats::current_stats;
 
@@ -496,6 +497,11 @@ pub struct Novelty {
     /// enforcement reuse the previously compiled shapes when nothing
     /// shape-affecting changed.
     pub shacl_epoch: u64,
+    /// Sticky: some flake in this overlay carried an RDF-list position
+    /// (`m.i`). Lets filtered-DELETE staging skip list-meta hydration when
+    /// both the index root and novelty report no list rows. Never cleared —
+    /// a trimmed overlay keeps the bit; the indexed root takes over.
+    pub has_list_meta: bool,
 
     /// Highest `commit_t` at which the ledger config graph (`CONFIG_GRAPH_ID`)
     /// received a write. Monotonic within a novelty window; resets to 0 when
@@ -522,6 +528,11 @@ pub struct Novelty {
 /// `0` uniquely means "empty since construction".
 static NEXT_CONTENT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+#[inline]
+fn flake_has_list_meta(flake: &Flake) -> bool {
+    flake.m.as_ref().is_some_and(|m| m.i.is_some())
+}
+
 impl Novelty {
     /// Create a new empty novelty overlay
     pub fn new(t: i64) -> Self {
@@ -534,6 +545,7 @@ impl Novelty {
             content_version: 0,
             schema_epoch: 0,
             shacl_epoch: 0,
+            has_list_meta: false,
             config_write_t: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
@@ -884,6 +896,7 @@ impl Novelty {
             // SHACL-vocabulary flake invalidates the compiled-shapes cache.
             schema_touched |= fluree_db_core::namespaces::is_rdfs_hierarchy_predicate(&flake.p);
             shacl_touched |= fluree_db_core::namespaces::is_shacl_affecting_flake(&flake);
+            self.has_list_meta |= flake_has_list_meta(&flake);
             per_graph.entry(g_id).or_default().push(flake);
         }
         if schema_touched {
@@ -964,7 +977,7 @@ impl Novelty {
         );
         let _guard = span.enter();
 
-        let started = std::time::Instant::now();
+        let started = fluree_db_core::clock::Instant::now();
 
         // ---- Phase 1: partition incoming flakes by graph ----
         let mut per_graph: HashMap<GraphId, Vec<Flake>> = HashMap::new();
@@ -984,6 +997,7 @@ impl Novelty {
                 if fluree_db_core::namespaces::is_shacl_affecting_flake(&flake) {
                     self.shacl_epoch += 1;
                 }
+                self.has_list_meta |= flake_has_list_meta(&flake);
                 per_graph.entry(g_id).or_default().push(flake);
             }
         }
@@ -1470,6 +1484,15 @@ impl OverlayProvider for Novelty {
             }
             _ => {}
         }
+    }
+
+    fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
+        Some(
+            self.graphs
+                .get(g_id as usize)
+                .and_then(Option::as_ref)
+                .map_or(0, |segs| segs.iter().map(|s| s.flakes.len()).sum()),
+        )
     }
 
     fn overlay_segments(&self, g_id: GraphId) -> Vec<fluree_db_core::OverlaySegmentMeta> {
@@ -1981,6 +2004,72 @@ mod tests {
         assert_eq!(slice.len(), 3);
     }
 
+    /// [`Segment::range`]'s exclusive lower bound is the third site #1711
+    /// reached, and the only one no other test in this crate covers: the
+    /// `partition_point` skips every flake the ordering calls `<= first`, so a
+    /// sibling the comparator wrongly tied with `first` was skipped along with
+    /// it. Here `first` is the `@en` flake at list position 0 and `@fr` at the
+    /// same position is its sibling — pre-fix the seek returns `[]`.
+    ///
+    /// The two in-repo callers that pass `leftmost: false` today both build a
+    /// synthetic bound with `m: None` and `t: i64::MIN`
+    /// (`fluree-db-query`'s `predicate_walk_bounds` / `overlay_walk_bounds`),
+    /// and `t` is compared before the metadata tiebreak — so this hazard is
+    /// **latent** through today's callers rather than live. It is pinned
+    /// anyway because [`Novelty::range_flakes`] is `pub` and takes an
+    /// arbitrary `first`: the seek has to be correct on its own terms, not on
+    /// its callers'.
+    ///
+    /// Deliberately one commit, so `fact_state`'s dedup (updated only *after*
+    /// the accept loop) never sees either flake. That keeps this assertion
+    /// independent of the `FactKey` / `same_identity` route the other #1711
+    /// regression tests exercise — it fails for a different reason than they do.
+    #[test]
+    fn exclusive_seek_past_a_tagged_bound_keeps_its_sibling_tag() {
+        let tagged = |lang: &str| {
+            make_flake_with_meta(
+                1,
+                1,
+                100,
+                1,
+                true,
+                Some(FlakeMeta {
+                    lang: Some(lang.to_string()),
+                    i: Some(0),
+                }),
+            )
+        };
+        let en = tagged("en");
+        let fr = tagged("fr");
+
+        let mut novelty = Novelty::new(0);
+        novelty
+            .apply_commit(vec![en.clone(), fr.clone()], 1, &no_graphs())
+            .unwrap();
+        assert_eq!(
+            novelty.len(),
+            2,
+            "both language tags must land in the segment for the seek to be the thing under test"
+        );
+
+        let ids = novelty.slice_for_range(0, IndexType::Spot, Some(&en), None, false);
+        let langs: Vec<Option<String>> = ids
+            .iter()
+            .map(|&id| {
+                novelty
+                    .get_flake(id)
+                    .m
+                    .as_ref()
+                    .and_then(|m| m.lang.clone())
+            })
+            .collect();
+        assert_eq!(
+            langs,
+            vec![Some("fr".to_string())],
+            "seeking strictly past `@en` at list position 0 must still yield its `@fr` sibling"
+        );
+    }
+
     #[test]
     fn test_clear_up_to() {
         let mut novelty = Novelty::new(0);
@@ -2220,6 +2309,42 @@ mod tests {
         assert!(
             !same_identity(&f_lo, &f_hi),
             "identity must split on differing metadata values"
+        );
+
+        // The three metas above all have `i: None`, so they only exercise the
+        // branch where the ordering consults `lang` unconditionally. Two tags
+        // at the SAME list position are the case that used to collapse:
+        // `FlakeMeta::cmp` compared `lang` only when neither side carried an
+        // index, so `{en, 0}` and `{fr, 0}` were `Equal` without being equal,
+        // and `same_identity` — which tests `cmp_meta(..) == Equal` — folded
+        // two distinct facts into one (#1711). Read the assertions above as
+        // covering this and you would be wrong; this is the case that pins it.
+        let at = |lang: &str, i: i32| FlakeMeta {
+            lang: Some(lang.to_string()),
+            i: Some(i),
+        };
+        let f_en0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("en", 0)));
+        let f_fr0 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("fr", 0)));
+        let f_en1 = make_flake_with_meta(101, 200, 42, 1, true, Some(at("en", 1)));
+        assert_eq!(
+            cmp_meta(&f_en0, &f_fr0),
+            Ordering::Less,
+            "one list position under two tags must order, not tie"
+        );
+        assert!(
+            !same_identity(&f_en0, &f_fr0),
+            "two language tags at the same list position are two facts"
+        );
+        assert_ne!(
+            IndexType::Spot.compare(&f_en0, &f_fr0),
+            Ordering::Equal,
+            "SPOT comparator must disagree when only the language tag differs"
+        );
+        // The index still dominates the tag: position orders first.
+        assert_eq!(
+            cmp_meta(&f_fr0, &f_en1),
+            Ordering::Less,
+            "list index remains the primary discriminator"
         );
 
         // `cmp_object` mixes value and datatype: equal value + differing

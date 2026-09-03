@@ -134,10 +134,47 @@ fn is_disk_full(err: &io::Error) -> bool {
 }
 
 pub fn try_read_cached_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::read(path) {
+    read_result_as_cache_outcome(fs::read(path))
+}
+
+/// `NotFound` — and `Unsupported`, which is what every `std::fs` call returns
+/// on wasm32-unknown-unknown — are cache MISSES that must fall through to the
+/// authoritative CAS fetch, not errors. `fetch_cached_bytes*` apply `?` to
+/// this result before attempting the fetch, so anything mapped to `Err` here
+/// aborts the read outright.
+fn read_result_as_cache_outcome(res: io::Result<Vec<u8>>) -> io::Result<Option<Vec<u8>>> {
+    match res {
         Ok(bytes) => Ok(Some(bytes)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(None)
+        }
         Err(err) => Err(err),
+    }
+}
+
+/// Create the disk-cache directory, treating "this platform has no
+/// filesystem" as success.
+///
+/// Loaders call this once before reading through the cache. On
+/// wasm32-unknown-unknown `create_dir_all` returns `Unsupported`, and failing
+/// there would abort the whole load before a single CAS fetch was attempted —
+/// even though every subsequent cache read already degrades to a miss
+/// ([`try_read_cached_bytes`]) and every cache write is already suppressed
+/// (`available_space` reports 0). Real filesystem failures — permissions, a
+/// full disk, a path that is a file — still surface.
+pub fn ensure_cache_dir(dir: &Path) -> io::Result<()> {
+    create_dir_result_as_cache_outcome(fs::create_dir_all(dir))
+}
+
+fn create_dir_result_as_cache_outcome(res: io::Result<()>) -> io::Result<()> {
+    match res {
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(()),
+        other => other,
     }
 }
 
@@ -205,6 +242,10 @@ impl DiskArtifactCache {
             };
         }
 
+        // No filesystem on wasm32: budget 0 disables cache writes, reads miss.
+        #[cfg(target_arch = "wasm32")]
+        let available: u64 = 0;
+        #[cfg(not(target_arch = "wasm32"))]
         let available = fs2::available_space(&root).unwrap_or_else(|err| {
             tracing::warn!(
                 cache_dir = %root.display(),
@@ -717,6 +758,54 @@ pub async fn fetch_cached_bytes_cid(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// wasm32-unknown-unknown returns `Unsupported` from every `std::fs`
+    /// call. That MUST read as a cache miss (fall through to CAS fetch), not
+    /// an error — `fetch_cached_bytes*` apply `?` to this result before ever
+    /// reaching the fetch.
+    #[test]
+    fn unsupported_read_is_a_miss_not_an_error() {
+        let miss = read_result_as_cache_outcome(Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "operation not supported on this platform",
+        )));
+        assert!(matches!(miss, Ok(None)));
+
+        let not_found =
+            read_result_as_cache_outcome(Err(io::Error::new(io::ErrorKind::NotFound, "enoent")));
+        assert!(matches!(not_found, Ok(None)));
+
+        let hit = read_result_as_cache_outcome(Ok(vec![1, 2, 3]));
+        assert!(matches!(hit, Ok(Some(ref b)) if b == &vec![1, 2, 3]));
+
+        // Real I/O failures (EIO, permissions) still surface as errors.
+        let denied = read_result_as_cache_outcome(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "eacces",
+        )));
+        assert!(denied.is_err());
+    }
+
+    /// The same rule for the loaders' one-time `create_dir_all`: on a
+    /// filesystem-less platform there is simply no cache directory to make,
+    /// and aborting there kills the load before any CAS fetch is attempted.
+    #[test]
+    fn unsupported_create_dir_is_not_an_error() {
+        let unsupported = create_dir_result_as_cache_outcome(Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "operation not supported on this platform",
+        )));
+        assert!(unsupported.is_ok());
+
+        assert!(create_dir_result_as_cache_outcome(Ok(())).is_ok());
+
+        // A real filesystem failure still aborts the load.
+        let denied = create_dir_result_as_cache_outcome(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "eacces",
+        )));
+        assert!(denied.is_err());
+    }
 
     fn temp_cache_dir(label: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<title>Fluree playground (wasm)</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 1.5rem; max-width: 72rem; }
+  textarea { width: 100%; min-height: 9rem; font: 12px/1.35 ui-monospace, monospace; }
+  pre { background: #f5f5f5; padding: .75rem; overflow: auto; max-height: 24rem; }
+  button { margin-right: .5rem; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  .status { color: #555; }
+</style>
+<h1>Fluree playground <small class="status" id="status">starting engine worker…</small></h1>
+<p>In-memory ledger, engine running in a dedicated worker. Served with no COOP/COEP headers.</p>
+
+<div class="row">
+  <div>
+    <h3>Data (JSON-LD)</h3>
+    <textarea id="data">{
+  "@context": {"ex": "http://example.org/ns/"},
+  "@graph": [
+    {"@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 34,
+     "ex:knows": {"@id": "ex:bob"}},
+    {"@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob", "ex:age": 29}
+  ]
+}</textarea>
+    <button id="insert">Insert</button>
+    <button id="upsert">Upsert</button>
+  </div>
+  <div>
+    <h3>Query (SPARQL string or JSON-LD object)</h3>
+    <textarea id="query">PREFIX ex: <http://example.org/ns/>
+SELECT ?name ?age WHERE { ?p a ex:Person ; ex:name ?name ; ex:age ?age } ORDER BY ?name</textarea>
+    <button id="run">Run</button>
+    <label><input type="checkbox" id="clone" /> clone transport (default: transfer)</label>
+  </div>
+</div>
+
+<h3>Output</h3>
+<pre id="out"></pre>
+
+<h3>Result transport measurement</h3>
+<p>Inserts <input id="n" type="number" value="20000" size="7" /> nodes, then runs one SELECT over all of
+them with each transport. Times are main-thread round trips (post → worker → engine → reply → parse).</p>
+<button id="bench">Measure</button>
+<pre id="benchOut"></pre>
+
+<script type="module">
+  import { playground } from "../dist/index.js";
+
+  const $ = (id) => document.getElementById(id);
+  const out = $("out");
+  const status = $("status");
+  const show = (v) => { out.textContent = typeof v === "string" ? v : JSON.stringify(v, null, 2); };
+  const parseInput = (text) => {
+    const t = text.trim();
+    return t.startsWith("{") || t.startsWith("[") ? JSON.parse(t) : t;
+  };
+
+  const pg = await playground();
+  const ledger = await pg.createLedger("demo");
+  status.textContent = `engine ${pg.version} ready — ledger ${ledger.id}`;
+
+  async function guarded(fn) {
+    try { show(await fn()); }
+    catch (e) { show(`${e.name} [${e.code ?? "?"} / ${e.status ?? "?"}]: ${e.message}`); }
+  }
+
+  $("insert").onclick = () => guarded(async () => {
+    const t0 = performance.now();
+    const r = await ledger.insert(parseInput($("data").value));
+    return { receipt: r, ms: Math.round(performance.now() - t0) };
+  });
+  $("upsert").onclick = () => guarded(async () => {
+    const t0 = performance.now();
+    const r = await ledger.upsert(parseInput($("data").value));
+    return { receipt: r, ms: Math.round(performance.now() - t0) };
+  });
+  $("run").onclick = () => guarded(async () => {
+    const t0 = performance.now();
+    const transport = $("clone").checked ? "clone" : "transfer";
+    const r = await ledger.query(parseInput($("query").value), { transport });
+    return { ms: Math.round(performance.now() - t0), transport, result: r };
+  });
+
+  $("bench").onclick = async () => {
+    const n = Number($("n").value) || 1000;
+    const benchOut = $("benchOut");
+    benchOut.textContent = "inserting…";
+    try {
+      const b = await pg.createLedger(`bench-${Date.now()}`);
+      const graph = [];
+      for (let i = 0; i < n; i++) {
+        graph.push({ "@id": `ex:n${i}`, "@type": "ex:Thing", "ex:label": `thing number ${i}`,
+          "ex:seq": i, "ex:note": "lorem ipsum dolor sit amet, consectetur adipiscing elit" });
+      }
+      let t0 = performance.now();
+      await b.insert({ "@context": { ex: "http://example.org/ns/" }, "@graph": graph });
+      const insertMs = Math.round(performance.now() - t0);
+      const q = `PREFIX ex: <http://example.org/ns/>
+        SELECT ?s ?label ?seq ?note WHERE { ?s a ex:Thing ; ex:label ?label ; ex:seq ?seq ; ex:note ?note }`;
+      const lines = [`inserted ${n} nodes in ${insertMs} ms`];
+      // Warm once so the engine-side cost is comparable across transports.
+      await b.query(q);
+      for (const transport of ["transfer", "clone", "transfer", "clone"]) {
+        t0 = performance.now();
+        const r = await b.query(q, { transport });
+        const ms = (performance.now() - t0).toFixed(1);
+        const bytes = new TextEncoder().encode(JSON.stringify(r)).length;
+        lines.push(`${transport.padEnd(8)} ${ms.padStart(8)} ms   rows=${r.results.bindings.length}   ~${(bytes / 1048576).toFixed(2)} MB JSON`);
+        benchOut.textContent = lines.join("\n");
+      }
+    } catch (e) {
+      benchOut.textContent = `${e.name} [${e.code ?? "?"}]: ${e.message}`;
+    }
+  };
+</script>
+</html>

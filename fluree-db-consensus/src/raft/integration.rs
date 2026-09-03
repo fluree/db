@@ -1,0 +1,1151 @@
+//! One-call assembly of a Raft-replicated nameservice node.
+//!
+//! Host-agnostic: nothing here knows about `fluree-db-server`. The
+//! server binary is one consumer; a process embedding the engine
+//! directly is another, and gets the same routers, admin surface, and
+//! channels. See [`super::embedded`] for the step after this one —
+//! attaching a `Fluree` engine and the per-node tasks.
+//!
+//! Gated on the `raft` feature. Bundles the per-node Raft handle, the
+//! shared state-machine handle (for follower-side read paths), and
+//! the [`LeaderForwarder`] that the client-facing router uses to
+//! redirect leader-only requests when this node is a follower.
+//!
+//! [`RaftIntegration::bootstrap`] is the one-call assembler:
+//!
+//! - opens the on-disk Raft storage,
+//! - wires the log + state-machine adapters,
+//! - builds a shared `reqwest::Client` (used by both the inter-node
+//!   RPC factory and the follower-forward middleware so they share a
+//!   single connection pool),
+//! - validates the raft config and calls `Raft::new`,
+//! - returns a clone-cheap [`RaftIntegration`].
+//!
+//! Bootstrap does **not** call `Raft::initialize` — the operator
+//! drives initial cluster formation via
+//! [`RaftAdmin`](crate::raft::admin) on a single node
+//! (typically `POST /cluster/initialize` against the private
+//! listener). Joining an existing cluster is the same routine on the
+//! peer side: bootstrap, then the existing leader's operator hits
+//! `POST /cluster/add-learner` referencing this node.
+
+use crate::raft::{
+    admin as raft_admin,
+    forward::LeaderForwarder,
+    log_adapter::LogAdapter,
+    nameservice::{apply_queue_poison_router, apply_staged_commit_router, RaftNameService},
+    network::{self as raft_network, HttpRaftNetworkFactory, NetworkConfig},
+    runtime,
+    staged_receipt::StagedReceiptMap,
+    state_machine_adapter::{NameServiceObserver, SharedState, StateMachineAdapter},
+    storage::{fs::FsRaftStorage, StorageError},
+    waiter::WaiterMap,
+};
+use crate::{NodeId, Raft, RaftConfig, RaftConfigError, RaftFatal, RaftStorageError, TypeConfig};
+use axum::Router;
+use fluree_db_core::ContentId;
+use fluree_db_nameservice::LedgerEventBus;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use thiserror::Error;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+
+/// Channel pair the state-machine adapter pushes evicted /
+/// admin-cleared envelope CIDs through. The receiver is consumed
+/// once by a per-node release task; on every node, that task owns
+/// the `Fluree` handle and calls `content_store(&ledger_id).release`.
+pub type ReleaseSender = UnboundedSender<(String, ContentId)>;
+pub type ReleaseReceiver = UnboundedReceiver<(String, ContentId)>;
+
+/// Per-node Raft integration. Cheap to clone; everything is `Arc`.
+#[derive(Clone)]
+pub struct RaftIntegration {
+    /// Raft handle. Cloned into the network, admin, and forward
+    /// routers; also used by
+    /// [`QueuedTransactor`](crate::raft::queued_transactor::QueuedTransactor)
+    /// and each per-branch
+    /// [`Worker`](crate::raft::commit_worker::Worker).
+    pub raft: Arc<Raft<TypeConfig>>,
+    /// This node's id. Cached so callers (notably the leader-aware
+    /// indexer watcher) don't have to dip into `raft.metrics()` just
+    /// to ask "is this me?"
+    pub id: NodeId,
+    /// Follower-forward middleware state. Cloned into the
+    /// client-facing router's middleware layer.
+    pub forwarder: Arc<LeaderForwarder<Raft<TypeConfig>>>,
+    /// Shared replicated state-machine handle. Hand off to a
+    /// `RaftNameService` for follower-side read paths so they observe
+    /// committed log state without going through the openraft RPC
+    /// surface.
+    pub shared_state: SharedState,
+    /// In-process broadcast bus the state-machine adapter emits
+    /// [`fluree_db_nameservice::NameServiceEvent`]s on after each
+    /// successful apply.
+    pub event_bus: Arc<LedgerEventBus>,
+    /// Per-process map the state-machine adapter resolves after each
+    /// queue-related apply. Shared with the
+    /// [`QueuedTransactor`](crate::raft::queued_transactor::QueuedTransactor)
+    /// so submission-side registrations meet apply-side resolutions.
+    pub waiter_map: Arc<WaiterMap>,
+    /// Per-process side channel each per-branch
+    /// [`Worker`](crate::raft::commit_worker::Worker)
+    /// stashes typed [`AppliedReceipt`](crate::raft::staged_receipt::AppliedReceipt)
+    /// values into before proposing `ApplyHead`; the adapter takes
+    /// them during waiter resolution so transactors see staged-time
+    /// detail instead of falling back to `Minimal`.
+    pub staged_receipts: Arc<StagedReceiptMap>,
+    /// Inter-node HTTP transport tuning. Held here so
+    /// [`Self::raft_rpc_router`] can apply the per-route body-byte
+    /// caps that match the outbound transport the factory was
+    /// built with — same `NetworkConfig` instance configures both
+    /// sides of every RPC.
+    network_config: NetworkConfig,
+    /// `NameService` adapter over the replicated state machine. Owns
+    /// reads of the shared state, all publish-paths (refs, indexes,
+    /// commits), and the cross-node `apply_staged_commit` forwarding
+    /// for follower workers. Held here so the same handle threads
+    /// through `Fluree`, the worker supervisor, and the inbound
+    /// `apply_staged_commit` HTTP route on `raft_rpc_router`.
+    nameservice: Arc<RaftNameService>,
+    /// One-shot slot holding the [`ReleaseReceiver`] half of the
+    /// adapter's CAS release channel. Server startup
+    /// [`take_release_receiver`](Self::take_release_receiver)s the
+    /// receiver and spawns a per-node task that owns the `Fluree`
+    /// handle and dispatches releases. The slot is wrapped in
+    /// `Arc<Mutex<Option<_>>>` so `RaftIntegration` can stay `Clone`
+    /// without giving up single-consumer semantics on the receiver.
+    release_rx: Arc<Mutex<Option<ReleaseReceiver>>>,
+    /// Late-binding slot for the ledger cache the adapter reports
+    /// commit-head advances into. Built after `bootstrap` returns,
+    /// so server assembly fills this via
+    /// [`attach_ledger_manager`](Self::attach_ledger_manager) once
+    /// `Fluree` exists.
+    ledger_manager: Arc<OnceLock<Arc<fluree_db_api::LedgerManager>>>,
+    /// File-registry adoption inputs, when the embedder configured
+    /// them (see [`RaftBootstrapConfig::adopt_file_registry`]):
+    /// where the predecessor registry lives, and the marker file
+    /// under the raft storage root that records a completed replay.
+    adoption: Option<AdoptionPaths>,
+}
+
+/// Where a configured file-registry adoption reads from and how it
+/// remembers completion. Derived in [`RaftIntegration::bootstrap`].
+#[derive(Clone, Debug)]
+struct AdoptionPaths {
+    /// The store root holding the predecessor `ns@v2` registry.
+    registry_root: PathBuf,
+    /// `<raft storage root>/file-registry-adopted` — written after a
+    /// successful replay. Node-local on purpose: only the node that
+    /// initialized the cluster ever adopts, and a crash between the
+    /// (idempotent, conflict-tolerant) replay and this write is
+    /// healed by simply replaying again on the next boot.
+    marker: PathBuf,
+}
+
+/// Shared HTTP transport: a `reqwest::Client` paired with the
+/// `NetworkConfig` it was built from.
+pub struct HttpTransport {
+    /// Carries the no-redirects guarantee the SSRF guard relies on;
+    /// build it through `raft_network::build_client`.
+    pub client: raft_network::RaftHttpClient,
+    pub config: NetworkConfig,
+}
+
+/// The in-process channels the state-machine adapter writes to on
+/// apply: a `NameServiceEvent` broadcast bus, a per-`queue_id`
+/// waiter map, and the per-leader staged-receipt stash.
+pub struct AdapterChannels {
+    pub event_bus: Arc<LedgerEventBus>,
+    pub waiter_map: Arc<WaiterMap>,
+    pub staged_receipts: Arc<StagedReceiptMap>,
+    /// The adapter's late-binding ledger-cache cell (see
+    /// [`RaftIntegration::attach_ledger_manager`]).
+    pub ledger_manager: Arc<OnceLock<Arc<fluree_db_api::LedgerManager>>>,
+}
+
+impl RaftIntegration {
+    /// Build the integration from a fully-constructed Raft handle.
+    /// The HTTP client is shared with the leader-forward middleware
+    /// so a single connection pool serves both inter-node RPC and
+    /// follower→leader request relays.
+    pub fn new(
+        raft: Arc<Raft<TypeConfig>>,
+        id: NodeId,
+        shared_state: SharedState,
+        channels: AdapterChannels,
+        transport: HttpTransport,
+        release_rx: ReleaseReceiver,
+    ) -> Self {
+        let AdapterChannels {
+            event_bus,
+            waiter_map,
+            staged_receipts,
+            ledger_manager,
+        } = channels;
+        let HttpTransport {
+            client: http_client,
+            config: network_config,
+        } = transport;
+        let forwarder = Arc::new(
+            LeaderForwarder::new(Arc::clone(&raft), id, http_client.clone())
+                .with_max_body_bytes(network_config.transport.forward_max_body_bytes),
+        );
+        let nameservice = Arc::new(
+            RaftNameService::new(shared_state.clone(), Arc::clone(&raft))
+                .with_staged_receipts(Arc::clone(&staged_receipts))
+                .with_forwarding(id, http_client, network_config.cross_node_propose_timeout),
+        );
+        Self {
+            raft,
+            id,
+            forwarder,
+            shared_state,
+            event_bus,
+            waiter_map,
+            staged_receipts,
+            network_config,
+            nameservice,
+            release_rx: Arc::new(Mutex::new(Some(release_rx))),
+            ledger_manager,
+            adoption: None,
+        }
+    }
+
+    /// Fill the state-machine adapter's late-binding ledger-cache
+    /// slot. Called by server assembly once `Fluree` exists; every
+    /// apply and snapshot install from then on reports commit-head
+    /// advances into the cache's watermark synchronously. A second
+    /// call is ignored with a warning — the first stays attached.
+    pub fn attach_ledger_manager(&self, manager: Arc<fluree_db_api::LedgerManager>) {
+        if self.ledger_manager.set(manager).is_err() {
+            tracing::warn!("ledger manager already attached; keeping the first");
+        }
+    }
+
+    /// Hand the release receiver to the caller. Returns `None` on
+    /// subsequent calls — single-consumer semantics. Server startup
+    /// calls this once and spawns a task that pulls releases off it.
+    pub async fn take_release_receiver(&self) -> Option<ReleaseReceiver> {
+        self.release_rx.lock().await.take()
+    }
+
+    /// One-call cluster bootstrap: open storage, wire adapters, build
+    /// the shared HTTP client, validate the raft config, and call
+    /// `Raft::new`. Returns a ready integration.
+    ///
+    /// The returned node is *not* part of any cluster yet. The
+    /// operator then calls either:
+    ///
+    /// - `POST /cluster/initialize` (this node, once, for a fresh
+    ///   cluster) — bootstraps single-node membership; the node
+    ///   auto-elects itself leader.
+    /// - `POST /cluster/add-learner` (the existing leader, naming
+    ///   this node) — joins an existing cluster.
+    pub async fn bootstrap(config: RaftBootstrapConfig) -> Result<Self, RaftBootstrapError> {
+        let adoption = config
+            .adopt_file_registry
+            .as_ref()
+            .map(|root| AdoptionPaths {
+                registry_root: root.clone(),
+                marker: config.storage_path.join("file-registry-adopted"),
+            });
+        let storage = Arc::new(FsRaftStorage::open(config.storage_path).await?);
+
+        let event_bus = Arc::new(LedgerEventBus::new(config.event_bus_capacity));
+        let waiter_map = Arc::new(WaiterMap::new());
+        let staged_receipts = Arc::new(StagedReceiptMap::new());
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        let log = LogAdapter::new(Arc::clone(&storage));
+        // `open` restores state from storage's current snapshot if one
+        // exists; required on restart so openraft's log replay starts
+        // from `last_applied + 1` instead of index 0 (the latter
+        // would silently lose committed state after a snapshot +
+        // log purge under the default `SnapshotPolicy`).
+        let observer = NameServiceObserver::new()
+            .with_event_bus(Arc::clone(&event_bus))
+            .with_waiter_map(Arc::clone(&waiter_map))
+            .with_staged_receipts(Arc::clone(&staged_receipts))
+            .with_release_sender(release_tx);
+        // Taken before the observer is handed off; server assembly
+        // fills it once `Fluree` exists.
+        let ledger_manager = observer.ledger_manager_cell();
+        let sm = StateMachineAdapter::open(Arc::clone(&storage), observer).await?;
+        let shared_state = sm.shared_state();
+
+        let raft_cfg = Arc::new(config.raft_config.validate()?);
+
+        // Liveness invariant: a candidate must outlast its own vote RPCs
+        // before re-electing, or a failover livelocks. Checked here
+        // because this is the one place holding both configs — an
+        // override of *either* that breaks the invariant is caught even
+        // when `runtime::default_raft_config` wasn't used to build it.
+        runtime::check_election_timeout(&raft_cfg, &config.network_config.transport);
+
+        let http_client = raft_network::build_client(&config.network_config.http_client)?;
+        let network_config = config.network_config.clone();
+        let factory = HttpRaftNetworkFactory::with_client(
+            http_client.clone(),
+            config.network_config.transport,
+        );
+
+        let raft = Raft::new(config.node_id, raft_cfg, factory, log, sm).await?;
+
+        let mut integration = Self::new(
+            Arc::new(raft),
+            config.node_id,
+            shared_state,
+            AdapterChannels {
+                event_bus,
+                waiter_map,
+                staged_receipts,
+                ledger_manager,
+            },
+            HttpTransport {
+                client: http_client,
+                config: network_config,
+            },
+            release_rx,
+        );
+        integration.adoption = adoption;
+        Ok(integration)
+    }
+
+    /// Inter-node Raft RPC router. Mount under `/raft` on the private
+    /// listener. Carries no auth — peers authenticate to one another
+    /// via network trust (VPC ACL); a compromised peer is already
+    /// inside that boundary. [`Self::cluster_admin_router`] is the
+    /// layer that gates membership changes against operator
+    /// credentials.
+    ///
+    /// Includes both the openraft RPCs (append-entries, vote,
+    /// install-snapshot) and the cross-node `apply_staged_commit`
+    /// and `apply_queue_poison` endpoints follower-owned workers
+    /// POST to.
+    pub fn raft_rpc_router(&self) -> Router {
+        raft_network::router(Arc::clone(&self.raft), &self.network_config.transport)
+            .merge(apply_staged_commit_router(
+                Arc::clone(&self.nameservice),
+                &self.network_config,
+            ))
+            .merge(apply_queue_poison_router(
+                Arc::clone(&self.nameservice),
+                &self.network_config,
+            ))
+    }
+
+    /// Borrow the shared [`RaftNameService`] handle. The integration
+    /// builds one in `new` and threads the same handle through the
+    /// HTTP routes, `Fluree`, and the worker supervisor so reads,
+    /// publishes, and the cross-node propose all observe one map of
+    /// staged receipts.
+    pub fn nameservice(&self) -> Arc<RaftNameService> {
+        Arc::clone(&self.nameservice)
+    }
+
+    /// Replay a predecessor file-nameservice registry into the
+    /// replicated one — the transition boot for a deployment moving
+    /// from the single-node file posture into raft.
+    ///
+    /// Call on the node that performed `Raft::initialize`, once a
+    /// leader is known (a fresh single voter elects itself within the
+    /// election timeout). Joining nodes must NOT call this — they
+    /// receive the registry by replication like any other log state.
+    ///
+    /// Semantics:
+    /// - No-op unless the bootstrap config carried
+    ///   [`adopt_file_registry`](RaftBootstrapConfig::adopt_file_registry),
+    ///   and at most once per raft storage root: a marker file written
+    ///   after a successful replay makes every later call `Ok(0)`.
+    ///   The registry is deliberately replayed ONLY into the machine
+    ///   this node just initialized — after that, the file registry
+    ///   beside the store goes stale on every raft write and must
+    ///   never be consulted again (embedders should guard their
+    ///   non-raft boot path accordingly). A configured root with no
+    ///   `ns@v2` subtree answers `Ok(0)` WITHOUT the marker, so a
+    ///   mistyped path stays correctable.
+    /// - Each non-retracted record replays as ordinary proposals:
+    ///   ledger init, commit head, index head, and the config / status
+    ///   values VERBATIM. Retracted records are skipped — a tombstone
+    ///   carries no live state.
+    /// - Crash-safe by idempotence, not atomicity: a crash between the
+    ///   replay and the marker write re-runs the replay next boot, and
+    ///   every step tolerates its own prior success (`AlreadyExists`
+    ///   on init; a head CAS conflict where the machine already holds
+    ///   a value at least as new; a config/status watermark already at
+    ///   or above the registry's).
+    /// - Any step that cannot be READ or replayed aborts the whole
+    ///   adoption before the marker is written, so the operator can
+    ///   repair the record and re-run. Nothing is carried in partially
+    ///   and silently.
+    ///
+    /// Returns how many ledger records were carried.
+    pub async fn adopt_file_registry(&self) -> Result<usize, FileRegistryAdoptionError> {
+        use fluree_db_nameservice::{
+            CasResult, ConfigCasResult, ConfigLookup, ConfigPublisher, LedgerLifecycle,
+            NameServiceError, NameServiceLookup, RefKind, RefLookup, RefPublisher, RefValue,
+            StatusCasResult, StatusLookup, StatusPublisher,
+        };
+
+        let Some(adoption) = &self.adoption else {
+            return Ok(0);
+        };
+        if adoption.marker.is_file() {
+            return Ok(0);
+        }
+        let registry = adoption.registry_root.join("ns@v2");
+        let finish = |adopted: usize| -> Result<usize, FileRegistryAdoptionError> {
+            std::fs::write(
+                &adoption.marker,
+                format!("adopted {adopted} ledger records\n"),
+            )
+            .map_err(FileRegistryAdoptionError::Marker)?;
+            Ok(adopted)
+        };
+        // Nothing to carry — and deliberately NO marker. A mistyped
+        // registry root would otherwise burn the one-shot adoption
+        // before the corrected config ever got a turn, exactly like
+        // the unconfigured case above, which also answers zero
+        // without writing one.
+        if !registry.is_dir() {
+            return Ok(0);
+        }
+        let file_ns = fluree_db_nameservice::file::FileNameService::new(&adoption.registry_root);
+        let records = file_ns
+            .all_records()
+            .await
+            .map_err(FileRegistryAdoptionError::Registry)?;
+
+        let publisher = self.nameservice();
+        let mut adopted = 0usize;
+        for record in records {
+            if record.retracted {
+                continue;
+            }
+            let ledger_id = &record.ledger_id;
+            match publisher.init(ledger_id).await {
+                Ok(()) | Err(NameServiceError::LedgerAlreadyExists(_)) => {}
+                Err(e) => return Err(FileRegistryAdoptionError::replay(ledger_id, "init", e)),
+            }
+            if record.commit_head_id.is_some() {
+                let head = RefValue {
+                    id: record.commit_head_id.clone(),
+                    t: record.commit_t,
+                };
+                match publisher.fast_forward_commit(ledger_id, &head, 3).await {
+                    Ok(CasResult::Updated) => {}
+                    // A retried replay finds its own prior write; a
+                    // machine already AHEAD of the file registry means
+                    // raft writes happened, which the marker should
+                    // have prevented — still nothing to carry.
+                    Ok(CasResult::Conflict { actual })
+                        if actual.as_ref().is_some_and(|a| a.t >= record.commit_t) => {}
+                    Ok(CasResult::Conflict { actual }) => {
+                        return Err(FileRegistryAdoptionError::Diverged {
+                            ledger_id: ledger_id.clone(),
+                            kind: "commit head",
+                            detail: format!(
+                                "machine holds {actual:?}, registry carries t={}",
+                                record.commit_t
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(FileRegistryAdoptionError::replay(
+                            ledger_id,
+                            "commit head",
+                            e,
+                        ))
+                    }
+                }
+            }
+            if record.index_head_id.is_some() {
+                let idx = RefValue {
+                    id: record.index_head_id.clone(),
+                    t: record.index_t,
+                };
+                // Read-then-CAS: a freshly initialized ledger may hold
+                // an implicit empty index ref, and a retried replay
+                // holds the previous attempt's value — start from
+                // whatever is actually there.
+                let current = publisher
+                    .get_ref(ledger_id, RefKind::IndexHead)
+                    .await
+                    .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "index head", e))?;
+                if !current.as_ref().is_some_and(|c| c.t >= record.index_t) {
+                    match publisher
+                        .compare_and_set_ref(ledger_id, RefKind::IndexHead, current.as_ref(), &idx)
+                        .await
+                    {
+                        Ok(CasResult::Updated) => {}
+                        Ok(CasResult::Conflict { actual }) => {
+                            return Err(FileRegistryAdoptionError::Diverged {
+                                ledger_id: ledger_id.clone(),
+                                kind: "index head",
+                                detail: format!(
+                                    "machine holds {actual:?}, registry carries t={}",
+                                    record.index_t
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            return Err(FileRegistryAdoptionError::replay(
+                                ledger_id,
+                                "index head",
+                                e,
+                            ))
+                        }
+                    }
+                }
+            }
+            // Config and status replay read-then-CAS, exactly like the
+            // index head above, for two reasons. An unreadable record
+            // must refuse loudly rather than carry the ledger in with
+            // its config silently absent — adoption is once-only, so a
+            // swallowed read error loses that config permanently and
+            // tells nobody. And the machine reads an unset value as
+            // the `unborn` / `initial` watermark rather than as
+            // missing, so `apply_versioned_push` demands `expected`
+            // match that watermark exactly: pushing `None` conflicts
+            // every time and would carry nothing at all.
+            let config = file_ns
+                .get_config(ledger_id)
+                .await
+                .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "config", e))?;
+            if let Some(config) = config {
+                let current = publisher
+                    .get_config(ledger_id)
+                    .await
+                    .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "config", e))?;
+                // A retried replay finds its own prior write at the
+                // same or a higher watermark; so does a registry whose
+                // config never moved off `unborn`. Nothing to carry.
+                if !current.as_ref().is_some_and(|c| c.v >= config.v) {
+                    match publisher
+                        .push_config(ledger_id, current.as_ref(), &config)
+                        .await
+                    {
+                        Ok(ConfigCasResult::Updated) => {}
+                        Ok(ConfigCasResult::Conflict { actual }) => {
+                            return Err(FileRegistryAdoptionError::Diverged {
+                                ledger_id: ledger_id.clone(),
+                                kind: "config",
+                                detail: format!(
+                                    "machine holds {actual:?}, registry carries v={}",
+                                    config.v
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            return Err(FileRegistryAdoptionError::replay(ledger_id, "config", e))
+                        }
+                    }
+                }
+            }
+            let status = file_ns
+                .get_status(ledger_id)
+                .await
+                .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "status", e))?;
+            if let Some(status) = status {
+                let current = publisher
+                    .get_status(ledger_id)
+                    .await
+                    .map_err(|e| FileRegistryAdoptionError::replay(ledger_id, "status", e))?;
+                if !current.as_ref().is_some_and(|c| c.v >= status.v) {
+                    match publisher
+                        .push_status(ledger_id, current.as_ref(), &status)
+                        .await
+                    {
+                        Ok(StatusCasResult::Updated) => {}
+                        Ok(StatusCasResult::Conflict { actual }) => {
+                            return Err(FileRegistryAdoptionError::Diverged {
+                                ledger_id: ledger_id.clone(),
+                                kind: "status",
+                                detail: format!(
+                                    "machine holds {actual:?}, registry carries v={}",
+                                    status.v
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            return Err(FileRegistryAdoptionError::replay(ledger_id, "status", e))
+                        }
+                    }
+                }
+            }
+            tracing::info!(ledger = %ledger_id, t = record.commit_t, index_t = record.index_t,
+                "file registry record adopted into the replicated nameservice");
+            adopted += 1;
+        }
+        finish(adopted)
+    }
+
+    /// Cluster admin router — bootstrap and membership-change
+    /// endpoints. Mount under `/cluster` on the private listener and
+    /// wrap with operator-credential middleware before serving. The
+    /// router itself carries no auth; layering happens at the mount
+    /// site so callers can pick their own mechanism (the in-tree
+    /// server applies `routes::admin_auth::require_admin_token`).
+    pub fn cluster_admin_router(&self) -> Router {
+        raft_admin::router(Arc::clone(&self.raft))
+    }
+
+    /// Combined unauthenticated private-listener router — `/raft/*`
+    /// for inter-node RPC and `/cluster/*` for admin. Convenience for
+    /// VPC-trusted setups, embedders that supply their own auth, and
+    /// integration tests; the in-tree server bypasses this method to
+    /// layer admin auth on the `/cluster` subtree before serving.
+    pub fn private_router(&self) -> Router {
+        Router::new()
+            .nest("/raft", self.raft_rpc_router())
+            .nest("/cluster", self.cluster_admin_router())
+    }
+}
+
+// ============================================================================
+// Bootstrap config + error
+// ============================================================================
+
+/// Inputs to [`RaftIntegration::bootstrap`].
+#[derive(Clone, Debug)]
+pub struct RaftBootstrapConfig {
+    /// This node's id in the cluster. Must be unique and stable
+    /// across restarts — the openraft log and snapshots are keyed by
+    /// it.
+    pub node_id: NodeId,
+    /// Root directory for the Raft log, vote, and snapshots. Created
+    /// if it doesn't exist; subdirectories carry the constituent
+    /// stores. Keep this on durable storage (not tmpfs) — losing the
+    /// log loses commits.
+    pub storage_path: PathBuf,
+    /// openraft tuning (election timeouts, heartbeat interval,
+    /// cluster name, snapshot policy). Defaults are sane for LAN
+    /// deployments; tighten election timeouts for low-latency
+    /// datacenter links or loosen them for high-jitter networks.
+    pub raft_config: RaftConfig,
+    /// Inter-node HTTP transport tuning (per-request and connect
+    /// timeouts). Defaults: 500ms RPC, 30s snapshot, 250ms connect.
+    pub network_config: NetworkConfig,
+    /// Buffer size of the `LedgerEventBus`. Subscribers that fall
+    /// this far behind receive `RecvError::Lagged` and fall back to
+    /// a catch-up sweep.
+    pub event_bus_capacity: usize,
+    /// Store root that MAY hold a predecessor file-nameservice
+    /// registry (`<root>/ns@v2`), for a deployment moving from the
+    /// single-node file posture into raft. When set, the node that
+    /// initializes the cluster calls
+    /// [`RaftIntegration::adopt_file_registry`] once after election
+    /// and every record replays into the replicated registry —
+    /// existence, both heads, config and status verbatim. `None`
+    /// (the default) means no adoption is ever attempted.
+    pub adopt_file_registry: Option<PathBuf>,
+}
+
+impl RaftBootstrapConfig {
+    /// Minimum-input constructor: `node_id`, `storage_path`, all
+    /// other knobs defaulted. Suitable for first-pass deployments;
+    /// tune `raft_config` / `network_config` as workload patterns
+    /// demand.
+    pub fn new(node_id: NodeId, storage_path: impl Into<PathBuf>) -> Self {
+        let network_config = NetworkConfig::default();
+        Self {
+            node_id,
+            storage_path: storage_path.into(),
+            raft_config: runtime::default_raft_config(&network_config.transport),
+            network_config,
+            event_bus_capacity: 1024,
+            adopt_file_registry: None,
+        }
+    }
+
+    /// Configure file-registry adoption (see the field docs): `root`
+    /// is the store directory whose `ns@v2` subtree holds the
+    /// predecessor registry.
+    pub fn with_file_registry_adoption(mut self, root: impl Into<PathBuf>) -> Self {
+        self.adopt_file_registry = Some(root.into());
+        self
+    }
+}
+
+/// Failures that can fall out of [`RaftIntegration::bootstrap`].
+#[derive(Debug, Error)]
+pub enum RaftBootstrapError {
+    /// Opening or initializing the on-disk Raft storage tree failed.
+    /// Usually a permissions / disk-full / mount-missing issue.
+    #[error("opening raft storage: {0}")]
+    Storage(#[from] StorageError),
+    /// openraft rejected the supplied `RaftConfig` (timeouts that
+    /// don't compose, invalid snapshot policy, etc.).
+    #[error("validating raft config: {0}")]
+    Config(#[from] RaftConfigError),
+    /// `reqwest::Client` builder rejected the network config. Very
+    /// rare in practice — usually only triggers on unusual TLS /
+    /// proxy environments.
+    #[error("building HTTP client: {0}")]
+    HttpClient(#[from] reqwest::Error),
+    /// Reading the current snapshot from the state-machine adapter
+    /// failed during the boot-time restore (see
+    /// [`StateMachineAdapter::open`](crate::raft::state_machine_adapter::StateMachineAdapter::open)).
+    /// Typically a corrupt snapshot file or a deserialization mismatch.
+    #[error("restoring state-machine snapshot: {0}")]
+    SnapshotRestore(#[from] RaftStorageError<NodeId>),
+    /// openraft refused to start. The variant carries the node id
+    /// the failure originated from. Usually a fatal storage error
+    /// surfaced during initial state load.
+    #[error("raft startup: {0}")]
+    RaftStart(#[from] RaftFatal<NodeId>),
+}
+
+/// Failures out of [`RaftIntegration::adopt_file_registry`].
+#[derive(Debug, Error)]
+pub enum FileRegistryAdoptionError {
+    /// Reading the predecessor file registry failed.
+    #[error("reading the file registry: {0}")]
+    Registry(fluree_db_nameservice::NameServiceError),
+    /// One record's replay failed at the named step.
+    #[error("adopting '{ledger_id}' ({step}): {source}")]
+    Replay {
+        ledger_id: String,
+        step: &'static str,
+        source: fluree_db_nameservice::NameServiceError,
+    },
+    /// The replicated registry already holds DIFFERENT state for a
+    /// ledger — the machine was written outside this adoption, which
+    /// the completion marker should have prevented. Refuse rather
+    /// than guess which side is authoritative.
+    #[error("adopting '{ledger_id}' ({kind}): registry diverged — {detail}")]
+    Diverged {
+        ledger_id: String,
+        kind: &'static str,
+        detail: String,
+    },
+    /// Writing the completion marker failed.
+    #[error("writing the adoption marker: {0}")]
+    Marker(std::io::Error),
+}
+
+impl FileRegistryAdoptionError {
+    fn replay(
+        ledger_id: &str,
+        step: &'static str,
+        source: fluree_db_nameservice::NameServiceError,
+    ) -> Self {
+        Self::Replay {
+            ledger_id: ledger_id.to_string(),
+            step,
+            source,
+        }
+    }
+}
+
+// ============================================================================
+// Leader-aware indexer launcher
+// ============================================================================
+
+/// Lifecycle transition emitted by [`LeaderTracker::tick`].
+///
+/// Driver loop translates these into actual `tokio::spawn` /
+/// `JoinHandle::abort` calls. The state machine itself is pure so we
+/// can unit-test it without touching tokio.
+#[derive(Debug, PartialEq, Eq)]
+enum LeadershipTransition {
+    /// We just won an election — start the indexer.
+    Spawn,
+    /// We just lost the lead — abort the currently-running indexer.
+    Abort,
+    /// No change relevant to the indexer lifecycle.
+    None,
+}
+
+/// Pure state for the leader-aware indexer driver.
+///
+/// Tracks the local node's "was leader last tick" so the driver only
+/// reacts to *transitions*, not to every metrics update. The watcher
+/// loop calls [`tick`](Self::tick) with each new "am I currently
+/// leader?" answer and routes the returned transition.
+#[derive(Debug, Default)]
+struct LeaderTracker {
+    was_leader: bool,
+}
+
+impl LeaderTracker {
+    fn tick(&mut self, is_leader: bool) -> LeadershipTransition {
+        let transition = match (self.was_leader, is_leader) {
+            (false, true) => LeadershipTransition::Spawn,
+            (true, false) => LeadershipTransition::Abort,
+            _ => LeadershipTransition::None,
+        };
+        self.was_leader = is_leader;
+        transition
+    }
+}
+
+/// Handle to a cancellable background task: the spawned future
+/// receives a [`CancellationToken`] and is expected to drain its
+/// own work before returning when the token fires. Callers drive
+/// graceful shutdown via [`Self::shutdown`] — cancels the token,
+/// awaits the task. [`Self::abort`] is a test-only escape hatch.
+///
+/// Returned by both [`spawn_leader_watcher`] and
+/// [`spawn_worker_supervisor`]; the handle's contract is the same
+/// for both — only the task body differs.
+pub struct CancellableTaskHandle {
+    join: JoinHandle<()>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl CancellableTaskHandle {
+    /// Cooperatively shut the task down. Cancels the token so the
+    /// task's loop exits naturally and runs whatever drain code its
+    /// body owns, then awaits the `JoinHandle` so the function
+    /// returns only after the task has actually stopped.
+    ///
+    /// Without it (e.g. `JoinHandle::abort` straight on the task)
+    /// the task's Future is dropped mid-await and its cleanup code
+    /// never runs.
+    pub async fn shutdown(self) {
+        self.cancel.cancel();
+        // `JoinError` here would mean the task panicked — log via
+        // `_` since shutdown has no caller to surface it to.
+        let _ = self.join.await;
+    }
+
+    /// Hard abort: signal cancellation *and* abort the task's
+    /// JoinHandle without awaiting. Test-only escape hatch — leaves
+    /// the cleanup invariants to whoever's tearing the runtime down.
+    #[cfg(test)]
+    pub fn abort(self) {
+        self.cancel.cancel();
+        self.join.abort();
+    }
+}
+
+/// Spawn a task whose body receives the matching
+/// [`CancellationToken`] for graceful shutdown, returning a handle
+/// that owns the join + cancel pair. Private — public spawn
+/// functions (e.g. [`spawn_leader_watcher`],
+/// [`spawn_worker_supervisor`]) delegate.
+fn spawn_cancellable<F, Fut>(future_fn: F) -> CancellableTaskHandle
+where
+    F: FnOnce(tokio_util::sync::CancellationToken) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let join = tokio::spawn(future_fn(cancel.clone()));
+    CancellableTaskHandle { join, cancel }
+}
+
+/// Spawn a background task that watches `raft.metrics()` and drives
+/// the lifecycle of every leader-only task: spawn them when this
+/// node becomes leader, abort *and await* them when it loses the
+/// lead, so a fast leader flap doesn't double-spawn before the
+/// previous tasks reach a yield point.
+///
+/// `spawn_leader_tasks` is invoked each time leadership is gained
+/// and must return the `JoinHandle`s of the freshly-spawned tasks —
+/// the driver owns the handles and tears every one down on
+/// leadership loss. Callers bundle as many tasks as belong to the
+/// leader (indexer, commit-queue worker, periodic idempotency
+/// evictor, …) into the returned `Vec`.
+///
+/// Shutdown via [`CancellableTaskHandle::shutdown`] — cancels the
+/// token, lets the watcher reach its cleanup code, awaits.
+///
+/// `tokio::sync::watch` is a "latest value" channel, so transient
+/// flips that don't cross the leader/not-leader boundary from this
+/// node's local view (e.g. Leader → Follower → Leader inside one
+/// tick) collapse to "still leader" and are correctly treated as
+/// no-ops — the leader tasks keep running and the cluster ends up
+/// with us back at the lead, no spawn/abort churn.
+pub fn spawn_leader_watcher<F>(
+    raft: Arc<Raft<TypeConfig>>,
+    id: NodeId,
+    spawn_leader_tasks: F,
+) -> CancellableTaskHandle
+where
+    F: Fn() -> Vec<JoinHandle<()>> + Send + 'static,
+{
+    spawn_cancellable(move |cancel| async move {
+        let mut metrics = raft.metrics();
+        let mut tracker = LeaderTracker::default();
+        let mut current_tasks: Vec<JoinHandle<()>> = Vec::new();
+
+        loop {
+            let is_leader = metrics.borrow().current_leader == Some(id);
+            match tracker.tick(is_leader) {
+                LeadershipTransition::Spawn => {
+                    current_tasks = spawn_leader_tasks();
+                }
+                LeadershipTransition::Abort => {
+                    // Await the abort so the next Spawn (a rapid
+                    // leader flap) can't race with still-running
+                    // tasks from the previous reign.
+                    abort_and_await(std::mem::take(&mut current_tasks)).await;
+                }
+                LeadershipTransition::None => {}
+            }
+            tokio::select! {
+                changed = metrics.changed() => {
+                    if changed.is_err() {
+                        // Raft handle was dropped — nothing more to observe.
+                        break;
+                    }
+                }
+                () = cancel.cancelled() => {
+                    break;
+                }
+            }
+        }
+
+        // Watcher shutdown: tear down any in-flight leader tasks.
+        // Awaiting here is what guarantees `shutdown()` returns only
+        // after every leader task has actually stopped.
+        abort_and_await(std::mem::take(&mut current_tasks)).await;
+    })
+}
+
+/// Spawn the per-node worker supervisor as a long-running background
+/// task. Unlike [`spawn_leader_watcher`], this is node-lifetime — the
+/// supervisor runs on every node (leader and followers alike) because
+/// distributed workers can land anywhere under rendezvous assignment.
+///
+/// Shutdown via [`CancellableTaskHandle::shutdown`].
+pub fn spawn_worker_supervisor(
+    supervisor: crate::raft::commit_worker::WorkerSupervisor,
+) -> CancellableTaskHandle {
+    spawn_cancellable(|cancel| async move { supervisor.run(cancel).await })
+}
+
+/// Abort every handle and wait for the joins to resolve. `abort` is
+/// best-effort — the task only stops at the next `.await` point —
+/// and the `await` after it is what gives the caller a "they've all
+/// actually stopped" guarantee, which the leader-flap path needs to
+/// avoid double-spawn.
+async fn abort_and_await(handles: Vec<JoinHandle<()>>) {
+    for handle in &handles {
+        handle.abort();
+    }
+    for handle in handles {
+        // `JoinError::Cancelled` is the expected outcome after `abort`;
+        // a panicked task surfaces here too — log via `_` because the
+        // caller (watcher loop) has no useful action beyond moving on.
+        let _ = handle.await;
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    //! - Smoke test for the bootstrap assembler. End-to-end cluster
+    //!   formation (initialize → leader → state-machine write) is
+    //!   covered in the multi-node integration test.
+    //! - Pure-logic tests for [`LeaderTracker`] — the watcher's
+    //!   transition machine, in isolation.
+    //! - One end-to-end watcher test that bootstraps a real
+    //!   single-node Raft, lets it self-elect, and verifies the
+    //!   indexer spawn closure fired exactly once.
+
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn bootstrap_assembles_integration_on_fresh_storage() {
+        let dir = TempDir::new().expect("temp dir");
+        let cfg = RaftBootstrapConfig::new(1, dir.path().to_path_buf());
+
+        let integration = RaftIntegration::bootstrap(cfg)
+            .await
+            .expect("bootstrap should succeed on fresh storage");
+
+        // Pre-initialize: no cluster yet, so no leader and the
+        // membership snapshot is empty.
+        assert_eq!(integration.raft.current_leader().await, None);
+        let metrics = integration.raft.metrics().borrow().clone();
+        assert_eq!(metrics.membership_config.nodes().count(), 0);
+
+        // Routers assemble without panicking.
+        let _ = integration.private_router();
+    }
+
+    // ----------------------------------------------------------------
+    // LeaderTracker — pure transition logic
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn leader_tracker_initial_state_is_not_leader() {
+        let mut t = LeaderTracker::default();
+        // First tick with `is_leader=false` is a no-op — we weren't
+        // leader before, still aren't.
+        assert_eq!(t.tick(false), LeadershipTransition::None);
+    }
+
+    #[test]
+    fn leader_tracker_gains_leadership_yields_spawn() {
+        let mut t = LeaderTracker::default();
+        assert_eq!(t.tick(true), LeadershipTransition::Spawn);
+    }
+
+    #[test]
+    fn leader_tracker_staying_leader_is_noop() {
+        let mut t = LeaderTracker::default();
+        assert_eq!(t.tick(true), LeadershipTransition::Spawn);
+        assert_eq!(t.tick(true), LeadershipTransition::None);
+        assert_eq!(t.tick(true), LeadershipTransition::None);
+    }
+
+    #[test]
+    fn leader_tracker_losing_leadership_yields_abort() {
+        let mut t = LeaderTracker::default();
+        assert_eq!(t.tick(true), LeadershipTransition::Spawn);
+        assert_eq!(t.tick(false), LeadershipTransition::Abort);
+    }
+
+    #[test]
+    fn leader_tracker_flap_cycle_emits_paired_transitions() {
+        let mut t = LeaderTracker::default();
+        // false → true → false → true → false
+        assert_eq!(t.tick(true), LeadershipTransition::Spawn);
+        assert_eq!(t.tick(false), LeadershipTransition::Abort);
+        assert_eq!(t.tick(true), LeadershipTransition::Spawn);
+        assert_eq!(t.tick(false), LeadershipTransition::Abort);
+    }
+
+    // ----------------------------------------------------------------
+    // spawn_leader_watcher — end-to-end against a real single-node Raft
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn watcher_spawns_leader_tasks_when_node_becomes_leader() {
+        let dir = TempDir::new().expect("temp dir");
+        let cfg = RaftBootstrapConfig::new(1, dir.path().to_path_buf());
+        let integration = RaftIntegration::bootstrap(cfg).await.expect("bootstrap");
+
+        // Counter incremented every time the watcher invokes the
+        // spawn closure. Wrapped in Arc so the closure can keep a
+        // handle to it across multiple invocations.
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let count_for_closure = Arc::clone(&spawn_count);
+
+        let watcher = spawn_leader_watcher(
+            Arc::clone(&integration.raft),
+            1, // id
+            move || {
+                count_for_closure.fetch_add(1, Ordering::SeqCst);
+                // Two parked tasks stand in for the indexer + commit
+                // worker pair. We're testing the multi-task lifecycle,
+                // not the build pipelines.
+                vec![
+                    tokio::spawn(async {
+                        futures::future::pending::<()>().await;
+                    }),
+                    tokio::spawn(async {
+                        futures::future::pending::<()>().await;
+                    }),
+                ]
+            },
+        );
+
+        // Bootstrap as single-voter; node 1 will auto-elect on the
+        // next election tick.
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(1u64, crate::raft::ClusterNode::default());
+        integration
+            .raft
+            .initialize(members)
+            .await
+            .expect("initialize");
+
+        // Wait for the leader transition to land.
+        integration
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .state(crate::RaftServerState::Leader, "leader after self-election")
+            .await
+            .expect("becomes leader");
+
+        // The metrics watch channel sends an update for the state
+        // transition; the watcher should observe it and invoke the
+        // spawn closure. Give the watcher task a tick to react.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            spawn_count.load(Ordering::SeqCst),
+            1,
+            "leader tasks should spawn exactly once on the leader transition"
+        );
+
+        // Tear down: aborting the watcher should also abort every
+        // current leader task (no leak), and Raft can shut down
+        // cleanly.
+        watcher.abort();
+        let _ = integration.raft.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watcher_shutdown_waits_for_leader_tasks_to_stop() {
+        // Verifies the cooperative shutdown path: cancelling the
+        // watcher's token must drive the leader-task cleanup to
+        // completion before `shutdown()` returns. A naked
+        // `JoinHandle::abort` on the outer watcher (the pre-token
+        // behavior) used to drop the cleanup mid-await, leaving
+        // leader tasks alive on the runtime.
+
+        let dir = TempDir::new().expect("temp dir");
+        let cfg = RaftBootstrapConfig::new(1, dir.path().to_path_buf());
+        let integration = RaftIntegration::bootstrap(cfg).await.expect("bootstrap");
+
+        // The leader task flips this flag to false in its Drop impl,
+        // giving the test a deterministic signal that the task has
+        // actually stopped (vs being merely signalled to stop).
+        let alive = Arc::new(AtomicUsize::new(0));
+        let alive_for_closure = Arc::clone(&alive);
+
+        struct AliveGuard(Arc<AtomicUsize>);
+        impl Drop for AliveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let watcher = spawn_leader_watcher(Arc::clone(&integration.raft), 1, move || {
+            alive_for_closure.fetch_add(1, Ordering::SeqCst);
+            let guard = AliveGuard(Arc::clone(&alive_for_closure));
+            vec![tokio::spawn(async move {
+                let _g = guard;
+                futures::future::pending::<()>().await;
+            })]
+        });
+
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(1u64, crate::raft::ClusterNode::default());
+        integration
+            .raft
+            .initialize(members)
+            .await
+            .expect("initialize");
+        integration
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .state(crate::RaftServerState::Leader, "leader after self-election")
+            .await
+            .expect("becomes leader");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(alive.load(Ordering::SeqCst), 1, "leader task spawned");
+
+        // The contract: when `shutdown().await` returns, the leader
+        // task's Drop has already run — `alive` is back to 0.
+        watcher.shutdown().await;
+        assert_eq!(
+            alive.load(Ordering::SeqCst),
+            0,
+            "leader task drop should run before shutdown() returns"
+        );
+
+        let _ = integration.raft.shutdown().await;
+    }
+}

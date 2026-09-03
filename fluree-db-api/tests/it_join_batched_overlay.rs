@@ -233,7 +233,21 @@ async fn probe_helpers_merge_novelty() {
             {"@id": "ex:bob",   "ex:age": 25, "ex:name": "Bob", "ex:city": "Berlin"},
             {"@id": "ex:dave",  "ex:age": 30, "ex:name": "Dave", "ex:city": "Lyon"},
             {"@id": "ex:frank", "ex:age": 40, "ex:name": "Frank", "ex:city": "Oslo"},
-            {"@id": "ex:lonely", "ex:age": 99}
+            {"@id": "ex:lonely", "ex:age": 99},
+            // Age-only filler sharing one value. The EXISTS cases below need
+            // `ex:X ex:knows ?b` to win the seed race against the `?b ex:age N`
+            // check: both estimates are means (knows count/ndv_subjects vs age
+            // count/ndv_values), and with every age distinct the two land within
+            // 0.1 of each other, so the check seeds instead and the exists lane
+            // never runs — a miss only the span assertion catches.
+            {"@id": "ex:pad-0", "ex:age": 50},
+            {"@id": "ex:pad-1", "ex:age": 50},
+            {"@id": "ex:pad-2", "ex:age": 50},
+            {"@id": "ex:pad-3", "ex:age": 50},
+            {"@id": "ex:pad-4", "ex:age": 50},
+            {"@id": "ex:pad-5", "ex:age": 50},
+            {"@id": "ex:pad-6", "ex:age": 50},
+            {"@id": "ex:pad-7", "ex:age": 50}
         ]
     });
     let receipt = fluree.insert(ledger, &base).await.expect("base insert");
@@ -508,30 +522,47 @@ async fn batched_object_join_merges_novelty() {
         .await
         .expect("novelty asserts");
 
-    let queries: &[(&str, &str, usize)] = &[
+    // (name, query, expected rows, must route through the batched-object lane)
+    let queries: &[(&str, &str, usize, bool)] = &[
         (
             "object-probe-mixed",
             r"PREFIX ex: <http://example.org/ns/>
               SELECT ?b ?x WHERE { ex:alice ex:knows ?b . ?x ex:author ?b }
               ORDER BY ?b ?x",
             2, // (bob, b3 injected) + (grace novelty-only, b4 injected);
-               // b2 retracted, b1/d1 authors not known by alice
+            // b2 retracted, b1/d1 authors not known by alice
+            true,
         ),
         (
             "object-probe-list-retract",
+            // Two rows on purpose: a SINGLE-row VALUES is folded into the
+            // object position by the planner (`inline_singleton_values_objects`)
+            // and takes the plain bound-object scan instead of this lane.
+            // `ex:dave` has no `ex:authors` edge, so the answer is unchanged.
             r"PREFIX ex: <http://example.org/ns/>
-              SELECT ?x WHERE { VALUES ?b { ex:bob } ?x ex:authors ?b }
+              SELECT ?x WHERE { VALUES ?b { ex:bob ex:dave } ?x ex:authors ?b }
               ORDER BY ?x",
             1, // the delete's WHERE dedupes the repeated @list value to one
-               // binding, so exactly ONE of the two o_i entries is retracted:
-               // the fate check must discriminate the entries by o_i (a
-               // default-read o_i would either resurrect both or drop both)
+            // binding, so exactly ONE of the two o_i entries is retracted:
+            // the fate check must discriminate the entries by o_i (a
+            // default-read o_i would either resurrect both or drop both)
+            true,
+        ),
+        (
+            // The folded form of the same `@list` retraction, which is what a
+            // one-row VALUES now plans as. Same answer, different lane.
+            "object-const-list-retract",
+            r"PREFIX ex: <http://example.org/ns/>
+              SELECT ?x WHERE { ?x ex:authors ex:bob }
+              ORDER BY ?x",
+            1,
+            false,
         ),
     ];
 
     let view = fluree.db(ledger_id).await.expect("novelty view");
     let mut novelty_results = Vec::new();
-    for (name, query, expected_len) in queries {
+    for (name, query, expected_len, expect_lane) in queries {
         let (spans, guard) = span_capture::init_test_tracing();
         let rows = run_query(&fluree, &view, query).await;
         drop(guard);
@@ -540,15 +571,17 @@ async fn batched_object_join_merges_novelty() {
             *expected_len,
             "{name}: row count under novelty; got {rows:?}"
         );
-        assert!(
-            spans.has_span("join_flush_batched_object_binary"),
-            "{name}: bound-object lane should engage under novelty; spans: {:?}",
-            spans.span_names()
-        );
-        assert!(
-            spans.has_event("join batched object flush merged novelty overlay"),
-            "{name}: object flush should merge the overlay"
-        );
+        if *expect_lane {
+            assert!(
+                spans.has_span("join_flush_batched_object_binary"),
+                "{name}: bound-object lane should engage under novelty; spans: {:?}",
+                spans.span_names()
+            );
+            assert!(
+                spans.has_event("join batched object flush merged novelty overlay"),
+                "{name}: object flush should merge the overlay"
+            );
+        }
         novelty_results.push(rows);
     }
 
@@ -557,7 +590,7 @@ async fn batched_object_join_merges_novelty() {
         .await
         .expect("reindex ground truth");
     let view = fluree.db(ledger_id).await.expect("indexed view");
-    for ((name, query, _), novelty_rows) in queries.iter().zip(&novelty_results) {
+    for ((name, query, _, _), novelty_rows) in queries.iter().zip(&novelty_results) {
         let indexed_rows = run_query(&fluree, &view, query).await;
         assert_eq!(
             &indexed_rows, novelty_rows,

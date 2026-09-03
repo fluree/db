@@ -138,6 +138,22 @@ WHERE {
 
 See the [R2RML documentation](../graph-sources/r2rml.md) for details.
 
+### SQL Endpoints
+
+**Differentiator**: The R2RML mapping runs over a live relational database or warehouse through a Trino-protocol HTTP endpoint — no copy, and no database driver inside Fluree. One Trino coordinator reaches Postgres, MySQL, SQL Server, Oracle, Snowflake, BigQuery and more; a small `fluree-sql-bridge` sidecar covers a single Postgres/MySQL/SQLite database without a JVM.
+
+**Use Cases:**
+- A virtual graph over an operational database
+- Federating a ledger with warehouse tables in one query
+- Serverless deployments — every scan is a stateless HTTP request
+
+**Key Features:**
+- Typed filter pushdown and exact `COUNT` per table; joins in the engine
+- `rr:sqlQuery` logical tables
+- Reads the current table state (no snapshots or time travel)
+
+See [SQL graph sources](../graph-sources/sql.md) for details.
+
 ## Graph Source Lifecycle
 
 ### Creation

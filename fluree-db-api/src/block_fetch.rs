@@ -422,7 +422,7 @@ pub async fn apply_policy_filter(
         .map_err(|e| BlockFetchError::PolicyFilter(e.to_string()))?;
 
     let filtered = enforcer
-        .filter_flakes_for_graph(snapshot, overlay, to_t, &tracker, flakes)
+        .filter_flakes_for_graph(snapshot, db.g_id, overlay, to_t, &tracker, flakes)
         .await
         .map_err(|e| BlockFetchError::PolicyFilter(e.to_string()))?;
 

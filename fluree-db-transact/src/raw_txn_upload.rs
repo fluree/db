@@ -11,52 +11,72 @@
 //! awaits [`PendingRawTxnUpload::finish`] just before writing the commit blob,
 //! so the upload overlaps CPU work and the commit still blocks on durability.
 //!
-//! # Failure handling
+//! # Failure handling — never delete inline
 //!
-//! On any error path that drops a pending upload without calling `finish()`,
-//! the [`Drop`] guard aborts the in-flight task and (if the upload completed
-//! before the abort landed) spawns a detached release task to reclaim the
-//! orphaned content. Callers on known-failure paths may call [`abort`]
-//! explicitly to await the release before proceeding.
+//! Raw-txn blobs are content-addressed: two transactions with byte-identical
+//! bodies (a client retry, an SQS redelivery, an in-process commit-conflict
+//! restage) map to the **same** CID and the same storage key, and
+//! `ContentStore::release` is an unconditional delete with no reference count.
+//! An inline release on a failure path can therefore delete a blob that an
+//! already-published commit references, leaving a permanent dangling
+//! `commit.txn` pointer (observed in production: a retry's Drop-guard delete
+//! landed after the winning attempt's no-op re-put). So a dropped pending
+//! upload only cancels the in-flight task; a blob that already landed is left
+//! in place as an orphan.
 //!
-//! [`abort`]: PendingRawTxnUpload::abort
+//! # No reclaim exists yet
+//!
+//! **Nothing currently deletes an orphaned txn blob.** The only collector in
+//! the workspace is `fluree-db-indexer/src/gc/`, and its storage sweep
+//! deliberately excludes this content kind (`gc/sweep.rs` — "Commits,
+//! transactions, and config blobs are deliberately excluded"). The upload is
+//! spawned before staging, so every distinct body that fails validation,
+//! policy, or the novelty cap leaves a blob behind permanently. That is a
+//! known, accepted cost of removing the unsafe inline delete — not a solved
+//! problem.
+//!
+//! Reclaiming them safely needs a collector rooted in the commit chain
+//! (`fluree_db_api::verify_commit_chain` is the root-set walk), and it cannot
+//! simply sweep the `txn/` prefix: the raft queued transactor writes its
+//! in-flight `QueuedRequest` envelopes under `ContentKind::Txn` into the same
+//! per-ledger prefix and releases them itself, so a prefix sweep that only
+//! knows about commit-referenced CIDs would delete live queue entries.
 
-use crate::error::{Result, TransactError};
+use crate::error::Result;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::error::TransactError;
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::task::JoinHandle;
 
 /// A raw-txn upload in flight or completed.
 ///
 /// See module docs for the lifecycle contract.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct PendingRawTxnUpload {
     handle: Option<JoinHandle<Result<ContentId>>>,
-    content_store: Arc<dyn ContentStore>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PendingRawTxnUpload {
     /// Spawn the upload on the current Tokio runtime.
     ///
     /// Serialization of `txn_json` happens inside the task so it doesn't add
     /// latency on the caller's path.
     pub fn spawn(content_store: Arc<dyn ContentStore>, txn_json: serde_json::Value) -> Self {
-        let store_for_task = Arc::clone(&content_store);
         let handle = tokio::spawn(async move {
             let bytes = serde_json::to_vec(&txn_json)?;
-            let cid = store_for_task.put(ContentKind::Txn, &bytes).await?;
-            tracing::info!(raw_txn_bytes = bytes.len(), "raw txn stored");
+            let cid = content_store.put(ContentKind::Txn, &bytes).await?;
+            tracing::info!(raw_txn_bytes = bytes.len(), raw_txn_cid = %cid, "raw txn stored");
             Ok::<_, TransactError>(cid)
         });
         Self {
             handle: Some(handle),
-            content_store,
         }
     }
 
     /// Await the upload and return the resulting ContentId.
-    ///
-    /// On success, consumes self without triggering the Drop-guard release —
-    /// the caller is committing to reference this CID from the commit record.
     pub async fn finish(mut self) -> Result<ContentId> {
         let handle = self
             .handle
@@ -70,47 +90,69 @@ impl PendingRawTxnUpload {
             ))),
         }
     }
-
-    /// Explicitly abort the upload and release any completed content.
-    ///
-    /// Awaits the cancellation so callers on known-error paths can be sure
-    /// the release has been issued before they return. For implicit failures
-    /// (e.g., `?` propagation), the Drop guard performs the same work on a
-    /// detached task.
-    pub async fn abort(mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-            if let Ok(Ok(cid)) = handle.await {
-                let _ = self.content_store.release(&cid).await;
-            }
-        }
-    }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for PendingRawTxnUpload {
     fn drop(&mut self) {
-        let Some(handle) = self.handle.take() else {
-            return;
-        };
-        handle.abort();
-        // Spawn a detached release task only if we're inside a tokio runtime.
-        // Outside of one (e.g., synchronous test teardown), we drop the handle
-        // and accept that orphaned content may remain for the backend's GC.
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let store = Arc::clone(&self.content_store);
-            rt.spawn(async move {
-                if let Ok(Ok(cid)) = handle.await {
-                    let _ = store.release(&cid).await;
-                }
-            });
+        // Cancel an upload still in flight. A blob that already landed stays
+        // in storage — see the module docs for why it must not be deleted.
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for PendingRawTxnUpload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingRawTxnUpload")
             .field("pending", &self.handle.is_some())
+            .finish()
+    }
+}
+
+/// wasm32 twin: single-threaded, no ambient tokio runtime — `tokio::spawn`
+/// would panic and there is no latency-overlap to win anyway. The upload is
+/// deferred as data and runs inside [`finish`](Self::finish); nothing is
+/// stored before that, so `abort` and `Drop` have nothing to release.
+#[cfg(target_arch = "wasm32")]
+pub struct PendingRawTxnUpload {
+    deferred: Option<(Arc<dyn ContentStore>, serde_json::Value)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl PendingRawTxnUpload {
+    /// Defer the upload (same signature as the native spawn; see type docs).
+    pub fn spawn(content_store: Arc<dyn ContentStore>, txn_json: serde_json::Value) -> Self {
+        Self {
+            deferred: Some((content_store, txn_json)),
+        }
+    }
+
+    /// Run the upload now and return the resulting ContentId.
+    pub async fn finish(mut self) -> Result<ContentId> {
+        let (store, txn_json) = self
+            .deferred
+            .take()
+            .expect("deferred inputs present until finish/abort");
+        let bytes = serde_json::to_vec(&txn_json)?;
+        let cid = store.put(ContentKind::Txn, &bytes).await?;
+        tracing::info!(raw_txn_bytes = bytes.len(), "raw txn stored");
+        Ok(cid)
+    }
+
+    /// Nothing has been stored yet; just drop the deferred inputs.
+    pub async fn abort(mut self) {
+        self.deferred = None;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl std::fmt::Debug for PendingRawTxnUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRawTxnUpload")
+            .field("pending", &self.deferred.is_some())
             .finish()
     }
 }

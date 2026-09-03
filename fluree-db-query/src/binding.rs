@@ -258,6 +258,44 @@ const _: () = assert!(
     "size_of::<Binding>() regressed past 88 bytes — box the large variant instead of widening the enum"
 );
 
+/// Whether this binding is a **string-dictionary term**: a literal whose
+/// lexical form is interned in the shared string dictionary, so the stored key
+/// alone does not identify the RDF term — the datatype (or language tag) is the
+/// rest of it.
+///
+/// One relation, read off either shape a literal binding takes. An encoded
+/// literal is in the lane exactly when its object kind is `LEX_ID`, the string
+/// dictionary's kind. A decoded literal is in it when its value is a string
+/// *and* its datatype is one the dictionary holds — the value alone isn't
+/// enough, because a cast or `STRDT` can build a string-backed literal for a
+/// datatype stored in another lane (`xsd:float(?o)` is carried as a
+/// `String` + `xsd:float`), and constraining one of those would narrow a probe
+/// that has nothing to do with the string dictionary.
+///
+/// Probe substitution (join, OPTIONAL) carries these bindings' datatype /
+/// language constraint onto the scan pattern, so `"abc"`, `"abc"@en`,
+/// `"abc"^^xsd:anyURI` and `"abc"^^ex:custom` stop probing each other's rows.
+/// Numeric and temporal literals are deliberately left out: the join is lenient
+/// across numeric subtypes (`1` ≡ `"1"^^xsd:long` ≡ `1.0`), a product decision
+/// pinned by `it_literal_identity.rs`.
+pub fn is_string_dict_term(binding: &Binding) -> bool {
+    match binding {
+        Binding::Lit { val, dtc, .. } => {
+            matches!(val, FlakeValue::String(_))
+                && match dtc {
+                    DatatypeConstraint::LangTag(_) => true,
+                    DatatypeConstraint::Explicit(dt) => {
+                        fluree_db_core::datatypes::is_string_dict_datatype(dt)
+                    }
+                }
+        }
+        Binding::EncodedLit { o_kind, .. } => {
+            *o_kind == fluree_db_core::value_id::ObjKind::LEX_ID.as_u8()
+        }
+        _ => false,
+    }
+}
+
 impl Binding {
     /// Create a new literal binding
     ///
@@ -285,9 +323,14 @@ impl Binding {
             !matches!(val, FlakeValue::Ref(_)),
             "Lit cannot contain Ref - use Binding::Sid"
         );
+        let lang: Arc<str> = lang.into();
+        let lang = match fluree_db_core::normalize_lang_tag(&lang) {
+            std::borrow::Cow::Borrowed(_) => lang,
+            std::borrow::Cow::Owned(s) => Arc::from(s),
+        };
         Binding::Lit {
             val,
-            dtc: DatatypeConstraint::LangTag(lang.into()),
+            dtc: DatatypeConstraint::LangTag(lang),
             t: None,
             op: None,
             p_id: None,

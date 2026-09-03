@@ -2,6 +2,11 @@
 /target/
 **/target/
 
+# fluree-db-wasm npm package build output (wasm-bindgen glue, tsc output)
+/fluree-db-wasm/js/pkg/
+/fluree-db-wasm/js/dist/
+/fluree-db-wasm/js/node_modules/
+
 # mdBook build output
 /docs/book/
 
@@ -20,9 +25,11 @@
 # OS
 .DS_Store
 
-# Claude Code — track commands/ (team skills) but not local settings
+# Claude Code — track commands/ (team skills) and CLAUDE.md (shared conventions),
+# but not local settings or personal notes
 .claude/settings.local.json
 .claude/dev-docs/
+CLAUDE.local.md
 
 # Fluree data (storage, indexes, etc.)
 .fluree/

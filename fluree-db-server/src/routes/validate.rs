@@ -52,6 +52,11 @@ pub struct ValidateBody {
     /// Union ad-hoc shapes with the attached shapes instead of replacing.
     #[serde(default)]
     pub include_attached: bool,
+    /// Micro-fuel ceiling for the pass (absent / 0 = unbounded), mirroring
+    /// `opts.max-fuel` on the query and transact endpoints. Worth setting
+    /// wherever untrusted parties can install `sh:sparql` shapes: a
+    /// constraint body is not limited to its focus node's neighbourhood.
+    pub max_fuel: Option<u64>,
 }
 
 /// Validate a ledger's current state (ledger in path tail).
@@ -141,10 +146,21 @@ async fn validate_local(
             ));
         }
 
+        // Same execution control the query endpoints use: a request-scoped
+        // cancellation carrying the configured timeout and the per-query
+        // memory ceiling. `sh:sparql` constraints run one query per focus
+        // node, so validation needs these as much as `/query` does.
+        //
+        // `exec_options` OWNS the timeout task's abort guard — dropping it
+        // cancels the timer, so it must stay alive across the call below.
+        let exec_options =
+            crate::query_control::current_query_execution_options(state.config.query_timeout_ms);
         let options = ValidateOptions {
             graph: body.graph.clone(),
             shapes: shapes_source(&body)?,
             include_attached: body.include_attached,
+            max_fuel: body.max_fuel,
+            cancellation: exec_options.cancellation.clone(),
         };
 
         let report = state
@@ -166,6 +182,7 @@ async fn validate_local(
             shapes = report.shape_count,
             "shacl validate complete"
         );
+        drop(exec_options);
         Ok(negotiate_response(&report, &headers))
     }
     .instrument(span)
@@ -222,6 +239,7 @@ fn negotiate_response(report: &ValidateReport, headers: &FlureeHeaders) -> Respo
         "warnings": report.warning_count(),
         "infos": report.info_count(),
         "shapesChecked": report.shape_count,
+        "t": report.t,
         "results": report.results,
     }))
     .into_response()

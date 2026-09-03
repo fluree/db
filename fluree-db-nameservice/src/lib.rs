@@ -268,6 +268,8 @@ pub enum GraphSourceType {
     R2rml,
     /// Apache Iceberg table
     Iceberg,
+    /// R2RML mapping over tables reached through a SQL endpoint
+    Sql,
     /// Unknown/custom graph source type
     Unknown(String),
 }
@@ -279,7 +281,9 @@ impl GraphSourceType {
             GraphSourceType::Bm25 | GraphSourceType::Vector | GraphSourceType::Geo => {
                 GraphSourceKind::Index
             }
-            GraphSourceType::R2rml | GraphSourceType::Iceberg => GraphSourceKind::Mapped,
+            GraphSourceType::R2rml | GraphSourceType::Iceberg | GraphSourceType::Sql => {
+                GraphSourceKind::Mapped
+            }
             GraphSourceType::Unknown(_) => GraphSourceKind::Index, // default assumption
         }
     }
@@ -295,6 +299,7 @@ impl GraphSourceType {
             GraphSourceType::Geo => "f:GeoIndex".to_string(),
             GraphSourceType::R2rml => "f:R2rmlMapping".to_string(),
             GraphSourceType::Iceberg => "f:IcebergMapping".to_string(),
+            GraphSourceType::Sql => "f:SqlMapping".to_string(),
             GraphSourceType::Unknown(s) => s.clone(),
         }
     }
@@ -311,12 +316,14 @@ impl GraphSourceType {
             "f:GeoIndex" => GraphSourceType::Geo,
             "f:R2rmlMapping" => GraphSourceType::R2rml,
             "f:IcebergMapping" => GraphSourceType::Iceberg,
+            "f:SqlMapping" => GraphSourceType::Sql,
             // Full IRI forms
             ns_types::BM25_INDEX => GraphSourceType::Bm25,
             ns_types::HNSW_INDEX => GraphSourceType::Vector,
             ns_types::GEO_INDEX => GraphSourceType::Geo,
             ns_types::R2RML_MAPPING => GraphSourceType::R2rml,
             ns_types::ICEBERG_MAPPING => GraphSourceType::Iceberg,
+            ns_types::SQL_MAPPING => GraphSourceType::Sql,
             _ => GraphSourceType::Unknown(s.to_string()),
         }
     }
@@ -450,6 +457,37 @@ pub trait NameServiceLookup:
             .into_iter()
             .filter(|r| r.name == ledger_name && !r.retracted)
             .collect())
+    }
+
+    /// Read both head pointers without assembling a full [`NsRecord`].
+    ///
+    /// Prefer this (or [`RefLookup::get_ref`] for a single head) over
+    /// [`lookup`](Self::lookup) whenever only `commit`/`index` identity or
+    /// `t` is needed: the full record costs config/context/status parsing
+    /// and, on remote backends, more items per read.
+    ///
+    /// `None` follows [`RefLookup::get_ref`] on the same backend — an
+    /// unknown ledger, and (where the backend tombstones) a retracted one.
+    /// That correspondence is about **existence only**, not values: the file
+    /// backend's `get_ref(IndexHead)` prefers the separate index file
+    /// unconditionally, where this and [`lookup`](Self::lookup) apply the
+    /// read-time `>=` merge, so the two can disagree on a stale index file.
+    /// Where they differ, `heads` sides with `lookup`.
+    ///
+    /// Retraction is not applied uniformly across backends — raft tombstones
+    /// on this surface, file/DynamoDB/memory do not. See #1670.
+    ///
+    /// The default reads the two refs separately; backends override when
+    /// they can serve both in one read.
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        let Some(commit) = self.get_ref(ledger_id, RefKind::CommitHead).await? else {
+            return Ok(None);
+        };
+        let index = self
+            .get_ref(ledger_id, RefKind::IndexHead)
+            .await?
+            .unwrap_or(RefValue { id: None, t: 0 });
+        Ok(Some(LedgerHeads { commit, index }))
     }
 }
 
@@ -911,6 +949,49 @@ pub struct RefValue {
     pub id: Option<ContentId>,
     /// Monotonic watermark (transaction time).
     pub t: i64,
+}
+
+/// Both head pointers of a ledger branch, read together.
+///
+/// The cheapest backend-agnostic "where is this ledger" read: every
+/// [`NameServiceLookup`] returns it via [`NameServiceLookup::heads`], and
+/// backends that can fetch both refs in one round trip override the default.
+/// Carries identities (CIDs), not just watermarks, so the values can feed
+/// staleness checks and [`RefPublisher::compare_and_set_ref`] directly.
+///
+/// The two refs are read together but not necessarily atomically (file
+/// backends keep them in separate files), so `index.t > commit.t` is a
+/// transient state callers must tolerate — the same rule as [`NsRecord`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerHeads {
+    pub commit: RefValue,
+    pub index: RefValue,
+}
+
+impl LedgerHeads {
+    pub fn from_record(record: &NsRecord) -> Self {
+        Self {
+            commit: RefValue {
+                id: record.commit_head_id.clone(),
+                t: record.commit_t,
+            },
+            index: RefValue {
+                id: record.index_head_id.clone(),
+                t: record.index_t,
+            },
+        }
+    }
+}
+
+impl From<&LedgerHeads> for NsRecordSnapshot {
+    fn from(heads: &LedgerHeads) -> Self {
+        Self {
+            commit_head_id: heads.commit.id.clone(),
+            commit_t: heads.commit.t,
+            index_head_id: heads.index.id.clone(),
+            index_t: heads.index.t,
+        }
+    }
 }
 
 /// Outcome of a compare-and-set operation.
@@ -1385,6 +1466,10 @@ where
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         (**self).list_branches(ledger_name).await
     }
+
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        (**self).heads(ledger_id).await
+    }
 }
 
 #[async_trait]
@@ -1803,5 +1888,66 @@ mod tests {
 
         assert!(matches!(updated, ConfigCasResult::Updated));
         assert!(matches!(conflict, ConfigCasResult::Conflict { .. }));
+    }
+
+    /// Exercises the trait-default `heads()` — only `get_ref` is implemented,
+    /// and the index ref is deliberately reported as unknown.
+    #[derive(Debug)]
+    struct RefOnlyNs;
+
+    #[async_trait]
+    impl RefLookup for RefOnlyNs {
+        async fn get_ref(&self, ledger_id: &str, kind: RefKind) -> Result<Option<RefValue>> {
+            Ok(match (ledger_id, kind) {
+                ("db:main", RefKind::CommitHead) => Some(RefValue {
+                    id: Some(ContentId::new(ContentKind::Commit, b"c")),
+                    t: 7,
+                }),
+                _ => None,
+            })
+        }
+    }
+    #[async_trait]
+    impl GraphSourceLookup for RefOnlyNs {
+        async fn lookup_graph_source(&self, _: &str) -> Result<Option<GraphSourceRecord>> {
+            Ok(None)
+        }
+        async fn lookup_any(&self, _: &str) -> Result<NsLookupResult> {
+            Ok(NsLookupResult::NotFound)
+        }
+        async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
+            Ok(vec![])
+        }
+    }
+    #[async_trait]
+    impl StatusLookup for RefOnlyNs {
+        async fn get_status(&self, _: &str) -> Result<Option<StatusValue>> {
+            Ok(None)
+        }
+    }
+    #[async_trait]
+    impl ConfigLookup for RefOnlyNs {
+        async fn get_config(&self, _: &str) -> Result<Option<ConfigValue>> {
+            Ok(None)
+        }
+    }
+    #[async_trait]
+    impl NameServiceLookup for RefOnlyNs {
+        async fn lookup(&self, _: &str) -> Result<Option<NsRecord>> {
+            Ok(None)
+        }
+        async fn all_records(&self) -> Result<Vec<NsRecord>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn heads_default_composes_get_ref() {
+        let heads = RefOnlyNs.heads("db:main").await.unwrap().unwrap();
+        assert_eq!(heads.commit.t, 7);
+        assert_eq!(heads.index, RefValue { id: None, t: 0 });
+        assert_eq!(RefOnlyNs.heads("other:main").await.unwrap(), None);
+        let snap = NsRecordSnapshot::from(&heads);
+        assert_eq!((snap.commit_t, snap.index_t), (7, 0));
     }
 }

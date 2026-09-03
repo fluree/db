@@ -19,10 +19,11 @@
 //! - Transactions serialize via `lock_for_write()` (hold lock for stage+commit)
 //! - Manager lock is released during I/O (no blocking other ledgers)
 
+use fluree_db_core::clock::Instant;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use std::path::PathBuf;
 
@@ -162,8 +163,9 @@ struct ConfigCacheEntry {
 /// All paths that touch both locks (snapshot, apply_index_v2, reload)
 /// follow this order to prevent deadlock and ensure coherence.
 ///
-/// `config_cache` is independent of `state` (guarded by its own lock, never
-/// held across the `state` lock), so it participates in no ordering constraint.
+/// `config_cache` has its own lock and is never held while acquiring `state`;
+/// `reload`'s swap takes it briefly *while holding* `state`, so the one
+/// permitted order is `state` → `config_cache`, never the reverse.
 struct LedgerHandleInner {
     /// Guards all access to the ledger state. A `RwLock` so concurrent reads
     /// (every query takes a brief shared `read()` to clone a cheap, Arc-backed
@@ -233,6 +235,24 @@ impl LedgerHandle {
         let mut entry = self.inner.config_cache.write().await;
         entry.key = Some(key);
         entry.config = config;
+    }
+
+    /// Drop the resolved-config entry so the next read re-resolves.
+    ///
+    /// Needed by out-of-band state swaps (`LedgerManager::reload`): the marker
+    /// only protects against staleness it can *see* advance. A reader that
+    /// raced the unwind gap of a detached commit (see `DetachedCacheSlot`)
+    /// can have resolved config against the empty placeholder and cached it
+    /// under `config_write_t = 0` — and a reloaded state whose config graph
+    /// was last written at or below `index_t` legitimately carries marker `0`
+    /// too, so that entry would *hit*, silently serving "no config" for a
+    /// configured ledger until the next config write. Clearing at the swap
+    /// point closes it (all but a resolve still in flight across the swap,
+    /// whose put can land after this clear — reaching even that needs a panic
+    /// plus two racing windows).
+    pub(crate) async fn config_cache_clear(&self) {
+        let mut entry = self.inner.config_cache.write().await;
+        *entry = ConfigCacheEntry::default();
     }
 
     /// Set the read-side tier width (`0`/`1` disables read-triggered compaction).
@@ -405,8 +425,11 @@ impl LedgerHandle {
     /// Apply a v2 binary index root to this handle.
     ///
     /// All I/O (root read, BinaryIndexStore load) happens outside any lock.
-    /// The state lock is held for the brief atomic swap of both `state` and
-    /// `binary_store`, ensuring coherence between `db.range_provider` and
+    /// The state lock is held while the snapshot is applied — novelty trim
+    /// and runtime-dict reseed scale with accumulated novelty, so this is
+    /// not a constant-time swap; see the `index_install_wait` /
+    /// `index_install_lock` spans — and both `state` and `binary_store` are
+    /// swapped under it, ensuring coherence between `db.range_provider` and
     /// `binary_store` (lock ordering: state → binary_store).
     ///
     /// `cs` MUST be branch-aware for branched ledgers (built via
@@ -420,6 +443,25 @@ impl LedgerHandle {
         cache_dir: &std::path::Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> Result<()> {
+        use tracing::Instrument as _;
+        let span = tracing::debug_span!(
+            "index_install",
+            ledger_id = %self.id(),
+            index_t = tracing::field::Empty,
+        );
+        self.apply_index_v2_inner(index_id, cs, cache_dir, leaflet_cache)
+            .instrument(span)
+            .await
+    }
+
+    async fn apply_index_v2_inner(
+        &self,
+        index_id: &ContentId,
+        cs: Arc<dyn ContentStore>,
+        cache_dir: &std::path::Path,
+        leaflet_cache: Option<Arc<LeafletCache>>,
+    ) -> Result<()> {
+        use tracing::Instrument as _;
         let bytes = cs
             .get(index_id)
             .await
@@ -451,15 +493,33 @@ impl LedgerHandle {
             has_annotations: root.has_annotations,
             annotation_index: root.annotation_index.clone(),
             had_annotation_arena: root.had_annotation_arena,
+            has_list_meta: root.has_list_meta,
         };
+        tracing::Span::current().record("index_t", meta.t);
         let db = LedgerSnapshot::new_meta(meta)
             .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;
 
-        // Brief lock: apply snapshot (trims novelty, rebuilds dict_novelty),
+        // Exclusive lock: apply snapshot (trims novelty, rebuilds dict_novelty),
         // then wire up range_provider with the correct dict_novelty.
         // Lock ordering: state → binary_store (same as snapshot()).
-        {
-            let mut state = self.inner.state.write().await;
+        //
+        // Wait and hold are bracketed by separate spans so each aggregates
+        // independently: a long `index_install_wait` is contention on the
+        // state lock (points at backpressure or install batching), while a
+        // long `index_install_lock` is the guarded work itself — the two
+        // novelty walks inside (apply_loaded_db, reseed_runtime_small_dicts)
+        // scale with accumulated novelty, so this is not a constant-time
+        // swap. No event fires inside the lock: under a default `fmt`
+        // subscriber, span lifecycle is in-memory bookkeeping rather than a
+        // formatted write to a shared writer.
+        let state_guard = self
+            .inner
+            .state
+            .write()
+            .instrument(tracing::debug_span!("index_install_wait"))
+            .await;
+        let install = async move {
+            let mut state = state_guard;
 
             // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
             state
@@ -492,10 +552,17 @@ impl LedgerHandle {
             // the M2a scan path even on snapshots with on-disk arenas.
             snap.content_store = Some(Arc::clone(&cs));
 
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
+
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
             *self.inner.binary_store.write().await = Some(arc_store);
-        }
+            Ok::<(), ApiError>(())
+        };
+        install
+            .instrument(tracing::debug_span!("index_install_lock"))
+            .await?;
 
         Ok(())
     }
@@ -730,10 +797,34 @@ impl Default for LedgerManagerConfig {
         Self {
             idle_ttl: Duration::from_secs(30 * 60),
             sweep_interval: Duration::from_secs(60),
-            cache_dir: std::env::temp_dir().join("fluree_binary_cache"),
+            cache_dir: default_cache_dir(),
             leaflet_cache: None,
         }
     }
+}
+
+/// A temp-dir-backed cache path under `leaf`.
+///
+/// wasm32 has no filesystem and `std::env::temp_dir()` PANICS there ("no
+/// filesystem on this platform"), so every cache-path site must route
+/// through here rather than calling it directly — this is the one place
+/// that knows the wasm arm exists. The synthetic path is never touched at
+/// runtime: the disk cache opens with a zero write budget
+/// (`fs::create_dir_all` fails → writes disabled) and reads map
+/// `Unsupported` to a cache miss.
+pub(crate) fn temp_cache_dir(leaf: &str) -> PathBuf {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::temp_dir().join(leaf)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        PathBuf::from("/").join(leaf)
+    }
+}
+
+fn default_cache_dir() -> PathBuf {
+    temp_cache_dir("fluree_binary_cache")
 }
 
 // ============================================================================
@@ -741,6 +832,38 @@ impl Default for LedgerManagerConfig {
 // ============================================================================
 
 use fluree_db_query::BinaryRangeProvider;
+
+/// Residency mode (F8): prewarm the reverse-dict leaves that overlay
+/// translation of this snapshot's novelty will touch, in one concurrent
+/// fetch round at load time. Novelty replay stays the load model; its
+/// query-time miss sources (sync `find_subject_id_by_parts` /
+/// `find_string_id` per novelty entry) are prefetched here so a cold
+/// residency peer does not spend a retry round per reverse-tree leaf.
+/// Best-effort: failures fall back to the query-entry retry loop.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+async fn prefetch_novelty_translation(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    dict_novelty: &fluree_db_core::dict_novelty::DictNovelty,
+) {
+    if dict_novelty.subjects.is_empty() && dict_novelty.strings.is_empty() {
+        return;
+    }
+    let outcome = store
+        .prefetch_novelty_reverse_wants(
+            dict_novelty.subjects.iter_entries(),
+            dict_novelty.strings.iter_values(),
+            fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+        )
+        .await;
+    if outcome.wanted > 0 {
+        tracing::debug!(
+            wanted = outcome.wanted,
+            newly_resident = outcome.newly_resident,
+            failures = outcome.failures.len(),
+            "novelty reverse-leaf prefetch at load"
+        );
+    }
+}
 
 /// Load BinaryIndexStore from a v2 index root, attach range_provider
 /// to the LedgerState's LedgerSnapshot, and return the Arc'd store.
@@ -846,6 +969,10 @@ pub(crate) async fn load_and_attach_binary_store(
     // would always be false on snapshots loaded outside the
     // LedgerManager handle path.
     snap.content_store = Some(Arc::clone(&cs));
+
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
+
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
     // graph-scoped BinaryRangeProviders (needed for named-graph upsert deletions).
@@ -1020,13 +1147,7 @@ impl LedgerManager {
         &self,
         ledger_id: &str,
     ) -> Option<RunningAttachmentEvents> {
-        let canonical_alias =
-            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
-        let entries = self.entries.read().await;
-        let entry = entries.get(&canonical_alias)?;
-        let LoadState::Ready(handle) = entry else {
-            return None;
-        };
+        let handle = self.ready_handle(ledger_id).await?;
         let view = handle.snapshot().await;
         // Coverage heuristic: when the snapshot's `t` is zero, no
         // index has ever run on this ledger, so the running
@@ -1087,14 +1208,29 @@ impl LedgerManager {
     /// the provider needs the snapshot + range_provider to scan the
     /// base index for `f:reifies*` flakes itself.
     pub async fn get_loaded_view(&self, ledger_id: &str) -> Option<LedgerView> {
+        let handle = self.ready_handle(ledger_id).await?;
+        Some(handle.snapshot().await)
+    }
+
+    /// Clone out a `Ready` handle, releasing the `entries` guard before
+    /// returning.
+    ///
+    /// Every caller that goes on to touch the handle's `state` lock must
+    /// come through here. Holding `entries` across a `state` acquisition
+    /// is the one ordering this file forbids: a transaction holds
+    /// `state` for its whole commit, so a reader parked behind it while
+    /// still holding `entries` blocks the next `entries.write()` — a
+    /// cold load of any ledger — and, because the lock is write-fair,
+    /// every `entries.read()` after that. The manager wedges for the
+    /// duration of an unrelated write.
+    async fn ready_handle(&self, ledger_id: &str) -> Option<LedgerHandle> {
         let canonical_alias =
             normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
         let entries = self.entries.read().await;
-        let entry = entries.get(&canonical_alias)?;
-        let LoadState::Ready(handle) = entry else {
-            return None;
-        };
-        Some(handle.snapshot().await)
+        match entries.get(&canonical_alias) {
+            Some(LoadState::Ready(handle)) => Some(handle.clone()),
+            _ => None,
+        }
     }
 
     /// Return the already-cached handle for `ledger_id`, or `None` when it is
@@ -1551,6 +1687,15 @@ impl LedgerManager {
                             let mut bs_guard = handle.inner.binary_store.write().await;
                             write_guard.replace(new_state);
                             *bs_guard = new_binary_store;
+                            // Out-of-band swap: any resolved-config entry may
+                            // have been cached against a state this swap just
+                            // replaced — including a detached-commit
+                            // placeholder whose marker (0) a reloaded state
+                            // can legitimately share. See `config_cache_clear`.
+                            // Taking the config lock while holding `state` is
+                            // safe: no path acquires `state` while holding the
+                            // config lock.
+                            handle.config_cache_clear().await;
                         } else {
                             // A concurrent commit advanced the in-memory state
                             // past the reloaded storage HEAD (a txn took the
@@ -2664,6 +2809,87 @@ mod tests {
             let entries = mgr.entries.read().await;
             assert_eq!(entries.len(), 0);
         }
+    }
+
+    // ========================================================================
+    // Lock order: never hold `entries` across a handle `state` lock
+    // ========================================================================
+
+    fn ready_handle(alias: &str) -> LedgerHandle {
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+        let state = LedgerState::new(LedgerSnapshot::genesis(alias), Novelty::new(1));
+        LedgerHandle::new(alias.to_string(), state, None)
+    }
+
+    /// The shape of the wedge a writer can cause: a transaction holds
+    /// ledger A's `state` write lock for its whole commit, and a
+    /// background reader snapshots A while still holding the global
+    /// `entries` guard. That reader now parks on A's state lock *with
+    /// `entries` held*, and because tokio's `RwLock` is write-fair, the
+    /// next `entries.write()` — a cold load of any other ledger — queues,
+    /// and every `entries.read()` after it queues too. `ledger_cached`
+    /// on a ledger that has nothing to do with A blocks until A's
+    /// transaction finishes.
+    ///
+    /// Drives the two offenders and asserts the manager stays usable.
+    #[tokio::test]
+    async fn snapshot_readers_release_entries_before_taking_state() {
+        let mgr = Arc::new(make_test_manager());
+        let handle = ready_handle("busy:main");
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert("busy:main".to_string(), LoadState::Ready(handle.clone()));
+        }
+
+        // A transaction in flight on `busy:main`.
+        let in_flight = handle.lock_for_write().await;
+
+        // Two background readers that snapshot the busy ledger. Each
+        // must park on `state`, not on `entries`.
+        let reader_a = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.try_running_attachment_events("busy:main").await })
+        };
+        let reader_b = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.get_loaded_view("busy:main").await })
+        };
+        tokio::task::yield_now().await;
+
+        // While those readers are parked, the manager must still admit
+        // a writer to `entries` (what a cold load of an unrelated ledger
+        // needs) and readers behind it.
+        let unrelated = tokio::time::timeout(Duration::from_millis(500), async {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "other:main".to_string(),
+                LoadState::Ready(ready_handle("other:main")),
+            );
+            drop(entries);
+            mgr.current_t("other:main").await
+        })
+        .await;
+        assert!(
+            unrelated
+                .expect("entries must not be wedged by a reader parked on a state lock")
+                .is_some(),
+            "the unrelated ledger must be reachable",
+        );
+
+        // Release the transaction; the parked readers complete normally.
+        drop(in_flight);
+        let a = tokio::time::timeout(Duration::from_secs(2), reader_a)
+            .await
+            .expect("reader A completes once the writer is done")
+            .expect("reader A does not panic");
+        assert!(a.is_some());
+        let b = tokio::time::timeout(Duration::from_secs(2), reader_b)
+            .await
+            .expect("reader B completes once the writer is done")
+            .expect("reader B does not panic");
+        assert!(b.is_some());
     }
 
     // ========================================================================

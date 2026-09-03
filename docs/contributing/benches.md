@@ -109,8 +109,20 @@ Numbers are percent regression allowed vs. the committed baseline. Omit a
 scale to fall back to `default_budget_pct` (5%). The CI gate fails if an
 observed run exceeds the budget for any listed scale.
 
-If you don't yet have a baseline, leave the entries empty — `default_budget_pct`
-applies. After your first nightly run lands a baseline, tighten the budget.
+Give every bench at least one scale. The reconciler treats an empty map the
+same as a missing one (`workspace_reconcile.rs` tests `!m.is_empty()`), so
+`"<category>_<name>": {}` fails the gate rather than falling back to
+`default_budget_pct`. If you don't yet have a baseline, copy the numbers from
+a sibling bench in the same category — they are placeholders until the first
+nightly run lands a baseline, and you tighten them in a follow-up once it
+exists.
+
+Verify before you push — this is the gate that catches a missing entry, and it
+is much cheaper than a CI round-trip:
+
+```bash
+cargo test -p fluree-bench-support --test workspace_reconcile
+```
 
 ### 6. Document if you added a new category
 
@@ -208,7 +220,7 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `import` | bulk Turtle / N-Quads / JSON-LD ingest | `fluree-db-api/benches/import_bulk.rs` |
 | `transact` | stage + commit | `fluree-db-api/benches/transact_commit.rs` |
 | `reindex` | full reindex; incremental | `fluree-db-api/benches/reindex_full.rs`, `fluree-db-api/benches/reindex_incremental.rs` |
-| `query_hot` | warm-cache query latency | `fluree-db-api/benches/query_hot_bsbm.rs` (BSBM Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break), `fluree-db-api/benches/query_hot_whole_graph_agg.rs` (Cypher metadata-lane aggregate folds vs. pipeline baseline) |
+| `query_hot` | warm-cache query latency | `fluree-db-api/benches/query_hot_bsbm.rs` (BSBM Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break), `fluree-db-api/benches/query_hot_property_path.rs` (property-path traversal), `fluree-db-api/benches/query_hot_whole_graph_agg.rs` (Cypher metadata-lane aggregate folds vs. pipeline baseline), `fluree-db-api/benches/query_hot_fanout_star.rs` (same-subject star with an unprojected fan-out object — the property-join semijoin demotion) |
 | `query_cold` | reload + first-query latency | `fluree-db-api/benches/query_cold_reload.rs` |
 | `novelty` | replay, catch-up, bulk-apply | `fluree-db-api/benches/novelty_replay.rs` |
 | `vector_math` | SIMD vs scalar math micro-benches | `fluree-db-query/benches/vector_math.rs` |
@@ -216,6 +228,7 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `insert_formats` | JSON-LD vs Turtle insert format comparison | `fluree-db-api/benches/insert_formats.rs` |
 | `vector_query` | end-to-end vector similarity through the query engine | `fluree-db-api/benches/vector_query.rs` |
 | `fulltext_query` | full-text scoring through novelty + index | `fluree-db-api/benches/fulltext_query.rs` |
+| `graphql_schema` | GraphQL schema derivation + registration, and the GraphQL request path against the JSON-LD query it lowers to | `fluree-db-api/benches/graphql_schema.rs` |
 
 **Reserved categories** (not yet in use; add a row here when you ship
 the first bench under that prefix): `core` (foundational ops —

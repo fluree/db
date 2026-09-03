@@ -1082,6 +1082,123 @@ fn parse_inline_reverse_key(key: &str, ctx: &JsonLdParseCtx) -> Result<Option<St
 
 /// Parse a selection-level array (the value of a hydration `{key: [...]}`)
 /// into either a `Wildcard` or `Explicit` level.
+/// A nested selection's parts: the selection array (absent for a literal-valued
+/// property, which has nothing to expand) and its per-value modifiers.
+type ModifiedSelection<'a> = (
+    Option<&'a [JsonValue]>,
+    Option<Box<ast::UnresolvedNestedModifiers>>,
+);
+
+/// The object form of a nested selection: `select` plus per-value modifiers.
+///
+/// Returns the selection array alongside the modifiers, so the caller parses the
+/// level exactly as it would the bare array form.
+fn parse_modified_selection<'a>(
+    value: &'a JsonValue,
+    ctx: &JsonLdParseCtx,
+) -> Result<ModifiedSelection<'a>> {
+    let map = value.as_object().expect("caller matched an object");
+
+    for key in map.keys() {
+        if !matches!(key.as_str(), "select" | "orderBy" | "limit" | "offset") {
+            return Err(ParseError::InvalidSelect(format!(
+                "unknown key `{key}` in a nested selection; expected `select`, `orderBy`, \
+                 `limit` or `offset`"
+            )));
+        }
+    }
+
+    // `select` is optional: a literal-valued property has nothing to expand, so
+    // `{"ex:tag": {"limit": 3}}` is meaningful on its own.
+    let select = match map.get("select") {
+        None | Some(JsonValue::Null) => None,
+        Some(v) => Some(v.as_array().ok_or_else(|| {
+            ParseError::InvalidSelect("`select` in a nested selection must be an array".to_string())
+        })?),
+    };
+
+    let mut modifiers = ast::UnresolvedNestedModifiers::default();
+    if let Some(order) = map.get("orderBy") {
+        modifiers.order = parse_nested_order(order, ctx)?;
+    }
+    modifiers.limit = parse_nested_count(map.get("limit"), "limit")?;
+    modifiers.offset = parse_nested_count(map.get("offset"), "offset")?;
+
+    if modifiers.is_noop() && select.is_none() {
+        return Err(ParseError::InvalidSelect(
+            "a nested selection object needs at least one of `select`, `orderBy`, `limit` \
+             or `offset`"
+                .to_string(),
+        ));
+    }
+
+    Ok((
+        select.map(Vec::as_slice),
+        (!modifiers.is_noop()).then(|| Box::new(modifiers)),
+    ))
+}
+
+/// `orderBy` for a nested selection: a predicate name, `["desc", name]`, or
+/// `"@value"` to order by the values themselves.
+fn parse_nested_order(
+    value: &JsonValue,
+    ctx: &JsonLdParseCtx,
+) -> Result<Vec<ast::UnresolvedNestedOrderKey>> {
+    let items = match value {
+        JsonValue::Array(items) => items.clone(),
+        other => vec![other.clone()],
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let (descending, key) = match &item {
+            JsonValue::Array(pair) if pair.len() == 2 => {
+                let dir = pair[0].as_str().ok_or_else(|| {
+                    ParseError::InvalidSelect(
+                        "nested orderBy direction must be \"asc\" or \"desc\"".to_string(),
+                    )
+                })?;
+                match dir {
+                    "desc" => (true, pair[1].clone()),
+                    "asc" => (false, pair[1].clone()),
+                    other => {
+                        return Err(ParseError::InvalidSelect(format!(
+                        "unknown nested orderBy direction `{other}`; expected \"asc\" or \"desc\""
+                    )))
+                    }
+                }
+            }
+            other => (false, other.clone()),
+        };
+        let name = key.as_str().ok_or_else(|| {
+            ParseError::InvalidSelect("nested orderBy key must be a string".to_string())
+        })?;
+        // `@value` / `@id` order by the value itself: the literal for a
+        // literal-valued property, and the subject IRI for an expanded node.
+        // Neither has a predicate to read.
+        let predicate = if name == "@value" || name == "@id" {
+            None
+        } else {
+            Some(ctx.expand_vocab(name)?.0)
+        };
+        out.push(ast::UnresolvedNestedOrderKey {
+            predicate,
+            descending,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_nested_count(value: Option<&JsonValue>, key: &str) -> Result<Option<usize>> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(v) => v.as_u64().map(|n| Some(n as usize)).ok_or_else(|| {
+            ParseError::InvalidSelect(format!(
+                "`{key}` in a nested selection must be a non-negative integer"
+            ))
+        }),
+    }
+}
+
 fn parse_selection_level(
     arr: &[JsonValue],
     ctx: &JsonLdParseCtx,
@@ -1114,6 +1231,7 @@ fn parse_selection_level(
                 forward.push(UnresolvedForwardItem::Property {
                     predicate: node_map::RDF_TYPE.to_string(),
                     sub_spec: None,
+                    modifiers: None,
                 });
             }
             // Property name: "ex:name" or inline "@reverse:ex:friend"
@@ -1128,6 +1246,7 @@ fn parse_selection_level(
                         forward.push(UnresolvedForwardItem::Property {
                             predicate: expanded,
                             sub_spec: None,
+                            modifiers: None,
                         });
                     }
                 }
@@ -1142,14 +1261,36 @@ fn parse_selection_level(
 
                 let (pred_str, sub_specs_val) = map.iter().next().unwrap();
 
-                let sub_arr = sub_specs_val.as_array().ok_or_else(|| {
-                    ParseError::InvalidSelect("nested selection value must be an array".to_string())
-                })?;
+                // Two forms. The array form is the selection alone; the object
+                // form adds per-value ordering and paging around it:
+                //   {"ex:friend": ["@id", "ex:name"]}
+                //   {"ex:friend": {"select": ["@id"], "orderBy": ["ex:name"], "limit": 5}}
+                let (sub_arr, modifiers) = match sub_specs_val {
+                    JsonValue::Array(items) => (Some(items.as_slice()), None),
+                    JsonValue::Object(_) => parse_modified_selection(sub_specs_val, ctx)?,
+                    _ => {
+                        return Err(ParseError::InvalidSelect(
+                            "nested selection value must be an array, or an object of \
+                             `select`/`orderBy`/`limit`/`offset`"
+                                .to_string(),
+                        ))
+                    }
+                };
 
-                let sub_level = parse_selection_level(sub_arr, ctx)?;
-                let nested = make_nested_spec(sub_level);
+                // No `select` means the values themselves, unexpanded — the same
+                // as the bare `"ex:tag"` string form, with modifiers attached.
+                let nested = match sub_arr {
+                    Some(arr) => make_nested_spec(parse_selection_level(arr, ctx)?),
+                    None => None,
+                };
 
                 if let Some(rev_iri) = parse_inline_reverse_key(pred_str, ctx)? {
+                    if modifiers.is_some() {
+                        return Err(ParseError::InvalidSelect(format!(
+                            "`{pred_str}` is a reverse selection, which does not accept \
+                             `orderBy`/`limit`/`offset` yet"
+                        )));
+                    }
                     reverse.insert(rev_iri, nested);
                 } else if pred_str == "@type"
                     || pred_str == "type"
@@ -1161,6 +1302,7 @@ fn parse_selection_level(
                     forward.push(UnresolvedForwardItem::Property {
                         predicate: node_map::RDF_TYPE.to_string(),
                         sub_spec: nested,
+                        modifiers,
                     });
                 } else {
                     let (expanded, entry) = ctx.expand_vocab(pred_str)?;
@@ -1174,11 +1316,13 @@ fn parse_selection_level(
                         forward.push(UnresolvedForwardItem::Property {
                             predicate: expanded,
                             sub_spec: Some(boxed),
+                            modifiers,
                         });
                     } else {
                         forward.push(UnresolvedForwardItem::Property {
                             predicate: expanded,
                             sub_spec: None,
+                            modifiers,
                         });
                     }
                 }
@@ -1199,6 +1343,7 @@ fn parse_selection_level(
             if let UnresolvedForwardItem::Property {
                 predicate,
                 sub_spec: Some(boxed),
+                ..
             } = item
             {
                 refinements.insert(predicate, boxed);

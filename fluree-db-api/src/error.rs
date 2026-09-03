@@ -248,6 +248,16 @@ pub enum ApiError {
     #[error("Invalid configuration: {0}")]
     Config(String),
 
+    /// Faults in a ledger's stored config graph.
+    ///
+    /// Distinct from [`Config`](Self::Config), which covers configuration the
+    /// caller supplies and is therefore a 400. The config graph is operator
+    /// data: no request can cause a fault in it and no change to a request can
+    /// clear one, so telling the caller their request was bad sends them
+    /// looking in the wrong place.
+    #[error("Ledger configuration error: {0}")]
+    LedgerConfig(String),
+
     /// A materialize pass's subject accumulator outgrew its memory budget.
     ///
     /// A pre-OOM circuit breaker, not an allocator meter: the bytes are
@@ -460,7 +470,7 @@ pub enum ApiError {
 
     /// Indexer crate errors
     #[error("Indexer error: {0}")]
-    Indexer(#[from] fluree_db_indexer::IndexerError),
+    Indexer(#[from] crate::wasm_compat::IndexerError),
 
     /// Builder validation errors (one or more problems with builder configuration)
     #[error("{0}")]
@@ -507,6 +517,11 @@ impl ApiError {
     /// Create a configuration error
     pub fn config(msg: impl Into<String>) -> Self {
         ApiError::Config(msg.into())
+    }
+
+    /// Create an error describing a fault in the ledger's stored config graph.
+    pub fn ledger_config(msg: impl Into<String>) -> Self {
+        ApiError::LedgerConfig(msg.into())
     }
 
     /// Create a SPARQL error with diagnostics
@@ -607,7 +622,7 @@ impl ApiError {
             ApiError::NoveltyDeferred { .. } => 503,
             ApiError::IndexingDisabled => 400, // Bad Request
             ApiError::Indexer(e) => {
-                use fluree_db_indexer::IndexerError;
+                use crate::wasm_compat::IndexerError;
                 match e {
                     IndexerError::LedgerNotFound(_) => 404,
                     IndexerError::NoCommits => 400,
@@ -630,6 +645,9 @@ impl ApiError {
                 fluree_db_query::QueryError::StorageAccessDenied { .. }
                 | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. },
             ) => 403,
+            // A malformed ledger config graph is the operator's to fix, and no
+            // change to the request can clear it.
+            ApiError::LedgerConfig(_) => 500,
             // Most errors are client errors (bad input)
             ApiError::Parse(_)
             | ApiError::Query(_)
@@ -649,6 +667,29 @@ impl ApiError {
                 | fluree_db_transact::TransactError::PublishLostRace { .. }
                 | fluree_db_transact::TransactError::NamespaceConflict(_),
             ) => 409,
+            // 413: the transaction's own delta meets or exceeds
+            // `reindex_max_bytes` (the commit check is `current + delta >=
+            // max`, so with drained novelty this still fails) — no amount of
+            // indexer draining can ever admit it. A 503 here would tell the
+            // client to retry a request that can never work; 413 says the
+            // payload itself is the problem. MUST precede the drainable
+            // novelty arm below.
+            ApiError::Transact(fluree_db_transact::TransactError::NoveltyWouldExceed {
+                delta_bytes,
+                max_bytes,
+                ..
+            }) if delta_bytes >= max_bytes => 413,
+            // 503 + retryable: novelty backpressure, the same class as
+            // `NoveltyDeferred` above. `NoveltyAtMax` (novelty already at
+            // `reindex_max_bytes`) and drainable `NoveltyWouldExceed` (this
+            // delta would cross it, but fits once novelty drains) are cleared
+            // by the indexer, not by changing the request — a 400 tells
+            // retrying clients the write is permanently invalid and to drop
+            // it.
+            ApiError::Transact(
+                fluree_db_transact::TransactError::NoveltyAtMax
+                | fluree_db_transact::TransactError::NoveltyWouldExceed { .. },
+            ) => 503,
             // Other transaction errors are usually validation failures
             ApiError::Transact(_) => 400,
             // Cross-ledger model dependency could not be resolved /

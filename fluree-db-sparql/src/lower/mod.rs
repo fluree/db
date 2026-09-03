@@ -1052,6 +1052,149 @@ mod tests {
         );
     }
 
+    fn first_triple(query: &Query) -> &fluree_db_query::ir::TriplePattern {
+        query
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Triple(tp) => Some(tp),
+                _ => None,
+            })
+            .expect("a triple pattern")
+    }
+
+    /// String objects carry their term identity into the scan; bare
+    /// numerics stay unconstrained (lenient across numeric subtypes).
+    #[test]
+    fn triple_object_literals_carry_string_term_constraints() {
+        use fluree_db_core::DatatypeConstraint;
+        use fluree_vocab::{namespaces::XSD, xsd_names};
+
+        let tagged = lower_query(
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"bob\"@en }",
+        )
+        .unwrap();
+        assert_eq!(
+            first_triple(&tagged).dtc,
+            Some(DatatypeConstraint::LangTag("en".into()))
+        );
+
+        let plain =
+            lower_query("PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:name \"bob\" }")
+                .unwrap();
+        assert_eq!(
+            first_triple(&plain).dtc,
+            Some(DatatypeConstraint::Explicit(Sid::new(
+                XSD,
+                xsd_names::STRING
+            )))
+        );
+
+        let typed = lower_query(
+            "PREFIX ex: <http://example.org/> \
+             PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             SELECT ?s WHERE { ?s ex:name \"bob\"^^xsd:string }",
+        )
+        .unwrap();
+        assert_eq!(
+            first_triple(&typed).dtc,
+            Some(DatatypeConstraint::Explicit(Sid::new(
+                XSD,
+                xsd_names::STRING
+            )))
+        );
+
+        let numeric =
+            lower_query("PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:age 25 }")
+                .unwrap();
+        assert_eq!(first_triple(&numeric).dtc, None);
+
+        // Property-path endpoints take the same rule.
+        fn walk<'a>(ps: &'a [Pattern], out: &mut Vec<&'a fluree_db_query::ir::TriplePattern>) {
+            for p in ps {
+                match p {
+                    Pattern::Triple(tp) => out.push(tp),
+                    Pattern::Union(arms) => arms.iter().for_each(|a| walk(a, out)),
+                    _ => {}
+                }
+            }
+        }
+        let path = lower_query(
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE { ?s ex:a|ex:b \"bob\"@fr }",
+        )
+        .unwrap();
+        let mut triples = Vec::new();
+        walk(&path.patterns, &mut triples);
+        assert!(
+            triples.len() >= 2,
+            "both alternation arms lowered to triples"
+        );
+        for tp in triples {
+            assert_eq!(tp.dtc, Some(DatatypeConstraint::LangTag("fr".into())));
+        }
+    }
+
+    /// A datatype IRI whose namespace is not registered lowers to the
+    /// EMPTY-namespace full-IRI Sid — a constraint no stored row carries,
+    /// so the pattern matches nothing (#1686). The old fallback rewrote it
+    /// to `xsd:string`, silently matching every plain-string row. Both
+    /// term-identity sites take the same rule: triple-pattern constraints
+    /// and VALUES rows.
+    #[test]
+    fn unregistered_datatype_lowers_to_match_nothing_sid() {
+        use fluree_db_core::DatatypeConstraint;
+        use fluree_db_query::binding::Binding;
+        use fluree_vocab::namespaces::EMPTY;
+
+        let bogus = "http://no-such-namespace.example.com/NoSuchType";
+        let expected_sid = Sid::new(EMPTY, bogus);
+
+        let pattern = lower_query(&format!(
+            "PREFIX ex: <http://example.org/> SELECT ?s WHERE {{ ?s ex:p \"a\"^^<{bogus}> }}"
+        ))
+        .unwrap();
+        assert_eq!(
+            first_triple(&pattern).dtc,
+            Some(DatatypeConstraint::Explicit(expected_sid.clone())),
+            "triple-pattern constraint must name the unregistered IRI, not xsd:string"
+        );
+
+        let values = lower_query(&format!(
+            "PREFIX ex: <http://example.org/> \
+             SELECT ?s WHERE {{ VALUES ?o {{ \"a\"^^<{bogus}> }} ?s ex:p ?o }}"
+        ))
+        .unwrap();
+        let row_binding = values
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Values { rows, .. } => rows.first().and_then(|r| r.first()),
+                _ => None,
+            })
+            .expect("a VALUES row");
+        match row_binding {
+            Binding::Lit { dtc, .. } => assert_eq!(
+                dtc,
+                &DatatypeConstraint::Explicit(expected_sid),
+                "VALUES row must carry the unregistered IRI, not xsd:string"
+            ),
+            other => panic!("expected literal binding, got {other:?}"),
+        }
+
+        // Control: a datatype in a REGISTERED namespace keeps its canonical
+        // Sid (the fix must not widen to registered custom datatypes).
+        let custom = lower_query(
+            "PREFIX ex: <http://example.org/> \
+             SELECT ?s WHERE { ?s ex:p \"z\"^^ex:Custom }",
+        )
+        .unwrap();
+        assert_eq!(
+            first_triple(&custom).dtc,
+            Some(DatatypeConstraint::Explicit(Sid::new(100, "Custom"))),
+            "registered namespaces still resolve to their canonical Sid"
+        );
+    }
+
     fn lower_query(sparql: &str) -> Result<Query> {
         lower_query_with_vars(sparql).map(|(q, _)| q)
     }

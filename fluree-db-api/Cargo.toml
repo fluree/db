@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 default = ["native"]
-native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "dep:sysinfo"]
+native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "fluree-db-connection/native", "dep:sysinfo"]
 # Enable AWS-backed storage support (S3, storage-backed nameservice,
 # vended-credential minting).
 aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts"]
@@ -17,6 +17,10 @@ aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts
 # Arrow columnar reader is the single graph-source read path (native predicate
 # pushdown: row-group skipping + exact row filtering).
 iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws"]
+# SQL graph sources (R2RML over a Trino-protocol endpoint). Stacks on `iceberg`
+# because the graph-source provider dispatch lives there; the crate itself adds
+# only an HTTP client, no database drivers.
+sql = ["iceberg", "dep:fluree-db-sql"]
 # Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
 aws-testcontainers = [
   "dep:fluree-db-storage-aws",
@@ -30,36 +34,43 @@ aws-testcontainers = [
 credential = ["dep:fluree-db-credential"]
 # SHACL validation (requires fluree-db-transact + fluree-db-shacl)
 shacl = ["dep:fluree-db-shacl", "fluree-db-transact/shacl"]
+# GraphQL endpoint (schema derived from ledger metadata; pulls in async-graphql)
+# Tier 2 reads SHACL shapes, so `shacl` comes with it.
+graphql = ["dep:fluree-db-graphql", "shacl"]
 # Temporary benchmark examples (opt-in so `cargo test` stays fast)
 benchmarks = []
 # Remote search client (HTTP client for remote search service)
 search-remote-client = ["dep:reqwest"]
 # Embedded vector search (HNSW-based approximate nearest neighbor)
 vector = ["fluree-db-query/vector"]
+# Store-driven sync residency mode (wasm32 has it unconditionally): compiles
+# the query-entry retry loop, the load-time novelty prefetch, and the read
+# arms beneath them, engaged at runtime only by miss-register-bearing stores.
+# Native production builds keep this off and compile the pre-residency paths.
+residency = ["fluree-db-query/residency", "fluree-db-binary-index/residency"]
 # IPFS-backed storage (via Kubo HTTP RPC)
 ipfs = ["dep:fluree-db-storage-ipfs"]
 # Convenience bundle (excludes vector, aws, and test-only features)
-full = ["native", "credential", "iceberg", "shacl", "ipfs"]
+full = ["native", "credential", "iceberg", "sql", "shacl", "ipfs", "graphql"]
 
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
 parking_lot = "0.12"
 lru = { workspace = true }
 fluree-db-crypto = { path = "../fluree-db-crypto", features = ["nameservice"] }
-fluree-db-connection = { path = "../fluree-db-connection" }
+fluree-db-connection = { path = "../fluree-db-connection", default-features = false }
 fluree-db-policy = { path = "../fluree-db-policy" }
 fluree-db-query = { path = "../fluree-db-query" }
 fluree-db-ledger = { path = "../fluree-db-ledger" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
-fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
-fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-db-cypher = { path = "../fluree-db-cypher" }
-fluree-db-spatial = { path = "../fluree-db-spatial" }
+fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
+fluree-db-sql = { path = "../fluree-db-sql", optional = true }
 fluree-db-tabular = { path = "../fluree-db-tabular" }
 fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true }
 fluree-db-storage-ipfs = { path = "../fluree-db-storage-ipfs", optional = true }
@@ -79,14 +90,13 @@ bytes = "1.4"
 chrono.workspace = true
 futures.workspace = true
 indexmap.workspace = true
-moka.workspace = true
+# moka is native-only: its eviction clock aborts on wasm32 (see fluree-db-core::wasm_cache)
 rustc-hash = "2"
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # SHA-256 of the R2RML mapping for the materialize twin's completion stamp.
 sha2.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 # Used for fast xxh3_128 hashing in streaming dictionary merge.
 xxhash-rust.workspace = true
@@ -112,7 +122,6 @@ aws-sdk-sts = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 
 # Platform directory resolution (XDG on Linux, Application Support on macOS)
-dirs = "5"
 
 # System memory detection for import memory budget auto-sizing (native only)
 sysinfo = { workspace = true, optional = true }
@@ -140,6 +149,17 @@ fluree-bench-support = { path = "../fluree-bench-support" }
 fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+wiremock = { workspace = true }
+# Residency-mode read arms for the wasm read-path recovery tests
+# (it_residency_retry): dev-only feature unification — production native
+# builds keep the feature off and compile the pre-residency read path.
+fluree-db-query = { path = "../fluree-db-query", features = ["residency"] }
+fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["residency"] }
+
+[[test]]
+name = "it_residency_retry"
+path = "tests/it_residency_retry.rs"
+required-features = ["residency"]
 
 [[test]]
 name = "grp_graphsource"
@@ -171,6 +191,13 @@ required-features = ["iceberg", "native"]
 name = "it_iceberg_warehouse_root"
 path = "tests/it_iceberg_warehouse_root.rs"
 required-features = ["iceberg", "native"]
+
+# End-to-end over a SQL graph source against a fake Trino-protocol endpoint
+# (wiremock), through registration, the R2RML query path and pushdown.
+[[test]]
+name = "it_sql_graph_source"
+path = "tests/it_sql_graph_source.rs"
+required-features = ["sql", "native"]
 
 [[test]]
 name = "grp_index"
@@ -212,11 +239,50 @@ path = "tests/grp_reasoning.rs"
 name = "grp_transact"
 path = "tests/grp_transact.rs"
 
+# Own binary: installs a process-global tracing subscriber and asserts on every
+# `fluree::cow_probe` event the process emits, so it must not share a process
+# with other tests that commit.
+[[test]]
+name = "it_cached_handle_cow"
+path = "tests/it_cached_handle_cow.rs"
+required-features = ["native"]
+
+# Own binary for the same reason (process-global `fluree::cow_probe` capture),
+# covering the branch-op (merge / revert) commit flows.
+[[test]]
+name = "it_branch_op_cow"
+path = "tests/it_branch_op_cow.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
 name = "it_count_datatype_pin"
 path = "tests/it_count_datatype_pin.rs"
+
+# Own binary for the same reason (kill switch + routing assertions).
+[[test]]
+name = "it_fastpath_1652_regression"
+path = "tests/it_fastpath_1652_regression.rs"
+
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_datetime_component_presence"
+path = "tests/it_datetime_component_presence.rs"
+
+[[test]]
+name = "it_timezone_accessors"
+path = "tests/it_timezone_accessors.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_temporal_lane_stability"
+path = "tests/it_temporal_lane_stability.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_temporal_arithmetic"
+path = "tests/it_temporal_arithmetic.rs"
+required-features = ["native"]
 
 # Own binary: asserts fast-path routing via process-scoped tracing capture.
 [[test]]
@@ -228,6 +294,11 @@ path = "tests/it_exists_semijoin_correlation.rs"
 [[test]]
 name = "it_repeated_var_fast_path_guards"
 path = "tests/it_repeated_var_fast_path_guards.rs"
+
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_count_star_row_multiplicity"
+path = "tests/it_count_star_row_multiplicity.rs"
 
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
@@ -243,6 +314,18 @@ path = "tests/it_cyclic_bgp_novelty_pred.rs"
 name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
 
+[[test]]
+name = "it_cyclic_bgp_string_dict"
+path = "tests/it_cyclic_bgp_string_dict.rs"
+
+# Own binary: asserts on a tracing event to pin that the BM25 incremental sync
+# really narrows its indexing query. Same convention and same two hazards as the
+# capture tests above — process-global callsite-interest cache, thread-local
+# `set_default`.
+[[test]]
+name = "it_bm25_sync_scoping"
+path = "tests/it_bm25_sync_scoping.rs"
+
 # Standalone (not in grp_misc): its process-scoped tracing capture + the
 # process-global callsite-interest cache require being the only test in its
 # process to avoid parallel-interleaving flake. Same convention as the span-
@@ -251,6 +334,13 @@ path = "tests/it_cyclic_bgp_probe.rs"
 name = "it_minmax_fast_path_fired"
 path = "tests/it_minmax_fast_path_fired.rs"
 
+# Standalone (not in grp_transact): asserts on the `upsert deletion subject
+# pre-check` tracing event via the thread-local span capture, so it must be the
+# only test in its process. Same convention as the span-capture tests above.
+[[test]]
+name = "it_upsert_skip_fires"
+path = "tests/it_upsert_skip_fires.rs"
+
 [[test]]
 name = "it_multi_graph_property_path"
 path = "tests/it_multi_graph_property_path.rs"
@@ -258,6 +348,10 @@ path = "tests/it_multi_graph_property_path.rs"
 [[test]]
 name = "it_cypher_seq_writes"
 path = "tests/it_cypher_seq_writes.rs"
+
+[[test]]
+name = "it_cypher_probe_reasoning"
+path = "tests/it_cypher_probe_reasoning.rs"
 
 [[test]]
 name = "it_query_cypher"
@@ -286,6 +380,11 @@ path = "tests/it_cypher_import.rs"
 [[test]]
 name = "it_query_explain"
 path = "tests/it_query_explain.rs"
+
+# Own binary: needs the background indexer to reach the indexed OPTIONAL lane.
+[[test]]
+name = "it_optional_after_union"
+path = "tests/it_optional_after_union.rs"
 
 [[test]]
 name = "it_query_sparql_indexed"
@@ -363,6 +462,11 @@ name = "fulltext_query"
 harness = false
 
 [[bench]]
+name = "graphql_schema"
+harness = false
+required-features = ["graphql"]
+
+[[bench]]
 name = "insert_formats"
 harness = false
 
@@ -372,6 +476,14 @@ harness = false
 
 [[bench]]
 name = "transact_commit"
+harness = false
+
+[[bench]]
+name = "transact_filtered_delete"
+harness = false
+
+[[bench]]
+name = "query_overlay_only_range"
 harness = false
 
 [[bench]]
@@ -394,6 +506,14 @@ harness = false
 name = "query_hot_bsbm"
 harness = false
 
+# Same-subject star with a fan-out predicate whose object var is unprojected —
+# the shape `PropertyJoinOperator`'s semijoin demotion serves. Its own fixture:
+# BSBM has no multi-valued same-subject predicate and adding one would move
+# `query_hot_bsbm`'s committed baseline for unrelated cases.
+[[bench]]
+name = "query_hot_fanout_star"
+harness = false
+
 [[bench]]
 name = "query_overlay_matrix"
 harness = false
@@ -407,8 +527,18 @@ name = "query_hot_property_path"
 harness = false
 
 [[bench]]
+name = "query_hot_optional"
+harness = false
+
+[[bench]]
 name = "query_hot_whole_graph_agg"
 harness = false
+
+[[test]]
+name = "it_absent_subject_scan_narrowing"
+
+[[test]]
+name = "it_values_object_bounds"
 
 [lints]
 workspace = true
@@ -420,3 +550,47 @@ harness = false
 [[bench]]
 name = "annotation_planner"
 harness = false
+
+[[test]]
+name = "it_batched_refs_overlay_lifecycle"
+path = "tests/it_batched_refs_overlay_lifecycle.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_filtered_delete_list_meta"
+path = "tests/it_filtered_delete_list_meta.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_literal_identity"
+path = "tests/it_literal_identity.rs"
+required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch AND asserts membership-join routing via span capture.
+[[test]]
+name = "it_membership_join_list_rows"
+path = "tests/it_membership_join_list_rows.rs"
+required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch AND asserts stats-merge routing via span capture.
+[[test]]
+name = "it_fast_stats_1391_regression"
+path = "tests/it_fast_stats_1391_regression.rs"
+required-features = ["native"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+moka = { workspace = true }
+fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
+fluree-db-indexer = { path = "../fluree-db-indexer" }
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+tokio = { workspace = true }
+# Platform directory resolution (XDG on Linux, Application Support on macOS)
+dirs = "5"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+fluree-db-transact = { path = "../fluree-db-transact" }
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "io-util"] }
+# Executor for `wasm_compat::spawn_detached` (browser event loop).
+wasm-bindgen-futures = "0.4"

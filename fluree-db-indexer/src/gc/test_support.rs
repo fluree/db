@@ -86,6 +86,7 @@ pub(crate) fn fir6_with_named_graph_for(
         has_annotations: false,
         annotation_index: None,
         had_annotation_arena: false,
+        has_list_meta: None,
         o_type_table: IndexRoot::build_o_type_table(&[], &[]),
         ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
     };

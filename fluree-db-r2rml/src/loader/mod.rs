@@ -259,3 +259,78 @@ mod tests {
             .is_some());
     }
 }
+
+#[cfg(all(test, feature = "turtle"))]
+mod sql_query_tests {
+    use super::R2rmlLoader;
+    use crate::mapping::LogicalTable;
+
+    const MAPPING: &str = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+
+        <http://example.org/m#Orders> a rr:TriplesMap ;
+            rr:logicalTable [ rr:sqlQuery """SELECT id, total FROM sales.orders WHERE status = 'open'""" ] ;
+            rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+            rr:predicateObjectMap [ rr:predicate ex:total ; rr:objectMap [ rr:column "total" ] ] .
+
+        <http://example.org/m#Customers> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sales.customers" ] ;
+            rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+    "#;
+
+    #[test]
+    fn sql_query_compiles_to_a_stable_alias_that_resolves_back_to_the_query() {
+        let compiled = R2rmlLoader::from_turtle(MAPPING)
+            .unwrap()
+            .compile()
+            .unwrap();
+        assert!(compiled.has_sql_queries());
+
+        let orders = compiled
+            .get("http://example.org/m#Orders")
+            .expect("orders map");
+        let alias = orders
+            .table_name()
+            .expect("alias stands in for the table name");
+        assert!(LogicalTable::is_sql_query_alias(alias), "{alias}");
+        assert_eq!(
+            compiled.sql_query_for_table(alias),
+            Some("SELECT id, total FROM sales.orders WHERE status = 'open'")
+        );
+        assert_eq!(compiled.sql_query_for_table("sales.customers"), None);
+
+        // Same query text → same alias, so caches keyed on the name are stable.
+        let again = R2rmlLoader::from_turtle(MAPPING)
+            .unwrap()
+            .compile()
+            .unwrap();
+        let alias_again = again
+            .triples_maps
+            .values()
+            .find(|tm| tm.iri.ends_with("#Orders"))
+            .and_then(|tm| tm.table_name())
+            .unwrap();
+        assert_eq!(alias, alias_again);
+
+        // Both maps are reachable by table name.
+        assert_eq!(compiled.find_maps_for_table(alias).len(), 1);
+        assert_eq!(compiled.find_maps_for_table("sales.customers").len(), 1);
+    }
+
+    #[test]
+    fn empty_sql_query_is_rejected() {
+        let mapping = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            <http://example.org/m#T> a rr:TriplesMap ;
+                rr:logicalTable [ rr:sqlQuery "  " ] ;
+                rr:subjectMap [ rr:template "http://example.org/{id}" ] .
+        "#;
+        let err = R2rmlLoader::from_turtle(mapping)
+            .unwrap()
+            .compile()
+            .unwrap_err();
+        assert!(err.to_string().contains("rr:sqlQuery"), "{err}");
+    }
+}
