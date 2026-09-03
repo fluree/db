@@ -384,13 +384,59 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // Add CORS if enabled
     if state.config.cors_enabled {
-        router = router.layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        );
+        router = router.layer(cors_layer());
     }
 
     router
+}
+
+/// CORS layer for browser clients.
+///
+/// Allowed request headers mirror the preflight's
+/// `Access-Control-Request-Headers`. The Fetch spec excludes
+/// `Authorization` from the `*` wildcard (it is a "CORS non-wildcard
+/// request-header name"), so `allow_headers(Any)` — which emits the literal
+/// `*` — broke bearer-token requests from browsers that enforce the rule.
+/// Mirroring covers `authorization` and every other header the API reads
+/// (the `fluree-*` policy/tracking headers, `idempotency-key`, trace ids,
+/// `range`, `if-none-match`, `last-event-id`, …) without a list to keep in
+/// sync.
+///
+/// This is **strictly more permissive** than the `*` it replaces, and
+/// deliberately so — the difference is the point of the change, not a side
+/// effect of it. Because `*` excludes `Authorization`, cross-origin
+/// *authenticated* requests were impossible before and are possible now. The
+/// consequence is real for an internal deployment: a page the user visits can
+/// reach an internal Fluree server with an `Authorization` header and read the
+/// response. That is not CSRF — there are no ambient credentials, so the page
+/// must already hold a token — but it does widen the browser-as-pivot surface,
+/// and it is the reason browser clients being first-class now makes an origin
+/// allow-list worth having (`cors_enabled` is currently a bool with
+/// `allow_origin(Any)` hardcoded).
+///
+/// The expose list makes response metadata — the
+/// Range/CAS headers and the `x-fdb-*` tracking headers — readable by
+/// browser JavaScript, which otherwise sees only the CORS-safelisted
+/// response headers.
+fn cors_layer() -> CorsLayer {
+    use axum::http::{header, HeaderName};
+    use tower_http::cors::AllowHeaders;
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers([
+            header::CONTENT_RANGE,
+            header::ETAG,
+            HeaderName::from_static("x-fluree-content-kind"),
+            HeaderName::from_static("x-fluree-block-type"),
+            HeaderName::from_static("x-fluree-policy-applied"),
+            HeaderName::from_static("x-fdb-time"),
+            HeaderName::from_static("x-fdb-fuel"),
+            HeaderName::from_static("x-fdb-policy"),
+            HeaderName::from_static("x-fdb-policy-enforcement"),
+            HeaderName::from_static("x-fdb-reasoning"),
+            HeaderName::from_static("x-fdb-warning"),
+        ])
+        .max_age(std::time::Duration::from_secs(86400))
 }

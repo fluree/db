@@ -383,13 +383,15 @@ pr-1; BASE↔G1 joint entries resolve at whichever lands second.
 
 **Post-implementation corrections to this roadmap:**
 
-- **`basic#list-1..4` do NOT green via PR-1** (contra §2's PR-1 row): Turtle
-  *ingest* stores object-position collections as Fluree `list_index` items and
-  drops `()` objects entirely (`parse_collection_as_list`,
-  fluree-graph-turtle), so the `rdf:first/rest` triples never exist in
-  storage. This is a new, owned-by-no-one ingest/model gap — **decision D-13**:
-  materialize first/rest at ingest vs translate at query time vs documented
-  divergence. Register comments updated in PR-1.
+- **`basic#list-2..4` do NOT green via PR-1** (contra §2's PR-1 row): Turtle
+  *ingest* stores object-position collections as Fluree `list_index` items
+  (`parse_collection_as_list`, fluree-graph-turtle), so the `rdf:first/rest`
+  triples never exist in storage. This is a new, owned-by-no-one ingest/model
+  gap — **decision D-13**: materialize first/rest at ingest vs translate at
+  query time vs documented divergence. Register comments updated in PR-1.
+  (When this was written ingest also dropped `()` objects entirely; the issue
+  #1694 fix now stores them as the `rdf:nil` triple they denote, which greened
+  `list-1` — its pattern needs no spine — and took it off this register.)
 - **`subquery12` is resolved by PR-1** (bare-`{SELECT}` misparse executing
   through error recovery) — remove it from PR-X2's scope; its probe item is
   closed, and it further evidences the diagnostic-swallowing hole PR-3 must

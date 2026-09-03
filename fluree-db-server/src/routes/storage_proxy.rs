@@ -328,6 +328,67 @@ fn parse_range_header(headers: &HeaderMap) -> Option<std::ops::Range<u64>> {
 }
 
 // ============================================================================
+// Conditional Requests
+// ============================================================================
+
+/// Cache policy for CAS object responses: the payload is content-addressed
+/// and immutable, so a cached copy is valid forever. `private` because the
+/// response was authorized by a bearer token; the public-visibility tier
+/// will relax this to `public` for ledgers that opt in.
+const OBJECT_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
+
+/// Paired with [`OBJECT_CACHE_CONTROL`], and load-bearing rather than
+/// decorative.
+///
+/// `private` keeps these bodies out of shared caches, but the browser's own
+/// cache is per *profile*, not per principal — and `immutable` means it never
+/// revalidates. Without the token in the cache key, principal A reading a
+/// ledger leaves entries that principal B, on the same browser profile, is
+/// served directly: the server never sees B's token and never gets to refuse
+/// it. `Vary` puts `Authorization` in that key, so a different token is a
+/// different entry.
+///
+/// The nameservice routes do not need this: [`NS_CACHE_CONTROL`] is
+/// `no-cache`, so every use revalidates and authorization re-runs on the
+/// server before anything is served.
+const OBJECT_VARY: &str = "Authorization";
+
+/// Cache policy for nameservice records: mutable state, so require
+/// revalidation — paired with the `ETag` this makes head polling a cheap
+/// 304 round-trip. `private` keeps shared caches from storing per-URL
+/// bodies once the public-visibility tier lifts the `Authorization` bar.
+const NS_CACHE_CONTROL: &str = "private, no-cache";
+
+/// True when an `If-None-Match` header names the given entity tag.
+///
+/// Handles comma-separated lists, comparing weakly (a `W/` prefix on
+/// either side is ignored) as RFC 9110 §13.1.2 prescribes for
+/// `If-None-Match`. The `*` form is deliberately not honored: it matches
+/// only when a current representation exists, and the object route
+/// answers before consulting storage.
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(value) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let target = etag.trim_start_matches("W/");
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate.trim_start_matches("W/") == target)
+}
+
+/// Entity tag for a serialized representation: a truncated SHA-256 of the
+/// exact bytes served, so any field change — heads, watermarks,
+/// `retracted`, `branches`, `serving` — yields a new validator.
+fn representation_etag(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("\"{}\"", hex::encode(&Sha256::digest(body)[..16]))
+}
+
+// ============================================================================
 // Ledger Resolution
 // ============================================================================
 
@@ -388,7 +449,8 @@ pub async fn get_ns_record(
     State(state): State<Arc<AppState>>,
     Path(ledger_id): Path<String>,
     StorageProxyBearer(principal): StorageProxyBearer,
-) -> Result<Json<NsRecordResponse>, ServerError> {
+    headers: HeaderMap,
+) -> Result<Response, ServerError> {
     // Check authorization for this specific ledger
     if !principal.is_authorized_for_ledger(&ledger_id) {
         // Return 404 for unauthorized (no existence leak)
@@ -416,7 +478,7 @@ pub async fn get_ns_record(
         }
     };
 
-    Ok(Json(NsRecordResponse {
+    let body = NsRecordResponse {
         // IMPORTANT: this endpoint is consumed by `fluree-db-nameservice-sync` which
         // deserializes into `NsRecord`. Therefore we must include all required
         // `NsRecord` fields with matching names and semantics.
@@ -445,7 +507,31 @@ pub async fn get_ns_record(
         source_branch: ns_record.source_branch.clone(),
         branches: ns_record.branches,
         serving,
-    }))
+    };
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| ServerError::internal(e.to_string()))?;
+
+    // Conditional GET: the validator identifies the whole representation
+    // (heads, watermarks, `retracted`, `branches`, `serving`), so an
+    // `If-None-Match` hit means the caller's copy is byte-identical to what
+    // would be served. Checked only after the authorization above — a 304
+    // must not become an existence oracle.
+    let etag = representation_etag(&body_bytes);
+    if if_none_match_matches(&headers, &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, NS_CACHE_CONTROL)
+            .body(Body::empty())
+            .map_err(|e| ServerError::internal(e.to_string()));
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ETAG, &etag)
+        .header(header::CACHE_CONTROL, NS_CACHE_CONTROL)
+        .body(Body::from(body_bytes))
+        .map_err(|e| ServerError::internal(e.to_string()))
 }
 
 /// POST /fluree/storage/block
@@ -746,6 +832,22 @@ pub async fn get_object_by_cid(
         return Err(ServerError::not_found("Object not found"));
     }
 
+    // 3d. Conditional GET: the CID is the entity tag (content-addressed, so
+    //     the representation can never change under it). Checked only after
+    //     the authorization and serving gates above so a 304 can't become an
+    //     existence oracle, and before the storage read so revalidation
+    //     costs no I/O.
+    let etag = format!("\"{id}\"");
+    if if_none_match_matches(&headers, &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, OBJECT_CACHE_CONTROL)
+            .header(header::VARY, OBJECT_VARY)
+            .body(Body::empty())
+            .map_err(|e| ServerError::internal(e.to_string()));
+    }
+
     // 4. Resolve CID → storage address and read bytes
     let admin_storage = state
         .fluree
@@ -789,6 +891,9 @@ pub async fn get_object_by_cid(
             .status(StatusCode::PARTIAL_CONTENT)
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header("X-Fluree-Content-Kind", kind_label)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, OBJECT_CACHE_CONTROL)
+            .header(header::VARY, OBJECT_VARY)
             .header(
                 header::CONTENT_RANGE,
                 format!("bytes {}-{}/{total}", range.start, end - 1),
@@ -801,6 +906,9 @@ pub async fn get_object_by_cid(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header("X-Fluree-Content-Kind", kind_label)
+        .header(header::ETAG, &etag)
+        .header(header::CACHE_CONTROL, OBJECT_CACHE_CONTROL)
+        .header(header::VARY, OBJECT_VARY)
         .body(Body::from(bytes))
         .map_err(|e| ServerError::internal(e.to_string()))
 }
