@@ -814,12 +814,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     /// path, which builds a spine for `( … )` — so the two positions share
     /// one code path and one grammar.
     ///
-    /// An object-position `()` is NOT special-cased in either style: it
-    /// reaches [`Self::parse_object`], which resolves it to the IRI
-    /// `rdf:nil` — the term the empty collection denotes — and the triple is
-    /// emitted like any other IRI object (issue #1694: the `IndexedItems`
-    /// path used to consume the statement and emit nothing, silently losing
-    /// it).
+    /// An object-position `()` denotes the IRI `rdf:nil` and stores that one
+    /// triple in both styles (issue #1694: the `IndexedItems` path used to
+    /// consume the statement and emit nothing, silently losing it). The
+    /// `NIL`-token spelling reaches [`Self::parse_object`], which resolves it
+    /// like any other IRI object; the comment spelling `( # c\n )` lexes as
+    /// `LParen`/`RParen` instead and is handled by the zero-item guard in
+    /// [`Self::parse_collection_as_list`] — same triple, same annotation
+    /// admission.
     ///
     /// Each object may carry an RDF 1.2 annotation tail (`~ reifier` and/or
     /// `{| … |}` blocks) — see [`Self::parse_annotation_tail`].
@@ -828,8 +830,21 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         loop {
             match self.current().kind {
                 TokenKind::LParen if indexed_lists => {
-                    self.parse_collection_as_list(subject, predicate)?;
-                    self.reject_annotation_on_collection()?;
+                    match self.parse_collection_as_list(subject, predicate)? {
+                        // The collection was `()` spelled with a comment
+                        // inside the parens: its object is the single term
+                        // `rdf:nil`, whose triple an annotation can reify —
+                        // exactly as on the `NIL`-token path below.
+                        Some(nil) => {
+                            if matches!(
+                                self.current().kind,
+                                TokenKind::Tilde | TokenKind::AnnotationOpen
+                            ) {
+                                self.parse_annotation_tail(subject, predicate, nil)?;
+                            }
+                        }
+                        None => self.reject_annotation_on_collection()?,
+                    }
                 }
                 _ => {
                     let object = self.parse_object()?;
@@ -853,7 +868,22 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     }
 
     /// Parse a collection in object position as indexed list items.
-    fn parse_collection_as_list(&mut self, subject: TermId, predicate: TermId) -> Result<()> {
+    ///
+    /// Returns the emitted `rdf:nil` term when the collection had zero
+    /// items. Only one input reaches this path with zero items: `()` spelled
+    /// with a comment inside the parens (`( # c\n )`) — the `NIL` token is
+    /// `'(' WS* ')'` and comments are not WS, so the comment spelling lexes
+    /// as `LParen`/`RParen` instead. It denotes the same term, so it emits
+    /// the same `rdf:nil` triple as the `NIL`-token path (issue #1694: it
+    /// used to fall out of the loop and emit nothing, re-opening the silent
+    /// loss through that one spelling), and the caller admits an annotation
+    /// tail on it. Non-empty collections return `None`: their items are
+    /// indexed events with no single term to annotate.
+    fn parse_collection_as_list(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+    ) -> Result<Option<TermId>> {
         self.with_nesting(|p| {
             p.expect(&TokenKind::LParen)?;
             let mut index: i32 = 0;
@@ -863,7 +893,12 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 index += 1;
             }
             p.expect(&TokenKind::RParen)?;
-            Ok(())
+            if index == 0 {
+                let nil = p.rdf_nil();
+                p.sink_emit_triple(subject, predicate, nil)?;
+                return Ok(Some(nil));
+            }
+            Ok(None)
         })
     }
 
@@ -2824,6 +2859,46 @@ mod tests {
             )]
         );
         assert!(!graph.iter().next().unwrap().is_list_element());
+    }
+
+    /// The `NIL` token is `'(' WS* ')'` and a comment is not WS, so
+    /// `( # c\n )` lexes as `LParen`/`RParen` and reaches the collection
+    /// path with zero items — the ONE spelling of the empty collection that
+    /// bypasses `TokenKind::Nil`. It denotes the same term and must emit
+    /// the same triple; without the zero-item guard in
+    /// `parse_collection_as_list` it re-opened issue #1694 through this
+    /// spelling.
+    #[test]
+    fn default_empty_collection_with_comment_is_rdf_nil() {
+        let graph = parse_to_graph(&format!(
+            "@prefix ex: <{EX}> .\nex:s ex:p ( # nothing here\n ) ."
+        ))
+        .unwrap();
+        assert_eq!(
+            rendered(&graph),
+            vec![(
+                format!("<{EX}s>"),
+                format!("<{EX}p>"),
+                format!("<{RDF_NIL}>")
+            )]
+        );
+        assert!(!graph.iter().next().unwrap().is_list_element());
+    }
+
+    /// The comment spelling of `()` is the same term, so an RDF 1.2
+    /// annotation on it must be admitted exactly as on the `NIL`-token
+    /// spelling (see `default_mode_admits_annotations_on_empty_collections`).
+    #[test]
+    fn default_mode_admits_annotations_on_comment_spelled_empty_collection() {
+        let mut sink = StarSink::default();
+        parse(&format!("{P}:s :p ( # c\n ) {{| :q :z |}} ."), &mut sink)
+            .expect("( #c\\n ) is the single term rdf:nil; its triple can be reified");
+        assert_eq!(sink.reified.len(), 1);
+        let nil = RecTerm::Iri(RDF_NIL.to_string());
+        assert!(sink.triples.contains(&(iri("s"), iri("p"), nil.clone())));
+        let (s, p, o, _r) = &sink.reified[0];
+        assert_eq!((s, p, o), (&iri("s"), &iri("p"), &nil));
+        assert_eq!(sink.triples.len(), 2, "the base triple + the annotation");
     }
 
     /// `()` must lower to EXACTLY what a literally-written `rdf:nil` object
