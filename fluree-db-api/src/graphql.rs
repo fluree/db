@@ -105,6 +105,13 @@ impl GraphQlRequest {
 /// where it is the only thing wrong.
 pub fn is_mutation(request: &GraphQlRequest) -> bool {
     use fluree_db_graphql::async_graphql::parser::types::OperationType;
+    // Refuse an over-nested document without parsing it: the parser overflows
+    // the stack before its own recursion counter fires, and an abort is not
+    // something the caller can catch. Reads as a query so the read path reports
+    // it, like any other unparseable document.
+    if fluree_db_graphql::limits::guard_nesting(&request.query).is_err() {
+        return false;
+    }
     let Ok(doc) = fluree_db_graphql::async_graphql::parser::parse_query(&request.query) else {
         return false;
     };
@@ -1210,6 +1217,12 @@ impl Fluree {
             .map_or_else(async_graphql::Variables::default, |v| {
                 async_graphql::Variables::from_json(v)
             });
+        // Before `parse_query`, not after: pest descends the grammar recursively
+        // with no limit of its own, so a deeply nested document overflows the
+        // stack and aborts the process before any counter is consulted.
+        if let Err(e) = fluree_db_graphql::limits::guard_nesting(&request.query) {
+            return Ok(error_envelope(&e.to_string(), e.code()));
+        }
         let doc = match async_graphql::parser::parse_query(&request.query) {
             Ok(doc) => doc,
             Err(e) => return Ok(error_envelope(&e.to_string(), "GRAPHQL_PARSE_FAILED")),

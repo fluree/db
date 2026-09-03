@@ -1,5 +1,4 @@
-//! Phase 0 spike: prove async-graphql's `dynamic` API supports the design in
-//! `GRAPHQL.md` — a schema built at runtime from a [`SchemaModel`], one root
+//! The dynamic schema — built at runtime from a [`SchemaModel`], one root
 //! resolver that receives the entire selection subtree, and generic pass-through
 //! resolvers for everything nested.
 //!

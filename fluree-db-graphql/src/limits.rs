@@ -52,3 +52,83 @@ impl Limits {
         }
     }
 }
+
+/// Brace nesting a document may reach before it is refused unparsed.
+///
+/// This is not a policy knob, it is a stack guard, and it deliberately matches
+/// `async_graphql_parser`'s own `MAX_RECURSION_DEPTH`: a document past this is
+/// one that parser would reject anyway. The reason to check first is that its
+/// counter runs while *building the AST*, after pest has already descended
+/// recursively through the grammar with no limit of its own — so a document a
+/// few hundred KB long overflows the stack and aborts the process before the
+/// counter is ever consulted. Aborting is not something a caller can catch, so
+/// the only defence is not to hand the parser the document at all.
+const MAX_PARSE_NESTING: usize = 64;
+
+/// Refuse a document whose brace nesting would drive the parser too deep.
+///
+/// Counts raw `{`, skipping strings and comments, which is the right proxy: a
+/// selection set and an input-object literal both recurse, and neither the
+/// grammar nor the stack cares which one it is descending through.
+pub fn guard_nesting(document: &str) -> crate::error::Result<()> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        Comment,
+        Str,
+        StrEscape,
+        BlockStr,
+    }
+
+    let bytes = document.as_bytes();
+    let mut state = State::Normal;
+    let mut depth = 0usize;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            State::Normal => match b {
+                b'#' => state = State::Comment,
+                b'"' => {
+                    if bytes[i..].starts_with(br#"""""#) {
+                        state = State::BlockStr;
+                        i += 3;
+                        continue;
+                    }
+                    state = State::Str;
+                }
+                b'{' => {
+                    depth += 1;
+                    if depth > MAX_PARSE_NESTING {
+                        return Err(crate::error::Error::Parse(format!(
+                            "document nests more than {MAX_PARSE_NESTING} levels deep"
+                        )));
+                    }
+                }
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            },
+            State::Comment => {
+                if b == b'\n' {
+                    state = State::Normal;
+                }
+            }
+            State::Str => match b {
+                b'\\' => state = State::StrEscape,
+                b'"' | b'\n' => state = State::Normal,
+                _ => {}
+            },
+            State::StrEscape => state = State::Str,
+            State::BlockStr => {
+                if bytes[i..].starts_with(br#"""""#) {
+                    state = State::Normal;
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}

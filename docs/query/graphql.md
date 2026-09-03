@@ -198,6 +198,15 @@ which is what bounds an aliased fan-out. Exceeding either is a `200` with
 - Several `graphql:Schema` instances in one ledger: the endpoint falls back to
   the shaped schema rather than guessing which to serve.
 - `::n` intra-mutation references; link by `id` across two mutations.
+- Ordering a root list by a multi-valued field, which would need the engine to
+  sort solutions by an aggregate — not expressible in JSON-LD `orderBy` today.
+- `NEQ` / `NIN` and ordering on IRI-valued fields: the filter language has no
+  IRI atom, so those lower to `values` patterns, which express membership but
+  not exclusion.
+- Dataset and multi-graph queries. The inferred tier unions per-graph class
+  statistics; a `graph:` root argument is the intended shape.
+- A fuel budget. The lowered query carries no `opts.maxFuel`, so the timeout is
+  the only ceiling on a single query's cost.
 - Subscriptions and federation.
 
 ## Related

@@ -331,6 +331,42 @@ async fn a_tighter_limit_is_not_served_a_looser_cached_schema() {
     );
 }
 
+/// The stack guard, which is the one limit that cannot run after parsing.
+///
+/// `async_graphql_parser` counts recursion while *building the AST*, but pest
+/// has already descended the grammar with no limit of its own by then — so a
+/// document a few hundred KB long overflows the stack and aborts the process.
+/// An abort is not catchable, so this test passing at all is the assertion: the
+/// document has to be refused before the parser sees it.
+#[tokio::test]
+async fn a_document_deep_enough_to_overflow_the_parser_is_refused_unparsed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed(&fluree, "gql-parser-stack:main").await;
+
+    // 10x past what was measured to abort the process when parsed.
+    let document = format!(
+        "{}name{}",
+        "{ persons ".repeat(100_000),
+        "}".repeat(100_000)
+    );
+    let response = fluree
+        .graphql(&view(&ledger), &GraphQlRequest::new(document.clone()))
+        .await
+        .expect("graphql request");
+
+    assert!(
+        errors(&response).contains("nests more than"),
+        "expected a pre-parse refusal, got: {response}"
+    );
+
+    // The route asks `is_mutation` first, which parses too — it must not be the
+    // hole the guard leaves open.
+    assert!(
+        !fluree_db_api::graphql::is_mutation(&GraphQlRequest::new(document)),
+        "is_mutation parsed a document the guard refuses"
+    );
+}
+
 /// Defaults are what an endpoint gets when nobody configures anything, so they
 /// have to be real numbers rather than "unlimited" spelled differently.
 #[tokio::test]
