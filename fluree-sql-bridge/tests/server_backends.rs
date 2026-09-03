@@ -29,6 +29,23 @@ const TRAILING_BACKSLASH: &str = r"c:\";
 /// What `bridge_secrets` holds — a mapping-scoped query must never see it.
 const SECRET: &str = "topsecret";
 
+/// What a `LIMIT 0` probe over `bridge_types` reports, on either backend.
+///
+/// Both produce the same vector: MySQL stores `BOOLEAN` as `TINYINT(1)`, but
+/// sqlx reports the declared type, so it maps to Trino `boolean` like
+/// Postgres's. That equivalence is what lets a mapping move between the two
+/// backends unchanged, so it is shared here rather than written out twice.
+const PROBE_TYPES: [&str; 8] = [
+    "integer",
+    "bigint",
+    "double",
+    "varchar",
+    "decimal(38,6)",
+    "date",
+    "timestamp(6)",
+    "boolean",
+];
+
 fn backend_url(var: &str) -> Option<String> {
     match std::env::var(var) {
         Ok(url) if !url.is_empty() => Some(url),
@@ -236,10 +253,7 @@ async fn postgres_string_literals_are_data_not_code() {
 /// The probe the engine's schema cache depends on: `SELECT * … LIMIT 0` must
 /// name every column with a Trino type, and values must round-trip.
 ///
-/// The two backends disagree on purpose in one place — MySQL has no distinct
-/// boolean storage, so `BOOLEAN` arrives as `TINYINT` and is reported (and
-/// rendered) as an integer, while Postgres reports `boolean`. The engine sees
-/// that difference, so the test pins it rather than papering over it.
+/// See [`PROBE_TYPES`] for why both backends report the same vector.
 #[tokio::test]
 async fn mysql_probe_names_trino_types_and_values_round_trip() {
     let Some(url) = backend_url("FLUREE_BRIDGE_MYSQL_URL") else {
@@ -258,20 +272,7 @@ async fn mysql_probe_names_trino_types_and_values_round_trip() {
     drop(pool);
     let router = router_for(&url).await;
 
-    assert_eq!(
-        probe_types(&router).await,
-        [
-            "integer",
-            "bigint",
-            "double",
-            "varchar",
-            "decimal(38,6)",
-            "date",
-            "timestamp(6)",
-            // TINYINT(1); MySQL has no boolean type of its own.
-            "integer",
-        ]
-    );
+    assert_eq!(probe_types(&router).await, PROBE_TYPES);
 
     let found = rows(&router, "SELECT i, b, d, s, dt, ok FROM bridge_types")
         .await
@@ -279,7 +280,7 @@ async fn mysql_probe_names_trino_types_and_values_round_trip() {
     assert_eq!(found.len(), 1);
     assert_eq!(
         found[0],
-        serde_json::json!([1, 2, 1.5, "x", "2024-01-02", 1])
+        serde_json::json!([1, 2, 1.5, "x", "2024-01-02", true])
     );
 }
 
@@ -301,19 +302,7 @@ async fn postgres_probe_names_trino_types_and_values_round_trip() {
     drop(pool);
     let router = router_for(&url).await;
 
-    assert_eq!(
-        probe_types(&router).await,
-        [
-            "integer",
-            "bigint",
-            "double",
-            "varchar",
-            "decimal(38,6)",
-            "date",
-            "timestamp(6)",
-            "boolean",
-        ]
-    );
+    assert_eq!(probe_types(&router).await, PROBE_TYPES);
 
     let found = rows(&router, "SELECT i, b, d, s, dt, ok FROM bridge_types")
         .await
