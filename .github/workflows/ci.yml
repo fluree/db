@@ -537,7 +537,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: fluree-react/package-lock.json
+          cache-dependency-path: |
+            fluree-react/package-lock.json
+            fluree-db-wasm/js/package-lock.json
 
       - name: Install
         run: npm ci
@@ -547,6 +549,17 @@ jobs:
 
       - name: Test
         run: npx vitest run
+
+      # @fluree/db-wasm's own JS shell (index.ts/protocol.ts, the main-thread
+      # proxy) — unit-tested against a stubbed Worker, no wasm build needed.
+      # Lives in this job, not a new one, because the `react-paths` filter
+      # above already reruns this job for any fluree-db-wasm/js change (the
+      # coupling that comment explains).
+      - name: Shell tests (@fluree/db-wasm)
+        working-directory: fluree-db-wasm/js
+        run: |
+          npm ci
+          npm test
 
       # Emits dist/ with `types: []`, so a src file that leaned on a vitest
       # global (or any dev-only type) fails here rather than in a consumer's
