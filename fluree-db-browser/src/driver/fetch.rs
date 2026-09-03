@@ -18,8 +18,8 @@ use std::time::Duration;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    AbortController, DomException, Headers, Request, RequestCredentials, RequestInit, RequestMode,
-    Response,
+    AbortController, DomException, Headers, ReadableStreamDefaultReader, Request,
+    RequestCredentials, RequestInit, RequestMode, Response,
 };
 
 /// Human-readable text for a thrown JavaScript value.
@@ -123,12 +123,12 @@ pub async fn execute(
         .map_err(|e| TransportError::Request(format!("invalid HTTP status: {e}")))?;
     let headers = collect_headers(&response.headers());
 
-    // Reject an oversized body BEFORE materializing it. `array_buffer()` pulls
-    // the whole response into JS memory and then copies it into wasm linear
-    // memory; with `max_concurrent_fetches` of these in flight, a hostile or
-    // broken server returning a multi-GiB object can exhaust the linear-memory
-    // ceiling and trap the instance. A declared length past the residency
-    // budget cannot be a legitimate block.
+    // Reject an oversized body BEFORE materializing it, when the server
+    // declares one. A declared length past the residency budget cannot be a
+    // legitimate block, so this is a cheap pre-check ahead of the read
+    // below — not the only guard: a chunked response declares no
+    // `Content-Length` at all and skips it entirely, which is what the
+    // incremental cap in `read_capped_body` is for.
     if let Some(len) = crate::config::declared_length_over_cap(
         response.headers().get("content-length").ok().flatten(),
         max_body_bytes,
@@ -139,32 +139,104 @@ pub async fn execute(
         )));
     }
 
-    let body_promise = response
-        .array_buffer()
-        .map_err(|e| TransportError::Body(js_error_text(&e)))?;
-    let buffer = match select(
-        Box::pin(JsFuture::from(body_promise)),
-        Box::pin(TimeoutFuture::new(timeout_ms)),
-    )
-    .await
-    {
-        Either::Left((result, _)) => result.map_err(|e| TransportError::Body(js_error_text(&e)))?,
-        Either::Right(_) => {
-            controller.abort();
-            return Err(TransportError::Timeout(format!(
-                "response body read timed out after {timeout_ms} ms"
-            )));
+    // Stream the body, capping the RUNNING total as chunks arrive —
+    // `array_buffer()` would materialize the whole response into JS memory
+    // first regardless of size, which is exactly what the cap exists to
+    // prevent for a hostile or broken server that never sends
+    // `Content-Length` (chunked transfer encoding). One `select` for the
+    // whole drain (not one per chunk): a trickle of small chunks must not
+    // be able to reset the deadline by keeping each individual read fast.
+    let body = match response.body() {
+        Some(stream) => {
+            let reader: ReadableStreamDefaultReader =
+                stream.get_reader().dyn_into().map_err(|_| {
+                    TransportError::Body("response body reader unavailable".to_string())
+                })?;
+            let outcome = select(
+                Box::pin(read_capped_body(&reader, max_body_bytes, &controller)),
+                Box::pin(TimeoutFuture::new(timeout_ms)),
+            )
+            .await;
+            match outcome {
+                Either::Left((result, _)) => result?,
+                Either::Right(_) => {
+                    controller.abort();
+                    return Err(TransportError::Timeout(format!(
+                        "response body read timed out after {timeout_ms} ms"
+                    )));
+                }
+            }
         }
+        // No body at all (e.g. a 204, or a status the fetch spec forbids a
+        // body on) — nothing to stream or cap.
+        None => Bytes::new(),
     };
-
-    // The one copy out of JavaScript memory; `Bytes::from(Vec)` is free.
-    let body = Bytes::from(Uint8Array::new(&buffer).to_vec());
 
     Ok(TransportResponse {
         status,
         headers,
         body,
     })
+}
+
+/// Drain `reader` into one buffer, aborting `controller` and returning a
+/// typed error the moment the running total crosses `max_body_bytes` — the
+/// incremental counterpart to the declared-length pre-check in [`execute`]
+/// for a response that never declares `Content-Length` up front. Hot path
+/// per chunk is [`config::body_cap_step`](crate::config::body_cap_step)
+/// (one saturating add, one compare); the copy out of JS memory happens
+/// exactly once per chunk, straight into the destination buffer.
+///
+/// No per-chunk timeout here: the caller races this whole future against
+/// one `TimeoutFuture` covering the entire drain, so the deadline is on
+/// total time-to-materialize, not on any single `read()`.
+async fn read_capped_body(
+    reader: &ReadableStreamDefaultReader,
+    max_body_bytes: u64,
+    controller: &AbortController,
+) -> Result<Bytes, TransportError> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut running: u64 = 0;
+    loop {
+        let result = JsFuture::from(reader.read())
+            .await
+            .map_err(|e| TransportError::Body(js_error_text(&e)))?;
+        let done = Reflect::get(&result, &JsValue::from_str("done"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if done {
+            break;
+        }
+        let value = Reflect::get(&result, &JsValue::from_str("value"))
+            .map_err(|e| TransportError::Body(js_error_text(&e)))?;
+        let chunk: Uint8Array = value.dyn_into().map_err(|_| {
+            TransportError::Body("response stream yielded a non-byte chunk".to_string())
+        })?;
+        let chunk_len = u64::from(chunk.length());
+
+        let (new_running, over_cap) =
+            crate::config::body_cap_step(running, chunk_len, max_body_bytes);
+        running = new_running;
+        if over_cap {
+            controller.abort();
+            // Best-effort: release the stream's backpressure promptly. The
+            // abort above is what actually stops the network transfer;
+            // this just lets the reader tear down cleanly either way.
+            let _ = reader.cancel();
+            return Err(TransportError::Body(format!(
+                "response body exceeded the {max_body_bytes}-byte cap while streaming \
+                 (chunked, no Content-Length to reject up front)"
+            )));
+        }
+
+        // The one copy out of JS memory: straight into the destination
+        // buffer, never through an intermediate `Vec` per chunk.
+        let start = buf.len();
+        buf.resize(start + chunk_len as usize, 0);
+        chunk.copy_to(&mut buf[start..]);
+    }
+    Ok(Bytes::from(buf))
 }
 
 fn collect_headers(headers: &Headers) -> HeaderMap {

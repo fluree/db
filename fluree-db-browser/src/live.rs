@@ -206,14 +206,29 @@ impl Coalescer {
         }
     }
 
-    /// Release a ledger's cycle slot without running the follow-up. Also
-    /// drops any signal folded into the abandoned cycle: nothing is left to
-    /// run it, and the next signal opens a fresh cycle at the latest head
-    /// anyway.
+    /// Release a ledger's cycle slot WITHOUT running the abandoned cycle's
+    /// own follow-up directly — but a `pending` fold survives. Clearing
+    /// `running` is the whole point (an abandoned slot must not strand the
+    /// ledger); clearing `pending` too would silently drop a real head
+    /// change that some OTHER task observed and folded in, on nothing more
+    /// than "this particular cycle happened to get cancelled" — and if no
+    /// further signal ever arrives for this ledger, that change would never
+    /// be served.
+    ///
+    /// Leaving `pending` set costs nothing: the next `begin()` (whatever
+    /// triggers it — an unrelated head change, or a new subscription's
+    /// solo `prime`) starts a fresh cycle at the CURRENT head regardless,
+    /// which already reflects the folded change. What preserving `pending`
+    /// actually buys is `finish()`'s ordinary "one more" contract on THAT
+    /// cycle: it still sees the leftover fold and forces one full
+    /// follow-up, which is what upgrades a solo prime's one-subscription
+    /// cycle into a full re-run of every OTHER subscription on the ledger
+    /// — exactly the re-run the abandoned cycle owed them. Without this, a
+    /// prime racing an abandoned cycle would serve only itself and leave
+    /// its siblings on stale data until an unrelated commit came along.
     fn abandon(&self, ledger: &str) {
         if let Some(state) = self.lock().get_mut(ledger) {
             state.running = false;
-            state.pending = false;
         }
     }
 }
@@ -823,18 +838,50 @@ mod tests {
     /// leaking it means that ledger never advances and never primes again,
     /// silently. Neither host cancels a cycle today; the guard is what
     /// keeps that from being load-bearing.
+    ///
+    /// No signal folds into this cycle before it drops (that case — a fold
+    /// surviving the abandon — is [`a_dropped_lease_preserves_a_folded_signal`]),
+    /// so the released slot really is clean: the next lease owes no
+    /// follow-up.
     #[tokio::test]
     async fn a_dropped_cycle_lease_releases_the_ledger() {
         let c = Coalescer::default();
         {
             let _lease = c.begin("l").expect("idle");
-            assert!(c.begin("l").is_none(), "a cycle is running");
-            // Scope end = the cycle future was dropped mid-await.
+            // Scope end = the cycle future was dropped mid-await, with
+            // nothing having folded into it.
         }
         let mut lease = c
             .begin("l")
             .expect("a dropped lease must release the ledger, not strand it");
         assert!(!lease.finish(), "and the slot is a clean one, not a fold");
+    }
+
+    /// A signal that folds into a cycle which then gets abandoned (dropped
+    /// without finishing) must not be dropped WITH it. `running` clears —
+    /// the ledger is not stranded — but `pending` survives, because it
+    /// describes a real head change some other task observed, independent
+    /// of why this particular cycle stopped running.
+    #[tokio::test]
+    async fn a_dropped_lease_preserves_a_folded_signal() {
+        let c = Coalescer::default();
+        {
+            let _lease = c.begin("l").expect("idle");
+            // A signal arrives while the cycle is "running": it folds.
+            assert!(c.begin("l").is_none(), "folds into the running cycle");
+            // Scope end = that cycle future was dropped mid-await, before
+            // ever calling `finish()`.
+        }
+        // The slot itself is released — `abandon` still does that.
+        let mut lease = c.begin("l").expect("abandon released the slot");
+        // But the fold survives: this cycle's `finish()` still owes exactly
+        // one follow-up for it, the same "one more" contract an ordinary
+        // mid-cycle signal gets.
+        assert!(
+            lease.finish(),
+            "the pending fold from the abandoned cycle must still be served"
+        );
+        assert!(!lease.finish(), "and exactly one follow-up, not a queue");
     }
 
     #[tokio::test]
@@ -1072,6 +1119,80 @@ mod tests {
             changed.contains(&early),
             "alongside the commit that landed: {follow_up:?}"
         );
+    }
+
+    /// The observable consequence of [`a_dropped_lease_preserves_a_folded_signal`]
+    /// at the public API: a commit folds into an in-flight cycle, that cycle
+    /// gets cancelled (dropped without finishing — the same stand-in
+    /// technique as `a_prime_racing_a_running_cycle_cannot_emit_an_older_watermark`),
+    /// and THEN an unrelated subscription mounts and primes. A solo prime's
+    /// first cycle only serves itself — so if the fold were lost with the
+    /// abandoned cycle, `early` would be stuck on its pre-commit result
+    /// until some future, unrelated head change happened to arrive. The
+    /// preserved fold instead forces the mandatory full follow-up cycle
+    /// `finish()` already owes on any mid-cycle signal, which re-runs
+    /// `early` too.
+    #[tokio::test]
+    async fn an_abandoned_cycles_folded_signal_still_forces_one_followup() {
+        let fluree = seeded_fluree().await;
+        let live = LiveQuerySet::new(fluree.clone(), None);
+        let early = live.subscribe(LEDGER, names_query());
+
+        let outcomes: Arc<Mutex<Vec<Vec<SubId>>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let outcomes = Arc::clone(&outcomes);
+            live.on_outcome(move |o| {
+                outcomes
+                    .lock()
+                    .unwrap()
+                    .push(o.changed.iter().map(|c| c.sub_id).collect());
+            });
+        }
+        // Give `early` an initial hash outside the coalescer, so the later
+        // commit is a genuine change to detect.
+        let _ = live.run_cycle(LEDGER).await;
+
+        // Stand in for a cycle in flight for this ledger (same technique as
+        // `a_prime_racing_a_running_cycle_cannot_emit_an_older_watermark`).
+        let in_flight = live
+            .inner
+            .coalescer
+            .begin(LEDGER)
+            .expect("ledger idle: stands in for a running cycle");
+
+        // A real head change arrives while it's "running" — folds.
+        add_person(&fluree, "carol", "Carol").await;
+        assert!(
+            live.inner.coalescer.begin(LEDGER).is_none(),
+            "folds into the in-flight cycle"
+        );
+
+        // The in-flight cycle is cancelled: dropped without ever finishing.
+        drop(in_flight);
+
+        // A later, unrelated subscription mounts and primes solo.
+        let late = live.subscribe(LEDGER, count_query());
+        let solo = live.prime(late).await.expect("known sub");
+        assert_eq!(solo.changed.len(), 1);
+        assert_eq!(solo.changed[0].sub_id, late);
+
+        // The preserved fold must have forced a full follow-up cycle (run
+        // synchronously inside `prime`'s await, before it returned) that
+        // re-ran `early` and picked up carol's commit.
+        let seen = outcomes.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "solo prime + forced followup: {seen:?}");
+        assert_eq!(seen[0], vec![late], "the solo cycle: {seen:?}");
+        assert_eq!(
+            seen[1],
+            vec![early],
+            "the forced followup catches early up on carol's commit: {seen:?}"
+        );
+
+        // Everything is quiescent now: a plain cycle reports no further
+        // changes — proof the followup actually delivered and committed.
+        let quiescent = live.run_cycle(LEDGER).await;
+        assert!(quiescent.changed.is_empty(), "{quiescent:?}");
+        assert_eq!(quiescent.unchanged.len(), 2);
     }
 
     #[tokio::test]

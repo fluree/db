@@ -168,6 +168,22 @@ pub(crate) fn declared_length_over_cap(content_length: Option<String>, max: u64)
         .filter(|&len| len > max)
 }
 
+/// One step of the incremental response-body cap: fold `chunk_len` into
+/// `running` (saturating — a chunk that would overflow `u64` is already far
+/// past any real cap, so wrapping and comparing wrong is not a risk worth
+/// taking) and report the new running total together with whether it now
+/// exceeds `max`. Hot path: one saturating add, one compare — called once
+/// per chunk read off the response stream. The counterpart to
+/// [`declared_length_over_cap`] for a chunked response that never declares
+/// a `Content-Length` at all, so the pre-check above has nothing to reject.
+/// Pure, so it is unit-tested here off-wasm; the wasm-only `driver::fetch`
+/// calls it once per chunk while draining the body.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn body_cap_step(running: u64, chunk_len: u64, max: u64) -> (u64, bool) {
+    let total = running.saturating_add(chunk_len);
+    (total, total > max)
+}
+
 impl CacheConfig {
     /// The eviction target in bytes (`budget_bytes * low_water_ratio`),
     /// clamped to a sane range.
@@ -230,6 +246,27 @@ mod tests {
             None
         );
         assert_eq!(declared_length_over_cap(Some(String::new()), CAP), None);
+    }
+
+    #[test]
+    fn body_cap_step_gates_the_running_total_not_any_one_chunk() {
+        const CAP: u64 = 1024;
+        // Individually tiny chunks that cross the cap only in aggregate —
+        // exactly the shape a `declared_length_over_cap` pre-check cannot
+        // see (no header ever claims the total up front).
+        let (total, over) = body_cap_step(0, 600, CAP);
+        assert_eq!((total, over), (600, false));
+        let (total, over) = body_cap_step(total, 600, CAP);
+        assert_eq!((total, over), (1200, true), "the chunk that tips it over");
+        // At or under the cap: never flagged.
+        let (total, over) = body_cap_step(0, CAP, CAP);
+        assert_eq!((total, over), (CAP, false));
+
+        // Saturating: a single absurd chunk length cannot wrap the total
+        // back under the cap.
+        let (total, over) = body_cap_step(u64::MAX - 10, 100, CAP);
+        assert_eq!(total, u64::MAX);
+        assert!(over);
     }
 
     #[test]
