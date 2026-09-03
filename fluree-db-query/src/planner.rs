@@ -418,6 +418,7 @@ pub struct RangeConstraint {
 pub enum RangeValue {
     Long(i64),
     Double(f64),
+    Decimal(Box<bigdecimal::BigDecimal>),
     String(String),
     /// Temporal value for range pushdown (NOT used for xsd:duration — it has no total order)
     Temporal(fluree_db_core::value::FlakeValue),
@@ -449,42 +450,58 @@ impl RangeConstraint {
     ///
     /// Takes the tighter of the two bounds. For lower bounds,
     /// the higher value is tighter. For upper bounds, the lower value is tighter.
-    pub fn merge(&mut self, other: &RangeConstraint) {
+    ///
+    /// Returns `false` when the two constraints carry bounds on the same side
+    /// that cannot be ordered against each other (e.g. a numeric and a string
+    /// lower bound). The tighter bound is then unknowable, so the caller must
+    /// not push either one down; `self` is left unchanged in that case.
+    #[must_use]
+    pub fn merge(&mut self, other: &RangeConstraint) -> bool {
+        use std::cmp::Ordering;
+
         if self.var != other.var {
-            return;
+            return true;
         }
 
         // Merge lower bounds: take the higher (tighter) one
+        let mut lower = self.lower.clone();
         if let Some((other_val, other_incl)) = &other.lower {
             match &self.lower {
-                None => self.lower = other.lower.clone(),
+                None => lower = other.lower.clone(),
                 Some((self_val, self_incl)) => {
-                    if compare_range_values(other_val, self_val) == std::cmp::Ordering::Greater
-                        || (compare_range_values(other_val, self_val) == std::cmp::Ordering::Equal
-                            && !other_incl
-                            && *self_incl)
+                    let Some(ord) = compare_range_values(other_val, self_val) else {
+                        return false;
+                    };
+                    if ord == Ordering::Greater
+                        || (ord == Ordering::Equal && !other_incl && *self_incl)
                     {
-                        self.lower = other.lower.clone();
+                        lower = other.lower.clone();
                     }
                 }
             }
         }
 
         // Merge upper bounds: take the lower (tighter) one
+        let mut upper = self.upper.clone();
         if let Some((other_val, other_incl)) = &other.upper {
             match &self.upper {
-                None => self.upper = other.upper.clone(),
+                None => upper = other.upper.clone(),
                 Some((self_val, self_incl)) => {
-                    if compare_range_values(other_val, self_val) == std::cmp::Ordering::Less
-                        || (compare_range_values(other_val, self_val) == std::cmp::Ordering::Equal
-                            && !other_incl
-                            && *self_incl)
+                    let Some(ord) = compare_range_values(other_val, self_val) else {
+                        return false;
+                    };
+                    if ord == Ordering::Less
+                        || (ord == Ordering::Equal && !other_incl && *self_incl)
                     {
-                        self.upper = other.upper.clone();
+                        upper = other.upper.clone();
                     }
                 }
             }
         }
+
+        self.lower = lower;
+        self.upper = upper;
+        true
     }
 
     /// Check if this constraint is unsatisfiable (contradictory bounds)
@@ -499,12 +516,16 @@ impl RangeConstraint {
         match (&self.lower, &self.upper) {
             (Some((lower_val, lower_incl)), Some((upper_val, upper_incl))) => {
                 match compare_range_values(lower_val, upper_val) {
-                    std::cmp::Ordering::Greater => true, // lower > upper
-                    std::cmp::Ordering::Equal => {
+                    Some(std::cmp::Ordering::Greater) => true, // lower > upper
+                    Some(std::cmp::Ordering::Equal) => {
                         // lower == upper: only satisfiable if both inclusive
                         !(*lower_incl && *upper_incl)
                     }
-                    std::cmp::Ordering::Less => false, // normal range
+                    Some(std::cmp::Ordering::Less) => false, // normal range
+                    // Bounds of different classes (numeric vs string, ...) are
+                    // not provably contradictory here; the scan's class-aware
+                    // `ObjectBounds::matches` rejects every row anyway.
+                    None => false,
                 }
             }
             _ => false, // Open-ended ranges are always satisfiable
@@ -512,24 +533,23 @@ impl RangeConstraint {
     }
 }
 
-/// Compare two range values
-fn compare_range_values(a: &RangeValue, b: &RangeValue) -> std::cmp::Ordering {
+/// Compare two range values within their class.
+///
+/// Numeric values (`Long`, `Double`, `Decimal`) order by mathematical value
+/// via the same `FlakeValue::numeric_cmp` the scan-side `ObjectBounds::matches`
+/// uses, so the bound the planner keeps is the bound the scan enforces.
+/// Temporal values order by instant when they are the same temporal type.
+/// Returns `None` for pairs that have no order (numeric vs string, date vs
+/// time, ...) — never a fabricated `Equal`, which would let `merge` keep an
+/// arbitrary bound and silently drop the other.
+fn compare_range_values(a: &RangeValue, b: &RangeValue) -> Option<std::cmp::Ordering> {
     match (a, b) {
-        (RangeValue::Long(a), RangeValue::Long(b)) => a.cmp(b),
-        (RangeValue::Double(a), RangeValue::Double(b)) => {
-            // Treat NaN as not comparable; avoid pretending NaN == anything.
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (RangeValue::String(a), RangeValue::String(b)) => a.cmp(b),
-        // Cross-type: Long <-> Double
-        (RangeValue::Long(a), RangeValue::Double(b)) => (*a as f64)
-            .partial_cmp(b)
-            .unwrap_or(std::cmp::Ordering::Equal),
-        (RangeValue::Double(a), RangeValue::Long(b)) => a
-            .partial_cmp(&(*b as f64))
-            .unwrap_or(std::cmp::Ordering::Equal),
-        // Different types that can't be compared
-        _ => std::cmp::Ordering::Equal,
+        (RangeValue::String(a), RangeValue::String(b)) => Some(a.cmp(b)),
+        (RangeValue::String(_), _) | (_, RangeValue::String(_)) => None,
+        (RangeValue::Temporal(a), RangeValue::Temporal(b)) => a.temporal_cmp(b),
+        (RangeValue::Temporal(_), _) | (_, RangeValue::Temporal(_)) => None,
+        // Long / Double / Decimal in any combination.
+        _ => a.to_flake_value().numeric_cmp(&b.to_flake_value()),
     }
 }
 
@@ -537,7 +557,8 @@ fn compare_range_values(a: &RangeValue, b: &RangeValue) -> std::cmp::Ordering {
 ///
 /// Returns `None` if the filter is not range-safe (contains OR, NOT, functions, etc.),
 /// or if any part of it compares against a constant that has no `RangeValue`
-/// representation (e.g. `xsd:decimal`, boolean). The result is total-or-nothing:
+/// representation (e.g. a boolean), or if two bounds on the same side of one
+/// variable cannot be ordered against each other. The result is total-or-nothing:
 /// callers treat `Some` as "the pushed bounds are equivalent to the whole filter"
 /// and drop the filter, so a partial extraction would silently discard the
 /// conjuncts it could not represent.
@@ -574,7 +595,9 @@ pub fn extract_range_constraints(expr: &Expression) -> Option<Vec<RangeConstrain
                         let right_constraint = create_constraint(var, op, hi_val, false);
                         // Merge both into one constraint
                         let mut merged = left_constraint;
-                        merged.merge(&right_constraint);
+                        if !merged.merge(&right_constraint) {
+                            return None;
+                        }
                         return Some(vec![merged]);
                     }
                     return None;
@@ -607,10 +630,16 @@ pub fn extract_range_constraints(expr: &Expression) -> Option<Vec<RangeConstrain
                     // otherwise be dropped from the filter it was part of.
                     let constraints = extract_range_constraints(e)?;
                     for constraint in constraints {
-                        all_constraints
-                            .entry(constraint.var)
-                            .and_modify(|existing| existing.merge(&constraint))
-                            .or_insert(constraint);
+                        match all_constraints.entry(constraint.var) {
+                            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                                if !existing.get_mut().merge(&constraint) {
+                                    return None;
+                                }
+                            }
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(constraint);
+                            }
+                        }
                     }
                 }
 
@@ -658,6 +687,7 @@ fn extract_const(expr: &Expression) -> Option<RangeValue> {
         // NaN is not a meaningful range bound.
         Expression::Const(FlakeValue::Double(d)) if d.is_nan() => None,
         Expression::Const(FlakeValue::Double(d)) => Some(RangeValue::Double(*d)),
+        Expression::Const(FlakeValue::Decimal(d)) => Some(RangeValue::Decimal(d.clone())),
         Expression::Const(FlakeValue::String(s)) => Some(RangeValue::String(s.clone())),
         // Temporal/duration values: only totally-orderable kinds push down.
         // Duration is partially ordered (months vs days) so skip it.
@@ -736,6 +766,7 @@ impl RangeValue {
         match self {
             RangeValue::Long(n) => FlakeValue::Long(*n),
             RangeValue::Double(d) => FlakeValue::Double(*d),
+            RangeValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
             RangeValue::String(s) => FlakeValue::String(s.clone()),
             RangeValue::Temporal(fv) => fv.clone(),
         }
@@ -3050,6 +3081,7 @@ mod tests {
 
     // Range extraction tests
     use crate::ir::{Expression, FlakeValue, Function};
+    use std::str::FromStr;
 
     #[test]
     fn test_extract_range_simple_gt() {
@@ -3168,55 +3200,228 @@ mod tests {
         assert!(vars.contains(&VarId(1)));
     }
 
+    fn decimal(s: &str) -> Expression {
+        use std::str::FromStr;
+        Expression::Const(FlakeValue::Decimal(Box::new(
+            bigdecimal::BigDecimal::from_str(s).unwrap(),
+        )))
+    }
+
+    fn decimal_value(s: &str) -> FlakeValue {
+        use std::str::FromStr;
+        FlakeValue::Decimal(Box::new(bigdecimal::BigDecimal::from_str(s).unwrap()))
+    }
+
+    fn date(s: &str) -> Expression {
+        Expression::Const(FlakeValue::Date(Box::new(
+            fluree_db_core::Date::parse(s).unwrap(),
+        )))
+    }
+
     #[test]
     fn test_extract_range_and_rejects_unrepresentable_conjunct() {
-        use std::str::FromStr;
-        // ?v >= 0 AND ?v < 0.01 — `0.01` is xsd:decimal, which has no RangeValue.
-        // The whole AND must fail to extract; a partial `>= 0` would replace the
-        // filter and silently drop the upper bound.
-        let decimal = |s: &str| {
-            Expression::Const(FlakeValue::Decimal(Box::new(
-                bigdecimal::BigDecimal::from_str(s).unwrap(),
-            )))
-        };
+        // ?v >= 0 AND ?v < true — a boolean has no RangeValue. The whole AND
+        // must fail to extract; a partial `>= 0` would replace the filter and
+        // silently drop the other conjunct.
         let lower = Expression::ge(
             Expression::Var(VarId(0)),
             Expression::Const(FlakeValue::Long(0)),
         );
-        let upper = Expression::lt(Expression::Var(VarId(0)), decimal("0.01"));
+        let bool_upper = Expression::lt(
+            Expression::Var(VarId(0)),
+            Expression::Const(FlakeValue::Boolean(true)),
+        );
 
-        assert!(
-            extract_range_constraints(&Expression::and(vec![lower.clone(), upper.clone()]))
-                .is_none()
-        );
+        assert!(extract_range_constraints(&Expression::and(vec![
+            lower.clone(),
+            bool_upper.clone()
+        ]))
+        .is_none());
         // Order irrelevant.
-        assert!(
-            extract_range_constraints(&Expression::and(vec![upper.clone(), lower.clone()]))
-                .is_none()
-        );
+        assert!(extract_range_constraints(&Expression::and(vec![
+            bool_upper.clone(),
+            lower.clone()
+        ]))
+        .is_none());
         // Nested AND is not a loophole.
         assert!(extract_range_constraints(&Expression::and(vec![
-            Expression::and(vec![lower.clone(), upper]),
+            Expression::and(vec![lower.clone(), bool_upper]),
             Expression::lt(
                 Expression::Var(VarId(0)),
                 Expression::Const(FlakeValue::Long(100)),
             ),
         ]))
         .is_none());
-        // Other unrepresentable constants behave the same.
-        assert!(extract_range_constraints(&Expression::and(vec![
-            lower,
+    }
+
+    #[test]
+    fn test_extract_range_and_rejects_incomparable_bounds_on_same_side() {
+        // ?v > 5 AND ?v > "z" — two lower bounds with no order between them.
+        // Neither can be proven tighter, so nothing may be pushed.
+        let expr = Expression::and(vec![
+            Expression::gt(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Long(5)),
+            ),
+            Expression::gt(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::String("z".to_string())),
+            ),
+        ]);
+        assert!(extract_range_constraints(&expr).is_none());
+
+        // Same when the numeric lower bound arrives via the sandwich form
+        // (< 5 ?v 10) and the string lower bound via a plain comparison.
+        let sandwich = Expression::Call {
+            func: Function::Lt,
+            args: vec![
+                Expression::Const(FlakeValue::Long(5)),
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Long(10)),
+            ],
+        };
+        assert!(extract_range_constraints(&sandwich).is_some());
+        let mixed = Expression::and(vec![
+            sandwich,
+            Expression::gt(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::String("z".to_string())),
+            ),
+        ]);
+        assert!(extract_range_constraints(&mixed).is_none());
+    }
+
+    #[test]
+    fn test_extract_range_decimal_bound_mixed_with_integer() {
+        // ?v >= 0 AND ?v < 0.01 — the shape that used to drop the decimal bound.
+        let expr = Expression::and(vec![
+            Expression::ge(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Long(0)),
+            ),
+            Expression::lt(Expression::Var(VarId(0)), decimal("0.01")),
+        ]);
+
+        let constraints = extract_range_constraints(&expr).expect("should extract");
+        assert_eq!(constraints.len(), 1);
+        let c = &constraints[0];
+        assert_eq!(c.lower, Some((RangeValue::Long(0), true)));
+        assert_eq!(
+            c.upper,
+            Some((
+                RangeValue::Decimal(Box::new(bigdecimal::BigDecimal::from_str("0.01").unwrap())),
+                false
+            ))
+        );
+
+        let bounds = extract_object_bounds_for_var(&expr, VarId(0)).expect("bounds");
+        assert!(bounds.matches(&FlakeValue::Double(0.005)));
+        assert!(bounds.matches(&FlakeValue::Long(0)));
+        assert!(bounds.matches(&decimal_value("0.0099")));
+        assert!(!bounds.matches(&FlakeValue::Double(0.01)));
+        assert!(!bounds.matches(&decimal_value("0.01")));
+        assert!(!bounds.matches(&FlakeValue::Long(7)));
+        assert!(!bounds.matches(&FlakeValue::Double(497.2607)));
+        assert!(!bounds.matches(&FlakeValue::Double(-0.5)));
+    }
+
+    #[test]
+    fn test_range_constraint_merge_tighter_across_numeric_types() {
+        // Upper: ?v < 5 AND ?v < 0.01 => 0.01 wins, in either order.
+        for (a, b) in [
+            (Expression::Const(FlakeValue::Long(5)), decimal("0.01")),
+            (decimal("0.01"), Expression::Const(FlakeValue::Long(5))),
+        ] {
+            let expr = Expression::and(vec![
+                Expression::lt(Expression::Var(VarId(0)), a),
+                Expression::lt(Expression::Var(VarId(0)), b),
+            ]);
+            let c = extract_range_constraints(&expr).expect("should extract");
+            assert_eq!(
+                c[0].upper,
+                Some((
+                    RangeValue::Decimal(Box::new(
+                        bigdecimal::BigDecimal::from_str("0.01").unwrap()
+                    )),
+                    false
+                ))
+            );
+        }
+
+        // Lower: ?v > 0.5 AND ?v > 0e0 => 0.5 wins.
+        let expr = Expression::and(vec![
+            Expression::gt(Expression::Var(VarId(0)), decimal("0.5")),
+            Expression::gt(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Double(0.0)),
+            ),
+        ]);
+        let c = extract_range_constraints(&expr).expect("should extract");
+        assert_eq!(
+            c[0].lower,
+            Some((
+                RangeValue::Decimal(Box::new(bigdecimal::BigDecimal::from_str("0.5").unwrap())),
+                false
+            ))
+        );
+
+        // Equal values across types: the exclusive bound is the tighter one.
+        let expr = Expression::and(vec![
+            Expression::ge(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Long(1)),
+            ),
+            Expression::gt(Expression::Var(VarId(0)), decimal("1.0")),
+        ]);
+        let c = extract_range_constraints(&expr).expect("should extract");
+        assert_eq!(c[0].lower.as_ref().map(|(_, incl)| *incl), Some(false));
+    }
+
+    #[test]
+    fn test_extract_range_decimal_unsatisfiable_across_types() {
+        // ?v > 1.5 AND ?v < 1 => empty range; no bounds pushed, filter kept.
+        let expr = Expression::and(vec![
+            Expression::gt(Expression::Var(VarId(0)), decimal("1.5")),
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FlakeValue::Boolean(true)),
+                Expression::Const(FlakeValue::Long(1)),
             ),
-        ]))
-        .is_none());
+        ]);
+        let c = extract_range_constraints(&expr).expect("should extract");
+        assert!(c[0].is_unsatisfiable());
+        assert!(extract_object_bounds_for_var(&expr, VarId(0)).is_none());
+    }
+
+    #[test]
+    fn test_range_constraint_merge_temporal_keeps_tighter() {
+        // ?d >= 2020-01-01 AND ?d >= 2021-06-01 => the later date is the bound.
+        // Without a temporal ordering the merge kept whichever came first.
+        for (a, b) in [("2020-01-01", "2021-06-01"), ("2021-06-01", "2020-01-01")] {
+            let expr = Expression::and(vec![
+                Expression::ge(Expression::Var(VarId(0)), date(a)),
+                Expression::ge(Expression::Var(VarId(0)), date(b)),
+            ]);
+            let c = extract_range_constraints(&expr).expect("should extract");
+            let Some((RangeValue::Temporal(FlakeValue::Date(d)), true)) = &c[0].lower else {
+                panic!(
+                    "expected an inclusive date lower bound, got {:?}",
+                    c[0].lower
+                );
+            };
+            assert_eq!(**d, fluree_db_core::Date::parse("2021-06-01").unwrap());
+        }
+
+        // Upper side, and unsatisfiable detection across the pair.
+        let expr = Expression::and(vec![
+            Expression::ge(Expression::Var(VarId(0)), date("2021-06-01")),
+            Expression::lt(Expression::Var(VarId(0)), date("2020-01-01")),
+        ]);
+        let c = extract_range_constraints(&expr).expect("should extract");
+        assert!(c[0].is_unsatisfiable());
     }
 
     #[test]
     fn test_pushdown_does_not_consume_filter_with_unrepresentable_conjunct() {
-        use std::str::FromStr;
         // The consumer-side check: a FILTER whose AND could only partially
         // extract must be neither narrowed nor marked consumed.
         let filter = Expression::and(vec![
@@ -3226,9 +3431,7 @@ mod tests {
             ),
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FlakeValue::Decimal(Box::new(
-                    bigdecimal::BigDecimal::from_str("0.01").unwrap(),
-                ))),
+                Expression::Const(FlakeValue::Boolean(true)),
             ),
         ]);
         assert!(extract_object_bounds_for_var(&filter, VarId(0)).is_none());
@@ -3239,6 +3442,27 @@ mod tests {
             crate::execute::pushdown::extract_bounds_from_filters(&[triple], &[filter]);
         assert!(bounds.is_empty());
         assert!(consumed.is_empty());
+    }
+
+    #[test]
+    fn test_pushdown_consumes_mixed_decimal_filter_with_both_bounds() {
+        let filter = Expression::and(vec![
+            Expression::ge(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Long(0)),
+            ),
+            Expression::lt(Expression::Var(VarId(0)), decimal("0.01")),
+        ]);
+        let triple =
+            TriplePattern::new(Ref::Var(VarId(1)), Ref::Var(VarId(2)), Term::Var(VarId(0)));
+        let (bounds, consumed) =
+            crate::execute::pushdown::extract_bounds_from_filters(&[triple], &[filter]);
+        assert_eq!(consumed, vec![0]);
+        let b = bounds.get(&VarId(0)).expect("bounds for ?v");
+        assert!(b.lower.is_some(), "lower bound pushed");
+        assert!(b.upper.is_some(), "upper bound pushed");
+        assert!(b.matches(&FlakeValue::Double(0.005)));
+        assert!(!b.matches(&FlakeValue::Double(0.01)));
     }
 
     #[test]
@@ -3278,7 +3502,7 @@ mod tests {
         let mut c1 = RangeConstraint::new(VarId(0)).with_lower(RangeValue::Long(10), false);
         let c2 = RangeConstraint::new(VarId(0)).with_lower(RangeValue::Long(20), false);
 
-        c1.merge(&c2);
+        assert!(c1.merge(&c2));
         assert_eq!(c1.lower, Some((RangeValue::Long(20), false)));
     }
 
@@ -3288,7 +3512,7 @@ mod tests {
         let mut c1 = RangeConstraint::new(VarId(0)).with_upper(RangeValue::Long(100), false);
         let c2 = RangeConstraint::new(VarId(0)).with_upper(RangeValue::Long(65), false);
 
-        c1.merge(&c2);
+        assert!(c1.merge(&c2));
         assert_eq!(c1.upper, Some((RangeValue::Long(65), false)));
     }
 
@@ -3298,7 +3522,7 @@ mod tests {
         let mut c1 = RangeConstraint::new(VarId(0)).with_lower(RangeValue::Long(18), true); // inclusive
         let c2 = RangeConstraint::new(VarId(0)).with_lower(RangeValue::Long(18), false); // exclusive
 
-        c1.merge(&c2);
+        assert!(c1.merge(&c2));
         // Exclusive is tighter than inclusive at the same value
         assert_eq!(c1.lower, Some((RangeValue::Long(18), false)));
     }

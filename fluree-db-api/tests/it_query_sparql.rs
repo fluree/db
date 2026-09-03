@@ -6688,10 +6688,12 @@ async fn sparql_count_distinct_chain_fan_in() {
 // Range pushdown must be total-or-nothing
 // =============================================================================
 
-/// Six `ex:price` rows: a=497.26 b=0.005 c=12.5 d=0.01 (doubles), e=7 (integer),
-/// f=0.5 (decimal). A conjoined FILTER that mixes a pushable bound with an
-/// `xsd:decimal` bound used to push the representable half and drop the rest.
-async fn seed_prices(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+/// `ex:price` rows: a=497.26 b=0.005 c=12.5 d=0.01 (doubles), e=7 (integer),
+/// f=0.5 (decimal). `ex:shipped` rows: a=2019-12-31 b=2020-06-15 c=2021-06-01
+/// d=2022-01-01. A conjoined FILTER that mixed a pushable bound with an
+/// `xsd:decimal` bound used to push the representable half and drop the rest;
+/// two temporal bounds on the same side used to keep whichever came first.
+async fn seed_ranges(fluree: &MemoryFluree, ledger_id: &str) -> fluree_db_api::TransactResult {
     let ledger0 = genesis_ledger(fluree, ledger_id);
     let insert = json!({
         "@context": {
@@ -6699,22 +6701,32 @@ async fn seed_prices(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
             "xsd": "http://www.w3.org/2001/XMLSchema#"
         },
         "@graph": [
-            {"@id": "ex:a", "ex:price": {"@value": "4.972607E2", "@type": "xsd:double"}},
-            {"@id": "ex:b", "ex:price": {"@value": "0.005", "@type": "xsd:double"}},
-            {"@id": "ex:c", "ex:price": {"@value": "12.5", "@type": "xsd:double"}},
-            {"@id": "ex:d", "ex:price": {"@value": "1.0E-2", "@type": "xsd:double"}},
+            {"@id": "ex:a", "ex:price": {"@value": "4.972607E2", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2019-12-31", "@type": "xsd:date"}},
+            {"@id": "ex:b", "ex:price": {"@value": "0.005", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2020-06-15", "@type": "xsd:date"}},
+            {"@id": "ex:c", "ex:price": {"@value": "12.5", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2021-06-01", "@type": "xsd:date"}},
+            {"@id": "ex:d", "ex:price": {"@value": "1.0E-2", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2022-01-01", "@type": "xsd:date"}},
             {"@id": "ex:e", "ex:price": 7},
             {"@id": "ex:f", "ex:price": {"@value": "0.5", "@type": "xsd:decimal"}}
         ]
     });
-    fluree.insert(ledger0, &insert).await.unwrap().ledger
+    fluree.insert(ledger0, &insert).await.unwrap()
 }
 
-async fn price_subjects(fluree: &MemoryFluree, ledger: &MemoryLedger, filter: &str) -> Vec<String> {
+async fn filtered_subjects(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    predicate: &str,
+    filter: &str,
+) -> Vec<String> {
     let query = format!(
         r"
         PREFIX ex: <http://example.org/>
-        SELECT ?s WHERE {{ ?s ex:price ?v . FILTER({filter}) }}
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s WHERE {{ ?s {predicate} ?v . FILTER({filter}) }}
         "
     );
     let result = support::query_sparql(fluree, ledger, &query)
@@ -6737,33 +6749,102 @@ async fn price_subjects(fluree: &MemoryFluree, ledger: &MemoryLedger, filter: &s
     subjects
 }
 
-#[tokio::test]
-async fn sparql_range_filter_with_decimal_bound_keeps_every_conjunct() {
-    assert_index_defaults();
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = seed_prices(&fluree, "prices:main").await;
+const RANGE_FILTER_CASES: &[(&str, &str, &[&str])] = &[
+    // Baselines: a lone bound and same-type pairs already worked.
+    ("ex:price", "?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 0.0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 0 && ?v < 1", &["b", "d", "f"]),
+    // Mixed pushable + decimal bound, either order and either side.
+    ("ex:price", "?v >= 0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v < 0.01 && ?v >= 0", &["b"]),
+    ("ex:price", "?v >= 0e0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 1 && ?v <= 12.5", &["c", "e"]),
+    ("ex:price", "?v >= 0.5 && ?v < 20", &["c", "e", "f"]),
+    ("ex:price", "?v >= 0 && ?v < 1.0", &["b", "d", "f"]),
+    (
+        "ex:price",
+        "(?v >= 0) && (?v < 20.5)",
+        &["b", "c", "d", "e", "f"],
+    ),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < 20.5 && ?v != 7",
+        &["b", "c", "d", "f"],
+    ),
+    // Two bounds on the same side: the tighter one must win, in either order.
+    ("ex:price", "?v < 5 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v < 0.01 && ?v < 5", &["b"]),
+    ("ex:price", "?v > 0.5 && ?v > 0e0", &["a", "c", "e"]),
+    // Contradictory across types: empty, not "everything".
+    ("ex:price", "?v > 1.5 && ?v < 1", &[]),
+    // Temporal: same-side pair keeps the tighter bound.
+    (
+        "ex:shipped",
+        "?v >= \"2020-01-01\"^^xsd:date && ?v >= \"2021-06-01\"^^xsd:date",
+        &["c", "d"],
+    ),
+    (
+        "ex:shipped",
+        "?v >= \"2021-06-01\"^^xsd:date && ?v >= \"2020-01-01\"^^xsd:date",
+        &["c", "d"],
+    ),
+    (
+        "ex:shipped",
+        "?v < \"2022-01-01\"^^xsd:date && ?v < \"2021-01-01\"^^xsd:date",
+        &["a", "b"],
+    ),
+    (
+        "ex:shipped",
+        "?v >= \"2020-01-01\"^^xsd:date && ?v < \"2021-06-01\"^^xsd:date",
+        &["b"],
+    ),
+];
 
-    let cases: &[(&str, &[&str])] = &[
-        // Baselines: a lone bound and same-type pairs already worked.
-        ("?v < 0.01", &["b"]),
-        ("?v >= 0.0 && ?v < 0.01", &["b"]),
-        ("?v >= 0 && ?v < 1", &["b", "d", "f"]),
-        // Mixed pushable + decimal bound, either order and either side.
-        ("?v >= 0 && ?v < 0.01", &["b"]),
-        ("?v < 0.01 && ?v >= 0", &["b"]),
-        ("?v >= 0e0 && ?v < 0.01", &["b"]),
-        ("?v >= 1 && ?v <= 12.5", &["c", "e"]),
-        ("?v >= 0.5 && ?v < 20", &["c", "e", "f"]),
-        ("?v >= 0 && ?v < 1.0", &["b", "d", "f"]),
-        ("(?v >= 0) && (?v < 20.5)", &["b", "c", "d", "e", "f"]),
-        ("?v >= 0 && ?v < 20.5 && ?v != 7", &["b", "c", "d", "f"]),
-    ];
-    for (filter, expected) in cases {
+async fn assert_range_filter_cases(fluree: &MemoryFluree, ledger: &MemoryLedger, lane: &str) {
+    for (predicate, filter, expected) in RANGE_FILTER_CASES {
         let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
         assert_eq!(
-            price_subjects(&fluree, &ledger, filter).await,
+            filtered_subjects(fluree, ledger, predicate, filter).await,
             expected,
-            "FILTER({filter})"
+            "[{lane}] FILTER({filter})"
         );
     }
+}
+
+#[tokio::test]
+async fn sparql_range_filter_keeps_every_conjunct_over_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ranges(&fluree, "ranges:main").await.ledger;
+    assert_range_filter_cases(&fluree, &ledger, "novelty").await;
+}
+
+#[tokio::test]
+async fn sparql_range_filter_keeps_every_conjunct_over_index() {
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "ranges/indexed:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let commit_t = seed_ranges(&fluree, ledger_id).await.receipt.t;
+            trigger_index_and_wait(&handle, ledger_id, commit_t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+            assert_eq!(
+                ledger.snapshot.t, commit_t,
+                "ledger must be indexed through the seed commit"
+            );
+            assert_range_filter_cases(&fluree, &ledger, "indexed").await;
+        })
+        .await;
 }
