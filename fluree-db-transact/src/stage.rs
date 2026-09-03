@@ -2760,9 +2760,9 @@ fn lower_where_patterns(
 
 /// Generate a unique transaction ID for blank node skolemization
 pub fn generate_txn_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use fluree_db_core::clock::SystemTime;
     let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     format!("{now:x}")

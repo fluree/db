@@ -218,7 +218,7 @@ async fn delete_old_snapshots(storage: &dyn Storage, graph_source_id: &str, cids
 /// Default snapshot retention for BM25 manifests.
 /// Uses the same default as index GC (`gc_max_old_indexes` + 1 for current).
 fn snapshot_retention() -> usize {
-    (fluree_db_indexer::DEFAULT_MAX_OLD_INDEXES as usize) + 1
+    (crate::wasm_compat::DEFAULT_MAX_OLD_INDEXES as usize) + 1
 }
 
 // =============================================================================

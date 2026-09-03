@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config_resolver;
+use crate::wasm_compat::IndexerHandle;
 use crate::{ApiError, Result};
 use crate::{TrackedErrorResponse, Tracker, TrackingOptions, TrackingTally};
 use fluree_db_core::ledger_config::LedgerConfig;
@@ -15,7 +16,6 @@ use fluree_db_core::{
     range_with_overlay, ContentId, ContentKind, FlakeValue, GraphId, IndexType, RangeMatch,
     RangeOptions, RangeTest, Sid,
 };
-use fluree_db_indexer::IndexerHandle;
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_novelty::TxnMetaEntry;
 #[cfg(feature = "shacl")]

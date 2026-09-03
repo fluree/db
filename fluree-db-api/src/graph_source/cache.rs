@@ -10,6 +10,13 @@
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 
+// moka's eviction clock reads std::time::Instant at cache construction, which
+// aborts on wasm32-unknown-unknown; use core's clock-free LRU stand-in there.
+#[cfg(target_arch = "wasm32")]
+use fluree_db_core::wasm_cache::Cache as SyncCache;
+#[cfg(not(target_arch = "wasm32"))]
+use moka::sync::Cache as SyncCache;
+
 #[cfg(feature = "iceberg")]
 use super::catalog_session::CachedLoadTable;
 #[cfg(feature = "iceberg")]
@@ -94,15 +101,15 @@ fn rest_client_ttl_secs() -> u64 {
 /// Uses `moka::sync::Cache` for lock-free concurrent reads.
 pub struct R2rmlCache {
     /// Cache for compiled R2RML mappings.
-    compiled_mappings: moka::sync::Cache<String, Arc<CompiledR2rmlMapping>>,
+    compiled_mappings: SyncCache<String, Arc<CompiledR2rmlMapping>>,
 
     /// Cache for parsed Iceberg table metadata.
     #[cfg(feature = "iceberg")]
-    table_metadata: moka::sync::Cache<String, Arc<TableMetadata>>,
+    table_metadata: SyncCache<String, Arc<TableMetadata>>,
 
     /// Cache for manifest-derived file selections keyed by metadata location.
     #[cfg(feature = "iceberg")]
-    scan_files: moka::sync::Cache<String, Arc<CachedScanFiles>>,
+    scan_files: SyncCache<String, Arc<CachedScanFiles>>,
 
     /// Shared Parquet footer cache for repeated scans of the same files.
     /// `Arc` so it can be shared into per-file read workers.
@@ -113,7 +120,7 @@ pub struct R2rmlCache {
     ///
     /// Uses moka's native TTL (`time_to_live`) so entries auto-expire.
     #[cfg(feature = "iceberg")]
-    direct_metadata_locations: moka::sync::Cache<String, String>,
+    direct_metadata_locations: SyncCache<String, String>,
 
     /// Process-wide REST catalog clients keyed by source config fingerprint.
     /// Reused across queries so the OAuth `CachedToken` and the HTTPS connection
@@ -124,14 +131,14 @@ pub struct R2rmlCache {
     /// (`DEFAULT_REST_CLIENT_TTL_SECS`) bounds how long such a rotation stays
     /// stale before the client is rebuilt and re-authenticated.
     #[cfg(feature = "iceberg")]
-    rest_clients: moka::sync::Cache<String, Arc<RestCatalogClient>>,
+    rest_clients: SyncCache<String, Arc<RestCatalogClient>>,
 
     /// Process-wide `loadTable` responses keyed by `(graph_source_id, ns.table)`,
     /// with a short TTL (see [`DEFAULT_REST_LOADTABLE_TTL_SECS`]) and a
     /// credential-expiry gate. Lets a burst of queries against the same table
     /// skip the ~1.3–3s catalog GET.
     #[cfg(feature = "iceberg")]
-    rest_load_tables: moka::sync::Cache<String, Arc<CachedLoadTable>>,
+    rest_load_tables: SyncCache<String, Arc<CachedLoadTable>>,
 }
 
 // moka::sync::Cache is Send+Sync but doesn't implement Debug
@@ -160,13 +167,13 @@ impl R2rmlCache {
         #[cfg(feature = "iceberg")]
         {
             Self {
-                compiled_mappings: moka::sync::Cache::new(mapping_cap),
-                table_metadata: moka::sync::Cache::new(metadata_cap),
-                scan_files: moka::sync::Cache::new(metadata_cap),
+                compiled_mappings: SyncCache::new(mapping_cap),
+                table_metadata: SyncCache::new(metadata_cap),
+                scan_files: SyncCache::new(metadata_cap),
                 parquet_footers: Arc::new(ParquetFooterCache::new(
                     (metadata_capacity.max(1) / 2).max(32),
                 )),
-                direct_metadata_locations: moka::sync::Cache::builder()
+                direct_metadata_locations: SyncCache::builder()
                     .max_capacity(metadata_cap)
                     .time_to_live(DIRECT_METADATA_LOCATION_TTL)
                     .build(),
@@ -175,11 +182,11 @@ impl R2rmlCache {
                 // an env-var/secret-store secret rotation self-heal (see
                 // `DEFAULT_REST_CLIENT_TTL_SECS`) since the config fingerprint
                 // does not change when the referenced secret does.
-                rest_clients: moka::sync::Cache::builder()
+                rest_clients: SyncCache::builder()
                     .max_capacity(64)
                     .time_to_live(Duration::from_secs(rest_client_ttl_secs()))
                     .build(),
-                rest_load_tables: moka::sync::Cache::builder()
+                rest_load_tables: SyncCache::builder()
                     .max_capacity(metadata_cap)
                     .time_to_live(Duration::from_secs(rest_loadtable_ttl_secs()))
                     .build(),
@@ -190,7 +197,7 @@ impl R2rmlCache {
         {
             let _ = metadata_cap;
             Self {
-                compiled_mappings: moka::sync::Cache::new(mapping_cap),
+                compiled_mappings: SyncCache::new(mapping_cap),
             }
         }
     }
