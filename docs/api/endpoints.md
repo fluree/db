@@ -1682,6 +1682,7 @@ POST /validate/{ledger...}
   "warnings": 0,
   "infos": 0,
   "shapesChecked": 1,
+  "t": 3,
   "results": [{
     "focus_node": "http://example.org/ns/bob",
     "result_path": "http://schema.org/name",
@@ -1696,6 +1697,8 @@ POST /validate/{ledger...}
 
 - `application/ld+json` — a W3C `sh:ValidationReport` JSON-LD document.
 - `text/turtle` — the same report as Turtle.
+
+`t` is the ledger commit the report describes: the exact state (index plus unindexed commits) the shapes were evaluated against. A caller that pairs these results with other reads — record counts for a violation rate, say — should query at that `t` (`"from": "mydb:main@t:3"`) rather than at "latest", since a commit can land between the two requests. The W3C renderings carry the same value on the report node as `f:t` (`f` = `https://ns.flur.ee/db#`), because `sh:ValidationReport` has no slot for a ledger time.
 
 `result_path` is present only when the path is a single predicate; complex paths are omitted rather than misrepresented.
 

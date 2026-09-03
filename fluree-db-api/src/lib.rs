@@ -2052,6 +2052,63 @@ impl FlureeBuilder {
         self
     }
 
+    /// Set how often the background indexer re-sweeps for stalled ledgers.
+    ///
+    /// `Duration::ZERO` disables the re-sweep. The sweep the worker performs at
+    /// start-up always runs — see [`fluree_db_indexer::IndexerConfig::catchup_interval`].
+    ///
+    /// No-op unless background indexing is enabled, since it configures the
+    /// worker; call it after `with_indexing*`.
+    pub fn with_indexer_catchup_interval(mut self, interval: std::time::Duration) -> Self {
+        if let Some(cfg) = self.indexing_config.take() {
+            self.indexing_config = Some(IndexingBuilderConfig {
+                indexer_config: cfg.indexer_config.with_catchup_interval(interval),
+                index_config: cfg.index_config,
+            });
+        }
+        self
+    }
+
+    /// Declare that another worker owns catch-up for this nameservice, so the
+    /// background indexer this builder spawns must not sweep.
+    ///
+    /// Both sweeps are skipped — the start-up one and the periodic re-sweep.
+    /// Everything else about the worker is unchanged: post-commit triggers,
+    /// admin reindex, the max-novelty nudge, and maintenance holds all keep
+    /// working, because they route through `IndexerHandle` rather than the
+    /// sweeps.
+    ///
+    /// Raft is the case this exists for. Every node builds a `Fluree` through
+    /// this builder and so runs a node-scope worker, while the leader
+    /// additionally runs a leader-scope worker wired to the consensus event
+    /// bus. Catch-up belongs to the leader-scope one: it is the worker raft
+    /// starts and stops with leadership, and it is the only one whose publishes
+    /// land. `RaftNameService::publish_index` swallows the `ForwardToLeader`
+    /// that `client_write` returns on a non-leader, so a follower's build pays
+    /// its full cost, is told it succeeded, and advances no index head. Left
+    /// enabled here, the leader would sweep twice over independent `states`
+    /// maps — `trigger_if_idle` cannot see the other worker's claim, so the
+    /// same ledger is queued and built concurrently — and every follower would
+    /// begin building into that no-op.
+    ///
+    /// Prefer this over `without_indexing()` for that case. `without_indexing()`
+    /// leaves `IndexingMode::Disabled`, which also turns off `admin::reindex`
+    /// and `admin::trigger_index` (they answer `ApiError::IndexingDisabled`),
+    /// drops the `cancel` + `wait_for_idle` quiesce that ledger drop and branch
+    /// purge rely on, and silently no-ops the max-novelty nudge.
+    ///
+    /// No-op unless background indexing is enabled, since it configures the
+    /// worker; call it after `with_indexing*`.
+    pub fn without_indexer_catchup_sweeps(mut self) -> Self {
+        if let Some(cfg) = self.indexing_config.take() {
+            self.indexing_config = Some(IndexingBuilderConfig {
+                indexer_config: cfg.indexer_config.with_catchup_sweeps(false),
+                index_config: cfg.index_config,
+            });
+        }
+        self
+    }
+
     /// Set novelty backpressure thresholds without enabling background indexing.
     ///
     /// Use this for short-lived processes (CLI, one-shot scripts) that need
@@ -4103,7 +4160,18 @@ impl Fluree {
             Err(ApiError::NotFound(_)) => None,
             Err(e) => return Err(e),
         };
-        let probe_view = probe_view.with_default_context(default_context);
+        // A write-decision probe reads asserted data only. Reasoning is a
+        // read-time view over the ledger, not something the ledger holds, so
+        // letting an entailed triple answer "does this already exist?" makes
+        // the branch depend on the reasoner. Worse than a mis-branch: staging
+        // does not reason, so an entailment-only match takes `ON MATCH` and
+        // then updates nothing, and the statement silently writes nothing at
+        // all. Explicit here rather than implicit in the view's origin,
+        // because config-graph defaults are completed at query preparation
+        // (`complete_config_defaults`) for every view that reaches it.
+        let probe_view = probe_view
+            .with_default_context(default_context)
+            .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::none());
 
         match cw {
             ConditionalCypherWrite::MergeSet { merge, trailing } => {

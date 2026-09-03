@@ -29,7 +29,6 @@ impl Fluree {
         let view = self
             .apply_source_or_global_policy(view, source, qc_opts)
             .await?;
-        let view = self.apply_config_defaults(view, None);
         Ok(Some(view))
     }
 
@@ -66,7 +65,6 @@ impl Fluree {
         let view = Box::pin(self.apply_source_or_global_policy(view, source, qc_opts))
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
-        let view = self.apply_config_defaults(view, None);
         Ok(Some(view))
     }
 
@@ -92,7 +90,6 @@ impl Fluree {
             return Ok(None);
         };
         let view = view.with_policy(Arc::new(policy.clone()));
-        let view = self.apply_config_defaults(view, None);
         Ok(Some(view))
     }
 
@@ -528,7 +525,6 @@ impl Fluree {
 
         if let Some(view) = single_view {
             let view = view.with_policy(Arc::new(policy.clone()));
-            let view = self.apply_config_defaults(view, None);
             return self
                 .query_tracked_with_r2rml_options(
                     &view,
@@ -594,7 +590,6 @@ impl Fluree {
 
         if let Some(view) = single_view {
             let view = view.with_policy(Arc::new(policy.clone()));
-            let view = self.apply_config_defaults(view, None);
             return self
                 .query_tracked_with_options(
                     &view,

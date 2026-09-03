@@ -234,6 +234,12 @@ pub trait StorageRead: Debug + Send + Sync {
         None
     }
 
+    /// Begin an in-flight window on the store's residency tier. Mirror of
+    /// [`ContentStore::query_guard`].
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        None
+    }
+
     /// Read a byte range from the object at the given address.
     ///
     /// The range is `[start, end)` in bytes. Returns the bytes within
@@ -455,6 +461,10 @@ impl StorageRead for Arc<dyn Storage> {
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.as_ref().miss_register()
     }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.as_ref().query_guard()
+    }
 }
 
 #[async_trait]
@@ -565,6 +575,15 @@ pub trait ContentStore: Debug + Send + Sync {
         None
     }
 
+    /// Begin an in-flight window on the store's residency tier, if it has
+    /// one. See [`residency::InFlightGuard`]: while the returned guard is
+    /// alive the tier must not evict resident bytes, so a retry loop's
+    /// rounds observe a monotone resident set. Stores without a residency
+    /// tier return `None` (the default).
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        None
+    }
+
     /// Signal that this content is no longer needed and may be reclaimed.
     ///
     /// Implementations should make a best effort to free the underlying
@@ -627,6 +646,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.as_ref().miss_register()
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.as_ref().query_guard()
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
@@ -822,13 +845,26 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // layout: on a ledger predating the `@shared` dict move or the
         // `.fir6` rename, the only copy sits at a legacy address, and
         // releasing just the canonical one silently reclaims nothing.
+        let mut deleted = Ok(());
         for address in candidate_addresses(&self.method, &self.ledger_id, id) {
             match self.storage.delete(&address).await {
                 Ok(()) | Err(crate::error::Error::NotFound(_)) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    deleted = Err(e);
+                    break;
+                }
             }
         }
-        Ok(())
+
+        // After the deletes, never before: evicting first leaves a window
+        // where a concurrent reader repopulates the entry from storage that
+        // still holds the blob. Runs even when a delete failed — the blob may
+        // be partly gone by then, and a needless eviction only costs a refetch.
+        // Off-native there is no disk cache to hold a stale entry.
+        #[cfg(feature = "native")]
+        crate::disk_cache::evict_cached_cid(id);
+
+        deleted
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
@@ -840,6 +876,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.storage.miss_register()
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.storage.query_guard()
     }
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
@@ -1169,6 +1209,21 @@ impl ContentStore for BranchedContentStore {
         self.branch_store
             .miss_register()
             .or_else(|| self.parents.iter().find_map(|p| p.miss_register()))
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        // Guard the whole ancestry chain: reads fall back through parents.
+        let mut guards: Vec<residency::InFlightGuard> = self
+            .branch_store
+            .query_guard()
+            .into_iter()
+            .chain(self.parents.iter().filter_map(ContentStore::query_guard))
+            .collect();
+        match guards.len() {
+            0 => None,
+            1 => Some(guards.remove(0)),
+            _ => Some(residency::InFlightGuard::join(guards)),
+        }
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
@@ -1520,6 +1575,39 @@ mod tests {
     use crate::storage::memory::MemoryStorage;
 
     const LEDGER: &str = "mydb:main";
+
+    /// Releasing a blob must take its cached copy with it. A cache entry that
+    /// outlives its blob reads back as a live object, so a caller deciding
+    /// what storage holds — the index-chain walk, which ends at a root storage
+    /// no longer has — would not see the ending.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn releasing_a_blob_evicts_its_cached_copy() {
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+        let bytes = b"root bytes";
+        let id = store.put(ContentKind::IndexRoot, bytes).await.unwrap();
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "fluree-release-evicts-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        crate::disk_cache::fetch_cached_bytes_cid(&store, &id, &cache_dir)
+            .await
+            .unwrap();
+        let cached = cache_dir.join(id.to_string());
+        assert!(cached.exists(), "the fetch should have populated the cache");
+
+        store.release(&id).await.unwrap();
+
+        assert!(
+            !cached.exists(),
+            "a released blob is still readable from the disk cache"
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
 
     /// `candidate_addresses` exists so that callers deciding a blob is
     /// unreferenced see every address `ContentStore::get` would resolve it to.

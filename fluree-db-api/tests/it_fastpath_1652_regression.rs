@@ -447,10 +447,11 @@ fn cases() -> Vec<Case> {
         // settling it may change this number. What the case does assert is
         // that the count lane cannot express the shape in an
         // (s, o_type, o_key) key, so it must decline and agree with whatever
-        // the generic join answers. (The membership lane would answer as a
+        // the generic join answers. (The membership lane used to answer as a
         // semi-join — one row per driving row, 3 — which the planner's
-        // driving-size gate now keeps it away from at this fixture's size;
-        // the lane's answer at or above the gate is unpinned.)
+        // driving-size gate keeps away from this fixture's size; its answer
+        // at or above the gate is pinned to the generic one by
+        // `it_membership_join_list_rows`, #1687.)
         Case {
             name: "composite join, list rows (declines to generic)",
             ledger: CompositeList,

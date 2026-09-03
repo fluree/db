@@ -917,3 +917,113 @@ async fn cross_ledger_plus_identity_mode_fails_closed() {
         "expected fail-closed diagnostic mentioning both, got: {msg}"
     );
 }
+
+/// Two class-targeted `f:query` rules in M govern the same class in D.
+/// Whichever the materializer loads first, an identity that satisfies
+/// either rule must see the instance, and the answer must be stable across
+/// re-materializations (each M commit produces a fresh governance-cache
+/// key). Before the fix, the evaluator denied on the first failing targeted
+/// f:query and the load order came from a `HashSet`, so roughly half of the
+/// M versions denied one identity or the other.
+#[tokio::test]
+async fn multiple_targeted_query_rules_any_allow_grants_across_materializations() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ctx = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+
+    let model_id = "test/cross-ledger-e2e/multi-query-model:main";
+    let mut model = fluree
+        .insert(
+            genesis_ledger(&fluree, model_id),
+            &json!({"@context": ctx, "@graph": [
+                {"@id": "ex:one-hop", "@type": "f:AccessPolicy", "f:action": {"@id": "f:view"},
+                 "f:onClass": [{"@id": "ex:Line"}],
+                 "f:query": "{\"where\":{\"@id\":\"?$this\",\"http://example.org/supplier\":{\"@id\":\"?$identity\"}}}"},
+                {"@id": "ex:two-hop", "@type": "f:AccessPolicy", "f:action": {"@id": "f:view"},
+                 "f:onClass": [{"@id": "ex:Line"}],
+                 "f:query": "{\"where\":{\"@id\":\"?$this\",\"http://example.org/supplier\":{\"@id\":\"?rec\",\"http://example.org/canonical\":{\"@id\":\"?$identity\"}}}}"}
+            ]}),
+        )
+        .await
+        .expect("seed M rules")
+        .ledger;
+
+    let data_id = "test/cross-ledger-e2e/multi-query-data:main";
+    let data = fluree
+        .insert(
+            genesis_ledger(&fluree, data_id),
+            &json!({"@context": ctx, "@graph": [
+                {"@id": "ex:acme", "@type": "ex:Supplier"},
+                {"@id": "ex:acme-rome", "@type": "ex:SupplierRecord", "ex:canonical": {"@id": "ex:acme"}},
+                {"@id": "ex:line1", "@type": "ex:Line", "ex:supplier": {"@id": "ex:acme-rome"}},
+                {"@id": "ex:line2", "@type": "ex:Line", "ex:supplier": {"@id": "ex:nobody"}}
+            ]}),
+        )
+        .await
+        .expect("seed D")
+        .ledger;
+    let config_iri = config_graph_iri(data_id);
+    fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig ; f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow false ; f:policyClass f:AccessPolicy ;
+                                 f:policySource <urn:cfg:ref> .
+                <urn:cfg:ref> rdf:type f:GraphRef ; f:graphSource <urn:cfg:src> .
+                <urn:cfg:src> f:ledger <{model_id}> ; f:graphSelector f:defaultGraph .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config");
+
+    let lines = |identity: &str| {
+        let opts = GovernanceOptions {
+            identity: Some(identity.into()),
+            ..Default::default()
+        };
+        let fluree = &fluree;
+        async move {
+            let wrapped = fluree
+                .db_with_policy(data_id, &opts)
+                .await
+                .expect("db_with_policy");
+            fluree
+                .query(
+                    &wrapped,
+                    &json!({"@context": {"ex": "http://example.org/"}, "select": ["?l"],
+                            "where": {"@id": "?l", "@type": "ex:Line"}}),
+                )
+                .await
+                .expect("query")
+                .to_jsonld(&wrapped.snapshot)
+                .expect("jsonld")
+        }
+    };
+
+    for round in 0..16 {
+        // Unrelated M commit: new resolved_t, fresh materialization.
+        model = fluree
+            .insert(
+                model,
+                &json!({"@context": ctx, "@id": "ex:tick", "ex:n": round}),
+            )
+            .await
+            .expect("tick")
+            .ledger;
+        assert_eq!(
+            lines("http://example.org/acme").await,
+            json!([["ex:line1"]]),
+            "round {round}: two-hop rule must grant acme"
+        );
+        assert_eq!(
+            lines("http://example.org/acme-rome").await,
+            json!([["ex:line1"]]),
+            "round {round}: one-hop rule must grant acme-rome"
+        );
+    }
+}

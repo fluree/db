@@ -525,8 +525,10 @@ pub async fn build_transact_policy_context(
     Ok(Some(policy_ctx))
 }
 
-/// Resolve the raw ledger config for the write path, memoized per-ledger by the
-/// novelty config-write marker (`Novelty::config_write_t`).
+/// Resolve the raw ledger config, memoized per-ledger by the novelty
+/// config-write marker (`Novelty::config_write_t`). Shared by the write path
+/// (transaction policy) and the read path (`resolve_and_attach_config`, which
+/// query preparation reaches on every view that arrives without a config).
 ///
 /// Reading the config graph on every write — including writes that carry no
 /// policy inputs — is feature-necessary (you must read config to learn
@@ -535,14 +537,16 @@ pub async fn build_transact_policy_context(
 /// advances iff a commit touches the config graph, so a configured-but-static
 /// ledger resolves config once per config change instead of once per write (and
 /// once per stage/commit retry — retries triggered by unrelated data conflicts
-/// leave the marker untouched and hit the cache).
+/// leave the marker untouched and hit the cache). Reads over the ledger-scoped
+/// server routes have the same shape: a fresh `LedgerState` per request, so a
+/// fresh resolve per request without this.
 ///
 /// Fail-safe by construction: the cache is consulted only at head, with a
 /// readable marker and a loaded handle. Any deviation — time-travel (`to_t`
 /// below head), a non-`Novelty` overlay, or no loaded handle — resolves fresh
 /// against the passed snapshot/overlay. A cache miss or a marker reset (e.g.
 /// after reindex) costs an extra resolve, never a stale (fail-open) read.
-async fn resolve_ledger_config_cached(
+pub(crate) async fn resolve_ledger_config_cached(
     fluree: &crate::Fluree,
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,

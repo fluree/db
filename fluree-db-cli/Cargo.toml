@@ -67,6 +67,9 @@ fluree-db-memory = { path = "../fluree-db-memory" }
 # Embedded docs lookup (human `fluree docs` CLI subcommand)
 fluree-db-docs = { path = "../fluree-db-docs" }
 
+# Document ingestion (`fluree doc`): parse, chunk, embed
+fluree-db-doc = { path = "../fluree-db-doc" }
+
 # Unified MCP service (stdio) — selectable memory/docs toolsets
 fluree-db-mcp = { path = "../fluree-db-mcp" }
 

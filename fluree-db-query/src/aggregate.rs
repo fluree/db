@@ -1015,7 +1015,9 @@ fn agg_group_concat(values: &[Binding], separator: &str) -> Binding {
                 FlakeValue::String(s) => Some(s.clone()),
                 FlakeValue::Json(s) => Some(s.clone()), // JSON as string
                 FlakeValue::Long(n) => Some(n.to_string()),
-                FlakeValue::Double(n) => Some(n.to_string()),
+                // Canonical xsd:double lexical form — the same string the
+                // serializer and STR() give this value (#1695).
+                FlakeValue::Double(n) => Some(fluree_graph_ir::canonical_xsd_double(*n)),
                 FlakeValue::Decimal(d) => Some(d.to_plain_string()),
                 FlakeValue::BigInt(n) => Some(n.to_string()),
                 FlakeValue::Boolean(b) => Some(b.to_string()),

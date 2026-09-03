@@ -10,13 +10,13 @@
 //!    load-bearing channel — the typed `NeedFetch` error is stringified by
 //!    most query-crate wrappers and cannot be relied on above the operator
 //!    boundary);
-//! 2. a drain → concurrent-fetch → re-run loop (progress-terminated, the
-//!    same shape `RetryBudget` implements) completes each query with results
-//!    IDENTICAL to a plain native instance over the same data;
-//! 3. the scan operator's in-frame retry consumes leaf misses without
-//!    surfacing them to the outer loop (F7's operator-local await-and-retry);
-//! 4. one-shot paths (fast paths, dir-only count walks, policy-filtered
-//!    queries) recover through the outer loop.
+//! 2. the PRODUCTION retry loop at the query entry (`query_with_options`)
+//!    absorbs every miss — a single direct `Fluree::query` call completes
+//!    with results IDENTICAL to a plain native instance over the same data,
+//!    scan misses handled in-frame by the operator and one-shot paths
+//!    (fast paths, dir walks, policy sub-queries) by the entry loop;
+//! 3. ledger LOAD prefetches novelty's overlay-translation miss sources
+//!    (F8: reverse-dict leaves), so translation lookups are pure hits.
 //!
 //! Every test asserts a positive "miss fired" marker; recovery is never
 //! inferred from the absence of an error.
@@ -34,7 +34,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fluree_db_api::{FlureeBuilder, GraphDb, NameServiceMode, QueryResult};
 use fluree_db_binary_index::read::need_fetch::fetch_wants;
-use fluree_db_core::storage::residency::{FetchKind, MissRegister, Want};
+use fluree_db_core::storage::residency::{MissRegister, Want};
 use fluree_db_core::storage::{
     ContentAddressedWrite, ContentStore, ContentWriteResult, MemoryStorage, StorageMethod,
     StorageRead, StorageWrite,
@@ -271,28 +271,6 @@ async fn recover_once(
     true
 }
 
-async fn query_with_recovery(
-    fluree: &fluree_db_api::Fluree,
-    db: &GraphDb,
-    query: &JsonValue,
-    storage: &ResidencyStorage,
-) -> (QueryResult, Recovery) {
-    let cs = recovery_store(storage);
-    let mut recovery = Recovery {
-        rounds: 0,
-        wants: Vec::new(),
-    };
-    loop {
-        match fluree.query(db, query).await {
-            Ok(result) => return (result, recovery),
-            Err(e) => {
-                let recovered = recover_once(&cs, storage, &mut recovery, &e).await;
-                assert!(recovered, "non-residency query error: {e:?}");
-            }
-        }
-    }
-}
-
 async fn ledger_with_recovery(
     fluree: &fluree_db_api::Fluree,
     storage: &ResidencyStorage,
@@ -318,13 +296,13 @@ fn rows_of(result: &QueryResult, ledger: &fluree_db_api::LedgerState) -> Vec<Jso
 }
 
 // ============================================================================
-// 1. Operator (scan) path: leaf misses are consumed IN-FRAME by the scan
-//    operator's retry; only non-leaf wants (forward packs) reach the outer
-//    loop.
+// 1. Operator (scan) path through the PRODUCTION loop: one direct query
+//    call completes — leaf misses consumed in-frame by the scan operator,
+//    forward-pack misses by the query-entry loop.
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-async fn scan_query_recovers_and_leaf_misses_stay_in_frame() {
+async fn scan_query_completes_through_production_loop() {
     support::assert_index_defaults();
     let (shared, ns, fluree_a) = build_indexed_fixture().await;
 
@@ -343,37 +321,36 @@ async fn scan_query_recovers_and_leaf_misses_stay_in_frame() {
     );
     assert_eq!(expected.len(), PEOPLE as usize, "fixture sanity");
 
-    // Residency-mode instance, cold resident tier.
+    // Residency-mode instance, cold resident tier: ONE direct call must
+    // succeed — the production loop owns the recovery.
     let (fluree_b, storage) = residency_instance(&shared, &ns);
     let ledger_b = ledger_with_recovery(&fluree_b, &storage).await;
     let db_b = GraphDb::from_ledger_state(&ledger_b);
     let misses_before = storage.miss_count();
 
-    let (result, recovery) = query_with_recovery(&fluree_b, &db_b, &query, &storage).await;
+    let result = fluree_b
+        .query(&db_b, &query)
+        .await
+        .expect("production retry loop must absorb every residency miss");
 
     assert!(
         storage.miss_count() > misses_before,
         "the residency path must actually miss (positive marker)"
     );
-    assert_eq!(rows_of(&result, &ledger_b), expected, "identical results");
-    // F7 in-frame proof: the scan operator drains and fetches its own leaf
-    // wants; whatever reached the OUTER loop must not be index leaves.
     assert!(
-        !recovery
-            .wants
-            .iter()
-            .any(|w| w.kind == FetchKind::IndexLeaf),
-        "leaf misses leaked to the outer loop — in-frame scan retry regressed: {:?}",
-        recovery.wants
+        storage.register.is_empty(),
+        "every recorded want must have been drained by a retry frame"
     );
+    assert_eq!(rows_of(&result, &ledger_b), expected, "identical results");
 }
 
 // ============================================================================
-// 2. Fast path (one-shot predicate COUNT): recovers through the outer loop.
+// 2. Fast path (one-shot predicate COUNT): the production loop at the query
+//    entry absorbs the miss the one-shot path cannot retry in-frame.
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-async fn fast_path_count_recovers_through_outer_loop() {
+async fn fast_path_count_completes_through_production_loop() {
     support::assert_index_defaults();
     let (shared, ns, fluree_a) = build_indexed_fixture().await;
 
@@ -389,59 +366,32 @@ async fn fast_path_count_recovers_through_outer_loop() {
     let (fluree_b, storage) = residency_instance(&shared, &ns);
     let ledger_b = ledger_with_recovery(&fluree_b, &storage).await;
     let db_b = GraphDb::from_ledger_state(&ledger_b);
+    let misses_before = storage.miss_count();
 
-    // Positive one-shot proof: the first attempt must surface the miss (fast
-    // paths have no in-frame retry; if this starts succeeding, they gained
-    // one and this test should be updated).
-    let first = fluree_b.query(&db_b, query).await;
-    assert!(
-        first.is_err(),
-        "expected the cold fast path to surface a residency miss on the first attempt"
-    );
-    assert!(
-        !storage.register.is_empty(),
-        "the miss must be recorded in the register before the retry loop runs"
-    );
+    let result = fluree_b
+        .query(&db_b, query)
+        .await
+        .expect("production retry loop must absorb the one-shot path's misses");
 
-    let cs = recovery_store(&storage);
-    let mut recovery = Recovery {
-        rounds: 0,
-        wants: Vec::new(),
-    };
-    let result = loop {
-        match fluree_b.query(&db_b, query).await {
-            Ok(result) => break result,
-            Err(e) => {
-                let recovered = recover_once(&cs, &storage, &mut recovery, &e).await;
-                assert!(recovered, "non-residency query error: {e:?}");
-            }
-        }
-    };
     assert!(
-        recovery.rounds >= 1,
-        "outer loop must have done the recovery"
+        storage.miss_count() > misses_before,
+        "the residency path must actually miss (positive marker)"
     );
-    assert!(
-        recovery
-            .wants
-            .iter()
-            .any(|w| w.kind == FetchKind::IndexLeaf),
-        "fast-path leaf wants flow through the outer loop: {:?}",
-        recovery.wants
-    );
+    assert!(storage.register.is_empty(), "wants drained");
     assert_eq!(rows_of(&result, &ledger_b), expected, "identical count");
 }
 
 // ============================================================================
 // 3. Dir-only walk (open_leaf_dir under the COUNT(DISTINCT ?s) fast path,
 //    `count_distinct_subjects_for_predicate`): the miss fires inside the
-//    leaflet-cache dir-load closure — the F2 stringification point — and
-//    still registers and recovers. (A whole-graph COUNT(*) is answered from
-//    index stats without touching leaves, so it cannot exercise this path.)
+//    leaflet-cache dir-load closure — the F2 stringification point — and the
+//    production loop still recovers it via the register. (A whole-graph
+//    COUNT(*) is answered from index stats without touching leaves, so it
+//    cannot exercise this path.)
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-async fn count_distinct_dir_walk_recovers() {
+async fn count_distinct_dir_walk_completes_through_production_loop() {
     support::assert_index_defaults();
     let (shared, ns, fluree_a) = build_indexed_fixture().await;
 
@@ -459,37 +409,26 @@ async fn count_distinct_dir_walk_recovers() {
     let db_b = GraphDb::from_ledger_state(&ledger_b);
     let misses_before = storage.miss_count();
 
-    let cs = recovery_store(&storage);
-    let mut recovery = Recovery {
-        rounds: 0,
-        wants: Vec::new(),
-    };
-    let result = loop {
-        match fluree_b.query(&db_b, query).await {
-            Ok(result) => break result,
-            Err(e) => {
-                let recovered = recover_once(&cs, &storage, &mut recovery, &e).await;
-                assert!(recovered, "non-residency query error: {e:?}");
-            }
-        }
-    };
+    let result = fluree_b
+        .query(&db_b, query)
+        .await
+        .expect("production retry loop must absorb the dir-walk misses");
 
     assert!(storage.miss_count() > misses_before, "misses must fire");
+    assert!(storage.register.is_empty(), "wants drained");
     assert_eq!(rows_of(&result, &ledger_b), expected, "identical count");
-    // The dir walk's wants are index leaves; whether they surface in-frame
-    // or in the outer loop depends on which count plan fires, so the strong
-    // assertion here is identical results plus the positive miss marker.
-    let _ = recovery;
 }
 
 // ============================================================================
-// 4. Policy-filtered query (f:query sub-query): the policy layer stringifies
-//    errors (`QueryError::Policy(String)`), so recovery MUST come from the
-//    register, not the error chain.
+// 4. Policy-filtered query (f:query sub-query): the policy layer
+//    stringifies errors (`QueryError::Policy(String)`), so the production
+//    loop's recovery works only because the register, not the error chain,
+//    carries the wants. `query_connection` routes single-ledger queries
+//    through `query_with_options`, i.e. through the production loop.
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-async fn policy_filtered_query_recovers_via_register() {
+async fn policy_filtered_query_completes_through_production_loop() {
     support::assert_index_defaults();
     let (shared, ns, fluree_a) = build_indexed_fixture().await;
 
@@ -527,27 +466,118 @@ async fn policy_filtered_query_recovers_via_register() {
     assert_eq!(expected.len(), (PEOPLE / 4) as usize, "fixture sanity");
 
     let (fluree_b, storage) = residency_instance(&shared, &ns);
-    let cs = recovery_store(&storage);
-    let mut recovery = Recovery {
-        rounds: 0,
-        wants: Vec::new(),
-    };
     let misses_before = storage.miss_count();
-    let result = loop {
-        match fluree_b.query_connection(&query).await {
-            Ok(result) => break result,
-            Err(e) => {
-                let recovered = recover_once(&cs, &storage, &mut recovery, &e).await;
-                assert!(recovered, "non-residency policy-query error: {e:?}");
-            }
-        }
-    };
+    let result = fluree_b
+        .query_connection(&query)
+        .await
+        .expect("production retry loop must absorb the policy path's misses");
 
     assert!(
         storage.miss_count() > misses_before,
         "the policy path must actually miss (positive marker)"
     );
+    assert!(storage.register.is_empty(), "wants drained");
     let ledger_b = ledger_with_recovery(&fluree_b, &storage).await;
     let rows = normalize_rows(&result.to_jsonld(&ledger_b.snapshot).expect("to_jsonld"));
     assert_eq!(rows, expected, "identical policy-filtered results");
+}
+
+// ============================================================================
+// 5. F8(b): a ledger with UNCOMMITTED-to-index novelty loads with the
+//    reverse-dict prefetch, so overlay translation lookups are pure hits and
+//    a query touching novelty completes through the production loop.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn novelty_ledger_prefetches_translation_and_completes() {
+    support::assert_index_defaults();
+    let (shared, ns, fluree_a) = build_indexed_fixture().await;
+
+    // Commit MORE people AFTER the index build: they live only in novelty,
+    // and their overlay translation must reverse-look-up the persisted dict
+    // trees at query time.
+    const EXTRA: u64 = 8;
+    let ledger_head = fluree_a.ledger(LEDGER).await.expect("ledger A at index");
+    let graph: Vec<JsonValue> = (0..EXTRA)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:novel{i}"),
+                "@type": "ex:Item",
+                "ex:name": format!("Novel {i}"),
+                "ex:level": 0
+            })
+        })
+        .collect();
+    let txn = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": graph
+    });
+    let _ = fluree_a
+        .insert(ledger_head, &txn)
+        .await
+        .expect("post-index novelty insert");
+
+    let query = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "select": "?name",
+        "where": [{ "@id": "?item", "ex:name": "?name" }]
+    });
+
+    // Ground truth (index + novelty) from the plain instance.
+    let ledger_a2 = fluree_a.ledger(LEDGER).await.expect("ledger A + novelty");
+    let db_a = GraphDb::from_ledger_state(&ledger_a2);
+    let expected = rows_of(
+        &fluree_a.query(&db_a, &query).await.expect("query A"),
+        &ledger_a2,
+    );
+    assert_eq!(expected.len(), (PEOPLE + EXTRA) as usize, "fixture sanity");
+
+    // Residency instance: LOAD runs the F8 reverse-leaf prefetch.
+    let (fluree_b, storage) = residency_instance(&shared, &ns);
+    let ledger_b = ledger_with_recovery(&fluree_b, &storage).await;
+
+    // Direct proof the prefetch covered translation: a novelty subject's
+    // reverse lookup — exactly what overlay translation performs per entry —
+    // must be a pure hit (no new miss, no retry round).
+    let provider = ledger_b
+        .snapshot
+        .range_provider
+        .as_ref()
+        .expect("indexed snapshot has a range provider");
+    let brp = provider
+        .as_any()
+        .downcast_ref::<fluree_db_query::BinaryRangeProvider>()
+        .expect("binary range provider");
+    let store = brp.store();
+    let dict_novelty = brp.dict_novelty();
+    let (ns_code, suffix) = dict_novelty
+        .subjects
+        .iter_entries()
+        .next()
+        .map(|(ns_code, suffix)| (ns_code, suffix.to_string()))
+        .expect("post-index commits must have populated dict novelty");
+    let misses_before = storage.miss_count();
+    let lookup = store.find_subject_id_by_parts(ns_code, &suffix);
+    assert!(
+        lookup.is_ok(),
+        "prefetched reverse leaf must serve the translation lookup: {lookup:?}"
+    );
+    assert_eq!(
+        storage.miss_count(),
+        misses_before,
+        "translation lookup after the load prefetch must be a pure hit          (F8: no retry round per reverse-dict leaf)"
+    );
+
+    // Full query (persisted + novelty rows) through the production loop.
+    let db_b = GraphDb::from_ledger_state(&ledger_b);
+    let result = fluree_b
+        .query(&db_b, &query)
+        .await
+        .expect("production retry loop must absorb the misses");
+    assert_eq!(
+        rows_of(&result, &ledger_b),
+        expected,
+        "identical results including novelty rows"
+    );
+    assert!(storage.register.is_empty(), "wants drained");
 }

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use fluree_db_binary_index::LeafletCache;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Resolves the ledger's effective configured full-text property list at
 /// index-build time.
@@ -181,6 +182,64 @@ pub struct IndexerConfig {
     /// queries might still be using.
     /// Default: 30 minutes
     pub gc_min_time_mins: u32,
+
+    /// How often the worker re-sweeps for ledgers whose indexing has stalled.
+    ///
+    /// A ledger is swept only if it is behind (`commit_t > index_t`) **and** its
+    /// `commit_t` has not moved since the previous sweep. A ledger that is still
+    /// committing is already served by the post-commit trigger; one that is
+    /// stuck is frozen by definition. Without the second condition a periodic
+    /// sweep would force an extra index build per behind ledger per interval,
+    /// because `catch_up_sweep`'s predicate alone matches most ledgers on a
+    /// busy deployment.
+    ///
+    /// The sweep costs one `all_records()` listing per tick, which is O(ledgers)
+    /// rather than O(1): a directory walk for file storage, a LIST plus a read
+    /// per branch for object stores.
+    ///
+    /// `Duration::ZERO` disables the periodic re-sweep. It does **not** disable
+    /// the sweep [`BackgroundIndexerWorker::run`] performs at start-up — that
+    /// one is a deadlock fix, not a tuning knob. To turn both off, see
+    /// [`catchup_sweeps_enabled`](Self::catchup_sweeps_enabled).
+    ///
+    /// Neither sweep can honour `reindex_min_bytes`: `NsRecord` carries no
+    /// novelty byte count, so "behind" is the only predicate available and a
+    /// ledger the soft threshold deliberately left unindexed is built anyway
+    /// once a sweep reaches it. The post-commit trigger does gate on
+    /// `should_reindex`, so this is the one path that bypasses the operator's
+    /// batching — an index build per behind ledger on every process start, plus
+    /// one per ledger that goes idle while behind. Builds are serialized per
+    /// worker, so the cost is throughput rather than a stampede.
+    ///
+    /// Default: 300 s.
+    pub catchup_interval: Duration,
+
+    /// Whether this worker owns catch-up for its nameservice.
+    ///
+    /// Both sweeps — the one [`BackgroundIndexerWorker::run`] performs at
+    /// start-up and the periodic re-sweep — are skipped when this is `false`.
+    /// Post-commit triggers, `trigger_if_idle`, and every `IndexerHandle`
+    /// operation (admin reindex, cancel, maintenance holds) keep working, so a
+    /// non-sweeping worker is still a fully functional indexer for work that is
+    /// asked for explicitly.
+    ///
+    /// This exists because a process can run more than one worker against the
+    /// same nameservice, and catch-up must have exactly one owner. Raft is that
+    /// case: every node runs a node-scope worker built by the api layer, and the
+    /// leader additionally runs a leader-scope worker wired to the event bus.
+    /// If both swept, the leader would queue and build each behind ledger twice
+    /// — the two workers hold independent `states` maps, so `trigger_if_idle`
+    /// cannot see the other's claim — and followers would start initiating
+    /// builds that publish through a nameservice which, under raft, proposes to
+    /// the state machine. Indexing is leader-only by design.
+    ///
+    /// Distinct from `catchup_interval == ZERO`, deliberately. That is an
+    /// operator tuning knob and leaves the start-up sweep alone, because the
+    /// start-up sweep is the deadlock fix. This is a statement about deployment
+    /// topology — who owns catch-up — and turns off both.
+    ///
+    /// Default: `true`.
+    pub catchup_sweeps_enabled: bool,
 
     /// Memory budget (bytes) for the run-sort buffer during index building.
     ///
@@ -386,6 +445,15 @@ pub const DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY: usize = 16;
 /// before deferring to full rebuild (issue #1266 ref/class-stat re-attribution).
 pub const DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS: usize = 100_000;
 
+/// Default interval for the worker's stalled-ledger re-sweep.
+///
+/// A safety net, not a scheduler: healthy ledgers are indexed on commit long
+/// before a sweep would notice them, and the stall condition needs two
+/// observations, so detection is up to twice this. Kept well above the 30 s
+/// retry-backoff ceiling so a sweep never races a build that is already
+/// retrying.
+pub const DEFAULT_CATCHUP_INTERVAL_SECS: u64 = 300;
+
 impl Default for IndexerConfig {
     fn default() -> Self {
         Self {
@@ -395,6 +463,8 @@ impl Default for IndexerConfig {
             branch_max_children: 200,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -417,6 +487,19 @@ impl Default for IndexerConfig {
 }
 
 impl IndexerConfig {
+    /// Where binary index artifacts are cached on local disk.
+    ///
+    /// Sited under [`data_dir`](Self::data_dir) so the cache survives restarts
+    /// and is shared by every reader on this instance. With no `data_dir` it
+    /// falls back to the system temp directory, which a short-lived process
+    /// still benefits from within its own run.
+    pub fn artifact_cache_dir(&self) -> PathBuf {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("binary_artifact_cache"))
+            .unwrap_or_else(|| std::env::temp_dir().join("fluree_binary_cache"))
+    }
+
     /// Create a new configuration with custom values
     pub fn new(
         leaf_target_bytes: u64,
@@ -431,6 +514,8 @@ impl IndexerConfig {
             branch_max_children,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -460,6 +545,8 @@ impl IndexerConfig {
             branch_max_children: 40,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -489,6 +576,8 @@ impl IndexerConfig {
             branch_max_children: 400,
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
+            catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -551,6 +640,24 @@ impl IndexerConfig {
 
     pub fn with_leaflets_per_leaf(mut self, n: usize) -> Self {
         self.leaflets_per_leaf = n.max(1);
+        self
+    }
+
+    /// Builder method to set the stalled-ledger re-sweep interval.
+    ///
+    /// [`Duration::ZERO`] disables the periodic re-sweep; the start-up sweep
+    /// runs regardless. See [`IndexerConfig::catchup_interval`].
+    pub fn with_catchup_interval(mut self, interval: Duration) -> Self {
+        self.catchup_interval = interval;
+        self
+    }
+
+    /// Builder method to set whether this worker owns catch-up sweeps.
+    ///
+    /// See [`IndexerConfig::catchup_sweeps_enabled`]. Pass `false` for a worker
+    /// that shares a nameservice with another worker that already sweeps.
+    pub fn with_catchup_sweeps(mut self, enabled: bool) -> Self {
+        self.catchup_sweeps_enabled = enabled;
         self
     }
 
