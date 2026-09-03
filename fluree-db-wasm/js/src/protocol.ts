@@ -137,6 +137,16 @@ export interface UnsubscribeRequest {
 
 /** Test-only: deliberately trap the wasm instance to exercise the
  * crash/recycle path (`Playground._debugCrash`). */
+/** Replace the bearer token for all subsequent engine I/O (peer mode only) —
+ * mid-session refresh for long-lived tabs whose connect-time token would
+ * otherwise expire. Complements the `getToken` pull, which runs only at
+ * connect and crash-recycle. */
+export interface SetTokenRequest {
+  id: number;
+  op: "setToken";
+  token: string;
+}
+
 export interface DebugCrashRequest {
   id: number;
   op: "debugCrash";
@@ -152,6 +162,7 @@ export type Request =
   | QueryRequest
   | SubscribeRequest
   | UnsubscribeRequest
+  | SetTokenRequest
   | DebugCrashRequest;
 
 // ---------------------------------------------------------------------------

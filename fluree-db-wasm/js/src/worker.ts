@@ -175,6 +175,21 @@ function requirePlayground(opName: string): Playground {
   return eng;
 }
 
+/** Peer-only surface (token refresh). */
+function requirePeer(opName: string): Peer {
+  const eng = requireEngine();
+  if (!(eng instanceof Peer)) {
+    const e = new Error(
+      `"${opName}" is not available in playground mode — memory ledgers ` +
+        `carry no bearer token`,
+    ) as Error & { code: string; status: number };
+    e.code = "unsupported";
+    e.status = 501;
+    throw e;
+  }
+  return eng;
+}
+
 /** Resolve a query target to a snapshot handle plus whether we own it. */
 async function resolveTarget(target: QueryTarget): Promise<{ handle: number; owned: boolean }> {
   if ("snapshot" in target) return { handle: target.snapshot, owned: false };
@@ -323,6 +338,10 @@ async function handle(req: Request): Promise<void> {
         return;
       case "unsubscribe":
         reply({ id, ok: true, result: requireEngine().unsubscribe(req.subId) });
+        return;
+      case "setToken":
+        requirePeer("setToken").setToken(req.token);
+        reply({ id, ok: true });
         return;
       case "debugCrash":
         // Test hook (see Playground._debugCrash): deliberately trap the

@@ -1034,6 +1034,18 @@ export class Peer {
    * consumer holding live queries must re-register them on `"ready"`.
    * Returns the unsubscriber.
    */
+  /** Replace the bearer token for all subsequent engine I/O — proactive
+   * mid-session refresh for long-lived tabs. The token pulled by `getToken`
+   * at connect eventually expires; without a refresh, block fetches start
+   * returning 401 and an SSE reconnect with the stale token goes fatal, with
+   * no recovery short of `close()` + `connect()`. Call this with a fresh
+   * token before expiry: every request/connect issued afterward carries the
+   * new bearer (requests already in flight keep the header they were stamped
+   * with). `getToken` is still pulled on crash-recycle — the two compose. */
+  async setToken(token: string): Promise<void> {
+    unwrap(await this.channel.call({ op: "setToken", token }));
+  }
+
   onEngineState(listener: (state: EngineState) => void): () => void {
     return this.channel.addStateListener(listener);
   }

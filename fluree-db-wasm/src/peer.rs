@@ -16,10 +16,12 @@
 //!   reserves for engine/operator memory.
 //! - **No raw token in `init`** (recycle replays init): the token arrives
 //!   from the main thread over the event channel just before this
-//!   constructor runs; it is then held inside the transports for the life of
-//!   the peer. There is no mid-session re-auth hook in `fluree-db-browser`
-//!   yet — a 401 after token expiry surfaces as a typed error and the shell
-//!   reconnects with a fresh token (worker recycle or explicit close+connect).
+//!   constructor runs. Mid-session refresh is [`Peer::set_token`] →
+//!   `BrowserPeer::set_token` (the shared `TokenCell`): every request or
+//!   connect issued afterward stamps the new bearer, with no teardown and no
+//!   loss of warm state. A 401 that lands before the app refreshed still
+//!   surfaces typed, and the shell reconnects with a fresh `getToken` pull
+//!   (worker recycle or explicit close+connect).
 //! - **Head changes** fan out through [`Peer::on_head_change`]: the
 //!   `Send + Sync` engine callback forwards into a channel, and a
 //!   `spawn_local` drain task calls the registered JS function — JS handles
@@ -168,6 +170,18 @@ impl Peer {
         timeout_ms: Option<f64>,
     ) -> Result<Vec<u8>, JsValue> {
         self.core.query_jsonld(snapshot, &query, timeout_ms).await
+    }
+
+    /// Replace the bearer token for every I/O surface — mid-session refresh
+    /// for long-lived tabs whose connect-time token would otherwise expire
+    /// (401s on block fetches, a fatal SSE reconnect). Delegates to
+    /// `BrowserPeer::set_token`: requests already in flight keep the header
+    /// they were stamped with; everything issued afterward carries the new
+    /// bearer (fetch transports stamp per request, the SSE source resolves
+    /// per connect). Refreshing proactively needs no restart.
+    #[wasm_bindgen(js_name = setToken)]
+    pub fn set_token(&self, token: String) {
+        self.peer.set_token(token);
     }
 
     /// Register a JS callback for ledger head changes. Called with one JSON
