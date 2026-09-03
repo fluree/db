@@ -865,10 +865,15 @@ impl Fluree {
         // largest of them, contributing to the ~2 MB worker-stack overflow on a
         // plain `select *` query (fluree/db#1408). Boxing keeps their state on
         // the heap so this frame stays O(1).
+        // Report the error's own status. Query preparation completes the
+        // ledger's config defaults, so a fault in the config graph surfaces
+        // here; a blanket 400 would tell the caller their request was bad
+        // when nothing about the request is.
         let executable = Box::pin(self.build_executable_for_view(db, &parsed))
             .await
             .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+                let status = e.status_code();
+                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
         // Execute with tracking
@@ -1267,7 +1272,9 @@ impl Fluree {
         // Start with the standard executable
         let mut executable = prepare_for_execution(parsed);
 
-        self.apply_reasoning_to_executable(db, &mut executable, !db.is_root())
+        // Server-verified identity for `f:overrideControl`. `None` until the
+        // request boundary threads it through; see `complete_config_defaults`.
+        self.apply_reasoning_to_executable(db, &mut executable, !db.is_root(), None)
             .await?;
 
         Ok(executable)
@@ -1279,10 +1286,15 @@ impl Fluree {
     /// ([`build_executable_for_view`](Self::build_executable_for_view)) and
     /// the dataset path (`build_executable_for_dataset`, which passes the
     /// dataset's primary view) so both engage the same reasoning surface:
-    /// mode precedence, the config materialization budget, config-graph
-    /// datalog restrictions, the query-time rule policy gate, local and
-    /// cross-ledger `f:rulesSource`, and the `f:schemaSource` bundle
-    /// (local, cross-ledger, and inline `opts.ontology`).
+    /// the ledger's config-graph defaults, mode precedence, the config
+    /// materialization budget, config-graph datalog restrictions, the
+    /// query-time rule policy gate, local and cross-ledger `f:rulesSource`,
+    /// and the `f:schemaSource` bundle (local, cross-ledger, and inline
+    /// `opts.ontology`).
+    ///
+    /// Config defaults are completed here rather than taken from the view as
+    /// received: a view arrives fully prepared, config-attached but
+    /// wrapper-less, or bare, depending on which entry point built it.
     ///
     /// `strip_query_rules` is true when a non-root view policy applies —
     /// `!db.is_root()` for a single view, `dataset.any_non_root_policy()`
@@ -1293,7 +1305,10 @@ impl Fluree {
         db: &GraphDb,
         executable: &mut ExecutableQuery,
         strip_query_rules: bool,
+        server_identity: Option<&str>,
     ) -> Result<()> {
+        let db = &self.complete_config_defaults(db, server_identity).await?;
+
         // Apply wrapper reasoning if applicable
         if db.reasoning().is_some() {
             // Check query's reasoning state
