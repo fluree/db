@@ -122,28 +122,46 @@ impl Renderer<'_> {
     fn collect_derived(&mut self, node: &RelNode) -> Result<()> {
         match node {
             RelNode::Derived { alias, plan } => {
-                let cols = self.output_types(plan)?;
+                let cols = self
+                    .output_types(plan)?
+                    .into_iter()
+                    .filter_map(|(n, t)| t.map(|t| (n, t)))
+                    .collect();
                 self.derived.insert(alias.clone(), cols);
                 Ok(())
             }
-            // The union's columns are the first branch's; every other
-            // branch must line up with it, or the database would coerce
-            // (or refuse) the union.
+            // A union's column is typed by the branches projecting a value
+            // there, which must agree, or the database would coerce (or
+            // refuse) the union; a branch's NULL padding takes that type.
             RelNode::UnionAll { alias, branches } => {
                 let Some(first) = branches.first() else {
                     return Err(SqlError::Unsupported("UNION ALL without branches".into()));
                 };
-                let cols = self.output_types(first)?;
+                let mut cols = self.output_types(first)?;
                 for b in &branches[1..] {
                     let other = self.output_types(b)?;
-                    if other.len() != cols.len()
-                        || other.iter().zip(&cols).any(|((_, x), (_, y))| x != y)
-                    {
+                    if other.len() != cols.len() {
                         return Err(SqlError::Unsupported(
-                            "UNION ALL branch column types differ".into(),
+                            "UNION ALL branches project different column counts".into(),
                         ));
                     }
+                    for ((_, slot), (_, ty)) in cols.iter_mut().zip(other) {
+                        match (&slot, ty) {
+                            (_, None) => {}
+                            (None, Some(t)) => *slot = Some(t),
+                            (Some(s), Some(t)) if *s == t => {}
+                            _ => {
+                                return Err(SqlError::Unsupported(
+                                    "UNION ALL branch column types differ".into(),
+                                ));
+                            }
+                        }
+                    }
                 }
+                let cols = cols
+                    .into_iter()
+                    .filter_map(|(n, t)| t.map(|t| (n, t)))
+                    .collect();
                 self.derived.insert(alias.clone(), cols);
                 Ok(())
             }
@@ -156,8 +174,9 @@ impl Renderer<'_> {
         }
     }
 
-    /// The output column types of a nested plan, from a renderer of its own.
-    fn output_types(&self, plan: &RelPlan) -> Result<Vec<(String, FieldType)>> {
+    /// The output column types of a nested plan, from a renderer of its
+    /// own; a `NULL` padding has none.
+    fn output_types(&self, plan: &RelPlan) -> Result<Vec<(String, Option<FieldType>)>> {
         let mut inner = Renderer {
             dialect: self.dialect,
             schemas: self.schemas,
@@ -173,15 +192,16 @@ impl Renderer<'_> {
         for o in &plan.output {
             let ty = match &o.expr {
                 OutputExpr::Col(c) | OutputExpr::Min(c) | OutputExpr::Max(c) => {
-                    inner.col_type(c)?
+                    Some(inner.col_type(c)?)
                 }
                 OutputExpr::Tag(_) | OutputExpr::CountRows | OutputExpr::Count { .. } => {
-                    FieldType::Int64
+                    Some(FieldType::Int64)
                 }
-                OutputExpr::Sum { .. } => FieldType::Decimal {
+                OutputExpr::Sum { .. } => Some(FieldType::Decimal {
                     precision: 38,
                     scale: 6,
-                },
+                }),
+                OutputExpr::Null => None,
             };
             cols.push((o.name.clone(), ty));
         }
@@ -277,6 +297,7 @@ impl Renderer<'_> {
         let expr = match &o.expr {
             OutputExpr::Col(c) => zoned(c, self.col(c))?,
             OutputExpr::Tag(n) => n.to_string(),
+            OutputExpr::Null => "NULL".to_string(),
             OutputExpr::CountRows => "COUNT(*)".to_string(),
             OutputExpr::Count { col, distinct: d } => {
                 format!("COUNT({}{})", distinct(*d), self.col(col))
@@ -675,6 +696,10 @@ pub fn capabilities(dialect: SqlDialect) -> PushdownCapabilities {
         // the `GROUP BY` as itself, so grouping folds case-variants together.
         string_distinct_is_binary: !matches!(dialect, SqlDialect::Mysql),
         string_order_is_codepoint: matches!(dialect, SqlDialect::Trino | SqlDialect::Sqlite),
+        // SQLite types a compound's column from the first branch's
+        // expression (a NULL literal has none), so a padded slot would come
+        // back as text.
+        union_null_is_typed: !matches!(dialect, SqlDialect::Sqlite),
         timestamp_is_text: matches!(dialect, SqlDialect::Sqlite),
     }
 }

@@ -144,11 +144,19 @@ impl FakeSql {
             // A `UNION ALL` of statements: the first branch's columns, every
             // branch's rows.
             let mut branches = split_top(&s[1..end], " UNION ALL ").into_iter();
-            let (columns, mut rows) = self.eval(branches.next().ok_or("empty derived table")?)?;
+            let (mut columns, mut rows) =
+                self.eval(branches.next().ok_or("empty derived table")?)?;
             for b in branches {
                 let (cols, more) = self.eval(b)?;
                 if cols.len() != columns.len() {
                     return Err("UNION ALL branches project different column counts".into());
+                }
+                // A NULL padding takes the type of a branch projecting a
+                // value there.
+                for (slot, (_, ty)) in columns.iter_mut().zip(cols) {
+                    if slot.1 == "unknown" {
+                        slot.1 = ty;
+                    }
                 }
                 rows.extend(more);
             }
@@ -490,6 +498,7 @@ enum SelectExpr {
     One,
     /// An integer literal.
     Const(i64),
+    Null,
     Col(Col),
     CountRows,
     Count(Col, bool),
@@ -502,7 +511,7 @@ impl SelectExpr {
     fn is_aggregate(&self) -> bool {
         !matches!(
             self,
-            SelectExpr::One | SelectExpr::Const(_) | SelectExpr::Col(_)
+            SelectExpr::One | SelectExpr::Const(_) | SelectExpr::Null | SelectExpr::Col(_)
         )
     }
 
@@ -526,6 +535,7 @@ impl SelectExpr {
             | SelectExpr::Const(_)
             | SelectExpr::CountRows
             | SelectExpr::Count(..) => "bigint".into(),
+            SelectExpr::Null => "unknown".into(),
             SelectExpr::Sum(c, _) => sum_type(&self.col_type(resolver, rels).unwrap_or_default())
                 .unwrap_or_else(|| format!("unsummable {}", c.1)),
             _ => self.col_type(resolver, rels).unwrap_or_default(),
@@ -536,6 +546,7 @@ impl SelectExpr {
         match self {
             SelectExpr::One => Ok(json!(1)),
             SelectExpr::Const(n) => Ok(json!(n)),
+            SelectExpr::Null => Ok(Value::Null),
             SelectExpr::Col(c) => {
                 let (ri, ci) = resolver.resolve(c)?;
                 Ok(cell(t, ri, ci))
@@ -569,6 +580,7 @@ impl SelectExpr {
         Ok(match self {
             SelectExpr::One => ("bigint".into(), json!(1)),
             SelectExpr::Const(n) => ("bigint".into(), json!(n)),
+            SelectExpr::Null => ("unknown".into(), Value::Null),
             SelectExpr::Col(c) => {
                 let (ri, ci) = resolver.resolve(c)?;
                 (
@@ -671,6 +683,8 @@ fn parse_select_item(item: &str) -> Result<SelectItem, String> {
         SelectExpr::Max(colref(inner))
     } else if let Ok(n) = expr.parse::<i64>() {
         SelectExpr::Const(n)
+    } else if expr == "NULL" {
+        SelectExpr::Null
     } else {
         SelectExpr::Col(colref(expr))
     };

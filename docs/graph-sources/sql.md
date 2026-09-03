@@ -291,10 +291,20 @@ pushable. In that statement:
   columns of the projected variables (plus what the join and any residual
   filter read), where the dialect's string equality is byte equality; the
   engine still deduplicates the returned terms;
-- a `UNION` runs **one statement per branch combination**, each branch
-  joined with the rest of the block and carrying its own residual filters,
-  so the branches may bind a variable from columns of different types; a
-  branch that can yield nothing sends nothing;
+- a `UNION` is one block per branch combination, each joined with the rest
+  of the block and carrying its own residual filters. The branches share
+  **one `UNION ALL` statement** under typed columns: a variable bound on
+  columns of the same database type in several branches takes one column,
+  a differently typed binding takes its own, and a branch not binding it
+  projects `NULL` there (on `dialect: sqlite`, whose compound columns are
+  typed from the first branch alone, such padding is not sent and the
+  branches run one statement each). Each row carries its branch, so its
+  terms decode through that branch's maps. `ORDER BY … LIMIT` pushes onto
+  the union when every branch orders on the same required column; when a
+  branch lacks the ordering variable the branches run one statement each so
+  that each keeps its own `LIMIT`. Branches seeded differently by the outer
+  query run one statement each; a branch that can yield nothing sends
+  nothing;
 - a grouped query over the block (`GROUP BY` with `COUNT`, `COUNT DISTINCT`,
   `SUM`, `AVG`, `MIN`, `MAX`; or `GROUP BY` alone, which is `SELECT
   DISTINCT`) is **one grouped statement**, with SPARQL's semantics patched
@@ -502,7 +512,7 @@ next to `99.50` as a real; typing by declaration keeps both as `5.0` and
 | Reads | Parquet files directly (S3/GCS/local) | SQL through an endpoint |
 | Filters | file/row-group pruning by min/max stats | exact `WHERE` |
 | Joins, OPTIONAL, VALUES, outer bindings | in the engine | one statement per block (pushdown lane) |
-| `UNION`, `DISTINCT` | in the engine | one statement per branch; `SELECT DISTINCT` (pushdown lane) |
+| `UNION`, `DISTINCT` | in the engine | one `UNION ALL` statement for the branches; `SELECT DISTINCT` (pushdown lane) |
 | `COUNT` | manifest stats, when provably exact | exact `COUNT(*)` |
 | `ORDER BY … LIMIT` | top-k file ordering | pushed by the pushdown lane on typed required columns |
 | Snapshots / time travel | pinned per query, incremental twins | none; full rebuilds |

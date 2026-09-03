@@ -713,10 +713,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a BIND after a UNION reads the union's variable",
             sparql: "SELECT ?o ?s FROM <shop-sql:main> WHERE { { ?o ex:total ?v } UNION { ?o ex:placed ?v } BIND(STR(?v) AS ?s) }",
-            sql: &[
-                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#,
-                r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL"#,
-            ],
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2", "u"."c3" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", NULL AS "c2", 0 AS "c3" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL UNION ALL SELECT "t0"."id" AS "c0", NULL AS "c1", "t0"."placed" AS "c2", 1 AS "c3" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL) AS "u""#],
             rows: &[
                 "o=http://example.org/order/10 s=2024-01-05",
                 "o=http://example.org/order/10 s=99.50",
@@ -1079,12 +1076,14 @@ fn cases() -> Vec<Case> {
             declined: None,
         },
         Case {
-            name: "UNION runs one statement per branch",
+            // `UNION` branches share one statement: `UNION ALL`ed under
+            // typed slots (a variable bound on columns of different types
+            // takes one per type, padded with NULL where a branch does not
+            // bind it), each row tagged with its branch, whose own
+            // materializer and residuals still run over it.
+            name: "UNION branches share one statement",
             sparql: "SELECT ?o ?v FROM <shop-sql:main> WHERE { { ?o ex:total ?v } UNION { ?o ex:placed ?v } }",
-            sql: &[
-                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#,
-                r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL"#,
-            ],
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2", "u"."c3" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", NULL AS "c2", 0 AS "c3" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL UNION ALL SELECT "t0"."id" AS "c0", NULL AS "c1", "t0"."placed" AS "c2", 1 AS "c3" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL) AS "u""#],
             rows: &[
                 "o=http://example.org/order/10 v=2024-01-05",
                 "o=http://example.org/order/10 v=99.50",
@@ -1100,15 +1099,51 @@ fn cases() -> Vec<Case> {
         Case {
             name: "UNION branches carry the block's other triples and their own filters",
             sparql: "SELECT ?o ?n FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n . { ?c ex:country \"UK\" } UNION { ?o ex:total ?t FILTER(?t > 40) } }",
-            sql: &[
-                r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL AND "t1"."country" = 'UK'"#,
-                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", "t1"."id" AS "c2", "t1"."name" AS "c3" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" > 40 AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#,
-            ],
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2", "u"."c3" AS "c3", "u"."c4" AS "c4" FROM (SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2", NULL AS "c3", 0 AS "c4" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL AND "t1"."country" = 'UK' UNION ALL SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2", "t0"."total" AS "c3", 1 AS "c4" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" > 40 AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL) AS "u""#],
             rows: &[
                 "n=Ada o=http://example.org/order/10",
                 "n=Ada o=http://example.org/order/10",
                 "n=Ada o=http://example.org/order/11",
                 "n=Bo o=http://example.org/order/12",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a top-k on a variable every UNION branch orders pushes on the union",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { { ?o ex:total ?t FILTER(?t > 40) } UNION { ?o ex:total ?t FILTER(?t < 6) } } ORDER BY DESC(?t) LIMIT 2",
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", 0 AS "c2" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" > 40 UNION ALL SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", 1 AS "c2" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" < 6) AS "u" ORDER BY "u"."c1" DESC LIMIT 2"#],
+            rows: &[
+                "o=http://example.org/order/10 t=99.50",
+                "o=http://example.org/order/12 t=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // Grouped, the union could not push the branch's own LIMIT.
+            name: "a top-k on a variable one UNION branch lacks keeps one statement per branch",
+            sparql: "SELECT ?o ?t ?p FROM <shop-sql:main> WHERE { { ?o ex:total ?t } UNION { ?o ex:placed ?p } } ORDER BY DESC(?t) LIMIT 2",
+            sql: &[
+                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY "t0"."total" DESC LIMIT 2"#,
+                r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL"#,
+            ],
+            rows: &[
+                "o=http://example.org/order/10 p= t=99.50",
+                "o=http://example.org/order/12 p= t=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a VALUES key set joins inside every branch of a shared UNION statement",
+            sparql: "SELECT ?o ?v FROM <shop-sql:main> WHERE { VALUES ?o { <http://example.org/order/10> <http://example.org/order/12> } { ?o ex:total ?v } UNION { ?o ex:placed ?v } }",
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2", "u"."c3" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", NULL AS "c2", 0 AS "c3" FROM "shop"."orders" AS "t0" JOIN (VALUES (10), (12)) AS "v0" ("k0") ON "v0"."k0" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL UNION ALL SELECT "t0"."id" AS "c0", NULL AS "c1", "t0"."placed" AS "c2", 1 AS "c3" FROM "shop"."orders" AS "t0" JOIN (VALUES (10), (12)) AS "v0" ("k0") ON "v0"."k0" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL) AS "u""#],
+            rows: &[
+                "o=http://example.org/order/10 v=2024-01-05",
+                "o=http://example.org/order/10 v=99.50",
+                "o=http://example.org/order/12 v=2024-03-01",
+                "o=http://example.org/order/12 v=42.00",
             ],
             routing: Routing::MustFire,
             declined: None,

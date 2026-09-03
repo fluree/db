@@ -249,6 +249,9 @@ pub enum OutputExpr {
     Col(ColRef),
     /// An integer literal: a `UNION ALL` branch tag.
     Tag(i64),
+    /// A bare `NULL`: a `UNION ALL` branch's padding for a column another
+    /// branch projects.
+    Null,
     /// `COUNT(*)`.
     CountRows,
     /// `COUNT([DISTINCT] col)`: non-null values.
@@ -273,7 +276,7 @@ impl OutputExpr {
             | OutputExpr::Sum { col: c, .. }
             | OutputExpr::Min(c)
             | OutputExpr::Max(c) => Some(c),
-            OutputExpr::CountRows | OutputExpr::Tag(_) => None,
+            OutputExpr::CountRows | OutputExpr::Tag(_) | OutputExpr::Null => None,
         }
     }
 
@@ -340,6 +343,10 @@ pub struct PushdownCapabilities {
     pub string_distinct_is_binary: bool,
     /// String `<` orders by code point (not a locale collation).
     pub string_order_is_codepoint: bool,
+    /// A bare `NULL` projected by one `UNION ALL` branch takes the type of
+    /// the column the other branches project there. False where the result
+    /// column is typed from the first branch's expression alone.
+    pub union_null_is_typed: bool,
     /// A `timestamp` without a zone is stored as text (SQLite), ordered by
     /// its characters. The date prefix orders correctly whatever the time
     /// separator; a comparison at time-of-day granularity does not.
