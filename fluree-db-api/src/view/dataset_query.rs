@@ -623,10 +623,14 @@ impl Fluree {
         let mut executable = prepare_for_execution(parsed);
 
         if let Some(primary) = dataset.primary() {
+            // Server-verified identity for `f:overrideControl`. `None` until
+            // the request boundary threads it through; see
+            // `complete_config_defaults`.
             self.apply_reasoning_to_executable(
                 primary,
                 &mut executable,
                 dataset.any_non_root_policy(),
+                None,
             )
             .await?;
         } else if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {

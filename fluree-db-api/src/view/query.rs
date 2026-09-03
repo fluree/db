@@ -1163,7 +1163,9 @@ impl Fluree {
         // Start with the standard executable
         let mut executable = prepare_for_execution(parsed);
 
-        self.apply_reasoning_to_executable(db, &mut executable, !db.is_root())
+        // Server-verified identity for `f:overrideControl`. `None` until the
+        // request boundary threads it through; see `complete_config_defaults`.
+        self.apply_reasoning_to_executable(db, &mut executable, !db.is_root(), None)
             .await?;
 
         Ok(executable)
@@ -1194,8 +1196,9 @@ impl Fluree {
         db: &GraphDb,
         executable: &mut ExecutableQuery,
         strip_query_rules: bool,
+        server_identity: Option<&str>,
     ) -> Result<()> {
-        let db = &self.complete_config_defaults(db).await?;
+        let db = &self.complete_config_defaults(db, server_identity).await?;
 
         // Apply wrapper reasoning if applicable
         if db.reasoning().is_some() {

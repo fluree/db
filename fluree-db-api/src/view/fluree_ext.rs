@@ -111,8 +111,8 @@ impl Fluree {
     ///
     /// Note: Reasoning defaults are NOT applied here — they are applied at
     /// query preparation by [`complete_config_defaults`](Self::complete_config_defaults),
-    /// via `config_resolver::merge_reasoning()`, which respects override
-    /// control and server-verified identity.
+    /// via `config_resolver::merge_reasoning()`, which applies override
+    /// control against whatever server-verified identity the caller supplies.
     pub(crate) async fn resolve_and_attach_config(&self, view: GraphDb) -> Result<GraphDb> {
         // Config reads are best-effort. If the config graph is unqueryable
         // (e.g., historical snapshot without a range_provider for g_id=2),
@@ -986,12 +986,25 @@ impl Fluree {
     ///
     /// A ledger with an empty config graph re-resolves on every query, but
     /// `resolve_ledger_config` short-circuits that case before it scans.
-    pub(crate) async fn complete_config_defaults(&self, view: &GraphDb) -> Result<GraphDb> {
+    ///
+    /// `server_identity` is the auth-layer-verified identity that
+    /// `f:overrideControl` gates on. It is not `opts.identity`, which is the
+    /// caller-settable policy evaluation context. This is the one place the
+    /// identity reaches the config merges, so threading it from the request
+    /// boundary is a change to the two callers of
+    /// `apply_reasoning_to_executable`, not to this function. Until that is
+    /// done both pass `None`, under which `f:IdentityRestricted` denies every
+    /// override, the same as `f:OverrideNone`.
+    pub(crate) async fn complete_config_defaults(
+        &self,
+        view: &GraphDb,
+        server_identity: Option<&str>,
+    ) -> Result<GraphDb> {
         let view = match view.resolved_config() {
             Some(_) => view.clone(),
             None => self.resolve_and_attach_config(view.clone()).await?,
         };
-        Ok(self.apply_config_defaults(view, None))
+        Ok(self.apply_config_defaults(view, server_identity))
     }
 
     /// Apply config-graph datalog defaults to a view.
