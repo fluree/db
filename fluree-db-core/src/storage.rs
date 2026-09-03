@@ -845,13 +845,26 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // layout: on a ledger predating the `@shared` dict move or the
         // `.fir6` rename, the only copy sits at a legacy address, and
         // releasing just the canonical one silently reclaims nothing.
+        let mut deleted = Ok(());
         for address in candidate_addresses(&self.method, &self.ledger_id, id) {
             match self.storage.delete(&address).await {
                 Ok(()) | Err(crate::error::Error::NotFound(_)) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    deleted = Err(e);
+                    break;
+                }
             }
         }
-        Ok(())
+
+        // After the deletes, never before: evicting first leaves a window
+        // where a concurrent reader repopulates the entry from storage that
+        // still holds the blob. Runs even when a delete failed — the blob may
+        // be partly gone by then, and a needless eviction only costs a refetch.
+        // Off-native there is no disk cache to hold a stale entry.
+        #[cfg(feature = "native")]
+        crate::disk_cache::evict_cached_cid(id);
+
+        deleted
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
@@ -1562,6 +1575,39 @@ mod tests {
     use crate::storage::memory::MemoryStorage;
 
     const LEDGER: &str = "mydb:main";
+
+    /// Releasing a blob must take its cached copy with it. A cache entry that
+    /// outlives its blob reads back as a live object, so a caller deciding
+    /// what storage holds — the index-chain walk, which ends at a root storage
+    /// no longer has — would not see the ending.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn releasing_a_blob_evicts_its_cached_copy() {
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+        let bytes = b"root bytes";
+        let id = store.put(ContentKind::IndexRoot, bytes).await.unwrap();
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "fluree-release-evicts-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        crate::disk_cache::fetch_cached_bytes_cid(&store, &id, &cache_dir)
+            .await
+            .unwrap();
+        let cached = cache_dir.join(id.to_string());
+        assert!(cached.exists(), "the fetch should have populated the cache");
+
+        store.release(&id).await.unwrap();
+
+        assert!(
+            !cached.exists(),
+            "a released blob is still readable from the disk cache"
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
 
     /// `candidate_addresses` exists so that callers deciding a blob is
     /// unreferenced see every address `ContentStore::get` would resolve it to.
