@@ -4711,11 +4711,12 @@ async fn sparql_double_canonical_lexical_form_across_formats() {
 /// drift apart again) plus the expected canonical spelling.
 ///
 /// The `xsd:string()` cast is pinned alongside precisely because it must NOT
-/// follow: SPARQL §17.5 defers casting to XPath, whose double→string rule is
-/// plain decimal notation in `[1e-6, 1e6)`, and W3C `cast-string` requires
-/// `xsd:string("1E0"^^xsd:double)` to be `"1"`. The two functions answer
-/// different questions; this test states both answers so neither drifts into
-/// the other.
+/// always follow: SPARQL §17.5 defers casting to XPath, whose double→string
+/// rule is plain decimal notation for absolute values in `[1e-6, 1e6)` — W3C
+/// `cast-string` requires `xsd:string("1E0"^^xsd:double)` to be `"1"` — and
+/// the canonical (scientific) lexical form outside that range, on BOTH sides
+/// (`1.0E-7` and `1.0E30` alike, never `0.0000001` or a 31-digit integer).
+/// This test states both answers so neither function drifts into the other.
 #[tokio::test]
 async fn sparql_str_double_matches_serializer_canonical_form() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -4727,9 +4728,15 @@ async fn sparql_str_double_matches_serializer_canonical_form() {
     let cases = [
         ("ex:d1", "1E0", "1.0E0", "1"),
         ("ex:d2", "5.0", "5.0E0", "5"),
-        ("ex:d3", "1.0E6", "1.0E6", "1000000"),
+        // 1e6 sits just OUTSIDE the XPath decimal-notation range (the upper
+        // bound is exclusive), so cast and canonical agree here.
+        ("ex:d3", "1.0E6", "1.0E6", "1.0E6"),
         ("ex:d4", "0.001", "1.0E-3", "0.001"),
         ("ex:d5", "-12.5", "-1.25E1", "-12.5"),
+        // Outside the XPath range on either side the cast is the canonical
+        // scientific form too — the range rule is two-sided.
+        ("ex:d9", "1.0E-7", "1.0E-7", "1.0E-7"),
+        ("ex:d10", "1.0E30", "1.0E30", "1.0E30"),
         // Specials share one spelling across both renderings — and neither is
         // Rust's `Display` ("inf"), which is a lexical form of nothing.
         ("ex:d6", "NaN", "NaN", "NaN"),
@@ -4793,10 +4800,13 @@ async fn sparql_str_double_matches_serializer_canonical_form() {
     }
 }
 
-/// Issue #1695 (float sibling): a stored `xsd:float` materializes as an f32 in
-/// expression evaluation, and `STR()` on it must likewise agree with the
-/// serializer's rendering of the same term (canonical form of the stored
-/// value).
+/// Issue #1695 (float sibling): a stored `xsd:float` is carried as a
+/// full-precision f64 (ingest never narrows) and the serializer prints THAT
+/// value; expression evaluation narrows the same binding to an f32. `STR()`
+/// must side with the serializer — it reads the stored f64 off the binding
+/// (`stored_float_f64`) rather than spelling the f32 truncation. The
+/// f32-inexact rows are the ones that catch it: for `3.14159265358979` the
+/// truncated spelling would be `3.1415927E0`.
 #[tokio::test]
 async fn sparql_str_float_matches_serializer_canonical_form() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -4806,6 +4816,12 @@ async fn sparql_str_float_matches_serializer_canonical_form() {
         ("ex:f1", "1E0", "1.0E0"),
         ("ex:f2", "33.33", "3.333E1"),
         ("ex:f3", "-0.5", "-5.0E-1"),
+        // f32-INEXACT: the stored f64 keeps more precision than an f32 can
+        // hold, so serializer-vs-STR() agreement is only possible if STR()
+        // reads the stored f64. (These rows go red if STR() ever routes
+        // through the f32 materialization again.)
+        ("ex:f4", "3.14159265358979", "3.14159265358979E0"),
+        ("ex:f5", "1.23456789012345E-5", "1.23456789012345E-5"),
     ];
     let graph: Vec<serde_json::Value> = cases
         .iter()

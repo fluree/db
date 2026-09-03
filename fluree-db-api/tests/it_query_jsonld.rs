@@ -64,6 +64,41 @@ async fn jsonld_bind_str_double_canonical_form() {
     );
 }
 
+/// Float sibling of the twin above (#1695, SPARQL↔JSON-LD parity): `(str ?f)`
+/// on a stored `xsd:float` must spell the STORED f64 — the same rendering the
+/// SPARQL surface's `STR()` and the serializers give the term — not the f32
+/// the numeric lanes narrow it to. The value is f32-inexact on purpose:
+/// through the f32 the lexical would come back `3.1415927E0`.
+#[tokio::test]
+async fn jsonld_bind_str_float_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "query/str-float-canonical");
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@id": "ex:y2",
+        "ex:f": {"@value": "3.14159265358979", "@type": "xsd:float"}
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where": [
+            {"@id": "ex:y2", "ex:f": "?f"},
+            ["bind", "?lex", "(str ?f)"]
+        ],
+        "select": ["?lex"]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("bind str(float) query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(json_rows, json!([["3.14159265358979E0"]]));
+}
+
 #[tokio::test]
 async fn jsonld_filter_single_filter() {
     // Mirrors `fluree.snapshot.query.filter-query-test/filter-test` ("single filter")

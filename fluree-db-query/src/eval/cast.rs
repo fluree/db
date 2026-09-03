@@ -189,42 +189,41 @@ fn float_typed_literal(f: f32) -> ComparableValue {
 
 /// Format an `f32` the way an XSD *cast* renders it.
 ///
-/// Deliberately NOT the canonical XSD lexical form `STR()` produces
+/// Deliberately NOT always the canonical XSD lexical form `STR()` produces
 /// (`fluree_graph_ir::canonical_xsd_float`): SPARQL §17.5 defers casting to
-/// XPath, whose float/double→string rule uses plain decimal notation for
-/// values in `[1e-6, 1e6)` rather than always-scientific. W3C `cast-string`
-/// pins it: `xsd:string("1E0"^^xsd:float)` is `"1"`, not `"1.0E0"`. The two
-/// renderings answer two different questions and must stay separate (#1695).
-/// Only the special values agree: `NaN`/`INF`/`-INF` in both.
+/// XPath, whose float/double→string rule converts a value with absolute
+/// value in `[1e-6, 1e6)` through `xs:decimal` — plain decimal notation,
+/// shortest round-trip digits (Rust's `Display`). W3C `cast-string` pins
+/// it: `xsd:string("1E0"^^xsd:float)` is `"1"`, not `"1.0E0"`. Outside that
+/// range (both sides — `1.0E-7` no less than `1.0E30`) XPath prescribes the
+/// canonical lexical representation, which IS the canonical form, so the two
+/// renderings converge there and this reuses the canonical writer. The
+/// special values agree everywhere: `NaN`/`INF`/`-INF` in both.
 pub(crate) fn format_f32(f: f32) -> String {
-    if f.is_nan() {
-        "NaN".to_string()
-    } else if f.is_infinite() {
-        if f.is_sign_positive() {
-            "INF".to_string()
-        } else {
-            "-INF".to_string()
-        }
+    if let Some(s) = fluree_graph_ir::XsdFloat::nonfinite_xsd(f) {
+        return s.to_string();
+    }
+    let a = f.abs();
+    if a != 0.0 && !(1e-6..1e6).contains(&a) {
+        fluree_graph_ir::canonical_xsd_float(f)
     } else {
-        // Use f32 Display which gives minimal-length representation
         f.to_string()
     }
 }
 
 /// `f64` counterpart of [`format_f32`], for the `xsd:string()` cast of a
-/// double. Rust's `Display` supplies the decimal mantissa; the special values
-/// take their XSD spellings — `f64::to_string()` alone yields `"inf"`, which
-/// is not a valid lexical form under either the cast rules or the canonical
+/// double: `xs:decimal` (plain, shortest round-trip) notation inside
+/// `[1e-6, 1e6)`, the canonical lexical form outside it, XSD spellings for
+/// the special values — `f64::to_string()` alone yields `"inf"`, which is
+/// not a valid lexical form under either the cast rules or the canonical
 /// ones (#1695).
 fn format_f64(d: f64) -> String {
-    if d.is_nan() {
-        "NaN".to_string()
-    } else if d.is_infinite() {
-        if d.is_sign_positive() {
-            "INF".to_string()
-        } else {
-            "-INF".to_string()
-        }
+    if let Some(s) = fluree_graph_ir::XsdFloat::nonfinite_xsd(d) {
+        return s.to_string();
+    }
+    let a = d.abs();
+    if a != 0.0 && !(1e-6..1e6).contains(&a) {
+        fluree_graph_ir::canonical_xsd_double(d)
     } else {
         d.to_string()
     }
@@ -349,6 +348,14 @@ fn cast_to_string(
     // Without these arms the cast would fall through to `into_string_value`
     // and pick up STR()'s canonical form, failing W3C `cast-string`.
     match &v {
+        // The `TypedLiteral` arm deliberately ignores `dtc`: no producer in
+        // the engine wraps a `FlakeValue::Double` in a `TypedLiteral` today
+        // (a stored float materializes as `Float` via `lit_to_comparable`;
+        // STRDT/cast results are string-backed; `TryFrom<FlakeValue>` maps
+        // `Double` to the bare variant), so a float-datatyped `Double`
+        // cannot reach the f64 branch. If such a producer ever appears,
+        // this arm must split on the datatype — the same variant-vs-datatype
+        // conflation the serializers carry (#1776).
         ComparableValue::Double(d)
         | ComparableValue::TypedLiteral {
             val: FlakeValue::Double(d),
@@ -838,5 +845,40 @@ mod tests {
             eval_xsd_double(&[double(-2.75)], &row, None).unwrap(),
             Some(ComparableValue::Double(-2.75))
         );
+    }
+
+    // === the XPath cast range, both sides (F&O: xs:decimal notation inside
+    // [1e-6, 1e6), canonical scientific outside) ===
+
+    #[test]
+    fn format_f64_xpath_range_is_two_sided() {
+        // Inside the range: plain decimal, shortest round-trip.
+        assert_eq!(format_f64(1.0), "1");
+        assert_eq!(format_f64(0.001), "0.001");
+        assert_eq!(format_f64(1e-6), "0.000001"); // lower bound is inclusive
+        assert_eq!(format_f64(999_999.5), "999999.5");
+        assert_eq!(format_f64(0.0), "0");
+        assert_eq!(format_f64(-12.5), "-12.5");
+        // Outside the range: the canonical (scientific) lexical form.
+        assert_eq!(format_f64(1e-7), "1.0E-7"); // NOT "0.0000001"
+        assert_eq!(format_f64(1e6), "1.0E6"); // upper bound is exclusive
+        assert_eq!(format_f64(1e30), "1.0E30"); // NOT a 31-digit integer
+        assert_eq!(format_f64(-2.5e6), "-2.5E6");
+        // Specials keep the XSD spellings on every path.
+        assert_eq!(format_f64(f64::NAN), "NaN");
+        assert_eq!(format_f64(f64::INFINITY), "INF");
+        assert_eq!(format_f64(f64::NEG_INFINITY), "-INF");
+    }
+
+    #[test]
+    fn format_f32_xpath_range_is_two_sided() {
+        assert_eq!(format_f32(1.0), "1");
+        assert_eq!(format_f32(33.33), "33.33");
+        assert_eq!(format_f32(0.0), "0");
+        assert_eq!(format_f32(1e-7), "1.0E-7");
+        assert_eq!(format_f32(1e6), "1.0E6");
+        assert_eq!(format_f32(1e30), "1.0E30");
+        assert_eq!(format_f32(f32::NAN), "NaN");
+        assert_eq!(format_f32(f32::NEG_INFINITY), "-INF");
     }
 }
