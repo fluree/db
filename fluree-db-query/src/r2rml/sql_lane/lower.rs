@@ -129,6 +129,10 @@ pub(crate) struct Lowered {
     /// when no residual filter drops rows afterwards and every variable
     /// shared with the outer query is seeded into the statement.
     pub limit_is_exact: bool,
+    /// The statement is `SELECT DISTINCT` over the columns of the variables
+    /// a `DISTINCT` above reads (plus what the join and residuals need);
+    /// the other block variables come back unbound.
+    pub distinct: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -172,32 +176,87 @@ pub(crate) struct LowerInput<'a> {
     pub policy: Option<PolicyVerdict<'a>>,
     /// Probed schemas for the relations [`wanted_schemas`] named.
     pub schemas: &'a HashMap<RelSource, Arc<BatchSchema>>,
+    /// The variables a `DISTINCT` directly above the block reads, when there
+    /// is one: the statement may then be `SELECT DISTINCT` over their columns.
+    pub projection: Option<&'a [VarId]>,
 }
 
-/// Lower a block. `Ok(Err(Decline))` is a structural decline (the per-scan
-/// lane runs); `Ok(Ok(None))` means the block provably yields no rows.
-pub(crate) fn lower_block(input: LowerInput<'_>) -> Result<Lowering<Option<Lowered>>> {
-    let block = match parse_block(input.patterns, input.snapshot) {
+/// The most `UNION` branch combinations one block expands into.
+const MAX_UNION_BLOCKS: usize = 8;
+
+/// Lower a block: one lowering per `UNION` branch combination, each its own
+/// statement. `Ok(Err(Decline))` is a structural decline (the per-scan lane
+/// runs); an empty `Ok(Ok(_))` means the block provably yields no rows.
+pub(crate) fn lower_block(input: LowerInput<'_>) -> Result<Lowering<Vec<Lowered>>> {
+    let blocks = match expand_unions(input.patterns) {
         Ok(b) => b,
         Err(d) => return Ok(Err(d)),
     };
-    let mut lw = Lowerer {
-        mapping: input.mapping,
-        caps: input.caps,
-        policy: input.policy,
-        schemas: input.schemas,
-        next_alias: 0,
-        accesses: Vec::new(),
-        access_preds: HashMap::new(),
-        edges: Vec::new(),
-        left_joins: Vec::new(),
-        vars: HashMap::new(),
-        var_order: Vec::new(),
-        residuals: Vec::new(),
-        required_columns: HashSet::new(),
-        static_keysets: Vec::new(),
-    };
-    lw.lower(block, input.child_vars)
+    let mut policy = input.policy;
+    let mut out = Vec::with_capacity(blocks.len());
+    for patterns in &blocks {
+        let block = match parse_block(patterns, input.snapshot) {
+            Ok(b) => b,
+            Err(d) => return Ok(Err(d)),
+        };
+        let mut lw = Lowerer {
+            mapping: input.mapping,
+            caps: input.caps,
+            policy: policy.take(),
+            schemas: input.schemas,
+            next_alias: 0,
+            accesses: Vec::new(),
+            access_preds: HashMap::new(),
+            edges: Vec::new(),
+            left_joins: Vec::new(),
+            vars: HashMap::new(),
+            var_order: Vec::new(),
+            residuals: Vec::new(),
+            required_columns: HashSet::new(),
+            static_keysets: Vec::new(),
+        };
+        let lowered = lw.lower(block, input.child_vars, input.projection)?;
+        policy = lw.policy.take();
+        match lowered {
+            Ok(Some(l)) => out.push(l),
+            Ok(None) => {}
+            Err(d) => return Ok(Err(d)),
+        }
+    }
+    Ok(Ok(out))
+}
+
+/// Every `UNION`-free block the patterns stand for: each `UNION` multiplies
+/// the blocks by its branches, a branch's patterns taking the union's place
+/// (SPARQL joins the union's result with the rest of the group, which is the
+/// same as joining each branch with it).
+fn expand_unions(patterns: &[Pattern]) -> Lowering<Vec<Vec<Pattern>>> {
+    let mut blocks: Vec<Vec<Pattern>> = vec![Vec::new()];
+    for p in patterns {
+        match p {
+            Pattern::Union(branches) => {
+                if branches.is_empty() {
+                    return decline("UNION without branches");
+                }
+                let mut next = Vec::new();
+                for branch in branches {
+                    for expanded in expand_unions(branch)? {
+                        for prefix in &blocks {
+                            let mut block = prefix.clone();
+                            block.extend(expanded.iter().cloned());
+                            next.push(block);
+                        }
+                    }
+                }
+                if next.len() > MAX_UNION_BLOCKS {
+                    return decline("too many UNION branch combinations");
+                }
+                blocks = next;
+            }
+            other => blocks.iter_mut().for_each(|b| b.push(other.clone())),
+        }
+    }
+    Ok(blocks)
 }
 
 struct Lowerer<'a> {
@@ -229,7 +288,12 @@ struct Empty;
 type RefEdge = (String, Vec<(String, String)>, String, VarId);
 
 impl<'a> Lowerer<'a> {
-    fn lower(&mut self, block: Block, child_vars: &[VarId]) -> Result<Lowering<Option<Lowered>>> {
+    fn lower(
+        &mut self,
+        block: Block,
+        child_vars: &[VarId],
+        projection: Option<&[VarId]>,
+    ) -> Result<Lowering<Option<Lowered>>> {
         // Required entities.
         let entities = group_entities(&block.triples);
         let required_subjects: HashSet<VarId> = entities
@@ -333,12 +397,35 @@ impl<'a> Lowerer<'a> {
             Err(d) => return Ok(Err(d)),
         };
 
+        // A DISTINCT above reads only `projection`; the statement then
+        // returns each distinct combination of those variables' columns
+        // once, keeping the columns the in-memory join and the residual
+        // filters read. Distinct column values are distinct terms only when
+        // string equality is byte equality (a case-folding collation would
+        // merge two IRIs or literals).
+        let distinct_vars: Option<HashSet<VarId>> = projection
+            .filter(|_| self.caps.string_eq_is_binary)
+            .map(|proj| {
+                let mut keep: HashSet<VarId> = proj.iter().copied().collect();
+                keep.extend(child_vars.iter().copied());
+                for f in &self.residuals {
+                    keep.extend(f.referenced_vars());
+                }
+                keep
+            });
+        let projected: Vec<VarId> = self
+            .var_order
+            .iter()
+            .copied()
+            .filter(|v| distinct_vars.as_ref().is_none_or(|keep| keep.contains(v)))
+            .collect();
+
         // Projection: every column a term source reads.
         let mut outputs: Vec<OutputCol> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
         let mut per_alias: HashMap<String, Vec<String>> = HashMap::new();
         let mut var_columns: HashMap<VarId, Vec<ColRef>> = HashMap::new();
-        for var in &self.var_order {
+        for var in &projected {
             let src = &self.vars[var];
             let cols = self.term_columns(&src.term);
             for col in &cols {
@@ -366,8 +453,7 @@ impl<'a> Lowerer<'a> {
             })
             .collect();
 
-        let terms: Vec<(VarId, TermSource)> = self
-            .var_order
+        let terms: Vec<(VarId, TermSource)> = projected
             .iter()
             .map(|v| (*v, self.vars[v].term.clone()))
             .collect();
@@ -419,6 +505,7 @@ impl<'a> Lowerer<'a> {
             var_columns,
             order_columns,
             limit_is_exact,
+            distinct: distinct_vars.is_some(),
         })))
     }
 
@@ -1693,13 +1780,21 @@ pub(crate) fn candidate_sources(
     snapshot: &LedgerSnapshot,
     mapping: &CompiledR2rmlMapping,
 ) -> Vec<RelSource> {
-    let Ok(block) = parse_block(patterns, snapshot) else {
+    let Ok(blocks) = expand_unions(patterns) else {
         return Vec::new();
     };
-    let preds: HashSet<&str> = block
-        .triples
+    let blocks: Vec<Block> = blocks
         .iter()
-        .chain(block.optionals.iter().flat_map(|(t, _)| t))
+        .filter_map(|b| parse_block(b, snapshot).ok())
+        .collect();
+    let preds: HashSet<&str> = blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .triples
+                .iter()
+                .chain(block.optionals.iter().flat_map(|(t, _)| t))
+        })
         .map(|t| t.p.as_str())
         .collect();
     let mut out: Vec<RelSource> = Vec::new();
@@ -1748,6 +1843,14 @@ pub(crate) fn block_is_admissible(patterns: &[Pattern]) -> bool {
                 }) {
                     return false;
                 }
+            }
+            // Every branch is a block of its own; a branch without triples
+            // would leave a combination with nothing to access.
+            Pattern::Union(branches) => {
+                if branches.is_empty() || !branches.iter().all(|b| block_is_admissible(b)) {
+                    return false;
+                }
+                has_triple = true;
             }
             _ => return false,
         }

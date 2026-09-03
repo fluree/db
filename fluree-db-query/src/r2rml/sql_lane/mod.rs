@@ -8,7 +8,8 @@
 //! as the fused aggregate. When it proceeds, bindings the outer query already
 //! holds are sent into the statement as a key set (chunked to the provider's
 //! limits), each returned page is joined to the outer rows in memory, and
-//! residual filters run in the engine above.
+//! residual filters run in the engine over the returned rows. A `UNION`
+//! runs one statement per branch combination, each with its own residuals.
 
 mod aggregate;
 mod lower;
@@ -29,6 +30,7 @@ use fluree_db_tabular::BatchSchema;
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::eval::PreparedBoolExpression;
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{GraphName, Pattern};
@@ -68,7 +70,9 @@ pub struct SqlBlockOperator {
     state: OperatorState,
     row_budget: Option<usize>,
     topk: Option<(VarId, usize, bool)>,
-    /// After open: the residual-filter chain over the source, or the fallback.
+    /// The variables a `DISTINCT` directly above reads.
+    distinct: Option<Vec<VarId>>,
+    /// After open: the source, or the fallback.
     chain: Option<BoxedOperator>,
 }
 
@@ -96,6 +100,7 @@ impl SqlBlockOperator {
             state: OperatorState::Created,
             row_budget: None,
             topk: None,
+            distinct: None,
             chain: None,
         }
     }
@@ -121,7 +126,14 @@ impl SqlBlockOperator {
         ctx: &ExecutionContext<'_>,
         child_vars: &[VarId],
     ) -> Result<Option<Resolved>> {
-        resolve_block(ctx, &self.graph_iri, &self.inner_patterns, child_vars).await
+        resolve_block(
+            ctx,
+            &self.graph_iri,
+            &self.inner_patterns,
+            child_vars,
+            self.distinct.as_deref(),
+        )
+        .await
     }
 }
 
@@ -132,6 +144,7 @@ pub(super) async fn resolve_block(
     graph_iri: &Arc<str>,
     patterns: &[Pattern],
     child_vars: &[VarId],
+    projection: Option<&[VarId]>,
 ) -> Result<Option<Resolved>> {
     let iri = graph_iri;
     match ctx.dataset {
@@ -195,44 +208,57 @@ pub(super) async fn resolve_block(
         child_vars,
         policy: verdicts.is_some().then_some(&mut verdict),
         schemas: &schemas,
+        projection,
     })?;
     let lowered = match lowered {
         Err(Decline(why)) => {
             tracing::debug!(graph = %iri, why, "sql pushdown declined");
             return Ok(None);
         }
-        Ok(None) => {
-            return Ok(Some(Resolved {
-                inner: None,
-                materializer: None,
-                caps,
-                mapping,
-                schemas,
-            }))
-        }
-        Ok(Some(l)) => l,
+        Ok(l) => l,
     };
-    tracing::debug!(
-        graph = %iri,
-        seeds = lowered.seeds.len(),
-        child_vars = ?child_vars,
-        block_vars = ?lowered.block_vars,
-        "sql pushdown lowered"
-    );
-    let materializer = Materializer::new(&lowered, &mapping, ctx.active_snapshot)?;
+    let mut branches = Vec::with_capacity(lowered.len());
+    for lowered in lowered {
+        tracing::debug!(
+            graph = %iri,
+            seeds = lowered.seeds.len(),
+            child_vars = ?child_vars,
+            block_vars = ?lowered.block_vars,
+            distinct = lowered.distinct,
+            "sql pushdown lowered"
+        );
+        let materializer = Materializer::new(&lowered, &mapping, ctx.active_snapshot)?;
+        let residuals = lowered
+            .residual_filters
+            .iter()
+            .map(|f| PreparedBoolExpression::new(f.clone()))
+            .collect();
+        branches.push(Branch {
+            lowered,
+            materializer,
+            residuals,
+        });
+    }
     Ok(Some(Resolved {
-        inner: Some(lowered),
-        materializer: Some(materializer),
+        branches,
         caps,
         mapping,
         schemas,
     }))
 }
 
+/// One statement of a resolved block: a `UNION` contributes one per branch
+/// combination, everything else exactly one.
+pub(super) struct Branch {
+    pub lowered: Lowered,
+    pub materializer: Materializer,
+    /// The branch's residual filters, run over its rows in the engine.
+    residuals: Vec<PreparedBoolExpression>,
+}
+
 pub(super) struct Resolved {
-    /// `None`: the block provably yields no rows.
-    pub inner: Option<Lowered>,
-    pub materializer: Option<Materializer>,
+    /// Empty: the block provably yields no rows.
+    pub branches: Vec<Branch>,
     pub caps: PushdownCapabilities,
     pub mapping: Arc<CompiledR2rmlMapping>,
     /// Probed schemas of the relations the block can reach.
@@ -251,6 +277,10 @@ impl Operator for SqlBlockOperator {
 
     fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
         self.topk = Some((sort_var, k, ascending));
+    }
+
+    fn set_distinct(&mut self, vars: &[VarId]) {
+        self.distinct = Some(vars.to_vec());
     }
 
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
@@ -288,23 +318,14 @@ impl Operator for SqlBlockOperator {
             }
             Some(resolved) => {
                 stamp_fast_path(SQL_BLOCK_PUSHDOWN_SITE, FastPathOutcome::Proceed);
-                let residuals = resolved
-                    .inner
-                    .as_ref()
-                    .map(|l| l.residual_filters.clone())
-                    .unwrap_or_default();
-                let mut op: BoxedOperator = Box::new(SqlBlockSource::new(
+                Box::new(SqlBlockSource::new(
                     child,
                     Arc::clone(&self.graph_iri),
                     Arc::clone(&self.schema),
                     resolved,
                     self.row_budget,
                     self.topk,
-                ));
-                for f in residuals {
-                    op = Box::new(crate::filter::FilterOperator::new(op, f));
-                }
-                op
+                ))
             }
         };
         chain.open(ctx).await?;
@@ -361,12 +382,16 @@ enum JoinPlan {
 
 struct InFlight {
     child_batch: Batch,
-    join: JoinPlan,
-    chunks: VecDeque<Option<KeySet>>,
-    stream: Option<ColumnBatchStream>,
+    /// One join plan per branch (a branch binds its own subset of the
+    /// shared variables).
+    joins: Vec<JoinPlan>,
+    /// `(branch, key-set chunk)` statements still to run.
+    chunks: VecDeque<(usize, Option<KeySet>)>,
+    stream: Option<(usize, ColumnBatchStream)>,
 }
 
-/// The source proper: executes the plan per child batch and merges rows.
+/// The source proper: executes each branch's plan per child batch and
+/// merges rows.
 struct SqlBlockSource {
     child: BoxedOperator,
     graph_iri: Arc<str>,
@@ -375,7 +400,9 @@ struct SqlBlockSource {
     row_budget: Option<usize>,
     topk: Option<(VarId, usize, bool)>,
     state: OperatorState,
-    pending: VecDeque<Vec<Binding>>,
+    /// Rows waiting to be batched, tagged with the branch that produced
+    /// them so the branch's residual filters run over a homogeneous batch.
+    pending: VecDeque<(usize, Vec<Binding>)>,
     inflight: Option<InFlight>,
     child_done: bool,
     out_pos: HashMap<VarId, usize>,
@@ -406,17 +433,14 @@ impl SqlBlockSource {
         }
     }
 
-    fn lowered(&self) -> &Lowered {
-        self.resolved
-            .inner
-            .as_ref()
-            .expect("source built only for a non-empty lowering")
+    fn lowered(&self, branch: usize) -> &Lowered {
+        &self.resolved.branches[branch].lowered
     }
 
-    /// The statement for one key-set chunk (or none), with the modifiers the
-    /// engine's LIMIT / top-k channels allow.
-    fn plan_for(&self, keyset: Option<KeySet>) -> RelPlan {
-        let lowered = self.lowered();
+    /// The statement for one branch and key-set chunk (or none), with the
+    /// modifiers the engine's LIMIT / top-k channels allow.
+    fn plan_for(&self, branch: usize, keyset: Option<KeySet>) -> RelPlan {
+        let lowered = self.lowered(branch);
         let mut root = lowered.root.clone();
         if let Some(ks) = keyset {
             let on: Vec<Pred> = lowered
@@ -459,17 +483,22 @@ impl SqlBlockSource {
             root,
             output: lowered.outputs.clone(),
             group_by: Vec::new(),
-            distinct: false,
+            distinct: lowered.distinct,
             order_by,
             limit,
         }
     }
 
-    /// Key-set chunks for a child batch: `[None]` when nothing can be seeded
-    /// (the statement runs once, unconstrained, and the in-memory join does
-    /// the rest).
-    fn keysets_for(&self, child_batch: &Batch, ctx: &ExecutionContext<'_>) -> Vec<Option<KeySet>> {
-        let lowered = self.lowered();
+    /// Key-set chunks for a child batch on one branch: `[None]` when nothing
+    /// can be seeded (the statement runs once, unconstrained, and the
+    /// in-memory join does the rest), empty when no outer row can match.
+    fn keysets_for(
+        &self,
+        branch: usize,
+        child_batch: &Batch,
+        ctx: &ExecutionContext<'_>,
+    ) -> Vec<Option<KeySet>> {
+        let lowered = self.lowered(branch);
         if lowered.seeds.is_empty() {
             return vec![None];
         }
@@ -547,12 +576,17 @@ impl SqlBlockSource {
         chunks
     }
 
-    fn build_join_plan(&self, child_batch: &Batch, ctx: &ExecutionContext<'_>) -> JoinPlan {
+    fn build_join_plan(
+        &self,
+        branch: usize,
+        child_batch: &Batch,
+        ctx: &ExecutionContext<'_>,
+    ) -> JoinPlan {
         let child_schema = child_batch.schema();
         let join_vars: Vec<VarId> = child_schema
             .iter()
             .copied()
-            .filter(|v| self.lowered().block_vars.contains(v))
+            .filter(|v| self.lowered(branch).block_vars.contains(v))
             .collect();
         if join_vars.is_empty() {
             return JoinPlan::Cross;
@@ -598,6 +632,7 @@ impl SqlBlockSource {
 
     fn emit_row(
         &mut self,
+        branch: usize,
         child_batch: &Batch,
         child_row_idx: usize,
         prod: &[(VarId, Binding)],
@@ -615,12 +650,13 @@ impl SqlBlockSource {
                 row[pos] = b.clone();
             }
         }
-        self.pending.push_back(row);
+        self.pending.push_back((branch, row));
         Ok(())
     }
 
     fn join_and_emit(
         &mut self,
+        branch: usize,
         child_batch: &Batch,
         join: &JoinPlan,
         prod: &[(VarId, Binding)],
@@ -629,7 +665,7 @@ impl SqlBlockSource {
         match join {
             JoinPlan::Cross => {
                 for child_row_idx in 0..child_batch.len() {
-                    self.emit_row(child_batch, child_row_idx, prod, ctx)?;
+                    self.emit_row(branch, child_batch, child_row_idx, prod, ctx)?;
                 }
             }
             JoinPlan::Hash {
@@ -659,39 +695,66 @@ impl SqlBlockSource {
                     }
                 }
                 for child_row_idx in matches {
-                    self.emit_row(child_batch, child_row_idx, prod, ctx)?;
+                    self.emit_row(branch, child_batch, child_row_idx, prod, ctx)?;
                 }
             }
         }
         Ok(())
     }
 
+    /// The next batch of pending rows: one branch's rows at a time, its
+    /// residual filters applied. `all` flushes short runs.
     fn take_batch(&mut self, ctx: &ExecutionContext<'_>, all: bool) -> Result<Option<Batch>> {
-        if self.pending.is_empty() || (!all && self.pending.len() < ctx.batch_size) {
-            return Ok(None);
-        }
-        let n = self.pending.len().min(ctx.batch_size);
-        let mut columns: Vec<Vec<Binding>> = (0..self.schema.len())
-            .map(|_| Vec::with_capacity(n))
-            .collect();
-        for _ in 0..n {
-            let row = self.pending.pop_front().unwrap();
-            for (i, b) in row.into_iter().enumerate() {
-                columns[i].push(b);
+        loop {
+            let Some(&(branch, _)) = self.pending.front() else {
+                return Ok(None);
+            };
+            if !all && self.pending.len() < ctx.batch_size {
+                return Ok(None);
             }
+            let n = self
+                .pending
+                .iter()
+                .take(ctx.batch_size)
+                .take_while(|(b, _)| *b == branch)
+                .count();
+            let mut columns: Vec<Vec<Binding>> = (0..self.schema.len())
+                .map(|_| Vec::with_capacity(n))
+                .collect();
+            for _ in 0..n {
+                let (_, row) = self.pending.pop_front().unwrap();
+                for (i, b) in row.into_iter().enumerate() {
+                    columns[i].push(b);
+                }
+            }
+            let mut batch = Batch::new(Arc::clone(&self.schema), columns)
+                .map_err(|e| QueryError::Internal(e.to_string()))?;
+            let mut dropped = false;
+            for f in &self.resolved.branches[branch].residuals {
+                match crate::filter::filter_batch(&batch, f, &self.schema, ctx)? {
+                    Some(kept) => batch = kept,
+                    None => {
+                        dropped = true;
+                        break;
+                    }
+                }
+            }
+            if dropped {
+                continue;
+            }
+            let stamp_ledger_id = match ctx.dataset {
+                Some(ds) if ds.spans_multiple_ledgers() => ds
+                    .named_graph(self.graph_iri.as_ref())
+                    .map(|g| Arc::clone(&g.ledger_id)),
+                _ => None,
+            };
+            return Ok(Some(match stamp_ledger_id {
+                Some(ledger_id) => {
+                    crate::dataset_operator::stamp_provenance(batch, &ledger_id, ctx)?
+                }
+                None => batch,
+            }));
         }
-        let batch = Batch::new(Arc::clone(&self.schema), columns)
-            .map_err(|e| QueryError::Internal(e.to_string()))?;
-        let stamp_ledger_id = match ctx.dataset {
-            Some(ds) if ds.spans_multiple_ledgers() => ds
-                .named_graph(self.graph_iri.as_ref())
-                .map(|g| Arc::clone(&g.ledger_id)),
-            _ => None,
-        };
-        Ok(Some(match stamp_ledger_id {
-            Some(ledger_id) => crate::dataset_operator::stamp_provenance(batch, &ledger_id, ctx)?,
-            None => batch,
-        }))
     }
 }
 
@@ -731,6 +794,7 @@ impl Operator for SqlBlockSource {
         let mut m = serde_json::Map::new();
         m.insert("graph".into(), self.graph_iri.to_string().into());
         m.insert("lane".into(), "sql_block_pushdown".into());
+        m.insert("statements".into(), self.resolved.branches.len().into());
         m
     }
 
@@ -744,7 +808,7 @@ impl Operator for SqlBlockSource {
         if self.state == OperatorState::Exhausted {
             return Ok(None);
         }
-        if self.resolved.inner.is_none() {
+        if self.resolved.branches.is_empty() {
             self.state = OperatorState::Exhausted;
             return Ok(None);
         }
@@ -755,27 +819,24 @@ impl Operator for SqlBlockSource {
                 return Ok(Some(batch));
             }
             if let Some(mut inflight) = self.inflight.take() {
-                if let Some(stream) = inflight.stream.as_mut() {
+                if let Some((branch, stream)) = inflight.stream.as_mut() {
                     use futures::StreamExt;
                     match stream.next().await {
                         Some(page) => {
                             let page = page?;
-                            let materializer = self
-                                .resolved
-                                .materializer
-                                .as_ref()
-                                .expect("materializer for a non-empty lowering");
-                            let outputs = &self.lowered().outputs;
-                            let batches = materializer.split_page(page, outputs)?;
+                            let branch = *branch;
+                            let b = &self.resolved.branches[branch];
+                            let batches = b.materializer.split_page(page, &b.lowered.outputs)?;
                             let num_rows = batches.values().next().map(|b| b.num_rows).unwrap_or(0);
                             let mut rows = Vec::with_capacity(num_rows);
                             for i in 0..num_rows {
-                                rows.push(materializer.row(&batches, i)?);
+                                rows.push(b.materializer.row(&batches, i)?);
                             }
                             for prod in &rows {
                                 self.join_and_emit(
+                                    branch,
                                     &inflight.child_batch,
-                                    &inflight.join,
+                                    &inflight.joins[branch],
                                     prod,
                                     &graph_ctx,
                                 )?;
@@ -788,14 +849,14 @@ impl Operator for SqlBlockSource {
                         }
                     }
                 }
-                if let Some(keyset) = inflight.chunks.pop_front() {
-                    let plan = self.plan_for(keyset);
+                if let Some((branch, keyset)) = inflight.chunks.pop_front() {
+                    let plan = self.plan_for(branch, keyset);
                     let table_provider = graph_ctx.r2rml_table_provider.ok_or_else(|| {
                         QueryError::InvalidQuery("R2RML table provider not configured".into())
                     })?;
                     let (sql, stream) = table_provider.execute_plan(&self.graph_iri, &plan).await?;
                     graph_ctx.tracker.record_statement(&self.graph_iri, &sql);
-                    inflight.stream = Some(stream);
+                    inflight.stream = Some((branch, stream));
                     self.inflight = Some(inflight);
                 }
                 continue;
@@ -809,17 +870,21 @@ impl Operator for SqlBlockSource {
             }
             match self.child.next_batch(ctx).await? {
                 Some(child_batch) => {
-                    let chunks: VecDeque<Option<KeySet>> = self
-                        .keysets_for(&child_batch, &graph_ctx)
-                        .into_iter()
-                        .collect();
-                    if chunks.is_empty() {
-                        continue; // no outer row can match
+                    let mut chunks: VecDeque<(usize, Option<KeySet>)> = VecDeque::new();
+                    let mut joins = Vec::with_capacity(self.resolved.branches.len());
+                    for branch in 0..self.resolved.branches.len() {
+                        // A branch no outer row can match contributes nothing.
+                        for ks in self.keysets_for(branch, &child_batch, &graph_ctx) {
+                            chunks.push_back((branch, ks));
+                        }
+                        joins.push(self.build_join_plan(branch, &child_batch, &graph_ctx));
                     }
-                    let join = self.build_join_plan(&child_batch, &graph_ctx);
+                    if chunks.is_empty() {
+                        continue;
+                    }
                     self.inflight = Some(InFlight {
                         child_batch,
-                        join,
+                        joins,
                         chunks,
                         stream: None,
                     });

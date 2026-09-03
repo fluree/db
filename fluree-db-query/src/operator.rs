@@ -112,6 +112,14 @@ pub trait Operator: Send + Sync {
     /// **before** `open()`.
     fn set_topk(&mut self, _sort_var: VarId, _k: usize, _ascending: bool) {}
 
+    /// Tell a source that a `DISTINCT` over exactly `vars` sits directly above
+    /// it (through row-preserving operators only), so it may return each
+    /// distinct combination of those variables once and leave the others
+    /// unbound. Default no-op; the `DistinctOperator` above stays
+    /// authoritative, so honoring it never changes results. Set **before**
+    /// `open()`.
+    fn set_distinct(&mut self, _vars: &[VarId]) {}
+
     // ------------------------------------------------------------------
     // EXPLAIN introspection (never called on the hot path)
     // ------------------------------------------------------------------

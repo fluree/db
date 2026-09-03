@@ -221,8 +221,8 @@ enum Routing {
 struct Case {
     name: &'static str,
     sparql: &'static str,
-    /// The exact statement, when the lane fires.
-    sql: Option<&'static str>,
+    /// The exact statements, in order, when the lane fires.
+    sql: &'static [&'static str],
     rows: &'static [&'static str],
     routing: Routing,
     /// The decline reason the lowering must report, for `MustNotFire` shapes.
@@ -237,7 +237,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "star with an exact numeric filter",
             sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t FILTER(?t > 40) }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" > 40"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" > 40"#],
             rows: &[
                 "o=http://example.org/order/10 t=99.50",
                 "o=http://example.org/order/12 t=42.00",
@@ -248,7 +248,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "foreign-key join between two entities",
             sparql: "SELECT ?o ?n FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#],
             rows: &[
                 "n=Ada o=http://example.org/order/10",
                 "n=Ada o=http://example.org/order/11",
@@ -260,7 +260,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "foreign-key object alone joins the parent for its IRI",
             sparql: "SELECT ?o ?c FROM <shop-sql:main> WHERE { ?o ex:customer ?c }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL"#],
             rows: &[
                 "c=http://example.org/customer/1 o=http://example.org/order/10",
                 "c=http://example.org/customer/1 o=http://example.org/order/11",
@@ -272,7 +272,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "constant subject reverses through the template",
             sparql: "SELECT ?t FROM <shop-sql:main> WHERE { <http://example.org/order/10> ex:total ?t }",
-            sql: Some(r#"SELECT "t0"."total" AS "c0" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."id" = 10 AND "t0"."total" IS NOT NULL"#),
+            sql: &[r#"SELECT "t0"."total" AS "c0" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."id" = 10 AND "t0"."total" IS NOT NULL"#],
             rows: &["t=99.50"],
             routing: Routing::MustFire,
             declined: None,
@@ -280,7 +280,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "optional member of the same entity is a nullable column",
             sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             rows: &["k= n=Bo", "k=UK n=Ada", "k=US n=Cy"],
             routing: Routing::MustFire,
             declined: None,
@@ -288,7 +288,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "optional entity hanging off a foreign key is a left join",
             sparql: "SELECT ?n ?o FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?o ex:customer ?c } }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."id" AS "c2" FROM "shop"."customers" AS "t0" LEFT JOIN "shop"."orders" AS "t1" ON "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t1"."customer_id" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."id" AS "c2" FROM "shop"."customers" AS "t0" LEFT JOIN "shop"."orders" AS "t1" ON "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t1"."customer_id" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             rows: &[
                 "n=Ada o=http://example.org/order/10",
                 "n=Ada o=http://example.org/order/11",
@@ -301,7 +301,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "unpushable filter stays in the engine as a residual",
             sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 2) }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             rows: &["n=Ada"],
             routing: Routing::MustFire,
             declined: None,
@@ -309,7 +309,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "typed date filter pushes as a DATE literal",
             sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:placed ?p FILTER(?p >= \"2024-02-01\"^^xsd:date) }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL AND "t0"."placed" >= DATE '2024-02-01'"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL AND "t0"."placed" >= DATE '2024-02-01'"#],
             rows: &["o=http://example.org/order/11", "o=http://example.org/order/12"],
             routing: Routing::MustFire,
             declined: None,
@@ -317,7 +317,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "IN list pushes as a set",
             sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(?n IN (\"Ada\", \"Cy\")) }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."name" IN ('Ada', 'Cy')"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."name" IN ('Ada', 'Cy')"#],
             rows: &["n=Ada", "n=Cy"],
             routing: Routing::MustFire,
             declined: None,
@@ -325,7 +325,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "VALUES in the block is a static key set",
             sparql: "SELECT ?n FROM <shop-sql:main> WHERE { VALUES ?c { <http://example.org/customer/2> } ?c ex:name ?n }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" JOIN (VALUES (2)) AS "v0" ("k0") ON "v0"."k0" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" JOIN (VALUES (2)) AS "v0" ("k0") ON "v0"."k0" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             rows: &["n=Bo"],
             routing: Routing::MustFire,
             declined: None,
@@ -333,7 +333,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "LIMIT without ORDER BY pushes a LIMIT",
             sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t } LIMIT 2",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL LIMIT 2"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL LIMIT 2"#],
             rows: &["o=http://example.org/order/10", "o=http://example.org/order/11"],
             routing: Routing::MustFire,
             declined: None,
@@ -341,7 +341,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "dateTime filter pushes as a zoned TIMESTAMP against a zoned column",
             sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:shipped ?s FILTER(?s > \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."shipped" AT TIME ZONE 'UTC' AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."shipped" IS NOT NULL AND "t0"."shipped" > TIMESTAMP '2024-01-10 00:00:00.000000 UTC'"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."shipped" AT TIME ZONE 'UTC' AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."shipped" IS NOT NULL AND "t0"."shipped" > TIMESTAMP '2024-01-10 00:00:00.000000 UTC'"#],
             rows: &["o=http://example.org/order/11"],
             routing: Routing::MustFire,
             declined: None,
@@ -349,7 +349,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "dateTime filter on a naive timestamp column stays in the engine",
             sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:updated ?u FILTER(?u > \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL"#],
             rows: &["o=http://example.org/order/11"],
             routing: Routing::MustFire,
             declined: None,
@@ -357,7 +357,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "ORDER BY DESC LIMIT pushes a top-k",
             sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t } ORDER BY DESC(?t) LIMIT 2",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY "t0"."total" DESC LIMIT 2"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY "t0"."total" DESC LIMIT 2"#],
             rows: &[
                 "o=http://example.org/order/10 t=99.50",
                 "o=http://example.org/order/12 t=42.00",
@@ -368,7 +368,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "OFFSET widens the pushed top-k",
             sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t } ORDER BY DESC(?t) OFFSET 1 LIMIT 1",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY "t0"."total" DESC LIMIT 2"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY "t0"."total" DESC LIMIT 2"#],
             rows: &["o=http://example.org/order/12 t=42.00"],
             routing: Routing::MustFire,
             declined: None,
@@ -376,7 +376,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a residual filter keeps LIMIT in the engine",
             sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 1) } LIMIT 1",
-            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             rows: &["n=Ada"],
             routing: Routing::MustFire,
             declined: None,
@@ -384,7 +384,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "constant subject whose key cannot be the column's type is empty without a round trip",
             sparql: "SELECT ?t FROM <shop-sql:main> WHERE { <http://example.org/order/abc> ex:total ?t }",
-            sql: None,
+            sql: &[],
             rows: &[],
             routing: Routing::MustFire,
             declined: None,
@@ -392,7 +392,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "predicates of two triples maps on one subject are empty without a round trip",
             sparql: "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?x ex:name ?n . ?x ex:total ?t }",
-            sql: None,
+            sql: &[],
             rows: &[],
             routing: Routing::MustFire,
             declined: None,
@@ -400,7 +400,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a variable shared by two value classes declines",
             sparql: "SELECT ?c ?o FROM <shop-sql:main> WHERE { ?c ex:name ?v . ?o ex:total ?v }",
-            sql: None,
+            sql: &[],
             rows: &[],
             routing: Routing::MustNotFire,
             declined: Some("repeated variable joins two value classes"),
@@ -408,7 +408,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "an optional hanging off an optional entity declines",
             sparql: "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?o ex:customer ?c } OPTIONAL { ?o ex:total ?t } }",
-            sql: None,
+            sql: &[],
             rows: &["n=Ada t=5.00", "n=Ada t=99.50", "n=Bo t=42.00", "n=Cy t="],
             routing: Routing::MustNotFire,
             declined: Some("optional chained on an optional entity"),
@@ -416,7 +416,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "an inexact filter inside OPTIONAL declines",
             sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k FILTER(STRLEN(?k) > 1) } }",
-            sql: None,
+            sql: &[],
             rows: &["k= n=Bo", "k=UK n=Ada", "k=US n=Cy"],
             routing: Routing::MustNotFire,
             declined: Some("filter inside a folded optional"),
@@ -424,7 +424,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "VALUES over an optional variable declines",
             sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } VALUES ?k { \"UK\" } }",
-            sql: None,
+            sql: &[],
             // An unbound ?k is compatible with the VALUES row, so Bo keeps it;
             // a WHERE on the column would have dropped that row.
             rows: &["k=UK n=Ada", "k=UK n=Bo"],
@@ -434,7 +434,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "variable predicate is not admitted",
             sparql: "SELECT ?p ?v FROM <shop-sql:main> WHERE { <http://example.org/customer/1> ?p ?v }",
-            sql: None,
+            sql: &[],
             rows: &[
                 "p=http://example.org/country v=UK",
                 "p=http://example.org/name v=Ada",
@@ -444,9 +444,100 @@ fn cases() -> Vec<Case> {
             declined: None,
         },
         Case {
+            name: "ORDER BY ASC LIMIT pushes a top-k",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t } ORDER BY ?t LIMIT 2",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY "t0"."total" ASC LIMIT 2"#],
+            rows: &[
+                "o=http://example.org/order/11 t=5.00",
+                "o=http://example.org/order/13 t=7.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "SELECT DISTINCT is DISTINCT over the projected columns",
+            sparql: "SELECT DISTINCT ?n FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n }",
+            sql: &[r#"SELECT DISTINCT "t1"."name" AS "c0" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#],
+            rows: &["n=Ada", "n=Bo"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "DISTINCT keeps the columns a residual filter reads",
+            sparql: "SELECT DISTINCT ?c FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n FILTER(STRLEN(?n) > 2) }",
+            sql: &[r#"SELECT DISTINCT "t1"."id" AS "c0", "t1"."name" AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#],
+            rows: &["c=http://example.org/customer/1"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "UNION runs one statement per branch",
+            sparql: "SELECT ?o ?v FROM <shop-sql:main> WHERE { { ?o ex:total ?v } UNION { ?o ex:placed ?v } }",
+            sql: &[
+                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#,
+                r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL"#,
+            ],
+            rows: &[
+                "o=http://example.org/order/10 v=2024-01-05",
+                "o=http://example.org/order/10 v=99.50",
+                "o=http://example.org/order/11 v=2024-02-01",
+                "o=http://example.org/order/11 v=5.00",
+                "o=http://example.org/order/12 v=2024-03-01",
+                "o=http://example.org/order/12 v=42.00",
+                "o=http://example.org/order/13 v=7.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "UNION branches carry the block's other triples and their own filters",
+            sparql: "SELECT ?o ?n FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n . { ?c ex:country \"UK\" } UNION { ?o ex:total ?t FILTER(?t > 40) } }",
+            sql: &[
+                r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL AND "t1"."country" = 'UK'"#,
+                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", "t1"."id" AS "c2", "t1"."name" AS "c3" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" > 40 AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#,
+            ],
+            rows: &[
+                "n=Ada o=http://example.org/order/10",
+                "n=Ada o=http://example.org/order/10",
+                "n=Ada o=http://example.org/order/11",
+                "n=Bo o=http://example.org/order/12",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a UNION branch that can yield nothing sends no statement",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { { ?o ex:total ?t } UNION { ?o ex:total ?t . ?o ex:name ?x } }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &[
+                "o=http://example.org/order/10 t=99.50",
+                "o=http://example.org/order/11 t=5.00",
+                "o=http://example.org/order/12 t=42.00",
+                "o=http://example.org/order/13 t=7.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a UNION branch with a nested OPTIONAL is not admitted",
+            sparql: "SELECT ?o ?v FROM <shop-sql:main> WHERE { { ?o ex:total ?v } UNION { ?o ex:placed ?v OPTIONAL { ?o ex:customer ?c OPTIONAL { ?c ex:name ?n } } } }",
+            sql: &[],
+            rows: &[
+                "o=http://example.org/order/10 v=2024-01-05",
+                "o=http://example.org/order/10 v=99.50",
+                "o=http://example.org/order/11 v=2024-02-01",
+                "o=http://example.org/order/11 v=5.00",
+                "o=http://example.org/order/12 v=2024-03-01",
+                "o=http://example.org/order/12 v=42.00",
+                "o=http://example.org/order/13 v=7.00",
+            ],
+            routing: Routing::MustNotFire,
+            declined: None,
+        },
+        Case {
             name: "disconnected entities decline (no cartesian product)",
             sparql: "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?c ex:name ?n . ?o ex:total ?t FILTER(?t > 90) }",
-            sql: None,
+            sql: &[],
             rows: &["n=Ada t=99.50", "n=Bo t=99.50", "n=Cy t=99.50"],
             routing: Routing::MustNotFire,
             declined: Some("disconnected entities (cartesian product)"),
@@ -512,11 +603,12 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
                 }
             }
         }
-        if let Some(sql) = c.sql {
-            if sent.as_slice() != [sql.to_string()] {
+        if !c.sql.is_empty() {
+            if sent != c.sql {
                 failures.push(format!(
-                    "{}: statements sent {sent:#?}\nexpected exactly:\n{sql}",
-                    c.name
+                    "{}: statements sent {sent:#?}\nexpected exactly:\n{}",
+                    c.name,
+                    c.sql.join("\n")
                 ));
             }
         } else if !sent.is_empty() {
@@ -714,7 +806,7 @@ fn aggregate_cases() -> Vec<Case> {
         Case {
             name: "COUNT(*) over a star is one counting statement",
             sparql: "SELECT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:total ?t }",
-            sql: Some(r#"SELECT COUNT(*) AS "c0" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#),
+            sql: &[r#"SELECT COUNT(*) AS "c0" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
             rows: &["n=4"],
             routing: Routing::MustFire,
             declined: None,
@@ -722,7 +814,7 @@ fn aggregate_cases() -> Vec<Case> {
         Case {
             name: "GROUP BY a foreign-key object with COUNT and SUM",
             sparql: "SELECT ?c (COUNT(?o) AS ?n) (SUM(?t) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?o ex:total ?t } GROUP BY ?c",
-            sql: Some(r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1", SUM("t0"."total") AS "c2", COUNT("t0"."total") AS "c3" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#),
+            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1", SUM("t0"."total") AS "c2", COUNT("t0"."total") AS "c3" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
             rows: &[
                 "c=http://example.org/customer/1 n=2 s=104.50",
                 "c=http://example.org/customer/2 n=1 s=42.00",
@@ -733,7 +825,7 @@ fn aggregate_cases() -> Vec<Case> {
         Case {
             name: "AVG pushes SUM and COUNT and divides in the engine",
             sparql: "SELECT ?c (AVG(?t) AS ?a) FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?o ex:total ?t } GROUP BY ?c",
-            sql: Some(r#"SELECT "t1"."id" AS "c0", SUM("t0"."total") AS "c1", COUNT("t0"."total") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#),
+            sql: &[r#"SELECT "t1"."id" AS "c0", SUM("t0"."total") AS "c1", COUNT("t0"."total") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
             rows: &[
                 "a=42 c=http://example.org/customer/2",
                 "a=52.25 c=http://example.org/customer/1",
@@ -744,7 +836,7 @@ fn aggregate_cases() -> Vec<Case> {
         Case {
             name: "MIN and MAX come back as terms of the mapping's datatype",
             sparql: "SELECT (MIN(?t) AS ?lo) (MAX(?p) AS ?last) FROM <shop-sql:main> WHERE { ?o ex:total ?t . ?o ex:placed ?p }",
-            sql: Some(r#"SELECT MIN("t0"."total") AS "c0", MAX("t0"."placed") AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."placed" IS NOT NULL"#),
+            sql: &[r#"SELECT MIN("t0"."total") AS "c0", MAX("t0"."placed") AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."placed" IS NOT NULL"#],
             rows: &["last=2024-03-01 lo=5.00"],
             routing: Routing::MustFire,
             declined: None,
@@ -752,7 +844,7 @@ fn aggregate_cases() -> Vec<Case> {
         Case {
             name: "COUNT DISTINCT of a foreign-key object",
             sparql: "SELECT (COUNT(DISTINCT ?c) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c }",
-            sql: Some(r#"SELECT COUNT(DISTINCT "t1"."id") AS "c0" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL"#),
+            sql: &[r#"SELECT COUNT(DISTINCT "t1"."id") AS "c0" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL"#],
             rows: &["n=2"],
             routing: Routing::MustFire,
             declined: None,
@@ -760,7 +852,7 @@ fn aggregate_cases() -> Vec<Case> {
         Case {
             name: "GROUP BY without aggregates is SELECT DISTINCT",
             sparql: "SELECT ?k FROM <shop-sql:main> WHERE { ?c ex:country ?k } GROUP BY ?k",
-            sql: Some(r#"SELECT DISTINCT "t0"."country" AS "c0" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."country" IS NOT NULL"#),
+            sql: &[r#"SELECT DISTINCT "t0"."country" AS "c0" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."country" IS NOT NULL"#],
             rows: &["k=UK", "k=US"],
             routing: Routing::MustFire,
             declined: None,
@@ -768,7 +860,7 @@ fn aggregate_cases() -> Vec<Case> {
         Case {
             name: "ORDER BY an aggregate with LIMIT pushes a top-k on the output",
             sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c ORDER BY DESC(?n) LIMIT 1",
-            sql: Some(r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id" ORDER BY "c1" DESC LIMIT 1"#),
+            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id" ORDER BY "c1" DESC LIMIT 1"#],
             rows: &["c=http://example.org/customer/1 n=2"],
             routing: Routing::MustFire,
             declined: None,
@@ -776,7 +868,7 @@ fn aggregate_cases() -> Vec<Case> {
         Case {
             name: "HAVING keeps LIMIT in the engine and filters the groups",
             sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c HAVING (COUNT(?o) > 1) LIMIT 5",
-            sql: Some(r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#),
+            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
             rows: &["c=http://example.org/customer/1 n=2"],
             routing: Routing::MustFire,
             declined: None,
@@ -784,7 +876,7 @@ fn aggregate_cases() -> Vec<Case> {
         Case {
             name: "an optional member counts only bound values",
             sparql: "SELECT (COUNT(?k) AS ?n) (COUNT(*) AS ?all) FROM <shop-sql:main> WHERE { ?c ex:name ?x OPTIONAL { ?c ex:country ?k } }",
-            sql: Some(r#"SELECT COUNT("t0"."country") AS "c0", COUNT(*) AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            sql: &[r#"SELECT COUNT("t0"."country") AS "c0", COUNT(*) AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             rows: &["all=3 n=2"],
             routing: Routing::MustFire,
             declined: None,
@@ -792,7 +884,7 @@ fn aggregate_cases() -> Vec<Case> {
         Case {
             name: "a residual filter under an aggregate declines",
             sparql: "SELECT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?c ex:name ?x FILTER(STRLEN(?x) > 2) }",
-            sql: None,
+            sql: &[],
             rows: &["n=1"],
             routing: Routing::MustNotFire,
             declined: Some("residual filter under an aggregate"),
@@ -856,11 +948,12 @@ async fn grouped_queries_send_one_grouped_statement() {
                 }
             }
         }
-        if let Some(sql) = c.sql {
-            if sent.as_slice() != [sql.to_string()] {
+        if !c.sql.is_empty() {
+            if sent != c.sql {
                 failures.push(format!(
-                    "{}: statements sent {sent:#?}\nexpected exactly:\n{sql}",
-                    c.name
+                    "{}: statements sent {sent:#?}\nexpected exactly:\n{}",
+                    c.name,
+                    c.sql.join("\n")
                 ));
             }
         } else if sent
@@ -1049,14 +1142,14 @@ async fn live_bridge_agrees_with_the_scan_lane() {
         // SUM/AVG over it declines (its datatype is decimal); the rows must
         // still agree, and the decline itself is pinned.
         let declines_on_sqlite = SQLITE_DECLINES.contains(&c.name);
-        match (&c.routing, c.sql) {
-            (Routing::MustFire, Some(_)) if declines_on_sqlite && !sent.is_empty() => {
+        match (&c.routing, c.sql.is_empty()) {
+            (Routing::MustFire, false) if declines_on_sqlite && !sent.is_empty() => {
                 failures.push(format!(
                     "{}: expected a decline on SQLite, sent {sent:?}",
                     c.name
                 ));
             }
-            (Routing::MustFire, Some(_)) if !declines_on_sqlite && sent.is_empty() => {
+            (Routing::MustFire, false) if !declines_on_sqlite && sent.is_empty() => {
                 failures.push(format!("{}: the lane sent no statement", c.name));
             }
             // A declined grouped shape may still run its block through the

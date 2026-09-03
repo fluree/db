@@ -489,18 +489,29 @@ impl Operator for SqlAggregateOperator {
             .fallback
             .take()
             .ok_or_else(|| QueryError::Internal("SqlAggregateOperator opened twice".into()))?;
-        let resolved =
-            resolve_block(ctx, &self.plan.graph_iri, &self.plan.inner_patterns, &[]).await?;
+        let resolved = resolve_block(
+            ctx,
+            &self.plan.graph_iri,
+            &self.plan.inner_patterns,
+            &[],
+            None,
+        )
+        .await?;
         let lowered = resolved.as_ref().and_then(|r| {
-            r.inner.as_ref().and_then(|l| {
-                match lower_aggregate(&self.plan, r, l, ctx.active_snapshot) {
-                    Ok(al) => Some(al),
-                    Err(why) => {
-                        tracing::debug!(graph = %self.plan.graph_iri, why, "sql aggregate pushdown declined");
-                        None
-                    }
+            // A UNION is several statements; grouping across them stays with
+            // the engine. An empty block has nothing to group either.
+            let single = match r.branches.as_slice() {
+                [b] => Ok(&b.lowered),
+                [] => Err("block yields no rows"),
+                _ => Err("UNION under an aggregate"),
+            };
+            match single.and_then(|l| lower_aggregate(&self.plan, r, l, ctx.active_snapshot)) {
+                Ok(al) => Some(al),
+                Err(why) => {
+                    tracing::debug!(graph = %self.plan.graph_iri, why, "sql aggregate pushdown declined");
+                    None
                 }
-            })
+            }
         });
         let mut chain: BoxedOperator = match lowered {
             None => {

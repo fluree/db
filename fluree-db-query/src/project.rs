@@ -65,6 +65,10 @@ impl Operator for ProjectOperator {
         self.child.set_topk(sort_var, k, ascending);
     }
 
+    fn set_distinct(&mut self, vars: &[crate::var_registry::VarId]) {
+        self.child.set_distinct(vars);
+    }
+
     async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         if !self.state.can_next() {
             if self.state == OperatorState::Created {
