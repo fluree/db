@@ -697,6 +697,14 @@ fn cases() -> Vec<Case> {
             declined: Some("predicate provided by several triples maps"),
         },
         Case {
+            name: "UNION branch combinations above the cap decline",
+            sparql: "SELECT ?a ?b ?c ?d FROM <shop-sql:main> WHERE { { <http://example.org/order/13> ex:total ?a } UNION { <http://example.org/order/13> ex:placed ?a } { <http://example.org/order/13> ex:total ?b } UNION { <http://example.org/order/13> ex:placed ?b } { <http://example.org/order/13> ex:total ?c } UNION { <http://example.org/order/13> ex:placed ?c } { <http://example.org/order/13> ex:total ?d } UNION { <http://example.org/order/13> ex:placed ?d } }",
+            sql: &[],
+            rows: &["a=7.00 b=7.00 c=7.00 d=7.00"],
+            routing: Routing::MustNotFire,
+            declined: Some("too many UNION branch combinations"),
+        },
+        Case {
             name: "a variable shared by two value classes declines",
             sparql: "SELECT ?c ?o FROM <shop-sql:main> WHERE { ?c ex:name ?v . ?o ex:total ?v }",
             sql: &[],
@@ -1096,6 +1104,71 @@ async fn outer_bindings_become_a_key_set() {
     ";
     let rows = rows_of(&query(&fluree, sparql).await);
     assert_eq!(rows, vec!["n=Ada tier=gold", "n=Cy tier=silver"]);
+}
+
+/// Outer bindings above the provider's key-set row cap go out as several
+/// statements; a `VALUES` or `IN` list inside the block above the cap is
+/// not pushed at all (the block still runs on the lane, the list in the
+/// engine), since the block's own key set is not chunked.
+#[tokio::test]
+async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    // 2001 distinct keys: 1..=3 exist, the rest match nothing.
+    let iris: Vec<String> = (1..=2001)
+        .map(|i| format!("<http://example.org/customer/{i}>"))
+        .collect();
+    let values = iris.join(" ");
+
+    let sparql = format!(
+        "{PREFIX}SELECT ?c ?n FROM NAMED <shop-sql:main> WHERE {{ VALUES ?c {{ {values} }} GRAPH <shop-sql:main> {{ ?c ex:name ?n }} }}"
+    );
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &sparql).await);
+    assert_eq!(
+        rows,
+        vec![
+            "c=http://example.org/customer/1 n=Ada",
+            "c=http://example.org/customer/2 n=Bo",
+            "c=http://example.org/customer/3 n=Cy",
+        ]
+    );
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert_eq!(sent.len(), 2, "2001 keys chunk into 2000 + 1: {sent:?}");
+    assert!(sent[0].contains("(2000)") && !sent[0].contains("(2001)"));
+    assert!(sent[1].contains("(VALUES (2001)) AS \"k\""), "{}", sent[1]);
+    set_fast_paths_disabled(true);
+    let scan = rows_of(&query(&fluree, &sparql).await);
+    set_fast_paths_disabled(false);
+    assert_eq!(scan, rows, "scan lane disagrees");
+
+    let sparql = format!(
+        "{PREFIX}SELECT ?c ?n FROM <shop-sql:main> WHERE {{ ?c ex:name ?n VALUES ?c {{ {values} }} }}"
+    );
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &sparql).await);
+    assert_eq!(rows.len(), 3);
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert!(
+        sent.is_empty(),
+        "an oversized VALUES in the block declines the lane: {sent:?}"
+    );
+
+    let names: Vec<String> = (1..=2001).map(|i| format!("\"n{i}\"")).collect();
+    let sparql = format!(
+        "{PREFIX}SELECT ?n FROM <shop-sql:main> WHERE {{ ?c ex:name ?n FILTER(?n IN (\"Ada\", {})) }}",
+        names.join(", ")
+    );
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &sparql).await);
+    assert_eq!(rows, vec!["n=Ada"]);
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        !sent[0].contains(" IN ("),
+        "an oversized IN list stays a residual: {}",
+        sent[0]
+    );
 }
 
 const AGG_SITE: &str = "sql_aggregate_pushdown";

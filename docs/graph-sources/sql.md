@@ -212,6 +212,12 @@ pushable. In that statement:
   joined on the subject's key columns; maps over the same table and subject
   share a single access. Every member must have exactly one providing map
   when no map provides them all, or the block is left to the engine;
+- the statement has limits the lane respects: outer bindings above the
+  provider's key-set cap (2000 rows, or half the statement budget) go out
+  as several statements, one per chunk; a `VALUES` block or an `IN` list
+  inside the block above that cap is not pushed (the block still runs on
+  the lane, the `VALUES` in the engine and the `IN` as a residual); a
+  `UNION` expanding to more than eight branch combinations declines;
 - a constant subject or object IRI is reversed through its template into
   key predicates; a key that cannot be a value of its column (`order/abc`
   over a `bigint`) makes the block empty without a round trip;

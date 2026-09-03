@@ -42,7 +42,7 @@ use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 
-use lower::{block_is_admissible, lower_block, Decline, LowerInput, Lowered};
+use lower::{block_is_admissible, literal_len, lower_block, Decline, LowerInput, Lowered};
 use terms::{seed_values, Materializer};
 
 /// Routing stamp site for `MustFire` / `MustNotFire` tests.
@@ -565,6 +565,15 @@ impl SqlBlockSource {
         let mut bytes = 0usize;
         for row in rows {
             let row_bytes: usize = row.iter().map(|l| literal_len(l) + 4).sum();
+            if row_bytes > byte_budget {
+                // One key the statement cannot carry: run the block unseeded
+                // and let the join filter it.
+                tracing::debug!(
+                    row_bytes,
+                    "sql pushdown: outer key over the byte budget, no key set"
+                );
+                return vec![None];
+            }
             if !current.is_empty() && (current.len() >= max_rows || bytes + row_bytes > byte_budget)
             {
                 chunks.push(Some(KeySet {
@@ -794,14 +803,6 @@ fn join_key(b: &Binding, ctx: &ExecutionContext<'_>) -> GroupKeyOwned {
             let gv = ctx.graph_view();
             binding_to_group_key_normalized(b, ctx.binary_store.as_deref(), gv.as_ref())
         }
-    }
-}
-
-fn literal_len(l: &Literal) -> usize {
-    match l {
-        Literal::Str(s) | Literal::TemplateKey(s) => s.len() + 2,
-        Literal::Set(items) => items.iter().map(literal_len).sum(),
-        _ => 24,
     }
 }
 

@@ -1383,6 +1383,13 @@ impl<'a> Lowerer<'a> {
         if out_rows.is_empty() {
             return decline("empty VALUES");
         }
+        // A key set the provider would not take in one statement stays with
+        // the engine: the block's VALUES is not chunked the way outer
+        // bindings are.
+        let bytes: usize = out_rows.iter().flatten().map(|l| literal_len(l) + 4).sum();
+        if out_rows.len() > self.caps.keyset_max_rows || bytes > self.caps.statement_max_bytes / 2 {
+            return decline("VALUES too large to push");
+        }
         self.static_keysets.push((
             KeySet {
                 alias: kalias,
@@ -1434,7 +1441,7 @@ impl<'a> Lowerer<'a> {
                     }
                     members.push(lit);
                 }
-                if members.is_empty() {
+                if members.is_empty() || members.len() > self.caps.keyset_max_rows {
                     return None;
                 }
                 let pred = Pred::Cmp {
@@ -1755,6 +1762,15 @@ impl<'a> Lowerer<'a> {
             .find(|a| a.alias == alias)
             .map(|a| a.tm_iri.as_str())?;
         self.mapping.get(iri)
+    }
+}
+
+/// Rendered size of a key-set literal, roughly: what the chunking budgets.
+pub(crate) fn literal_len(l: &Literal) -> usize {
+    match l {
+        Literal::Str(s) | Literal::TemplateKey(s) => s.len() + 2,
+        Literal::Set(items) => items.iter().map(literal_len).sum(),
+        _ => 24,
     }
 }
 
