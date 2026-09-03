@@ -166,11 +166,66 @@ impl RelNode {
     }
 }
 
-/// One projected column and the unique name it is returned under.
+/// What one output column computes: a column, or an aggregate over the
+/// groups `RelPlan::group_by` forms (the whole input when it is empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputExpr {
+    Col(ColRef),
+    /// `COUNT(*)`.
+    CountRows,
+    /// `COUNT([DISTINCT] col)`: non-null values.
+    Count {
+        col: ColRef,
+        distinct: bool,
+    },
+    /// `SUM([DISTINCT] col)`; NULL over an empty input.
+    Sum {
+        col: ColRef,
+        distinct: bool,
+    },
+    Min(ColRef),
+    Max(ColRef),
+}
+
+impl OutputExpr {
+    pub fn col(&self) -> Option<&ColRef> {
+        match self {
+            OutputExpr::Col(c)
+            | OutputExpr::Count { col: c, .. }
+            | OutputExpr::Sum { col: c, .. }
+            | OutputExpr::Min(c)
+            | OutputExpr::Max(c) => Some(c),
+            OutputExpr::CountRows => None,
+        }
+    }
+
+    pub fn is_aggregate(&self) -> bool {
+        !matches!(self, OutputExpr::Col(_))
+    }
+}
+
+/// One projected expression and the unique name it is returned under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputCol {
-    pub col: ColRef,
+    pub expr: OutputExpr,
     pub name: String,
+}
+
+impl OutputCol {
+    pub fn column(col: ColRef, name: impl Into<String>) -> Self {
+        Self {
+            expr: OutputExpr::Col(col),
+            name: name.into(),
+        }
+    }
+}
+
+/// An `ORDER BY` key: a column of the join, or one of the plan's outputs by
+/// name (the only way to order by an aggregate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderKey {
+    Col(ColRef),
+    Output(String),
 }
 
 /// A complete pushed-down block: a join tree, a projection, and the
@@ -179,9 +234,11 @@ pub struct OutputCol {
 pub struct RelPlan {
     pub root: RelNode,
     pub output: Vec<OutputCol>,
+    /// Grouping columns; every non-aggregate output must be one of them.
+    pub group_by: Vec<ColRef>,
     pub distinct: bool,
-    /// `(column, ascending)`.
-    pub order_by: Vec<(ColRef, bool)>,
+    /// `(key, ascending)`.
+    pub order_by: Vec<(OrderKey, bool)>,
     pub limit: Option<u64>,
 }
 

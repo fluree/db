@@ -199,7 +199,9 @@ async fn block_statements(server: &MockServer) -> Vec<String> {
         .iter()
         .filter(|r| r.method == "POST")
         .map(|r| String::from_utf8_lossy(&r.body).to_string())
-        .filter(|s| s.starts_with(r#"SELECT "t0""#))
+        // Only the lane aliases its accesses; per-scan statements and the
+        // probes never carry `AS "t0"`.
+        .filter(|s| s.contains(r#" AS "t0""#))
         .collect()
 }
 
@@ -705,6 +707,240 @@ async fn outer_bindings_become_a_key_set() {
     assert_eq!(rows, vec!["n=Ada tier=gold", "n=Cy tier=silver"]);
 }
 
+const AGG_SITE: &str = "sql_aggregate_pushdown";
+
+fn aggregate_cases() -> Vec<Case> {
+    vec![
+        Case {
+            name: "COUNT(*) over a star is one counting statement",
+            sparql: "SELECT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:total ?t }",
+            sql: Some(r#"SELECT COUNT(*) AS "c0" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#),
+            rows: &["n=4"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "GROUP BY a foreign-key object with COUNT and SUM",
+            sparql: "SELECT ?c (COUNT(?o) AS ?n) (SUM(?t) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?o ex:total ?t } GROUP BY ?c",
+            sql: Some(r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1", SUM("t0"."total") AS "c2", COUNT("t0"."total") AS "c3" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#),
+            rows: &[
+                "c=http://example.org/customer/1 n=2 s=104.50",
+                "c=http://example.org/customer/2 n=1 s=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "AVG pushes SUM and COUNT and divides in the engine",
+            sparql: "SELECT ?c (AVG(?t) AS ?a) FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?o ex:total ?t } GROUP BY ?c",
+            sql: Some(r#"SELECT "t1"."id" AS "c0", SUM("t0"."total") AS "c1", COUNT("t0"."total") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#),
+            rows: &[
+                "a=42 c=http://example.org/customer/2",
+                "a=52.25 c=http://example.org/customer/1",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "MIN and MAX come back as terms of the mapping's datatype",
+            sparql: "SELECT (MIN(?t) AS ?lo) (MAX(?p) AS ?last) FROM <shop-sql:main> WHERE { ?o ex:total ?t . ?o ex:placed ?p }",
+            sql: Some(r#"SELECT MIN("t0"."total") AS "c0", MAX("t0"."placed") AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."placed" IS NOT NULL"#),
+            rows: &["last=2024-03-01 lo=5.00"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "COUNT DISTINCT of a foreign-key object",
+            sparql: "SELECT (COUNT(DISTINCT ?c) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c }",
+            sql: Some(r#"SELECT COUNT(DISTINCT "t1"."id") AS "c0" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL"#),
+            rows: &["n=2"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "GROUP BY without aggregates is SELECT DISTINCT",
+            sparql: "SELECT ?k FROM <shop-sql:main> WHERE { ?c ex:country ?k } GROUP BY ?k",
+            sql: Some(r#"SELECT DISTINCT "t0"."country" AS "c0" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."country" IS NOT NULL"#),
+            rows: &["k=UK", "k=US"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "ORDER BY an aggregate with LIMIT pushes a top-k on the output",
+            sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c ORDER BY DESC(?n) LIMIT 1",
+            sql: Some(r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id" ORDER BY "c1" DESC LIMIT 1"#),
+            rows: &["c=http://example.org/customer/1 n=2"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "HAVING keeps LIMIT in the engine and filters the groups",
+            sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c HAVING (COUNT(?o) > 1) LIMIT 5",
+            sql: Some(r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#),
+            rows: &["c=http://example.org/customer/1 n=2"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "an optional member counts only bound values",
+            sparql: "SELECT (COUNT(?k) AS ?n) (COUNT(*) AS ?all) FROM <shop-sql:main> WHERE { ?c ex:name ?x OPTIONAL { ?c ex:country ?k } }",
+            sql: Some(r#"SELECT COUNT("t0"."country") AS "c0", COUNT(*) AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            rows: &["all=3 n=2"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a residual filter under an aggregate declines",
+            sparql: "SELECT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?c ex:name ?x FILTER(STRLEN(?x) > 2) }",
+            sql: None,
+            rows: &["n=1"],
+            routing: Routing::MustNotFire,
+            declined: Some("residual filter under an aggregate"),
+        },
+    ]
+}
+
+/// Grouped queries over a SQL block are one grouped statement; each shape
+/// is pinned like the join layer's, and replayed against the per-scan lane.
+#[tokio::test]
+async fn grouped_queries_send_one_grouped_statement() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    let cases = aggregate_cases();
+    let (store, tracing_guard) = span_capture::init_test_tracing();
+    set_fast_paths_disabled(false);
+    let mut failures: Vec<String> = Vec::new();
+    let mut lane_rows: Vec<Vec<String>> = Vec::new();
+    for c in &cases {
+        let before_events = store.find_events("fast-path outcome").len();
+        let before_declines = store.find_events("sql aggregate pushdown declined").len();
+        let before_stmts = block_statements(&server).await.len();
+        let rows = rows_of(&query(&fluree, &format!("{PREFIX}{}", c.sparql)).await);
+        let proceeded = proceeded_sites(&store, before_events);
+        let declined: Vec<String> = store.find_events("sql aggregate pushdown declined")
+            [before_declines..]
+            .iter()
+            .filter_map(|e| e.fields.get("why").cloned())
+            .collect();
+        let sent: Vec<String> = block_statements(&server).await[before_stmts..].to_vec();
+        let expected: Vec<String> = c.rows.iter().map(|s| (*s).to_string()).collect();
+        if rows != expected {
+            failures.push(format!(
+                "{}: lane rows {rows:?}, expected {expected:?}",
+                c.name
+            ));
+        }
+        match c.routing {
+            Routing::MustFire => {
+                if !proceeded.iter().any(|s| s == AGG_SITE) {
+                    failures.push(format!(
+                        "{}: expected `{AGG_SITE}` to proceed [proceeded: {proceeded:?}, declined: {declined:?}]",
+                        c.name
+                    ));
+                }
+            }
+            Routing::MustNotFire => {
+                if proceeded.iter().any(|s| s == AGG_SITE) {
+                    failures.push(format!(
+                        "{}: `{AGG_SITE}` proceeded on a declined shape",
+                        c.name
+                    ));
+                }
+                if let Some(why) = c.declined {
+                    if !declined.iter().any(|d| d == why) {
+                        failures.push(format!(
+                            "{}: expected decline `{why}`, got {declined:?}",
+                            c.name
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(sql) = c.sql {
+            if sent.as_slice() != [sql.to_string()] {
+                failures.push(format!(
+                    "{}: statements sent {sent:#?}\nexpected exactly:\n{sql}",
+                    c.name
+                ));
+            }
+        } else if sent
+            .iter()
+            .any(|s| s.contains("GROUP BY") || s.contains("COUNT("))
+        {
+            failures.push(format!(
+                "{}: unexpected grouped statement {sent:#?}",
+                c.name
+            ));
+        }
+        lane_rows.push(rows);
+    }
+    drop(tracing_guard);
+
+    set_fast_paths_disabled(true);
+    for (i, c) in cases.iter().enumerate() {
+        let rows = rows_of(&query(&fluree, &format!("{PREFIX}{}", c.sparql)).await);
+        if rows != lane_rows[i] {
+            failures.push(format!(
+                "{}: scan lane rows {rows:?} differ from lane rows {:?}",
+                c.name, lane_rows[i]
+            ));
+        }
+    }
+    set_fast_paths_disabled(false);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+}
+
+const TEXT_AMOUNT_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Entry>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.entries" ] ;
+        rr:subjectMap [ rr:template "http://example.org/entry/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:amount ;
+            rr:objectMap [ rr:column "amount" ; rr:datatype xsd:decimal ]
+        ] .
+"#;
+
+/// A numeric datatype over a text column (a SQLite `NUMERIC` the bridge
+/// reports as varchar): the lane declines the SUM, and every path below it
+/// must still parse the text as the generic pipeline does.
+#[tokio::test]
+async fn text_typed_numeric_columns_sum_the_same_on_every_path() {
+    let _lock = KILL_SWITCH.lock().await;
+    let server = FakeSql::new()
+        .table(Table::new(
+            "shop.entries",
+            &[("id", "bigint"), ("amount", "varchar")],
+            vec![
+                vec![json!(1), json!("99.50")],
+                vec![json!(2), json!("5")],
+                vec![json!(3), Value::Null],
+            ],
+        ))
+        .mount()
+        .await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "entries-sql",
+            server.uri(),
+            TEXT_AMOUNT_R2RML,
+        ))
+        .await
+        .expect("create");
+    let sparql = "PREFIX ex: <http://example.org/>\nSELECT (SUM(?a) AS ?s) (COUNT(?a) AS ?n) FROM <entries-sql:main> WHERE { ?e ex:amount ?a }";
+    set_fast_paths_disabled(true);
+    let scan = rows_of(&query(&fluree, sparql).await);
+    set_fast_paths_disabled(false);
+    let fast = rows_of(&query(&fluree, sparql).await);
+    assert_eq!(scan, vec!["n=2 s=104.50"]);
+    assert_eq!(fast, scan, "fast paths disagree with the scan lane");
+}
+
 /// A tracked query reports every statement the lane sent, in order, so a
 /// caller can see what ran remotely without reading the server log.
 #[tokio::test]
@@ -745,6 +981,13 @@ async fn tracked_queries_report_the_statements_sent() {
         .unwrap_or_else(|e| panic!("tracked query failed: {}", e.error));
     assert!(response.sql.is_none(), "{:?}", response.sql);
 }
+
+/// Grouped cases whose SUM/AVG column is `decimal` in the mapping but text
+/// or double in SQLite, so the aggregate lane declines there.
+const SQLITE_DECLINES: &[&str] = &[
+    "GROUP BY a foreign-key object with COUNT and SUM",
+    "AVG pushes SUM and COUNT and divides in the engine",
+];
 
 /// Every case replayed against a real database: SQLite behind
 /// `fluree-sql-bridge`, seeded through the bridge itself. The fake endpoint
@@ -791,7 +1034,7 @@ async fn live_bridge_agrees_with_the_scan_lane() {
         .expect("create live sql source");
 
     let mut failures: Vec<String> = Vec::new();
-    for c in cases() {
+    for c in cases().into_iter().chain(aggregate_cases()) {
         let sparql = format!("{PREFIX}{}", c.sparql).replace("shop-sql:main", "shop-live:main");
         set_fast_paths_disabled(false);
         let tracked = fluree
@@ -802,11 +1045,28 @@ async fn live_bridge_agrees_with_the_scan_lane() {
             .unwrap_or_else(|e| panic!("{}: lane query failed: {}\n{sparql}", c.name, e.error));
         let lane_rows = rows_of(&tracked.result);
         let sent = tracked.sql.unwrap_or_default();
+        // SQLite's `NUMERIC` reaches the bridge as text or double, so a
+        // SUM/AVG over it declines (its datatype is decimal); the rows must
+        // still agree, and the decline itself is pinned.
+        let declines_on_sqlite = SQLITE_DECLINES.contains(&c.name);
         match (&c.routing, c.sql) {
-            (Routing::MustFire, Some(_)) if sent.is_empty() => {
+            (Routing::MustFire, Some(_)) if declines_on_sqlite && !sent.is_empty() => {
+                failures.push(format!(
+                    "{}: expected a decline on SQLite, sent {sent:?}",
+                    c.name
+                ));
+            }
+            (Routing::MustFire, Some(_)) if !declines_on_sqlite && sent.is_empty() => {
                 failures.push(format!("{}: the lane sent no statement", c.name));
             }
-            (Routing::MustNotFire, _) if !sent.is_empty() => {
+            // A declined grouped shape may still run its block through the
+            // join layer under the engine's grouping; only a grouped
+            // statement would be wrong.
+            (Routing::MustNotFire, _)
+                if sent
+                    .iter()
+                    .any(|s| s.sql.contains("GROUP BY") || s.sql.contains("COUNT(")) =>
+            {
                 failures.push(format!("{}: a declined shape sent {sent:?}", c.name));
             }
             _ => {}

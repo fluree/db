@@ -204,7 +204,20 @@ pushable. In that statement:
   pattern joined to the block), are sent as a `VALUES` key set so the
   source does the semi-join;
 - `LIMIT` and a single-column `ORDER BY` on a typed, required column are
-  pushed when no residual filter could drop rows afterwards.
+  pushed when no residual filter could drop rows afterwards;
+- a grouped query over the block (`GROUP BY` with `COUNT`, `COUNT DISTINCT`,
+  `SUM`, `AVG`, `MIN`, `MAX`; or `GROUP BY` alone, which is `SELECT
+  DISTINCT`) is **one grouped statement**, with SPARQL's semantics patched
+  where SQL differs: `AVG` is pushed as `SUM` and `COUNT` and divided in the
+  engine (databases round a decimal average to the input's scale), an empty
+  `SUM` comes back `NULL` and is reported as `0`, aggregate results take the
+  datatype of the mapping's `rr:datatype`, and string keys, `COUNT DISTINCT`
+  of strings and `MIN`/`MAX` of strings are pushed only where the dialect
+  compares bytes. `HAVING`, `ORDER BY` and `LIMIT` run in the engine over
+  the grouped rows; an `ORDER BY` on an aggregate with a `LIMIT` and no
+  `HAVING` is offered to the statement as a top-k. Any residual filter, a
+  `SUM`/`AVG` over a column whose SQL type does not match its datatype, or
+  an aggregate over an IRI template declines to the engine's grouping.
 
 Terms are always built in the engine from the returned columns, so
 datatypes come from the mapping, not from the SQL types. Shapes the lane

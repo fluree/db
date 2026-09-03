@@ -10,13 +10,20 @@
 //! limits), each returned page is joined to the outer rows in memory, and
 //! residual filters run in the engine above.
 
+mod aggregate;
 mod lower;
 mod terms;
+
+pub use aggregate::{
+    detect_sql_block_aggregate, SqlAggregateOperator, SQL_AGGREGATE_PUSHDOWN_SITE,
+};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use fluree_db_tabular::plan::{ColRef, KeySet, Literal, Pred, RelNode, RelPlan, RelSource};
+use fluree_db_tabular::plan::{
+    ColRef, KeySet, Literal, OrderKey, Pred, RelNode, RelPlan, RelSource,
+};
 use fluree_db_tabular::BatchSchema;
 
 use crate::binding::{Batch, Binding};
@@ -30,6 +37,7 @@ use crate::r2rml::policy::R2rmlPolicyGate;
 use crate::r2rml::{ColumnBatchStream, PushdownCapabilities};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
+use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 
 use lower::{block_is_admissible, lower_block, Decline, LowerInput, Lowered};
 use terms::{seed_values, Materializer};
@@ -108,111 +116,127 @@ impl SqlBlockOperator {
         Box::new(op)
     }
 
-    /// Everything that must be true of the graph, the provider, the mapping
-    /// and the policy before the block is lowered; `None` means fall back.
     async fn resolve(
         &self,
         ctx: &ExecutionContext<'_>,
         child_vars: &[VarId],
     ) -> Result<Option<Resolved>> {
-        let iri = &self.graph_iri;
-        match ctx.dataset {
-            Some(ds) => {
-                if !ds.has_named_graph(iri) {
-                    return Ok(None);
-                }
-            }
-            None => {
-                // A ledger's own named graph is never a source. The source's
-                // own id can equal the view's ledger id (a `query_from` on the
-                // source), so that is not excluded; the capability check below
-                // decides.
-                if ctx.single_db_user_graph_id(iri).is_some() {
-                    return Ok(None);
-                }
-            }
-        }
-        let (Some(provider), Some(table_provider)) = (ctx.r2rml_provider, ctx.r2rml_table_provider)
-        else {
-            return Ok(None);
-        };
-        let Some(caps) = table_provider.pushdown_capabilities(iri).await? else {
-            return Ok(None);
-        };
-        let as_of_t = if ctx.dataset.is_some() {
-            None
-        } else {
-            Some(ctx.to_t)
-        };
-        let mapping = provider.compiled_mapping(iri, as_of_t).await?;
-        let graph_ctx = ctx.with_active_graph(Arc::clone(iri));
-        let verdicts = match R2rmlPolicyGate::build(&graph_ctx, &mapping, iri) {
-            None => None,
-            Some(mut gate) => match gate.static_verdicts(&graph_ctx, &mapping).await? {
-                Some(v) => Some(v),
-                None => {
-                    tracing::debug!(graph = %iri, "sql pushdown declined: policy is not static");
-                    return Ok(None);
-                }
-            },
-        };
-        let mut verdict =
-            |tm: &fluree_db_r2rml::mapping::TriplesMap, pred: &str| -> Result<Option<bool>> {
-                Ok(match &verdicts {
-                    None => Some(true),
-                    Some(v) => v.get(&(tm.iri.clone(), pred.to_string())).copied(),
-                })
-            };
-        let mut schemas: HashMap<RelSource, Arc<BatchSchema>> = HashMap::new();
-        for src in lower::candidate_sources(&self.inner_patterns, ctx.active_snapshot, &mapping) {
-            if let Some(schema) = table_provider.source_schema(iri, &src).await? {
-                schemas.insert(src, schema);
-            }
-        }
-        let lowered = lower_block(LowerInput {
-            patterns: &self.inner_patterns,
-            mapping: &mapping,
-            snapshot: ctx.active_snapshot,
-            caps: &caps,
-            child_vars,
-            policy: verdicts.is_some().then_some(&mut verdict),
-            schemas: &schemas,
-        })?;
-        let lowered = match lowered {
-            Err(Decline(why)) => {
-                tracing::debug!(graph = %iri, why, "sql pushdown declined");
-                return Ok(None);
-            }
-            Ok(None) => {
-                return Ok(Some(Resolved {
-                    inner: None,
-                    materializer: None,
-                    caps,
-                }))
-            }
-            Ok(Some(l)) => l,
-        };
-        tracing::debug!(
-            graph = %iri,
-            seeds = lowered.seeds.len(),
-            child_vars = ?child_vars,
-            block_vars = ?lowered.block_vars,
-            "sql pushdown lowered"
-        );
-        let materializer = Materializer::new(&lowered, &mapping, ctx.active_snapshot)?;
-        Ok(Some(Resolved {
-            inner: Some(lowered),
-            materializer: Some(materializer),
-            caps,
-        }))
+        resolve_block(ctx, &self.graph_iri, &self.inner_patterns, child_vars).await
     }
 }
 
-struct Resolved {
+/// Everything that must be true of the graph, the provider, the mapping and
+/// the policy before a block is lowered; `None` means fall back.
+pub(super) async fn resolve_block(
+    ctx: &ExecutionContext<'_>,
+    graph_iri: &Arc<str>,
+    patterns: &[Pattern],
+    child_vars: &[VarId],
+) -> Result<Option<Resolved>> {
+    let iri = graph_iri;
+    match ctx.dataset {
+        Some(ds) => {
+            if !ds.has_named_graph(iri) {
+                return Ok(None);
+            }
+        }
+        None => {
+            // A ledger's own named graph is never a source. The source's
+            // own id can equal the view's ledger id (a `query_from` on the
+            // source), so that is not excluded; the capability check below
+            // decides.
+            if ctx.single_db_user_graph_id(iri).is_some() {
+                return Ok(None);
+            }
+        }
+    }
+    let (Some(provider), Some(table_provider)) = (ctx.r2rml_provider, ctx.r2rml_table_provider)
+    else {
+        return Ok(None);
+    };
+    let Some(caps) = table_provider.pushdown_capabilities(iri).await? else {
+        return Ok(None);
+    };
+    let as_of_t = if ctx.dataset.is_some() {
+        None
+    } else {
+        Some(ctx.to_t)
+    };
+    let mapping = provider.compiled_mapping(iri, as_of_t).await?;
+    let graph_ctx = ctx.with_active_graph(Arc::clone(iri));
+    let verdicts = match R2rmlPolicyGate::build(&graph_ctx, &mapping, iri) {
+        None => None,
+        Some(mut gate) => match gate.static_verdicts(&graph_ctx, &mapping).await? {
+            Some(v) => Some(v),
+            None => {
+                tracing::debug!(graph = %iri, "sql pushdown declined: policy is not static");
+                return Ok(None);
+            }
+        },
+    };
+    let mut verdict =
+        |tm: &fluree_db_r2rml::mapping::TriplesMap, pred: &str| -> Result<Option<bool>> {
+            Ok(match &verdicts {
+                None => Some(true),
+                Some(v) => v.get(&(tm.iri.clone(), pred.to_string())).copied(),
+            })
+        };
+    let mut schemas: HashMap<RelSource, Arc<BatchSchema>> = HashMap::new();
+    for src in lower::candidate_sources(patterns, ctx.active_snapshot, &mapping) {
+        if let Some(schema) = table_provider.source_schema(iri, &src).await? {
+            schemas.insert(src, schema);
+        }
+    }
+    let lowered = lower_block(LowerInput {
+        patterns,
+        mapping: &mapping,
+        snapshot: ctx.active_snapshot,
+        caps: &caps,
+        child_vars,
+        policy: verdicts.is_some().then_some(&mut verdict),
+        schemas: &schemas,
+    })?;
+    let lowered = match lowered {
+        Err(Decline(why)) => {
+            tracing::debug!(graph = %iri, why, "sql pushdown declined");
+            return Ok(None);
+        }
+        Ok(None) => {
+            return Ok(Some(Resolved {
+                inner: None,
+                materializer: None,
+                caps,
+                mapping,
+                schemas,
+            }))
+        }
+        Ok(Some(l)) => l,
+    };
+    tracing::debug!(
+        graph = %iri,
+        seeds = lowered.seeds.len(),
+        child_vars = ?child_vars,
+        block_vars = ?lowered.block_vars,
+        "sql pushdown lowered"
+    );
+    let materializer = Materializer::new(&lowered, &mapping, ctx.active_snapshot)?;
+    Ok(Some(Resolved {
+        inner: Some(lowered),
+        materializer: Some(materializer),
+        caps,
+        mapping,
+        schemas,
+    }))
+}
+
+pub(super) struct Resolved {
     /// `None`: the block provably yields no rows.
-    inner: Option<Lowered>,
-    materializer: Option<Materializer>,
-    caps: PushdownCapabilities,
+    pub inner: Option<Lowered>,
+    pub materializer: Option<Materializer>,
+    pub caps: PushdownCapabilities,
+    pub mapping: Arc<CompiledR2rmlMapping>,
+    /// Probed schemas of the relations the block can reach.
+    pub schemas: HashMap<RelSource, Arc<BatchSchema>>,
 }
 
 #[async_trait::async_trait]
@@ -420,7 +444,7 @@ impl SqlBlockSource {
             match self.topk {
                 Some((var, k, asc)) => {
                     if let Some((col, _)) = lowered.order_columns.get(&var) {
-                        order_by.push((col.clone(), asc));
+                        order_by.push((OrderKey::Col(col.clone()), asc));
                         limit = Some(k as u64);
                     }
                 }
@@ -434,6 +458,7 @@ impl SqlBlockSource {
         RelPlan {
             root,
             output: lowered.outputs.clone(),
+            group_by: Vec::new(),
             distinct: false,
             order_by,
             limit,

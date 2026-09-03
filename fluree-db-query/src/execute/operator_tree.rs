@@ -2640,6 +2640,44 @@ fn build_operator_tree_inner(
         }
     }
 
+    // Fast-path: a grouped query over one SQL-source block runs as one grouped
+    // statement. Takes precedence over the fused aggregate below for SQL
+    // sources; its fallback is that fused operator when the shape admits (so
+    // an Iceberg source keeps its lane), else the generic pipeline.
+    if enable_fused_fast_paths {
+        if let Some(plan) = crate::r2rml::sql_lane::detect_sql_block_aggregate(query) {
+            let mut fallback_query = query.clone();
+            fallback_query.ordering = Vec::new();
+            fallback_query.order_binds = Vec::new();
+            fallback_query.limit = None;
+            fallback_query.offset = None;
+            let generic =
+                build_operator_tree_inner(&fallback_query, stats.clone(), false, planning)?;
+            let fallback: BoxedOperator = match crate::r2rml::detect_fused_r2rml_aggregate(query) {
+                Some(fused) => Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
+                    fused, generic,
+                )),
+                None => generic,
+            };
+            let mut op: BoxedOperator = Box::new(
+                crate::r2rml::sql_lane::SqlAggregateOperator::new(plan, fallback),
+            );
+            if let Some(having) = query.grouping.as_ref().and_then(|g| g.having()) {
+                op = Box::new(crate::having::HavingOperator::new(op, having.clone()));
+            }
+            if !query.ordering.is_empty() {
+                op = Box::new(crate::sort::SortOperator::new(op, query.ordering.clone()));
+            }
+            if let Some(offset) = query.offset {
+                op = Box::new(OffsetOperator::new(op, offset));
+            }
+            if let Some(limit) = query.limit {
+                op = Box::new(LimitOperator::new(op, limit));
+            }
+            return Ok(op);
+        }
+    }
+
     // Fast-path: a single R2RML graph-source scan feeding a simple COUNT
     // aggregate — fold straight from column batches instead of materializing an
     // RDF binding per table row. Falls back to the normal pipeline at open if

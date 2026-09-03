@@ -87,10 +87,10 @@ pub(crate) enum KeyShape {
 }
 
 #[derive(Debug, Clone)]
-struct VarSource {
-    term: TermSource,
-    key: Option<KeyShape>,
-    nullable: bool,
+pub(crate) struct VarSource {
+    pub term: TermSource,
+    pub key: Option<KeyShape>,
+    pub nullable: bool,
 }
 
 /// One table access in the plan.
@@ -119,6 +119,10 @@ pub(crate) struct Lowered {
     pub seeds: Vec<SeedSpec>,
     /// Variables the block binds, in schema order.
     pub block_vars: Vec<VarId>,
+    /// Where each block variable's value comes from, and the plan columns
+    /// it is a function of (what a GROUP BY or an aggregate reads).
+    pub vars: HashMap<VarId, VarSource>,
+    pub var_columns: HashMap<VarId, Vec<ColRef>>,
     /// Required (non-nullable) literal columns a `ORDER BY` may be pushed on.
     pub order_columns: HashMap<VarId, (ColRef, RdfClass)>,
     /// A `LIMIT` on the statement is a superset of the block's result only
@@ -333,18 +337,21 @@ impl<'a> Lowerer<'a> {
         let mut outputs: Vec<OutputCol> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
         let mut per_alias: HashMap<String, Vec<String>> = HashMap::new();
+        let mut var_columns: HashMap<VarId, Vec<ColRef>> = HashMap::new();
         for var in &self.var_order {
             let src = &self.vars[var];
-            for col in self.term_columns(&src.term) {
+            let cols = self.term_columns(&src.term);
+            for col in &cols {
                 if seen.insert((col.alias.clone(), col.column.clone())) {
                     per_alias
                         .entry(col.alias.clone())
                         .or_default()
                         .push(col.column.clone());
                     let name = format!("c{}", outputs.len());
-                    outputs.push(OutputCol { col, name });
+                    outputs.push(OutputCol::column(col.clone(), name));
                 }
             }
+            var_columns.insert(*var, cols);
         }
         if outputs.is_empty() {
             return Ok(Err(Decline("no columns to project")));
@@ -408,6 +415,8 @@ impl<'a> Lowerer<'a> {
             residual_filters: std::mem::take(&mut self.residuals),
             seeds,
             block_vars: self.var_order.clone(),
+            vars: self.vars.clone(),
+            var_columns,
             order_columns,
             limit_is_exact,
         })))
@@ -1668,7 +1677,7 @@ fn decimal_literal(bd: &bigdecimal::BigDecimal) -> Option<Literal> {
     })
 }
 
-fn source_of_tm(tm: &TriplesMap) -> RelSource {
+pub(crate) fn source_of_tm(tm: &TriplesMap) -> RelSource {
     match tm.sql_query() {
         Some(q) => RelSource::Query(q.to_string()),
         None => RelSource::Table(tm.table_name().unwrap_or_default().to_string()),

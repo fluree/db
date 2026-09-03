@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fluree_db_tabular::plan::{
-    ColRef, KeySet, Literal, OutputCol, Pred, PushdownCapabilities, RelNode, RelPlan, RelSource,
+    ColRef, KeySet, Literal, OrderKey, OutputCol, OutputExpr, Pred, PushdownCapabilities, RelNode,
+    RelPlan, RelSource,
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 
@@ -69,11 +70,22 @@ pub fn render_plan(
         sql.push_str(" WHERE ");
         sql.push_str(&r.render_conjunction(&r.where_preds)?);
     }
+    if !plan.group_by.is_empty() {
+        let keys: Vec<String> = plan.group_by.iter().map(|c| r.col(c)).collect();
+        sql.push_str(" GROUP BY ");
+        sql.push_str(&keys.join(", "));
+    }
     if !plan.order_by.is_empty() {
         let keys: Vec<String> = plan
             .order_by
             .iter()
-            .map(|(c, asc)| format!("{} {}", r.col(c), if *asc { "ASC" } else { "DESC" }))
+            .map(|(k, asc)| {
+                let key = match k {
+                    OrderKey::Col(c) => r.col(c),
+                    OrderKey::Output(name) => dialect.quote_ident(name),
+                };
+                format!("{key} {}", if *asc { "ASC" } else { "DESC" })
+            })
             .collect();
         sql.push_str(" ORDER BY ");
         sql.push_str(&keys.join(", "));
@@ -163,15 +175,29 @@ impl Renderer<'_> {
     }
 
     fn render_output(&self, o: &OutputCol) -> Result<String> {
-        let ty = self.col_type(&o.col)?;
-        let qualified = self.col(&o.col);
         let name = self.dialect.quote_ident(&o.name);
-        Ok(match (ty, self.dialect) {
-            (FieldType::TimestampTz, SqlDialect::Trino) => {
-                format!("{qualified} AT TIME ZONE 'UTC' AS {name}")
+        let zoned = |c: &ColRef, rendered: String| -> Result<String> {
+            Ok(match (self.col_type(c)?, self.dialect) {
+                (FieldType::TimestampTz, SqlDialect::Trino) => {
+                    format!("{rendered} AT TIME ZONE 'UTC'")
+                }
+                _ => rendered,
+            })
+        };
+        let distinct = |d: bool| if d { "DISTINCT " } else { "" };
+        let expr = match &o.expr {
+            OutputExpr::Col(c) => zoned(c, self.col(c))?,
+            OutputExpr::CountRows => "COUNT(*)".to_string(),
+            OutputExpr::Count { col, distinct: d } => {
+                format!("COUNT({}{})", distinct(*d), self.col(col))
             }
-            _ => format!("{qualified} AS {name}"),
-        })
+            OutputExpr::Sum { col, distinct: d } => {
+                format!("SUM({}{})", distinct(*d), self.col(col))
+            }
+            OutputExpr::Min(c) => zoned(c, format!("MIN({})", self.col(c)))?,
+            OutputExpr::Max(c) => zoned(c, format!("MAX({})", self.col(c)))?,
+        };
+        Ok(format!("{expr} AS {name}"))
     }
 
     /// A flat `a AND b AND c`: nested conjunctions are spliced in, and only a
@@ -504,10 +530,7 @@ mod tests {
     }
 
     fn out(alias: &str, col: &str, name: &str) -> OutputCol {
-        OutputCol {
-            col: ColRef::new(alias, col),
-            name: name.into(),
-        }
+        OutputCol::column(ColRef::new(alias, col), name)
     }
 
     #[test]
@@ -536,14 +559,63 @@ mod tests {
                 out("c", "name", "c1"),
                 out("o", "placed", "c2"),
             ],
+            group_by: Vec::new(),
             distinct: false,
-            order_by: vec![(ColRef::new("o", "total"), false)],
+            order_by: vec![(OrderKey::Col(ColRef::new("o", "total")), false)],
             limit: Some(10),
         };
         let sql = render_plan(&plan, &schemas(), SqlDialect::Trino).unwrap();
         assert_eq!(
             sql,
             r#"SELECT "o"."id" AS "c0", "c"."name" AS "c1", "o"."placed" AT TIME ZONE 'UTC' AS "c2" FROM "sales"."orders" AS "o" JOIN "sales"."customers" AS "c" ON "o"."customer_id" = "c"."id" WHERE "o"."id" IS NOT NULL AND "o"."total" > 100 ORDER BY "o"."total" DESC LIMIT 10"#
+        );
+    }
+
+    #[test]
+    fn grouped_plan_renders_aggregates_and_orders_by_output() {
+        let plan = RelPlan {
+            root: RelNode::Join {
+                left: Box::new(access("o", "sales.orders")),
+                right: Box::new(access("c", "sales.customers")),
+                on: Pred::ColEq {
+                    left: ColRef::new("o", "customer_id"),
+                    right: ColRef::new("c", "id"),
+                },
+            },
+            output: vec![
+                out("c", "id", "c0"),
+                OutputCol {
+                    expr: OutputExpr::CountRows,
+                    name: "c1".into(),
+                },
+                OutputCol {
+                    expr: OutputExpr::Sum {
+                        col: ColRef::new("o", "total"),
+                        distinct: false,
+                    },
+                    name: "c2".into(),
+                },
+                OutputCol {
+                    expr: OutputExpr::Count {
+                        col: ColRef::new("o", "total"),
+                        distinct: true,
+                    },
+                    name: "c3".into(),
+                },
+                OutputCol {
+                    expr: OutputExpr::Max(ColRef::new("o", "placed")),
+                    name: "c4".into(),
+                },
+            ],
+            group_by: vec![ColRef::new("c", "id")],
+            distinct: false,
+            order_by: vec![(OrderKey::Output("c1".into()), false)],
+            limit: Some(5),
+        };
+        let sql = render_plan(&plan, &schemas(), SqlDialect::Trino).unwrap();
+        assert_eq!(
+            sql,
+            r#"SELECT "c"."id" AS "c0", COUNT(*) AS "c1", SUM("o"."total") AS "c2", COUNT(DISTINCT "o"."total") AS "c3", MAX("o"."placed") AT TIME ZONE 'UTC' AS "c4" FROM "sales"."orders" AS "o" JOIN "sales"."customers" AS "c" ON "o"."customer_id" = "c"."id" GROUP BY "c"."id" ORDER BY "c1" DESC LIMIT 5"#
         );
     }
 
@@ -562,6 +634,7 @@ mod tests {
                 },
             },
             output: vec![out("o", "id", "c0"), out("c", "name", "c1")],
+            group_by: Vec::new(),
             distinct: false,
             order_by: vec![],
             limit: None,
@@ -588,6 +661,7 @@ mod tests {
                 },
             },
             output: vec![out("c", "id", "c0"), out("c", "name", "c1")],
+            group_by: Vec::new(),
             distinct: true,
             order_by: vec![],
             limit: None,
@@ -624,6 +698,7 @@ mod tests {
                 },
             },
             output: vec![out("c", "id", "c0")],
+            group_by: Vec::new(),
             distinct: false,
             order_by: vec![],
             limit: None,
@@ -647,6 +722,7 @@ mod tests {
                 },
             },
             output: vec![out("o", "id", "c0")],
+            group_by: Vec::new(),
             distinct: false,
             order_by: vec![],
             limit: None,
@@ -669,6 +745,7 @@ mod tests {
                 },
             },
             output: vec![out("c", "id", "c0")],
+            group_by: Vec::new(),
             distinct: false,
             order_by: vec![],
             limit: None,

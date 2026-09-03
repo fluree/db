@@ -7,9 +7,11 @@
 //! table) followed by any number of `JOIN` / `LEFT JOIN` items — tables or
 //! `VALUES` key sets — with `ON` predicates; `WHERE` conjunctions of
 //! `IS [NOT] NULL`, comparisons, `IN`, `NOT (…)` and `OR`; `GROUP BY` with
-//! `HAVING COUNT(*) > n` (the uniqueness probe); `ORDER BY` on one column;
-//! `LIMIT`. Anything else answers with a Trino error naming the
-//! statement, so a test fails loudly with the SQL it sent.
+//! `HAVING COUNT(*) > n` (the uniqueness probe) or with `COUNT`, `SUM`,
+//! `MIN`, `MAX` select items (`DISTINCT` inside them too); `SELECT DISTINCT`;
+//! `ORDER BY` on one column or output name; `LIMIT`. Anything else answers
+//! with a Trino error naming the statement, so a test fails loudly with the
+//! SQL it sent.
 
 #![allow(dead_code)]
 
@@ -173,6 +175,10 @@ impl FakeSql {
         let select_list = select_list
             .strip_prefix("SELECT ")
             .ok_or_else(|| format!("not a SELECT: {sql}"))?;
+        let (select_distinct, select_list) = match select_list.strip_prefix("DISTINCT ") {
+            Some(rest) => (true, rest),
+            None => (false, select_list),
+        };
 
         let (first, mut rest) = self.parse_item(rest, "")?;
         let mut rels: Vec<Rel> = vec![first];
@@ -254,35 +260,124 @@ impl FakeSql {
             let pred = parse_pred(w)?;
             tuples.retain(|t| pred.eval(t, &resolver));
         }
-        if let Some(cols) = &group_by {
-            // One representative tuple per group, kept only when the group
-            // is large enough for HAVING.
-            let idx: Vec<(usize, usize)> = cols
+
+        // Ordering on a join column happens before grouping/projection;
+        // ordering on an output name happens after.
+        let mut order_output: Option<(String, bool)> = None;
+        if let Some((col, asc)) = &order {
+            match resolver.resolve(col) {
+                Ok((ri, ci)) => {
+                    tuples.sort_by(|a, b| {
+                        let o = cmp_values(&cell(a, ri, ci), &cell(b, ri, ci));
+                        if *asc {
+                            o
+                        } else {
+                            o.reverse()
+                        }
+                    });
+                }
+                Err(_) if col.0.is_none() => order_output = Some((col.1.clone(), *asc)),
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Select items.
+        let items: Vec<SelectItem> = if select_list.trim() == "*" {
+            rels[0]
+                .columns
+                .iter()
+                .map(|(n, _)| SelectItem {
+                    expr: SelectExpr::Col((None, n.clone())),
+                    name: n.clone(),
+                })
+                .collect()
+        } else if select_list.trim() == "1" {
+            vec![SelectItem {
+                expr: SelectExpr::One,
+                name: "_col0".into(),
+            }]
+        } else {
+            split_top(select_list, ", ")
+                .into_iter()
+                .map(parse_select_item)
+                .collect::<Result<_, _>>()?
+        };
+        let grouped = group_by.is_some() || items.iter().any(|i| i.expr.is_aggregate());
+
+        let mut out_cols: Vec<(String, String)> = Vec::new();
+        let mut data: Vec<Vec<Value>> = Vec::new();
+        if grouped {
+            let key_idx: Vec<(usize, usize)> = group_by
+                .as_deref()
+                .unwrap_or(&[])
                 .iter()
                 .map(|c| resolver.resolve(c))
                 .collect::<Result<_, _>>()?;
-            let mut groups: Vec<(Vec<Value>, Tuple, usize)> = Vec::new();
+            let mut groups: Vec<(Vec<Value>, Vec<Tuple>)> = Vec::new();
             for t in &tuples {
-                let key: Vec<Value> = idx.iter().map(|(ri, ci)| cell(t, *ri, *ci)).collect();
+                let key: Vec<Value> = key_idx.iter().map(|(ri, ci)| cell(t, *ri, *ci)).collect();
                 match groups
                     .iter_mut()
-                    .find(|(k, _, _)| k.iter().zip(&key).all(|(a, b)| values_eq(a, b)))
+                    .find(|(k, _)| k.iter().zip(&key).all(|(a, b)| values_eq(a, b)))
                 {
-                    Some((_, _, n)) => *n += 1,
-                    None => groups.push((key, t.clone(), 1)),
+                    Some((_, members)) => members.push(t.clone()),
+                    None => groups.push((key, vec![t.clone()])),
                 }
             }
+            if key_idx.is_empty() && groups.is_empty() {
+                // An implicit group over no rows still yields one row.
+                groups.push((Vec::new(), Vec::new()));
+            }
             let min = having_min_count.unwrap_or(0);
-            tuples = groups
-                .into_iter()
-                .filter(|(_, _, n)| *n >= min)
-                .map(|(_, t, _)| t)
-                .collect();
+            for (_, members) in groups.into_iter().filter(|(_, m)| m.len() >= min) {
+                let mut row = Vec::with_capacity(items.len());
+                for item in &items {
+                    let (ty, v) = item.expr.eval_group(&members, &resolver, &rels)?;
+                    if data.is_empty() {
+                        out_cols.push((item.name.clone(), ty));
+                    }
+                    row.push(v);
+                }
+                data.push(row);
+            }
+            if data.is_empty() {
+                for item in &items {
+                    out_cols.push((item.name.clone(), item.expr.type_hint(&resolver, &rels)));
+                }
+            }
+        } else {
+            for item in &items {
+                out_cols.push((item.name.clone(), item.expr.type_hint(&resolver, &rels)));
+            }
+            for t in &tuples {
+                let row = items
+                    .iter()
+                    .map(|item| item.expr.eval_row(t, &resolver))
+                    .collect::<Result<Vec<_>, _>>()?;
+                data.push(row);
+            }
         }
-        if let Some((col, asc)) = order {
-            let (ri, ci) = resolver.resolve(&col)?;
-            tuples.sort_by(|a, b| {
-                let o = cmp_values(&cell(a, ri, ci), &cell(b, ri, ci));
+        if select_distinct {
+            let mut seen: Vec<Vec<Value>> = Vec::new();
+            data.retain(|r| {
+                if seen
+                    .iter()
+                    .any(|s| s.iter().zip(r).all(|(a, b)| values_eq(a, b)))
+                {
+                    false
+                } else {
+                    seen.push(r.clone());
+                    true
+                }
+            });
+        }
+        if let Some((name, asc)) = order_output {
+            let idx = out_cols
+                .iter()
+                .position(|(n, _)| *n == name)
+                .ok_or_else(|| format!("ORDER BY unknown output {name}"))?;
+            data.sort_by(|a, b| {
+                let o = cmp_values(&a[idx], &b[idx]);
                 if asc {
                     o
                 } else {
@@ -291,50 +386,199 @@ impl FakeSql {
             });
         }
         if let Some(n) = limit {
-            tuples.truncate(n);
+            data.truncate(n);
         }
-
-        if select_list.trim() == "1" {
-            return Ok((
-                vec![("_col0".into(), "integer".into())],
-                tuples.iter().map(|_| vec![json!(1)]).collect(),
-            ));
-        }
-        if select_list.trim() == "COUNT(*)" {
-            return Ok((
-                vec![("_col0".into(), "bigint".into())],
-                vec![vec![json!(tuples.len())]],
-            ));
-        }
-        let mut out_cols: Vec<(String, String)> = Vec::new();
-        let mut src: Vec<(usize, usize)> = Vec::new();
-        if select_list.trim() == "*" {
-            for (i, c) in rels[0].columns.iter().enumerate() {
-                out_cols.push(c.clone());
-                src.push((0, i));
-            }
-        } else {
-            for item in split_top(select_list, ", ") {
-                let (expr, out_name) = match item.rsplit_once(" AS ") {
-                    Some((e, n)) => (e, Some(n.replace('"', ""))),
-                    None => (item, None),
-                };
-                let expr = expr.split(" AT TIME ZONE").next().unwrap_or(expr);
-                let col = colref(expr);
-                let (ri, ci) = resolver.resolve(&col)?;
-                out_cols.push((
-                    out_name.unwrap_or_else(|| col.1.clone()),
-                    rels[ri].columns[ci].1.clone(),
-                ));
-                src.push((ri, ci));
-            }
-        }
-        let data = tuples
-            .iter()
-            .map(|t| src.iter().map(|(ri, ci)| cell(t, *ri, *ci)).collect())
-            .collect();
         Ok((out_cols, data))
     }
+}
+
+struct SelectItem {
+    expr: SelectExpr,
+    name: String,
+}
+
+enum SelectExpr {
+    One,
+    Col(Col),
+    CountRows,
+    Count(Col, bool),
+    Sum(Col, bool),
+    Min(Col),
+    Max(Col),
+}
+
+impl SelectExpr {
+    fn is_aggregate(&self) -> bool {
+        !matches!(self, SelectExpr::One | SelectExpr::Col(_))
+    }
+
+    fn col_type(&self, resolver: &Resolver<'_>, rels: &[Rel]) -> Result<String, String> {
+        match self {
+            SelectExpr::Col(c)
+            | SelectExpr::Min(c)
+            | SelectExpr::Max(c)
+            | SelectExpr::Sum(c, _)
+            | SelectExpr::Count(c, _) => {
+                let (ri, ci) = resolver.resolve(c)?;
+                Ok(rels[ri].columns[ci].1.clone())
+            }
+            _ => Ok("bigint".into()),
+        }
+    }
+
+    fn type_hint(&self, resolver: &Resolver<'_>, rels: &[Rel]) -> String {
+        match self {
+            SelectExpr::One | SelectExpr::CountRows | SelectExpr::Count(..) => "bigint".into(),
+            SelectExpr::Sum(c, _) => sum_type(&self.col_type(resolver, rels).unwrap_or_default())
+                .unwrap_or_else(|| format!("unsummable {}", c.1)),
+            _ => self.col_type(resolver, rels).unwrap_or_default(),
+        }
+    }
+
+    fn eval_row(&self, t: &Tuple, resolver: &Resolver<'_>) -> Result<Value, String> {
+        match self {
+            SelectExpr::One => Ok(json!(1)),
+            SelectExpr::Col(c) => {
+                let (ri, ci) = resolver.resolve(c)?;
+                Ok(cell(t, ri, ci))
+            }
+            _ => Err("aggregate outside a group".into()),
+        }
+    }
+
+    /// `(trino type, value)` over one group.
+    fn eval_group(
+        &self,
+        members: &[Tuple],
+        resolver: &Resolver<'_>,
+        rels: &[Rel],
+    ) -> Result<(String, Value), String> {
+        let values = |c: &Col, distinct: bool| -> Result<Vec<Value>, String> {
+            let (ri, ci) = resolver.resolve(c)?;
+            let mut out: Vec<Value> = Vec::new();
+            for t in members {
+                let v = cell(t, ri, ci);
+                if v.is_null() {
+                    continue;
+                }
+                if distinct && out.iter().any(|o| values_eq(o, &v)) {
+                    continue;
+                }
+                out.push(v);
+            }
+            Ok(out)
+        };
+        Ok(match self {
+            SelectExpr::One => ("bigint".into(), json!(1)),
+            SelectExpr::Col(c) => {
+                let (ri, ci) = resolver.resolve(c)?;
+                (
+                    rels[ri].columns[ci].1.clone(),
+                    members
+                        .first()
+                        .map(|t| cell(t, ri, ci))
+                        .unwrap_or(Value::Null),
+                )
+            }
+            SelectExpr::CountRows => ("bigint".into(), json!(members.len())),
+            SelectExpr::Count(c, d) => ("bigint".into(), json!(values(c, *d)?.len())),
+            SelectExpr::Sum(c, d) => {
+                let ty = self.col_type(resolver, rels)?;
+                let out_ty = sum_type(&ty).ok_or_else(|| format!("SUM over {ty}"))?;
+                let vals = values(c, *d)?;
+                if vals.is_empty() {
+                    return Ok((out_ty, Value::Null));
+                }
+                let total: f64 = vals.iter().map(num_of).sum();
+                let v = if let Some(scale) = decimal_scale(&out_ty) {
+                    json!(format!("{total:.scale$}"))
+                } else if out_ty == "bigint" {
+                    json!(total as i64)
+                } else {
+                    json!(total)
+                };
+                (out_ty, v)
+            }
+            SelectExpr::Min(c) | SelectExpr::Max(c) => {
+                let ty = self.col_type(resolver, rels)?;
+                let vals = values(c, false)?;
+                let best = vals.into_iter().reduce(|a, b| {
+                    let keep_a = match self {
+                        SelectExpr::Min(_) => cmp_values(&a, &b).is_le(),
+                        _ => cmp_values(&a, &b).is_ge(),
+                    };
+                    if keep_a {
+                        a
+                    } else {
+                        b
+                    }
+                });
+                (ty, best.unwrap_or(Value::Null))
+            }
+        })
+    }
+}
+
+fn num_of(v: &Value) -> f64 {
+    match v {
+        Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        Value::String(s) => s.parse().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+fn decimal_scale(ty: &str) -> Option<usize> {
+    let inner = ty.strip_prefix("decimal(")?.strip_suffix(')')?;
+    inner.split(',').nth(1)?.trim().parse().ok()
+}
+
+fn sum_type(ty: &str) -> Option<String> {
+    if let Some(scale) = decimal_scale(ty) {
+        return Some(format!("decimal(38,{scale})"));
+    }
+    match ty {
+        "bigint" | "integer" | "smallint" | "tinyint" => Some("bigint".into()),
+        "double" | "real" => Some("double".into()),
+        _ => None,
+    }
+}
+
+fn parse_select_item(item: &str) -> Result<SelectItem, String> {
+    let (expr, out_name) = match item.rsplit_once(" AS ") {
+        Some((e, n)) => (e, Some(n.replace('"', ""))),
+        None => (item, None),
+    };
+    let expr = expr.split(" AT TIME ZONE").next().unwrap_or(expr).trim();
+    let agg = |inner: &str| -> (Col, bool) {
+        match inner.strip_prefix("DISTINCT ") {
+            Some(c) => (colref(c), true),
+            None => (colref(inner), false),
+        }
+    };
+    let parsed = if expr == "COUNT(*)" {
+        SelectExpr::CountRows
+    } else if let Some(inner) = expr
+        .strip_prefix("COUNT(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        let (c, d) = agg(inner);
+        SelectExpr::Count(c, d)
+    } else if let Some(inner) = expr.strip_prefix("SUM(").and_then(|r| r.strip_suffix(')')) {
+        let (c, d) = agg(inner);
+        SelectExpr::Sum(c, d)
+    } else if let Some(inner) = expr.strip_prefix("MIN(").and_then(|r| r.strip_suffix(')')) {
+        SelectExpr::Min(colref(inner))
+    } else if let Some(inner) = expr.strip_prefix("MAX(").and_then(|r| r.strip_suffix(')')) {
+        SelectExpr::Max(colref(inner))
+    } else {
+        SelectExpr::Col(colref(expr))
+    };
+    let name = match (out_name, &parsed) {
+        (Some(n), _) => n,
+        (None, SelectExpr::Col(c)) => c.1.clone(),
+        (None, _) => "_col0".to_string(),
+    };
+    Ok(SelectItem { expr: parsed, name })
 }
 
 fn cell(t: &Tuple, ri: usize, ci: usize) -> Value {

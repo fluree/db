@@ -59,7 +59,11 @@ impl Materializer {
                     lowered
                         .outputs
                         .iter()
-                        .position(|o| &o.col.alias == alias && &o.col.column == c)
+                        .position(|o| {
+                            o.expr
+                                .col()
+                                .is_some_and(|k| &k.alias == alias && &k.column == c)
+                        })
                         .ok_or_else(|| {
                             QueryError::Internal(format!("column {alias}.{c} not projected"))
                         })
