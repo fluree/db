@@ -117,20 +117,36 @@ impl Fluree {
         // Config reads are best-effort. If the config graph is unqueryable
         // (e.g., historical snapshot without a range_provider for g_id=2),
         // treat it as "no config" and apply system defaults.
-        let config =
-            match config_resolver::resolve_ledger_config(&view.snapshot, &*view.overlay, view.t)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(error = %e, "Config graph read failed — using system defaults");
-                    return Ok(view);
-                }
-            };
+        //
+        // Resolved through the same marker-keyed cache the write path uses:
+        // query preparation completes config defaults on every view that
+        // arrives without them, which for the ledger-scoped server routes is
+        // every request, and a configured ledger would otherwise pay the full
+        // config-graph read each time. The cache serves a value only on an
+        // exact `config_write_t` match at head, so a stale read is not
+        // possible; a miss costs the resolve this used to do unconditionally.
+        // `view.novelty()` is passed explicitly because a read view's overlay
+        // may be a composed reasoning overlay rather than a bare `Novelty`, in
+        // which case the resolver's own downcast would find no marker and
+        // silently stop caching.
+        let config = match crate::policy_view::resolve_ledger_config_cached(
+            self,
+            &view.snapshot,
+            &*view.overlay,
+            view.novelty().map(|n| &**n),
+            view.t,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "Config graph read failed — using system defaults");
+                return Ok(view);
+            }
+        };
 
-        let config = match config {
-            Some(c) => Arc::new(c),
-            None => return Ok(view),
+        let Some(config) = config else {
+            return Ok(view);
         };
 
         // Resolve effective config for this view's graph
@@ -1116,6 +1132,90 @@ fn populate_dict_novelty_from_view(
 mod tests {
     use super::*;
     use crate::FlureeBuilder;
+
+    /// A query over a view that arrives without a resolved config resolves it
+    /// through the shared marker-keyed cache, so the next such query on the
+    /// same ledger state hits instead of re-reading the config graph. Lives
+    /// here rather than in `tests/` because `config_cache_get` is crate-private.
+    ///
+    /// Both memo shapes are covered: a resolved config on a configured ledger,
+    /// and the "no config" result on an unconfigured one, which is what lets
+    /// unconfigured ledgers skip the scan after the first miss.
+    #[tokio::test]
+    async fn read_path_populates_the_config_cache() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        assert!(
+            fluree.ledger_manager().is_some(),
+            "harness: the cache lives on the ledger manager, which this builder must attach"
+        );
+
+        // --- configured ledger: memoizes Some(config) ---
+        let configured = "cfgcache/configured:main";
+        let ledger = fluree.create_ledger(configured).await.expect("create");
+        let trig = format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <urn:fluree:{configured}#config> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+                <urn:config:reasoning> f:reasoningModes f:rdfs .
+            }}
+            "
+        );
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&trig)
+            .execute()
+            .await
+            .expect("write config");
+
+        let handle = fluree
+            .ledger_cached(configured)
+            .await
+            .expect("cached handle");
+        let state = fluree.ledger(configured).await.expect("ledger state");
+        let key = state.novelty.config_write_t;
+        assert!(
+            handle.config_cache_get(key).await.is_none(),
+            "nothing has resolved config yet, so the marker must miss"
+        );
+
+        let db = GraphDb::from_ledger_state(&state);
+        let q = serde_json::json!({"select": "?s", "where": {"@id": "?s"}});
+        fluree.query(&db, &q).await.expect("query");
+
+        assert!(
+            matches!(handle.config_cache_get(key).await, Some(Some(_))),
+            "a read over a config-less view must resolve through the cache and memoize the config"
+        );
+
+        // --- unconfigured ledger: memoizes None ---
+        let bare = "cfgcache/bare:main";
+        let ledger = fluree.create_ledger(bare).await.expect("create");
+        fluree
+            .insert(
+                ledger,
+                &serde_json::json!({"@id": "http://example.org/a", "http://example.org/p": "v"}),
+            )
+            .await
+            .expect("insert");
+        let handle = fluree.ledger_cached(bare).await.expect("cached handle");
+        let state = fluree.ledger(bare).await.expect("ledger state");
+        let key = state.novelty.config_write_t;
+        assert!(
+            handle.config_cache_get(key).await.is_none(),
+            "unconfigured: cold"
+        );
+
+        let db = GraphDb::from_ledger_state(&state);
+        fluree.query(&db, &q).await.expect("query");
+
+        assert!(
+            matches!(handle.config_cache_get(key).await, Some(None)),
+            "a read over an unconfigured ledger must memoize the no-config result"
+        );
+    }
 
     #[tokio::test]
     async fn test_view_not_found() {

@@ -4029,3 +4029,56 @@ async fn shacl_txn_validation_mode_reject_strengthens_warn() {
         "requested reject must strengthen a warn posture: {err:?}"
     );
 }
+
+// =============================================================================
+// Config resolution is cached on the read path; a config change must still win
+// =============================================================================
+
+/// Reads resolve config through the marker-keyed cache the write path uses.
+/// This pins the invalidation contract from the outside: a commit to the config
+/// graph advances `config_write_t`, so the next read over the new state must
+/// miss and re-resolve rather than serve the previous config.
+///
+/// Not a pin for the cache itself, which passes with or without it. It is the
+/// guard against a wrong key: anything that kept serving the first config after
+/// a config write, keying on the ledger alone, say, fails here.
+#[tokio::test]
+async fn config_change_is_visible_to_the_next_read() {
+    let ledger_id = "it/config-cache-invalidation:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        "",
+    )
+    .await;
+
+    assert_eq!(
+        entailed_names_jsonld(&fluree, ledger_id).await,
+        json!(["Alice"]),
+        "first read: the rdfs config governs"
+    );
+
+    // Flip the configured default to `none` in a new commit.
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        GRAPH <{config_iri}> {{
+            <urn:config:reasoning> f:reasoningModes f:none .
+        }}
+    "
+    );
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("rewrite config");
+
+    assert_eq!(
+        entailed_names_jsonld(&fluree, ledger_id).await,
+        json!([]),
+        "second read: the config write must invalidate what the first read cached"
+    );
+}
