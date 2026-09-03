@@ -740,6 +740,20 @@ impl SqlBlockSource {
             }
             let mut batch = Batch::new(Arc::clone(&self.schema), columns)
                 .map_err(|e| QueryError::Internal(e.to_string()))?;
+            for (var, expr) in &self.lowered(branch).binds {
+                let mut computed = Vec::with_capacity(batch.len());
+                for row in batch.rows() {
+                    computed.push(if ctx.strict_bind_errors {
+                        expr.try_eval_to_binding(&row, Some(ctx))?
+                    } else {
+                        expr.try_eval_to_binding_non_strict(&row, Some(ctx))?
+                    });
+                }
+                let (schema, mut columns, len) = batch.into_parts();
+                columns[self.out_pos[var]] = computed;
+                batch = Batch::from_parts(schema, columns, len)
+                    .map_err(|e| QueryError::Internal(e.to_string()))?;
+            }
             let mut dropped = false;
             for f in &self.resolved.branches[branch].residuals {
                 match crate::filter::filter_batch(&batch, f, &self.schema, ctx)? {

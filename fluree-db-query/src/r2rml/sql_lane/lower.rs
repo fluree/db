@@ -119,6 +119,9 @@ pub(crate) struct Lowered {
     pub accesses: Vec<AccessInfo>,
     pub terms: Vec<(VarId, TermSource)>,
     pub residual_filters: Vec<Expression>,
+    /// `BIND`s evaluated in the engine over each returned row, in order,
+    /// before the residual filters.
+    pub binds: Vec<(VarId, Expression)>,
     pub seeds: Vec<SeedSpec>,
     /// Variables the block binds, in schema order.
     pub block_vars: Vec<VarId>,
@@ -163,6 +166,7 @@ struct Block {
     filters: Vec<Expression>,
     optionals: Vec<(Vec<Tp>, Vec<Expression>)>,
     values: Vec<(Vec<VarId>, Vec<Vec<Binding>>)>,
+    binds: Vec<(VarId, Expression)>,
 }
 
 /// Per-`(triples map, predicate)` view-policy verdict: `Some(true)` allowed,
@@ -293,10 +297,16 @@ type RefEdge = (String, Vec<(String, String)>, String, VarId);
 impl<'a> Lowerer<'a> {
     fn lower(
         &mut self,
-        block: Block,
+        mut block: Block,
         child_vars: &[VarId],
         projection: Option<&[VarId]>,
     ) -> Result<Lowering<Option<Lowered>>> {
+        // A BIND is computed in the engine after the statement, so it cannot
+        // be a join key with the outer query.
+        let binds = std::mem::take(&mut block.binds);
+        if binds.iter().any(|(v, _)| child_vars.contains(v)) {
+            return Ok(Err(Decline("BIND variable bound by the outer query")));
+        }
         // Required entities.
         let entities = group_entities(&block.triples);
         let required_subjects: HashSet<VarId> = entities
@@ -414,6 +424,9 @@ impl<'a> Lowerer<'a> {
                 for f in &self.residuals {
                     keep.extend(f.referenced_vars());
                 }
+                for (_, e) in &binds {
+                    keep.extend(e.referenced_vars());
+                }
                 keep
             });
         let projected: Vec<VarId> = self
@@ -503,6 +516,7 @@ impl<'a> Lowerer<'a> {
             accesses,
             terms,
             residual_filters: std::mem::take(&mut self.residuals),
+            binds,
             seeds,
             block_vars: self.var_order.clone(),
             vars: self.vars.clone(),
@@ -1611,6 +1625,7 @@ fn parse_block(patterns: &[Pattern], snapshot: &LedgerSnapshot) -> Lowering<Bloc
         filters: Vec::new(),
         optionals: Vec::new(),
         values: Vec::new(),
+        binds: Vec::new(),
     };
     for p in patterns {
         match p {
@@ -1632,6 +1647,7 @@ fn parse_block(patterns: &[Pattern], snapshot: &LedgerSnapshot) -> Lowering<Bloc
                 block.optionals.push((triples, filters));
             }
             Pattern::Values { vars, rows } => block.values.push((vars.clone(), rows.clone())),
+            Pattern::Bind { var, expr } => block.binds.push((*var, expr.clone())),
             _ => return decline("unsupported pattern in block"),
         }
     }
@@ -1831,7 +1847,8 @@ pub(crate) fn key_fits(ty: Option<FieldType>, raw: &str) -> bool {
 /// The mapping-dependent decisions happen at open.
 pub(crate) fn block_is_admissible(patterns: &[Pattern]) -> bool {
     let mut has_triple = false;
-    for p in patterns {
+    let mut in_scope: Vec<VarId> = Vec::new();
+    for (i, p) in patterns.iter().enumerate() {
         match p {
             Pattern::Triple(tp) => {
                 has_triple = true;
@@ -1840,6 +1857,24 @@ pub(crate) fn block_is_admissible(patterns: &[Pattern]) -> bool {
                 }
             }
             Pattern::Filter(_) | Pattern::Values { .. } => {}
+            // Evaluated in the engine over the statement's rows, so it must
+            // read only what the block bound before it, and nothing the
+            // statement joins or filters on may read it (a filter above is
+            // group-scoped and runs after the BIND either way).
+            Pattern::Bind { var, expr } => {
+                if crate::filter::contains_exists(expr)
+                    || crate::eval::metadata_resolve::contains_metadata_read(expr)
+                    || in_scope.contains(var)
+                    || expr.referenced_vars().iter().any(|v| !in_scope.contains(v))
+                    || patterns.iter().enumerate().any(|(j, q)| {
+                        j != i
+                            && !matches!(q, Pattern::Filter(_))
+                            && q.referenced_vars().contains(var)
+                    })
+                {
+                    return false;
+                }
+            }
             Pattern::Optional(inner) => {
                 if !inner.iter().all(|q| match q {
                     Pattern::Triple(tp) => triple_is_admissible(tp),
@@ -1859,6 +1894,7 @@ pub(crate) fn block_is_admissible(patterns: &[Pattern]) -> bool {
             }
             _ => return false,
         }
+        in_scope.extend(p.produced_vars());
     }
     has_triple
 }

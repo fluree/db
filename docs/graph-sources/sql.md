@@ -203,6 +203,13 @@ pushable. In that statement:
 - a `VALUES` block, and bindings the outer query already holds (a ledger
   pattern joined to the block), are sent as a `VALUES` key set so the
   source does the semi-join;
+- a `BIND` in the block keeps the block on one statement: the statement
+  returns the columns the expression reads and the engine computes the
+  value per row, before any residual filter (so a `FILTER` over the bound
+  variable is fine). The `BIND` must read only variables the block bound
+  before it, and nothing the statement joins or filters on may read the
+  bound variable; an `EXISTS` inside the expression, or a `BIND` inside an
+  `OPTIONAL` or a `UNION` branch, leaves the block to the engine;
 - `LIMIT`, and `ORDER BY … LIMIT` as a top-k, are pushed when no residual
   filter could drop rows afterwards. The top-k needs every `ORDER BY` key to
   be a typed, required column (either direction); a key the statement cannot
