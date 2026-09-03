@@ -113,6 +113,49 @@ pub const SPARQL11_EXISTS: &[&str] = &[
 pub const SPARQL11_FUNCTIONS: &[&str] = &[
     // fully green: concat02 (CONCAT type-errors on a non-string argument) and
     // strlang03-rdf11 (case-insensitive language-tag comparison) — PR-X2
+    //
+    // Timezone offsets are not supported. Deliberate, and not a burn-down
+    // item — see rule 2 of "Managing the Skip List".
+    //
+    // Every temporal value is canonicalized the moment it is parsed
+    // (fluree-db-core/src/temporal.rs): an xsd:dateTime becomes a UTC instant
+    // (the offset is applied) and an xsd:date/xsd:time drops its designator
+    // (the offset is discarded, not applied). The source offset is retained
+    // nowhere — not in novelty, not in the commit log, not in the index. So
+    // TZ is always "Z", TIMEZONE always "PT0S", and HOURS reads the UTC hour:
+    // hours-01 expects 15 for "…T15:38:02-08:00" and gets 23.
+    //
+    // Why one representation, rather than keeping the offset while it is
+    // available: the parsed value used to keep it in novelty and lose it once
+    // indexed, so every consumer that read it — these accessors, but also
+    // comparison, equality, hashing, arithmetic and rendering — answered one
+    // thing before a background reindex and another after. The same query
+    // over unchanged data returning a different result, with no write behind
+    // it and no way for a caller to predict which they would get.
+    //
+    // These three tests passed until 2026-08-29 only because this harness
+    // loads into a fresh in-memory ledger and never reindexes, so it exercised
+    // the novelty lane exclusively. On an indexed ledger — the steady state of
+    // any real deployment — they already failed. Registering them records a
+    // choice that was, in practice, already made.
+    //
+    // Storing the offset would fix it, but it does not fit: an `ObjKey` is a
+    // u64 and holds 59 bits of microsecond-range instant, leaving no room for
+    // the 11 bits an offset needs. The alternatives are an arena handle (which
+    // would destroy the inline key ordering that dateTime range pushdown
+    // depends on) or a sidecar — real cost for an accessor whose value the
+    // caller can supply themselves by rendering in whichever zone they want.
+    //
+    // Spec: https://www.w3.org/TR/sparql11-query/#func-hours    (§17.4.5.5)
+    //       https://www.w3.org/TR/sparql11-query/#func-timezone (§17.4.5.8)
+    //       https://www.w3.org/TR/sparql11-query/#func-tz       (§17.4.5.9)
+    // Behaviour + rationale: docs/reference/compatibility.md
+    // Cross-lane pin: fluree-db-api/tests/it_timezone_accessors.rs,
+    //                 fluree-db-api/tests/it_temporal_lane_stability.rs
+    // NEEDS: second reviewer per "Managing the Skip List" rule 4.
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#hours",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#timezone",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#tz",
 ];
 
 pub const SPARQL11_GROUPING: &[&str] = &[];
@@ -197,10 +240,20 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // expr-ops {add,subtract,multiply,divide}-numbers-cast + unplus-2/unminus-2:
     // greened by D4 numeric promotion (xsd:float first-class, double∘decimal→
     // double) — PR-X2
-    // date-1: xsd:date `=` — Fluree drops the timezone, so "2006-08-23" ≡
-    // "2006-08-23Z" ≡ "2006-08-23+00:00"; needs temporal value semantics — PR-X2
-    // (temporal, deferred).
+    // date-1..4: timezone offsets are not supported — the same decision as
+    // functions#tz/#timezone/#hours in SPARQL11_FUNCTIONS above, see the
+    // rationale there and docs/reference/compatibility.md. Not deferred.
+    //   date-1: `=` — the designator is discarded on an xsd:date, so
+    //           "2006-08-23" ≡ "2006-08-23Z" ≡ "2006-08-23+00:00".
+    //   date-2/3/4: the expected results echo the lexical as written
+    //           ("2001-01-01Z", "2006-08-23+00:00", "…T09:00:00+01:00");
+    //           Fluree returns the canonical form ("2001-01-01",
+    //           "2006-08-23", "…T08:00:00Z"). date-2/3/4 passed until
+    //           2026-09-02 only because this harness never reindexes.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-1",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-2",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-3",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-01",
     // open-eq-04 greened (D5 datatype-aware `=`/`!=`). open-eq-05/06 need BOTH the
     // scan-path EncodedLit datatype-carry (bench-sensitive, D5b class) AND typed-

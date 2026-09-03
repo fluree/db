@@ -246,6 +246,21 @@ path = "tests/it_fastpath_1652_regression.rs"
 name = "it_datetime_component_presence"
 path = "tests/it_datetime_component_presence.rs"
 
+[[test]]
+name = "it_timezone_accessors"
+path = "tests/it_timezone_accessors.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_temporal_lane_stability"
+path = "tests/it_temporal_lane_stability.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_temporal_arithmetic"
+path = "tests/it_temporal_arithmetic.rs"
+required-features = ["native"]
+
 # Own binary: asserts fast-path routing via process-scoped tracing capture.
 [[test]]
 name = "it_exists_semijoin_correlation"

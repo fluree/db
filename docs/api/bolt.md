@@ -92,9 +92,11 @@ conversion with the Cypher JSON transport:
 - **Paths**: Bolt `Path` structures (unique node/relationship lists plus
   walk indices).
 - **Temporal values**: `xsd:date`/`dateTime`/`time` map to Bolt
-  `Date`/`DateTime`/`Time` structures (4.4 sessions get the legacy
-  local-seconds `DateTime`; lexical forms without a timezone map to the
-  `Local*` variants).
+  `Date`/`DateTime`/`LocalTime`. A `dateTime` is always a UTC instant, so it
+  is always the zoned `DateTime` with offset `0` (4.4 sessions get the legacy
+  local-seconds form); a `time` carries no offset, so it is always
+  `LocalTime`. Source offsets are not retained — see
+  [Timezone offsets are not supported](../reference/compatibility.md).
 - **`xsd:decimal`**: rendered as Float — Neo4j parity, with precision
   loss; the JSON transport keeps exact lexical strings instead. Integer
   division produces decimals, so this shows up on ordinary `a / b`.

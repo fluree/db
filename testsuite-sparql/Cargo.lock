@@ -709,6 +709,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "wasm-bindgen-futures",
  "xxhash-rust",
  "zstd",
 ]
@@ -723,7 +724,6 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-spatial",
  "fluree-vocab",
- "fs2",
  "futures",
  "hex",
  "memmap2",
@@ -741,6 +741,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "uuid",
  "xxhash-rust",
  "zstd",
 ]
@@ -773,9 +774,12 @@ dependencies = [
  "fluree-vocab",
  "fs2",
  "futures",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "hashbrown 0.16.1",
  "hex",
  "libc",
+ "lru",
  "moka",
  "multihash",
  "num-bigint",
@@ -791,6 +795,8 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "uuid",
+ "web-time",
  "xxhash-rust",
  "zstd",
 ]
@@ -957,10 +963,10 @@ dependencies = [
  "futures",
  "geo",
  "geo-types",
+ "getrandom 0.2.17",
  "hashbrown 0.16.1",
  "lru",
  "md-5",
- "memmap2",
  "moka",
  "num-bigint",
  "num-traits",
@@ -977,7 +983,6 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror 1.0.69",
- "tokio",
  "tracing",
  "uuid",
  "wkt",
@@ -1056,7 +1061,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
- "tokio",
  "tracing",
  "wkt",
  "zstd",
@@ -1333,8 +1337,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1344,9 +1350,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2631,6 +2639,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-bindgen-futures"
+version = "0.4.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70a6e77fd0ae8029c9ea0063f87c46fde723e7d887703d74ad2616d792e51e6f"
+dependencies = [
+ "cfg-if",
+ "futures-util",
+ "js-sys",
+ "once_cell",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "wasm-bindgen-macro"
 version = "0.2.108"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2694,6 +2716,16 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "web-sys"
+version = "0.3.85"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "312e32e551d92129218ea9a2452120f4aabc03529ef03e4d0d82fb2780608598"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]
