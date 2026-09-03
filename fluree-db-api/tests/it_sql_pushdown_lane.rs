@@ -1151,24 +1151,61 @@ async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
     let sparql = format!(
         "{PREFIX}SELECT ?c ?n FROM NAMED <shop-sql:main> WHERE {{ VALUES ?c {{ {values} }} GRAPH <shop-sql:main> {{ ?c ex:name ?n }} }}"
     );
+    let expected = vec![
+        "c=http://example.org/customer/1 n=Ada",
+        "c=http://example.org/customer/2 n=Bo",
+        "c=http://example.org/customer/3 n=Cy",
+    ];
+    // An outer side past one key set probes the block's size; the fake's
+    // three customers fit, so one unseeded statement answers every batch.
     let before = block_statements(&server).await.len();
     let rows = rows_of(&query(&fluree, &sparql).await);
-    assert_eq!(
-        rows,
-        vec![
-            "c=http://example.org/customer/1 n=Ada",
-            "c=http://example.org/customer/2 n=Bo",
-            "c=http://example.org/customer/3 n=Cy",
-        ]
-    );
+    assert_eq!(rows, expected);
     let sent = block_statements(&server).await[before..].to_vec();
-    assert_eq!(sent.len(), 2, "2001 keys chunk into 2000 + 1: {sent:?}");
-    assert!(sent[0].contains("(2000)") && !sent[0].contains("(2001)"));
-    assert!(sent[1].contains("(VALUES (2001)) AS \"k\""), "{}", sent[1]);
+    assert_eq!(
+        sent.len(),
+        2,
+        "a COUNT(*) probe then the whole block: {sent:?}"
+    );
+    assert_eq!(
+        sent[0],
+        r#"SELECT COUNT(*) AS "n" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#
+    );
+    assert_eq!(
+        sent[1],
+        r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#
+    );
     set_fast_paths_disabled(true);
     let scan = rows_of(&query(&fluree, &sparql).await);
     set_fast_paths_disabled(false);
     assert_eq!(scan, rows, "scan lane disagrees");
+
+    // A block above the cache cap (here: three rows against a cap of two)
+    // stays seeded, chunked at the key-set cap.
+    std::env::set_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS", "2");
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &sparql).await);
+    assert_eq!(rows, expected);
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert_eq!(
+        sent.len(),
+        3,
+        "a COUNT(*) probe, then 2000 + 1 keys: {sent:?}"
+    );
+    assert!(sent[0].starts_with("SELECT COUNT(*)"), "{}", sent[0]);
+    assert!(sent[1].contains("(2000)") && !sent[1].contains("(2001)"));
+    assert!(sent[2].contains("(VALUES (2001)) AS \"k\""), "{}", sent[2]);
+
+    // Caching off: no probe, every batch seeded.
+    std::env::set_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS", "0");
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &sparql).await);
+    assert_eq!(rows, expected);
+    let sent = block_statements(&server).await[before..].to_vec();
+    std::env::remove_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS");
+    assert_eq!(sent.len(), 2, "2001 keys chunk into 2000 + 1: {sent:?}");
+    assert!(sent[0].contains("(2000)") && !sent[0].contains("(2001)"));
+    assert!(sent[1].contains("(VALUES (2001)) AS \"k\""), "{}", sent[1]);
 
     let sparql = format!(
         "{PREFIX}SELECT ?c ?n FROM <shop-sql:main> WHERE {{ ?c ex:name ?n VALUES ?c {{ {values} }} }}"

@@ -230,7 +230,16 @@ pushable. In that statement:
   over a `bigint`) makes the block empty without a round trip;
 - a `VALUES` block, and bindings the outer query already holds (a ledger
   pattern joined to the block), are sent as a `VALUES` key set so the
-  source does the semi-join;
+  source does the semi-join. Once the outer side has grown past one key
+  set (2000 rows), a seeded statement per outer batch stops paying: the
+  lane counts the block once (`SELECT COUNT(*)`, an index-only scan on
+  most tables) and, when it holds at most 100,000 rows and no more than
+  four rows per outer row seen so far, fetches it whole in one statement
+  and joins every outer batch to it in memory; a larger block stays
+  seeded. On a 1M-row Postgres table, 50,000 outer keys against a
+  100,000-row block run 2.2x faster this way, and 5,000 keys stay seeded.
+  The row cap is `FLUREE_SQL_PUSHDOWN_CACHE_ROWS` (`0` keeps every batch
+  seeded);
 - a `BIND` in the block keeps the block on one statement: the statement
   returns the columns the expression reads and the engine computes the
   value per row, before any residual filter (so a `FILTER` over the bound

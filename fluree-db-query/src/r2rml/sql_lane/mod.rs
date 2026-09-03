@@ -23,9 +23,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use fluree_db_tabular::plan::{
-    ColRef, KeySet, Literal, OrderKey, Pred, RelNode, RelPlan, RelSource,
+    ColRef, KeySet, Literal, OrderKey, OutputCol, OutputExpr, Pred, RelNode, RelPlan, RelSource,
 };
-use fluree_db_tabular::BatchSchema;
+use fluree_db_tabular::{BatchSchema, Column};
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
@@ -52,6 +52,24 @@ pub const SQL_BLOCK_PUSHDOWN_SITE: &str = "sql_block_pushdown";
 pub(crate) fn sql_pushdown_lane_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_SQL_PUSHDOWN_LANE"))
+}
+
+/// Rows a block may hold in memory to answer every outer batch from one
+/// unseeded statement instead of a seeded statement per batch.
+/// `FLUREE_SQL_PUSHDOWN_CACHE_ROWS` overrides; `0` keeps every batch seeded.
+const BLOCK_CACHE_MAX_ROWS: usize = 100_000;
+
+/// Block rows per outer row above which seeding stays cheaper than fetching
+/// the block whole. On the 1M-row Postgres probe a seeded key costs ~7.6µs
+/// and a fetched row ~1.4µs, so the break-even is near five; four keeps the
+/// wrong call on the side that only costs what it costs today.
+const CACHE_ROWS_PER_OUTER_ROW: usize = 4;
+
+fn block_cache_max_rows() -> usize {
+    std::env::var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BLOCK_CACHE_MAX_ROWS)
 }
 
 /// Whether the planner should route this GRAPH block through the lane.
@@ -245,6 +263,7 @@ pub(super) async fn resolve_block(
         caps,
         mapping,
         schemas,
+        cache_max_rows: block_cache_max_rows(),
     }))
 }
 
@@ -264,6 +283,8 @@ pub(super) struct Resolved {
     pub mapping: Arc<CompiledR2rmlMapping>,
     /// Probed schemas of the relations the block can reach.
     pub schemas: HashMap<RelSource, Arc<BatchSchema>>,
+    /// See [`BLOCK_CACHE_MAX_ROWS`].
+    pub cache_max_rows: usize,
 }
 
 #[async_trait::async_trait]
@@ -381,6 +402,31 @@ enum JoinPlan {
     },
 }
 
+/// A branch's rows, fetched once and joined to every outer batch in memory.
+struct CachedBlock {
+    rows: Vec<Vec<(VarId, Binding)>>,
+    /// The outer variables the join meets on, in key order.
+    join_vars: Vec<VarId>,
+    /// Rows bound on every join variable, by key.
+    index: HashMap<Vec<GroupKeyOwned>, Vec<usize>>,
+    /// `(row, key)` of rows with an unbound join variable, which agree with
+    /// any outer value there.
+    partial: Vec<(usize, Vec<Option<GroupKeyOwned>>)>,
+}
+
+/// Whether a branch answers outer batches from a cache or from seeded
+/// statements.
+enum BlockCache {
+    /// The outer side has not yet outgrown one key set.
+    Untried,
+    /// Counted and small enough to hold, but not yet worth fetching for
+    /// the outer rows seen so far.
+    Counted(usize),
+    /// Too large to hold (or its size unreadable): every batch is seeded.
+    Seeded,
+    Rows(CachedBlock),
+}
+
 struct InFlight {
     child_batch: Batch,
     /// One join plan per branch (a branch binds its own subset of the
@@ -407,6 +453,9 @@ struct SqlBlockSource {
     inflight: Option<InFlight>,
     child_done: bool,
     out_pos: HashMap<VarId, usize>,
+    /// Outer rows seen so far, the statistic behind [`BlockCache`].
+    outer_rows: usize,
+    caches: Vec<BlockCache>,
 }
 
 impl SqlBlockSource {
@@ -419,6 +468,9 @@ impl SqlBlockSource {
         topk: Option<(Vec<SortSpec>, usize)>,
     ) -> Self {
         let out_pos = schema.iter().enumerate().map(|(i, v)| (*v, i)).collect();
+        let caches = (0..resolved.branches.len())
+            .map(|_| BlockCache::Untried)
+            .collect();
         Self {
             child,
             graph_iri,
@@ -431,6 +483,8 @@ impl SqlBlockSource {
             inflight: None,
             child_done: false,
             out_pos,
+            outer_rows: 0,
+            caches,
         }
     }
 
@@ -498,6 +552,224 @@ impl SqlBlockSource {
             order_by,
             limit,
         }
+    }
+
+    /// The branch's whole answer, to be joined in the engine: no key set and
+    /// no modifiers, since every outer batch reads from it.
+    fn plan_for_cache(&self, branch: usize) -> RelPlan {
+        let lowered = self.lowered(branch);
+        RelPlan {
+            root: lowered.root.clone(),
+            output: lowered.outputs.clone(),
+            group_by: Vec::new(),
+            distinct: lowered.distinct,
+            order_by: Vec::new(),
+            limit: None,
+        }
+    }
+
+    /// Once the outer side has outgrown one key set, a branch is counted;
+    /// one small enough to hold, and to be cheaper fetched whole than
+    /// seeded for the outer rows seen, is fetched once and joined in memory
+    /// in place of a seeded statement per outer batch (or, for a branch
+    /// nothing seeds, a re-run per batch).
+    async fn count_block(&self, branch: usize, ctx: &ExecutionContext<'_>) -> Result<BlockCache> {
+        let max_rows = self.resolved.cache_max_rows;
+        if max_rows == 0 {
+            return Ok(BlockCache::Seeded);
+        }
+        let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
+            QueryError::InvalidQuery("R2RML table provider not configured".into())
+        })?;
+        use futures::StreamExt;
+        let lowered = self.lowered(branch);
+        let count_plan = RelPlan {
+            root: lowered.root.clone(),
+            output: vec![OutputCol {
+                expr: OutputExpr::CountRows,
+                name: "n".into(),
+            }],
+            group_by: Vec::new(),
+            distinct: false,
+            order_by: Vec::new(),
+            limit: None,
+        };
+        let (sql, mut stream) = table_provider
+            .execute_plan(&self.graph_iri, &count_plan)
+            .await?;
+        ctx.tracker.record_statement(&self.graph_iri, &sql);
+        let mut count: Option<i64> = None;
+        while let Some(page) = stream.next().await {
+            let page = page?;
+            count = match page.columns.first() {
+                Some(Column::Int64(v)) => v.first().copied().flatten(),
+                Some(Column::Int32(v)) => v.first().copied().flatten().map(i64::from),
+                Some(Column::Decimal {
+                    values, scale: 0, ..
+                }) => values
+                    .first()
+                    .copied()
+                    .flatten()
+                    .and_then(|v| i64::try_from(v).ok()),
+                _ => None,
+            };
+        }
+        let Some(count) = count.and_then(|n| usize::try_from(n).ok()) else {
+            tracing::debug!(
+                branch,
+                "sql pushdown: block count unreadable, staying seeded"
+            );
+            return Ok(BlockCache::Seeded);
+        };
+        if count > max_rows {
+            tracing::debug!(
+                branch,
+                count,
+                max_rows,
+                "sql pushdown: block too large to cache"
+            );
+            return Ok(BlockCache::Seeded);
+        }
+        Ok(BlockCache::Counted(count))
+    }
+
+    /// Whether a counted branch is now cheaper fetched whole than seeded.
+    fn worth_fetching(&self, count: usize) -> bool {
+        count <= self.outer_rows.saturating_mul(CACHE_ROWS_PER_OUTER_ROW)
+    }
+
+    async fn fetch_block(
+        &self,
+        branch: usize,
+        count: usize,
+        child_batch: &Batch,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<BlockCache> {
+        let max_rows = self.resolved.cache_max_rows;
+        let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
+            QueryError::InvalidQuery("R2RML table provider not configured".into())
+        })?;
+        use futures::StreamExt;
+        let lowered = self.lowered(branch);
+        let plan = self.plan_for_cache(branch);
+        let (sql, mut stream) = table_provider.execute_plan(&self.graph_iri, &plan).await?;
+        ctx.tracker.record_statement(&self.graph_iri, &sql);
+        let b = &self.resolved.branches[branch];
+        let mut rows: Vec<Vec<(VarId, Binding)>> = Vec::with_capacity(count);
+        while let Some(page) = stream.next().await {
+            ctx.checkpoint()?;
+            let batches = b.materializer.split_page(page?, &b.lowered.outputs)?;
+            let num_rows = batches.values().next().map(|b| b.num_rows).unwrap_or(0);
+            for i in 0..num_rows {
+                rows.push(b.materializer.row(&batches, i)?);
+            }
+            if rows.len() > max_rows {
+                tracing::debug!(branch, max_rows, "sql pushdown: block outgrew its count");
+                return Ok(BlockCache::Seeded);
+            }
+        }
+        let join_vars: Vec<VarId> = child_batch
+            .schema()
+            .iter()
+            .copied()
+            .filter(|v| lowered.block_vars.contains(v))
+            .collect();
+        let mut index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
+        let mut partial = Vec::new();
+        for (row_idx, row) in rows.iter().enumerate() {
+            let key: Vec<Option<GroupKeyOwned>> = join_vars
+                .iter()
+                .map(|jv| {
+                    row.iter()
+                        .find(|(v, b)| v == jv && b.is_bound())
+                        .map(|(_, b)| join_key(b, ctx))
+                })
+                .collect();
+            if key.iter().all(Option::is_some) {
+                index
+                    .entry(key.into_iter().map(Option::unwrap).collect())
+                    .or_default()
+                    .push(row_idx);
+            } else {
+                partial.push((row_idx, key));
+            }
+        }
+        tracing::debug!(branch, rows = rows.len(), "sql pushdown: block cached");
+        Ok(BlockCache::Rows(CachedBlock {
+            rows,
+            join_vars,
+            index,
+            partial,
+        }))
+    }
+
+    /// Join an outer batch to a cached branch: the same meeting rule as
+    /// [`Self::join_and_emit`], with the cache as the indexed side.
+    fn emit_cached(
+        &mut self,
+        branch: usize,
+        child_batch: &Batch,
+        cache: &CachedBlock,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<()> {
+        let child_schema = child_batch.schema();
+        let positions: Vec<usize> = cache
+            .join_vars
+            .iter()
+            .map(|jv| child_schema.iter().position(|v| v == jv).unwrap())
+            .collect();
+        for child_row_idx in 0..child_batch.len() {
+            let mut key: Vec<Option<GroupKeyOwned>> = Vec::with_capacity(positions.len());
+            let mut poisoned = false;
+            for &pos in &positions {
+                let b = &child_batch.column_by_idx(pos).unwrap()[child_row_idx];
+                if b.is_poisoned() {
+                    poisoned = true;
+                    break;
+                }
+                key.push(b.is_bound().then(|| join_key(b, ctx)));
+            }
+            if poisoned {
+                continue;
+            }
+            let agrees = |cached: &[Option<GroupKeyOwned>]| {
+                cached.iter().zip(key.iter()).all(|(c, k)| match (c, k) {
+                    (Some(c), Some(k)) => c == k,
+                    _ => true,
+                })
+            };
+            let mut matches: Vec<usize> = Vec::new();
+            if key.iter().all(Option::is_some) {
+                let full: Vec<GroupKeyOwned> = key.iter().cloned().map(Option::unwrap).collect();
+                matches.extend(cache.index.get(&full).into_iter().flatten().copied());
+                matches.extend(
+                    cache
+                        .partial
+                        .iter()
+                        .filter(|(_, c)| agrees(c))
+                        .map(|(i, _)| *i),
+                );
+            } else {
+                // An unbound outer value meets every cached value: walk them.
+                for (full, rows) in &cache.index {
+                    let full: Vec<Option<GroupKeyOwned>> = full.iter().cloned().map(Some).collect();
+                    if agrees(&full) {
+                        matches.extend(rows.iter().copied());
+                    }
+                }
+                matches.extend(
+                    cache
+                        .partial
+                        .iter()
+                        .filter(|(_, c)| agrees(c))
+                        .map(|(i, _)| *i),
+                );
+            }
+            for i in matches {
+                self.emit_row(branch, child_batch, child_row_idx, &cache.rows[i], ctx)?;
+            }
+        }
+        Ok(())
     }
 
     /// Key-set chunks for a child batch on one branch: `[None]` when nothing
@@ -896,9 +1168,34 @@ impl Operator for SqlBlockSource {
             }
             match self.child.next_batch(ctx).await? {
                 Some(child_batch) => {
+                    self.outer_rows += child_batch.len();
+                    let outgrown = self.outer_rows > self.resolved.caps.keyset_max_rows;
                     let mut chunks: VecDeque<(usize, Option<KeySet>)> = VecDeque::new();
                     let mut joins = Vec::with_capacity(self.resolved.branches.len());
                     for branch in 0..self.resolved.branches.len() {
+                        if outgrown && matches!(self.caches[branch], BlockCache::Untried) {
+                            self.caches[branch] = self.count_block(branch, &graph_ctx).await?;
+                        }
+                        if let BlockCache::Counted(n) = self.caches[branch] {
+                            if self.worth_fetching(n) {
+                                self.caches[branch] = self
+                                    .fetch_block(branch, n, &child_batch, &graph_ctx)
+                                    .await?;
+                            }
+                        }
+                        if let BlockCache::Rows(_) = self.caches[branch] {
+                            let cache =
+                                std::mem::replace(&mut self.caches[branch], BlockCache::Untried);
+                            let BlockCache::Rows(cached) = &cache else {
+                                unreachable!()
+                            };
+                            let emitted =
+                                self.emit_cached(branch, &child_batch, cached, &graph_ctx);
+                            self.caches[branch] = cache;
+                            emitted?;
+                            joins.push(JoinPlan::Cross);
+                            continue;
+                        }
                         // A branch no outer row can match contributes nothing.
                         for ks in self.keysets_for(branch, &child_batch, &graph_ctx) {
                             chunks.push_back((branch, ks));
@@ -924,6 +1221,9 @@ impl Operator for SqlBlockSource {
         self.child.close();
         self.inflight = None;
         self.pending.clear();
+        self.caches
+            .iter_mut()
+            .for_each(|c| *c = BlockCache::Untried);
         self.state = OperatorState::Closed;
     }
 }
