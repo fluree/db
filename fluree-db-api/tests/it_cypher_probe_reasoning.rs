@@ -1,11 +1,12 @@
 //! Ledger-config reasoning must not reach Cypher write-decision probes.
 //!
 //! A conditional Cypher write chooses its branch by probing the pre-write
-//! state: `MERGE` asks whether the pattern already exists, and `DETACH DELETE`
-//! asks whether the target still has relationships. Those probes decide what
-//! gets written, so they must read asserted data only. An entailed triple is
-//! not something the ledger holds; treating one as a match makes a write
-//! depend on the reasoner.
+//! state: `MERGE` asks whether the pattern already exists, and a bare `DELETE`
+//! asks whether the target still has relationships, which Cypher requires it
+//! to refuse (`DETACH DELETE` skips that check). Those probes decide what gets
+//! written, so they must read asserted data only. An entailed triple is not
+//! something the ledger holds; treating one as a match makes a write depend
+//! on the reasoner.
 //!
 //! The failure is not a mis-branch that merely picks `ON MATCH` over `CREATE`.
 //! The probe reasons but staging does not, so an entailment-only match sends
@@ -212,5 +213,123 @@ async fn sequential_merge_probe_ignores_entailed_match() {
         person_count(&fluree, &r.ledger).await,
         2,
         "sequential MERGE matched an entailed triple instead of creating"
+    );
+}
+
+// =============================================================================
+// Bare DELETE and an entailment-only relationship
+// =============================================================================
+//
+// RDFS cannot build this fixture: every asserted edge touches both of its
+// endpoints and the guard probes both directions, so `subPropertyOf` leaves
+// the target with an asserted relationship either way. `owl:hasValue` can:
+// every instance of the class gets `likes Pizza` from its type alone, so a
+// `Person` carrying only a literal property has a relationship by entailment
+// and none by assertion.
+
+/// Seed a `Person` with no asserted relationships, a restriction entailing
+/// `likes Pizza` for every `Person`, and `f:reasoningModes f:owl2rl`.
+async fn seeded_restriction_ledger(
+    ledger_id: &str,
+) -> (fluree_db_api::Fluree, fluree_db_api::LedgerState) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let r = fluree
+        .transact_cypher(ledger, r#"CREATE (a:Person {childName: "Alice"})"#)
+        .await
+        .expect("seed node");
+
+    let r = fluree
+        .insert(
+            r.ledger,
+            &serde_json::json!({
+                "@context": {
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                    "owl": "http://www.w3.org/2002/07/owl#"
+                },
+                "@graph": [
+                    {"@id": "Person", "rdfs:subClassOf": {"@id": "urn:restr:likes-pizza"}},
+                    {"@id": "urn:restr:likes-pizza", "@type": "owl:Restriction",
+                     "owl:onProperty": {"@id": "likes"},
+                     "owl:hasValue": {"@id": "Pizza"}}
+                ]
+            }),
+        )
+        .await
+        .expect("hasValue restriction");
+
+    let config = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <urn:fluree:{ledger_id}#config> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:reasoningModes f:owl2rl .
+        }}
+        "
+    );
+    let r = fluree
+        .stage_owned(r.ledger)
+        .upsert_turtle(&config)
+        .execute()
+        .await
+        .expect("reasoning config");
+
+    (fluree, r.ledger)
+}
+
+/// Control: the relationship really is entailed for reads and really is not
+/// asserted. Both halves matter, since a fixture that asserted `likes` would
+/// make the delete below fail for a legitimate reason.
+#[tokio::test]
+async fn reads_see_the_entailed_relationship() {
+    let (fluree, ledger) = seeded_restriction_ledger("it/cyprobe-del-control:main").await;
+
+    let db = graphdb_from_ledger(&ledger);
+    let out = fluree
+        .query(
+            &db,
+            &serde_json::json!({
+                "select": "?o",
+                "where": {"@id": "?s", "likes": {"@id": "?o"}}
+            }),
+        )
+        .await
+        .expect("read")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+
+    assert_eq!(
+        out,
+        serde_json::json!(["Pizza"]),
+        "fixture is wrong: config OWL2-RL reasoning is not entailing the relationship"
+    );
+    assert!(
+        !has_asserted(&fluree, &ledger, "likes").await,
+        "fixture is wrong: `likes` must be entailed only, never asserted"
+    );
+}
+
+/// A bare `DELETE` must succeed when the node's only relationship is
+/// entailed. The guard exists to stop a delete from stranding asserted edges;
+/// an entailed edge is not stranded by anything, it simply stops being
+/// derivable once its subject is gone.
+#[tokio::test]
+async fn bare_delete_ignores_entailed_relationship() {
+    let (fluree, ledger) = seeded_restriction_ledger("it/cyprobe-delete:main").await;
+    assert_eq!(person_count(&fluree, &ledger).await, 1, "seed");
+
+    let r = fluree
+        .transact_cypher(ledger, r#"MATCH (a:Person {childName: "Alice"}) DELETE a"#)
+        .await
+        .expect("bare DELETE refused a node whose only relationship is entailed");
+
+    assert_eq!(
+        person_count(&fluree, &r.ledger).await,
+        0,
+        "DELETE succeeded but the node is still there"
     );
 }
