@@ -9,6 +9,8 @@ mod it_cached_handle_cow_recovery;
 mod it_concurrent_update_reconcile;
 #[path = "it_enforce_unique_upsert_indexed.rs"]
 mod it_enforce_unique_upsert_indexed;
+#[path = "it_jsonld_empty_list.rs"]
+mod it_jsonld_empty_list;
 #[path = "it_raw_txn_parallel_upload.rs"]
 mod it_raw_txn_parallel_upload;
 #[path = "it_stable_blank_nodes.rs"]
