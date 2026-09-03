@@ -130,6 +130,36 @@ jobs:
     # database drivers, none of which belong in the fluree binary), so the
     # workspace gates above never reach it.
     runs-on: ubuntu-latest
+    # SQLite exercises the protocol in-process, but it is the one backend whose
+    # string literals cannot misbehave. The escaping rule the bridge enforces
+    # (NO_BACKSLASH_ESCAPES on MySQL) is only observable against a real server,
+    # so both are supplied here. `server_backends_are_configured_in_ci` fails if
+    # these ever stop being set, so a skipped test cannot read as a pass.
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: fluree
+          MYSQL_DATABASE: bridge_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pfluree"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: fluree
+          POSTGRES_DB: bridge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd=pg_isready
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -147,8 +177,11 @@ jobs:
         working-directory: fluree-sql-bridge
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test (SQLite-backed protocol tests)
+      - name: Test (SQLite, MySQL and Postgres backed protocol tests)
         working-directory: fluree-sql-bridge
+        env:
+          FLUREE_BRIDGE_MYSQL_URL: mysql://root:fluree@127.0.0.1:3306/bridge_test
+          FLUREE_BRIDGE_POSTGRES_URL: postgres://postgres:fluree@127.0.0.1:5432/bridge_test
         run: cargo test
 
   bench-paths:

@@ -131,10 +131,10 @@ fn push_value(column: &mut Column, name: &str, ty: FieldType, value: Value) -> R
         }),
         Column::Float32(v) => v.push(
             parse_double(&value)
-                .map_err(|_| bad("real", &value))?
+                .map_err(|()| bad("real", &value))?
                 .map(|d| d as f32),
         ),
-        Column::Float64(v) => v.push(parse_double(&value).map_err(|_| bad("double", &value))?),
+        Column::Float64(v) => v.push(parse_double(&value).map_err(|()| bad("double", &value))?),
         Column::String(v) => v.push(match value {
             Value::Null => None,
             Value::String(s) => Some(s),

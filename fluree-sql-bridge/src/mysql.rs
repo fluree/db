@@ -7,6 +7,23 @@ use tokio::sync::mpsc;
 use crate::backend::{flush, Backend, ColumnMeta, RowChunk, Session, CHUNK_ROWS};
 use crate::render::{self, trino};
 
+/// Make MySQL read string literals by the standard-SQL rule, where `''` is an
+/// escaped quote and a backslash is an ordinary character.
+///
+/// Clients render literals with quote doubling alone, which is the whole rule
+/// on Trino, Postgres and SQLite. MySQL's default `sql_mode` additionally
+/// treats `\\` as live inside a literal, so a value ending in a backslash would
+/// escape its own closing quote and the remainder of the statement would parse
+/// as SQL. `NO_BACKSLASH_ESCAPES` removes that difference for every session
+/// this pool hands out.
+///
+/// The `IF` guards an empty `sql_mode`, which `CONCAT` would turn into a
+/// leading comma that MySQL rejects.
+const ENFORCE_STANDARD_STRING_LITERALS: &str = concat!(
+    "SET SESSION sql_mode = IF(@@sql_mode = '', 'NO_BACKSLASH_ESCAPES', ",
+    "CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES'))"
+);
+
 pub struct MySql {
     pool: MySqlPool,
     decimal_scale: i64,
@@ -20,6 +37,12 @@ impl MySql {
     ) -> Result<Self, String> {
         let pool = MySqlPoolOptions::new()
             .max_connections(max_connections)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    conn.execute(ENFORCE_STANDARD_STRING_LITERALS).await?;
+                    Ok(())
+                })
+            })
             .connect(url)
             .await
             .map_err(|e| format!("connect mysql: {e}"))?;

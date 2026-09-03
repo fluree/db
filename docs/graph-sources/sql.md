@@ -163,13 +163,16 @@ Pushed as `WHERE`:
 Every predicate is rendered **against the column's type**, learned from a
 cached `SELECT * FROM … LIMIT 0` probe. A literal that cannot be compared
 safely with the column — a string against a `bigint`, a naive timestamp
-against a `timestamp with time zone`, a NaN — is simply not pushed. The
-in-engine `FILTER` remains the authority in every case, so a declined push
-costs I/O, never correctness.
+against a `timestamp with time zone`, a NaN, or (on `dialect: mysql`) a string
+containing a backslash — is simply not pushed. The in-engine `FILTER` remains
+the authority in every case, so a declined push costs I/O, never correctness.
 
 `COUNT` over a single triples map is answered by an exact
 `SELECT COUNT(*) … WHERE <key columns> IS NOT NULL` — exact where the Iceberg
-source can only use manifest statistics.
+source can only use manifest statistics. Note the trade: this is a real query
+against the endpoint, so cardinality on a large table costs an aggregate scan,
+where an Iceberg source answers from metadata. Most engines optimize
+`COUNT(*)`, but plan for it if a query shape asks for cardinality repeatedly.
 
 **Not pushed:** `ORDER BY … LIMIT`. A NULL in a key or required column would
 consume `LIMIT` slots for rows the mapping drops, so the engine's own sort
@@ -225,8 +228,21 @@ moment. Consequently
 - Filter literals are rendered with proper quoting and typed against the
   probed schema; identifiers are quoted per dialect. `rr:sqlQuery` text is
   the mapping author's, not a query author's.
+- String literals are escaped by the standard-SQL rule — `''` is an escaped
+  quote, and a backslash is an ordinary character. That holds on Trino,
+  Postgres and SQLite. MySQL's default `sql_mode` treats a backslash as live
+  inside a literal, so on `dialect: mysql` a value containing one is **not
+  pushed down** at all; the in-engine `FILTER` applies it instead. The bridge
+  additionally sets `NO_BACKSLASH_ESCAPES` on every MySQL session it opens.
+  If you point a `mysql` source at some other Trino-protocol endpoint, set the
+  equivalent there.
 - Credentials can be indirected (`{"env_var": "TRINO_TOKEN"}` or
-  `{"secret_ref": "…"}`) rather than stored in the record.
+  `{"secret_ref": "…"}`) rather than stored inline — but only in a
+  graph-source record whose config JSON is authored directly. Both
+  `POST /v1/fluree/sql/map` and `fluree sql map` store what they are given as
+  a literal, so a secret supplied to either lives at rest in the record, which
+  should be protected accordingly. This matches how the Iceberg REST catalog
+  registers; accepting a `secret_ref` through those paths is a follow-up.
 
 ## Running the bridge
 
