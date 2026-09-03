@@ -4,17 +4,23 @@
 //! endpoint instead of direct file access. This allows peers to operate without storage
 //! credentials.
 
+use crate::transport::{HttpTransport, TransportRequest};
 use async_trait::async_trait;
 use fluree_db_nameservice::{NameServiceError, NsRecord, Result};
-use reqwest::{Client, StatusCode};
+use http::StatusCode;
 use serde::Deserialize;
 use std::fmt::Debug;
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 /// NameService implementation that proxies lookups through the transaction server
+///
+/// All network I/O goes through the [`HttpTransport`] seam; see
+/// [`crate::transport`] for the wasm-implementability contract.
 #[derive(Clone)]
 pub struct ProxyNameService {
-    client: Client,
+    transport: Arc<dyn HttpTransport>,
     api_base: String,
     token: String,
 }
@@ -105,6 +111,7 @@ impl ProxyNameService {
     ///
     /// * `base_url` - Base URL of the transaction server (e.g., `https://tx.fluree.internal:8090`)
     /// * `token` - Bearer token for authentication (with `fluree.storage.*` claims)
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(base_url: String, token: String) -> Self {
         // Server root → default versioned API base.
         let api_base = format!("{}/v1/fluree", base_url.trim_end_matches('/'));
@@ -116,14 +123,25 @@ impl ProxyNameService {
     /// add` or advertised via discovery's `api_base_url`. Use this instead
     /// of [`new`](Self::new) when the API may be mounted under a
     /// non-default prefix.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_api_base(api_base: String, token: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30)) // 30 seconds for NS lookups
-            .build()
-            .expect("Failed to create proxy nameservice client");
+        let transport = Arc::new(crate::transport::ReqwestTransport::with_timeout(
+            Duration::from_secs(30), // 30 seconds for NS lookups
+        ));
+        Self::from_api_base_with_transport(api_base, token, transport)
+    }
 
+    /// Create a proxy nameservice client over a caller-supplied
+    /// [`HttpTransport`] (e.g. a browser fetch transport);
+    /// [`new`](Self::new) and [`from_api_base`](Self::from_api_base) are
+    /// conveniences that plug in the default reqwest transport.
+    pub fn from_api_base_with_transport(
+        api_base: String,
+        token: String,
+        transport: Arc<dyn HttpTransport>,
+    ) -> Self {
         Self {
-            client,
+            transport,
             api_base: api_base.trim_end_matches('/').to_string(),
             token,
         }
@@ -217,23 +235,27 @@ impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let url = self.ns_url(ledger_id);
 
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", self.token))
-            .send()
-            .await
-            .map_err(|e| {
-                NameServiceError::storage(format!("Nameservice proxy request failed: {e}"))
-            })?;
+        let request =
+            TransportRequest::get(url).header("authorization", format!("Bearer {}", self.token));
+        let response = self.transport.execute(request).await.map_err(|e| match e {
+            // Body-read failures historically surfaced through response
+            // decoding, so they keep the parse-error message.
+            crate::transport::TransportError::Body(e) => {
+                NameServiceError::storage(format!("Failed to parse NS response: {e}"))
+            }
+            other => {
+                NameServiceError::storage(format!("Nameservice proxy request failed: {other}"))
+            }
+        })?;
 
-        let status = response.status();
+        let status = response.status;
 
         match status {
             StatusCode::OK => {
-                let ns_response: NsRecordResponse = response.json().await.map_err(|e| {
-                    NameServiceError::storage(format!("Failed to parse NS response: {e}"))
-                })?;
+                let ns_response: NsRecordResponse = serde_json::from_slice(&response.body)
+                    .map_err(|e| {
+                        NameServiceError::storage(format!("Failed to parse NS response: {e}"))
+                    })?;
                 Ok(Some(ns_response.into_ns_record(ledger_id)))
             }
             StatusCode::NOT_FOUND => Ok(None),

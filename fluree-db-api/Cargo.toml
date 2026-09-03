@@ -43,6 +43,11 @@ benchmarks = []
 search-remote-client = ["dep:reqwest"]
 # Embedded vector search (HNSW-based approximate nearest neighbor)
 vector = ["fluree-db-query/vector"]
+# Store-driven sync residency mode (wasm32 has it unconditionally): compiles
+# the query-entry retry loop, the load-time novelty prefetch, and the read
+# arms beneath them, engaged at runtime only by miss-register-bearing stores.
+# Native production builds keep this off and compile the pre-residency paths.
+residency = ["fluree-db-query/residency", "fluree-db-binary-index/residency"]
 # IPFS-backed storage (via Kubo HTTP RPC)
 ipfs = ["dep:fluree-db-storage-ipfs"]
 # Convenience bundle (excludes vector, aws, and test-only features)
@@ -154,6 +159,7 @@ fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["resi
 [[test]]
 name = "it_residency_retry"
 path = "tests/it_residency_retry.rs"
+required-features = ["residency"]
 
 [[test]]
 name = "grp_graphsource"

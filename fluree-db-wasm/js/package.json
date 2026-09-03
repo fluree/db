@@ -1,0 +1,45 @@
+{
+  "name": "@fluree/db-wasm",
+  "version": "0.0.0-dev",
+  "description": "Fluree in the browser: the graph database engine compiled to WebAssembly, hosted in a dedicated worker.",
+  "license": "BUSL-1.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fluree/db",
+    "directory": "fluree-db-wasm/js"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker.d.ts",
+      "default": "./dist/worker.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "pkg/fluree_db_wasm.js",
+    "pkg/fluree_db_wasm_bg.wasm",
+    "pkg/fluree_db_wasm.d.ts",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:ts": "tsc -p tsconfig.json",
+    "smoke": "node scripts/smoke-browser.mjs",
+    "serve": "node scripts/serve.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
