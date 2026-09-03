@@ -674,6 +674,7 @@ type Col = (Option<String>, String);
 
 enum Pred {
     IsNull(Col, bool),
+    Like(Col, String),
     Cmp(Col, String, Value),
     ColEq(Col, Col),
     In(Col, Vec<Value>),
@@ -687,6 +688,13 @@ impl Pred {
         let get = |c: &Col| r.resolve(c).map(|(ri, ci)| cell(t, ri, ci)).ok();
         match self {
             Pred::IsNull(c, want_null) => get(c).is_none_or(|v| v.is_null()) == *want_null,
+            Pred::Like(c, pattern) => match get(c) {
+                Some(Value::String(s)) => like_matches(
+                    &pattern.chars().collect::<Vec<_>>(),
+                    &s.chars().collect::<Vec<_>>(),
+                ),
+                _ => false,
+            },
             Pred::Cmp(c, op, lit) => {
                 let Some(v) = get(c) else { return false };
                 if v.is_null() {
@@ -741,6 +749,15 @@ fn parse_pred(text: &str) -> Result<Pred, String> {
     if let Some(c) = text.strip_suffix(" IS NULL") {
         return Ok(Pred::IsNull(colref(c), true));
     }
+    if let Some((c, rest)) = split_once_top(text, " LIKE ") {
+        let lit = rest
+            .strip_suffix(" ESCAPE '!'")
+            .ok_or("LIKE without the lane's ESCAPE clause")?;
+        let Value::String(pattern) = parse_literal(lit)? else {
+            return Err("LIKE pattern is not a string".into());
+        };
+        return Ok(Pred::Like(colref(c), pattern));
+    }
     if let Some((c, list)) = split_once_top(text, " IN ") {
         let inner = strip_parens(list.trim());
         let lits = split_top(inner, ", ")
@@ -758,6 +775,18 @@ fn parse_pred(text: &str) -> Result<Pred, String> {
         }
     }
     Err(format!("unparsed predicate: {text}"))
+}
+
+/// Case-sensitive `LIKE` with `!` as the escape character.
+fn like_matches(pattern: &[char], text: &[char]) -> bool {
+    match pattern {
+        [] => text.is_empty(),
+        ['%', rest @ ..] => (0..=text.len()).any(|i| like_matches(rest, &text[i..])),
+        ['_', rest @ ..] => !text.is_empty() && like_matches(rest, &text[1..]),
+        ['!', c, rest @ ..] | [c, rest @ ..] => {
+            text.first() == Some(c) && like_matches(rest, &text[1..])
+        }
+    }
 }
 
 /// `"alias"."col"` or `"col"` → (alias, col).

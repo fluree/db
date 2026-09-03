@@ -78,9 +78,27 @@ pub enum Pred {
     },
     IsNull(ColRef),
     IsNotNull(ColRef),
+    /// `col LIKE pattern ESCAPE '!'`: `%` and `_` are wildcards unless
+    /// escaped with `!` (see [`like_escape`]).
+    Like {
+        col: ColRef,
+        pattern: String,
+    },
     And(Vec<Pred>),
     Or(Vec<Pred>),
     Not(Box<Pred>),
+}
+
+/// `s` as a literal fragment of a [`Pred::Like`] pattern.
+pub fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '!') {
+            out.push('!');
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl Pred {

@@ -197,6 +197,15 @@ pushable. In that statement:
   `timestamp` without a zone, is not exact and stays in the engine as a
   residual filter over the returned rows; against a `timestamp with time
   zone` column it pushes as a zoned `TIMESTAMP` literal;
+- a filter the statement can only approximate is still pushed as a
+  **widening** predicate, with the exact filter kept in the engine over the
+  rows that come back: `STRSTARTS`, `STRENDS` and `CONTAINS` of a constant
+  against a string column, and a `REGEX` anchored on a literal prefix with
+  no flags, push a `LIKE` (a collation can only match more strings than a
+  byte prefix, never fewer). Inside a conjunction the parts that cannot be
+  widened are simply dropped from the pushed predicate. A widened filter is
+  a residual, so a `LIMIT` above it stays in the engine and a grouped query
+  over it declines;
 - a constant subject or object IRI is reversed through its template into
   key predicates; a key that cannot be a value of its column (`order/abc`
   over a `bigint`) makes the block empty without a round trip;

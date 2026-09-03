@@ -22,7 +22,7 @@ use fluree_db_tabular::plan::{
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 
-use crate::dialect::{cmp_sql, is_numeric, render_literal, SqlDialect};
+use crate::dialect::{cmp_sql, is_numeric, render_literal, sql_string, SqlDialect};
 use crate::error::{Result, SqlError};
 
 struct Renderer<'a> {
@@ -394,6 +394,19 @@ impl Renderer<'_> {
             }
             Pred::IsNull(c) => format!("{} IS NULL", self.col(c)),
             Pred::IsNotNull(c) => format!("{} IS NOT NULL", self.col(c)),
+            Pred::Like { col, pattern } => {
+                let ty = self.col_type(col)?;
+                if ty != FieldType::String {
+                    return Err(SqlError::Unsupported(format!(
+                        "LIKE on {}.{} ({ty:?})",
+                        col.alias, col.column
+                    )));
+                }
+                let lit = sql_string(pattern, self.dialect).ok_or_else(|| {
+                    SqlError::Unsupported(format!("LIKE pattern {pattern:?} cannot be rendered"))
+                })?;
+                format!("{} LIKE {lit} ESCAPE '!'", self.col(col))
+            }
             Pred::And(ps) => self.render_junction(ps, " AND ")?,
             Pred::Or(ps) => self.render_junction(ps, " OR ")?,
             Pred::Not(p) => format!("NOT ({})", self.render_pred(p)?),
@@ -711,6 +724,38 @@ mod tests {
             sql,
             "SELECT `c`.`id` AS `c0` FROM `customers` AS `c` WHERE `c`.`name` = BINARY 'Bob'"
         );
+    }
+
+    /// A `LIKE` carries its own escape character, so a needle's wildcards
+    /// survive on every dialect; MySQL's backslash-escaping literals decline
+    /// as string comparisons do, and a non-string column is refused.
+    #[test]
+    fn like_renders_with_an_escape_clause() {
+        let like = |col: &str, pattern: &str| RelPlan {
+            root: RelNode::Filter {
+                input: Box::new(access("c", "customers")),
+                pred: Pred::Like {
+                    col: ColRef::new("c", col),
+                    pattern: pattern.to_string(),
+                },
+            },
+            output: vec![out("c", "id", "c0")],
+            group_by: Vec::new(),
+            distinct: false,
+            order_by: vec![],
+            limit: None,
+        };
+        let pattern = format!("{}%", fluree_db_tabular::plan::like_escape("50%_!"));
+        assert_eq!(
+            render_plan(&like("name", &pattern), &schemas(), SqlDialect::Postgres).unwrap(),
+            r#"SELECT "c"."id" AS "c0" FROM "customers" AS "c" WHERE "c"."name" LIKE '50!%!_!!%' ESCAPE '!'"#
+        );
+        assert_eq!(
+            render_plan(&like("name", "O'B%"), &schemas(), SqlDialect::Mysql).unwrap(),
+            "SELECT `c`.`id` AS `c0` FROM `customers` AS `c` WHERE `c`.`name` LIKE 'O''B%' ESCAPE '!'"
+        );
+        assert!(render_plan(&like("name", r"c:\%"), &schemas(), SqlDialect::Mysql).is_err());
+        assert!(render_plan(&like("id", "1%"), &schemas(), SqlDialect::Postgres).is_err());
     }
 
     /// A string join on MySQL compares bytes too, and an integer join is

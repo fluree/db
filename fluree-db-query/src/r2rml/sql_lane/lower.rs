@@ -20,7 +20,8 @@ use fluree_db_r2rml::mapping::{
 use fluree_db_r2rml::materialize::reverse_subject_template;
 use fluree_db_r2rml::RdfTerm;
 use fluree_db_tabular::plan::{
-    CmpOp, ColRef, KeySet, Literal, OutputCol, Pred, PushdownCapabilities, RelNode, RelSource,
+    like_escape, CmpOp, ColRef, KeySet, Literal, OutputCol, Pred, PushdownCapabilities, RelNode,
+    RelSource,
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 use fluree_vocab::{rdf, xsd, UnresolvedDatatypeConstraint};
@@ -397,11 +398,17 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        // Filters: exact ones into the plan, the rest stay in the engine.
+        // Filters: exact ones into the plan; the rest stay in the engine,
+        // with a widening predicate in the plan where one exists.
         for f in &block.filters {
             match self.lower_filter(f) {
                 Some(pred) => self.place_pred(pred),
-                None => self.residuals.push(f.clone()),
+                None => {
+                    if let Some(pred) = self.lower_superset(f) {
+                        self.place_pred(pred);
+                    }
+                    self.residuals.push(f.clone());
+                }
             }
         }
 
@@ -1389,6 +1396,75 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// A predicate every row `expr` keeps satisfies, for an `expr` the plan
+    /// cannot evaluate exactly: the statement filters with it and the engine
+    /// still runs `expr` over what comes back. `None` when nothing can be
+    /// said. A `LIKE` widens because a collation can only match more (case
+    /// or accent folding), never fewer, of the strings a byte prefix does.
+    fn lower_superset(&self, expr: &Expression) -> Option<Pred> {
+        if let Some(pred) = self.lower_filter(expr) {
+            return Some(pred);
+        }
+        let Expression::Call { func, args } = expr else {
+            return None;
+        };
+        match func {
+            // Dropping a conjunct widens; every disjunct must widen.
+            Function::And => {
+                Pred::and(args.iter().filter_map(|a| self.lower_superset(a)).collect())
+            }
+            Function::Or => {
+                let parts: Option<Vec<Pred>> =
+                    args.iter().map(|a| self.lower_superset(a)).collect();
+                let parts = parts?;
+                (!parts.is_empty()).then_some(Pred::Or(parts))
+            }
+            Function::StrStarts | Function::StrEnds | Function::Contains => {
+                let (col, needle) = self.string_column_and_literal(args)?;
+                let needle = like_escape(&needle);
+                let pattern = match func {
+                    Function::StrStarts => format!("{needle}%"),
+                    Function::StrEnds => format!("%{needle}"),
+                    _ => format!("%{needle}%"),
+                };
+                Some(Pred::Like { col, pattern })
+            }
+            // `^literal` with no flags is a case-sensitive prefix.
+            Function::Regex => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let (col, pattern) = self.string_column_and_literal(args)?;
+                let prefix = pattern.strip_prefix('^')?;
+                if prefix.is_empty() || prefix.chars().any(|c| r".^$*+?()[]{}|".contains(c)) {
+                    return None;
+                }
+                Some(Pred::Like {
+                    col,
+                    pattern: format!("{}%", like_escape(prefix)),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// `(?v, "literal")` where `?v` is a physical string column.
+    fn string_column_and_literal(&self, args: &[Expression]) -> Option<(ColRef, String)> {
+        let [Expression::Var(v), Expression::Const(c)] = args else {
+            return None;
+        };
+        let (col, class) = self.literal_column(*v)?;
+        if !matches!(class, RdfClass::Str | RdfClass::LangStr(_))
+            || !self.literal_exact(&col, &class)
+        {
+            return None;
+        }
+        match literal_of(c, None)? {
+            (Literal::Str(s), RdfClass::Str) => Some((col, s)),
+            _ => None,
+        }
+    }
+
     /// The plain literal column behind `var`, if it has one.
     fn literal_column(&self, var: VarId) -> Option<(ColRef, RdfClass)> {
         match self.vars.get(&var)?.key.as_ref()? {
@@ -1575,7 +1651,10 @@ impl<'a> Lowerer<'a> {
 
 fn collect_aliases(pred: &Pred, out: &mut HashSet<String>) {
     match pred {
-        Pred::Cmp { col, .. } | Pred::IsNull(col) | Pred::IsNotNull(col) => {
+        Pred::Cmp { col, .. }
+        | Pred::IsNull(col)
+        | Pred::IsNotNull(col)
+        | Pred::Like { col, .. } => {
             out.insert(col.alias.clone());
         }
         Pred::ColEq { left, right } => {
