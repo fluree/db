@@ -875,14 +875,16 @@ fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
         FlakeValue::Decimal(d) if crate::r2rml::iceberg_numeric_stats_enabled() => {
             scan_value_from_bigdecimal(d)
         }
-        // Item 10 (F-AUD-11): an xsd:dateTime pushes as micros-since-epoch, carrying
-        // whether the source was tz-AWARE (an explicit offset ⇒ UTC frame) so the
-        // provider can frame-match it to a `timestamp` vs `timestamptz` column.
-        // Gated by FLUREE_ICEBERG_TIMESTAMP_STATS.
+        // Item 10 (F-AUD-11): an xsd:dateTime pushes as micros-since-epoch in the
+        // UTC frame, so it frame-matches a `timestamptz` column. Every dateTime
+        // is a UTC instant (see fluree_db_core::temporal) — a naive lexical is
+        // read as UTC too — so the push is declined against a plain `timestamp`
+        // column and the in-engine FILTER handles it. Gated by
+        // FLUREE_ICEBERG_TIMESTAMP_STATS.
         FlakeValue::DateTime(dt) if crate::r2rml::iceberg_timestamp_stats_enabled() => {
             Some(ScanValue::Timestamp {
                 micros: dt.epoch_micros(),
-                tz: dt.tz_offset().is_some(),
+                tz: true,
             })
         }
         _ => None,
@@ -2938,10 +2940,13 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    // ---- Item 10 (F-AUD-11): xsd:dateTime → frame-aware Timestamp ----
+    // ---- Item 10 (F-AUD-11): xsd:dateTime → UTC-frame Timestamp ----
 
+    // Used to assert `tz: false` for the naive literal. Every dateTime is now a
+    // UTC instant with no notion of a source offset, so both push in the UTC
+    // frame with identical micros.
     #[test]
-    fn datetime_emits_frame_aware_timestamp() {
+    fn datetime_emits_utc_frame_timestamp() {
         use fluree_db_core::DateTime;
         let mk =
             |s: &str| to_scan_value(&FlakeValue::DateTime(Box::new(DateTime::parse(s).unwrap())));
@@ -2956,11 +2961,8 @@ mod tests {
                     micros: m_n,
                 }),
             ) => {
-                assert!(tz_a, "explicit Z ⇒ tz-aware (UTC frame)");
-                assert!(!tz_n, "no offset ⇒ naive (wall-clock frame)");
-                // A naive dateTime is treated as UTC, so the same wall-clock yields
-                // the same micros — only the frame flag differs.
-                assert_eq!(m_a, m_n);
+                assert!(tz_a && tz_n, "every dateTime pushes in the UTC frame");
+                assert_eq!(m_a, m_n, "a naive dateTime is read as UTC");
             }
             other => panic!("expected two Timestamps, got {other:?}"),
         }

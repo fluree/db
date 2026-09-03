@@ -51,6 +51,7 @@ pub enum SyncError {
     PackNotSupported,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<reqwest::Error> for SyncError {
     fn from(e: reqwest::Error) -> Self {
         SyncError::Remote(e.to_string())

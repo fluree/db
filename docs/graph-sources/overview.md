@@ -147,6 +147,11 @@ Iceberg graph sources require an [R2RML mapping](r2rml.md) that defines how tabl
 
 See [Iceberg / Parquet](iceberg.md) for full configuration details and examples.
 
+View policy is enforced on Iceberg and SQL sources for static targeting
+(`f:onProperty`, `f:onClass`, `f:onSubject`, defaults); `f:query` policies fail
+closed. Stored policies and the class hierarchy come from a model ledger named
+at registration (`--model`). See [Access policy](iceberg.md#access-policy).
+
 **Query:**
 ```json
 {
@@ -157,6 +162,23 @@ See [Iceberg / Parquet](iceberg.md) for full configuration details and examples.
     { "@id": "?order", "ex:total": "?total" }
   ]
 }
+```
+
+### 4. SQL Endpoints
+
+**Backend:** Tables behind a Trino-protocol HTTP endpoint (Trino / Starburst / PrestoDB, or the `fluree-sql-bridge` sidecar), via R2RML mapping
+
+**Purpose:** Virtual graph over a relational database or warehouse, read live
+
+SQL sources use the same [R2RML mapping](r2rml.md) as Iceberg sources and additionally accept `rr:sqlQuery`. The engine pushes one typed single-table `SELECT` per triples map and performs joins itself. No database driver is linked into Fluree; the endpoint holds the connections.
+
+See [SQL endpoints](sql.md) for configuration, pushdown rules and the bridge.
+
+**Query:**
+```sparql
+PREFIX ex: <http://example.org/>
+SELECT ?name ?total FROM <orders-db:main>
+WHERE { ?o ex:customer ?c ; ex:total ?total . ?c ex:name ?name . FILTER(?total > 100) }
 ```
 
 ## Creating Graph Sources
@@ -201,21 +223,26 @@ SELECT ?s ?p ?o FROM <execution-log:main> WHERE { ?s ?p ?o } LIMIT 10
 ```json
 {
   "from": "mydb:main",
+  "from-named": ["warehouse-orders:main"],
   "select": ["?customer", "?orderId", "?total"],
   "where": [
     { "@id": "?customer", "schema:name": "?name" },
     { "@id": "?customer", "ex:customerId": "?custId" },
-    {
-      "graph": "warehouse-orders:main",
-      "where": [
-        { "@id": "?order", "ex:customerId": "?custId" },
-        { "@id": "?order", "ex:orderId": "?orderId" },
-        { "@id": "?order", "ex:total": "?total" }
-      ]
-    }
+    ["graph", "warehouse-orders:main", {
+      "@id": "?order",
+      "ex:customerId": "?custId",
+      "ex:orderId": "?orderId",
+      "ex:total": "?total"
+    }]
   ]
 }
 ```
+
+A graph pattern is the **array form** `["graph", <name>, <pattern>]` — an object
+with a `"graph"` key is parsed as an ordinary node pattern and fails. The graph
+source must also be part of the dataset (`"from-named"` here, `FROM NAMED` in
+SPARQL), or the block matches nothing. Address a graph source by its full id:
+dataset-local `fromNamed` aliases do not currently resolve to graph sources.
 
 Iceberg graph sources use R2RML mappings to define how table rows become RDF triples. See [Iceberg / Parquet](iceberg.md) and [R2RML](r2rml.md) for details.
 

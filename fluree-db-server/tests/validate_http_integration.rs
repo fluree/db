@@ -114,6 +114,10 @@ async fn validate_attached_shapes_json_envelope() {
     assert_eq!(body["conforms"], json!(false));
     assert_eq!(body["violations"], json!(1));
     assert_eq!(body["shapesChecked"], json!(1));
+    assert!(
+        body["t"].as_i64().is_some_and(|t| t >= 1),
+        "summary must carry the validated t: {body}"
+    );
     let result = &body["results"][0];
     assert_eq!(result["focus_node"], json!("http://example.org/ns/bob"));
     assert_eq!(

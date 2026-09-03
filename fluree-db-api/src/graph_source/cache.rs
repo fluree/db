@@ -23,6 +23,8 @@ use super::catalog_session::CachedLoadTable;
 use fluree_db_iceberg::catalog::RestCatalogClient;
 #[cfg(feature = "iceberg")]
 use fluree_db_iceberg::{io::parquet::ParquetFooterCache, metadata::TableMetadata, DataFile};
+#[cfg(feature = "sql")]
+use fluree_db_sql::TrinoClient;
 #[cfg(feature = "iceberg")]
 use std::time::Duration;
 
@@ -139,6 +141,13 @@ pub struct R2rmlCache {
     /// skip the ~1.3–3s catalog GET.
     #[cfg(feature = "iceberg")]
     rest_load_tables: SyncCache<String, Arc<CachedLoadTable>>,
+
+    /// Process-wide SQL endpoint clients keyed like `rest_clients` (id + raw
+    /// config fingerprint), sharing its TTL rationale. Each client also holds
+    /// the per-table schema probes, so reuse across queries skips the
+    /// `LIMIT 0` round trip.
+    #[cfg(feature = "sql")]
+    sql_clients: SyncCache<String, Arc<TrinoClient>>,
 }
 
 // moka::sync::Cache is Send+Sync but doesn't implement Debug
@@ -189,6 +198,11 @@ impl R2rmlCache {
                 rest_load_tables: SyncCache::builder()
                     .max_capacity(metadata_cap)
                     .time_to_live(Duration::from_secs(rest_loadtable_ttl_secs()))
+                    .build(),
+                #[cfg(feature = "sql")]
+                sql_clients: SyncCache::builder()
+                    .max_capacity(64)
+                    .time_to_live(Duration::from_secs(rest_client_ttl_secs()))
                     .build(),
             }
         }
@@ -296,6 +310,16 @@ impl R2rmlCache {
         self.rest_clients.insert(fingerprint, client);
     }
 
+    #[cfg(feature = "sql")]
+    pub(crate) fn sql_client(&self, key: &str) -> Option<Arc<TrinoClient>> {
+        self.sql_clients.get(key)
+    }
+
+    #[cfg(feature = "sql")]
+    pub(crate) fn put_sql_client(&self, key: String, client: Arc<TrinoClient>) {
+        self.sql_clients.insert(key, client);
+    }
+
     /// Get a cross-query `loadTable` response if cached, within TTL, and its
     /// vended credentials are not near expiry; otherwise `None` (an expired
     /// entry is invalidated). Returns `None` when caching or the cross-query
@@ -336,6 +360,8 @@ impl R2rmlCache {
             self.rest_clients.invalidate_all();
             self.rest_load_tables.invalidate_all();
         }
+        #[cfg(feature = "sql")]
+        self.sql_clients.invalidate_all();
     }
 
     /// Get cache statistics.

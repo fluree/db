@@ -555,14 +555,14 @@ fn hash_flake_value(value: &FlakeValue, state: &mut impl Hasher) {
         FlakeValue::Double(v) => v.to_bits().hash(state),
         FlakeValue::BigInt(v) => v.to_string().hash(state),
         FlakeValue::Decimal(v) => v.to_string().hash(state),
-        FlakeValue::DateTime(v) => v.original().hash(state),
-        FlakeValue::Date(v) => v.original().hash(state),
-        FlakeValue::Time(v) => v.original().hash(state),
-        FlakeValue::GYear(v) => v.original().hash(state),
-        FlakeValue::GYearMonth(v) => v.original().hash(state),
-        FlakeValue::GMonth(v) => v.original().hash(state),
-        FlakeValue::GDay(v) => v.original().hash(state),
-        FlakeValue::GMonthDay(v) => v.original().hash(state),
+        FlakeValue::DateTime(v) => v.hash(state),
+        FlakeValue::Date(v) => v.hash(state),
+        FlakeValue::Time(v) => v.hash(state),
+        FlakeValue::GYear(v) => v.hash(state),
+        FlakeValue::GYearMonth(v) => v.hash(state),
+        FlakeValue::GMonth(v) => v.hash(state),
+        FlakeValue::GDay(v) => v.hash(state),
+        FlakeValue::GMonthDay(v) => v.hash(state),
         FlakeValue::YearMonthDuration(v) => v.original().hash(state),
         FlakeValue::DayTimeDuration(v) => v.original().hash(state),
         FlakeValue::Duration(v) => v.original().hash(state),
@@ -616,6 +616,18 @@ pub fn check_min_arity(args: &[Expression], min: usize, fn_name: &str) -> Result
 // DateTime Parsing
 // =============================================================================
 
+/// Whether `dt` is one of the datatypes the temporal readers accept.
+fn is_temporal_datatype(dt: &fluree_db_core::Sid, datatypes: &WellKnownDatatypes) -> bool {
+    *dt == datatypes.xsd_datetime
+        || *dt == datatypes.xsd_date
+        || *dt == datatypes.xsd_time
+        || *dt == datatypes.xsd_g_year
+        || *dt == datatypes.xsd_g_year_month
+        || *dt == datatypes.xsd_g_month
+        || *dt == datatypes.xsd_g_day
+        || *dt == datatypes.xsd_g_month_day
+}
+
 /// Parse a datetime from a binding, respecting datatype
 ///
 /// Returns None if not a datetime type or parse fails.
@@ -632,19 +644,9 @@ pub fn parse_datetime_from_binding(
     match binding {
         Binding::Lit { val, dtc, .. } => {
             let dt = dtc.datatype();
-            let is_datetime_type = *dt == datatypes.xsd_datetime
-                || *dt == datatypes.xsd_date
-                || *dt == datatypes.xsd_time
-                || *dt == datatypes.xsd_g_year
-                || *dt == datatypes.xsd_g_year_month
-                || *dt == datatypes.xsd_g_month
-                || *dt == datatypes.xsd_g_day
-                || *dt == datatypes.xsd_g_month_day;
-
-            if !is_datetime_type {
+            if !is_temporal_datatype(dt, datatypes) {
                 return None;
             }
-
             flake_value_to_datetime(val, Some(dt), datatypes)
         }
         Binding::EncodedLit {
@@ -658,27 +660,35 @@ pub fn parse_datetime_from_binding(
             let ctx = ctx?;
             let store = ctx.binary_store.as_deref()?;
             let dt_sid = store.dt_sids().get(*dt_id as usize)?.clone();
-
-            let is_datetime_type = dt_sid == datatypes.xsd_datetime
-                || dt_sid == datatypes.xsd_date
-                || dt_sid == datatypes.xsd_time
-                || dt_sid == datatypes.xsd_g_year
-                || dt_sid == datatypes.xsd_g_year_month
-                || dt_sid == datatypes.xsd_g_month
-                || dt_sid == datatypes.xsd_g_day
-                || dt_sid == datatypes.xsd_g_month_day;
-            if !is_datetime_type {
+            if !is_temporal_datatype(&dt_sid, datatypes) {
                 return None;
             }
-
             let gv = ctx.graph_view()?;
             let val = gv
                 .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
                 .ok()?;
-
             flake_value_to_datetime(&val, Some(&dt_sid), datatypes)
         }
         _ => None,
+    }
+}
+
+/// Whether this binding holds a temporal value — the only question `TZ` and
+/// `TIMEZONE` need to answer.
+///
+/// Deliberately inspects the datatype alone and never decodes the value: Fluree
+/// normalizes temporals to UTC and does not persist the source offset, so the
+/// answer cannot depend on the value. Skipping the decode also keeps `TZ` cheap,
+/// since it is evaluated per row.
+pub fn binding_is_temporal(binding: &Binding, ctx: Option<&ExecutionContext<'_>>) -> bool {
+    let datatypes = &*WELL_KNOWN_DATATYPES;
+    match binding {
+        Binding::Lit { dtc, .. } => is_temporal_datatype(dtc.datatype(), datatypes),
+        Binding::EncodedLit { dt_id, .. } => ctx
+            .and_then(|c| c.binary_store.as_deref())
+            .and_then(|store| store.dt_sids().get(*dt_id as usize))
+            .is_some_and(|dt_sid| is_temporal_datatype(dt_sid, datatypes)),
+        _ => false,
     }
 }
 
@@ -700,13 +710,15 @@ fn promotion_default_date() -> Option<NaiveDate> {
     )
 }
 
+/// Promote a gYear-family fragment to a full instant by filling the missing
+/// fields from the shared defaults. Always UTC — these types carry no timezone
+/// (see `fluree_db_core::temporal`).
 fn promote_calendar_fragment(
-    tz_offset: Option<FixedOffset>,
     year: Option<i32>,
     month: Option<u32>,
     day: Option<u32>,
 ) -> Option<DateTime<FixedOffset>> {
-    let offset = tz_offset.unwrap_or(FixedOffset::east_opt(0)?);
+    let offset = FixedOffset::east_opt(0)?;
     let naive = NaiveDate::from_ymd_opt(
         year.unwrap_or(i32::try_from(CalendarField::Year.promotion_default()).ok()?),
         month.unwrap_or(u32::try_from(CalendarField::Month.promotion_default()).ok()?),
@@ -737,53 +749,30 @@ fn flake_value_to_datetime(
     let utc = FixedOffset::east_opt(0).unwrap();
 
     match val {
-        FlakeValue::DateTime(dt) => {
-            let offset = dt.tz_offset().unwrap_or(utc);
-            Some(dt.instant().with_timezone(&offset))
-        }
-        FlakeValue::Date(d) => {
-            let offset = d.tz_offset().unwrap_or(utc);
-            let naive = d.date().and_hms_opt(0, 0, 0)?;
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
-        }
+        // Temporal values carry no offset (see fluree_db_core::temporal), so
+        // every component is read in UTC on both storage lanes.
+        FlakeValue::DateTime(dt) => Some(dt.instant().with_timezone(&utc)),
+        FlakeValue::Date(d) => Some(utc.from_utc_datetime(&d.date().and_hms_opt(0, 0, 0)?)),
         FlakeValue::Time(t) => {
-            let offset = t.tz_offset().unwrap_or(utc);
             // A time carries no date; fill it from the shared defaults.
             let date = promotion_default_date()?;
-            let naive = NaiveDateTime::new(date, t.time());
-            Some(
-                offset
-                    .from_local_datetime(&naive)
-                    .single()
-                    .unwrap_or_else(|| offset.from_utc_datetime(&naive)),
-            )
+            Some(utc.from_utc_datetime(&NaiveDateTime::new(date, t.time())))
         }
-        FlakeValue::GYear(gy) => {
-            promote_calendar_fragment(gy.tz_offset(), Some(gy.year()), None, None)
-        }
+        FlakeValue::GYear(gy) => promote_calendar_fragment(Some(gy.year()), None, None),
         FlakeValue::GYearMonth(gym) => {
-            promote_calendar_fragment(gym.tz_offset(), Some(gym.year()), Some(gym.month()), None)
+            promote_calendar_fragment(Some(gym.year()), Some(gym.month()), None)
         }
-        FlakeValue::GMonth(gm) => {
-            promote_calendar_fragment(gm.tz_offset(), None, Some(gm.month()), None)
-        }
-        FlakeValue::GDay(gd) => {
-            promote_calendar_fragment(gd.tz_offset(), None, None, Some(gd.day()))
-        }
+        FlakeValue::GMonth(gm) => promote_calendar_fragment(None, Some(gm.month()), None),
+        FlakeValue::GDay(gd) => promote_calendar_fragment(None, None, Some(gd.day())),
         FlakeValue::GMonthDay(gmd) => {
-            promote_calendar_fragment(gmd.tz_offset(), None, Some(gmd.month()), Some(gmd.day()))
+            promote_calendar_fragment(None, Some(gmd.month()), Some(gmd.day()))
         }
         FlakeValue::String(s) => DateTime::parse_from_rfc3339(s).ok().or_else(|| {
             let with_time = format!("{s}T00:00:00+00:00");
             DateTime::parse_from_rfc3339(&with_time).ok()
         }),
         FlakeValue::Long(y) if dt_sid == Some(&datatypes.xsd_g_year) => {
-            promote_calendar_fragment(None, Some(i32::try_from(*y).ok()?), None, None)
+            promote_calendar_fragment(Some(i32::try_from(*y).ok()?), None, None)
         }
         _ => None,
     }

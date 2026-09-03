@@ -311,6 +311,10 @@ Pass policies in `opts.policy` (an array of policy nodes) for ad-hoc requests:
 
 Useful for tests, admin scripts, and migration tooling. Inline policies and stored policies can coexist in a single request: inline policies always merge **on top of** whatever stored policies the request selects — via `identity`, `policy-class`, or a cross-ledger `f:policySource` — never instead of them.
 
+### Virtual graph sources
+
+An Iceberg or SQL graph source has no ledger to store policies in. Its stored policies, identity `f:policyClass` assignments, and class hierarchy live in a **model ledger** named when the source is registered (`--model`), resolved through the [cross-ledger](cross-ledger-policy.md#virtual-graph-sources-iceberg--sql) mechanism. Inline policies work on a virtual source with or without a model. Only static targeting is enforceable there — `f:query` fails closed — see [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
+
 ## Request-time options
 
 Each request can supply these `opts` fields (JSON-LD form). Over SPARQL, the equivalent fluree-* HTTP headers carry the same values.

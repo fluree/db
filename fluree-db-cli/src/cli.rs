@@ -925,6 +925,64 @@ pub enum Commands {
     ///   fluree validate mydb --shacl proposed-shapes.ttl
     ///   fluree validate data.ttl --shacl shapes.ttl
     ///   fluree validate data.jsonld --format jsonld
+    /// Query a ledger through GraphQL
+    ///
+    /// The schema is derived from the ledger's own data — every class becomes a
+    /// type and every observed property a field — so there is nothing to
+    /// register. The ledger's default context decides the names.
+    ///
+    /// Examples:
+    ///   fluree graphql --schema mydb
+    ///   fluree graphql mydb '{ persons { id name } }'
+    ///   fluree graphql mydb -f query.graphql --variables '{"n": 10}'
+    #[cfg(feature = "graphql")]
+    Graphql {
+        /// Optional ledger name and/or inline GraphQL document.
+        ///
+        /// With 0 args: the active ledger; provide the document via -e, -f, or
+        /// stdin. With 1 arg: a document if it looks like one, otherwise a
+        /// ledger name. With 2 args: ledger name then document.
+        #[arg(num_args = 0..=2)]
+        args: Vec<String>,
+
+        /// Ledger name (defaults to the active ledger)
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
+
+        /// Inline GraphQL document
+        #[arg(short = 'e', long = "expr")]
+        expr: Option<String>,
+
+        /// Read the document from a file
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
+
+        /// Query variables, as a JSON object
+        #[arg(long)]
+        variables: Option<String>,
+
+        /// Operation to run, when the document defines several
+        #[arg(long)]
+        operation: Option<String>,
+
+        /// Print the derived schema as SDL instead of running a query
+        #[arg(long)]
+        schema: bool,
+
+        /// Print SHACL shapes derived from the schema, as a starting point for
+        /// refining it. Nothing is written: edit the output, then apply it with
+        /// `fluree insert`. Shapes activate SHACL validation for their class,
+        /// so applying them is a decision to make deliberately.
+        #[arg(long, conflicts_with = "schema")]
+        bootstrap: bool,
+
+        /// Include `extensions.explain`: the Fluree query or transaction each
+        /// root field lowered to, and which tier the schema came from. Reports
+        /// what ran — it is not a dry run, and a mutation still writes.
+        #[arg(long)]
+        explain: bool,
+    },
+
     #[cfg(feature = "shacl")]
     Validate {
         /// Ledger name (with optional :branch) or an RDF data file
@@ -1284,10 +1342,22 @@ pub enum Commands {
         action: DocsAction,
     },
 
+    /// Turn a folder of documents into a searchable graph: structure, chunks, embeddings
+    Doc {
+        #[command(subcommand)]
+        action: DocAction,
+    },
+
     /// Manage Apache Iceberg table connections
     Iceberg {
         #[command(subcommand)]
         action: IcebergAction,
+    },
+
+    /// Manage SQL graph sources (R2RML over a Trino-protocol endpoint)
+    Sql {
+        #[command(subcommand)]
+        action: SqlAction,
     },
 
     /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg)
@@ -2975,6 +3045,138 @@ pub enum IcebergAction {
     },
 }
 
+#[derive(Debug, Clone, Subcommand)]
+pub enum SqlAction {
+    /// Map tables behind a SQL endpoint as an R2RML graph source
+    ///
+    /// The endpoint speaks the Trino client protocol: Trino, Starburst,
+    /// PrestoDB, or a `fluree-sql-bridge` sidecar in front of Postgres,
+    /// MySQL or SQLite.
+    ///
+    /// Examples:
+    ///   fluree sql map orders-db --endpoint https://trino.example.com:8443 --r2rml mappings/orders.ttl --auth-bearer $TOKEN
+    ///   fluree sql map crm --endpoint http://localhost:8080 --catalog pg --schema public --r2rml crm.ttl
+    Map(Box<SqlMapArgs>),
+
+    /// List mapped graph sources (SQL, Iceberg and R2RML)
+    List {
+        /// List graph sources on a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show details for a mapped graph source
+    Info {
+        /// Graph source name
+        name: String,
+
+        /// Query a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Drop a mapped graph source
+    Drop {
+        /// Graph source name
+        name: String,
+
+        /// Required flag to confirm deletion
+        #[arg(long)]
+        force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Arguments for mapping a SQL endpoint as a graph source.
+#[derive(Debug, Clone, clap::Args)]
+pub struct SqlMapArgs {
+    /// Graph source name (e.g., "orders-db")
+    pub name: String,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    /// Statement endpoint base URL (e.g., "https://trino.example.com:8443")
+    #[arg(long)]
+    pub endpoint: String,
+
+    /// R2RML mapping file. Each rr:tableName names a table reachable through
+    /// the endpoint; rr:sqlQuery is also accepted.
+    #[arg(long)]
+    pub r2rml: PathBuf,
+
+    /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
+    #[arg(long)]
+    pub r2rml_type: Option<String>,
+
+    /// Branch name (defaults to "main")
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// SQL rendering dialect: trino (default), postgres, mysql, sqlite
+    #[arg(long)]
+    pub dialect: Option<String>,
+
+    /// Header family: trino (default) or presto
+    #[arg(long)]
+    pub protocol: Option<String>,
+
+    /// Default catalog for unqualified table names
+    #[arg(long)]
+    pub catalog: Option<String>,
+
+    /// Default schema for unqualified table names
+    #[arg(long)]
+    pub schema: Option<String>,
+
+    /// Protocol user (X-Trino-User); defaults to "fluree"
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Bearer token for endpoint authentication
+    #[arg(long)]
+    pub auth_bearer: Option<String>,
+
+    /// OAuth2 token URL for client credentials auth
+    #[arg(long)]
+    pub oauth2_token_url: Option<String>,
+
+    /// OAuth2 client ID
+    #[arg(long)]
+    pub oauth2_client_id: Option<String>,
+
+    /// OAuth2 client secret
+    #[arg(long)]
+    pub oauth2_client_secret: Option<String>,
+
+    /// OAuth2 scope
+    #[arg(long)]
+    pub oauth2_scope: Option<String>,
+
+    /// OAuth2 audience
+    #[arg(long)]
+    pub oauth2_audience: Option<String>,
+
+    /// Session property (repeatable): --session query_max_run_time=5m
+    #[arg(long = "session", value_name = "KEY=VALUE")]
+    pub session: Vec<String>,
+
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
+}
+
 /// Arguments for mapping an Iceberg table as a graph source.
 #[derive(Debug, Clone, clap::Args)]
 pub struct IcebergMapArgs {
@@ -3028,6 +3230,17 @@ pub struct IcebergMapArgs {
     /// Branch name (defaults to "main")
     #[arg(long)]
     pub branch: Option<String>,
+
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
 
     /// Bearer token for REST catalog authentication
     #[arg(long)]
@@ -3164,4 +3377,183 @@ mod tests {
             Some(&serde_json::Value::Bool(true))
         );
     }
+}
+
+/// `fluree doc` — documents in, a graph-RAG ledger out.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand, Debug)]
+pub enum DocAction {
+    /// Parse documents into a ledger: DoCO structure graph, retrieval chunks,
+    /// embeddings, and the vector + full-text indexes over them
+    ///
+    /// Reads PDF, Markdown, HTML, DOCX, PPTX and images. Parsing is
+    /// deterministic and local; with `[doc.vlm]` (or `[doc.llm]`) configured,
+    /// pages the parser could not read are escalated to that vision model.
+    /// With `[doc.embedding]` configured every chunk is embedded. Parses and
+    /// model readings are cached under `.fluree/cache/doc/`, so a re-run only
+    /// pays for what changed.
+    ///
+    /// Examples:
+    ///   fluree doc ingest ./contracts --ledger contracts
+    ///   fluree doc ingest report.pdf notes/ -l docs --no-escalate
+    ///   fluree config set doc.embedding.url http://localhost:11434/v1
+    ///   fluree config set doc.embedding.model nomic-embed-text
+    Ingest(DocIngestArgs),
+
+    /// Search a ledger's chunks by meaning (vector) or by words (full-text)
+    ///
+    /// Examples:
+    ///   fluree doc search "termination notice period" -l contracts
+    ///   fluree doc search "LM358B supply voltage" --mode text -n 5
+    Search(DocSearchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DocIngestArgs {
+    /// Files or directories to ingest
+    #[arg(required = true, value_name = "PATH")]
+    pub paths: Vec<PathBuf>,
+
+    /// Target ledger (default: the active ledger). Created when missing.
+    #[arg(short = 'l', long, value_name = "LEDGER")]
+    pub ledger: Option<String>,
+
+    /// IRI prefix documents are minted under; the path relative to the
+    /// ingested directory is appended, so a document keeps its IRI across runs
+    #[arg(long, default_value = "urn:fluree:doc:", value_name = "IRI")]
+    pub base_iri: String,
+
+    /// Skip embeddings even when `[doc.embedding]` is configured
+    #[arg(long)]
+    pub no_embed: bool,
+
+    /// Never call a vision model, whatever `[doc.vlm]` says
+    #[arg(long)]
+    pub no_escalate: bool,
+
+    /// Skip indexing after the run: the ledger's own index, and the vector
+    /// and full-text indexes
+    #[arg(long)]
+    pub no_index: bool,
+
+    /// Neither read nor write the parse and reading caches
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Re-ingest documents already in the ledger with the same content,
+    /// parser and embedding model
+    #[arg(long)]
+    pub force: bool,
+
+    /// Emit a chunk once its buffer reaches this many characters
+    #[arg(long, default_value_t = 1500, value_name = "N")]
+    pub min_chars: usize,
+
+    /// Split a single element longer than this many characters
+    #[arg(long, default_value_t = 4000, value_name = "N")]
+    pub max_chars: usize,
+
+    /// Most crops one document may send to the vision model
+    #[arg(long, default_value_t = 70, value_name = "N")]
+    pub max_crops: usize,
+
+    /// Ontology the language model extracts against: a ledger, or a
+    /// `.ttl` / `.jsonld` file. Needs `[doc.llm]` (or a Fluree AI account)
+    #[arg(long, value_name = "LEDGER|FILE")]
+    pub model: Option<String>,
+
+    /// Known entities to find by their labels (`skos:prefLabel`, `skos:altLabel`,
+    /// `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a ledger or a
+    /// `.ttl` / `.jsonld` file, optionally scoped to one class with `#Class`.
+    /// Repeatable. A mention keeps the entity's own IRI
+    #[arg(long, value_name = "LEDGER|FILE[#CLASS]", action = clap::ArgAction::Append)]
+    pub entities: Vec<String>,
+
+    /// What becomes of the relations the language model reports: `direct`
+    /// writes an edge for every predicate the model admits, `reified` keeps
+    /// them as review nodes only, `off` extracts entities alone
+    #[arg(long, value_enum, default_value_t = DocRelationMode::Direct)]
+    pub relations: DocRelationMode,
+
+    /// A file of project priorities placed in the extraction prompt
+    /// (config: `doc.extraction.guidance`)
+    #[arg(long, value_name = "FILE")]
+    pub guidance: Option<PathBuf>,
+
+    /// A file replacing the extraction system prompt; keeps the `{model}`
+    /// and `{guidance}` slots (config: `doc.extraction.system_prompt`)
+    #[arg(long, value_name = "FILE")]
+    pub system_prompt: Option<PathBuf>,
+
+    /// A file replacing the extraction user prompt; keeps the `{existing}`
+    /// and `{document}` slots (config: `doc.extraction.user_prompt`)
+    #[arg(long, value_name = "FILE")]
+    pub user_prompt: Option<PathBuf>,
+
+    /// Chunks sent to the language model at once (config:
+    /// `doc.extraction.concurrency`, default 4)
+    #[arg(long, value_name = "N")]
+    pub concurrency: Option<usize>,
+
+    /// Drop new entities whose class is not in the ontology instead of
+    /// keeping them flagged `doc:offModel` (config: `doc.extraction.drop_off_model`)
+    #[arg(long)]
+    pub drop_off_model: bool,
+
+    /// Language of the documents, for stemming in the entity scan
+    #[arg(long, default_value = "en", value_name = "CODE")]
+    pub lang: String,
+
+    /// Skip entity and relation extraction even when `--model` or `--entities` is given
+    #[arg(long)]
+    pub no_extract: bool,
+
+    /// Parse, chunk and embed, then report what would be written — write nothing
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Also write each document's transaction as `<relative-path>.jsonld` here
+    #[arg(long, value_name = "DIR")]
+    pub out_dir: Option<PathBuf>,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocRelationMode {
+    Direct,
+    Reified,
+    Off,
+}
+
+#[derive(Args, Debug)]
+pub struct DocSearchArgs {
+    /// What to look for
+    #[arg(required = true, value_name = "QUERY")]
+    pub query: String,
+
+    /// Ledger to search (default: the active ledger)
+    #[arg(short = 'l', long, value_name = "LEDGER")]
+    pub ledger: Option<String>,
+
+    /// Results to return
+    #[arg(short = 'n', long, default_value_t = 10, value_name = "N")]
+    pub limit: usize,
+
+    /// `vector` embeds the query with `[doc.embedding]` and searches the HNSW
+    /// index; `text` runs BM25; `hybrid` runs both and fuses them by
+    /// reciprocal rank; `auto` picks hybrid when both indexes exist and the
+    /// query can be embedded, else whichever there is
+    #[arg(long, value_enum, default_value_t = DocSearchMode::Auto)]
+    pub mode: DocSearchMode,
+
+    /// Print the raw query result as JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocSearchMode {
+    Auto,
+    Vector,
+    Text,
+    Hybrid,
 }

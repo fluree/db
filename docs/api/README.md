@@ -16,7 +16,9 @@ High-level introduction to the Fluree HTTP API, including:
 
 Complete reference for all HTTP endpoints:
 - `POST /update` - Submit update transactions (WHERE/DELETE/INSERT or SPARQL UPDATE)
-- `POST /query` - Execute queries
+- `POST /query` - Execute queries (JSON-LD, SPARQL, Cypher)
+- `POST /graphql/*ledger` - GraphQL over the schema derived from the ledger's data
+- `GET /graphql-schema/*ledger` - that schema as SDL
 - `POST /multi-query` - Bundle multiple queries against a shared snapshot ([dedicated doc](multi-query.md))
 - `GET /v1/fluree/ledgers` - List ledgers
 - `GET /health` - Health checks
@@ -26,6 +28,12 @@ Complete reference for all HTTP endpoints:
 ### [Multi-query envelope](multi-query.md)
 
 Bundle multiple JSON-LD and/or SPARQL queries into a single request that runs against one shared snapshot moment, with envelope-level `@context` / `opts` defaults and per-alias result assembly.
+
+### [GraphQL](../query/graphql.md)
+
+A GraphQL endpoint on every ledger, with the schema derived from its data and
+SHACL shapes rather than registered. Read and write, with `explain` showing the
+JSON-LD query each field lowered to.
 
 ### [Bolt protocol](bolt.md)
 

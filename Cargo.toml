@@ -12,6 +12,7 @@ members = [
     "fluree-db-query",
     "fluree-db-sparql",
     "fluree-db-cypher",
+    "fluree-db-graphql",
     "fluree-db-nameservice",
     "fluree-db-novelty",
     "fluree-db-ledger",
@@ -29,25 +30,29 @@ members = [
     "fluree-db-iceberg",
     "fluree-db-tabular",
     "fluree-db-r2rml",
+    "fluree-db-sql",
     "fluree-db-server",
     "fluree-db-bolt",
     "fluree-db-peer",
     "fluree-sse",
     "fluree-db-nameservice-sync",
+    "fluree-db-browser",
     "fluree-search-protocol",
     "fluree-search-service",
     "fluree-search-httpd",
     "fluree-db-cli",
     "fluree-db-memory",
     "fluree-db-docs",
+    "fluree-db-doc",
     "fluree-db-mcp",
     "fluree-bench-support",
     "fluree-bench-alloc",
     "fluree-bench-virtual",
     "fluree-db-consensus",
     "fluree-raft-core",
+    "fluree-db-wasm",
 ]
-exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load"]
+exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load", "fluree-sql-bridge"]
 
 [workspace.package]
 version = "4.1.6"
@@ -67,6 +72,12 @@ thiserror = "1.0"
 # Used by fluree-db-novelty's current-state fact index.
 imbl = "3"
 winnow = "0.7"
+
+# GraphQL runtime (fluree-db-graphql): parse/validate/introspect/execute over a
+# schema built at runtime from ledger metadata. `default-features = false` drops
+# the multipart-upload (`tempfile`) and bundled GraphiQL (`askama`) features; the
+# `dynamic-schema` API is all this repo uses.
+async-graphql = { version = "7.2", default-features = false, features = ["dynamic-schema"] }
 indexmap = { version = "2", features = ["serde"] }
 
 # For content addressing and hashing
@@ -166,6 +177,17 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 urlencoding = "2"
 
+# Document parsing engine (fluree-doc-parse). Pin by rev; bump
+# `fluree_db_doc::parse::DOC_PARSE_REV` in step so the parse cache invalidates.
+fluree-doc-model = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-pdf = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-markdown = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-docx = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-html = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+fluree-doc-pptx = { git = "https://github.com/fluree/fluree-doc-parse", rev = "407daa034aeca0de1a70a53eac7899d94c52bb5d" }
+hayro-syntax = "0.7"
+walkdir = "2"
+
 # JWT verification (standard OIDC JWT with JWKS support)
 jsonwebtoken = "9"
 
@@ -247,3 +269,12 @@ split-debuginfo = "unpacked"
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
+
+# Browser artifact profile (`fluree-db-wasm`, `--target wasm32-unknown-unknown`).
+# Inert for every native build: profiles only apply when selected with
+# `--profile wasm-release`. Inherits release's fat LTO / strip / single
+# codegen unit; overrides opt-level because the shipped .wasm is download-
+# size-bound (see fluree-db-wasm/README.md for the measured level trade-off).
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
